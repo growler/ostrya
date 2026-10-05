@@ -37,7 +37,13 @@
 //!
 //! [`ReceiveService`] runs the same session as steps, one for each request of
 //! a transport such as HTTP, with concurrent object streams on the one
-//! session transaction.
+//! session transaction. A session that
+//! [`ReceiveService::hello_with_hooks`] opens calls the [`ReceiveHooks`] of
+//! its host: [`ReceiveHooks::before_update`] runs just before the update lock
+//! of the commit. It can refuse the commit with a [`HookRefusal`], or give an
+//! [`UpdatePlan`]: the [`HostEntry`] values that the commit writes into the
+//! detached metadata of its new commits, and a value that the commit holds to
+//! its end.
 //!
 //! [`Repo::receive_stream`](crate::Repo::receive_stream) reads one one-way
 //! stream: the messages of a session in one direction, with no reply. It runs
@@ -47,6 +53,7 @@
 mod ancestry;
 mod core;
 mod finish;
+mod hooks;
 mod ingest;
 mod merge;
 mod pattern;
@@ -59,6 +66,7 @@ mod stream;
 mod trust;
 mod walk;
 
+pub use hooks::{HookFuture, HookRefusal, HostEntry, ReceiveHooks, UpdatePlan};
 pub use pattern::RefPattern;
 pub use policy::{ReceivePolicy, ReceiveRule, ReceiveVerify};
 pub use service::ReceiveService;
@@ -81,4 +89,8 @@ const _: fn() = || {
     assert_send_sync::<ReceiveReport>();
     assert_send_sync::<ReceiveWarning>();
     assert_send_sync::<ReceiveService>();
+    assert_send_sync::<HostEntry>();
+    assert_send_sync::<HookRefusal>();
+    fn assert_send<T: Send>() {}
+    assert_send::<UpdatePlan>();
 };

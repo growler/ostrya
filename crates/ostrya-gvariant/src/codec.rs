@@ -539,6 +539,17 @@ impl<'a> GvType for VariantBytes<'a> {
     const FIXED_SIZE: Option<usize> = None;
 }
 
+impl<'a> GvEncode for VariantBytes<'a> {
+    /// Re-emit the borrowed child bytes, the type separator, and the child
+    /// signature, so the variant reproduces the bytes it was read from.
+    fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        out.extend_from_slice(self.child);
+        out.push(0);
+        out.extend_from_slice(self.signature.as_bytes());
+        Ok(())
+    }
+}
+
 impl<'a> GvDecode<'a> for VariantBytes<'a> {
     fn decode(data: &'a [u8]) -> Result<Self> {
         let Some(sep) = data.iter().rposition(|&b| b == 0) else {
@@ -969,6 +980,44 @@ mod tests {
             VariantBytes::decode(b"no separator").err(),
             Some(Error::NotNormal("variant lacks a type separator"))
         );
+    }
+
+    /// The entries of an `a{sv}` read as `(&str, VariantBytes)` and written
+    /// again with [`write_array`] give the bytes of the dict, and one
+    /// variant encodes to the bytes it was read from.
+    #[test]
+    fn variant_bytes_encode_the_bytes_they_were_read_from() {
+        let ty = Type::parse("a{sv}").unwrap();
+        let dict = Value::Array(vec![
+            Value::Tuple(vec!["a".into(), Value::variant(Type::Str, "text".into())]),
+            Value::Tuple(vec![
+                "b".into(),
+                Value::variant(Type::parse("t").unwrap(), Value::U64(7)),
+            ]),
+            Value::Tuple(vec![
+                "c".into(),
+                Value::variant(
+                    Type::parse("aay").unwrap(),
+                    Value::Array(vec![Value::Bytes(b"xy".to_vec())]),
+                ),
+            ]),
+        ]);
+        let bytes = to_bytes(&ty, &dict).unwrap();
+        let entries: Vec<(&str, VariantBytes)> =
+            <ArrayIter<(&str, VariantBytes)> as GvDecode>::decode(&bytes)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+        let mut out = Vec::new();
+        write_array(&mut out, 8, false, entries.len(), |out, i| {
+            entries[i].encode(out)
+        })
+        .unwrap();
+        assert_eq!(out, bytes);
+
+        let variant = to_bytes(&Type::Variant, &Value::variant(Type::Str, "text".into())).unwrap();
+        let read = VariantBytes::decode(&variant).unwrap();
+        assert_eq!(encode_to_vec(&read).unwrap(), variant);
     }
 
     #[test]

@@ -163,6 +163,36 @@ pub fn connect() -> (Client, PipeReader, PipeWriter) {
     (client, server_in, server_out)
 }
 
+/// Write one object to `w`: its header, its bytes in pieces of 40 KiB, and
+/// the end chunk.
+pub async fn write_object<W>(w: &mut FrameWriter<W>, o: &Obj) -> push::Result<()>
+where
+    W: futures_io::AsyncWrite + Unpin,
+{
+    w.write_message(&Message::ObjectHeader(ObjectHeader {
+        name: ObjectName::new(o.checksum, o.ty),
+        encoding: o.encoding,
+    }))
+    .await?;
+    for piece in o.bytes.chunks(40 * 1024) {
+        w.write_object_data(piece).await?;
+    }
+    w.end_object().await
+}
+
+/// The body of one `objects` request of a `ReceiveService`: each object,
+/// then `ObjectsEnd`.
+pub fn body(objects: &[Obj]) -> Vec<u8> {
+    block_on(async {
+        let mut w = FrameWriter::new(Vec::new());
+        for o in objects {
+            write_object(&mut w, o).await.unwrap();
+        }
+        w.write_message(&Message::ObjectsEnd).await.unwrap();
+        w.into_inner()
+    })
+}
+
 /// The wire code a failed session returned to its caller.
 pub fn returned_code(result: &ostrya::Result<ostrya::ReceiveReport>) -> Option<ErrorCode> {
     match result {
@@ -299,6 +329,23 @@ pub fn staging_entries(root: &Path) -> Vec<String> {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with("staging-"))
         .collect()
+}
+
+/// Wait until no staging directory is left under `root`. A session that
+/// ends with no commit removes its staging directory in the background.
+pub fn assert_staging_removed(root: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let left = staging_entries(root);
+        if left.is_empty() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "staging entries stay: {left:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// Assert that the session published nothing: the files under `objects/`,

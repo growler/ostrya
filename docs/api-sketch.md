@@ -2753,6 +2753,10 @@ knows no HTTP, no session id, no owner, no timeout, and no status.
   `Error::InvalidInput`. The service sets no upper bound, and the host
   keeps the value in a range of its own. A `Hello` with `one-way` true is
   `protocol`.
+- `hello_with_hooks` opens the session as `hello` does, with the
+  `ReceiveHooks` of the host. `hello` is `hello_with_hooks` with `None`.
+  The hooks belong to the session. `Repo::receive` and
+  `Repo::receive_stream` take none.
 - Up to `parallel_uploads` `objects` calls run at the same time and write
   through the one session transaction. One call more is `limit-exceeded`,
   and ends the session. One `have` runs next to the other steps and does
@@ -2812,12 +2816,104 @@ impl ReceiveService {
     pub fn check_hello(repo: &Repo, hello: &Hello) -> Result<()>;
     pub async fn hello(repo: Repo, policy: Arc<ReceivePolicy>, parallel_uploads: u32,
                        hello: Hello) -> Result<(ReceiveService, HelloReply)>;
+    pub async fn hello_with_hooks(repo: Repo, policy: Arc<ReceivePolicy>,
+                                  hooks: Option<Arc<dyn ReceiveHooks>>,
+                                  parallel_uploads: u32, hello: Hello)
+        -> Result<(ReceiveService, HelloReply)>;
     pub async fn have(&self, names: Vec<ObjectName>) -> Result<HaveReply>;
     pub async fn objects<R>(&self, input: R) -> Result<ObjectsReply>
     where
         R: AsyncRead + Unpin + Send;
     pub async fn commit(&self, request: CommitRequest) -> Result<ReceiveReport>;
     pub fn abort(&self);
+}
+```
+
+`ReceiveHooks` holds the hook of the host that `commit` calls. Its one
+method, `before_update`, runs once in each commit of a session with hooks:
+
+- It runs after all the checks of `Commit` (the ref names, the size of the
+  reply, the rules, the objects, the bindings, and the signature policy),
+  the server signatures, and the ancestry walks, just before the update
+  lock. A commit that fails one of these checks does not call it.
+- It gets every ref update of `Commit`, deletes included (`new` is
+  `None`), with the `Expected` value of the client. It gets no `force`
+  flag: the policy holds `allow_non_fast_forward`.
+- It returns an `UpdatePlan` or a `HookRefusal`. `HookRefusal::denied`
+  gives `ref-denied`, and `HookRefusal::internal` gives `internal`. A
+  message longer than 4096 bytes is cut at a character boundary.
+- `UpdatePlan::metadata` gives `HostEntry` values for the new commits of
+  the updates. A host entry replaces the client entry of the same key, with
+  no duplicate-key error. A commit with no client dict gets a new dict. The
+  `detached-metadata-exclude` filter does not apply to the host entries.
+  The commit merges the host entries into the serialized client dict in one
+  pass over its bytes, and builds no value tree for it.
+- Under the update lock, the merge into the stored dict applies
+  `keep_existing`. An entry with `keep_existing` true keeps a value that
+  the stored dict holds under its key, and its value is written only when
+  the stored dict has no such key. An entry with `keep_existing` false
+  replaces the stored value.
+- These plans are refused with `internal`, as `Error::InvalidInput`,
+  before any merge: a commit that is not the new commit of an update, a
+  commit in two tuples, a signature key (`ostree.gpgsigs`,
+  `ostree.sign.ed25519`, `ostree.sign.spki`, or `ostree.sign.dummy`), a key
+  two times for one commit, a value that is not a `Value::Variant`, and a
+  variant that does not encode. A variant that does not encode has an
+  inner value of another type, a NUL byte in a string or in the key, a
+  value or a type nested deeper than the parser reads, or a type that the
+  parser does not read, for example a dict entry with a key that is not a
+  basic type. The first five checks run over the whole plan first, and the
+  encode check runs after them. The first failure is the refusal, and the
+  message is cut at 4096 bytes. A merged dict over `MAX_METADATA_SIZE` is
+  `limit-exceeded`, before the update lock. No ref changes in any of these
+  cases.
+- The entries are written also for an update that changes no ref, and once
+  for a commit that several updates name. A plan with no entry writes no
+  detached metadata. The detached metadata is durable before a ref names
+  the commit, in one transaction commit.
+- `UpdatePlan::carried` is a `Box<dyn Any + Send>` that the commit holds to
+  its end. It drops once, after the update lock is released, also when a
+  ref check under the lock fails (`ref-mismatch`, `non-fast-forward`,
+  `delete-denied`, or the alias refusal). The host puts owned guards of its
+  own locks in it. The lock order is the repository lock shared, then the
+  locks of the host, then the update lock. The host never takes a lock that
+  `before_update` takes while it holds the update lock or an `UpdateGuard`,
+  and never waits for an exclusive repository lock while it holds such a
+  lock.
+- The transaction commit writes the detached metadata and the refs on the
+  blocking pool. A `commit` future that is dropped while these writes go
+  on releases the update lock and drops `carried` before the writes end.
+  So the host runs each commit to its end, for example in a task that it
+  joins.
+- A panic in the hook is not caught.
+
+```rust
+pub type HookFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+pub trait ReceiveHooks: Send + Sync {
+    fn before_update<'a>(&'a self, updates: &'a [RefUpdate])
+        -> HookFuture<'a, Result<UpdatePlan, HookRefusal>>;
+}
+
+#[derive(Debug)]
+pub struct UpdatePlan {
+    pub metadata: Vec<(Checksum, Vec<HostEntry>)>,
+    pub carried: Box<dyn Any + Send>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostEntry {
+    pub key: String,
+    pub value: Value,
+    pub keep_existing: bool,
+}
+
+#[derive(Debug)]
+pub struct HookRefusal { /* private */ }
+
+impl HookRefusal {
+    pub fn denied(message: impl Into<String>) -> HookRefusal;
+    pub fn internal(message: impl Into<String>) -> HookRefusal;
 }
 ```
 

@@ -222,8 +222,11 @@
 //! received commit is held to the same signature checks a pull makes, over the
 //! keys the receive policy names. `Repo::receive` runs one push session over a
 //! pair of streams, and `ReceiveService` runs one as a step for each request of
-//! a transport such as HTTP. `Repo::receive_stream` reads one one-way stream,
-//! a session in one direction with no reply.
+//! a transport such as HTTP. `ReceiveService::hello_with_hooks` gives a session
+//! the `ReceiveHooks` of its host: `before_update` runs just before the update
+//! lock of the commit, can refuse it, and gives detached-metadata entries that
+//! the commit writes with the refs. `Repo::receive_stream` reads one one-way
+//! stream, a session in one direction with no reply.
 //!
 //! Under the `push` feature it also covers the client side of a push from a
 //! repository. `Repo::push` pushes the commits of a set of refspecs to a
@@ -346,8 +349,9 @@ pub use push_repo::{ExportStreamOptions, RepoPushOptions, is_push_address, resol
 pub use read::{CommitSizes, CommitState, MetadataReader};
 #[cfg(feature = "receive")]
 pub use receive::{
-    ReceivePolicy, ReceiveReport, ReceiveRule, ReceiveService, ReceiveStep, ReceiveVerify,
-    ReceiveWarning, RefPattern, ServerSigner, TrustedKeys,
+    HookFuture, HookRefusal, HostEntry, ReceiveHooks, ReceivePolicy, ReceiveReport, ReceiveRule,
+    ReceiveService, ReceiveStep, ReceiveVerify, ReceiveWarning, RefPattern, ServerSigner,
+    TrustedKeys, UpdatePlan,
 };
 pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
 pub use repo::{CreateOptions, Repo};

@@ -320,7 +320,8 @@ pub(crate) fn append_dict_entry(metadata: &mut Value, key: &str, value: Value) -
 /// `None` the edit starts from the file's own dict, or from an empty dict
 /// where the file is absent or is the zero-length marker. `merge`, where
 /// given, is the serialized `a{sv}` dict merged into that dict with a union
-/// of each signature list. Each entry of `appends` then appends one signature
+/// of each signature list, and the keys whose value stays where that dict
+/// holds them. Each entry of `appends` then appends one signature
 /// to its engine's `aay` array, in order, and the result replaces the file
 /// atomically.
 ///
@@ -331,7 +332,7 @@ pub(crate) fn merge_detached_blocking(
     objects_fd: BorrowedFd<'_>,
     checksum: &Checksum,
     replace: Option<Value>,
-    merge: Option<Vec<u8>>,
+    merge: Option<(Vec<u8>, Vec<String>)>,
     appends: Vec<(String, Vec<u8>)>,
     fsync: bool,
     repo_mode: RepoMode,
@@ -345,8 +346,8 @@ pub(crate) fn merge_detached_blocking(
         // Only a receiving session queues a merge.
         let mut dict = match merge {
             #[cfg(feature = "receive")]
-            Some(incoming) => match crate::summary::parse_signature_dict(&incoming)? {
-                Some(incoming) => crate::receive::merge_detached(base, incoming)?,
+            Some((incoming, keep)) => match crate::summary::parse_signature_dict(&incoming)? {
+                Some(incoming) => crate::receive::merge_detached(base, incoming, &keep)?,
                 None => base.unwrap_or_else(|| Value::Array(Vec::new())),
             },
             _ => base.unwrap_or_else(|| Value::Array(Vec::new())),

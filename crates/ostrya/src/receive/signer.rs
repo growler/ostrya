@@ -447,6 +447,7 @@ mod tests {
         let merged = super::super::merge::merge_detached(
             Some(dict_with(&key, foreign)),
             dict_with(&key, own),
+            &[],
         )
         .unwrap();
         assert!(has_signed(&server, Some(&merged)));

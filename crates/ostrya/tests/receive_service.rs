@@ -12,15 +12,14 @@
 mod common;
 
 use std::io;
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use common::receive::{
-    Obj, PIPE_CAP, PipeReader, PipeWriter, fixture_objects, header, new_repo, pipe, raw_object,
-    sha, staging_entries,
+    Obj, PIPE_CAP, PipeReader, PipeWriter, assert_staging_removed, body, fixture_objects, header,
+    new_repo, pipe, raw_object, sha, staging_entries, write_object,
 };
 use common::{COMMIT, TmpDir, foreign_holder, lock_holder_main};
 use futures_io::AsyncRead;
@@ -70,33 +69,6 @@ fn fixture_update() -> CommitRequest {
     }
 }
 
-async fn write_object<W>(w: &mut FrameWriter<W>, o: &Obj) -> push::Result<()>
-where
-    W: futures_io::AsyncWrite + Unpin,
-{
-    w.write_message(&Message::ObjectHeader(ObjectHeader {
-        name: ObjectName::new(o.checksum, o.ty),
-        encoding: o.encoding,
-    }))
-    .await?;
-    for piece in o.bytes.chunks(40 * 1024) {
-        w.write_object_data(piece).await?;
-    }
-    w.end_object().await
-}
-
-/// The body of one `objects` request: each object, then `ObjectsEnd`.
-fn body(objects: &[Obj]) -> Vec<u8> {
-    block_on(async {
-        let mut w = FrameWriter::new(Vec::new());
-        for o in objects {
-            write_object(&mut w, o).await.unwrap();
-        }
-        w.write_message(&Message::ObjectsEnd).await.unwrap();
-        w.into_inner()
-    })
-}
-
 /// A body that the test writes while the call reads it.
 fn live_body() -> (FrameWriter<PipeWriter>, PipeReader) {
     let (writer, reader) = pipe(PIPE_CAP);
@@ -130,20 +102,6 @@ fn assert_ended<T: std::fmt::Debug>(result: ostrya::Result<T>, reason: &str) {
             assert!(message.contains(reason), "{message}")
         }
         other => panic!("expected protocol with {reason:?}, got {other:?}"),
-    }
-}
-
-/// Wait until no staging directory is left under `root`. A session that
-/// ends with no commit removes its staging directory in the background.
-fn assert_staging_removed(root: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let left = staging_entries(root);
-        if left.is_empty() {
-            return;
-        }
-        assert!(Instant::now() < deadline, "staging entries stay: {left:?}");
-        std::thread::sleep(Duration::from_millis(5));
     }
 }
 

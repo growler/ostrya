@@ -130,7 +130,8 @@ struct Staged {
 /// the stored one; `replace` is the dict
 /// [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
 /// put in place of the stored one; `merge` is the dict a receiving session
-/// merges into it; `appends` are the signatures
+/// merges into it, with the keys whose stored value stays; `appends` are the
+/// signatures
 /// [`sign_commit`](Transaction::sign_commit) produced after it, in call order.
 #[derive(Default)]
 struct DetachedEdit {
@@ -142,9 +143,11 @@ struct DetachedEdit {
     /// queued one. `None` starts the edit from the stored dict.
     replace: Option<Value>,
     /// The serialized `a{sv}` dict merged into the dict the edit starts
-    /// from, before the appends: each signature list gets the union of the
-    /// two lists, and each other key takes the value of this dict.
-    merge: Option<Vec<u8>>,
+    /// from, before the appends, and the keys whose stored value stays: each
+    /// signature list gets the union of the two lists, a key of the list
+    /// that the dict the edit starts from holds keeps its value, and each
+    /// other key takes the value of this dict.
+    merge: Option<(Vec<u8>, Vec<String>)>,
     /// Signatures to append, each an engine metadata key and one signature.
     appends: Vec<(String, Vec<u8>)>,
 }
@@ -582,14 +585,21 @@ impl Transaction {
     /// parses `incoming`, and merges it into the stored dict under the guard
     /// the whole process shares for
     /// detached-metadata edits: each signature list gets the union of the
-    /// stored and the incoming list, and each other key takes the incoming
+    /// stored and the incoming list, a key of `keep` that the stored dict
+    /// holds keeps the stored value, and each other key takes the incoming
     /// value. The signatures
     /// [`append_signature`](Transaction::append_signature) queues follow the
-    /// merge. Queueing twice for one checksum keeps the last dict.
+    /// merge. Queueing twice for one checksum keeps the last dict and its
+    /// `keep`.
     #[cfg(feature = "receive")]
-    pub(crate) fn merge_commit_detached(&self, checksum: &Checksum, incoming: Vec<u8>) {
+    pub(crate) fn merge_commit_detached(
+        &self,
+        checksum: &Checksum,
+        incoming: Vec<u8>,
+        keep: Vec<String>,
+    ) {
         let mut queue = self.detached.lock().unwrap();
-        Self::edit_for(&mut queue, checksum).merge = Some(incoming);
+        Self::edit_for(&mut queue, checksum).merge = Some((incoming, keep));
     }
 
     /// Queue `signature`, a signature made before this call, for the engine
@@ -1548,6 +1558,7 @@ mod tests {
             txn.merge_commit_detached(
                 &commit,
                 crate::summary::serialize_signature_dict(&incoming).unwrap(),
+                Vec::new(),
             );
             txn.commit().await.unwrap();
 

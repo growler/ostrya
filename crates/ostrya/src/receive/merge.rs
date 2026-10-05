@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ostrya_core::{ArrayIter, GvDecode, Type, Value, VariantBytes};
+use ostrya_core::{ArrayIter, GvDecode, GvEncode, GvType, Type, Value, VariantBytes};
 
 use crate::error::{Error, Result};
 
@@ -26,6 +26,7 @@ const SIGNATURE_ARRAY: &str = "aay";
 /// How a refusal names each input.
 const INCOMING: &str = "the incoming detached metadata";
 const STORED: &str = "the stored detached metadata";
+const HOST: &str = "a detached-metadata entry of the host";
 
 /// Merge the `a{sv}` dict `incoming` into `stored`, the dict the repository
 /// holds for the same commit, and give the merged dict.
@@ -39,6 +40,9 @@ const STORED: &str = "the stored detached metadata";
 ///   lists: the stored blobs in the stored order, then each incoming blob that
 ///   is not byte-equal to a blob already in the list. A duplicate the stored
 ///   list already holds stays as it is.
+/// - Under a key of `keep` that the stored dict holds, the stored value stays,
+///   and the incoming value is dropped. A key of `keep` that the stored dict
+///   does not hold is added as each other incoming key is.
 /// - Under any other key, the incoming value replaces the stored value, at the
 ///   position of the stored key.
 /// - A key only the stored dict holds stays.
@@ -58,7 +62,11 @@ const STORED: &str = "the stored detached metadata";
 /// The merge moves the entries and the blobs of both inputs into the merged
 /// dict and copies no blob. Its time is linear in the number of keys and
 /// blobs of the two inputs.
-pub(crate) fn merge_detached(stored: Option<Value>, incoming: Value) -> Result<Value> {
+pub(crate) fn merge_detached(
+    stored: Option<Value>,
+    incoming: Value,
+    keep: &[String],
+) -> Result<Value> {
     let incoming = dict_entries(incoming, INCOMING)?;
     let mut seen = HashSet::with_capacity(incoming.len());
     for (key, _) in &incoming {
@@ -80,6 +88,7 @@ pub(crate) fn merge_detached(stored: Option<Value>, incoming: Value) -> Result<V
     for (position, (key, _)) in merged.iter().enumerate() {
         positions.entry(key.clone()).or_insert(position);
     }
+    let keep: HashSet<&str> = keep.iter().map(String::as_str).collect();
     for (key, value) in incoming {
         let signatures = SIGNATURE_KEYS.contains(&key.as_str());
         match positions.get(&key) {
@@ -87,6 +96,7 @@ pub(crate) fn merge_detached(stored: Option<Value>, incoming: Value) -> Result<V
                 let list = signature_list(&mut merged[position].1, &key, STORED)?;
                 union(list, signature_blobs(value, &key, INCOMING)?);
             }
+            Some(_) if keep.contains(key.as_str()) => {}
             Some(&position) => merged[position].1 = value,
             None if signatures => {
                 let mut list = Vec::new();
@@ -102,6 +112,69 @@ pub(crate) fn merge_detached(stored: Option<Value>, incoming: Value) -> Result<V
             .map(|(key, value)| Value::Tuple(vec![Value::Str(key), value]))
             .collect(),
     ))
+}
+
+/// The serialized dict `incoming` with the entries of `host` in place of each
+/// entry of the same key, building no value. `incoming` is `None` where there
+/// is no incoming dict, and each dict of `host` holds one entry.
+///
+/// The dict holds each entry of `incoming` whose key no dict of `host` holds,
+/// in the incoming order, and then the entries of `host`, in order. Each
+/// entry is copied as its bytes, in one pass over the inputs, and the bytes
+/// are those that the serialization of the same dict gives. The caller has
+/// checked each dict of `host` as an `a{sv}` in normal form, and it is read
+/// with no second check. Refused as [`Error::InvalidFormat`]: an `incoming`
+/// that is not an `a{sv}` in normal form.
+pub(crate) fn replace_entries(incoming: Option<&[u8]>, host: &[Vec<u8>]) -> Result<Vec<u8>> {
+    let mut replacing = Vec::with_capacity(host.len());
+    for dict in host {
+        let entries: ArrayIter<(&str, VariantBytes)> =
+            ArrayIter::decode(dict).map_err(|e| not_a_dict(HOST, e))?;
+        for entry in entries {
+            replacing.push(entry.map_err(|e| not_a_dict(HOST, e))?);
+        }
+    }
+    let keys: HashSet<&str> = replacing.iter().map(|(key, _)| *key).collect();
+    let kept = match incoming {
+        Some(bytes) => Some((entries_in_place(bytes, INCOMING)?, entry_count(bytes))),
+        None => None,
+    };
+    let count = kept.as_ref().map_or(0, |(_, count)| *count);
+    let mut entries: Vec<(&str, VariantBytes)> = Vec::with_capacity(count + replacing.len());
+    if let Some((kept, _)) = kept {
+        for entry in kept {
+            let (key, value) = entry.map_err(|e| not_a_dict(INCOMING, e))?;
+            if !keys.contains(key) {
+                entries.push((key, value));
+            }
+        }
+    }
+    entries.extend(replacing);
+    let size = incoming.map_or(0, <[u8]>::len) + host.iter().map(Vec::len).sum::<usize>();
+    let mut out = Vec::with_capacity(size);
+    ostrya_core::write_array(
+        &mut out,
+        <(&str, VariantBytes) as GvType>::ALIGNMENT,
+        false,
+        entries.len(),
+        |out, i| entries[i].encode(out),
+    )
+    .map_err(ostrya_core::Error::from)?;
+    Ok(out)
+}
+
+/// The number of entries of `bytes`, a serialized `a{sv}` checked in normal
+/// form, from its framing offsets: the last offset is the end of the last
+/// entry, and the offsets take the bytes after it, one for each entry.
+fn entry_count(bytes: &[u8]) -> usize {
+    let z = ostrya_core::offset_size_for(bytes.len());
+    let Some(last) = bytes.len().checked_sub(z) else {
+        return 0;
+    };
+    let mut end = [0u8; 8];
+    end[..z].copy_from_slice(&bytes[last..]);
+    let end = u64::from_le_bytes(end) as usize;
+    bytes.len().saturating_sub(end) / z
 }
 
 /// Check, building no value, that [`merge_detached`] takes the serialized
@@ -325,6 +398,7 @@ mod tests {
         let merged = merge_detached(
             Some(dict(vec![(ED, sigs(&[b"A"]))])),
             dict(vec![(ED, sigs(&[b"B"]))]),
+            &[],
         )
         .unwrap();
         assert_eq!(blobs(&merged, ED), [b"A".to_vec(), b"B".to_vec()]);
@@ -336,6 +410,7 @@ mod tests {
         let merged = merge_detached(
             Some(dict(vec![(ED, sigs(&[b"A"]))])),
             dict(vec![(ED, sigs(&[b"A", b"B"]))]),
+            &[],
         )
         .unwrap();
         assert_eq!(blobs(&merged, ED), [b"A".to_vec(), b"B".to_vec()]);
@@ -343,6 +418,7 @@ mod tests {
         let merged = merge_detached(
             Some(dict(vec![(ED, sigs(&[b"A"]))])),
             dict(vec![(ED, sigs(&[b"B", b"B"]))]),
+            &[],
         )
         .unwrap();
         assert_eq!(blobs(&merged, ED), [b"A".to_vec(), b"B".to_vec()]);
@@ -351,6 +427,7 @@ mod tests {
         let merged = merge_detached(
             Some(dict(vec![(ED, sigs(&[b"A", b"A"]))])),
             dict(vec![(ED, sigs(&[b"A"]))]),
+            &[],
         )
         .unwrap();
         assert_eq!(blobs(&merged, ED), [b"A".to_vec(), b"A".to_vec()]);
@@ -364,6 +441,7 @@ mod tests {
             let merged = merge_detached(
                 Some(dict(vec![(key, sigs(&[b"A"]))])),
                 dict(vec![(key, sigs(&[b"B"]))]),
+                &[],
             )
             .unwrap();
             assert_eq!(blobs(&merged, key), [b"A".to_vec(), b"B".to_vec()], "{key}");
@@ -386,7 +464,7 @@ mod tests {
             ("ostree.gpgsigs", sigs(&[b"G", b"G"])),
             ("new.a", number(4)),
         ]);
-        let merged = merge_detached(Some(stored), incoming).unwrap();
+        let merged = merge_detached(Some(stored), incoming, &[]).unwrap();
         assert_eq!(
             keys(&merged),
             ["x", ED, "kept", "new.b", "ostree.gpgsigs", "new.a"]
@@ -401,7 +479,7 @@ mod tests {
     #[test]
     fn no_stored_dict_gives_the_incoming_dict() {
         let incoming = dict(vec![(ED, sigs(&[b"A"])), ("x", number(1))]);
-        let merged = merge_detached(None, incoming.clone()).unwrap();
+        let merged = merge_detached(None, incoming.clone(), &[]).unwrap();
         assert_eq!(merged, incoming);
     }
 
@@ -411,6 +489,7 @@ mod tests {
         let merged = merge_detached(
             Some(dict(vec![(ED, sigs(&[b"A"]))])),
             dict(vec![(ED, sigs(&[b"B"])), ("x", number(1))]),
+            &[],
         )
         .unwrap();
         let bytes = crate::summary::serialize_signature_dict(&merged).unwrap();
@@ -420,11 +499,86 @@ mod tests {
         assert_eq!(back, merged);
     }
 
+    /// Under a key of `keep` that the stored dict holds, the stored value
+    /// stays. A key of `keep` that the stored dict does not hold is added,
+    /// and each other key takes the incoming value.
+    #[test]
+    fn a_kept_key_keeps_the_stored_value() {
+        let stored = dict(vec![("u", number(1)), ("o", number(2))]);
+        let incoming = dict(vec![("u", number(3)), ("o", number(4)), ("n", number(5))]);
+        let keep = ["u".to_owned(), "n".to_owned()];
+        let merged = merge_detached(Some(stored), incoming, &keep).unwrap();
+        assert_eq!(keys(&merged), ["u", "o", "n"]);
+        assert_eq!(merged.dict_get("u"), Some(&number(1)));
+        assert_eq!(merged.dict_get("o"), Some(&number(4)));
+        assert_eq!(merged.dict_get("n"), Some(&number(5)));
+    }
+
+    /// The serialized `a{sv}` of `dict`.
+    fn bytes(dict: &Value) -> Vec<u8> {
+        crate::summary::serialize_signature_dict(dict).unwrap()
+    }
+
+    /// A blob of `len` bytes, as a variant.
+    fn blob(len: usize, fill: u8) -> Value {
+        Value::variant(Type::parse("ay").unwrap(), Value::Bytes(vec![fill; len]))
+    }
+
+    /// The dict that [`replace_entries`] writes is the serialization of the
+    /// same dict: with no incoming dict, with each incoming key replaced, and
+    /// with the kept incoming entries first, for dicts whose framing offsets
+    /// take 1, 2, and 4 bytes. The count of entries read from the framing
+    /// offsets is exact for each of them.
+    #[test]
+    fn replaced_entries_give_the_serialized_dict() {
+        for len in [0, 1, 7, 100, 200, 300, 70_000] {
+            let host_entries = vec![("a", blob(len, 1)), ("z", number(9))];
+            let host: Vec<Vec<u8>> = host_entries
+                .iter()
+                .map(|(key, value)| bytes(&dict(vec![(key, value.clone())])))
+                .collect();
+
+            let out = replace_entries(None, &host).unwrap();
+            assert_eq!(out, bytes(&dict(host_entries.clone())), "len {len}");
+
+            let incoming = bytes(&dict(vec![("z", number(1)), ("a", blob(len / 2, 2))]));
+            let out = replace_entries(Some(&incoming), &host).unwrap();
+            assert_eq!(out, bytes(&dict(host_entries.clone())), "len {len}");
+
+            let incoming = bytes(&dict(vec![
+                ("x", blob(len, 3)),
+                ("a", number(2)),
+                ("y", number(3)),
+            ]));
+            let out = replace_entries(Some(&incoming), &host).unwrap();
+            let expected = dict(vec![
+                ("x", blob(len, 3)),
+                ("y", number(3)),
+                ("a", blob(len, 1)),
+                ("z", number(9)),
+            ]);
+            assert_eq!(out, bytes(&expected), "len {len}");
+            assert_eq!(entry_count(&incoming), 3, "len {len}");
+            assert_eq!(entry_count(&out), 4, "len {len}");
+        }
+        assert_eq!(entry_count(&bytes(&dict(Vec::new()))), 0);
+        // No incoming dict and no host entry give the empty dict.
+        assert_eq!(
+            replace_entries(None, &[]).unwrap(),
+            bytes(&dict(Vec::new()))
+        );
+        // An input that is not an `a{sv}` is refused.
+        assert!(matches!(
+            replace_entries(Some(b"\x01"), &[]),
+            Err(Error::InvalidFormat(_))
+        ));
+    }
+
     /// Each malformed input is refused by what is wrong with it.
     #[test]
     fn malformed_inputs_are_refused() {
         let refused = |stored: Option<Value>, incoming: Value, part: &str| {
-            let err = merge_detached(stored, incoming).unwrap_err();
+            let err = merge_detached(stored, incoming, &[]).unwrap_err();
             assert!(
                 matches!(&err, Error::InvalidFormat(m) if m.contains(part)),
                 "{err}"

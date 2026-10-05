@@ -3,8 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use futures_io::AsyncRead;
 use ostrya_core::{
@@ -12,6 +12,7 @@ use ostrya_core::{
 };
 
 use super::ReceivePolicy;
+use super::hooks::ReceiveHooks;
 use super::ingest::{self, Counted, ModeRules, limit_exceeded};
 use super::merge::check_incoming;
 use super::session::{Failure, ReceiveReport, aborted, codec, next, out_of_order};
@@ -38,6 +39,8 @@ pub(super) struct SessionCore<P: Deref<Target = ReceivePolicy>> {
     named: Vec<String>,
     /// The session reads a one-way stream.
     one_way: bool,
+    /// The hooks of the session, which `Commit` calls.
+    hooks: Option<Arc<dyn ReceiveHooks>>,
     meta: Mutex<MetaState>,
     /// The bytes of the dirtree, dirmeta, and commit objects that the object
     /// streams of the session read now and did not stage yet. The session
@@ -62,11 +65,13 @@ struct MetaState {
 impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
     /// Answer `Hello` of a two-way session: check the version, the repository,
     /// and the ref names, and open the session transaction. `parallel_uploads`
-    /// is the value the reply announces. A `Hello` with `one-way` true is
-    /// `protocol`, before the version check.
+    /// is the value the reply announces, and `hooks` are the hooks that
+    /// `Commit` calls. A `Hello` with `one-way` true is `protocol`, before the
+    /// version check.
     pub(super) async fn open(
         repo: Repo,
         policy: P,
+        hooks: Option<Arc<dyn ReceiveHooks>>,
         parallel_uploads: u32,
         hello: Hello,
     ) -> std::result::Result<(Self, HelloReply), Failure> {
@@ -77,7 +82,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
                     .into(),
             )));
         }
-        let core = Self::start(repo, policy, hello, false).await?;
+        let core = Self::start(repo, policy, hooks, hello, false).await?;
         let repo = &core.repo;
         let tips = repo
             .resolve_ref_tips(&core.named)
@@ -109,7 +114,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
                 "a one-way stream starts with a Hello with one-way true".into(),
             )));
         }
-        Self::start(repo, policy, hello, true).await
+        Self::start(repo, policy, None, hello, true).await
     }
 
     /// Run the checks of [`check_hello`] on `hello`, and open the session
@@ -118,6 +123,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
     async fn start(
         repo: Repo,
         policy: P,
+        hooks: Option<Arc<dyn ReceiveHooks>>,
         hello: Hello,
         one_way: bool,
     ) -> std::result::Result<Self, Failure> {
@@ -150,6 +156,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
             rules,
             named: hello.refs,
             one_way,
+            hooks,
             meta: Mutex::default(),
             reading: AtomicU64::new(0),
         })
@@ -369,11 +376,13 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
             policy,
             txn,
             named,
+            hooks,
             meta,
             ..
         } = self;
         let dicts = meta.into_inner().expect("detached metadata mutex").dicts;
-        super::finish::finish(&repo, &policy, txn, &named, dicts, request).await
+        let hooks = hooks.as_deref();
+        super::finish::finish(&repo, &policy, hooks, txn, &named, dicts, request).await
     }
 }
 

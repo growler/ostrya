@@ -12,9 +12,9 @@ use futures_io::AsyncRead;
 use futures_lite::io::{AsyncReadExt, BufReader};
 use ostrya_core::ObjectName;
 
-use super::ReceivePolicy;
 use super::core::SessionCore;
 use super::session::{Failure, ReceiveReport, STREAM_BUFFER, aborted, next, out_of_order};
+use super::{ReceiveHooks, ReceivePolicy};
 use crate::error::{Error, Result};
 use crate::push;
 use crate::push::proto::{
@@ -75,6 +75,9 @@ type Core = SessionCore<Arc<ReceivePolicy>>;
 /// place of its result. A service dropped while the session is open ends the
 /// session in the same way.
 ///
+/// [`hello_with_hooks`](Self::hello_with_hooks) opens a session with the
+/// [`ReceiveHooks`] of the host, which [`commit`](Self::commit) calls.
+///
 /// The session id, the owner of the session, its idle timeout, and the
 /// session limit belong to the host.
 pub struct ReceiveService {
@@ -134,9 +137,26 @@ impl ReceiveService {
     /// `parallel_uploads` of 0 is [`Error::InvalidInput`]. The service sets
     /// no upper bound: the host keeps the value in a range of its own. A
     /// `Hello` with `one-way` true is `protocol`.
+    ///
+    /// The session has no hooks. It is
+    /// [`hello_with_hooks`](Self::hello_with_hooks) with `None`.
     pub async fn hello(
         repo: Repo,
         policy: Arc<ReceivePolicy>,
+        parallel_uploads: u32,
+        hello: Hello,
+    ) -> Result<(ReceiveService, HelloReply)> {
+        Self::hello_with_hooks(repo, policy, None, parallel_uploads, hello).await
+    }
+
+    /// Open the session as [`hello`](Self::hello) does, with the hooks of the
+    /// host. [`commit`](Self::commit) calls
+    /// [`ReceiveHooks::before_update`] of `hooks` just before the update
+    /// lock. `None` gives a session with no hooks.
+    pub async fn hello_with_hooks(
+        repo: Repo,
+        policy: Arc<ReceivePolicy>,
+        hooks: Option<Arc<dyn ReceiveHooks>>,
         parallel_uploads: u32,
         hello: Hello,
     ) -> Result<(ReceiveService, HelloReply)> {
@@ -145,7 +165,7 @@ impl ReceiveService {
                 "parallel_uploads must be at least 1".into(),
             ));
         }
-        let (core, reply) = SessionCore::open(repo, policy, parallel_uploads, hello)
+        let (core, reply) = SessionCore::open(repo, policy, hooks, parallel_uploads, hello)
             .await
             .map_err(into_error)?;
         let service = ReceiveService {
@@ -215,6 +235,13 @@ impl ReceiveService {
     /// them. The session ends with it. A call while another step of the
     /// session is in flight is `protocol`, and ends the session.
     ///
+    /// In a session with hooks, the commit calls
+    /// [`ReceiveHooks::before_update`] after its checks, its server
+    /// signatures, and its ancestry walks, just before the update lock, and
+    /// writes the detached-metadata entries of the host with the refs. A
+    /// refusal of the hook ends the session with its code, and no ref
+    /// changes. [`ReceiveHooks`] states the rules.
+    ///
     /// The host sends `CommitReply` from the refs of the report. When that
     /// send fails, the host adds a warning of the step
     /// [`ReplyNotDelivered`](super::ReceiveStep::ReplyNotDelivered) to the
@@ -225,6 +252,12 @@ impl ReceiveService {
     /// inline, on the thread that drops the future, and each later step is
     /// `protocol`. A host drops it only when it drops the commit task, for
     /// example at the shutdown of the runtime.
+    ///
+    /// The transaction commit writes the detached metadata and the refs on
+    /// the blocking pool. A `commit` future that is dropped while these
+    /// writes go on releases the update lock, and drops the carried value of
+    /// the hooks, before the writes end. So the host runs each commit to its
+    /// end, for example in a task that it joins.
     pub async fn commit(&self, request: CommitRequest) -> Result<ReceiveReport> {
         let core = {
             let mut state = self.lock();
@@ -613,6 +646,14 @@ const _: fn() = || {
     fn assert_send<T: Send>(_: T) {}
     let _ = |repo: Repo, policy: Arc<ReceivePolicy>, hello: Hello| {
         assert_send(ReceiveService::hello(repo, policy, 1, hello))
+    };
+    let _ = |repo: Repo,
+             policy: Arc<ReceivePolicy>,
+             hooks: Option<Arc<dyn ReceiveHooks>>,
+             hello: Hello| {
+        assert_send(ReceiveService::hello_with_hooks(
+            repo, policy, hooks, 1, hello,
+        ))
     };
     let _ = |service: &ReceiveService, names: Vec<ObjectName>, request: CommitRequest| {
         assert_send(service.have(names));

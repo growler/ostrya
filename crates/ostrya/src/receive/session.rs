@@ -276,7 +276,8 @@ where
     }
 
     async fn hello(&mut self, hello: Hello) -> std::result::Result<(), Failure> {
-        let (core, reply) = SessionCore::open(self.repo.clone(), self.policy, 1, hello).await?;
+        let (core, reply) =
+            SessionCore::open(self.repo.clone(), self.policy, None, 1, hello).await?;
         self.core = Some(core);
         self.reply(&Message::HelloReply(reply)).await
     }

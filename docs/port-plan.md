@@ -206,6 +206,8 @@ bounded:
   a receive policy it also runs the receive endpoint of a push: it holds the
   session table, and each request is one step of the `ReceiveService` of
   its session (`api-sketch.md`, "Archive view and HTTP server"). The
+  endpoint opens each session with `ReceiveService::hello`, so a session of
+  the endpoint has no `ReceiveHooks`. The
   endpoint authenticates each request through the public trait
   `ReceiveAuth`, which also gives the policy of each session. The server
   implements it with the crate-private `FileAuth`, which authorizes each
@@ -7153,7 +7155,13 @@ client certificate, or as an anonymous push (`docs/api-sketch.md`,
 "serve"). A host mounts the same endpoint in its own router with
 `ReceiveEndpoint` of `ostrya-server` and an authentication of its own, and
 `push_tree` pushes to it over HTTPS and HTTP/2 under a path prefix that the
-host removes (`docs/api-sketch.md`, "Archive view and HTTP server"). The
+host removes (`docs/api-sketch.md`, "Archive view and HTTP server"). A
+host of `ReceiveService` gives a session hooks of its own through
+`ReceiveService::hello_with_hooks`: `ReceiveHooks::before_update` runs just
+before the update lock of the commit, can refuse the commit, and gives
+detached-metadata entries that the commit writes with the refs, and a
+carried value that drops at the end of the commit (`docs/api-sketch.md`,
+"Receive policy (feature `receive`)"). The
 HTTP push transport is done: `PushSession::connect`,
 `push_tree`, and `Repo::push` take an `http://` or `https://` address, with
 a bearer token, a Basic credential, or a client certificate, and with

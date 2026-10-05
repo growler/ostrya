@@ -8,15 +8,25 @@
 //! does not stop at a match.
 
 use std::collections::HashMap;
+use std::future::{Future, ready};
 use std::hint::black_box;
+use std::sync::Arc;
 
-use hyper::header::AUTHORIZATION;
+use hyper::header::{AUTHORIZATION, HeaderValue, WWW_AUTHENTICATE};
+use hyper::http::request::Parts;
 use hyper::{HeaderMap, StatusCode};
-use ostrya::Checksum;
+use ostrya::push::proto::Hello;
+use ostrya::{Checksum, ReceivePolicy};
 
 use crate::error::Error;
+use crate::options::ServeOptions;
+use crate::receive_auth::{ReceiveAuth, Refusal, RequestKind, SessionSetup};
 
-/// What the connection of a request states about its client.
+/// The `WWW-Authenticate` headers of a 401: the two schemes of a credential.
+const CHALLENGES: [&str; 2] = [r#"Bearer realm="ostrya""#, r#"Basic realm="ostrya""#];
+
+/// What the connection of a request states about its client. The server puts
+/// it into the extensions of each request.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Peer {
     /// Whether the connection runs over TLS.
@@ -25,19 +35,6 @@ pub(crate) struct Peer {
     /// the client presented in the TLS handshake. The handshake verified the
     /// certificate against the client CA.
     pub(crate) cert: Option<Checksum>,
-}
-
-/// The credential that a session belongs to. A request of a session from
-/// another owner gets the answer of an unknown session.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Owner {
-    /// A bearer token or a Basic credential, by the name of its line. Both
-    /// methods give the same owner for one line.
-    Token(String),
-    /// A client certificate, by the SHA-256 digest of its DER bytes.
-    Certificate(Checksum),
-    /// A request with no credential, on a server that allows anonymous push.
-    Anonymous,
 }
 
 /// One line of the credential file.
@@ -138,50 +135,72 @@ fn match_line(lines: &[Credential], digest: &[u8; 32]) -> Option<usize> {
     found
 }
 
-/// The authentication methods of the receive endpoint.
-pub(crate) struct Auth {
+/// The authentication methods of `ostrya serve`: the credential file, the
+/// client certificate, and anonymous push. The owner key of a principal has a
+/// prefix for each method: `token:NAME` for a bearer token or a Basic
+/// credential, by the name of its line, `cert:HEX` for a client certificate,
+/// by the SHA-256 digest of its DER bytes in lowercase hex, and `anonymous`.
+/// A name can be equal to a digest, and the prefix keeps the keys of two
+/// methods apart. A bearer token and a Basic credential of one line give one
+/// key. Each session gets the policy of the server.
+pub(crate) struct FileAuth {
     /// A request with no credential may push.
-    pub(crate) anonymous: bool,
+    anonymous: bool,
     /// The TLS layer verifies a client certificate against a client CA.
-    pub(crate) client_ca: bool,
+    client_ca: bool,
     /// A bearer or Basic credential is taken over plain HTTP.
-    pub(crate) cleartext: bool,
+    cleartext: bool,
     /// The lines of the credential file.
-    pub(crate) credentials: Vec<Credential>,
+    credentials: Vec<Credential>,
+    /// The policy of each session.
+    policy: Arc<ReceivePolicy>,
 }
 
-/// A request that no authentication method accepts: the status, 401 or 403,
-/// and the message of its `unauthorized` frame.
-#[derive(Debug)]
-pub(crate) struct Refusal {
-    pub(crate) status: StatusCode,
-    pub(crate) message: String,
-}
-
-impl Refusal {
-    fn unauthorized(message: &str) -> Refusal {
-        Refusal {
-            status: StatusCode::UNAUTHORIZED,
-            message: message.into(),
+impl FileAuth {
+    /// The methods of `opts`, with `policy` for each session. A malformed
+    /// line of the credential file is [`Error::Credentials`]. A server with
+    /// no method is refused, and so is a server with no TLS whose one method
+    /// is the credential file and that takes no credential over plain HTTP,
+    /// because no request can pass it.
+    pub(crate) fn new(opts: &ServeOptions, policy: Arc<ReceivePolicy>) -> Result<FileAuth, Error> {
+        let credentials = match &opts.credentials {
+            Some(bytes) => parse_credentials(bytes)?,
+            None => Vec::new(),
+        };
+        let auth = FileAuth {
+            anonymous: opts.allow_anonymous_push,
+            client_ca: opts
+                .tls
+                .as_ref()
+                .is_some_and(|tls| tls.client_ca_pem.is_some()),
+            cleartext: opts.allow_cleartext_credentials,
+            credentials,
+            policy,
+        };
+        if !auth.has_method() {
+            return Err(Error::Options(
+                "a receive endpoint with no authentication method".into(),
+            ));
         }
+        // With no TLS there is no client CA, so the credential lines are the one
+        // method, and the endpoint refuses each of them over plain HTTP.
+        if opts.tls.is_none() && !auth.anonymous && !auth.cleartext {
+            return Err(Error::Options(
+                "a receive endpoint over plain HTTP with the credential file as its one method \
+                 and no allow_cleartext_credentials"
+                    .into(),
+            ));
+        }
+        Ok(auth)
     }
 
-    fn forbidden(message: &str) -> Refusal {
-        Refusal {
-            status: StatusCode::FORBIDDEN,
-            message: message.into(),
-        }
-    }
-}
-
-impl Auth {
     /// Whether one method or more can accept a request.
-    pub(crate) fn has_method(&self) -> bool {
+    fn has_method(&self) -> bool {
         self.anonymous || self.client_ca || !self.credentials.is_empty()
     }
 
-    /// The owner of a request with `headers` from `peer`, or the refusal of
-    /// the request.
+    /// The owner key of a request with `headers` from `peer`, or the refusal
+    /// of the request.
     ///
     /// More than one `Authorization` header is 401. A bearer or Basic
     /// credential on a connection without TLS is 403, unless the server
@@ -190,7 +209,7 @@ impl Auth {
     /// header, a verified client certificate gives its owner, then
     /// anonymous push where it is allowed. Else the request is 401 where the
     /// server has credential lines, and 403 where it has a client CA alone.
-    pub(crate) fn authorize(&self, headers: &HeaderMap, peer: &Peer) -> Result<Owner, Refusal> {
+    fn authorize(&self, headers: &HeaderMap, peer: &Peer) -> Result<String, Refusal> {
         let mut values = headers.get_all(AUTHORIZATION).iter();
         let Some(value) = values.next() else {
             return self.without_credential(peer);
@@ -220,7 +239,7 @@ impl Auth {
             None
         };
         match matched {
-            Some(index) => Ok(Owner::Token(self.credentials[index].name.clone())),
+            Some(index) => Ok(format!("token:{}", self.credentials[index].name)),
             None => Err(Refusal::unauthorized(
                 "the credential of the request matches no credential of the server",
             )),
@@ -254,15 +273,15 @@ impl Auth {
         (self.credentials[index].name == name).then_some(index)
     }
 
-    /// The owner of a request with no `Authorization` header.
-    fn without_credential(&self, peer: &Peer) -> Result<Owner, Refusal> {
+    /// The owner key of a request with no `Authorization` header.
+    fn without_credential(&self, peer: &Peer) -> Result<String, Refusal> {
         if self.client_ca
             && let Some(cert) = peer.cert
         {
-            return Ok(Owner::Certificate(cert));
+            return Ok(format!("cert:{}", cert.to_hex()));
         }
         if self.anonymous {
-            return Ok(Owner::Anonymous);
+            return Ok("anonymous".into());
         }
         if self.credentials.is_empty() {
             Err(Refusal::forbidden(
@@ -271,6 +290,54 @@ impl Auth {
         } else {
             Err(Refusal::unauthorized("the request has no credential"))
         }
+    }
+}
+
+/// `refusal`, with the two challenges of a credential when it is 401.
+fn challenge(refusal: Refusal) -> Refusal {
+    if refusal.status != StatusCode::UNAUTHORIZED {
+        return refusal;
+    }
+    CHALLENGES.into_iter().fold(refusal, |refusal, challenge| {
+        refusal.with_header(WWW_AUTHENTICATE, HeaderValue::from_static(challenge))
+    })
+}
+
+impl ReceiveAuth for FileAuth {
+    /// The owner key.
+    type Principal = String;
+
+    fn owner(principal: &String) -> &str {
+        principal
+    }
+
+    /// The owner key of the request, from its headers and the [`Peer`] in
+    /// its extensions. The server puts a peer into each request of its
+    /// receive endpoint. A request with no peer is taken as plain HTTP with
+    /// no client certificate. The route does not change the answer.
+    fn authenticate(
+        &self,
+        parts: &Parts,
+        _kind: RequestKind,
+    ) -> impl Future<Output = Result<String, Refusal>> + Send {
+        let peer = parts.extensions.get::<Peer>().copied();
+        debug_assert!(peer.is_some(), "the server puts a peer into each request");
+        let peer = peer.unwrap_or(Peer {
+            tls: false,
+            cert: None,
+        });
+        ready(self.authorize(&parts.headers, &peer).map_err(challenge))
+    }
+
+    /// The policy of the server, for every principal.
+    fn open(
+        &self,
+        _principal: &String,
+        _hello: &Hello,
+    ) -> impl Future<Output = Result<SessionSetup, Refusal>> + Send {
+        ready(Ok(SessionSetup {
+            policy: self.policy.clone(),
+        }))
     }
 }
 
@@ -294,12 +361,13 @@ mod tests {
         format!("{name}:{}\n", Checksum::sha256(secret.as_bytes()).to_hex())
     }
 
-    fn auth(file: &str) -> Auth {
-        Auth {
+    fn auth(file: &str) -> FileAuth {
+        FileAuth {
             anonymous: false,
             client_ca: false,
             cleartext: false,
             credentials: parse_credentials(file.as_bytes()).unwrap(),
+            policy: Arc::new(ReceivePolicy::default()),
         }
     }
 
@@ -503,13 +571,13 @@ mod tests {
     fn a_bearer_token_and_basic_give_the_owner_of_their_line() {
         let auth = auth(&(line("alice", "a-token") + &line("bob", "b-token")));
         let owner = |value: &str| auth.authorize(&headers(&[value]), &TLS);
-        let bob = Owner::Token("bob".into());
+        let bob = "token:bob";
         assert_eq!(owner("Bearer b-token").unwrap(), bob);
         assert_eq!(owner("bearer   b-token").unwrap(), bob);
         assert_eq!(owner(&basic("bob", "b-token")).unwrap(), bob);
         assert_eq!(
             owner(&basic("alice", "a-token").replacen("Basic", "BASIC", 1)).unwrap(),
-            Owner::Token("alice".into())
+            "token:alice"
         );
         assert_eq!(owner(&basic("bob", "x:y")).unwrap_err().status, 401);
     }
@@ -520,10 +588,7 @@ mod tests {
     fn a_basic_password_with_a_colon_matches() {
         let auth = auth(&(line("alice", "a-token") + &line("bob", "pa:ss:")));
         let owner = |value: &str| auth.authorize(&headers(&[value]), &TLS);
-        assert_eq!(
-            owner(&basic("bob", "pa:ss:")).unwrap(),
-            Owner::Token("bob".into())
-        );
+        assert_eq!(owner(&basic("bob", "pa:ss:")).unwrap(), "token:bob");
         assert_eq!(owner(&basic("bob", "pa:ss")).unwrap_err().status, 401);
         assert_eq!(owner(&basic("alice", "pa:ss:")).unwrap_err().status, 401);
     }
@@ -586,7 +651,7 @@ mod tests {
         assert_eq!(
             auth.authorize(&headers(&["Bearer a-token"]), &PLAIN)
                 .unwrap(),
-            Owner::Token("alice".into())
+            "token:alice"
         );
     }
 
@@ -599,21 +664,16 @@ mod tests {
             tls: true,
             cert: Some(cert),
         };
+        let cert_key = format!("cert:{}", cert.to_hex());
         let none = HeaderMap::new();
         let mut auth = auth("");
         auth.client_ca = true;
         assert!(auth.has_method());
-        assert_eq!(
-            auth.authorize(&none, &with_cert).unwrap(),
-            Owner::Certificate(cert)
-        );
+        assert_eq!(auth.authorize(&none, &with_cert).unwrap(), cert_key);
         assert_eq!(auth.authorize(&none, &TLS).unwrap_err().status, 403);
         auth.anonymous = true;
-        assert_eq!(
-            auth.authorize(&none, &with_cert).unwrap(),
-            Owner::Certificate(cert)
-        );
-        assert_eq!(auth.authorize(&none, &TLS).unwrap(), Owner::Anonymous);
+        assert_eq!(auth.authorize(&none, &with_cert).unwrap(), cert_key);
+        assert_eq!(auth.authorize(&none, &TLS).unwrap(), "anonymous");
         let mut auth = self::auth(&line("alice", "a-token"));
         assert!(auth.has_method());
         assert_eq!(auth.authorize(&none, &with_cert).unwrap_err().status, 401);
@@ -630,7 +690,151 @@ mod tests {
         assert!(open.has_method());
         assert_eq!(
             open.authorize(&HeaderMap::new(), &PLAIN).unwrap(),
-            Owner::Anonymous
+            "anonymous"
         );
+    }
+
+    /// The parts of a request with the `Authorization` values `values` and,
+    /// when it is given, `peer` in its extensions.
+    fn parts(values: &[&str], peer: Option<Peer>) -> Parts {
+        let mut builder = hyper::Request::builder();
+        for value in values {
+            builder = builder.header(AUTHORIZATION, *value);
+        }
+        if let Some(peer) = peer {
+            builder = builder.extension(peer);
+        }
+        builder.body(()).unwrap().into_parts().0
+    }
+
+    fn authenticate(auth: &FileAuth, parts: &Parts) -> Result<String, Refusal> {
+        ostrya_rt::block_on(auth.authenticate(parts, RequestKind::Open))
+    }
+
+    /// `authenticate` reads the peer from the extensions of the request, and
+    /// adds the two challenges to a 401 alone. The route does not change the
+    /// answer.
+    #[test]
+    fn authenticate_reads_the_peer_and_challenges_a_401_alone() {
+        let mut auth = auth(&line("alice", "a-token"));
+        auth.client_ca = true;
+        let cert = Checksum::sha256(b"cert");
+        let with_cert = Peer {
+            tls: true,
+            cert: Some(cert),
+        };
+        assert_eq!(
+            authenticate(&auth, &parts(&[], Some(with_cert))).unwrap(),
+            format!("cert:{}", cert.to_hex())
+        );
+        let token = parts(&["Bearer a-token"], Some(TLS));
+        for kind in [
+            RequestKind::Open,
+            RequestKind::Have,
+            RequestKind::Objects,
+            RequestKind::Commit,
+            RequestKind::Delete,
+        ] {
+            let owner = ostrya_rt::block_on(auth.authenticate(&token, kind)).unwrap();
+            assert_eq!(FileAuth::owner(&owner), "token:alice");
+        }
+
+        let refusal = authenticate(&auth, &parts(&[], Some(TLS))).unwrap_err();
+        assert_eq!(refusal.status, StatusCode::UNAUTHORIZED);
+        let challenges: Vec<_> = CHALLENGES
+            .into_iter()
+            .map(|c| (WWW_AUTHENTICATE, HeaderValue::from_static(c)))
+            .collect();
+        assert_eq!(refusal.headers, challenges);
+
+        let refusal = authenticate(&auth, &parts(&["Bearer a-token"], Some(PLAIN))).unwrap_err();
+        assert_eq!(refusal.status, StatusCode::FORBIDDEN);
+        assert!(refusal.headers.is_empty());
+    }
+
+    /// In a build with debug assertions, a request with no peer panics.
+    /// Otherwise it is plain HTTP with no client certificate, so a
+    /// credential is 403.
+    #[test]
+    fn a_request_with_no_peer_is_plain_http() {
+        let auth = auth(&line("alice", "a-token"));
+        let no_peer = parts(&["Bearer a-token"], None);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            authenticate(&auth, &no_peer)
+        }));
+        if cfg!(debug_assertions) {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(result.unwrap().unwrap_err().status, StatusCode::FORBIDDEN);
+        }
+    }
+
+    /// `open` gives the policy of the server to every principal.
+    #[test]
+    fn open_gives_the_policy_of_the_server() {
+        let auth = auth("");
+        let hello = Hello {
+            version: 1,
+            agent: None,
+            refs: vec!["main".into()],
+            one_way: false,
+        };
+        for principal in ["anonymous", "token:alice"] {
+            let setup = ostrya_rt::block_on(auth.open(&principal.to_owned(), &hello)).unwrap();
+            assert!(Arc::ptr_eq(&setup.policy, &auth.policy));
+        }
+    }
+
+    /// `FileAuth::new` refuses a server with no method, and a server with
+    /// no TLS whose one method is the credential file, unless it takes
+    /// credentials over plain HTTP. A malformed line is
+    /// [`Error::Credentials`].
+    #[test]
+    fn new_refuses_a_server_that_no_request_can_pass() {
+        let policy = Arc::new(ReceivePolicy::default());
+        let new = |change: &dyn Fn(&mut ServeOptions)| {
+            let mut opts = ServeOptions::default();
+            change(&mut opts);
+            FileAuth::new(&opts, policy.clone())
+        };
+        let options = |result: Result<FileAuth, Error>| match result {
+            Err(Error::Options(message)) => message,
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("the options pass"),
+        };
+        let file = line("alice", "a-token").into_bytes();
+        assert_eq!(
+            options(new(&|_| {})),
+            "a receive endpoint with no authentication method"
+        );
+        assert_eq!(
+            options(new(&|o| o.credentials = Some(b"# none\n".to_vec()))),
+            "a receive endpoint with no authentication method"
+        );
+        assert!(options(new(&|o| o.credentials = Some(file.clone()))).contains("over plain HTTP"),);
+        assert!(matches!(
+            new(&|o| o.credentials = Some(b"alice".to_vec())),
+            Err(Error::Credentials { line: 1, .. })
+        ));
+        let auth = new(&|o| {
+            o.credentials = Some(file.clone());
+            o.allow_cleartext_credentials = true;
+        })
+        .unwrap();
+        assert!(auth.cleartext && !auth.anonymous && !auth.client_ca);
+        assert_eq!(auth.credentials.len(), 1);
+        let auth = new(&|o| {
+            o.credentials = Some(file.clone());
+            o.tls = Some(crate::ServerTls {
+                cert_chain_pem: Vec::new(),
+                key_pem: Vec::new(),
+                key_passphrase: None,
+                client_ca_pem: Some(Vec::new()),
+            });
+        })
+        .unwrap();
+        assert!(auth.client_ca && !auth.cleartext);
+        let auth = new(&|o| o.allow_anonymous_push = true).unwrap();
+        assert!(auth.anonymous && auth.credentials.is_empty());
     }
 }

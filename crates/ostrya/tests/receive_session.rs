@@ -194,24 +194,35 @@ fn a_malformed_write_setting_is_internal_at_hello() {
     }
 }
 
-/// A reply the codec refuses goes to the peer as `internal`, and the caller
-/// gets the same code.
+/// A `Hello` whose reply can need a frame over the limit is
+/// `limit-exceeded` on the wire and for the caller, before the session
+/// transaction opens: under a foreign exclusive lock the answer comes at
+/// once, and not as the `internal` of the lock timeout.
 #[test]
-fn a_reply_over_the_frame_limit_is_internal() {
+fn a_reply_over_the_frame_limit_is_limit_exceeded() {
     let tmp = TmpDir::new("recv-bigreply");
-    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let repo = new_repo(&tmp, RepoMode::Archive, "lock-timeout-secs=1\n");
     std::fs::write(
         repo.path().join("refs/heads/m"),
         format!("{}\n", sha(b"tip")),
     )
     .unwrap();
     let refs = vec!["m"; 100_000];
+    let holder = foreign_holder(repo.path(), ".lock");
+    let started = Instant::now();
     let (result, error) = session(&repo, &policy(), |mut c| async move {
         c.hello(&refs).await.unwrap();
         c.error().await
     });
-    assert_eq!(error.code, ErrorCode::Internal);
-    assert_eq!(returned_code(&result), Some(ErrorCode::Internal));
+    let waited = started.elapsed();
+    drop(holder);
+    assert_eq!(error.code, ErrorCode::LimitExceeded, "{error:?}");
+    assert!(error.message.contains("100000 refs"), "{}", error.message);
+    assert_eq!(returned_code(&result), Some(ErrorCode::LimitExceeded));
+    assert!(
+        waited < Duration::from_secs(1),
+        "the Hello returned after {waited:?}"
+    );
 }
 
 #[test]

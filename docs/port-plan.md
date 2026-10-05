@@ -206,13 +206,16 @@ bounded:
   a receive policy it also runs the receive endpoint of a push: it holds the
   session table, and each request is one step of the `ReceiveService` of
   its session (`api-sketch.md`, "Archive view and HTTP server"). The
-  endpoint authorizes each request with a bearer token or a Basic
-  credential, which it matches against the push credential file
-  (`format-reference.md`, "Port extension: the push credential file"), with
-  a client certificate, or as an anonymous push. It compares the digests in
-  constant time with a hand-rolled compare and no dependency. It refuses to
-  start with no method, and over plain HTTP with the credential file as its
-  one method and no switch for credentials over plain HTTP. With the
+  endpoint authenticates each request through the public trait
+  `ReceiveAuth`, which also gives the policy of each session. The server
+  implements it with the crate-private `FileAuth`, which authorizes each
+  request with a bearer token or a Basic credential, which it matches
+  against the push credential file (`format-reference.md`, "Port
+  extension: the push credential file"), with a client certificate, or as
+  an anonymous push. `FileAuth` compares the digests in constant time with
+  a hand-rolled compare and no dependency. The server refuses to start with
+  no method, and over plain HTTP with the credential file as its one method
+  and no switch for credentials over plain HTTP. With the
   endpoint, an HTTP/2 stream has a receive window of 2 MiB, and a
   connection a window of 2 MiB for each of the `parallel_uploads` object
   streams of a session. It

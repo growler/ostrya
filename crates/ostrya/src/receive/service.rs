@@ -160,6 +160,26 @@ impl ReceiveService {
         Ok((service, reply))
     }
 
+    /// The checks of `hello` that every session runs before it opens, in
+    /// this order: the protocol version (`version-unsupported`), the mode
+    /// `bare-split-xattrs` (`mode-refused`), `[core] locking=false` for a
+    /// `Hello` with `one-way` false (`locking-disabled`), each ref name
+    /// (`invalid-ref`), and for a `Hello` with `one-way` false, the
+    /// `HelloReply` with a commit for each ref against [`MAX_FRAME`]
+    /// (`limit-exceeded`). The call is sync and does no I/O.
+    ///
+    /// [`hello`](Self::hello), [`Repo::receive`](crate::Repo::receive), and
+    /// [`Repo::receive_stream`](crate::Repo::receive_stream) run the same
+    /// checks. A `Hello` that passes can still fail to open: the open of the
+    /// session transaction, the reads of `[core] fsync`, `[ex-integrity]
+    /// fsverity`, and `[archive] zlib-level`, and the refusal of a `bare`
+    /// repository when the process does not run as root come after them.
+    /// The call does not refuse a `Hello` with `one-way` true, which
+    /// [`hello`](Self::hello) refuses.
+    pub fn check_hello(repo: &Repo, hello: &Hello) -> Result<()> {
+        super::core::check_hello(repo, hello).map_err(into_error)
+    }
+
     /// Answer a `Have`: one bit for each object the repository and the session
     /// do not hold. A call while another `have` of the session is in flight
     /// is `limit-exceeded`, and ends the session.

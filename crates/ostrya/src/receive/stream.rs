@@ -23,6 +23,8 @@ impl Repo {
     /// the repository mode and of `policy`. A `bare-split-xattrs` repository
     /// is `mode-refused`, and so is a `bare` repository unless the process
     /// runs as root. A repository with `[core] locking=false` is accepted.
+    /// The size of a `HelloReply` does not bound the ref names of `Hello`,
+    /// because the stream gets no reply.
     ///
     /// The session transaction holds the repository lock shared from `Hello`
     /// to the end, with no lock under `[core] locking=false`. The commit

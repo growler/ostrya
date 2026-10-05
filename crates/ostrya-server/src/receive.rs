@@ -10,15 +10,17 @@ use std::sync::Arc;
 
 use futures_lite::future;
 use hyper::body::{Body, Bytes, Frame};
-use hyper::header::{ALLOW, CONNECTION, CONTENT_LENGTH, HeaderName, HeaderValue, WWW_AUTHENTICATE};
+use hyper::header::{
+    ALLOW, CONNECTION, CONTENT_LENGTH, HeaderName, HeaderValue, TRANSFER_ENCODING,
+};
 use hyper::{Method, Request, Response, StatusCode, Version};
 use ostrya::push::proto::{ErrorMessage, MAX_FRAME, Message};
 use ostrya::push::{self, ErrorCode};
-use ostrya::{ReceivePolicy, ReceiveReport, ReceiveService, ReceiveStep, ReceiveWarning, Repo};
+use ostrya::{ReceiveReport, ReceiveService, ReceiveStep, ReceiveWarning, Repo};
 use ostrya_rt as rt;
 
-use crate::auth::{Auth, Owner, Peer};
 use crate::body::ServeBody;
+use crate::receive_auth::{ReceiveAuth, Refusal, RequestKind};
 use crate::request::{RequestBody, drain, read_message};
 use crate::router::empty;
 use crate::session::{Active, Begin, Cancel, Deleted, SessionId, SessionTable};
@@ -29,17 +31,17 @@ pub(crate) const PREFIX: &str = "/_ostrya/receive/v1/";
 /// The response header that carries the id of a new session.
 const SESSION_HEADER: HeaderName = HeaderName::from_static("ostrya-session");
 
-/// The `WWW-Authenticate` headers of a 401: the two schemes of a credential.
-const CHALLENGES: [&str; 2] = [r#"Bearer realm="ostrya""#, r#"Basic realm="ostrya""#];
+/// The headers of a refusal of the host that the endpoint drops, because it
+/// sets the framing and the connection state of the response itself.
+const OWN_HEADERS: [HeaderName; 3] = [CONTENT_LENGTH, TRANSFER_ENCODING, CONNECTION];
 
 /// The callback of [`ServeOptions::on_report`](crate::ServeOptions::on_report).
 pub(crate) type OnReport = Arc<dyn Fn(ReceiveReport) + Send + Sync>;
 
-/// The receive endpoint of a server.
-pub(crate) struct Receive {
+/// The receive endpoint of a server, with the authentication `A`.
+pub(crate) struct Receive<A> {
     pub(crate) repo: Repo,
-    pub(crate) policy: Arc<ReceivePolicy>,
-    pub(crate) auth: Auth,
+    pub(crate) auth: A,
     pub(crate) parallel_uploads: u32,
     pub(crate) on_report: Option<OnReport>,
     pub(crate) table: Arc<SessionTable>,
@@ -85,6 +87,17 @@ impl Route {
         })
     }
 
+    /// The kind of the route, which the authentication gets.
+    fn kind(self) -> RequestKind {
+        match self {
+            Route::Open => RequestKind::Open,
+            Route::Session(_) => RequestKind::Delete,
+            Route::Step(_, Step::Have) => RequestKind::Have,
+            Route::Step(_, Step::Objects) => RequestKind::Objects,
+            Route::Step(_, Step::Commit) => RequestKind::Commit,
+        }
+    }
+
     /// The method of the route.
     fn method(self) -> Method {
         match self {
@@ -102,48 +115,53 @@ impl Route {
     }
 }
 
-impl Receive {
+impl<A: ReceiveAuth> Receive<A> {
     /// The response to a request under [`PREFIX`] with a method other than
-    /// `GET` and `HEAD`, which go to the archive view.
-    pub(crate) async fn handle<B>(&self, peer: &Peer, req: Request<B>) -> Response<ServeBody>
+    /// `GET` and `HEAD`, which go to the archive view. The authentication
+    /// runs before a byte of the body is read.
+    pub(crate) async fn handle<B>(&self, req: Request<B>) -> Response<ServeBody>
     where
         B: Body<Data = Bytes> + Send + Unpin + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
+        let version = req.version();
         let Some(route) = Route::parse(req.uri().path()) else {
-            return self.refuse(req, empty(StatusCode::NOT_FOUND)).await;
+            let response = empty(StatusCode::NOT_FOUND);
+            return self.refuse(version, req.into_body(), response).await;
         };
         if *req.method() != route.method() {
             let mut response = empty(StatusCode::METHOD_NOT_ALLOWED);
             response.headers_mut().insert(ALLOW, route.allow());
-            return self.refuse(req, response).await;
+            return self.refuse(version, req.into_body(), response).await;
         }
-        let owner = match self.auth.authorize(req.headers(), peer) {
-            Ok(owner) => owner,
+        let (parts, body) = req.into_parts();
+        let principal = self.auth.authenticate(&parts, route.kind()).await;
+        // The read of the body and the steps of the session do not hold the
+        // head of the request.
+        drop(parts);
+        let principal = match principal {
+            Ok(principal) => principal,
             Err(refusal) => {
-                let message = error_message(ErrorCode::Unauthorized, refusal.message);
-                let mut response = frame(refusal.status, &message);
-                if refusal.status == StatusCode::UNAUTHORIZED {
-                    let headers = response.headers_mut();
-                    for challenge in CHALLENGES {
-                        headers.append(WWW_AUTHENTICATE, HeaderValue::from_static(challenge));
-                    }
-                }
-                return self.refuse(req, response).await;
+                return self.refuse(version, body, refusal_response(refusal)).await;
             }
         };
+        let owner = A::owner(&principal);
         match route {
-            Route::Open => self.open(owner, req).await,
-            Route::Session(id) => match self.table.delete(&id, &owner) {
-                Deleted::Done => self.refuse(req, no_content()).await,
-                Deleted::Committing => self.refuse(req, failure(&committing())).await,
-                Deleted::NotFound => self.refuse(req, empty(StatusCode::NOT_FOUND)).await,
-            },
-            Route::Step(id, step) => {
-                let Some(mut active) = self.table.lookup(&id, &owner) else {
-                    return self.refuse(req, empty(StatusCode::NOT_FOUND)).await;
+            Route::Open => self.open(&principal, body).await,
+            Route::Session(id) => {
+                let response = match self.table.delete(&id, owner) {
+                    Deleted::Done => no_content(),
+                    Deleted::Committing => failure(&committing()),
+                    Deleted::NotFound => empty(StatusCode::NOT_FOUND),
                 };
-                let body = RequestBody::new(req.into_body(), Some(active.track()));
+                self.refuse(version, body, response).await
+            }
+            Route::Step(id, step) => {
+                let Some(mut active) = self.table.lookup(&id, owner) else {
+                    let response = empty(StatusCode::NOT_FOUND);
+                    return self.refuse(version, body, response).await;
+                };
+                let body = RequestBody::new(body, Some(active.track()));
                 let response = match step {
                     Step::Have => have(&active, body).await,
                     Step::Objects => objects(&active, body).await,
@@ -155,22 +173,22 @@ impl Receive {
         }
     }
 
-    /// Answer `req` with `response` before its body is read. The body is
-    /// read and dropped first, up to 1 MiB within the idle timeout or
-    /// 5 seconds, whichever is shorter, so the client can read the response.
-    /// On HTTP/1 a body that did not reach its end closes the connection
-    /// after the response.
+    /// Answer a request of `version` with `response` before its `body` is
+    /// read. The body is read and dropped first, up to 1 MiB within the idle
+    /// timeout or 5 seconds, whichever is shorter, so the client can read
+    /// the response. On HTTP/1 a body that did not reach its end closes the
+    /// connection after the response.
     async fn refuse<B>(
         &self,
-        req: Request<B>,
+        version: Version,
+        body: B,
         mut response: Response<ServeBody>,
     ) -> Response<ServeBody>
     where
         B: Body<Data = Bytes> + Send + Unpin + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        let version = req.version();
-        let drained = drain(req.into_body(), self.table.idle()).await;
+        let drained = drain(body, self.table.idle()).await;
         if !drained && version <= Version::HTTP_11 {
             response
                 .headers_mut()
@@ -179,15 +197,17 @@ impl Receive {
         response
     }
 
-    /// `POST session`: read `Hello`, take a slot of the session limit, and
-    /// open the session. The body must arrive in full within the idle
-    /// timeout.
-    async fn open<B>(&self, owner: Owner, req: Request<B>) -> Response<ServeBody>
+    /// `POST session` of `principal`: read `Hello`, refuse a `Hello` with
+    /// `one-way` true, check `Hello`, take a slot of the session limit, get
+    /// the setup of the session from the authentication, and open the
+    /// session. The body must arrive in full within the idle timeout. A
+    /// refusal of the authentication frees the slot.
+    async fn open<B>(&self, principal: &A::Principal, body: B) -> Response<ServeBody>
     where
         B: Body<Data = Bytes> + Send + Unpin + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        let mut body = RequestBody::new(req.into_body(), None);
+        let mut body = RequestBody::new(body, None);
         let read = future::or(async { Some(read_message(&mut body).await) }, async {
             rt::Timer::after(self.table.idle()).await;
             None
@@ -206,6 +226,17 @@ impl Receive {
             }
         };
         drop(body);
+        // The text of the refusal of `ReceiveService::hello`, which comes
+        // before the check of the version.
+        if hello.one_way {
+            return failure(&protocol(
+                "a Hello with one-way true opens a one-way stream, which this session does not \
+                 read",
+            ));
+        }
+        if let Err(e) = ReceiveService::check_hello(&self.repo, &hello) {
+            return failure(&e);
+        }
         let Some(slot) = self.table.reserve() else {
             return no_more_sessions();
         };
@@ -219,9 +250,13 @@ impl Receive {
                 return frame(StatusCode::INTERNAL_SERVER_ERROR, &message);
             }
         };
+        let setup = match self.auth.open(principal, &hello).await {
+            Ok(setup) => setup,
+            Err(refusal) => return refusal_response(refusal),
+        };
         let opened = ReceiveService::hello(
             self.repo.clone(),
-            self.policy.clone(),
+            setup.policy,
             self.parallel_uploads,
             hello,
         )
@@ -232,9 +267,14 @@ impl Receive {
         };
         let bytes = match encode(&Message::HelloReply(reply)) {
             Ok(bytes) => bytes,
-            Err(e) => return failure(&e.into()),
+            // `check_hello` refuses a `Hello` whose reply, with a commit for
+            // each ref, is over the frame limit, so this arm is not reached.
+            Err(e) => {
+                debug_assert!(false, "the reply of a Hello does not fit: {e}");
+                return failure(&e.into());
+            }
         };
-        if !slot.insert(id, service, owner) {
+        if !slot.insert(id, service, A::owner(principal).to_owned()) {
             return no_more_sessions();
         }
         let mut response = full(StatusCode::OK, bytes);
@@ -414,6 +454,25 @@ pub(crate) fn status(e: &ostrya::Error) -> (StatusCode, ErrorMessage) {
     (status, message)
 }
 
+/// The response of a refusal of the authentication: its status, an
+/// `unauthorized` frame with its message, and its headers in order, except
+/// the headers that the endpoint sets itself.
+fn refusal_response(refusal: Refusal) -> Response<ServeBody> {
+    let Refusal {
+        status,
+        message,
+        headers,
+    } = refusal;
+    let mut response = frame(status, &error_message(ErrorCode::Unauthorized, message));
+    let out = response.headers_mut();
+    for (name, value) in headers {
+        if !OWN_HEADERS.contains(&name) {
+            out.append(name, value);
+        }
+    }
+    response
+}
+
 /// The 503 of a `session` request that gets no slot: the sessions are at
 /// the limit, or the server stopped.
 fn no_more_sessions() -> Response<ServeBody> {
@@ -561,15 +620,23 @@ mod tests {
     use std::marker::PhantomData;
     use std::pin::Pin;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use std::time::Duration;
 
+    use hyper::header::WWW_AUTHENTICATE;
+    use hyper::http::request::Parts;
+
     use super::*;
+    use crate::ServeOptions;
+    use crate::SessionSetup;
+    use crate::auth::{FileAuth, Peer};
     use crate::body::tests::frames;
+    use crate::request::MAX_DRAIN;
     use crate::session::tests::TmpRepo;
     use ostrya::push::proto::{CommitRequest, Hello, Kind};
     use ostrya::push::{Expected, RefOutcome, RefUpdate};
-    use ostrya::{Checksum, ObjectName, ObjectType, TransactionStats};
+    use ostrya::{Checksum, ObjectName, ObjectType, ReceivePolicy, ReceiveRule, TransactionStats};
     use ostrya_rt::block_on;
 
     #[test]
@@ -654,8 +721,9 @@ mod tests {
         assert_eq!(message.current.unwrap().name, "main");
     }
 
-    /// Every response of the endpoint goes without `Content-Type` and
-    /// without `Retry-After`, and a frame response states its length.
+    /// Every response that the endpoint builds itself goes without
+    /// `Content-Type` and without `Retry-After`, and a frame response states
+    /// its length.
     #[test]
     fn a_frame_response_has_its_length_and_no_type() {
         let response = failure(&protocol("x"));
@@ -817,43 +885,62 @@ mod tests {
         future
     }
 
-    /// An endpoint over `tmp` with anonymous push and at most `max`
-    /// sessions.
-    fn endpoint(tmp: &TmpRepo, max: usize) -> Receive {
+    /// An endpoint over `tmp` with the authentication `auth` and at most
+    /// `max` sessions.
+    fn endpoint_with<A: ReceiveAuth>(tmp: &TmpRepo, max: usize, auth: A) -> Receive<A> {
         Receive {
             repo: tmp.repo.clone(),
-            policy: Arc::new(ReceivePolicy::default()),
-            auth: Auth {
-                anonymous: true,
-                client_ca: false,
-                cleartext: false,
-                credentials: Vec::new(),
-            },
+            auth,
             parallel_uploads: 1,
             on_report: None,
             table: SessionTable::new(max, Duration::from_secs(60)),
         }
     }
 
+    /// An endpoint over `tmp` with anonymous push and at most `max`
+    /// sessions.
+    fn endpoint(tmp: &TmpRepo, max: usize) -> Receive<FileAuth> {
+        let opts = ServeOptions {
+            allow_anonymous_push: true,
+            ..ServeOptions::default()
+        };
+        let auth = FileAuth::new(&opts, Arc::new(ReceivePolicy::default())).unwrap();
+        endpoint_with(tmp, max, auth)
+    }
+
     /// The response to a `POST` of `path` under [`PREFIX`], with the frame of
     /// `message` as a [`Pieces`] body in pieces of 3 bytes.
-    async fn post(
-        receive: &Receive,
+    async fn post<A: ReceiveAuth>(
+        receive: &Receive<A>,
         path: &str,
         message: &Message,
         fail_after: Option<usize>,
     ) -> Response<ServeBody> {
-        let peer = Peer {
-            tls: false,
-            cert: None,
-        };
+        post_as(receive, "anonymous", path, message, fail_after).await
+    }
+
+    /// [`post`] with the header `x-principal: principal`, which [`TestAuth`]
+    /// reads. The request carries the peer of a connection over plain HTTP,
+    /// as each request of the server does.
+    async fn post_as<A: ReceiveAuth>(
+        receive: &Receive<A>,
+        principal: &str,
+        path: &str,
+        message: &Message,
+        fail_after: Option<usize>,
+    ) -> Response<ServeBody> {
         let bytes = encode(message).unwrap();
         let req = Request::builder()
             .method(Method::POST)
             .uri(format!("{PREFIX}{path}"))
+            .header("x-principal", principal)
+            .extension(Peer {
+                tls: false,
+                cert: None,
+            })
             .body(Pieces::new(&bytes, 3, fail_after))
             .unwrap();
-        send(receive.handle(&peer, req)).await
+        send(receive.handle(req)).await
     }
 
     /// The status of `response`, and the message of its body.
@@ -885,8 +972,13 @@ mod tests {
     }
 
     /// Open a session, and give its id.
-    async fn open(receive: &Receive) -> String {
-        let response = post(receive, "session", &hello(), None).await;
+    async fn open<A: ReceiveAuth>(receive: &Receive<A>) -> String {
+        open_as(receive, "anonymous").await
+    }
+
+    /// Open a session of `principal`, and give its id.
+    async fn open_as<A: ReceiveAuth>(receive: &Receive<A>, principal: &str) -> String {
+        let response = post_as(receive, principal, "session", &hello(), None).await;
         let id = response.headers()[SESSION_HEADER]
             .to_str()
             .unwrap()
@@ -948,7 +1040,7 @@ mod tests {
             };
             assert_eq!(refs, vec![outcome]);
             let id = SessionId::parse(&id).unwrap();
-            assert!(receive.table.lookup(&id, &Owner::Anonymous).is_none());
+            assert!(receive.table.lookup(&id, "anonymous").is_none());
 
             let id = open(&receive).await;
             let response = post(&receive, &format!("session/{id}/commit"), &commit, Some(2)).await;
@@ -989,4 +1081,316 @@ mod tests {
             assert_eq!(response.headers()[CONNECTION], "close");
         });
     }
+
+    /// An authentication of a host for the tests. The principal of a
+    /// request is its `x-principal` header. `authenticate` refuses the
+    /// principal `deny`. `open` refuses the principal `forbidden`, gives the
+    /// principal `strict` a policy that accepts no update, and gives each
+    /// other principal the default policy.
+    struct TestAuth {
+        /// The bytes that an [`Endless`] body of the test gave.
+        polled: Arc<AtomicU64>,
+        /// `polled` when `authenticate` last ran, `u64::MAX` before.
+        polled_at_authenticate: AtomicU64,
+        /// The count of `open` calls.
+        opens: AtomicUsize,
+    }
+
+    impl TestAuth {
+        fn new() -> TestAuth {
+            TestAuth {
+                polled: Arc::new(AtomicU64::new(0)),
+                polled_at_authenticate: AtomicU64::new(u64::MAX),
+                opens: AtomicUsize::new(0),
+            }
+        }
+
+        fn opens(&self) -> usize {
+            self.opens.load(Ordering::SeqCst)
+        }
+    }
+
+    const REASON: HeaderName = HeaderName::from_static("x-reason");
+
+    impl ReceiveAuth for TestAuth {
+        type Principal = String;
+
+        fn owner(principal: &String) -> &str {
+            principal
+        }
+
+        async fn authenticate(&self, parts: &Parts, _kind: RequestKind) -> Result<String, Refusal> {
+            let polled = self.polled.load(Ordering::SeqCst);
+            self.polled_at_authenticate.store(polled, Ordering::SeqCst);
+            let principal = parts.headers["x-principal"].to_str().unwrap();
+            if principal == "deny" {
+                let refusal = Refusal::unauthorized("the test denies the request")
+                    .with_header(REASON, HeaderValue::from_static("deny"));
+                return Err(refusal);
+            }
+            Ok(principal.to_owned())
+        }
+
+        async fn open(&self, principal: &String, _hello: &Hello) -> Result<SessionSetup, Refusal> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            let policy = match principal.as_str() {
+                "forbidden" => {
+                    let value = HeaderValue::from_static;
+                    let refusal = Refusal::forbidden("the test forbids the session")
+                        .with_header(WWW_AUTHENTICATE, value("Test first"))
+                        .with_header(CONTENT_LENGTH, value("999"))
+                        .with_header(TRANSFER_ENCODING, value("chunked"))
+                        .with_header(CONNECTION, value("keep-alive"))
+                        .with_header(WWW_AUTHENTICATE, value("Test second"))
+                        .with_header(REASON, value("forbidden"));
+                    return Err(refusal);
+                }
+                "strict" => ReceivePolicy {
+                    default_rule: ReceiveRule {
+                        accept: false,
+                        ..ReceiveRule::default()
+                    },
+                    ..ReceivePolicy::default()
+                },
+                _ => ReceivePolicy::default(),
+            };
+            Ok(SessionSetup {
+                policy: Arc::new(policy),
+            })
+        }
+    }
+
+    /// The bytes of one frame of an [`Endless`] body.
+    static CHUNK: [u8; 64 * 1024] = [0; 64 * 1024];
+
+    /// A request body of data frames of 64 KiB without end, which counts the
+    /// bytes it gives. It has the shape of the body of a router.
+    struct Endless {
+        polled: Arc<AtomicU64>,
+        _not_sync: PhantomData<Cell<()>>,
+    }
+
+    impl Body for Endless {
+        type Data = Bytes;
+        type Error = io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<io::Result<Frame<Bytes>>>> {
+            self.polled.fetch_add(CHUNK.len() as u64, Ordering::SeqCst);
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(&CHUNK)))))
+        }
+    }
+
+    /// A refusal of `authenticate` comes before a byte of the body is read,
+    /// also before the lookup of a session. The endpoint then reads at most
+    /// the drain limit and one frame of an endless body, and closes the
+    /// connection. The response has the status and the headers of the
+    /// refusal and an `unauthorized` frame, and no header of the endpoint.
+    #[test]
+    fn a_refusal_of_authenticate_reads_no_byte_of_the_body() {
+        let tmp = TmpRepo::new("receive-auth-refused");
+        let receive = endpoint_with(&tmp, 1, TestAuth::new());
+        block_on(async {
+            let unknown = "ab".repeat(32);
+            for path in ["session".to_string(), format!("session/{unknown}/have")] {
+                receive.auth.polled.store(0, Ordering::SeqCst);
+                let req = Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("{PREFIX}{path}"))
+                    .header("x-principal", "deny")
+                    .body(Endless {
+                        polled: receive.auth.polled.clone(),
+                        _not_sync: PhantomData,
+                    })
+                    .unwrap();
+                let response = send(receive.handle(req)).await;
+                let at_authenticate = receive.auth.polled_at_authenticate.load(Ordering::SeqCst);
+                assert_eq!(at_authenticate, 0, "{path}");
+                let polled = receive.auth.polled.load(Ordering::SeqCst);
+                assert!(polled > MAX_DRAIN, "{path}: {polled}");
+                assert!(polled <= MAX_DRAIN + CHUNK.len() as u64, "{path}: {polled}");
+
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+                let headers = response.headers();
+                assert_eq!(headers[REASON], "deny");
+                assert!(headers.get(WWW_AUTHENTICATE).is_none());
+                assert_eq!(headers[CONNECTION], "close");
+                let (_, reply) = answer(response).await;
+                let e = error(reply);
+                assert_eq!(e.code, ErrorCode::Unauthorized);
+                assert_eq!(e.message, "the test denies the request");
+            }
+            assert_eq!(receive.auth.opens(), 0);
+        });
+    }
+
+    /// A refusal of `open` gets its status, its headers in order, and an
+    /// `unauthorized` frame with its message. The headers that the endpoint
+    /// sets itself are dropped. The refusal frees the slot of the session.
+    #[test]
+    fn a_refusal_of_open_gets_its_status_and_headers_and_frees_the_slot() {
+        let tmp = TmpRepo::new("receive-open-refused");
+        let receive = endpoint_with(&tmp, 1, TestAuth::new());
+        block_on(async {
+            let response = post_as(&receive, "forbidden", "session", &hello(), None).await;
+            let headers = response.headers().clone();
+            let (status, reply) = answer(response).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            let challenges: Vec<_> = headers.get_all(WWW_AUTHENTICATE).iter().collect();
+            assert_eq!(challenges, ["Test first", "Test second"]);
+            assert_eq!(headers[REASON], "forbidden");
+            assert!(headers.get(TRANSFER_ENCODING).is_none());
+            assert!(headers.get(CONNECTION).is_none());
+            assert!(headers.get(SESSION_HEADER).is_none());
+            let lengths: Vec<_> = headers.get_all(CONTENT_LENGTH).iter().collect();
+            let frame = encode(&reply).unwrap();
+            assert_eq!(lengths, [frame.len().to_string().as_str()]);
+            let e = error(reply);
+            assert_eq!(e.code, ErrorCode::Unauthorized);
+            assert_eq!(e.message, "the test forbids the session");
+            assert_eq!(receive.auth.opens(), 1);
+
+            open_as(&receive, "alice").await;
+            assert_eq!(receive.auth.opens(), 2);
+            receive.table.close_all();
+        });
+    }
+
+    /// A refusal with a message of 2 MiB keeps its status and its headers,
+    /// and its `unauthorized` frame carries the message cut to at most
+    /// 4096 bytes at a character boundary.
+    #[test]
+    fn a_long_refusal_message_is_cut_to_fit_its_frame() {
+        let long = format!("a{}", "é".repeat(1 << 20));
+        let refusal = Refusal::unauthorized(long.clone())
+            .with_header(REASON, HeaderValue::from_static("long"));
+        let response = refusal_response(refusal);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[REASON], "long");
+        let (_, reply) = block_on(answer(response));
+        let e = error(reply);
+        assert_eq!(e.code, ErrorCode::Unauthorized);
+        assert!(e.message.len() <= 4096, "{}", e.message.len());
+        assert!(long.starts_with(&e.message));
+        assert!(e.message.len() > 4000, "{}", e.message.len());
+    }
+
+    /// The session takes the policy that `open` gives for its principal, and
+    /// a request of another principal gets the 404 of an unknown session.
+    #[test]
+    fn the_policy_of_open_is_the_policy_of_the_session() {
+        let tmp = TmpRepo::new("receive-open-policy");
+        let receive = endpoint_with(&tmp, 2, TestAuth::new());
+        block_on(async {
+            let strict = open_as(&receive, "strict").await;
+            let alice = open_as(&receive, "alice").await;
+            let commit = delete_main();
+
+            let path = format!("session/{strict}/commit");
+            let response = post_as(&receive, "alice", &path, &commit, None).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let (status, reply) =
+                answer(post_as(&receive, "strict", &path, &commit, None).await).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(error(reply).code, ErrorCode::RefDenied);
+
+            let path = format!("session/{alice}/commit");
+            let (status, reply) =
+                answer(post_as(&receive, "alice", &path, &commit, None).await).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(matches!(reply, Message::CommitReply(_)), "{reply:?}");
+        });
+    }
+
+    /// A `Hello` with a bad ref name gets `invalid-ref` with 422 before
+    /// `open` runs and before a slot is taken, so a full table does not
+    /// change the answer.
+    #[test]
+    fn a_bad_ref_name_is_invalid_ref_before_open() {
+        let tmp = TmpRepo::new("receive-bad-name");
+        let receive = endpoint_with(&tmp, 1, TestAuth::new());
+        block_on(async {
+            let bad = Message::Hello(Hello {
+                version: 1,
+                agent: None,
+                refs: vec!["main".into(), "a//b".into()],
+                one_way: false,
+            });
+            for open_before in [false, true] {
+                if open_before {
+                    open_as(&receive, "alice").await;
+                }
+                let opens = receive.auth.opens();
+                let (status, reply) =
+                    answer(post_as(&receive, "alice", "session", &bad, None).await).await;
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+                assert_eq!(error(reply).code, ErrorCode::InvalidRef);
+                assert_eq!(receive.auth.opens(), opens);
+            }
+            receive.table.close_all();
+        });
+    }
+
+    /// A `Hello` with `one-way` true gets `protocol` with the text of the
+    /// two-way service, before the check of its version and before `open`.
+    #[test]
+    fn a_one_way_hello_is_protocol_before_its_version() {
+        let tmp = TmpRepo::new("receive-one-way");
+        let receive = endpoint_with(&tmp, 1, TestAuth::new());
+        block_on(async {
+            let one_way = Message::Hello(Hello {
+                version: 2,
+                agent: None,
+                refs: vec!["main".into()],
+                one_way: true,
+            });
+            let (status, reply) =
+                answer(post_as(&receive, "alice", "session", &one_way, None).await).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            let e = error(reply);
+            assert_eq!(e.code, ErrorCode::Protocol);
+            assert_eq!(
+                e.message,
+                "a Hello with one-way true opens a one-way stream, which this session does not read"
+            );
+            assert_eq!(receive.auth.opens(), 0);
+        });
+    }
+
+    /// A `session` request past the session limit, and one after the stop,
+    /// gets 503 before `open` runs.
+    #[test]
+    fn a_full_table_gets_503_before_open() {
+        let tmp = TmpRepo::new("receive-full");
+        let receive = endpoint_with(&tmp, 1, TestAuth::new());
+        block_on(async {
+            open_as(&receive, "alice").await;
+            assert_eq!(receive.auth.opens(), 1);
+            for stopped in [false, true] {
+                if stopped {
+                    receive.table.close_all();
+                }
+                let (status, reply) =
+                    answer(post_as(&receive, "alice", "session", &hello(), None).await).await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "stopped {stopped}");
+                assert_eq!(error(reply).code, ErrorCode::LimitExceeded);
+                assert_eq!(receive.auth.opens(), 1);
+            }
+        });
+    }
+
+    /// The future of a request is `Send` for every authentication and a
+    /// body that is not `Sync`. The return type of the generic function is
+    /// checked for every `A`.
+    const _: fn() = || {
+        fn handle_is_send<A: ReceiveAuth>(
+            receive: &Receive<A>,
+            req: Request<Pieces>,
+        ) -> impl Future<Output = Response<ServeBody>> + Send {
+            receive.handle(req)
+        }
+        let _ = handle_is_send::<TestAuth>;
+    };
 }

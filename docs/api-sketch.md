@@ -2566,7 +2566,10 @@ messages through `ostrya`. `Error::Push` carries them in every build too.
   `Hello` that `validate_refspec` refuses is `invalid-ref` with the text
   `invalid ref name 'NAME'`. A ref name with a trailing `^` passes, and so
   does a ref name of 64 lowercase hex characters: `Hello` does not tell a
-  write from a delete, and `Commit` checks that shape. A `Hello` with
+  write from a delete, and `Commit` checks that shape. A `Hello` whose
+  `HelloReply` needs a frame over `MAX_FRAME` when each ref has a commit is
+  `limit-exceeded`. These checks are those of `ReceiveService::check_hello`,
+  and they run before the session transaction opens. A `Hello` with
   `one-way` true is `protocol`, before the version check: it opens a
   one-way stream, which `Repo::receive_stream` reads.
 - `Have` gets one bit for each object that neither the repository nor the
@@ -2697,7 +2700,9 @@ returns the result.
 - The frame limit and the chunk limit are 1 MiB, because no `HelloReply`
   announces another one. The objects are staged as in `Repo::receive`.
 - The checks of `Hello` are those of `Repo::receive`, except that a
-  repository with `[core] locking=false` is accepted. A `Hello` without
+  repository with `[core] locking=false` is accepted, and that the size of
+  a `HelloReply` does not bound the names, because the stream gets no
+  reply. A `Hello` without
   `one-way` true is `protocol`, before the version check. The session
   transaction holds the repository lock shared from `Hello` to the end, with
   no lock under `[core] locking=false`. The commit takes the update lock,
@@ -2728,6 +2733,21 @@ same wire codes, and the host sends the reply. The service is
 in an `Arc` and runs steps of one session at the same time. The service
 knows no HTTP, no session id, no owner, no timeout, and no status.
 
+- `check_hello` runs the checks of `Hello` that every session runs before
+  it opens, in this order: the protocol version (`version-unsupported`),
+  the mode `bare-split-xattrs` (`mode-refused`), `[core] locking=false` for
+  a `Hello` with `one-way` false (`locking-disabled`), each ref name
+  (`invalid-ref`), and for a `Hello` with `one-way` false, the `HelloReply`
+  with a commit for each ref against `MAX_FRAME` (`limit-exceeded`). The
+  call is sync and does no I/O. It computes the size of the reply from the
+  encoded reply with no ref and the length of each name, and builds no
+  reply with the refs. `hello`, `Repo::receive`, and `Repo::receive_stream`
+  run the same checks before they open the session transaction. A `Hello`
+  that passes can still fail to open: the open of the transaction, the
+  reads of `[core] fsync`, `[ex-integrity] fsverity`, and `[archive]
+  zlib-level`, and the refusal of a `bare` repository when the process does
+  not run as root come after the checks. `check_hello` does not refuse a
+  `Hello` with `one-way` true.
 - `hello` opens the session transaction. `parallel_uploads` is the value
   that `HelloReply` announces. A `parallel_uploads` of 0 is
   `Error::InvalidInput`. The service sets no upper bound, and the host
@@ -2789,6 +2809,7 @@ knows no HTTP, no session id, no owner, no timeout, and no status.
 pub struct ReceiveService { /* private */ }
 
 impl ReceiveService {
+    pub fn check_hello(repo: &Repo, hello: &Hello) -> Result<()>;
     pub async fn hello(repo: Repo, policy: Arc<ReceivePolicy>, parallel_uploads: u32,
                        hello: Hello) -> Result<(ReceiveService, HelloReply)>;
     pub async fn have(&self, names: Vec<ObjectName>) -> Result<HaveReply>;
@@ -3923,7 +3944,68 @@ number and holds no byte of it. A read-only server reads neither
 `credentials` nor `allow_cleartext_credentials`. The `Debug` text of
 `ServeOptions` states `credentials` by its length alone.
 
-Authentication. The methods of the endpoint are:
+Authentication. The endpoint authenticates each request through the trait
+`ReceiveAuth`. The server implements it with its built-in methods, and
+each session gets the policy of `receive`.
+
+```rust
+pub trait ReceiveAuth: Send + Sync + 'static {
+    type Principal: Send + Sync + 'static;
+    /// The owner key of a principal.
+    fn owner(principal: &Self::Principal) -> &str;
+    /// For each request, before a byte of the body is read.
+    fn authenticate(&self, parts: &hyper::http::request::Parts, kind: RequestKind)
+        -> impl Future<Output = Result<Self::Principal, Refusal>> + Send;
+    /// For a `session` request, after `check_hello` and the slot.
+    fn open(&self, principal: &Self::Principal, hello: &Hello)
+        -> impl Future<Output = Result<SessionSetup, Refusal>> + Send;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RequestKind { Open, Have, Objects, Commit, Delete }
+
+#[derive(Debug)]
+pub struct Refusal { /* private: the status, the message, the headers */ }
+
+impl Refusal {
+    pub fn unauthorized(message: impl Into<String>) -> Refusal;   // 401
+    pub fn forbidden(message: impl Into<String>) -> Refusal;      // 403
+    pub fn with_header(self, name: HeaderName, value: HeaderValue) -> Refusal;
+}
+
+pub struct SessionSetup {
+    pub policy: Arc<ReceivePolicy>,
+}
+```
+
+- The endpoint calls `authenticate` for each request with a known route
+  and method, with the `RequestKind` of the route, before it reads a byte
+  of the body. `Parts`, `HeaderName`, and `HeaderValue` are the types that
+  `hyper` re-exports.
+- For a `session` request the endpoint then does these steps, in this
+  order: it reads `Hello`; it refuses a `Hello` with `one-way` true with
+  `protocol` and the text of `ReceiveService::hello`, before the version
+  check; it calls `ReceiveService::check_hello`; it takes a slot of
+  `max_sessions`, or answers 503; it calls `open`; and it opens the session
+  with the policy of the `SessionSetup`. A refusal of `open` frees the
+  slot. A bad `Hello` thus gets its 422 also when the sessions are at the
+  limit, and `open` sees valid ref names alone. `max_sessions` also limits
+  the count of `open` calls that run at one time. A session can fail to
+  start after `open` returns, for example when a configuration read fails
+  or a `bare` repository gets `mode-refused`, so a host does not hold state
+  from `open` alone.
+- A `Refusal` gets its status, its headers in the order they were added,
+  and an `unauthorized` frame with its message. The endpoint adds no
+  `WWW-Authenticate` header of its own. It drops a header of the refusal
+  named `Content-Length`, `Transfer-Encoding`, or `Connection`, because it
+  sets the framing and the connection state of the response itself. A
+  message longer than 4096 bytes is cut at a character boundary.
+- The session table stores the owner key of the principal of the `session`
+  request. A later request of the session whose principal gives another
+  key gets the 404 of an unknown id.
+
+The built-in methods of the endpoint are:
 
 - A bearer token, `Authorization: Bearer TOKEN`, which matches a line of
   `credentials` by the SHA-256 digest of the token.
@@ -3942,7 +4024,7 @@ result goes through `black_box` too. A request compares its digest with the
 digest of every line and does not stop at a match. A Basic credential then
 compares its `NAME` with the name of the one line whose digest matched. No
 two lines have one digest.
-The server authorizes each request of the endpoint, in this order:
+The built-in methods authorize each request of the endpoint, in this order:
 
 1. More than one `Authorization` header gets 401.
 2. A `Bearer` or `Basic` scheme, in any case, on a connection without TLS
@@ -3956,13 +4038,16 @@ The server authorizes each request of the endpoint, in this order:
    401 when `credentials` has a line, and 403 when the client CA is the one
    method.
 
-Each refusal carries an `unauthorized` frame. Each 401 carries the two
-headers `WWW-Authenticate: Bearer realm="ostrya"` and `WWW-Authenticate:
-Basic realm="ostrya"`. The owner of a session is the `NAME` of the line of
-its `session` request, the SHA-256 digest of the DER bytes of the client
-certificate, or anonymous. A bearer token and a Basic credential of one line
-give one owner. Every request of a session is authorized again, and a
-request of another owner gets the 404 of an unknown id. A `GET` and a
+Each refusal carries an `unauthorized` frame. The built-in methods add the
+two headers `WWW-Authenticate: Bearer realm="ostrya"` and
+`WWW-Authenticate: Basic realm="ostrya"` to each 401. The owner key has a
+prefix for each method: `token:NAME` for the line of a bearer token or a
+Basic credential, `cert:HEX` for a client certificate, where `HEX` is the
+lowercase hex SHA-256 digest of its DER bytes, and `anonymous`. A name can
+be equal to a digest, and the prefix keeps the keys of two methods apart. A
+bearer token and a Basic credential of one line give one key. Every request
+of a session is authorized again, and a request with another key gets the
+404 of an unknown id. A `GET` and a
 `HEAD` of the archive view ignore `Authorization`, so a read with a Basic
 credential over plain HTTP succeeds.
 
@@ -4003,8 +4088,8 @@ Sessions:
   progress, the request bodies in flight with the time each one started to
   wait for the client, and a cancel signal. The table lock is never held
   while a service is aborted or dropped.
-- A `session` request takes a slot after its `Hello` body is read. With
-  `max_sessions` sessions open or opening, it gets 503 with
+- A `session` request takes a slot after its `Hello` body is read and
+  checked. With `max_sessions` sessions open or opening, it gets 503 with
   `limit-exceeded` and `the server serves no more sessions`. The `Hello`
   body must arrive in full within the idle timeout.
 - An id that the table does not hold and a session of another owner get the
@@ -4043,17 +4128,19 @@ Sessions:
 
 The status of an error: `ref-mismatch` and `non-fast-forward` get 409.
 `internal`, and each error with no wire code, get 500 with an `internal`
-frame of the error text. A request that no authentication method accepts
-gets 401 or 403 with `unauthorized`, as the authorization states. Every
+frame of the error text. A request that the authentication refuses gets
+401 or 403 with `unauthorized`, as the refusal states. Every
 other code gets 422. A response with an
 error carries one `Error` frame. 404, 405, and 204 have no body. No response
-of the endpoint carries `Content-Type` or `Retry-After`. Before a refusal
-that comes before the body is read (the authentication, 404, 405, 204, and
-the 422 of a `DELETE` while the session commits), the server reads and drops
-up to 1 MiB of the body within `session_idle_timeout` or 5 seconds,
-whichever is shorter. On HTTP/1.1 a body that did not reach its end then
-gets `Connection: close`. The body of an authorized `session`, `have`,
-`objects`, or `commit` request keeps the bound of `session_idle_timeout`.
+that the endpoint builds itself carries `Content-Type` or `Retry-After`. A
+refusal of the authentication carries the headers that the host adds.
+Before a refusal that comes before the body is read (the authentication,
+404, 405, 204, and the 422 of a `DELETE` while the session commits), the
+server reads and drops up to 1 MiB of the body within
+`session_idle_timeout` or 5 seconds, whichever is shorter. On HTTP/1.1 a
+body that did not reach its end then gets `Connection: close`. The body of
+an authorized `session`, `have`, `objects`, or `commit` request keeps the
+bound of `session_idle_timeout`.
 
 The report of each commit goes to `on_report` when the response body drops.
 When hyper did not take the `CommitReply` frame from the body, the report

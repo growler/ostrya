@@ -113,7 +113,10 @@ impl Repo {
     /// `locking-disabled`, and a `bare-split-xattrs` repository with
     /// `mode-refused`. A `bare` repository refuses the session with
     /// `mode-refused` unless the process runs as root, because only root can
-    /// store the owner of each file. A `Hello` with `one-way` true is
+    /// store the owner of each file. A `Hello` whose `HelloReply`, with a
+    /// commit for each ref, needs a frame over
+    /// [`MAX_FRAME`](crate::push::proto::MAX_FRAME) is `limit-exceeded`
+    /// before the transaction opens. A `Hello` with `one-way` true is
     /// `protocol`: it opens a one-way stream, which
     /// [`Repo::receive_stream`] reads.
     ///

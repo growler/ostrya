@@ -18,7 +18,7 @@ use crate::session::BodyTrack;
 
 /// The most bytes of a request body the server reads and drops before it
 /// answers a request that it refuses before the body.
-const MAX_DRAIN: u64 = 1024 * 1024;
+pub(crate) const MAX_DRAIN: u64 = 1024 * 1024;
 
 /// The longest time the server reads and drops a request body before it
 /// answers a request that it refuses before the body. A shorter idle

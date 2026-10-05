@@ -8,13 +8,15 @@ use std::time::Duration;
 use futures_lite::future;
 use futures_rustls::TlsAcceptor;
 use futures_rustls::rustls::ServerConfig;
+use hyper::Request;
+use hyper::body::Incoming;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use ostrya::{ArchiveView, Checksum, Repo};
 use ostrya_fetch::{FuturesIo, RtExecutor, RtTimer};
 use ostrya_rt as rt;
 
-use crate::auth::{Auth, Peer, parse_credentials};
+use crate::auth::{FileAuth, Peer};
 use crate::error::{Error, Result};
 use crate::options::ServeOptions;
 use crate::receive::Receive;
@@ -59,47 +61,19 @@ pub struct Server {
     listeners: Vec<rt::TcpListener>,
     addrs: Vec<SocketAddr>,
     view: Arc<ArchiveView>,
-    receive: Option<Arc<Receive>>,
+    receive: Option<Arc<Receive<FileAuth>>>,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,
 }
 
 /// Check the options of the receive endpoint of `opts`, and build it over
-/// `repo` when `opts` has a receive policy. An endpoint with no
-/// authentication method is refused, and so is an endpoint with no TLS
-/// whose one method is the credential file and that takes no credential
-/// over plain HTTP, because no request can pass it.
-fn receive(repo: &Repo, opts: &ServeOptions) -> Result<Option<Arc<Receive>>> {
+/// `repo` when `opts` has a receive policy. The authentication methods are
+/// checked first, as [`FileAuth::new`] checks them.
+fn receive(repo: &Repo, opts: &ServeOptions) -> Result<Option<Arc<Receive<FileAuth>>>> {
     let Some(policy) = &opts.receive else {
         return Ok(None);
     };
-    let credentials = match &opts.credentials {
-        Some(bytes) => parse_credentials(bytes)?,
-        None => Vec::new(),
-    };
-    let auth = Auth {
-        anonymous: opts.allow_anonymous_push,
-        client_ca: opts
-            .tls
-            .as_ref()
-            .is_some_and(|tls| tls.client_ca_pem.is_some()),
-        cleartext: opts.allow_cleartext_credentials,
-        credentials,
-    };
-    if !auth.has_method() {
-        return Err(Error::Options(
-            "a receive endpoint with no authentication method".into(),
-        ));
-    }
-    // With no TLS there is no client CA, so the credential lines are the one
-    // method, and the endpoint refuses each of them over plain HTTP.
-    if opts.tls.is_none() && !auth.anonymous && !auth.cleartext {
-        return Err(Error::Options(
-            "a receive endpoint over plain HTTP with the credential file as its one method \
-             and no allow_cleartext_credentials"
-                .into(),
-        ));
-    }
+    let auth = FileAuth::new(opts, policy.clone())?;
     if !PARALLEL_UPLOADS.contains(&opts.parallel_uploads) {
         return Err(Error::Options(format!(
             "parallel_uploads {} is outside {}..={}",
@@ -116,7 +90,6 @@ fn receive(repo: &Repo, opts: &ServeOptions) -> Result<Option<Arc<Receive>>> {
     }
     Ok(Some(Arc::new(Receive {
         repo: repo.clone(),
-        policy: policy.clone(),
         auth,
         parallel_uploads: opts.parallel_uploads,
         on_report: opts.on_report.clone(),
@@ -217,7 +190,7 @@ impl Server {
 /// What each connection of a server shares.
 struct Serving {
     view: Arc<ArchiveView>,
-    receive: Option<Arc<Receive>>,
+    receive: Option<Arc<Receive<FileAuth>>>,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,
 }
@@ -248,16 +221,21 @@ async fn connection(stream: rt::TcpStream, serving: Arc<Serving>) {
     .await
 }
 
-/// Serve one connection. An error ends the connection alone.
+/// Serve one connection. An error ends the connection alone. With a receive
+/// endpoint, each request carries the [`Peer`] of the connection in its
+/// extensions.
 async fn serve_connection(stream: rt::TcpStream, serving: Arc<Serving>, stall: Arc<Stall>) {
     let shared = serving.clone();
     let service = move |peer: Peer| {
-        service_fn(move |req| {
+        service_fn(move |mut req: Request<Incoming>| {
             let serving = shared.clone();
             let stall = stall.clone();
+            if serving.receive.is_some() {
+                req.extensions_mut().insert(peer);
+            }
             async move {
                 let receive = serving.receive.as_deref();
-                let response = router::handle(&serving.view, receive, &peer, &stall, req).await;
+                let response = router::handle(&serving.view, receive, &stall, req).await;
                 Ok::<_, Infallible>(response)
             }
         })

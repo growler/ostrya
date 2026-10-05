@@ -648,6 +648,21 @@ fn merged_detached_metadata_over_the_limit_is_limit_exceeded() {
     assert_nothing_published(&repo, &before);
 }
 
+/// A one-way `Hello` gets no reply, so the size of a reply does not bound its
+/// names: a `Hello` whose two-way reply cannot fit in a frame passes, and a
+/// stream of `Hello` alone ends before `Commit`.
+#[test]
+fn a_one_way_hello_has_no_bound_of_the_reply() {
+    let tmp = TmpDir::new("one-way-many-names");
+    let (repo, before) = empty_repo(&tmp, "");
+    let many = vec!["m"; 100_000];
+    match receive(&repo, &policy(), &Stream::hello(&many, true).bytes()) {
+        Err(Error::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+        other => panic!("{other:?}"),
+    }
+    assert_nothing_published(&repo, &before);
+}
+
 // ---------------------------------------------------------------------------
 // The two-way receiver.
 // ---------------------------------------------------------------------------

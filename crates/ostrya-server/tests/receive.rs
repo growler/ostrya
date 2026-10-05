@@ -679,6 +679,29 @@ fn a_session_past_the_limit_gets_503() {
     });
 }
 
+/// A `Hello` is checked before it takes a slot, so a bad `Hello` gets its
+/// 422 also when the sessions are at the limit.
+#[test]
+fn a_bad_hello_is_422_also_when_the_sessions_are_at_the_limit() {
+    let tmp = TmpDir::new("limit-bad-hello");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let mut opts = options();
+    opts.max_sessions = 1;
+    with_server(repo, opts, |client, _| async move {
+        client.open().await;
+        let bad = Message::Hello(Hello {
+            version: 1,
+            agent: None,
+            refs: vec!["a//b".into()],
+            one_way: false,
+        });
+        let reply = client.post(SESSION, encode(&[bad]).await).await;
+        reply.error(422, ErrorCode::InvalidRef);
+        let reply = client.post(SESSION, encode(&[hello()]).await).await;
+        reply.error(503, ErrorCode::LimitExceeded);
+    });
+}
+
 /// Over HTTP/2, a `DELETE` gets 204 with no `Content-Length`, and an unknown
 /// session the empty 404.
 #[test]

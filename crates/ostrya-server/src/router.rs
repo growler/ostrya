@@ -8,7 +8,7 @@ use hyper::header::{ALLOW, CONTENT_LENGTH, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use ostrya::{ArchiveAnswer, ArchiveHead, ArchiveView};
 
-use crate::auth::Peer;
+use crate::auth::FileAuth;
 use crate::body::ServeBody;
 use crate::receive::{self, Receive};
 use crate::stall::Stall;
@@ -21,15 +21,14 @@ use crate::stall::Stall;
 /// `HEAD` there goes to the view, which finds nothing.
 pub(crate) async fn handle(
     view: &ArchiveView,
-    receive: Option<&Receive>,
-    peer: &Peer,
+    receive: Option<&Receive<FileAuth>>,
     stall: &Arc<Stall>,
     req: Request<Incoming>,
 ) -> Response<ServeBody> {
     if let Some(receive) = receive {
         let read = matches!(*req.method(), Method::GET | Method::HEAD);
         if !read && req.uri().path().starts_with(receive::PREFIX) {
-            return receive.handle(peer, req).await;
+            return receive.handle(req).await;
         }
     }
     let head = match *req.method() {

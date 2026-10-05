@@ -76,14 +76,16 @@
 //! Each other response body is one frame. An error is an `Error` frame:
 //! `ref-mismatch` and `non-fast-forward` get 409, `internal` gets 500, and
 //! every other code gets 422. An error of the server with no wire code gets
-//! 500 with `internal` and the text of the error. A `session` request past
-//! [`ServeOptions::max_sessions`] gets 503 with `limit-exceeded`. A request
-//! that no authentication method accepts gets 401 or 403 with
-//! `unauthorized` (see below). No response carries `Content-Type` or
-//! `Retry-After`. Before a refusal that comes before the body is read, the
-//! server reads and drops up to 1 MiB of the body within the idle timeout
-//! or 5 seconds, whichever is shorter. On HTTP/1.1 a body that did not
-//! reach its end then gets `Connection: close`.
+//! 500 with `internal` and the text of the error. A `session` request whose
+//! `Hello` passes its checks gets 503 with `limit-exceeded` past
+//! [`ServeOptions::max_sessions`] (see below). A request that the
+//! authentication refuses gets 401 or 403 with `unauthorized`. No response
+//! that the endpoint builds itself carries `Content-Type` or `Retry-After`.
+//! A refusal of the authentication carries the headers that it adds. Before
+//! a refusal that comes before the body is read, the server reads and drops
+//! up to 1 MiB of the body within the idle timeout or 5 seconds, whichever
+//! is shorter. On HTTP/1.1 a body that did not reach its end then gets
+//! `Connection: close`.
 //!
 //! A failed step ends its session, and the other requests of the session
 //! in flight get 422 with `protocol` and the cause. A request that ends
@@ -112,9 +114,42 @@
 //!
 //! # Authentication
 //!
-//! Each request of the endpoint is authorized, and [`bind`] refuses an
-//! endpoint with no method. With no TLS, [`bind`] also refuses an endpoint
-//! whose one method is the credential file, unless
+//! [`ReceiveAuth`] is the authentication of the endpoint. The endpoint calls
+//! [`ReceiveAuth::authenticate`] for each request with a known route and
+//! method, with the [`RequestKind`] of the route, before it reads a byte of
+//! the body. For a `session` request it then does these steps, in this
+//! order:
+//!
+//! 1. It reads `Hello`.
+//! 2. It refuses a `Hello` with `one-way` true with `protocol`, before the
+//!    check of the version.
+//! 3. It checks `Hello` with [`ostrya::ReceiveService::check_hello`].
+//! 4. It takes a slot of the session limit, or answers 503.
+//! 5. It calls [`ReceiveAuth::open`], which gives the [`SessionSetup`] of
+//!    the session: its receive policy. A refusal frees the slot.
+//! 6. It opens the session.
+//!
+//! A bad `Hello` thus gets its 422 also when the sessions are at the limit
+//! or the server stopped, and `open` sees valid ref names alone. The session
+//! limit also limits the count of `open` calls that run at one time. A
+//! session can fail to start after `open` returns, for example when a read
+//! of the repository configuration fails, or when a `bare` repository gets
+//! `mode-refused` because the server does not run as root.
+//!
+//! A [`Refusal`] of either call gets its status, 401 or 403, its headers,
+//! and an `unauthorized` frame with its message. A message longer than
+//! 4096 bytes is cut at a character boundary. The endpoint adds no
+//! `WWW-Authenticate` header of its own. It drops a header of the refusal
+//! named `Content-Length`, `Transfer-Encoding`, or `Connection`, because it
+//! sets the framing and the connection state of the response itself. A
+//! session belongs to the owner key, [`ReceiveAuth::owner`], of the
+//! principal of its `session` request. A request of the session whose
+//! principal gives another key gets the 404 of an unknown session.
+//!
+//! The server runs the endpoint with its built-in methods, and every
+//! session gets the policy of [`ServeOptions::receive`]. [`bind`] refuses
+//! an endpoint with no method. With no TLS, [`bind`] also refuses an
+//! endpoint whose one method is the credential file, unless
 //! [`ServeOptions::allow_cleartext_credentials`] is set. The methods are:
 //!
 //! - A bearer token, `Authorization: Bearer TOKEN`, which matches a line of
@@ -141,13 +176,14 @@
 //!    where the server has credential lines, and 403 where it has a client
 //!    CA alone.
 //!
-//! Each refusal carries an `unauthorized` frame, and a 401 carries the
-//! headers `WWW-Authenticate: Bearer realm="ostrya"` and
-//! `WWW-Authenticate: Basic realm="ostrya"`. A session belongs to the owner
-//! of its `session` request: the name of the credential line, the digest of
-//! the client certificate, or anonymous. A request of the session from
-//! another owner gets the 404 of an unknown session. A `GET` and a `HEAD`
-//! of the archive view ignore `Authorization`.
+//! The built-in methods add the headers `WWW-Authenticate: Bearer
+//! realm="ostrya"` and `WWW-Authenticate: Basic realm="ostrya"` to each 401.
+//! The owner key of a request has a prefix for each method: `token:NAME` for
+//! a bearer token or a Basic credential, by the name of its credential line,
+//! `cert:HEX` for a client certificate, by the lowercase hex SHA-256 digest
+//! of its DER bytes, and `anonymous`. A bearer token and a Basic credential
+//! of one line give one key. A `GET` and a `HEAD` of the archive view ignore
+//! `Authorization`.
 //!
 //! The crate builds on Linux alone. The `smol` and `tokio` features select
 //! the runtime backend of `ostrya-rt`.
@@ -157,6 +193,7 @@ mod body;
 mod error;
 mod options;
 mod receive;
+mod receive_auth;
 mod request;
 mod router;
 mod server;
@@ -166,4 +203,5 @@ mod stall;
 
 pub use error::{Error, Result};
 pub use options::{ServeOptions, ServerTls};
+pub use receive_auth::{ReceiveAuth, Refusal, RequestKind, SessionSetup};
 pub use server::{Server, bind, serve};

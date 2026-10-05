@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 use ostrya::{Checksum, ReceiveService};
 use ostrya_rt as rt;
 
-use crate::auth::Owner;
 use crate::shutdown::{Shutdown, Wait};
 
 /// The cause of a session with no request in progress for the idle timeout.
@@ -108,7 +107,8 @@ impl Cancel {
 /// One open session.
 struct Entry {
     service: Arc<ReceiveService>,
-    owner: Owner,
+    /// The owner key of the session.
+    owner: String,
     /// The time of the last activity.
     last: Instant,
     /// The requests of the session in progress.
@@ -201,16 +201,12 @@ impl SessionTable {
         })
     }
 
-    /// The session `id` of `owner`, counted as active until the returned
-    /// value drops. An unknown id and a session of another owner both give
-    /// `None`.
-    pub(crate) fn lookup(
-        self: &Arc<SessionTable>,
-        id: &SessionId,
-        owner: &Owner,
-    ) -> Option<Active> {
+    /// The session `id` of the owner key `owner`, counted as active until the
+    /// returned value drops. An unknown id and a session of another owner
+    /// both give `None`.
+    pub(crate) fn lookup(self: &Arc<SessionTable>, id: &SessionId, owner: &str) -> Option<Active> {
         let mut state = self.lock();
-        let entry = state.entries.get_mut(id).filter(|e| e.owner == *owner)?;
+        let entry = state.entries.get_mut(id).filter(|e| e.owner == owner)?;
         entry.active += 1;
         Some(Active {
             table: self.clone(),
@@ -221,13 +217,13 @@ impl SessionTable {
         })
     }
 
-    /// End the session `id` of `owner` for a `DELETE`. A session that commits
-    /// is left as it is.
-    pub(crate) fn delete(&self, id: &SessionId, owner: &Owner) -> Deleted {
+    /// End the session `id` of the owner key `owner` for a `DELETE`. A
+    /// session that commits is left as it is.
+    pub(crate) fn delete(&self, id: &SessionId, owner: &str) -> Deleted {
         let entry = {
             let mut state = self.lock();
             match state.entries.get(id) {
-                Some(entry) if entry.owner == *owner => {
+                Some(entry) if entry.owner == owner => {
                     if entry.committing {
                         return Deleted::Committing;
                     }
@@ -338,10 +334,10 @@ pub(crate) struct Reservation {
 }
 
 impl Reservation {
-    /// Put the session `id` into the slot. `false` when the server stopped
-    /// after the slot was reserved: the service is then aborted and dropped,
-    /// and the table holds no entry for it.
-    pub(crate) fn insert(mut self, id: SessionId, service: ReceiveService, owner: Owner) -> bool {
+    /// Put the session `id` of the owner key `owner` into the slot. `false`
+    /// when the server stopped after the slot was reserved: the service is
+    /// then aborted and dropped, and the table holds no entry for it.
+    pub(crate) fn insert(mut self, id: SessionId, service: ReceiveService, owner: String) -> bool {
         let mut state = self.table.lock();
         state.pending -= 1;
         self.used = true;
@@ -615,7 +611,7 @@ pub(crate) mod tests {
         let table = SessionTable::new(1, Duration::from_secs(60));
         let id = SessionId::new().unwrap();
         let slot = table.reserve().unwrap();
-        assert!(slot.insert(id, repo.service(), Owner::Anonymous));
+        assert!(slot.insert(id, repo.service(), "anonymous".into()));
         (table, id)
     }
 
@@ -660,13 +656,13 @@ pub(crate) mod tests {
     fn a_request_dropped_before_its_response_ends_the_session() {
         let repo = TmpRepo::new("cut");
         let (table, id) = one_session(&repo);
-        let mut done = table.lookup(&id, &Owner::Anonymous).unwrap();
+        let mut done = table.lookup(&id, "anonymous").unwrap();
         done.complete();
         drop(done);
-        let other = table.lookup(&id, &Owner::Anonymous).unwrap();
-        let cut = table.lookup(&id, &Owner::Anonymous).unwrap();
+        let other = table.lookup(&id, "anonymous").unwrap();
+        let cut = table.lookup(&id, "anonymous").unwrap();
         drop(cut);
-        assert!(table.lookup(&id, &Owner::Anonymous).is_none());
+        assert!(table.lookup(&id, "anonymous").is_none());
         assert_eq!(other.cancel().cause(), CUT);
         assert!(table.reserve().is_some(), "the slot is free");
     }
@@ -679,7 +675,7 @@ pub(crate) mod tests {
         let repo = TmpRepo::new("fail");
         for (cut, cause) in [(false, FAILED), (true, CUT)] {
             let (table, id) = one_session(&repo);
-            let mut active = table.lookup(&id, &Owner::Anonymous).unwrap();
+            let mut active = table.lookup(&id, "anonymous").unwrap();
             let track = active.track();
             if cut {
                 track.cut();
@@ -700,13 +696,13 @@ pub(crate) mod tests {
         let repo = TmpRepo::new("commit");
         for (ok, cause) in [(true, COMMITTED), (false, FAILED)] {
             let (table, id) = one_session(&repo);
-            let mut active = table.lookup(&id, &Owner::Anonymous).unwrap();
+            let mut active = table.lookup(&id, "anonymous").unwrap();
             let Begin::Started(mut end) = active.begin_commit() else {
                 panic!("the first commit starts");
             };
             assert!(matches!(active.begin_commit(), Begin::Committing));
             assert!(matches!(
-                table.delete(&id, &Owner::Anonymous),
+                table.delete(&id, "anonymous"),
                 Deleted::Committing
             ));
             assert!(table.reserve().is_none(), "the commit holds the slot");
@@ -731,8 +727,8 @@ pub(crate) mod tests {
         table.close_all();
         assert!(table.reserve().is_none());
         let id = SessionId::new().unwrap();
-        assert!(!slot.insert(id, repo.service(), Owner::Anonymous));
-        assert!(table.lookup(&id, &Owner::Anonymous).is_none());
+        assert!(!slot.insert(id, repo.service(), "anonymous".into()));
+        assert!(table.lookup(&id, "anonymous").is_none());
         assert_eq!(table.lock().pending, 0);
     }
 }

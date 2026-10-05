@@ -3645,7 +3645,9 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   aborted, and so is a push session with a request body that delivers no
   byte for that time. A value of 0 is refused at exit 1.
 - `--max-sessions` takes a positive number, and the default is 16. A
-  request that opens a session past it gets 503.
+  request that opens a session past it gets 503. A `session` request whose
+  `Hello` fails its checks gets 422 also when the sessions are at the
+  limit, because the checks run before a slot is taken.
 - `--parallel-uploads` takes a number from 1 to 31, and the default is 4.
   `HelloReply` announces it, and a push session runs that many object
   streams at the same time. Over HTTP/2 the receive window of a stream is

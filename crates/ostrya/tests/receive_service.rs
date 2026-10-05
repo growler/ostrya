@@ -22,7 +22,7 @@ use common::receive::{
     Obj, PIPE_CAP, PipeReader, PipeWriter, fixture_objects, header, new_repo, pipe, raw_object,
     sha, staging_entries,
 };
-use common::{COMMIT, TmpDir};
+use common::{COMMIT, TmpDir, foreign_holder, lock_holder_main};
 use futures_io::AsyncRead;
 use futures_lite::future::{poll_once, zip};
 use ostrya::push::proto::{CommitRequest, FrameWriter, Hello, Message, ObjectHeader};
@@ -263,6 +263,12 @@ impl AsyncRead for Gated {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "helper process for the lock tests"]
+fn lock_holder_subprocess() {
+    lock_holder_main();
+}
+
+#[test]
 fn zero_parallel_uploads_is_invalid_input() {
     let tmp = TmpDir::new("svc-zero");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
@@ -288,6 +294,72 @@ fn hello_refusals_keep_their_codes() {
         matches!(result, Err(ref e) if !matches!(e, Error::Push(_))),
         "{result:?}"
     );
+    assert!(staging_entries(repo.path()).is_empty());
+}
+
+/// `check_hello` checks the version, then the mode, then `[core]
+/// locking=false` for a two-way `Hello`, then the ref names, then the size of
+/// the reply for a two-way `Hello`. It opens no transaction, and it leaves the
+/// refusal of a `bare` repository to `hello`. `hello` refuses the size of the
+/// reply before it takes the repository lock, so a foreign exclusive lock
+/// does not delay the answer.
+#[test]
+fn check_hello_runs_its_checks_in_order() {
+    let check = |repo: &Repo, hello: &Hello| ReceiveService::check_hello(repo, hello);
+    let many = vec!["m"; 100_000];
+
+    let tmp = TmpDir::new("svc-check-locking");
+    let repo = new_repo(&tmp, RepoMode::Archive, "locking=false\n");
+    let mut wrong_version = hello(&["bad//name"]);
+    wrong_version.version = 2;
+    assert_eq!(
+        code(&check(&repo, &wrong_version)),
+        Some(ErrorCode::VersionUnsupported)
+    );
+    assert_eq!(
+        code(&check(&repo, &hello(&["bad//name"]))),
+        Some(ErrorCode::LockingDisabled)
+    );
+    let mut one_way = hello(&many);
+    one_way.one_way = true;
+    check(&repo, &one_way).unwrap();
+    one_way.refs.push("bad//name".into());
+    assert_eq!(code(&check(&repo, &one_way)), Some(ErrorCode::InvalidRef));
+
+    let tmp = TmpDir::new("svc-check-bsx");
+    let repo = new_repo(&tmp, RepoMode::BareSplitXattrs, "locking=false\n");
+    assert_eq!(
+        code(&check(&repo, &hello(&["bad//name"]))),
+        Some(ErrorCode::ModeRefused)
+    );
+
+    let tmp = TmpDir::new("svc-check-reply");
+    let repo = new_repo(&tmp, RepoMode::Archive, "lock-timeout-secs=1\n");
+    let mut bad_name = hello(&many);
+    bad_name.refs.push("bad//name".into());
+    assert_eq!(code(&check(&repo, &bad_name)), Some(ErrorCode::InvalidRef));
+    assert_eq!(
+        code(&check(&repo, &hello(&many))),
+        Some(ErrorCode::LimitExceeded)
+    );
+    let policy = Arc::new(ReceivePolicy::default());
+    let holder = foreign_holder(repo.path(), ".lock");
+    let started = Instant::now();
+    let opened = block_on(ReceiveService::hello(repo.clone(), policy, 1, hello(&many)));
+    let waited = started.elapsed();
+    drop(holder);
+    let opened = opened.map(|_| ());
+    assert_eq!(code(&opened), Some(ErrorCode::LimitExceeded), "{opened:?}");
+    let message = opened.unwrap_err().to_string();
+    assert!(message.contains("100000 refs"), "{message}");
+    assert!(
+        waited < Duration::from_secs(1),
+        "the Hello returned after {waited:?}"
+    );
+
+    let tmp = TmpDir::new("svc-check-bare");
+    let repo = new_repo(&tmp, RepoMode::Bare, "");
+    check(&repo, &hello(&["main"])).unwrap();
     assert!(staging_entries(repo.path()).is_empty());
 }
 

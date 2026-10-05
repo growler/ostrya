@@ -7,7 +7,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_io::AsyncRead;
-use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode, loose_path};
+use ostrya_core::{
+    Checksum, ObjectName, ObjectType, RepoMode, choose_offset_size, loose_path, offset_size_for,
+};
 
 use super::ReceivePolicy;
 use super::ingest::{self, Counted, ModeRules, limit_exceeded};
@@ -88,21 +90,13 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
             .zip(tips)
             .map(|(name, commit)| RefState { name, commit })
             .collect();
-        let reply = HelloReply {
-            version: PROTOCOL_VERSION,
-            mode: repo.mode().as_mode_str().into(),
-            collection_id: repo.config().collection_id().map(Into::into),
-            max_frame: MAX_FRAME,
-            max_have: MAX_HAVE,
-            encodings: vec![Encoding::Raw, Encoding::Deflate],
-            parallel_uploads,
-            refs,
-        };
+        let reply = hello_reply(repo, parallel_uploads, refs);
         Ok((core, reply))
     }
 
     /// Read `Hello` of a one-way stream: the checks of a two-way `Hello`
-    /// except the refusal of `[core] locking=false`, and the open of the
+    /// except the refusal of `[core] locking=false` and the size of the
+    /// reply, which a one-way stream does not get, and the open of the
     /// session transaction. A `Hello` without `one-way` true is `protocol`,
     /// before the version check.
     pub(super) async fn open_one_way(
@@ -118,40 +112,17 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         Self::start(repo, policy, hello, true).await
     }
 
-    /// Check the version, the repository, and the ref names of `hello`, and
-    /// open the session transaction. A two-way session refuses a repository
-    /// with `[core] locking=false`.
+    /// Run the checks of [`check_hello`] on `hello`, and open the session
+    /// transaction. A `bare` repository is refused unless the server runs as
+    /// root.
     async fn start(
         repo: Repo,
         policy: P,
         hello: Hello,
         one_way: bool,
     ) -> std::result::Result<Self, Failure> {
-        if hello.version != PROTOCOL_VERSION {
-            return Err(Failure::Wire(push::Error::VersionUnsupported(format!(
-                "the server speaks protocol version {PROTOCOL_VERSION}, not {}",
-                hello.version
-            ))));
-        }
+        check_hello(&repo, &hello)?;
         let mode = repo.mode();
-        if mode == RepoMode::BareSplitXattrs {
-            return Err(Failure::Wire(push::Error::ModeRefused(
-                "the repository mode bare-split-xattrs is read-only".into(),
-            )));
-        }
-        if !one_way && !repo.config().locking().map_err(Failure::Internal)? {
-            return Err(Failure::Wire(push::Error::LockingDisabled(
-                "the repository sets [core] locking=false".into(),
-            )));
-        }
-        for name in &hello.refs {
-            crate::validate_refspec(name).map_err(|e| match e {
-                Error::InvalidRefspec(_) => Failure::Wire(push::Error::InvalidRef(format!(
-                    "invalid ref name '{name}'"
-                ))),
-                other => Failure::Internal(other),
-            })?;
-        }
         let txn = repo.transaction().await.map_err(Failure::Internal)?;
         // Read the settings the writes of the session read, so a malformed
         // value fails here as a fault of the server, and not later as a fault
@@ -406,6 +377,122 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
     }
 }
 
+/// The checks of `hello` that every session runs before it opens, in this
+/// order: the protocol version, the mode `bare-split-xattrs`, `[core]
+/// locking=false` for a two-way `Hello`, each ref name, and for a two-way
+/// `Hello` the size of its longest `HelloReply`. No check does I/O.
+pub(super) fn check_hello(repo: &Repo, hello: &Hello) -> std::result::Result<(), Failure> {
+    if hello.version != PROTOCOL_VERSION {
+        return Err(Failure::Wire(push::Error::VersionUnsupported(format!(
+            "the server speaks protocol version {PROTOCOL_VERSION}, not {}",
+            hello.version
+        ))));
+    }
+    if repo.mode() == RepoMode::BareSplitXattrs {
+        return Err(Failure::Wire(push::Error::ModeRefused(
+            "the repository mode bare-split-xattrs is read-only".into(),
+        )));
+    }
+    if !hello.one_way && !repo.config().locking().map_err(Failure::Internal)? {
+        return Err(Failure::Wire(push::Error::LockingDisabled(
+            "the repository sets [core] locking=false".into(),
+        )));
+    }
+    for name in &hello.refs {
+        crate::validate_refspec(name).map_err(|e| match e {
+            Error::InvalidRefspec(_) => Failure::Wire(push::Error::InvalidRef(format!(
+                "invalid ref name '{name}'"
+            ))),
+            other => Failure::Internal(other),
+        })?;
+    }
+    if !hello.one_way {
+        check_hello_reply_fits(repo, &hello.refs)?;
+    }
+    Ok(())
+}
+
+/// The `HelloReply` of `repo` for the ref states `refs`. `parallel_uploads`
+/// is the value the reply announces.
+fn hello_reply(repo: &Repo, parallel_uploads: u32, refs: Vec<RefState>) -> HelloReply {
+    HelloReply {
+        version: PROTOCOL_VERSION,
+        mode: repo.mode().as_mode_str().into(),
+        collection_id: repo.config().collection_id().map(Into::into),
+        max_frame: MAX_FRAME,
+        max_have: MAX_HAVE,
+        encodings: vec![Encoding::Raw, Encoding::Deflate],
+        parallel_uploads,
+        refs,
+    }
+}
+
+/// The `HelloReply` of `names` fits in a frame of [`MAX_FRAME`], with a
+/// commit for each ref, the longest state a ref can have. A reply over the
+/// limit is `limit-exceeded`. The size comes from the reply with no ref and
+/// the length of each name, and no reply with the refs is built.
+fn check_hello_reply_fits(repo: &Repo, names: &[String]) -> std::result::Result<(), Failure> {
+    // A reply the codec refuses is a fault of the server, whatever code the
+    // codec gives it. The value of `parallel_uploads` does not change the
+    // size of the reply.
+    let empty = Message::HelloReply(hello_reply(repo, 1, Vec::new()))
+        .encode_body()
+        .map_err(|e| Failure::Wire(push::Error::Internal(e.to_string())))?;
+    let fits = reply_frame_len(empty.len(), names.iter().map(String::len))
+        .is_some_and(|len| len <= u64::from(MAX_FRAME));
+    if !fits {
+        return Err(Failure::Wire(push::Error::LimitExceeded(format!(
+            "the reply to the {} refs of Hello can need a frame over the limit {MAX_FRAME}",
+            names.len()
+        ))));
+    }
+    Ok(())
+}
+
+/// The bytes of one ref state `(smay)` with a name of `name` bytes and a
+/// commit: the name and its NUL, the 32 bytes of the commit and the byte
+/// that marks a maybe of variable size, and the framing offset of the name.
+fn ref_state_len(name: u64) -> u64 {
+    let data = name + 1 + 32 + 1;
+    data + offset_size(data, 1)
+}
+
+/// The framing offset size of a container of `data` bytes with `n` offsets.
+fn offset_size(data: u64, n: u64) -> u64 {
+    match (usize::try_from(data), usize::try_from(n)) {
+        (Ok(data), Ok(n)) => choose_offset_size(data, n) as u64,
+        _ => 8,
+    }
+}
+
+/// The frame length of a `HelloReply` `(ua{sv}a(smay))` whose body with no
+/// ref is `empty` bytes, with a ref of each name length of `names`, each with
+/// a commit. `None` as soon as the ref states alone pass [`MAX_FRAME`].
+///
+/// The body with no ref is the version, its padding, and the dict, then one
+/// framing offset for the end of the dict, whose size the encoder chose from
+/// the length of the body. The array of the ref states follows the dict with
+/// no padding, and holds the states and one framing offset for each.
+fn reply_frame_len(empty: usize, names: impl Iterator<Item = usize>) -> Option<u64> {
+    let head = (empty - offset_size_for(empty)) as u64;
+    let mut states = 0u64;
+    let mut count = 0u64;
+    for name in names {
+        states += ref_state_len(name as u64);
+        count += 1;
+        if states > u64::from(MAX_FRAME) {
+            return None;
+        }
+    }
+    let array = if count == 0 {
+        0
+    } else {
+        states + count * offset_size(states, count)
+    };
+    let data = head + array;
+    Some(data + offset_size(data, 1) + 1)
+}
+
 /// The bytes of one dirtree, dirmeta, or commit object that an object stream
 /// reads, counted against the budget that every object stream of the session
 /// shares. Dropping it, when the object is staged, dropped, or failed, gives
@@ -437,5 +524,98 @@ impl Reading<'_> {
 impl Drop for Reading<'_> {
     fn drop(&mut self) {
         self.total.fetch_sub(self.held, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `HelloReply` like the one of a session, with a collection id of
+    /// `collection_id` bytes, or none for 0, and `count` refs with names of
+    /// `name` bytes, each with a commit.
+    fn reply(collection_id: usize, name: usize, count: usize) -> HelloReply {
+        let commit = Some(Checksum::from_bytes([7; 32]));
+        HelloReply {
+            version: PROTOCOL_VERSION,
+            mode: RepoMode::Archive.as_mode_str().into(),
+            collection_id: (collection_id > 0).then(|| "c".repeat(collection_id)),
+            max_frame: MAX_FRAME,
+            max_have: MAX_HAVE,
+            encodings: vec![Encoding::Raw, Encoding::Deflate],
+            parallel_uploads: 1,
+            refs: (0..count)
+                .map(|i| RefState {
+                    name: format!("{i:0>name$}")[..name].into(),
+                    commit,
+                })
+                .collect(),
+        }
+    }
+
+    fn encoded_frame_len(reply: HelloReply) -> u64 {
+        Message::HelloReply(reply).encode_body().unwrap().len() as u64 + 1
+    }
+
+    fn computed_frame_len(collection_id: usize, name: usize, count: usize) -> Option<u64> {
+        let empty = Message::HelloReply(reply(collection_id, 0, 0))
+            .encode_body()
+            .unwrap();
+        reply_frame_len(empty.len(), std::iter::repeat_n(name, count))
+    }
+
+    /// The computed frame length is the length of the frame the encoder
+    /// writes, across the sizes of the framing offsets of a ref state, of
+    /// the array, and of the reply.
+    #[test]
+    fn the_reply_bound_is_the_encoded_size() {
+        for collection_id in [0, 300] {
+            for name in [0, 1, 220, 221, 300] {
+                for count in [0, 1, 2, 7, 8, 9, 1000] {
+                    assert_eq!(
+                        computed_frame_len(collection_id, name, count),
+                        Some(encoded_frame_len(reply(collection_id, name, count))),
+                        "collection id {collection_id}, name {name}, count {count}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The largest count of refs whose bound fits in a frame gives a reply
+    /// that fits, and one ref more gives a reply over the limit.
+    #[test]
+    fn the_largest_count_that_fits_is_the_limit_of_the_encoder() {
+        let limit = u64::from(MAX_FRAME);
+        for (collection_id, name) in [(0, 220), (300, 1)] {
+            let fits = |count| {
+                computed_frame_len(collection_id, name, count).is_some_and(|len| len <= limit)
+            };
+            // The largest count that fits, by bisection: `low` fits, and
+            // `high` does not.
+            let (mut low, mut high) = (0, MAX_FRAME as usize);
+            while high - low > 1 {
+                let mid = low + (high - low) / 2;
+                if fits(mid) {
+                    low = mid;
+                } else {
+                    high = mid;
+                }
+            }
+            let count = low;
+            assert!(encoded_frame_len(reply(collection_id, name, count)) <= limit);
+            assert!(encoded_frame_len(reply(collection_id, name, count + 1)) > limit);
+        }
+    }
+
+    /// The computation stops as soon as the ref states pass the frame
+    /// limit, and gives `None`.
+    #[test]
+    fn the_reply_bound_stops_past_the_frame_limit() {
+        let empty = Message::HelloReply(reply(0, 0, 0)).encode_body().unwrap();
+        let mut taken = 0usize;
+        let names = std::iter::repeat_n(1000, usize::MAX).inspect(|_| taken += 1);
+        assert_eq!(reply_frame_len(empty.len(), names), None);
+        assert!(taken <= MAX_FRAME as usize / 1000 + 1, "{taken}");
     }
 }

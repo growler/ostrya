@@ -2756,7 +2756,8 @@ knows no HTTP, no session id, no owner, no timeout, and no status.
 - `hello_with_hooks` opens the session as `hello` does, with the
   `ReceiveHooks` of the host. `hello` is `hello_with_hooks` with `None`.
   The hooks belong to the session. `Repo::receive` and
-  `Repo::receive_stream` take none.
+  `Repo::receive_stream` take none. The receive endpoint of `ostrya-server`
+  gives the hooks that its `SessionSetup` holds.
 - Up to `parallel_uploads` `objects` calls run at the same time and write
   through the one session transaction. One call more is `limit-exceeded`,
   and ends the session. One `have` runs next to the other steps and does
@@ -4084,7 +4085,7 @@ number and holds no byte of it. A read-only server reads neither
 
 Authentication. The endpoint authenticates each request through the trait
 `ReceiveAuth`. The server implements it with its built-in methods, and
-each session gets the policy of `receive`.
+each session gets the policy of `receive` and no hooks.
 
 ```rust
 pub trait ReceiveAuth: Send + Sync + 'static {
@@ -4114,6 +4115,7 @@ impl Refusal {
 
 pub struct SessionSetup {
     pub policy: Arc<ReceivePolicy>,
+    pub hooks: Option<Arc<dyn ReceiveHooks>>,
 }
 ```
 
@@ -4126,13 +4128,14 @@ pub struct SessionSetup {
   `protocol` and the text of `ReceiveService::hello`, before the version
   check; it calls `ReceiveService::check_hello`; it takes a slot of
   `max_sessions`, or answers 503; it calls `open`; and it opens the session
-  with the policy of the `SessionSetup`. A refusal of `open` frees the
-  slot. A bad `Hello` thus gets its 422 also when the sessions are at the
-  limit, and `open` sees valid ref names alone. `max_sessions` also limits
-  the count of `open` calls that run at one time. A session can fail to
-  start after `open` returns, for example when a configuration read fails
-  or a `bare` repository gets `mode-refused`, so a host does not hold state
-  from `open` alone.
+  with `ReceiveService::hello_with_hooks`, with the policy and the hooks of
+  the `SessionSetup`. A refusal of `open` frees the slot. A bad `Hello`
+  thus gets its 422 also when the sessions are at the limit, and `open`
+  sees valid ref names alone. `max_sessions` also limits the count of
+  `open` calls that run at one time. A session can fail to start after
+  `open` returns, for example when a configuration read fails or a `bare`
+  repository gets `mode-refused`, so a host does not hold state from
+  `open` alone.
 - A `Refusal` gets its status, its headers in the order they were added,
   and an `unauthorized` frame with its message. The endpoint adds no
   `WWW-Authenticate` header of its own. It drops a header of the refusal
@@ -4190,8 +4193,12 @@ pub struct ReceiveBody { /* private */ } // Body<Data = Bytes, Error = io::Error
 - The request body of `handle` need not be `Sync`, so the body of axum 0.8
   fits. A request body that fails is a request that ended before its
   response: 500 with `internal`, and the session ends. A panic in the
-  commit resumes in `handle`, through the join of the commit task, so it
-  panics the request task of the host.
+  commit, also in a hook of the session, resumes in `handle` when `handle`
+  joins the commit task, so it panics the request task of the host. When
+  the future of `handle` drops first, for example when the client resets
+  the stream, the commit task is detached, and the runtime catches the
+  panic and drops it. A panic in `after_update` comes after the refs are
+  written.
 - `sweep` applies the idle timeout until `shutdown`, and then completes at
   once. A host runs its future once, in a task of its own, when it starts.
   `shutdown` aborts each session that does not commit and ends `sweep`. A
@@ -4364,7 +4371,12 @@ When hyper did not take the `CommitReply` frame from the body, the report
 gets a `ReceiveWarning` with the step `ReplyNotDelivered`, also when the
 client left before the commit ended. hyper can take the frame and still fail
 to write it, so the warning is best effort. `on_report` runs on a task of
-the server, or of the host, and must return soon.
+the server, or of the host, and must return soon. In a session with hooks,
+`on_report` runs after `after_update`, and only when `after_update`
+succeeds. When `after_update` returns an error, the client gets 500 with
+`internal`, the refs and the detached metadata stay written, the session
+ends as aborted, and `on_report` is not called. The host has the report in
+`after_update`.
 
 `ostrya_fetch::server_config` builds the TLS configuration from the PEM
 bytes, with the provider and the key loaders of the fetcher, and ALPN `h2`

@@ -33,7 +33,9 @@ pub(super) fn cut(message: &mut String) {
 ///
 /// The hooks belong to the session. [`ReceiveService::hello`](super::ReceiveService::hello),
 /// [`Repo::receive`](crate::Repo::receive), and
-/// [`Repo::receive_stream`](crate::Repo::receive_stream) take none.
+/// [`Repo::receive_stream`](crate::Repo::receive_stream) take none. The
+/// receive endpoint of `ostrya-server` gives the hooks that its
+/// `SessionSetup` holds.
 ///
 /// # When `before_update` runs
 ///

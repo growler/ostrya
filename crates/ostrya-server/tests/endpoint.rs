@@ -1,10 +1,15 @@
 //! The receive endpoint mounted in the router of a host: a push of a tree
 //! over HTTPS and HTTP/2 to a path prefix that the host removes, with the
 //! authentication of the host and the HTTP/2 windows of the endpoint, and
-//! the stop of the endpoint. The client is `push_tree`. The assertions at
-//! the end pin the auto traits of the public types.
+//! the stop of the endpoint. The hooks of the host run through the same
+//! mount: an entry of the host in the detached metadata, a per-name lock in
+//! the carried value, an error of `after_update`, and a ref that moves during
+//! `before_update`. The client is `push_tree`. The assertions at the end pin
+//! the auto traits of the public types.
 
+use std::any::Any;
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::fs::File;
 use std::future::Future;
@@ -12,7 +17,7 @@ use std::io::{self, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -25,10 +30,15 @@ use hyper::header::AUTHORIZATION;
 use hyper::http::request::Parts;
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
-use hyper::{Request, Response};
+use hyper::{Request, Response, StatusCode};
 use ostrya::push::proto::Hello;
-use ostrya::push::{ConnectOptions, PushRemote, TreePushOptions, push_tree};
-use ostrya::{CreateOptions, ReceivePolicy, Repo, RepoMode};
+use ostrya::push::{
+    self, ConnectOptions, ParentPolicy, PushRemote, RefUpdate, TreePushOptions, push_tree,
+};
+use ostrya::{
+    Checksum, CreateOptions, HookFuture, HookRefusal, HostEntry, ReceiveHooks, ReceivePolicy,
+    ReceiveReport, Repo, RepoMode, Type, UpdatePlan, Value,
+};
 use ostrya_fetch::{FetcherOptions, FuturesIo, Proxy, RtExecutor, RtTimer};
 use ostrya_rt::{self as rt, Timer, block_on};
 use ostrya_server::{
@@ -98,6 +108,7 @@ impl ReceiveAuth for TokenAuth {
         self.opened.lock().unwrap().push(hello.refs.clone());
         Ok(SessionSetup {
             policy: Arc::new(ReceivePolicy::default()),
+            hooks: None,
         })
     }
 }
@@ -110,13 +121,28 @@ struct Seen {
     h2_connections: AtomicUsize,
     /// The raw path of each request, before the host removes its prefix.
     requests: Mutex<Vec<String>>,
+    /// The raw path and the response status of each request, in the order
+    /// of the responses.
+    statuses: Mutex<Vec<(String, StatusCode)>>,
+}
+
+impl Seen {
+    /// The status of each `commit` request, in order.
+    fn commit_statuses(&self) -> Vec<StatusCode> {
+        let statuses = self.statuses.lock().unwrap();
+        statuses
+            .iter()
+            .filter(|(path, _)| path.ends_with("/commit"))
+            .map(|(_, status)| *status)
+            .collect()
+    }
 }
 
 /// Accept connections on `listener` and serve each in a task of its own.
-async fn host(
+async fn host<A: ReceiveAuth>(
     listener: rt::TcpListener,
     config: Arc<ServerConfig>,
-    endpoint: Arc<ReceiveEndpoint<TokenAuth>>,
+    endpoint: Arc<ReceiveEndpoint<A>>,
     seen: Arc<Seen>,
 ) {
     loop {
@@ -130,10 +156,10 @@ async fn host(
 
 /// Serve one TLS connection over HTTP/2 with the windows of the endpoint
 /// and at most 32 streams at the same time.
-async fn connection(
+async fn connection<A: ReceiveAuth>(
     stream: rt::TcpStream,
     config: Arc<ServerConfig>,
-    endpoint: Arc<ReceiveEndpoint<TokenAuth>>,
+    endpoint: Arc<ReceiveEndpoint<A>>,
     seen: Arc<Seen>,
 ) {
     let Ok(tls) = TlsAcceptor::from(config).accept(stream).await else {
@@ -159,10 +185,10 @@ async fn connection(
 }
 
 /// The route of the host: it records the request, removes [`MOUNT`] from
-/// the path, and calls the endpoint. A path outside the mount goes to the
-/// endpoint as it is, and gets 404.
-async fn mounted(
-    endpoint: &ReceiveEndpoint<TokenAuth>,
+/// the path, calls the endpoint, and records the status of the response. A
+/// path outside the mount goes to the endpoint as it is, and gets 404.
+async fn mounted<A: ReceiveAuth>(
+    endpoint: &ReceiveEndpoint<A>,
     seen: &Seen,
     mut req: Request<Incoming>,
 ) -> Response<ReceiveBody> {
@@ -171,7 +197,12 @@ async fn mounted(
     if let Some(rest) = path.strip_prefix(MOUNT).filter(|r| r.starts_with('/')) {
         *req.uri_mut() = rest.parse().expect("a path is a URI");
     }
-    endpoint.handle(req).await
+    let response = endpoint.handle(req).await;
+    seen.statuses
+        .lock()
+        .unwrap()
+        .push((path, response.status()));
+    response
 }
 
 /// A tree of small files and one file of 3 MiB of pseudo-random bytes, so
@@ -198,7 +229,7 @@ fn tree(base: &Path) -> PathBuf {
 }
 
 /// A tree of one small file, for the pushes that the endpoint refuses at
-/// the `session` request.
+/// the `session` request, and for the pushes of the hooks test.
 fn small_tree(base: &Path) -> PathBuf {
     let root = base.join("small");
     std::fs::create_dir_all(&root).unwrap();
@@ -345,6 +376,340 @@ fn a_push_through_a_mounted_endpoint_commits_over_http2() {
         .await;
     });
     assert_eq!(reports.load(Ordering::SeqCst), 1);
+}
+
+/// The locks of the host, one for each ref name.
+#[derive(Default)]
+struct NameLocks {
+    held: Mutex<BTreeSet<String>>,
+}
+
+impl NameLocks {
+    /// Take the locks of all `names`, or of none when one of them is held.
+    fn try_lock(self: &Arc<Self>, mut names: Vec<String>) -> Option<NameGuard> {
+        names.sort();
+        names.dedup();
+        let mut held = self.held.lock().unwrap();
+        if names.iter().any(|name| held.contains(name)) {
+            return None;
+        }
+        held.extend(names.iter().cloned());
+        Some(NameGuard {
+            locks: self.clone(),
+            names,
+        })
+    }
+
+    /// The names that are held, in order.
+    fn held(&self) -> Vec<String> {
+        self.held.lock().unwrap().iter().cloned().collect()
+    }
+}
+
+/// The locks of some names. They are released when the guard drops.
+struct NameGuard {
+    locks: Arc<NameLocks>,
+    names: Vec<String>,
+}
+
+impl Drop for NameGuard {
+    fn drop(&mut self) {
+        let mut held = self.locks.held.lock().unwrap();
+        for name in &self.names {
+            held.remove(name);
+        }
+    }
+}
+
+/// The state that the hooks of all sessions share with the test.
+#[derive(Default)]
+struct HostState {
+    /// When set, `after_update` returns an error.
+    fail_after: AtomicBool,
+    /// A ref that the next `before_update` sets, to move a ref after the
+    /// checks of the session and before the update lock.
+    move_ref: Mutex<Option<(String, Checksum)>>,
+    before_calls: AtomicUsize,
+    after_calls: AtomicUsize,
+    /// The held names that each `after_update` saw before it dropped the
+    /// carried value.
+    held_in_after: Mutex<Vec<Vec<String>>>,
+}
+
+/// The text of the error of `after_update`.
+const AFTER_FAILED: &str = "the host failed after the update";
+
+/// The hooks of the host for one session of `uploader`. `before_update`
+/// first sets the ref of [`HostState::move_ref`], where one is given. It then
+/// locks the names of the refs, and gives a `centrex.uploader` entry with
+/// `keep_existing` true for each new commit. `after_update` releases the
+/// locks.
+struct HostHooks {
+    uploader: String,
+    repo: Repo,
+    locks: Arc<NameLocks>,
+    state: Arc<HostState>,
+}
+
+impl ReceiveHooks for HostHooks {
+    fn before_update<'a>(
+        &'a self,
+        updates: &'a [RefUpdate],
+    ) -> HookFuture<'a, Result<UpdatePlan, HookRefusal>> {
+        Box::pin(async move {
+            self.state.before_calls.fetch_add(1, Ordering::SeqCst);
+            let moved = self.state.move_ref.lock().unwrap().take();
+            if let Some((name, commit)) = moved {
+                self.repo
+                    .set_ref_immediate(&name, Some(&commit))
+                    .await
+                    .map_err(|e| HookRefusal::internal(e.to_string()))?;
+            }
+            let names = updates.iter().map(|u| u.name.clone()).collect();
+            let Some(guard) = self.locks.try_lock(names) else {
+                return Err(HookRefusal::internal("a ref of the push is locked"));
+            };
+            let commits: BTreeSet<Checksum> = updates.iter().filter_map(|u| u.new).collect();
+            let entry = HostEntry {
+                key: "centrex.uploader".into(),
+                value: Value::variant(Type::Str, Value::Str(self.uploader.clone())),
+                keep_existing: true,
+            };
+            Ok(UpdatePlan {
+                metadata: commits
+                    .into_iter()
+                    .map(|commit| (commit, vec![entry.clone()]))
+                    .collect(),
+                carried: Box::new(guard),
+            })
+        })
+    }
+
+    fn after_update<'a>(
+        &'a self,
+        _report: &'a ReceiveReport,
+        carried: Box<dyn Any + Send>,
+    ) -> HookFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            self.state.after_calls.fetch_add(1, Ordering::SeqCst);
+            let guard = carried
+                .downcast::<NameGuard>()
+                .map_err(|_| "the carried value is not a NameGuard".to_owned())?;
+            self.state
+                .held_in_after
+                .lock()
+                .unwrap()
+                .push(self.locks.held());
+            drop(guard);
+            if self.state.fail_after.load(Ordering::SeqCst) {
+                return Err(AFTER_FAILED.into());
+            }
+            Ok(())
+        })
+    }
+}
+
+/// The authentication of a host with hooks: a bearer token of `alice` or of
+/// `bob`. Each session gets the default policy and the hooks of its
+/// principal.
+struct HookAuth {
+    repo: Repo,
+    locks: Arc<NameLocks>,
+    state: Arc<HostState>,
+}
+
+impl ReceiveAuth for HookAuth {
+    type Principal = String;
+
+    fn owner(principal: &String) -> &str {
+        principal
+    }
+
+    async fn authenticate(&self, parts: &Parts, _kind: RequestKind) -> Result<String, Refusal> {
+        let token = parts
+            .headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        match token {
+            Some("alice-token") => Ok("alice".to_owned()),
+            Some("bob-token") => Ok("bob".to_owned()),
+            _ => Err(Refusal::unauthorized(
+                "the host takes the tokens of its users alone",
+            )),
+        }
+    }
+
+    async fn open(&self, principal: &String, _hello: &Hello) -> Result<SessionSetup, Refusal> {
+        let hooks = HostHooks {
+            uploader: principal.clone(),
+            repo: self.repo.clone(),
+            locks: self.locks.clone(),
+            state: self.state.clone(),
+        };
+        Ok(SessionSetup {
+            policy: Arc::new(ReceivePolicy::default()),
+            hooks: Some(Arc::new(hooks)),
+        })
+    }
+}
+
+/// The string under `centrex.uploader` in the detached metadata of `commit`.
+async fn uploader(repo: &Repo, commit: &Checksum) -> Option<String> {
+    let dict = repo.read_commit_detached_metadata(commit).await.unwrap()?;
+    dict.dict_get("centrex.uploader")
+        .and_then(Value::as_variant)
+        .and_then(|(_, value)| value.as_str().map(str::to_owned))
+}
+
+/// The hooks that `ReceiveAuth::open` gives run in the commit of a push
+/// through a mounted endpoint. Every push sends the same tree with no
+/// parent, no bindings, and one timestamp, so all the pushes give the same
+/// commit. The entry of the first uploader stays at the second push. An
+/// error of `after_update` gets 500 with the ref written and no report. A
+/// ref that `before_update` moves gets 409 with `ref-mismatch`. The locks of
+/// the host are held in `after_update`, and free after each push.
+#[test]
+fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
+    let tmp = TmpDir::new("hooks");
+    let small = small_tree(tmp.path());
+    let receiver = block_on(Repo::create(
+        &tmp.path().join("receiver"),
+        CreateOptions::new(RepoMode::Archive),
+    ))
+    .unwrap();
+    let ca = tmp.path().join("ca.pem");
+    std::fs::write(&ca, CA_PEM).unwrap();
+    let alice = tmp.path().join("alice-token");
+    std::fs::write(&alice, b"alice-token\n").unwrap();
+    let bob = tmp.path().join("bob-token");
+    std::fs::write(&bob, b"bob-token\n").unwrap();
+
+    let reports = Arc::new(AtomicUsize::new(0));
+    let counter = reports.clone();
+    let options = EndpointOptions {
+        on_report: Some(Arc::new(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        })),
+        ..EndpointOptions::default()
+    };
+    let locks = Arc::new(NameLocks::default());
+    let state = Arc::new(HostState::default());
+    let auth = HookAuth {
+        repo: receiver.clone(),
+        locks: locks.clone(),
+        state: state.clone(),
+    };
+    let endpoint = Arc::new(ReceiveEndpoint::new(receiver.clone(), auth, options).unwrap());
+    let seen = Arc::new(Seen::default());
+
+    let connect = |token: &Path| ConnectOptions {
+        tls_ca_path: Some(ca.clone()),
+        push_token_file: Some(token.to_owned()),
+        http: FetcherOptions {
+            proxy: Proxy::None,
+            ..FetcherOptions::default()
+        },
+        ..ConnectOptions::default()
+    };
+    let push_options = |name: &str| TreePushOptions {
+        refs: vec![name.into()],
+        parent: ParentPolicy::None,
+        timestamp: Some(1_700_000_000),
+        no_bindings: true,
+        ..TreePushOptions::default()
+    };
+    let before_calls = || state.before_calls.load(Ordering::SeqCst);
+    let after_calls = || state.after_calls.load(Ordering::SeqCst);
+
+    block_on(async {
+        let config = ostrya_fetch::server_config(SERVER_CERT_PEM, SERVER_KEY_PEM, None, None)
+            .await
+            .unwrap();
+        let listener = rt::TcpListener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let remote = PushRemote::parse(&format!("https://127.0.0.1:{port}{MOUNT}")).unwrap();
+        let serving = host(listener, config, endpoint.clone(), seen.clone());
+        future::or(
+            async {
+                serving.await;
+                unreachable!("the host serves until the test ends");
+            },
+            async {
+                let resolve = |name: &'static str| receiver.resolve_rev(name, false);
+
+                // The first push writes the entry of its uploader.
+                let outcome = push_tree(&remote, &small, connect(&alice), push_options("rel/a"))
+                    .await
+                    .unwrap();
+                let commit = outcome.commit.expect("a tree push builds a commit");
+                assert_eq!(resolve("rel/a").await.unwrap(), Some(commit));
+                assert_eq!(uploader(&receiver, &commit).await.as_deref(), Some("alice"));
+                assert_eq!((before_calls(), after_calls()), (1, 1));
+                assert_eq!(
+                    *state.held_in_after.lock().unwrap(),
+                    vec![vec!["rel/a".to_owned()]]
+                );
+                assert_eq!(seen.commit_statuses(), [StatusCode::OK]);
+                assert!(locks.held().is_empty());
+                eventually("the first report", || reports.load(Ordering::SeqCst) == 1).await;
+
+                // The second push of the commit keeps the first entry.
+                let outcome = push_tree(&remote, &small, connect(&bob), push_options("rel/b"))
+                    .await
+                    .unwrap();
+                assert_eq!(outcome.commit, Some(commit));
+                assert_eq!(resolve("rel/b").await.unwrap(), Some(commit));
+                assert_eq!(uploader(&receiver, &commit).await.as_deref(), Some("alice"));
+                assert_eq!((before_calls(), after_calls()), (2, 2));
+                assert_eq!(seen.commit_statuses(), [StatusCode::OK; 2]);
+                assert!(locks.held().is_empty());
+                eventually("the second report", || reports.load(Ordering::SeqCst) == 2).await;
+
+                // An error of `after_update` comes after the ref is written.
+                state.fail_after.store(true, Ordering::SeqCst);
+                let failed = push_tree(&remote, &small, connect(&bob), push_options("rel/c")).await;
+                match &failed {
+                    Err(push::Error::Internal(message)) => {
+                        assert!(message.contains(AFTER_FAILED), "{message}");
+                    }
+                    other => panic!("{other:?}"),
+                }
+                assert_eq!(
+                    seen.commit_statuses().last(),
+                    Some(&StatusCode::INTERNAL_SERVER_ERROR)
+                );
+                assert_eq!(resolve("rel/c").await.unwrap(), Some(commit));
+                assert_eq!((before_calls(), after_calls()), (3, 3));
+                assert!(locks.held().is_empty());
+                assert_eq!(reports.load(Ordering::SeqCst), 2);
+
+                // A ref that moves after the checks of the session and before
+                // the update lock fails the check under the lock.
+                state.fail_after.store(false, Ordering::SeqCst);
+                *state.move_ref.lock().unwrap() = Some(("rel/d".into(), commit));
+                let moved =
+                    push_tree(&remote, &small, connect(&alice), push_options("rel/d")).await;
+                match &moved {
+                    Err(push::Error::RefMismatch { name, current, .. }) => {
+                        assert_eq!(name, "rel/d");
+                        assert_eq!(*current, Some(commit));
+                    }
+                    other => panic!("{other:?}"),
+                }
+                assert_eq!(seen.commit_statuses().last(), Some(&StatusCode::CONFLICT));
+                assert_eq!(resolve("rel/d").await.unwrap(), Some(commit));
+                assert_eq!((before_calls(), after_calls()), (4, 3));
+                assert!(locks.held().is_empty());
+                assert_eq!(reports.load(Ordering::SeqCst), 2);
+                assert_eq!(state.held_in_after.lock().unwrap().len(), 3);
+            },
+        )
+        .await;
+    });
+    assert_eq!(reports.load(Ordering::SeqCst), 2);
 }
 
 /// A request body with the shape of the body of a router: `Send` and

@@ -206,18 +206,19 @@ bounded:
   a receive policy it also runs the receive endpoint of a push: it holds the
   session table, and each request is one step of the `ReceiveService` of
   its session (`api-sketch.md`, "Archive view and HTTP server"). The
-  endpoint opens each session with `ReceiveService::hello`, so a session of
-  the endpoint has no `ReceiveHooks`. The
-  endpoint authenticates each request through the public trait
-  `ReceiveAuth`, which also gives the policy of each session. The server
-  implements it with the crate-private `FileAuth`, which authorizes each
-  request with a bearer token or a Basic credential, which it matches
-  against the push credential file (`format-reference.md`, "Port
-  extension: the push credential file"), with a client certificate, or as
-  an anonymous push. `FileAuth` compares the digests in constant time with
-  a hand-rolled compare and no dependency. The server refuses to start with
-  no method, and over plain HTTP with the credential file as its one method
-  and no switch for credentials over plain HTTP. The public type
+  endpoint opens each session with `ReceiveService::hello_with_hooks`, with
+  the policy and the hooks that `ReceiveAuth::open` gives in
+  `SessionSetup`. The endpoint authenticates each request through the
+  public trait `ReceiveAuth`, which also gives the setup of each session:
+  its policy and its hooks. The server implements it with the
+  crate-private `FileAuth`, which authorizes each request with a bearer
+  token or a Basic credential, which it matches against the push
+  credential file (`format-reference.md`, "Port extension: the push
+  credential file"), with a client certificate, or as an anonymous push.
+  `FileAuth` gives no hooks. `FileAuth` compares the digests in constant
+  time with a hand-rolled compare and no dependency. The server refuses to
+  start with no method, and over plain HTTP with the credential file as its
+  one method and no switch for credentials over plain HTTP. The public type
   `ReceiveEndpoint<A>` is the endpoint with any `ReceiveAuth`, which a host
   mounts in its own router: it opens no listener and does no TLS, and the
   server builds on `ReceiveEndpoint<FileAuth>`. `EndpointOptions` holds the
@@ -7162,7 +7163,13 @@ before the update lock of the commit, can refuse the commit, and gives
 detached-metadata entries that the commit writes with the refs, and a
 carried value that goes to `ReceiveHooks::after_update`, which runs with the
 report of the commit after the update lock is released
-(`docs/api-sketch.md`, "Receive policy (feature `receive`)"). The
+(`docs/api-sketch.md`, "Receive policy (feature `receive`)"). A host of
+`ReceiveEndpoint` gives a session hooks through `SessionSetup::hooks`. A
+test pushes over HTTPS and HTTP/2 through a mounted endpoint with hooks: the
+entry of the host is written, an entry with `keep_existing` keeps the first
+value at a second push of the commit, an error of `after_update` gives 500
+with the refs written, and a ref that moves during `before_update` gives 409
+with `ref-mismatch`. The
 HTTP push transport is done: `PushSession::connect`,
 `push_tree`, and `Repo::push` take an `http://` or `https://` address, with
 a bearer token, a Basic credential, or a client certificate, and with

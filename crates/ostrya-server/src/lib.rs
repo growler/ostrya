@@ -114,10 +114,12 @@
 //! the body adds a warning of the step
 //! [`ReplyNotDelivered`](ostrya::ReceiveStep::ReplyNotDelivered). hyper can
 //! take the frame and still fail to write it, so the warning is best
-//! effort. The endpoint reads the receive policy and the repository
-//! settings once, at start. A change applies at the next start. The server
-//! takes the options of the endpoint from the fields of the same names in
-//! [`ServeOptions`].
+//! effort. In a session with hooks, the call comes after
+//! [`ReceiveHooks::after_update`](ostrya::ReceiveHooks::after_update), and
+//! only when `after_update` succeeds. The endpoint reads the receive policy
+//! and the repository settings once, at start. A change applies at the next
+//! start. The server takes the options of the endpoint from the fields of
+//! the same names in [`ServeOptions`].
 //!
 //! # Authentication
 //!
@@ -133,7 +135,8 @@
 //! 3. It checks `Hello` with [`ostrya::ReceiveService::check_hello`].
 //! 4. It takes a slot of the session limit, or answers 503.
 //! 5. It calls [`ReceiveAuth::open`], which gives the [`SessionSetup`] of
-//!    the session: its receive policy. A refusal frees the slot.
+//!    the session: its receive policy and its hooks. A refusal frees the
+//!    slot.
 //! 6. It opens the session.
 //!
 //! A bad `Hello` thus gets its 422 also when the sessions are at the limit
@@ -154,9 +157,9 @@
 //! principal gives another key gets the 404 of an unknown session.
 //!
 //! The server runs the endpoint with its built-in methods, and every
-//! session gets the policy of [`ServeOptions::receive`]. [`bind`] refuses
-//! an endpoint with no method. With no TLS, [`bind`] also refuses an
-//! endpoint whose one method is the credential file, unless
+//! session gets the policy of [`ServeOptions::receive`] and no hooks.
+//! [`bind`] refuses an endpoint with no method. With no TLS, [`bind`] also
+//! refuses an endpoint whose one method is the credential file, unless
 //! [`ServeOptions::allow_cleartext_credentials`] is set. The methods are:
 //!
 //! - A bearer token, `Authorization: Bearer TOKEN`, which matches a line of
@@ -191,6 +194,47 @@
 //! of its DER bytes, and `anonymous`. A bearer token and a Basic credential
 //! of one line give one key. A `GET` and a `HEAD` of the archive view ignore
 //! `Authorization`.
+//!
+//! # Hooks
+//!
+//! [`SessionSetup::hooks`] gives the session the [`ostrya::ReceiveHooks`] of
+//! the host. The commit of the session calls
+//! [`before_update`](ostrya::ReceiveHooks::before_update) just before the
+//! update lock. A refusal of the hook gets 422 with `ref-denied` or 500 with
+//! `internal`. These checks run after the hook, so a commit can fail after
+//! the hook returned a plan:
+//!
+//! - Before the update lock, a plan that the checks refuse gets 500 with
+//!   `internal`. A merged dict with host entries over the size limit gets
+//!   422 with `limit-exceeded`. [`ostrya::ReceiveHooks`] states the checks
+//!   of the plan.
+//! - Under the update lock, a ref that is an alias, a path that a ref write
+//!   cannot replace, and two updates of which one names a directory of the
+//!   other get 422 with `ref-denied`. `ref-mismatch` and `non-fast-forward`
+//!   get 409, and `delete-denied` gets 422. Where the stored dict changed
+//!   since the plan, a merged dict over the size limit gets 422 with
+//!   `limit-exceeded`.
+//!
+//! The commit calls [`after_update`](ostrya::ReceiveHooks::after_update)
+//! after the update lock is released. An error of `after_update` gets 500
+//! with `internal`, the refs and the detached metadata stay written, the
+//! session ends as aborted, and [`EndpointOptions::on_report`] is not called.
+//! The client gets the message of a refusal or of an error of a hook in the
+//! `Error` frame, as the hook wrote it, cut at 4096 bytes. A host must thus
+//! not put secrets or internal details in it.
+//!
+//! While a hook runs, the session commits. It keeps its slot of
+//! [`EndpointOptions::max_sessions`], and the idle timeout, a `DELETE`, and
+//! [`ReceiveEndpoint::shutdown`] do not end it. During `before_update` the
+//! session also holds the repository lock shared, so a prune waits. The
+//! response to `commit` waits for both hooks. The host must thus bound the
+//! time of its hooks.
+//!
+//! A panic in a hook is not caught. It resumes in
+//! [`ReceiveEndpoint::handle`] when the call joins the commit task. When the
+//! future of `handle` drops first, for example when the client resets the
+//! stream, the commit task is detached, and the runtime catches the panic and
+//! drops it.
 //!
 //! # Mounting the endpoint
 //!

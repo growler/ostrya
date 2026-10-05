@@ -6,8 +6,8 @@ use std::sync::Arc;
 use hyper::StatusCode;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::http::request::Parts;
-use ostrya::ReceivePolicy;
 use ostrya::push::proto::Hello;
+use ostrya::{ReceiveHooks, ReceivePolicy};
 
 /// The authentication of the requests of the receive endpoint.
 ///
@@ -36,7 +36,8 @@ pub trait ReceiveAuth: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Self::Principal, Refusal>> + Send;
 
     /// The setup of the session that `hello` opens for `principal`, or its
-    /// refusal.
+    /// refusal. The setup holds the receive policy and the hooks of the
+    /// session.
     ///
     /// It is called for a `session` request after the endpoint reads
     /// `Hello`, after the checks of
@@ -120,8 +121,34 @@ impl Refusal {
     }
 }
 
-/// What [`ReceiveAuth::open`] gives to the session.
+/// What [`ReceiveAuth::open`] gives to the session: its receive policy and
+/// its hooks.
 pub struct SessionSetup {
     /// The receive policy of the session.
     pub policy: Arc<ReceivePolicy>,
+    /// The hooks of the session, or `None` for a session with no hooks.
+    ///
+    /// The endpoint opens the session with
+    /// [`ReceiveService::hello_with_hooks`](ostrya::ReceiveService::hello_with_hooks).
+    /// The commit of the session calls [`ReceiveHooks::before_update`] just
+    /// before the update lock, and [`ReceiveHooks::after_update`] after the
+    /// update lock is released. A refusal of `before_update` with
+    /// [`HookRefusal::denied`](ostrya::HookRefusal::denied) gets 422 with
+    /// `ref-denied`, and a refusal with
+    /// [`HookRefusal::internal`](ostrya::HookRefusal::internal) gets 500
+    /// with `internal`. An error of `after_update` gets 500 with `internal`.
+    /// The refs and the detached metadata stay written, the session ends as
+    /// aborted, and [`EndpointOptions::on_report`](crate::EndpointOptions::on_report)
+    /// is not called. The client gets the message of the refusal or of the
+    /// error in the `Error` frame, as the hook wrote it, cut at 4096 bytes.
+    /// A host must thus not put secrets or internal details in it.
+    ///
+    /// While a hook runs, the session commits. It keeps its slot of
+    /// [`EndpointOptions::max_sessions`](crate::EndpointOptions::max_sessions),
+    /// and the idle timeout, a `DELETE`, and
+    /// [`ReceiveEndpoint::shutdown`](crate::ReceiveEndpoint::shutdown) do not
+    /// end it. During `before_update` the session also holds the repository
+    /// lock shared, so a prune waits. The response to `commit` waits for both
+    /// hooks. The host must thus bound the time of its hooks.
+    pub hooks: Option<Arc<dyn ReceiveHooks>>,
 }

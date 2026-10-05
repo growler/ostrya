@@ -329,7 +329,7 @@ impl ReceiveAuth for FileAuth {
         ready(self.authorize(&parts.headers, &peer).map_err(challenge))
     }
 
-    /// The policy of the server, for every principal.
+    /// The policy of the server and no hooks, for every principal.
     fn open(
         &self,
         _principal: &String,
@@ -337,6 +337,7 @@ impl ReceiveAuth for FileAuth {
     ) -> impl Future<Output = Result<SessionSetup, Refusal>> + Send {
         ready(Ok(SessionSetup {
             policy: self.policy.clone(),
+            hooks: None,
         }))
     }
 }

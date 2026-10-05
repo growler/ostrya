@@ -20,7 +20,7 @@ use ostrya::{ReceiveReport, ReceiveService, ReceiveStep, ReceiveWarning, Repo};
 use ostrya_rt as rt;
 
 use crate::body::ServeBody;
-use crate::receive_auth::{ReceiveAuth, Refusal, RequestKind};
+use crate::receive_auth::{ReceiveAuth, Refusal, RequestKind, SessionSetup};
 use crate::request::{RequestBody, drain, read_message};
 use crate::router::empty;
 use crate::session::{Active, Begin, Cancel, Deleted, SessionId, SessionTable};
@@ -199,8 +199,9 @@ impl<A: ReceiveAuth> Receive<A> {
     /// `POST session` of `principal`: read `Hello`, refuse a `Hello` with
     /// `one-way` true, check `Hello`, take a slot of the session limit, get
     /// the setup of the session from the authentication, and open the
-    /// session. The body must arrive in full within the idle timeout. A
-    /// refusal of the authentication frees the slot.
+    /// session with the policy and the hooks of the setup. The body must
+    /// arrive in full within the idle timeout. A refusal of the
+    /// authentication frees the slot.
     async fn open<B>(&self, principal: &A::Principal, body: B) -> Response<ServeBody>
     where
         B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -249,13 +250,14 @@ impl<A: ReceiveAuth> Receive<A> {
                 return frame(StatusCode::INTERNAL_SERVER_ERROR, &message);
             }
         };
-        let setup = match self.auth.open(principal, &hello).await {
+        let SessionSetup { policy, hooks } = match self.auth.open(principal, &hello).await {
             Ok(setup) => setup,
             Err(refusal) => return refusal_response(refusal),
         };
-        let opened = ReceiveService::hello(
+        let opened = ReceiveService::hello_with_hooks(
             self.repo.clone(),
-            setup.policy,
+            policy,
+            hooks,
             self.parallel_uploads,
             hello,
         )
@@ -1155,6 +1157,7 @@ mod tests {
             };
             Ok(SessionSetup {
                 policy: Arc::new(policy),
+                hooks: None,
             })
         }
     }

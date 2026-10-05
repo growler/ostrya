@@ -46,6 +46,16 @@ pub struct EndpointOptions {
     /// [`ReplyNotDelivered`](ostrya::ReceiveStep::ReplyNotDelivered). The
     /// call runs on a task of the host, so it must return soon. The default
     /// is `None`.
+    ///
+    /// In a session with hooks, the call comes after
+    /// [`ReceiveHooks::after_update`](ostrya::ReceiveHooks::after_update),
+    /// and only when `after_update` succeeds. When `after_update` returns an
+    /// error, the client gets 500 with `internal`, the refs and the detached
+    /// metadata stay written, the session ends as aborted, and the call does
+    /// not occur. The host has the report in `after_update`. The client gets
+    /// the message of the error in the `Error` frame, as the hook wrote it,
+    /// cut at 4096 bytes. A host must thus not put secrets or internal
+    /// details in it.
     pub on_report: Option<Arc<dyn Fn(ReceiveReport) + Send + Sync>>,
 }
 
@@ -137,7 +147,15 @@ impl<A: ReceiveAuth> ReceiveEndpoint<A> {
     ///
     /// A request body that fails is a request that ended before its
     /// response: the request gets 500 with `internal`, and its session
-    /// ends. A panic in the commit resumes in this call.
+    /// ends.
+    ///
+    /// A panic in the commit, also in a hook of the session, is not caught.
+    /// The commit runs in a task of its own, and the panic resumes in this
+    /// call when the call joins that task. It thus panics the request task of
+    /// the host: over HTTP/2 hyper resets the stream, and over HTTP/1.1 it
+    /// closes the connection. The session ends and frees its slot. A panic in
+    /// [`ReceiveHooks::after_update`](ostrya::ReceiveHooks::after_update)
+    /// comes after the refs are written.
     ///
     /// Under the tokio backend, the call must run within a tokio runtime
     /// with the time driver enabled: the commit runs in a task of its own,
@@ -166,8 +184,8 @@ impl<A: ReceiveAuth> ReceiveEndpoint<A> {
 
     /// Stop the endpoint: abort each session that does not commit, and end
     /// [`sweep`](ReceiveEndpoint::sweep). A commit that runs goes on to its
-    /// end, and a `session` request after the call gets 503. A second call
-    /// does nothing more.
+    /// end, also through the hooks of its session, and a `session` request
+    /// after the call gets 503. A second call does nothing more.
     pub fn shutdown(&self) {
         self.stop.fire();
         self.inner.table.close_all();

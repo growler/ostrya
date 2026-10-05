@@ -226,8 +226,10 @@
 //! the `ReceiveHooks` of its host: `before_update` runs just before the update
 //! lock of the commit, can refuse it, and gives detached-metadata entries that
 //! the commit writes with the refs, and `after_update` runs with the report of
-//! the commit after the update lock is released. `Repo::receive_stream` reads
-//! one one-way stream, a session in one direction with no reply.
+//! the commit after the update lock is released. The receive endpoint of
+//! `ostrya-server` gives the hooks that its `SessionSetup` holds.
+//! `Repo::receive_stream` reads one one-way stream, a session in one direction
+//! with no reply.
 //!
 //! Under the `push` feature it also covers the client side of a push from a
 //! repository. `Repo::push` pushes the commits of a set of refspecs to a

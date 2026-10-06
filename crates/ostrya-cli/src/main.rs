@@ -78,11 +78,11 @@ use ostrya::{
     Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult,
     FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
     FsckPhase, MutableTree, ObjectType, OverwriteMode, PruneOptions, PullFlags, PullOptions,
-    PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias, Repo, RepoMode, RepoTree,
-    Result, Signer, Summary, SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck,
-    Transaction, TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy,
-    Xattrs, base64, from_bytes, load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated,
-    validate_refspec,
+    PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias, Repo, RepoConfig,
+    RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions, TarExportOptions,
+    TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value,
+    Verifier, VerifyOutcome, VerityPolicy, Xattrs, base64, from_bytes, load_sign_keys,
+    load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier, SignatureInfo};
@@ -7753,6 +7753,11 @@ fn config_get(repo: &Repo, args: &ConfigArgs) -> Result<()> {
 /// document back. The value is escaped the way the tool escapes one on write, so
 /// a value carrying a newline or leading whitespace is stored in a form that
 /// reads back whole.
+///
+/// The edit is made first on the configuration read at open, so a refusal
+/// takes no lock. The command then takes one update guard, reads the document
+/// from disk, makes the edit again, and writes the document, so an edit another
+/// writer made before the guard was taken is kept.
 async fn config_set(repo: &Repo, args: &ConfigArgs) -> Result<()> {
     if args.args.len() < 2 {
         if args.group.is_some() {
@@ -7762,21 +7767,49 @@ async fn config_set(repo: &Repo, args: &ConfigArgs) -> Result<()> {
     }
     let (group, key) = config_target(args);
     let value = &args.args[1];
-    let mut keyfile = repo.config().keyfile().clone();
-    keyfile.set_string(group, key, value)?;
-    repo.write_config(&keyfile).await
+    let edit = |config: &RepoConfig| -> Result<_> {
+        let mut keyfile = config.keyfile().clone();
+        keyfile.set_string(group, key, value)?;
+        Ok(keyfile)
+    };
+    edit(repo.config())?;
+    let guard = repo.begin_update().await?;
+    let edited = async {
+        let keyfile = edit(&guard.read_config().await?)?;
+        guard.write_config(&keyfile).await
+    }
+    .await;
+    let finished = guard.finish().await;
+    edited.and(finished)
 }
 
 /// Remove one configuration value and write the document back. A key the
 /// document does not hold, and a group it does not hold, are both success and
 /// leave the file untouched, matching the tool.
+///
+/// The key is looked up first in the configuration read at open, so an absent
+/// key takes no lock. Otherwise the document is read from disk, edited, and
+/// written under one update guard, as `config set` does, and a key that is
+/// gone from the document on disk is success with no write.
 async fn config_unset(repo: &Repo, args: &ConfigArgs) -> Result<()> {
     let (group, key) = config_target(args);
-    let mut keyfile = repo.config().keyfile().clone();
-    if !keyfile.remove_key(group, key) {
+    let edit = |config: &RepoConfig| {
+        let mut keyfile = config.keyfile().clone();
+        keyfile.remove_key(group, key).then_some(keyfile)
+    };
+    if edit(repo.config()).is_none() {
         return Ok(());
     }
-    repo.write_config(&keyfile).await
+    let guard = repo.begin_update().await?;
+    let edited = async {
+        match edit(&guard.read_config().await?) {
+            Some(keyfile) => guard.write_config(&keyfile).await,
+            None => Ok(()),
+        }
+    }
+    .await;
+    let finished = guard.finish().await;
+    edited.and(finished)
 }
 
 // --- remote ------------------------------------------------------------------
@@ -7863,6 +7896,14 @@ fn remote_url(section: &ostrya::Remote<'_>, name: &str) -> Result<String> {
 /// metalink), the branch list, the content URL, the custom backend, the
 /// `--set` pairs in the order they were given, the GPG switch, the sign-api
 /// verification keys, and the collection id.
+///
+/// The edit is made first on the configuration read at open, so a remote that
+/// `--if-not-exists` leaves as it is and each refusal take no lock. The command
+/// then takes one update guard, reads the document from disk, makes the edit
+/// again, and writes the document, so an edit another writer made before the
+/// guard was taken is kept. The keyring of `--gpg-import` is imported only when
+/// the command wrote the remote, after the guard is finished, because the
+/// import takes the locks itself.
 async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()> {
     let (Some(name), Some(url)) = (args.name.as_deref(), args.url.as_deref()) else {
         exit_with_nested_error("remote", nested, "NAME and URL must be specified");
@@ -7882,67 +7923,88 @@ async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()
     }
 
     let group = remote_group(name);
-    let mut keyfile = repo.config().keyfile().clone();
-    if keyfile.has_group(&group) {
-        if args.if_not_exists {
-            return Ok(());
+    // The edited document, or `None` for a remote that `--if-not-exists` leaves
+    // as it is.
+    let edit = |config: &RepoConfig| -> Result<Option<_>> {
+        let mut keyfile = config.keyfile().clone();
+        if keyfile.has_group(&group) {
+            if args.if_not_exists {
+                return Ok(None);
+            }
+            if !args.force {
+                exit_error(&format!(
+                    "Remote configuration for \"{name}\" already exists: (in config)"
+                ));
+            }
+            keyfile.remove_group(&group);
         }
-        if !args.force {
-            exit_error(&format!(
-                "Remote configuration for \"{name}\" already exists: (in config)"
-            ));
-        }
-        keyfile.remove_group(&group);
-    }
 
-    match url.strip_prefix("metalink=") {
-        Some(metalink) => keyfile.set_string(&group, "metalink", metalink)?,
-        None => keyfile.set_string(&group, "url", url)?,
-    }
-    if !args.branches.is_empty() {
-        // Each branch is followed by the separator, the trailing one included,
-        // which is the list form the tool writes.
-        let mut list = String::new();
-        for branch in &args.branches {
-            list.push_str(branch);
-            list.push(';');
+        match url.strip_prefix("metalink=") {
+            Some(metalink) => keyfile.set_string(&group, "metalink", metalink)?,
+            None => keyfile.set_string(&group, "url", url)?,
         }
-        keyfile.set_string(&group, "branches", &list)?;
-    }
-    if let Some(contenturl) = &args.contenturl {
-        keyfile.set_string(&group, "contenturl", contenturl)?;
-    }
-    if let Some(backend) = &args.custom_backend {
-        keyfile.set_string(&group, "custom-backend", backend)?;
-    }
-    for pair in &args.set {
-        let Some((key, value)) = pair.split_once('=') else {
-            exit_error("Missing '=' in KEY=VALUE for --set");
-        };
-        keyfile.set_string(&group, key, value)?;
-    }
-    // `--no-sign-verify` turns the GPG check off as well, which is what the tool
-    // writes for it.
-    if args.no_gpg_verify || args.no_sign_verify {
-        keyfile.set_string(&group, "gpg-verify", "false")?;
-    }
-    if args.no_sign_verify {
-        keyfile.set_string(&group, "sign-verify", "false")?;
-    }
-    if !args.sign_verify.is_empty() {
-        let mut engines: Vec<&str> = Vec::new();
-        for spec in &args.sign_verify {
-            let (engine, key, from_file) = parse_sign_verify_spec(spec);
-            let suffix = if from_file { "file" } else { "key" };
-            keyfile.set_string(&group, &format!("verification-{engine}-{suffix}"), key)?;
-            engines.push(engine);
+        if !args.branches.is_empty() {
+            // Each branch is followed by the separator, the trailing one included,
+            // which is the list form the tool writes.
+            let mut list = String::new();
+            for branch in &args.branches {
+                list.push_str(branch);
+                list.push(';');
+            }
+            keyfile.set_string(&group, "branches", &list)?;
         }
-        keyfile.set_string(&group, "sign-verify", &engines.join(","))?;
+        if let Some(contenturl) = &args.contenturl {
+            keyfile.set_string(&group, "contenturl", contenturl)?;
+        }
+        if let Some(backend) = &args.custom_backend {
+            keyfile.set_string(&group, "custom-backend", backend)?;
+        }
+        for pair in &args.set {
+            let Some((key, value)) = pair.split_once('=') else {
+                exit_error("Missing '=' in KEY=VALUE for --set");
+            };
+            keyfile.set_string(&group, key, value)?;
+        }
+        // `--no-sign-verify` turns the GPG check off as well, which is what the tool
+        // writes for it.
+        if args.no_gpg_verify || args.no_sign_verify {
+            keyfile.set_string(&group, "gpg-verify", "false")?;
+        }
+        if args.no_sign_verify {
+            keyfile.set_string(&group, "sign-verify", "false")?;
+        }
+        if !args.sign_verify.is_empty() {
+            let mut engines: Vec<&str> = Vec::new();
+            for spec in &args.sign_verify {
+                let (engine, key, from_file) = parse_sign_verify_spec(spec);
+                let suffix = if from_file { "file" } else { "key" };
+                keyfile.set_string(&group, &format!("verification-{engine}-{suffix}"), key)?;
+                engines.push(engine);
+            }
+            keyfile.set_string(&group, "sign-verify", &engines.join(","))?;
+        }
+        if let Some(collection_id) = &args.collection_id {
+            keyfile.set_string(&group, "collection-id", collection_id)?;
+        }
+        Ok(Some(keyfile))
+    };
+    if edit(repo.config())?.is_none() {
+        return Ok(());
     }
-    if let Some(collection_id) = &args.collection_id {
-        keyfile.set_string(&group, "collection-id", collection_id)?;
+    let guard = repo.begin_update().await?;
+    let edited = async {
+        match edit(&guard.read_config().await?)? {
+            Some(keyfile) => guard.write_config(&keyfile).await.map(|()| true),
+            None => Ok(false),
+        }
     }
-    repo.write_config(&keyfile).await?;
+    .await;
+    let finished = guard.finish().await;
+    let written = edited?;
+    finished?;
+    if !written {
+        return Ok(());
+    }
 
     if let Some(path) = &args.gpg_import {
         let keys = read_keyring_file(path)?;
@@ -7985,21 +8047,35 @@ fn parse_sign_verify_spec(spec: &str) -> (&str, &str, bool) {
     }
 }
 
-/// Delete a remote's configuration section and its trusted keyring.
+/// Delete a remote's trusted keyring and then its configuration section, under
+/// one update guard. The section is looked up first in the configuration read
+/// at open, so an absent section takes no lock, and then again in `config` as
+/// it is on disk when the guard is taken. A failure between the two steps
+/// leaves the section with no keyring, never a keyring with no section.
 async fn remote_delete(repo: &Repo, nested: &str, args: RemoteDeleteArgs) -> Result<()> {
     let name = remote_operand(nested, args.name.as_deref());
     if !ostrya::valid_remote_name(name) {
         exit_error(&format!("Invalid remote name {name}"));
     }
-    let mut keyfile = repo.config().keyfile().clone();
-    if !keyfile.remove_group(&remote_group(name)) {
+    let absent = || -> Result<()> {
         if args.if_exists {
             return Ok(());
         }
         exit_error(&format!("Remote \"{name}\" not found"));
+    };
+    if !repo.config().keyfile().has_group(&remote_group(name)) {
+        return absent();
     }
-    repo.write_config(&keyfile).await?;
-    repo.remove_remote_keyring(name).await
+    let guard = repo.begin_update().await?;
+    let deleted = guard.delete_remote(name).await;
+    let finished = guard.finish().await;
+    match deleted {
+        Err(Error::RemoteNotFound(_)) => {
+            finished?;
+            absent()
+        }
+        deleted => deleted.and(finished),
+    }
 }
 
 /// List the configured remote names, sorted by name, with each URL after its

@@ -11844,6 +11844,499 @@ fn remote_add_and_delete_match_the_tool() {
     );
 }
 
+/// The longest a test waits for a child command to reach the update lock, and
+/// for it to end after the test releases the guard.
+const GUARD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A child process that is killed and reaped when the value drops, so a test
+/// that panics leaves no process behind.
+struct KillOnDrop {
+    inner: Option<std::process::Child>,
+}
+
+impl KillOnDrop {
+    fn child(&mut self) -> &mut std::process::Child {
+        self.inner.as_mut().expect("the child was taken")
+    }
+
+    /// Take the child out, so the drop no longer kills it.
+    fn take(mut self) -> std::process::Child {
+        self.inner.take().expect("the child was taken")
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(child) = self.inner.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Wait until `child` has `file` open, as `/proc/<pid>/fd` shows it. Panic
+/// when the child ends first, or when `GUARD_WAIT` passes.
+fn wait_for_open_file(child: &mut std::process::Child, file: &Path, shown: &str) {
+    use std::time::Instant;
+
+    let fds = PathBuf::from(format!("/proc/{}/fd", child.id()));
+    let deadline = Instant::now() + GUARD_WAIT;
+    loop {
+        let open = std::fs::read_dir(&fds)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| std::fs::read_link(entry.path()).is_ok_and(|target| target == file));
+        if open {
+            return;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "`{shown}` ended while the guard was held"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "`{shown}` did not open {} in {GUARD_WAIT:?}",
+            file.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Run `ostrya --repo=<repo> <args>` while the test holds the update guard of
+/// `repo`, and return the run. The test waits until the child has
+/// `<repo>/.update.lock` open. The child opens that file only after it read
+/// `config` at the open of the repository. The guard then adds the remote
+/// `r0` and finishes, and the child runs to its end. The repository must
+/// state `lock-timeout-secs=-1`, so the wait of the child has no limit.
+fn run_under_held_guard(repo: &Path, args: &[&str]) -> Run {
+    use std::time::Instant;
+
+    let shown = args.join(" ");
+    let lock_file = std::fs::canonicalize(repo).unwrap().join(".update.lock");
+    block_on(async {
+        let handle = Repo::open(repo).await.unwrap();
+        let guard = handle.begin_update().await.unwrap();
+        let mut child = KillOnDrop {
+            inner: Some(
+                Command::new(env!("CARGO_BIN_EXE_ostrya"))
+                    .arg(format!("--repo={}", repo.display()))
+                    .args(args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("spawn ostrya"),
+            ),
+        };
+        wait_for_open_file(child.child(), &lock_file, &shown);
+        assert!(
+            child.child().try_wait().unwrap().is_none(),
+            "`{shown}` ended while the guard was held"
+        );
+        guard
+            .add_remote("r0", &[("url", "https://example.invalid/r0")])
+            .await
+            .unwrap();
+        guard.finish().await.unwrap();
+
+        let deadline = Instant::now() + GUARD_WAIT;
+        while child.child().try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "`{shown}` still ran {GUARD_WAIT:?} after the guard finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let out = child.take().wait_with_output().expect("wait ostrya");
+        Run {
+            status: out.status,
+            stdout: out.stdout,
+            stderr: out.stderr,
+        }
+    })
+}
+
+/// A fresh repository whose lock waits have no limit, for the tests that hold
+/// the update guard while a command runs.
+fn create_unlimited_wait_repo(base: &Path) -> PathBuf {
+    let repo = create_repo(base, RepoMode::Archive);
+    set_core_key(&repo, "lock-timeout-secs=-1");
+    repo
+}
+
+/// Assert that the run succeeded with no output on stdout, and that `config`
+/// holds the remote `r0` the guard added while the command waited.
+fn assert_keeps_guard_remote(repo: &Path, run: &Run) {
+    run.ok();
+    assert!(
+        run.stdout.is_empty(),
+        "unexpected stdout: {}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let config = config_text(repo);
+    assert!(
+        config.contains("[remote \"r0\"]"),
+        "the command dropped the remote the guard added:\n{config}"
+    );
+}
+
+/// `remote add` reads `config` after it takes the update lock, so it keeps a
+/// remote another writer added while the command waited for the lock.
+#[test]
+fn remote_add_keeps_a_remote_added_under_a_held_guard() {
+    let tmp = TmpDir::new("remote-add-guard");
+    let repo = create_unlimited_wait_repo(tmp.path());
+    let run = run_under_held_guard(
+        &repo,
+        &["remote", "add", "r1", "https://example.invalid/r1"],
+    );
+    assert_keeps_guard_remote(&repo, &run);
+    let config = config_text(&repo);
+    assert!(
+        config.contains("[remote \"r1\"]\nurl=https://example.invalid/r1\n"),
+        "the added remote is missing:\n{config}"
+    );
+}
+
+/// `remote delete` reads `config` after it takes the update lock, so it keeps
+/// a remote another writer added while the command waited for the lock.
+#[test]
+fn remote_delete_keeps_a_remote_added_under_a_held_guard() {
+    let tmp = TmpDir::new("remote-delete-guard");
+    let repo = create_unlimited_wait_repo(tmp.path());
+    let repo_arg = format!("--repo={}", repo.display());
+    ostrya(
+        &[
+            &repo_arg,
+            "remote",
+            "add",
+            "r1",
+            "https://example.invalid/r1",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let run = run_under_held_guard(&repo, &["remote", "delete", "r1"]);
+    assert_keeps_guard_remote(&repo, &run);
+    let config = config_text(&repo);
+    assert!(
+        !config.contains("[remote \"r1\"]"),
+        "the deleted remote is still there:\n{config}"
+    );
+}
+
+/// `config set` reads `config` after it takes the update lock, so it keeps a
+/// remote another writer added while the command waited for the lock.
+#[test]
+fn config_set_keeps_a_remote_added_under_a_held_guard() {
+    let tmp = TmpDir::new("config-set-guard");
+    let repo = create_unlimited_wait_repo(tmp.path());
+    let run = run_under_held_guard(&repo, &["config", "set", "core.k1", "v1"]);
+    assert_keeps_guard_remote(&repo, &run);
+    let config = config_text(&repo);
+    assert!(
+        config.lines().any(|line| line == "k1=v1"),
+        "the set key is missing:\n{config}"
+    );
+}
+
+/// `config unset` reads `config` after it takes the update lock, so it keeps a
+/// remote another writer added while the command waited for the lock.
+#[test]
+fn config_unset_keeps_a_remote_added_under_a_held_guard() {
+    let tmp = TmpDir::new("config-unset-guard");
+    let repo = create_unlimited_wait_repo(tmp.path());
+    set_core_key(&repo, "k1=v1");
+    let run = run_under_held_guard(&repo, &["config", "unset", "core.k1"]);
+    assert_keeps_guard_remote(&repo, &run);
+    let config = config_text(&repo);
+    assert!(
+        !config.lines().any(|line| line.starts_with("k1=")),
+        "the unset key is still there:\n{config}"
+    );
+}
+
+/// `remote delete` removes the trusted keyring before it writes `config`. A
+/// keyring path that cannot be removed fails the command, and `config` keeps
+/// the remote.
+#[test]
+fn remote_delete_removes_the_keyring_before_the_config() {
+    let tmp = TmpDir::new("remote-delete-keyring-first");
+    let repo = create_repo(tmp.path(), RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    ostrya(
+        &[
+            &repo_arg,
+            "remote",
+            "add",
+            "r1",
+            "https://example.invalid/r1",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let keyring = repo.join("r1.trustedkeys.gpg");
+    std::fs::create_dir(&keyring).unwrap();
+    let before = config_text(&repo);
+
+    let run = ostrya(&[&repo_arg, "remote", "delete", "r1"], None, &[]);
+    assert!(
+        !run.status.success(),
+        "the delete succeeded with a keyring it cannot remove"
+    );
+    assert_eq!(
+        config_text(&repo),
+        before,
+        "the delete wrote `config` although the keyring stayed"
+    );
+    assert!(keyring.is_dir(), "the keyring directory is gone");
+}
+
+/// A `remote delete` whose write of `config` fails has removed the trusted
+/// keyring already, and `config` keeps the remote. The file size limit of the
+/// child is 0, so the write of `config` fails with `EFBIG`, and the temporary
+/// file of the write does not stay.
+#[test]
+fn remote_delete_keeps_the_remote_when_the_config_write_fails() {
+    let tmp = TmpDir::new("remote-delete-config-write");
+    let repo = create_repo(tmp.path(), RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    ostrya(
+        &[
+            &repo_arg,
+            "remote",
+            "add",
+            "r1",
+            "https://example.invalid/r1",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let keyring = repo.join("r1.trustedkeys.gpg");
+    std::fs::write(&keyring, b"keys").unwrap();
+    let before = config_text(&repo);
+
+    let out = Command::new("sh")
+        .args([
+            "-c",
+            "trap '' XFSZ; ulimit -f 0; exec \"$0\" \"$@\"",
+            env!("CARGO_BIN_EXE_ostrya"),
+            &repo_arg,
+            "remote",
+            "delete",
+            "r1",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ostrya under a file size limit");
+    assert!(
+        !out.status.success(),
+        "the delete succeeded with no room for `config`: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("(os error 27)"),
+        "the delete failed with no EFBIG: {stderr}"
+    );
+    assert!(
+        !keyring.exists(),
+        "the keyring stayed after a failed write of `config`"
+    );
+    assert_eq!(
+        config_text(&repo),
+        before,
+        "the failed write changed `config`"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(&repo)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("config.tmp-"))
+        .collect();
+    assert!(leftovers.is_empty(), "the failed write left {leftovers:?}");
+}
+
+/// `remote add --if-not-exists` on a remote that exists writes nothing and
+/// imports no keyring, so it does not read the file `--gpg-import` names.
+#[test]
+fn remote_add_if_not_exists_imports_no_keyring_for_an_existing_remote() {
+    let tmp = TmpDir::new("remote-add-if-not-exists-import");
+    let repo = create_repo(tmp.path(), RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    ostrya(
+        &[
+            &repo_arg,
+            "remote",
+            "add",
+            "r1",
+            "https://example.invalid/r1",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let before = config_text(&repo);
+    let import = format!("--gpg-import={}", tmp.path().join("absent.gpg").display());
+
+    let run = ostrya(
+        &[
+            &repo_arg,
+            "remote",
+            "add",
+            "--if-not-exists",
+            &import,
+            "r1",
+            "https://example.invalid/other",
+        ],
+        None,
+        &[],
+    );
+    run.ok();
+    assert_eq!(
+        (run.stdout.as_slice(), run.stderr.as_slice()),
+        (&b""[..], &b""[..]),
+        "unexpected output: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(config_text(&repo), before, "the command wrote `config`");
+    assert!(
+        !repo.join("r1.trustedkeys.gpg").exists(),
+        "the command wrote a keyring"
+    );
+}
+
+/// `remote add --if-not-exists` checks again under the update lock. A remote
+/// that another writer added while the command waited is kept as it is, and
+/// the command imports no keyring.
+#[test]
+fn remote_add_if_not_exists_keeps_a_remote_added_under_a_held_guard() {
+    let tmp = TmpDir::new("remote-add-if-not-exists-guard");
+    let repo = create_unlimited_wait_repo(tmp.path());
+    let import = format!("--gpg-import={}", tmp.path().join("absent.gpg").display());
+    let run = run_under_held_guard(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "--if-not-exists",
+            &import,
+            "r0",
+            "https://example.invalid/other",
+        ],
+    );
+    assert_keeps_guard_remote(&repo, &run);
+    assert!(
+        run.stderr.is_empty(),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let config = config_text(&repo);
+    assert!(
+        config.contains("[remote \"r0\"]\nurl=https://example.invalid/r0\n"),
+        "the command changed the remote the guard added:\n{config}"
+    );
+    assert!(
+        !repo.join("r0.trustedkeys.gpg").exists(),
+        "the command wrote a keyring"
+    );
+}
+
+/// The no-op paths and the refusals of `config set`, `config unset`, `remote
+/// add`, and `remote delete` decide from the configuration read at open, and
+/// take no lock. Another holder of the update lock and `lock-timeout-secs=0`
+/// do not change their exit status or their output.
+#[test]
+fn config_no_ops_and_refusals_take_no_lock() {
+    let tmp = TmpDir::new("config-no-lock");
+    let repo = create_repo(tmp.path(), RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    ostrya(
+        &[&repo_arg, "remote", "add", "o", "https://example.invalid/o"],
+        None,
+        &[],
+    )
+    .ok();
+    set_core_key(&repo, "lock-timeout-secs=0");
+    let before = config_text(&repo);
+
+    let cases: &[(&[&str], i32, &str)] = &[
+        (&["config", "unset", "core.absent"], 0, ""),
+        (
+            &["config", "set", "core.a=b", "v"],
+            1,
+            "error: keyfile: key 'a=b' contains a structural character\n",
+        ),
+        (&["remote", "delete", "--if-exists", "absent"], 0, ""),
+        (
+            &["remote", "delete", "absent"],
+            1,
+            "error: Remote \"absent\" not found\n",
+        ),
+        (
+            &[
+                "remote",
+                "add",
+                "--if-not-exists",
+                "o",
+                "https://example.invalid/other",
+            ],
+            0,
+            "",
+        ),
+        (
+            &["remote", "add", "o", "https://example.invalid/other"],
+            1,
+            "error: Remote configuration for \"o\" already exists: (in config)\n",
+        ),
+        (
+            &[
+                "remote",
+                "add",
+                "p",
+                "https://example.invalid/p",
+                "--set",
+                "foo",
+            ],
+            1,
+            "error: Missing '=' in KEY=VALUE for --set\n",
+        ),
+        (
+            &[
+                "remote",
+                "add",
+                "p",
+                "https://example.invalid/p",
+                "--sign-verify=bad",
+            ],
+            1,
+            "error: Failed to parse KEYTYPE=[inline|file]:DATA in bad\n",
+        ),
+    ];
+    let handle = block_on(Repo::open(&repo)).unwrap();
+    let guard = block_on(handle.begin_update()).unwrap();
+    let mut wrong = Vec::new();
+    for (args, code, stderr) in cases {
+        let mut full = vec![repo_arg.as_str()];
+        full.extend_from_slice(args);
+        let run = ostrya(&full, None, &[]);
+        let got = (
+            run.status.code(),
+            String::from_utf8_lossy(&run.stdout).into_owned(),
+            String::from_utf8_lossy(&run.stderr).into_owned(),
+        );
+        if got != (Some(*code), String::new(), (*stderr).to_owned()) {
+            wrong.push(format!("{args:?}: {got:?}"));
+        }
+    }
+    block_on(guard.finish()).unwrap();
+    assert!(wrong.is_empty(), "wrong results:\n{}", wrong.join("\n"));
+    assert_eq!(config_text(&repo), before, "a command wrote `config`");
+}
+
 /// `remote refs` and `remote summary` read a live remote over HTTP: the ref
 /// listing, the report, the raw variant, and the metadata forms.
 #[test]

@@ -460,6 +460,24 @@ repository lock shared first:
   takes a reference to the held lock and does not take it again.
   `regenerate_summary` holds the lock from the read of the previous anchor
   commit to the removal of `summary.sig`.
+- The CLI commands `config set`, `config unset`, `remote add`, and `remote
+  delete` first decide each no-op and each refusal from the configuration
+  that `Repo::open` read, and take no lock for it. A held lock, a
+  `lock-timeout-secs` value, or a read-only repository thus does not change
+  the result of a no-op or a refusal. The commands take one `UpdateGuard`
+  only when a write is due, and check again under the guard. `config set`,
+  `config unset`, and `remote add` read the file with
+  `UpdateGuard::read_config`, make the edit again, write the file with
+  `UpdateGuard::write_config`, and then call `finish`. So the edit keeps each
+  change that another writer made before the command took the guard. A key
+  that `config unset` finds gone under the guard is success with no write. A
+  remote that `remote add` finds present under the guard gets the result of
+  the first check, with no write. `remote delete` calls
+  `UpdateGuard::delete_remote`, so the keyring goes first, under the same
+  guard, and a section that is gone under the guard gets the result of an
+  absent section. `remote add --gpg-import` imports the keyring after
+  `finish`, and only when the command wrote the remote, because
+  `Repo::gpg_import_keys` takes the locks itself.
 
 A prune takes no update lock for its ref deletions, and a static delta write
 takes none. `Repo::regenerate_summary` takes
@@ -5004,7 +5022,8 @@ New library work, not just CLI wiring:
   config rewrite (tmpfile, fdatasync, rename), matching the durability
   conventions the rest of the write path already follows.
 - `remote add/delete/list/show-url/refs/summary`: `add`/`delete` mutate a
-  `[remote "name"]` group through the same config-write path; `refs` and
+  `[remote "name"]` group under one `UpdateGuard`, which reads `config` from
+  disk and writes it through the same root-file writer; `refs` and
   `summary` reuse the pull machinery's existing remote resolution against a
   live remote.
 - `gpg-import`/`gpg-list-keys`: thin wrappers over the certificate parsing
@@ -5057,8 +5076,11 @@ does not already hold and reports that count, which is what the tool's own
 creation instant, and the user ids off each certificate. A `KEY-ID` selection
 takes the certificates its selectors name, and a selector naming nothing is
 refused by name, which leaves the keyring as it was. `remote delete` removes
-`<remote>.trustedkeys.gpg` with the section, through
-`Repo::remove_remote_keyring`.
+`<remote>.trustedkeys.gpg` and then the section, under one `UpdateGuard`,
+through `UpdateGuard::delete_remote`. A failure between the two steps leaves
+the section with no keyring. A valid remote name whose keyring name is longer
+than the file system accepts has no keyring file, so `remote delete` removes
+the section of that remote and exits 0.
 
 Four facts the option help does not state came out of the comparison, and are
 recorded in `format-reference.md`, "CLI output formats": `--no-sign-verify`

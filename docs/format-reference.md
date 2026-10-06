@@ -6049,7 +6049,9 @@ exit 1 with no usage text. A missing NAME or URL reports the usage text and
 `remote delete NAME` removes the section and the remote's
 `<remote>.trustedkeys.gpg` keyring, and prints nothing at exit 0. A section the
 document does not hold reports `error: Remote "<name>" not found` at exit 1,
-which `--if-exists` turns into exit 0.
+which `--if-exists` turns into exit 0. The port removes the keyring before it
+writes `config`, so a failed write of `config` leaves the section with no
+keyring.
 
 `remote list` prints one name per line, sorted by name, whatever order the
 sections appear in. `-u`/`--show-urls` prints each name padded with spaces to the

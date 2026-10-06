@@ -16,11 +16,13 @@
 //! the GLib string-unescaping and list-splitting rules on read.
 //! [`KeyFile::set_value`] takes a raw value and rejects group names, keys, and
 //! values whose structural characters would not survive a re-parse;
-//! [`KeyFile::set_string`] escapes a value the way the tool does on write.
-//! [`KeyFile::remove_key`] and [`KeyFile::remove_group`] are the write side's
-//! other half: a rewritten document keeps the groups and keys the caller did
-//! not touch, in the order it read them, and drops the comment and blank lines
-//! the input carried, which is what the tool's own rewrite does.
+//! [`KeyFile::set_string`] escapes a value the way the tool does on write;
+//! [`KeyFile::set_string_list`] escapes each item of a list the same way and
+//! writes the `;` separators. [`KeyFile::remove_key`] and
+//! [`KeyFile::remove_group`] are the write side's other half: a rewritten
+//! document keeps the groups and keys the caller did not touch, in the order
+//! it read them, and drops the comment and blank lines the input carried,
+//! which is what the tool's own rewrite does.
 
 use std::collections::HashMap;
 
@@ -247,6 +249,39 @@ impl KeyFile {
     /// [`set_value`](KeyFile::set_value) to store an already-escaped raw value.
     pub fn set_string(&mut self, group: &str, key: &str, value: &str) -> Result<()> {
         self.set_value(group, key, &escape(value))
+    }
+
+    /// Set a key to a list of string values. This is the inverse of
+    /// [`get_string_list`](KeyFile::get_string_list).
+    ///
+    /// Each item is escaped as [`set_string`](KeyFile::set_string) escapes a
+    /// value, so each space and tab at the start of each item is written
+    /// `\s` or `\t`. A `;` in an item is written `\;`. A `;` follows each
+    /// item, the last item included, and an empty list writes an empty value.
+    /// Because the last item always has a separator, an empty item reads back:
+    /// `["a", ""]` writes `a;;`, and `[""]` writes `;`. The group name and key
+    /// are validated as [`set_value`](KeyFile::set_value) validates them.
+    pub fn set_string_list(
+        &mut self,
+        group: &str,
+        key: &str,
+        items: &[impl AsRef<str>],
+    ) -> Result<()> {
+        let mut value = String::new();
+        for item in items {
+            // `escape` writes a backslash only as the first character of a
+            // two-character sequence whose second character is never `;`, so
+            // each `;` it writes stands alone and the `\;` added here stays a
+            // single escape.
+            for c in escape(item.as_ref()).chars() {
+                if c == ';' {
+                    value.push('\\');
+                }
+                value.push(c);
+            }
+            value.push(';');
+        }
+        self.set_value(group, key, &value)
     }
 
     /// Remove one key, reporting whether it was there.
@@ -770,6 +805,132 @@ mod tests {
             let reparsed = KeyFile::parse(&kf.to_string()).unwrap();
             assert_eq!(kf, reparsed);
         }
+    }
+
+    // ---- string lists on write ----------------------------------------------
+
+    #[test]
+    fn set_string_list_writes_a_trailing_separator() {
+        let mut kf = KeyFile::default();
+        kf.set_string_list("g", "k", &["a", "b"]).unwrap();
+        assert_eq!(kf.get_value("g", "k"), Some("a;b;"));
+        assert_eq!(kf.to_string(), "[g]\nk=a;b;\n");
+    }
+
+    /// (items, stored raw value) pairs shared by the escaping and round-trip
+    /// tests.
+    const LIST_CASES: &[(&[&str], &str)] = &[
+        (&["a;b", "c"], "a\\;b;c;"),
+        (&["a b"], "a b;"),
+        (&[" a"], "\\sa;"),
+        (&["x", " b"], "x;\\sb;"),
+        (&["a ", "b "], "a ;b ;"),
+        (&["\tx", "y\tz"], "\\tx;y\tz;"), // an interior tab is literal
+        (&["a\\b"], "a\\\\b;"),
+        (&["\\;"], "\\\\\\;;"),
+        (&["a\\"], "a\\\\;"),
+        (&["\\\\;"], "\\\\\\\\\\;;"),
+        (&[";"], "\\;;"),
+        (&[";;"], "\\;\\;;"),
+        (&["a\nb", "c\rd"], "a\\nb;c\\rd;"),
+    ];
+
+    #[test]
+    fn set_string_list_escapes_each_item() {
+        for &(items, stored) in LIST_CASES {
+            let mut kf = KeyFile::default();
+            kf.set_string_list("g", "k", items).unwrap();
+            assert_eq!(kf.get_value("g", "k"), Some(stored), "input {items:?}");
+        }
+    }
+
+    #[test]
+    fn set_string_list_get_string_list_round_trips() {
+        let extra: &[&[&str]] = &[
+            &["#c", "=", "[g]", "k=v"],
+            &["\u{a0}nb\u{a0}"],
+            &["   "],
+            &["a", "", ""],
+        ];
+        for &items in LIST_CASES.iter().map(|(items, _)| items).chain(extra) {
+            let mut kf = KeyFile::default();
+            kf.set_string_list("g", "k", items).unwrap();
+            assert_eq!(
+                kf.get_string_list("g", "k").unwrap().unwrap(),
+                items,
+                "input {items:?}"
+            );
+            // The stored value carries no raw newline, so it is a single line.
+            assert!(
+                !kf.get_value("g", "k").unwrap().contains(['\n', '\r']),
+                "input {items:?}"
+            );
+            // The serialized file reparses to an equal KeyFile and list.
+            let reparsed = KeyFile::parse(&kf.to_string()).unwrap();
+            assert_eq!(kf, reparsed, "input {items:?}");
+            assert_eq!(
+                reparsed.get_string_list("g", "k").unwrap().unwrap(),
+                items,
+                "input {items:?}"
+            );
+        }
+        // An owned list is accepted too.
+        let owned: Vec<String> = vec!["a;b".to_string(), " c".to_string()];
+        let mut kf = KeyFile::default();
+        kf.set_string_list("g", "k", &owned).unwrap();
+        assert_eq!(kf.get_value("g", "k"), Some("a\\;b;\\sc;"));
+        assert_eq!(kf.get_string_list("g", "k").unwrap(), Some(owned.clone()));
+        let reparsed = KeyFile::parse(&kf.to_string()).unwrap();
+        assert_eq!(kf, reparsed);
+        assert_eq!(reparsed.get_string_list("g", "k").unwrap(), Some(owned));
+    }
+
+    #[test]
+    fn set_string_list_keeps_empty_items() {
+        for (items, stored) in [
+            (&["a", ""][..], "a;;"),
+            (&[""][..], ";"),
+            (&["", "a"][..], ";a;"),
+            (&["", ""][..], ";;"),
+        ] {
+            let mut kf = KeyFile::default();
+            kf.set_string_list("g", "k", items).unwrap();
+            assert_eq!(kf.get_value("g", "k"), Some(stored), "input {items:?}");
+            assert_eq!(
+                kf.get_string_list("g", "k").unwrap().unwrap(),
+                items,
+                "input {items:?}"
+            );
+            let reparsed = KeyFile::parse(&kf.to_string()).unwrap();
+            assert_eq!(
+                reparsed.get_string_list("g", "k").unwrap().unwrap(),
+                items,
+                "input {items:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_string_list_writes_an_empty_list_as_an_empty_value() {
+        let mut kf = KeyFile::default();
+        kf.set_string_list("g", "k", &[] as &[&str]).unwrap();
+        assert_eq!(kf.get_value("g", "k"), Some(""));
+        assert_eq!(kf.to_string(), "[g]\nk=\n");
+        assert_eq!(kf.get_string_list("g", "k").unwrap(), Some(vec![]));
+        let reparsed = KeyFile::parse(&kf.to_string()).unwrap();
+        assert_eq!(reparsed.get_string_list("g", "k").unwrap(), Some(vec![]));
+    }
+
+    #[test]
+    fn set_string_list_replaces_in_place_and_validates_names() {
+        let mut kf = KeyFile::parse("[g]\nk=1\nz=2\n").unwrap();
+        kf.set_string_list("g", "k", &["x"]).unwrap();
+        assert_eq!(kf.to_string(), "[g]\nk=x;\nz=2\n");
+        let before = kf.clone();
+        assert!(kf.set_string_list("a[b", "k", &["x"]).is_err());
+        assert_eq!(kf, before);
+        assert!(kf.set_string_list("g", "a=b", &["x"]).is_err());
+        assert_eq!(kf, before);
     }
 
     // ---- B6: removal (observed via `ostree config unset`) -------------------

@@ -18661,18 +18661,37 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         both_refuse(&[&source, filter]);
     }
 
-    // Two compile limits whose refusal line agrees character for character, the
-    // character offset included, which is what the shared engine buys.
-    for (filter, line) in [
+    // The port reports the code-unit offset PCRE2 answers, and each loop below
+    // compares the port's line exactly. The tool reads the offset from the
+    // PCRE2 the host links, and the value follows that PCRE2 version, so the
+    // test compares the tool's line exactly except for the offset digits
+    // (`docs/conformance/cli-surface.md`, "P2").
+    let tool_refusal_agrees = |stderr: &[u8], expression: &str, reason: &str| {
+        let stderr = String::from_utf8_lossy(stderr);
+        let head = format!(
+            "error: --tar-pathname-filter: Error while compiling regular expression \
+             \u{2018}{expression}\u{2019} at char "
+        );
+        let Some(rest) = stderr.strip_prefix(head.as_str()) else {
+            return false;
+        };
+        let tail = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+        tail.len() < rest.len() && tail == format!(": {reason}\n")
+    };
+
+    // Two compile limits whose reason string agrees character for character.
+    for (filter, expression, at, reason) in [
         (
             "--tar-pathname-filter=[[:bogus:]],Q",
-            "error: --tar-pathname-filter: Error while compiling regular expression \
-             \u{2018}[[:bogus:]]\u{2019} at char 10: unknown POSIX class name\n",
+            "[[:bogus:]]",
+            10,
+            "unknown POSIX class name",
         ),
         (
             "--tar-pathname-filter=f{65536},Q",
-            "error: --tar-pathname-filter: Error while compiling regular expression \
-             \u{2018}f{65536}\u{2019} at char 7: number too big in {} quantifier\n",
+            "f{65536}",
+            7,
+            "number too big in {} quantifier",
         ),
     ] {
         let args = [
@@ -18686,19 +18705,24 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         let (port, tool) = run_both(&port_repo, &tool_repo, &args);
         for (who, run) in [("port", &port), ("tool", &tool)] {
             assert_eq!(run.status.code(), Some(1), "the {who} accepted `{filter}`");
-            assert_eq!(
-                String::from_utf8_lossy(&run.stderr),
-                line,
-                "the {who} worded the refusal of `{filter}` differently",
-            );
         }
+        assert_eq!(
+            String::from_utf8_lossy(&port.stderr),
+            format!(
+                "error: --tar-pathname-filter: Error while compiling regular expression \
+                 \u{2018}{expression}\u{2019} at char {at}: {reason}\n"
+            ),
+            "the port worded the refusal of `{filter}` differently",
+        );
+        assert!(
+            tool_refusal_agrees(&tool.stderr, expression, reason),
+            "the tool worded the refusal of `{filter}` differently: {:?}",
+            String::from_utf8_lossy(&tool.stderr),
+        );
     }
 
-    // The reason string is one of the two recorded divergences left in the
-    // compile-failure line: GLib passes some of PCRE2's reasons through and
-    // rewords others. The other is the unit the offset counts in, code units in
-    // the port and characters in the tool; every expression here is ASCII, so
-    // the offset agrees over each of them
+    // The reason string is a recorded divergence in the compile-failure line:
+    // GLib passes some of PCRE2's reasons through and rewords others
     // (`docs/conformance/cli-surface.md`, "P2").
     for (filter, expression, at, port_reason, tool_reason) in [
         (
@@ -18732,35 +18756,35 @@ fn commit_tar_pathname_filter_matches_the_tool() {
             filter,
         ];
         let (port, tool) = run_both(&port_repo, &tool_repo, &args);
-        let head = format!(
-            "error: --tar-pathname-filter: Error while compiling regular expression \
-             \u{2018}{expression}\u{2019} at char {at}: "
-        );
-        for (who, run, reason) in [("port", &port, port_reason), ("tool", &tool, tool_reason)] {
+        for (who, run) in [("port", &port), ("tool", &tool)] {
             assert_eq!(run.status.code(), Some(1), "the {who} accepted `{filter}`");
-            assert_eq!(
-                String::from_utf8_lossy(&run.stderr),
-                format!("{head}{reason}\n"),
-                "the {who} worded the refusal of `{filter}` differently",
-            );
         }
+        assert_eq!(
+            String::from_utf8_lossy(&port.stderr),
+            format!(
+                "error: --tar-pathname-filter: Error while compiling regular expression \
+                 \u{2018}{expression}\u{2019} at char {at}: {port_reason}\n"
+            ),
+            "the port worded the refusal of `{filter}` differently",
+        );
+        assert!(
+            tool_refusal_agrees(&tool.stderr, expression, tool_reason),
+            "the tool worded the refusal of `{filter}` differently: {:?}",
+            String::from_utf8_lossy(&tool.stderr),
+        );
     }
 
-    // The unit the offset counts in is the other one: the port reports the
-    // code-unit offset PCRE2 answers, which is a byte offset for the 8-bit
-    // library, and the tool reports a character offset. A non-ASCII character
-    // ahead of the error point moves the two apart by the extra bytes it
-    // occupies, so the two-byte `é` moves them apart by one and the four-byte
-    // `U+1F600` by three, which counts per character and not per two bytes.
-    // Each expression carries one error the loop above already words, so the
-    // count is stated apart from the error kind
-    // (`docs/conformance/cli-surface.md`, "P2").
-    for (filter, expression, port_at, tool_at, port_reason, tool_reason) in [
+    // The port reports the code-unit offset PCRE2 answers, which is a byte
+    // offset for the 8-bit library. A non-ASCII character ahead of the error
+    // point adds the extra bytes it occupies, so the two-byte `é` adds one and
+    // the four-byte `U+1F600` adds three. Each expression carries one error the
+    // loop above already words, so the count is stated apart from the error
+    // kind (`docs/conformance/cli-surface.md`, "P2").
+    for (filter, expression, port_at, port_reason, tool_reason) in [
         (
             r"--tar-pathname-filter=é\q,Q",
             r"é\q",
             3,
-            2,
             r"unrecognized character follows \",
             r"unrecognised character following \",
         ),
@@ -18768,7 +18792,6 @@ fn commit_tar_pathname_filter_matches_the_tool() {
             r"--tar-pathname-filter=éé\q,Q",
             r"éé\q",
             5,
-            3,
             r"unrecognized character follows \",
             r"unrecognised character following \",
         ),
@@ -18776,7 +18799,6 @@ fn commit_tar_pathname_filter_matches_the_tool() {
             r"--tar-pathname-filter=😀\q,Q",
             r"😀\q",
             5,
-            2,
             r"unrecognized character follows \",
             r"unrecognised character following \",
         ),
@@ -18784,7 +18806,6 @@ fn commit_tar_pathname_filter_matches_the_tool() {
             "--tar-pathname-filter=é[[:bogus:]],Q",
             "é[[:bogus:]]",
             12,
-            11,
             "unknown POSIX class name",
             "unknown POSIX class name",
         ),
@@ -18792,7 +18813,6 @@ fn commit_tar_pathname_filter_matches_the_tool() {
             "--tar-pathname-filter=édir1((,x",
             "édir1((",
             8,
-            7,
             "missing closing parenthesis",
             "missing terminating )",
         ),
@@ -18800,7 +18820,6 @@ fn commit_tar_pathname_filter_matches_the_tool() {
             "--tar-pathname-filter=ééédir1((,x",
             "ééédir1((",
             12,
-            9,
             "missing closing parenthesis",
             "missing terminating )",
         ),
@@ -18808,7 +18827,6 @@ fn commit_tar_pathname_filter_matches_the_tool() {
             "--tar-pathname-filter=éf{65536},Q",
             "éf{65536}",
             9,
-            8,
             "number too big in {} quantifier",
             "number too big in {} quantifier",
         ),
@@ -18816,7 +18834,6 @@ fn commit_tar_pathname_filter_matches_the_tool() {
             "--tar-pathname-filter=é(*BOGUS)f,Q",
             "é(*BOGUS)f",
             9,
-            8,
             "(*VERB) not recognized or malformed",
             "(*VERB) not recognised",
         ),
@@ -18830,23 +18847,22 @@ fn commit_tar_pathname_filter_matches_the_tool() {
             filter,
         ];
         let (port, tool) = run_both(&port_repo, &tool_repo, &args);
-        let line = |at: usize, reason: &str| {
+        for (who, run) in [("port", &port), ("tool", &tool)] {
+            assert_eq!(run.status.code(), Some(1), "the {who} accepted `{filter}`");
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&port.stderr),
             format!(
                 "error: --tar-pathname-filter: Error while compiling regular expression \
-                 \u{2018}{expression}\u{2019} at char {at}: {reason}\n"
-            )
-        };
-        for (who, run, at, reason) in [
-            ("port", &port, port_at, port_reason),
-            ("tool", &tool, tool_at, tool_reason),
-        ] {
-            assert_eq!(run.status.code(), Some(1), "the {who} accepted `{filter}`");
-            assert_eq!(
-                String::from_utf8_lossy(&run.stderr),
-                line(at, reason),
-                "the {who} reported another offset or reason for `{filter}`",
-            );
-        }
+                 \u{2018}{expression}\u{2019} at char {port_at}: {port_reason}\n"
+            ),
+            "the port reported another offset or reason for `{filter}`",
+        );
+        assert!(
+            tool_refusal_agrees(&tool.stderr, expression, tool_reason),
+            "the tool reported another reason for `{filter}`: {:?}",
+            String::from_utf8_lossy(&tool.stderr),
+        );
     }
 
     // A match-time limit refuses the commit. PCRE2 accounts a step budget, so an

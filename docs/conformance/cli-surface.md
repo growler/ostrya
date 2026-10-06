@@ -585,27 +585,33 @@ The reason string is the first. GLib passes some of PCRE2's own reasons through
 and rewords others. The reword set is wider than the five the cited test
 compares:
 
-- `[[:bogus:]]` at char 10 reads `unknown POSIX class name` from both, character
-  for character.
-- `f{65536}` at char 7 reads `number too big in {} quantifier` from both.
-- `dir1((` at char 6 reads `missing closing parenthesis` from the port and
-  `missing terminating )` from the tool.
-- `\q` at char 1 reads `unrecognized character follows \` from the port and
+- `[[:bogus:]]` reads `unknown POSIX class name` from both, character for
+  character.
+- `f{65536}` reads `number too big in {} quantifier` from both.
+- `dir1((` reads `missing closing parenthesis` from the port and `missing
+  terminating )` from the tool.
+- `\q` reads `unrecognized character follows \` from the port and
   `unrecognised character following \` from the tool.
-- `(*BOGUS)f` at char 7 reads `(*VERB) not recognized or malformed` from the
-  port and `(*VERB) not recognised` from the tool.
+- `(*BOGUS)f` reads `(*VERB) not recognized or malformed` from the port and
+  `(*VERB) not recognised` from the tool.
 
-The unit `N` counts is the second. The port reports the code-unit offset PCRE2
-answers, which is a byte offset for the 8-bit library, and the tool reports a
-character offset. The two answer the same offset for an expression that holds
-ASCII characters alone ahead of the error point, which is every expression
-above. Past that the port's offset runs ahead by the extra bytes the characters
-before the error point occupy. Each probe below carries one error the list above
-already states, so the count rule is measured apart from the error kind. The
-port's offset stands first.
+The offset `N` is the second. The port reports the code-unit offset PCRE2
+answers, which is a byte offset for the 8-bit library. The tool reads the
+offset from the PCRE2 the host links and counts it in characters, and the value
+follows that PCRE2 version.
+With PCRE2 10.48 the tool reports char 2 for `\q`, and the port, with its
+compiled-in PCRE2 10.46, reports char 1. The cited test compares the port's
+line exactly and the tool's line exactly except for the offset digits.
 
-- `é\q` reads 3 and 2, and `éé\q` reads 5 and 3.
-- The four-byte `U+1F600` ahead of `\q` reads 5 and 2.
+The port's offset is 10 for `[[:bogus:]]`, 7 for `f{65536}`, 6 for `dir1((`, 1
+for `\q`, and 7 for `(*BOGUS)f`. A non-ASCII character ahead of the error
+point adds the extra bytes it occupies to the port's offset. Each probe below
+carries one error the list above already states, so the count rule is measured
+apart from the error kind. The port's offset stands first, and the tool's
+offset with PCRE2 10.48 stands second.
+
+- `é\q` reads 3 and 3, and `éé\q` reads 5 and 4.
+- The four-byte `U+1F600` ahead of `\q` reads 5 and 3.
 - `é[[:bogus:]]` reads 12 and 11, `édir1((` reads 8 and 7, `éf{65536}` reads 9
   and 8, and `é(*BOGUS)f` reads 9 and 8.
 - `ééédir1((` reads 12 and 9.
@@ -629,7 +635,7 @@ name of '<name>' is not valid UTF-8` at exit 1, and the tool's assertion reads
 The PCRE2 version is the last difference. The port carries the 10.46 the
 `pcre2-sys` crate vendors, pinned to the vendored static build in
 `.cargo/config.toml` so a host that installs `libpcre2-dev` cannot supply
-another, and the tool carries whatever the host GLib links, which is 10.46 on
+another, and the tool carries whatever the host GLib links, which is 10.48 on
 the host these probes ran on.
 
 The fourth is a reference defect over a member the filter maps to the empty

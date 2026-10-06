@@ -8008,18 +8008,18 @@ note: a value with no comma reports `error: Missing ',' in
  both report `error: --tar-pathname-filter: Error while compiling regular
  expression '<expression>' at char N: <reason>`. The reason string is one
  difference: GLib passes some of PCRE2's own reasons through and rewords
- others, so `[[:bogus:]]` and `f{65536}` agree character for character where
- `dir1((`, `\q`, and `(*BOGUS)f` part on the reason alone. The unit `N` counts
- is the other: the port reports the code-unit offset PCRE2 answers, the tool
- reports a character offset. The two agree over an expression that holds ASCII
- characters alone ahead of the error point, which is the five named above, and
- the cited test states each of the five lines. A non-ASCII character ahead of
- the error point parts the offsets by the code units that character occupies
- beyond the first: `\q` behind one `é` reports char 3 from the port and char 2
- from the tool, and behind one `U+1F600` char 5 and char 2. The cited test
- states both offsets over eight such expressions, so an assertion holds the
- divergence (`cli-surface.md`, "Scope of CLI compatibility"). Both need a
- `tar=` source, which no setup binds.
+ others, so `[[:bogus:]]` and `f{65536}` give the same reason where `dir1((`,
+ `\q`, and `(*BOGUS)f` give different reasons. The offset `N` is the other:
+ the port reports the code-unit offset PCRE2 answers, and the tool reads the
+ offset from the PCRE2 the host links, so its value follows that PCRE2
+ version. With PCRE2 10.48 the tool reports char 2 for `\q`, and the port,
+ with its compiled-in PCRE2 10.46, reports char 1. A non-ASCII character ahead
+ of the error point adds to the port's offset the code units that character
+ occupies beyond the first: `\q` behind one `é` reports char 3 from the port,
+ and behind one `U+1F600` char 5. The cited test states the port's line
+ exactly over thirteen expressions, and the tool's line exactly except for the
+ offset digits, so an assertion holds the divergence (`cli-surface.md`, "Scope
+ of CLI compatibility"). Both need a `tar=` source, which no setup binds.
 
 family: M10
 subcommand: commit

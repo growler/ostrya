@@ -5,8 +5,11 @@
 
 mod common;
 
+use std::future::Future;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use common::{
@@ -484,6 +487,468 @@ fn the_writes_of_the_guard_are_visible_under_the_guard() {
         reopened.config().keyfile().get_value("ex-test", "written"),
         Some("under-the-guard")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Remotes.
+// ---------------------------------------------------------------------------
+
+/// The key-file group of the remote `name`.
+fn group(name: &str) -> String {
+    format!("remote \"{name}\"")
+}
+
+/// The bytes and the inode of the config of the repository at `path`.
+fn config_file(path: &Path) -> (Vec<u8>, u64) {
+    let config = path.join("config");
+    let ino = std::fs::metadata(&config).unwrap().ino();
+    (std::fs::read(&config).unwrap(), ino)
+}
+
+/// The keys of the remote `name` and their values, in file order, as the
+/// config of the repository at `path` holds them on disk.
+fn remote_keys(path: &Path, name: &str) -> Vec<(String, String)> {
+    let text = std::fs::read_to_string(path.join("config")).unwrap();
+    let keyfile = ostrya_core::KeyFile::parse(&text).unwrap();
+    let group = group(name);
+    keyfile
+        .keys(&group)
+        .map(|k| {
+            let value = keyfile.get_string(&group, k).unwrap().unwrap();
+            (k.to_owned(), value)
+        })
+        .collect()
+}
+
+/// Add the remote `name` with `keys` through a guard of its own.
+fn add_remote(path: &Path, name: &str, keys: &[(&str, &str)]) {
+    let repo = open(path);
+    block_on(async {
+        let guard = repo.begin_update().await.unwrap();
+        guard.add_remote(name, keys).await.unwrap();
+        guard.finish().await.unwrap();
+    });
+}
+
+fn assert_invalid_input<T: std::fmt::Debug>(result: ostrya::Result<T>) {
+    match result {
+        Err(Error::InvalidInput(_)) => {}
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+}
+
+fn assert_remote_not_found<T: std::fmt::Debug>(result: ostrya::Result<T>, name: &str) {
+    match result {
+        Err(Error::RemoteNotFound(n)) => assert_eq!(n, name),
+        other => panic!("expected RemoteNotFound, got {other:?}"),
+    }
+}
+
+/// A remote added through the guard is in the config a new open reads, with
+/// its keys in the order given and a value escaped as the key file escapes it.
+#[test]
+fn add_remote_writes_a_group_a_new_open_reads() {
+    let tmp = TmpDir::new("guard-remote-add");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    add_remote(
+        &path,
+        "origin",
+        &[("url", "https://example.invalid/repo"), ("note", " a\nb")],
+    );
+    let repo = open(&path);
+    assert_eq!(repo.config().remotes().collect::<Vec<_>>(), ["origin"]);
+    assert_eq!(
+        repo.config().remote("origin").unwrap().url().unwrap(),
+        Some("https://example.invalid/repo".to_owned())
+    );
+    assert_eq!(
+        remote_keys(&path, "origin"),
+        [
+            ("url".to_owned(), "https://example.invalid/repo".to_owned()),
+            ("note".to_owned(), " a\nb".to_owned()),
+        ]
+    );
+}
+
+/// An add over a remote that exists fails with `RemoteExists` and leaves the
+/// config file as it was, down to its inode.
+#[test]
+fn add_remote_over_an_existing_remote_writes_nothing() {
+    let tmp = TmpDir::new("guard-remote-exists");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    add_remote(&path, "origin", &[("url", "https://example.invalid/one")]);
+    let before = config_file(&path);
+    let repo = open(&path);
+    block_on(async {
+        let guard = repo.begin_update().await.unwrap();
+        match guard
+            .add_remote("origin", &[("url", "https://example.invalid/two")])
+            .await
+        {
+            Err(Error::RemoteExists(name)) => assert_eq!(name, "origin"),
+            other => panic!("expected RemoteExists, got {other:?}"),
+        }
+        guard.finish().await.unwrap();
+    });
+    assert_eq!(config_file(&path), before);
+}
+
+/// An add refuses a name the tool refuses and an empty key list, and an add
+/// and a set refuse a key name the config cannot hold. Nothing is written.
+#[test]
+fn the_remote_calls_refuse_bad_names_and_keys() {
+    let tmp = TmpDir::new("guard-remote-invalid");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    add_remote(&path, "origin", &[("url", "https://example.invalid/repo")]);
+    let before = config_file(&path);
+    let repo = open(&path);
+    block_on(async {
+        let guard = repo.begin_update().await.unwrap();
+        for name in ["", "-", ".", "..", "a b", "a/b", "a+b"] {
+            assert_invalid_input(guard.add_remote(name, &[("url", "u")]).await);
+        }
+        assert_invalid_input(guard.add_remote("fresh", &[]).await);
+        for key in ["a=b", " k", "#k", ""] {
+            assert_invalid_input(guard.add_remote("fresh", &[("url", "u"), (key, "v")]).await);
+            assert_invalid_input(guard.set_remote_key("origin", key, "v").await);
+        }
+        guard.finish().await.unwrap();
+    });
+    assert_eq!(config_file(&path), before);
+}
+
+/// A set writes one key and leaves the other keys of the group as they were;
+/// an unset removes it. An unset of an absent key returns `false` and leaves
+/// the config file as it was, down to its inode.
+#[test]
+fn set_and_unset_remote_key_edit_one_key() {
+    let tmp = TmpDir::new("guard-remote-set");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    add_remote(
+        &path,
+        "origin",
+        &[
+            ("url", "https://example.invalid/repo"),
+            ("gpg-verify", "false"),
+        ],
+    );
+    let repo = open(&path);
+    block_on(async {
+        let guard = repo.begin_update().await.unwrap();
+        guard
+            .set_remote_key("origin", "url", "https://example.invalid/moved")
+            .await
+            .unwrap();
+        guard
+            .set_remote_key("origin", "branches", "main;")
+            .await
+            .unwrap();
+        assert_eq!(
+            remote_keys(&path, "origin"),
+            [
+                ("url".to_owned(), "https://example.invalid/moved".to_owned()),
+                ("gpg-verify".to_owned(), "false".to_owned()),
+                ("branches".to_owned(), "main;".to_owned()),
+            ]
+        );
+
+        assert!(guard.unset_remote_key("origin", "url").await.unwrap());
+        assert_eq!(
+            remote_keys(&path, "origin"),
+            [
+                ("gpg-verify".to_owned(), "false".to_owned()),
+                ("branches".to_owned(), "main;".to_owned()),
+            ]
+        );
+
+        let before = config_file(&path);
+        assert!(!guard.unset_remote_key("origin", "url").await.unwrap());
+        assert_eq!(config_file(&path), before);
+        guard.finish().await.unwrap();
+    });
+}
+
+/// A set and an unset on a remote the config does not carry fail with
+/// `RemoteNotFound` and write nothing.
+#[test]
+fn set_and_unset_on_an_absent_remote_fail() {
+    let tmp = TmpDir::new("guard-remote-set-absent");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let before = config_file(&path);
+    let repo = open(&path);
+    block_on(async {
+        let guard = repo.begin_update().await.unwrap();
+        assert_remote_not_found(guard.set_remote_key("absent", "url", "u").await, "absent");
+        assert_remote_not_found(guard.unset_remote_key("absent", "url").await, "absent");
+        guard.finish().await.unwrap();
+    });
+    assert_eq!(config_file(&path), before);
+}
+
+/// A delete removes the group and the trusted keyring of the remote, and it
+/// succeeds for a remote that has no keyring.
+#[test]
+fn delete_remote_removes_the_group_and_the_keyring() {
+    let tmp = TmpDir::new("guard-remote-delete");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    add_remote(&path, "keyed", &[("url", "https://example.invalid/keyed")]);
+    add_remote(&path, "bare", &[("url", "https://example.invalid/bare")]);
+    let keyring = path.join("keyed.trustedkeys.gpg");
+    std::fs::write(&keyring, b"keys").unwrap();
+    let repo = open(&path);
+    block_on(async {
+        let guard = repo.begin_update().await.unwrap();
+        guard.delete_remote("keyed").await.unwrap();
+        assert!(!keyring.exists());
+        guard.delete_remote("bare").await.unwrap();
+        guard.finish().await.unwrap();
+    });
+    let reopened = open(&path);
+    assert_eq!(reopened.config().remotes().count(), 0);
+    assert!(!reopened.config().keyfile().has_group(&group("keyed")));
+}
+
+/// A delete of a remote the config does not carry fails with
+/// `RemoteNotFound` and removes no keyring; a delete of a name the tool
+/// refuses fails with `InvalidInput`.
+#[test]
+fn delete_remote_refuses_an_absent_remote_and_a_bad_name() {
+    let tmp = TmpDir::new("guard-remote-delete-absent");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let stale = path.join("gone.trustedkeys.gpg");
+    std::fs::write(&stale, b"keys").unwrap();
+    let before = config_file(&path);
+    let repo = open(&path);
+    block_on(async {
+        let guard = repo.begin_update().await.unwrap();
+        assert_remote_not_found(guard.delete_remote("gone").await, "gone");
+        for name in ["", "..", "a/b", "../gone"] {
+            assert_invalid_input(guard.delete_remote(name).await);
+        }
+        guard.finish().await.unwrap();
+    });
+    assert!(stale.exists());
+    assert_eq!(config_file(&path), before);
+}
+
+/// Each guard reads the config on disk, so a guard of a handle opened before
+/// another handle added a remote keeps that remote when it adds its own.
+#[test]
+fn a_guard_adds_to_the_config_another_handle_wrote() {
+    let tmp = TmpDir::new("guard-remote-two-handles");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let first = open(&path);
+    add_remote(&path, "one", &[("url", "https://example.invalid/one")]);
+    block_on(async {
+        let guard = first.begin_update().await.unwrap();
+        guard
+            .add_remote("two", &[("url", "https://example.invalid/two")])
+            .await
+            .unwrap();
+        guard.finish().await.unwrap();
+    });
+    let reopened = open(&path);
+    assert_eq!(
+        reopened.config().remotes().collect::<Vec<_>>(),
+        ["one", "two"]
+    );
+}
+
+/// Poll each future of `futures` in turn until all of them are ready, so
+/// their blocking work runs at the same time.
+async fn join_all(mut futures: Vec<Pin<Box<dyn Future<Output = ()> + '_>>>) {
+    let mut done = vec![false; futures.len()];
+    futures_lite::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (future, done) in futures.iter_mut().zip(done.iter_mut()) {
+            if !*done {
+                match future.as_mut().poll(cx) {
+                    Poll::Ready(()) => *done = true,
+                    Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })
+    .await;
+}
+
+/// Eight adds on one guard, polled together, each keep the remotes the
+/// others added.
+#[test]
+fn concurrent_adds_on_one_guard_lose_no_remote() {
+    let tmp = TmpDir::new("guard-remote-concurrent-add");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let names: Vec<String> = (0..8).map(|i| format!("r{i}")).collect();
+    let repo = open(&path);
+    block_on(async {
+        let guard = repo.begin_update().await.unwrap();
+        let adds = names
+            .iter()
+            .map(|name| {
+                let guard = &guard;
+                Box::pin(async move {
+                    guard
+                        .add_remote(name, &[("url", "https://example.invalid/repo")])
+                        .await
+                        .unwrap();
+                }) as Pin<Box<dyn Future<Output = ()> + '_>>
+            })
+            .collect();
+        join_all(adds).await;
+        guard.finish().await.unwrap();
+    });
+    let reopened = open(&path);
+    let mut remotes: Vec<&str> = reopened.config().remotes().collect();
+    remotes.sort_unstable();
+    assert_eq!(remotes, names);
+}
+
+/// An add, a set, an unset, and a delete on one guard, polled together, each
+/// keep the edits of the others.
+#[test]
+fn concurrent_remote_calls_on_one_guard_keep_each_edit() {
+    let tmp = TmpDir::new("guard-remote-concurrent-mix");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    for name in ["set", "unset", "gone"] {
+        add_remote(
+            &path,
+            name,
+            &[("url", "https://example.invalid/repo"), ("note", "n")],
+        );
+    }
+    let repo = open(&path);
+    block_on(async {
+        let guard = repo.begin_update().await.unwrap();
+        let edits = &guard;
+        join_all(vec![
+            Box::pin(async move {
+                edits
+                    .add_remote("added", &[("url", "https://example.invalid/added")])
+                    .await
+                    .unwrap();
+            }),
+            Box::pin(async move {
+                edits.set_remote_key("set", "note", "m").await.unwrap();
+            }),
+            Box::pin(async move {
+                assert!(edits.unset_remote_key("unset", "note").await.unwrap());
+            }),
+            Box::pin(async move {
+                edits.delete_remote("gone").await.unwrap();
+            }),
+        ])
+        .await;
+        guard.finish().await.unwrap();
+    });
+    let url = ("url".to_owned(), "https://example.invalid/repo".to_owned());
+    assert_eq!(
+        remote_keys(&path, "set"),
+        [url.clone(), ("note".to_owned(), "m".to_owned())]
+    );
+    assert_eq!(remote_keys(&path, "unset"), [url]);
+    let reopened = open(&path);
+    let mut remotes: Vec<&str> = reopened.config().remotes().collect();
+    remotes.sort_unstable();
+    assert_eq!(remotes, ["added", "set", "unset"]);
+}
+
+/// A delete removes the keyring before it writes the config: a keyring path
+/// that is a directory fails the delete, and the config file stays as it
+/// was, down to its inode.
+#[test]
+fn delete_remote_fails_on_the_keyring_before_it_writes_the_config() {
+    let tmp = TmpDir::new("guard-remote-delete-order");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    add_remote(&path, "origin", &[("url", "https://example.invalid/repo")]);
+    std::fs::create_dir(path.join("origin.trustedkeys.gpg")).unwrap();
+    let before = config_file(&path);
+    let repo = open(&path);
+    block_on(async {
+        let guard = repo.begin_update().await.unwrap();
+        assert!(guard.delete_remote("origin").await.is_err());
+        guard.finish().await.unwrap();
+    });
+    assert_eq!(config_file(&path), before);
+    assert!(path.join("origin.trustedkeys.gpg").is_dir());
+}
+
+/// An add leaves a trusted keyring of the name as it was.
+#[test]
+fn add_remote_leaves_an_existing_keyring() {
+    let tmp = TmpDir::new("guard-remote-add-keyring");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let keyring = path.join("origin.trustedkeys.gpg");
+    std::fs::write(&keyring, b"keys").unwrap();
+    add_remote(&path, "origin", &[("url", "https://example.invalid/repo")]);
+    assert_eq!(std::fs::read(&keyring).unwrap(), b"keys");
+}
+
+/// A remote whose keyring name is too long for any file is added and then
+/// deleted.
+#[test]
+fn a_remote_with_a_long_name_is_added_and_deleted() {
+    let tmp = TmpDir::new("guard-remote-long-name");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let name = "a".repeat(250);
+    add_remote(&path, &name, &[("url", "https://example.invalid/repo")]);
+    let repo = open(&path);
+    assert_eq!(repo.config().remotes().collect::<Vec<_>>(), [name.as_str()]);
+    block_on(async {
+        let guard = repo.begin_update().await.unwrap();
+        guard.delete_remote(&name).await.unwrap();
+        guard.finish().await.unwrap();
+    });
+    assert!(!open(&path).config().keyfile().has_group(&group(&name)));
+}
+
+/// A set of the value a key holds writes nothing, also when the file spells
+/// the value with an escape the set would not write.
+#[test]
+fn set_remote_key_to_the_held_value_writes_nothing() {
+    let tmp = TmpDir::new("guard-remote-set-same");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    add_remote(&path, "origin", &[("url", "https://example.invalid/repo")]);
+    append_config(&path, "branches=a\\;b\n");
+    let before = config_file(&path);
+    let repo = open(&path);
+    block_on(async {
+        let guard = repo.begin_update().await.unwrap();
+        guard
+            .set_remote_key("origin", "url", "https://example.invalid/repo")
+            .await
+            .unwrap();
+        guard
+            .set_remote_key("origin", "branches", "a;b")
+            .await
+            .unwrap();
+        guard.finish().await.unwrap();
+    });
+    assert_eq!(config_file(&path), before);
+}
+
+/// A set on a remote whose group name the config parses and a set refuses
+/// fails with the error of the key file, and writes nothing.
+#[test]
+fn set_remote_key_passes_on_an_error_of_the_group() {
+    let tmp = TmpDir::new("guard-remote-set-bad-group");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    append_config(&path, "\n[remote \"a\rb\"]\nurl=x\n");
+    let before = config_file(&path);
+    let repo = open(&path);
+    block_on(async {
+        let guard = repo.begin_update().await.unwrap();
+        match guard.set_remote_key("a\rb", "url", "y").await {
+            Err(Error::Core(_)) => {}
+            other => panic!("expected Core, got {other:?}"),
+        }
+        guard.finish().await.unwrap();
+    });
+    assert_eq!(config_file(&path), before);
 }
 
 // ---------------------------------------------------------------------------

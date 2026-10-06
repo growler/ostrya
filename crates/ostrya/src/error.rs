@@ -35,6 +35,14 @@ pub enum Error {
     /// A refspec did not resolve to a commit.
     #[error("ref not found: {0}")]
     RefNotFound(String),
+    /// The configuration has no `[remote "<name>"]` group for the remote. The
+    /// payload is the remote name.
+    #[error("remote not found: {0}")]
+    RemoteNotFound(String),
+    /// The configuration already has a `[remote "<name>"]` group for the
+    /// remote. The payload is the remote name.
+    #[error("remote already exists: {0}")]
+    RemoteExists(String),
     /// A refspec does not name a path inside the `refs/` tree: an empty name,
     /// an empty, `.`, or `..` component, a remote or collection element holding
     /// a `/`, or an interior NUL. The payload is the refspec as given, spelled
@@ -425,6 +433,7 @@ impl From<Error> for std::io::Error {
             | Error::DanglingSymlink { .. }
             | Error::ObjectNotFound { .. }
             | Error::RefNotFound(_)
+            | Error::RemoteNotFound(_)
             | Error::StaticDeltaNotFound { .. }
             | Error::HttpStatus { status: 404, .. } => ErrorKind::NotFound,
             Error::HttpStatus {
@@ -432,9 +441,10 @@ impl From<Error> for std::io::Error {
             } => ErrorKind::PermissionDenied,
             Error::FetchTooLarge { .. } => ErrorKind::FileTooLarge,
             Error::NotADirectory { .. } | Error::ReplaceFileWithDir(_) => ErrorKind::NotADirectory,
-            Error::EntryExists { .. } | Error::MergeConflict(_) | Error::ReplaceDirWithFile(_) => {
-                ErrorKind::AlreadyExists
-            }
+            Error::EntryExists { .. }
+            | Error::MergeConflict(_)
+            | Error::ReplaceDirWithFile(_)
+            | Error::RemoteExists(_) => ErrorKind::AlreadyExists,
             Error::MutableTree(_) | Error::InvalidInput(_) => ErrorKind::InvalidInput,
             _ => ErrorKind::Other,
         };
@@ -478,6 +488,7 @@ mod tests {
                 ErrorKind::NotFound,
             ),
             (Error::RefNotFound("x/y".into()), ErrorKind::NotFound),
+            (Error::RemoteNotFound("origin".into()), ErrorKind::NotFound),
             (
                 Error::StaticDeltaNotFound {
                     from: None,
@@ -503,6 +514,10 @@ mod tests {
             ),
             (
                 Error::ReplaceDirWithFile("etc".into()),
+                ErrorKind::AlreadyExists,
+            ),
+            (
+                Error::RemoteExists("origin".into()),
                 ErrorKind::AlreadyExists,
             ),
             (

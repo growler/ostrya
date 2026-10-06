@@ -400,8 +400,7 @@ impl Repo {
     /// The handle keeps the configuration it was opened with.
     pub(crate) async fn read_config_file(&self) -> Result<RepoConfig> {
         let repo = self.clone();
-        let bytes = ostrya_rt::unblock(move || read_file(repo.repo_fd(), CONFIG)).await?;
-        parse_config(&bytes)
+        ostrya_rt::unblock(move || read_config_blocking(repo.repo_fd())).await
     }
 
     /// The repository root directory fd, anchoring fd-relative access to
@@ -442,6 +441,13 @@ pub(crate) fn check_config_size(bytes: &[u8]) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Read `config` at the repository root and parse it, as the open of a
+/// handle does. Blocks the calling thread.
+pub(crate) fn read_config_blocking(repo_fd: BorrowedFd<'_>) -> Result<RepoConfig> {
+    let bytes = read_file(repo_fd, CONFIG)?;
+    parse_config(&bytes)
 }
 
 /// Parse the bytes of `config`. This step is CPU-only. A read of `config`

@@ -7822,23 +7822,6 @@ fn remote_group(name: &str) -> String {
     format!("remote \"{name}\"")
 }
 
-/// Whether `name` is a name the tool accepts for a remote: at least one
-/// character, every character alphanumeric or one of `-`, `_`, `.`, and the
-/// first one alphanumeric or `_`. Recovered by offering the tool a set of names
-/// (`docs/format-reference.md`, "CLI output formats", under `remote add`), which
-/// is why `_` is a name and `-`, `.`, and `..` are not.
-fn valid_remote_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first.is_alphanumeric() || first == '_') {
-        return false;
-    }
-    name.chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
-}
-
 /// The operand naming the remote, or the tool's own refusal for a missing one.
 fn remote_operand<'a>(nested: &str, name: Option<&'a str>) -> &'a str {
     match name {
@@ -7894,7 +7877,7 @@ async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()
     if !args.sign_verify.is_empty() && args.no_sign_verify {
         exit_error("Cannot specify both --sign-verify and --no-sign-verify");
     }
-    if !valid_remote_name(name) {
+    if !ostrya::valid_remote_name(name) {
         exit_error(&format!("Invalid remote name {name}"));
     }
 
@@ -8005,7 +7988,7 @@ fn parse_sign_verify_spec(spec: &str) -> (&str, &str, bool) {
 /// Delete a remote's configuration section and its trusted keyring.
 async fn remote_delete(repo: &Repo, nested: &str, args: RemoteDeleteArgs) -> Result<()> {
     let name = remote_operand(nested, args.name.as_deref());
-    if !valid_remote_name(name) {
+    if !ostrya::valid_remote_name(name) {
         exit_error(&format!("Invalid remote name {name}"));
     }
     let mut keyfile = repo.config().keyfile().clone();

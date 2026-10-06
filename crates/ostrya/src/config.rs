@@ -437,6 +437,11 @@ impl RepoConfig {
     pub fn keyfile(&self) -> &KeyFile {
         &self.keyfile
     }
+
+    /// The parsed key file backing this view, taken by value.
+    pub(crate) fn into_keyfile(self) -> KeyFile {
+        self.keyfile
+    }
 }
 
 impl Repo {
@@ -723,8 +728,25 @@ fn parse_sign_verify(raw: Option<&str>) -> SignVerify {
 }
 
 /// The key-file group name for a remote: `remote "<name>"`.
-fn remote_group(name: &str) -> String {
+pub(crate) fn remote_group(name: &str) -> String {
     format!("remote \"{name}\"")
+}
+
+/// Whether `name` is a name the tool accepts for a remote: at least one
+/// character, every character alphanumeric or one of `-`, `_`, `.`, and the
+/// first one alphanumeric or `_`. So `_` is a name, and `-`, `.`, and `..` are
+/// not. "Alphanumeric" is [`char::is_alphanumeric`], so a non-ASCII letter
+/// counts.
+pub fn valid_remote_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_alphanumeric() || first == '_') {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// The remote name in a `remote "<name>"` group header, or `None` for any other
@@ -758,6 +780,16 @@ mod tests {
     use super::*;
 
     const ARCHIVE_CONFIG: &str = "[core]\nrepo_version=1\nmode=archive-z2\n";
+
+    #[test]
+    fn valid_remote_name_takes_the_names_the_tool_takes() {
+        for name in ["_", "1o", "a..b", "\u{e9}", "origin"] {
+            assert!(valid_remote_name(name), "{name:?}");
+        }
+        for name in ["", "-", ".", "..", "a b", "a/b", "a+b"] {
+            assert!(!valid_remote_name(name), "{name:?}");
+        }
+    }
 
     #[test]
     fn parses_core_mode_and_version() {

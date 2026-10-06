@@ -135,6 +135,8 @@ pub enum Error {
     Core(ostrya_core::Error),          // the format-primitive layer
     ObjectNotFound { checksum: Checksum, ty: ObjectType },
     RefNotFound(String),
+    RemoteNotFound(String),            // the remote name
+    RemoteExists(String),              // the remote name
     InvalidRefspec(String),
     NoParentCommit(Checksum),
     InvalidFormat(String),
@@ -167,9 +169,11 @@ impl From<Error> for std::io::Error;
 The `io::ErrorKind` an error converts to:
 
 - `NotFound`: `PathNotFound`, `DanglingSymlink`, `ObjectNotFound`,
-  `RefNotFound`, `StaticDeltaNotFound`, `HttpStatus` with status 404.
+  `RefNotFound`, `RemoteNotFound`, `StaticDeltaNotFound`, `HttpStatus` with
+  status 404.
 - `NotADirectory`: `NotADirectory`, `ReplaceFileWithDir`.
-- `AlreadyExists`: `EntryExists`, `MergeConflict`, `ReplaceDirWithFile`.
+- `AlreadyExists`: `EntryExists`, `MergeConflict`, `ReplaceDirWithFile`,
+  `RemoteExists`.
 - `InvalidInput`: `MutableTree`, `InvalidInput`.
 - `PermissionDenied`: `HttpStatus` with status 401 or 403.
 - `FileTooLarge`: `FetchTooLarge`, the same kind a body that outgrows the cap
@@ -328,6 +332,10 @@ pub struct TextError { pub spans: Vec<Span>, pub reason: String }
 pub struct Repo { /* Arc<RepoInner> */ }
 
 pub struct CreateOptions { pub mode: RepoMode, pub collection_id: Option<String> }
+
+/// Whether `name` is a remote name the tool accepts: the first character is
+/// alphanumeric or `_`, and each character is alphanumeric, `-`, `_`, or `.`.
+pub fn valid_remote_name(name: &str) -> bool;
 
 impl Repo {
     pub async fn open_at(dir: BorrowedFd<'_>, path: &Path) -> Result<Repo>;
@@ -500,6 +508,23 @@ impl UpdateGuard {
     /// was opened with.
     pub async fn read_config(&self) -> Result<RepoConfig>;
     pub async fn write_config(&self, keyfile: &KeyFile) -> Result<()>;
+    // The remote calls read `config` from disk, edit it, and write it as
+    // `write_config` does, in one step. The remote calls and `write_config`
+    // of one guard run one at a time. A refusal writes nothing.
+
+    /// Add a group with `keys` in order. `RemoteExists` when the group is
+    /// there; `InvalidInput` for a bad name, no keys, or a bad key name.
+    pub async fn add_remote(&self, name: &str, keys: &[(&str, &str)]) -> Result<()>;
+    /// Set one key of a remote; no write when the key holds the value.
+    /// `RemoteNotFound` when the group is absent.
+    pub async fn set_remote_key(&self, name: &str, key: &str, value: &str)
+        -> Result<()>;
+    /// Remove one key of a remote; `false` and no write when the key is absent.
+    pub async fn unset_remote_key(&self, name: &str, key: &str) -> Result<bool>;
+    /// Remove `<name>.trustedkeys.gpg`, then the group. An absent keyring, or
+    /// a keyring name too long for a file name, is not an error.
+    /// `RemoteNotFound` when the group is absent, with no file removed.
+    pub async fn delete_remote(&self, name: &str) -> Result<()>;
     /// Wait until each write of the guard has ended, also a write whose
     /// future was dropped, then run `fsync` on each directory that changed,
     /// once, deepest first, then release both locks. Returns the first error

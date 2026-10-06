@@ -306,7 +306,9 @@ pub use bootable::{BootableMetadata, BootableRefusal};
 pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMode};
 pub use commit::CommitOptions;
 pub use composefs::{ComposefsOptions, VerityPolicy};
-pub use config::{MinFreeSpace, Remote, RepoConfig, SignVerify, SizeSpec, SizeUnit, Tristate};
+pub use config::{
+    MinFreeSpace, Remote, RepoConfig, SignVerify, SizeSpec, SizeUnit, Tristate, valid_remote_name,
+};
 pub use delta::{
     DeltaEndianness, DeltaFallback, DeltaOpCounts, DeltaPart, DeltaPartStats, DeltaSuperblock,
 };

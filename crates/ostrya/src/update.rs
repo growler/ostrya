@@ -3,7 +3,9 @@
 //! [`Repo::begin_update`] takes the repository lock shared and then the update
 //! lock on `<repo>/.update.lock` exclusive, and returns an [`UpdateGuard`]. The
 //! guard reads and writes refs, collection refs, and ref aliases, reads
-//! `config` from disk, and writes `config`. It stages no object.
+//! `config` from disk, and writes `config`. It adds a remote to `config`, sets
+//! and unsets the keys of a remote, and deletes a remote together with its
+//! trusted keyring. It stages no object.
 //!
 //! Each write of the guard is atomic and visible when it returns. With
 //! `[core] fsync` set, the guard records each directory that a write changed.
@@ -14,18 +16,21 @@
 //! after the syncs ran.
 
 use std::collections::BTreeSet;
+use std::os::fd::BorrowedFd;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use ostrya_core::{Checksum, KeyFile};
+use rustix::fs::AtFlags;
+use rustix::io::Errno;
 
-use crate::config::RepoConfig;
-use crate::error::Result;
+use crate::config::{RepoConfig, remote_group, remote_keyring_name, valid_remote_name};
+use crate::error::{Error, Result};
 use crate::lock::UpdateLocks;
 use crate::refs::{
     CollectionRef, collection_ref_to_relpath, put_alias_blocking, put_ref_blocking,
     refspec_to_relpath, relative_link, sync_dirs_all,
 };
-use crate::repo::{Repo, check_config_size};
+use crate::repo::{Repo, check_config_size, read_config_blocking};
 use crate::summary::put_root_file_blocking;
 
 /// The config file name at the repository root.
@@ -34,11 +39,24 @@ const CONFIG_FILE: &str = "config";
 /// The directory that holds `config`: the repository root.
 const ROOT_DIR: &str = ".";
 
+/// A group name that a key file accepts, under which a key name is checked
+/// alone.
+const KEY_CHECK_GROUP: &str = "remote";
+
 /// An exclusive hold on the writes of refs, ref aliases, and `config` of one
 /// repository, across processes and inside the process.
 ///
 /// [`Repo::begin_update`] returns it. The guard is a value: a caller holds
 /// it, passes it, and stores it. It is `Send + Sync`.
+///
+/// The guard edits the remotes of `config` as a read-modify-write of the file
+/// on disk: [`add_remote`](UpdateGuard::add_remote),
+/// [`set_remote_key`](UpdateGuard::set_remote_key),
+/// [`unset_remote_key`](UpdateGuard::unset_remote_key), and
+/// [`delete_remote`](UpdateGuard::delete_remote), which also removes the
+/// trusted keyring of the remote. These calls and
+/// [`write_config`](UpdateGuard::write_config) run one at a time on one
+/// guard.
 ///
 /// While you hold the guard, write through the guard. The writers that wait
 /// for the guard are:
@@ -61,8 +79,8 @@ const ROOT_DIR: &str = ".";
 /// the repository lock. No call detects a holder that waits for its own
 /// guard: a task that holds the guard and calls one of those writers, or
 /// waits for a task that calls one, waits until `lock-timeout-secs` and then
-/// fails with [`Error::LockTimeout`](crate::Error::LockTimeout). With
-/// `lock-timeout-secs=-1` it waits forever.
+/// fails with [`Error::LockTimeout`]. With `lock-timeout-secs=-1` it waits
+/// forever.
 ///
 /// Call [`finish`](UpdateGuard::finish) to release the guard. A guard that
 /// drops without `finish` runs the directory syncs of `finish`
@@ -86,6 +104,9 @@ struct Held {
     fsync: bool,
     /// The writes in flight and the directories to sync.
     state: Mutex<Writes>,
+    /// Held for the whole of each edit and each write of `config`, so the
+    /// read-modify-writes of one guard do not interleave.
+    config: Mutex<()>,
     /// Signalled when the last write in flight ends.
     idle: Condvar,
     /// Both locks, until [`finish`](UpdateGuard::finish) releases them.
@@ -182,10 +203,10 @@ impl Repo {
     /// for the update lock.
     ///
     /// Each of the two waits gets the whole of `[core] lock-timeout-secs`, and
-    /// then fails with [`Error::LockTimeout`](crate::Error::LockTimeout). With
-    /// `-1` a wait has no limit, and with `0` it makes one attempt. There is no
-    /// variant that fails at once. With `[core] locking=false` the repository
-    /// lock is not taken, and the update lock is taken all the same.
+    /// then fails with [`Error::LockTimeout`]. With `-1` a wait has no limit,
+    /// and with `0` it makes one attempt. There is no variant that fails at
+    /// once. With `[core] locking=false` the repository lock is not taken, and
+    /// the update lock is taken all the same.
     ///
     /// The call reads `[core] fsync`, `[core] locking`, and `[core]
     /// lock-timeout-secs` from the configuration this handle was opened with,
@@ -215,6 +236,7 @@ impl Repo {
                 repo: self.clone(),
                 fsync,
                 state: Mutex::new(Writes::default()),
+                config: Mutex::new(()),
                 idle: Condvar::new(),
                 locks: Mutex::new(Some(locks)),
             }),
@@ -293,17 +315,157 @@ impl UpdateGuard {
     /// The document is written as given. The repository handle and the guard
     /// keep the values they read before; reopen the repository to read the
     /// new ones. A document over 1 MiB, the size an open accepts, is refused
-    /// with [`Error::InvalidFormat`](crate::Error::InvalidFormat) and nothing
-    /// is written.
+    /// with [`Error::InvalidFormat`] and nothing is written. The write does
+    /// not interleave with a remote call of the same guard.
     pub async fn write_config(&self, keyfile: &KeyFile) -> Result<()> {
-        let bytes = keyfile.to_string().into_bytes();
-        check_config_size(&bytes)?;
-        self.write(move |repo_fd, fsync, dirs| {
-            put_root_file_blocking(repo_fd, CONFIG_FILE, &bytes, fsync)?;
-            if fsync {
+        let bytes = config_bytes(keyfile)?;
+        self.edit_config(move |repo_fd, fsync, dirs| {
+            put_config_blocking(repo_fd, &bytes, fsync, dirs)
+        })
+        .await
+    }
+
+    /// Add the remote `name` to `config`, with the keys of `keys` set in the
+    /// order given. The `[remote "<name>"]` group goes at the end of the file.
+    ///
+    /// The call reads `config` from disk, edits it, and writes it in one step
+    /// on the blocking pool, as [`write_config`](UpdateGuard::write_config)
+    /// writes it: atomically, with the sync of the repository directory left
+    /// to [`finish`](UpdateGuard::finish). [`Repo::config`] keeps the copy
+    /// that the handle read at open. The rewrite keeps the groups and keys of
+    /// the file in their order, and drops its comment lines and blank lines.
+    ///
+    /// The remote calls and [`write_config`](UpdateGuard::write_config) of one
+    /// guard run one at a time, so concurrent calls on one guard lose no edit.
+    /// A call whose future drops after its first poll makes the whole edit or
+    /// none of it. An edit that runs completes, and `finish` waits for it.
+    ///
+    /// A name that [`valid_remote_name`] refuses, an empty `keys`, and a key
+    /// name that `config` cannot hold fail with [`Error::InvalidInput`]. A
+    /// remote of that name that exists fails with [`Error::RemoteExists`].
+    /// A refusal writes nothing. The call does not touch a trusted keyring
+    /// of the name.
+    pub async fn add_remote(&self, name: &str, keys: &[(&str, &str)]) -> Result<()> {
+        if !valid_remote_name(name) {
+            return Err(Error::InvalidInput(format!("invalid remote name: {name}")));
+        }
+        if keys.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "remote {name} is added with no keys"
+            )));
+        }
+        let name = name.to_owned();
+        let keys: Vec<(String, String)> = keys
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
+        self.edit_config(move |repo_fd, fsync, dirs| {
+            let group = remote_group(&name);
+            let mut keyfile = read_config_blocking(repo_fd)?.into_keyfile();
+            if keyfile.has_group(&group) {
+                return Err(Error::RemoteExists(name));
+            }
+            for (key, value) in &keys {
+                check_key(key)?;
+                keyfile.set_string(&group, key, value)?;
+            }
+            put_config_blocking(repo_fd, &config_bytes(&keyfile)?, fsync, dirs)
+        })
+        .await
+    }
+
+    /// Set the key `key` of the remote `name` in `config` to `value`. A key
+    /// that exists keeps its position; a new key goes at the end of the
+    /// group. A key that holds `value` already is left as it is, and nothing
+    /// is written.
+    ///
+    /// The call reads and writes `config` as
+    /// [`add_remote`](UpdateGuard::add_remote) does. A remote that `config`
+    /// does not carry fails with [`Error::RemoteNotFound`], and a key name
+    /// that `config` cannot hold fails with [`Error::InvalidInput`]. A
+    /// refusal writes nothing.
+    pub async fn set_remote_key(&self, name: &str, key: &str, value: &str) -> Result<()> {
+        let name = name.to_owned();
+        let key = key.to_owned();
+        let value = value.to_owned();
+        self.edit_config(move |repo_fd, fsync, dirs| {
+            let group = remote_group(&name);
+            let mut keyfile = read_config_blocking(repo_fd)?.into_keyfile();
+            if !keyfile.has_group(&group) {
+                return Err(Error::RemoteNotFound(name));
+            }
+            check_key(&key)?;
+            if matches!(keyfile.get_string(&group, &key), Ok(Some(held)) if held == value) {
+                return Ok(());
+            }
+            keyfile.set_string(&group, &key, &value)?;
+            put_config_blocking(repo_fd, &config_bytes(&keyfile)?, fsync, dirs)
+        })
+        .await
+    }
+
+    /// Remove the key `key` of the remote `name` from `config`, and return
+    /// whether the key was there. The group stays, also when it has no key
+    /// left.
+    ///
+    /// The call reads and writes `config` as
+    /// [`add_remote`](UpdateGuard::add_remote) does. An absent key returns
+    /// `false` and writes nothing. A remote that `config` does not carry
+    /// fails with [`Error::RemoteNotFound`] and writes nothing.
+    pub async fn unset_remote_key(&self, name: &str, key: &str) -> Result<bool> {
+        let name = name.to_owned();
+        let key = key.to_owned();
+        self.edit_config(move |repo_fd, fsync, dirs| {
+            let group = remote_group(&name);
+            let mut keyfile = read_config_blocking(repo_fd)?.into_keyfile();
+            if !keyfile.has_group(&group) {
+                return Err(Error::RemoteNotFound(name));
+            }
+            if !keyfile.remove_key(&group, &key) {
+                return Ok(false);
+            }
+            put_config_blocking(repo_fd, &config_bytes(&keyfile)?, fsync, dirs)?;
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Delete the remote `name`: remove its trusted keyring,
+    /// `<name>.trustedkeys.gpg` at the repository root, and then its group
+    /// from `config`. A keyring that is absent is not an error, and neither
+    /// is a keyring name too long for the file system, which no file has.
+    ///
+    /// The keyring goes with the remote, so a later remote of the same name
+    /// does not trust the keys of this one. The keyring goes first, so a
+    /// failure between the two steps leaves a remote with no keys, never
+    /// keys with no remote. The removal is visible when the call returns,
+    /// and the sync of the repository directory waits for
+    /// [`finish`](UpdateGuard::finish).
+    ///
+    /// The call reads and writes `config` as
+    /// [`add_remote`](UpdateGuard::add_remote) does. A name that
+    /// [`valid_remote_name`] refuses fails with [`Error::InvalidInput`]. A
+    /// remote that `config` does not carry fails with
+    /// [`Error::RemoteNotFound`], and a rewrite of `config` over 1 MiB fails
+    /// with [`Error::InvalidFormat`]. A refusal removes no file and
+    /// writes nothing.
+    pub async fn delete_remote(&self, name: &str) -> Result<()> {
+        if !valid_remote_name(name) {
+            return Err(Error::InvalidInput(format!("invalid remote name: {name}")));
+        }
+        let name = name.to_owned();
+        self.edit_config(move |repo_fd, fsync, dirs| {
+            let mut keyfile = read_config_blocking(repo_fd)?.into_keyfile();
+            if !keyfile.remove_group(&remote_group(&name)) {
+                return Err(Error::RemoteNotFound(name));
+            }
+            let bytes = config_bytes(&keyfile)?;
+            let removed = remove_keyring_blocking(repo_fd, &remote_keyring_name(&name))?;
+            let put = put_root_file_blocking(repo_fd, CONFIG_FILE, &bytes, fsync);
+            if fsync && (removed || put.is_ok()) {
                 dirs.push(ROOT_DIR.to_owned());
             }
-            Ok(())
+            put
         })
         .await
     }
@@ -342,16 +504,30 @@ impl UpdateGuard {
         .await
     }
 
+    /// Run `edit` as a write of the guard, as [`write`](UpdateGuard::write)
+    /// runs it, with the `config` lock of the guard held for the whole of it.
+    async fn edit_config<T, F>(&self, edit: F) -> Result<T>
+    where
+        F: FnOnce(BorrowedFd<'_>, bool, &mut Vec<String>) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let held = self.held.clone();
+        self.write(move |repo_fd, fsync, dirs| {
+            let _config = held.config.lock().unwrap_or_else(PoisonError::into_inner);
+            edit(repo_fd, fsync, dirs)
+        })
+        .await
+    }
+
     /// Run the write `put` on the blocking pool and record the directories it
     /// changed. The closure owns a reference to the held state and counts in
     /// flight until it ends, so a write whose future drops still holds both
     /// locks until it ends, still records its directories, and holds
     /// [`finish`](UpdateGuard::finish) back until it ends.
-    async fn write<F>(&self, put: F) -> Result<()>
+    async fn write<T, F>(&self, put: F) -> Result<T>
     where
-        F: FnOnce(std::os::fd::BorrowedFd<'_>, bool, &mut Vec<String>) -> Result<()>
-            + Send
-            + 'static,
+        F: FnOnce(BorrowedFd<'_>, bool, &mut Vec<String>) -> Result<T> + Send + 'static,
+        T: Send + 'static,
     {
         let flight = InFlight::start(&self.held);
         ostrya_rt::unblock(move || {
@@ -368,6 +544,48 @@ impl UpdateGuard {
     }
 }
 
+/// Refuse a key name that no key file can hold, as an argument error of the
+/// caller. The check sets the key alone in an empty key file, so an error of
+/// the group of `config` is not taken for an error of the key.
+fn check_key(key: &str) -> Result<()> {
+    KeyFile::default()
+        .set_string(KEY_CHECK_GROUP, key, "")
+        .map_err(|e| Error::InvalidInput(e.to_string()))
+}
+
+/// The bytes of `keyfile` as `config` holds them. A document over the size an
+/// open accepts is refused.
+fn config_bytes(keyfile: &KeyFile) -> Result<Vec<u8>> {
+    let bytes = keyfile.to_string().into_bytes();
+    check_config_size(&bytes)?;
+    Ok(bytes)
+}
+
+/// Write `bytes` to `config` atomically and record the repository root.
+fn put_config_blocking(
+    repo_fd: BorrowedFd<'_>,
+    bytes: &[u8],
+    fsync: bool,
+    dirs: &mut Vec<String>,
+) -> Result<()> {
+    put_root_file_blocking(repo_fd, CONFIG_FILE, bytes, fsync)?;
+    if fsync {
+        dirs.push(ROOT_DIR.to_owned());
+    }
+    Ok(())
+}
+
+/// Remove the trusted keyring `name` at the repository root, and return
+/// whether a file was removed. An absent file is no error, and neither is a
+/// name too long for the file system: no file can have that name.
+fn remove_keyring_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> Result<bool> {
+    match rustix::fs::unlinkat(repo_fd, name, AtFlags::empty()) {
+        Ok(()) => Ok(true),
+        Err(Errno::NOENT | Errno::NAMETOOLONG) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// The guard and the futures of its calls move freely across tasks and
 /// threads.
 const _: fn() = || {
@@ -377,6 +595,10 @@ const _: fn() = || {
     let _ = |repo: &Repo| assert_send(&repo.begin_update());
     let _ = |guard: &UpdateGuard, c: &Checksum| assert_send(&guard.set_ref("r", Some(c)));
     let _ = |guard: &UpdateGuard, k: &KeyFile| assert_send(&guard.write_config(k));
+    let _ = |guard: &UpdateGuard| assert_send(&guard.add_remote("r", &[("url", "u")]));
+    let _ = |guard: &UpdateGuard| assert_send(&guard.set_remote_key("r", "url", "u"));
+    let _ = |guard: &UpdateGuard| assert_send(&guard.unset_remote_key("r", "url"));
+    let _ = |guard: &UpdateGuard| assert_send(&guard.delete_remote("r"));
     let _ = |guard: UpdateGuard| assert_send(&guard.finish());
 };
 

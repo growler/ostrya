@@ -402,9 +402,14 @@ too, so a holder never waits for a pull. When `[core] locking` is on, a holder
 waits for a prune. Each of the two waits gets the whole of `lock-timeout-secs`.
 With `[core] locking=false` the repository lock is not taken, and the update
 lock is taken all the same. The guard reads and writes refs, collection refs,
-and ref aliases, reads `config` from disk, and writes `config`. It stages no
-object. Each write is atomic and visible when it returns. With fsync on, the
-guard records each directory that a write changed, once for each directory.
+and ref aliases, reads `config` from disk, and writes `config`. It adds a
+remote, sets and unsets a key of a remote, and deletes a remote, each as a
+read-modify-write of `config` on disk in one step. The remote calls and
+`write_config` of one guard run one at a time. A delete removes the trusted
+keyring of the remote first and then writes `config`, so a failure between the
+two steps leaves a remote with no keys. It stages no object. Each write is
+atomic and visible when it returns. With fsync on, the guard records each
+directory that a write changed, once for each directory.
 `UpdateGuard::finish` waits until no write of the guard runs, also a write
 whose future was dropped, runs `fsync` on each recorded directory once, deepest
 first, returns the first error, and then releases both locks. So `finish` syncs

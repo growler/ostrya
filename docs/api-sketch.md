@@ -2212,7 +2212,15 @@ sourced from `src` first and then each of
 `localcache_repos` in order, and the walk that decides what to import resolves
 each commit and dirtree through the same order, so a subtree `src` has lost is
 enumerated from a cache that holds it. Refs are written after the objects are
-published.
+published. With `no_ref_writes` set, the pull writes no ref, and the caller
+writes the refs itself. `PullStats` does not report the pulled commits. The
+local pull resolves each name in `refs` on `src` with revision syntax, so the
+caller pins a commit when it gives the checksum as the name. The local pull
+reads the ref it would write only for delta discovery under
+`require_static_deltas`. When a pulled commit has detached metadata, a pull
+with `no_ref_writes` still takes the update lock to write it. A caller that
+holds an `UpdateGuard` of the destination during the pull then waits for its
+own guard until the lock timeout.
 
 `pull` fetches the same thing from an HTTP remote named in the repository's
 config, or over ssh from a remote with an ssh address, into one transaction, with up to `max_outstanding_fetches` objects in
@@ -2248,7 +2256,13 @@ ref store's rule -- no empty, `.`, or `..` component -- before any object is
 requested. Refs are written under
 `refs/remotes/<remote>/<ref>`, or as local refs under `MIRROR`, which also copies
 the remote's `summary` and `summary.sig` bytes to this repository when the pull
-took every ref.
+took every ref. With `no_ref_writes` set, the pull writes no ref and copies no
+summary. It stores the objects and the `.commitmeta` files, and removes the
+`.commitpartial` markers, as without the option. Delta discovery and
+`TimestampCheck::CurrentRef` still read the ref the pull would write. The pull
+resolves each name as a ref name, through the summary or the ref file. A
+checksum given as a name fails with `RefNotFound`, unless the remote holds a
+ref of that name.
 
 A remote that publishes static deltas delivers a commit as one delta instead of
 one request per object. A pull looks for one delta per tip: `<from>-<to>`, where
@@ -2348,6 +2362,8 @@ pub struct PullOptions {
     pub refs: Vec<String>,                // empty: every ref under refs/heads,
                                           // or the summary / `branches` remotely
     pub remote: Option<String>,           // refs/remotes/<remote>/<ref>
+    pub no_ref_writes: bool,              // write no ref and no mirror summary;
+                                          // the caller writes the refs
     pub flags: PullFlags,
     pub depth: i32,                       // 0 = the commit alone, -1 = all;
                                           // below -1: InvalidInput, nothing written

@@ -504,8 +504,34 @@ pub struct PullOptions {
     /// The remote name the pulled refs are written under
     /// (`refs/remotes/<remote>/<ref>`). `None` writes them as local refs under
     /// `refs/heads/` for a local pull, and under the remote's own name for an
-    /// HTTP pull.
+    /// HTTP pull. Under [`no_ref_writes`](PullOptions::no_ref_writes) the
+    /// pull writes no ref, and the name still selects the ref the pull reads.
     pub remote: Option<String>,
+    /// Write no ref. The pull stores the objects and the detached metadata,
+    /// and clears the `.commitpartial` marker of each commit it completes, as
+    /// it does without the option. The caller writes the refs itself.
+    ///
+    /// [`PullStats`] does not report the commits a pull takes. A local pull
+    /// resolves each name in [`refs`](PullOptions::refs) on the source with
+    /// revision syntax, so a caller pins the commit it writes a ref to by
+    /// passing its checksum as the name. An HTTP or ssh pull resolves each
+    /// name as a ref name, through the remote's summary or its ref file, so a
+    /// checksum names no commit there and fails with [`Error::RefNotFound`]
+    /// unless the remote holds a ref of that name.
+    ///
+    /// An HTTP or ssh pull still reads the ref it would write: delta
+    /// discovery takes the commit that ref names as the source of a delta,
+    /// and [`TimestampCheck::CurrentRef`] compares against it. A local pull
+    /// reads that ref for delta discovery alone, and only under
+    /// [`require_static_deltas`](PullOptions::require_static_deltas). A
+    /// [`MIRROR`](PullFlags::MIRROR) pull of every ref copies no `summary`
+    /// and no `summary.sig` under the option.
+    ///
+    /// When a pulled commit has detached metadata, the pull still takes the
+    /// update lock to write it, as [`Transaction::commit`] does. A caller that
+    /// holds an [`UpdateGuard`](crate::UpdateGuard) of the destination during
+    /// the pull waits for its own guard until the lock timeout.
+    pub no_ref_writes: bool,
     /// The flag set.
     pub flags: PullFlags,
     /// How many parents of each pulled commit to follow: `0` for the named
@@ -913,7 +939,8 @@ impl Repo {
     /// [`depth`](PullOptions::depth) parents, and every object those commits
     /// reach imported into this repository. The refs are written last, after the
     /// objects are published, so no ref in this repository ever names a commit
-    /// whose objects are not yet durable.
+    /// whose objects are not yet durable. Under
+    /// [`no_ref_writes`](PullOptions::no_ref_writes) the pull writes no ref.
     ///
     /// A [`depth`](PullOptions::depth) below `-1` fails the pull with
     /// [`Error::InvalidInput`] before it reads a ref or an object of `src`.
@@ -1141,8 +1168,10 @@ impl Repo {
                 )
                 .await?;
             }
-            for (ref_name, tip) in &targets {
-                txn.set_ref(&refspec(opts.remote.as_deref(), ref_name), Some(tip));
+            if !opts.no_ref_writes {
+                for (ref_name, tip) in &targets {
+                    txn.set_ref(&refspec(opts.remote.as_deref(), ref_name), Some(tip));
+                }
             }
             txn.commit().await
         }

@@ -846,3 +846,42 @@ fn a_refused_policy_stops_the_pull_before_the_ssh_client_starts() {
         assert_eq!(recorded(&header), None);
     });
 }
+
+/// A pull through the ssh source that writes no ref completes every commit
+/// it pulls and writes no ref.
+#[test]
+fn the_ssh_source_with_no_ref_writes_writes_no_ref() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-no-ref-writes");
+        let (remote, first, second) = build_remote_two_commits(dir.path()).await;
+        let dest_path = dir.path().join("dest");
+        let dest = dest_at(&dest_path, RepoMode::Archive, None).await;
+        let refs = common::file_inventory(&dest_path, "refs");
+
+        let (pulled, served) = pull_ssh(
+            &dest,
+            &remote,
+            PullOptions {
+                no_ref_writes: true,
+                ..main_ref(1)
+            },
+        )
+        .await;
+        pulled.unwrap();
+        served.unwrap();
+
+        assert_eq!(common::file_inventory(&dest_path, "refs"), refs);
+        assert!(!dest_path.join("refs/remotes/origin").exists());
+        for commit in [&first, &second] {
+            assert_eq!(
+                dest.commit_state(commit).await.unwrap(),
+                ostrya::CommitState::Normal
+            );
+            let marker = format!("state/{}.commitpartial", commit.to_hex());
+            assert!(!dest_path.join(marker).exists());
+            for name in &remote.traverse_commit(commit, 0).await.unwrap() {
+                assert!(dest.has_object(name.ty, &name.checksum).await.unwrap());
+            }
+        }
+    });
+}

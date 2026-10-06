@@ -3092,7 +3092,13 @@ binding, follow each tip's parents to `depth`, write the commitpartial markers,
 import every object, copy each commit's detached metadata, publish, write the
 refs, remove the markers. Ref writes come last through the transaction's ref
 queue, so no ref names a commit whose objects are not yet durable, matching the
-durability contract Phase 7d set.
+durability contract Phase 7d set. With `PullOptions::no_ref_writes` set, the
+pull queues no ref. It imports the objects and the detached metadata and
+removes the markers as without the option, and the caller writes the refs
+itself. The pull resolves each name in `refs` on the source with revision
+syntax, so the caller pins a commit when it gives the checksum as the name.
+It reads the ref it would write only for delta discovery under
+`require_static_deltas`.
 
 Each tip is followed to `depth` on its own. The chain walk records the number of
 parents a commit still had to follow when it was reached, and a chain arriving at
@@ -3554,7 +3560,14 @@ percent-encoded outside the unreserved set, `/` excepted, so a name carrying `%`
 and the remote argument otherwise, or as local refs under `MIRROR`; a mirror pull
 of every ref also copies the remote's summary bytes verbatim to `<repo>/summary`,
 and the `summary.sig` bytes with them, so a client pulling from the mirror with
-`gpg-verify-summary=true` reads the pair.
+`gpg-verify-summary=true` reads the pair. With `PullOptions::no_ref_writes` set,
+the HTTP pull and the ssh pull write no ref and copy no `summary` and no
+`summary.sig`. They store the objects and the `.commitmeta` files, and remove
+the `.commitpartial` markers, as without the option. Delta discovery and
+`TimestampCheck::CurrentRef` still read the ref the pull would write. The pull
+resolves each name as a ref name, through the summary or the ref file, and
+`PullStats` does not report the pulled commits. A checksum given as a name
+fails with `RefNotFound`, unless the remote holds a ref of that name.
 `TimestampCheck` refuses a fetched tip strictly older than the commit the ref
 currently names here (`CurrentRef`, where an absent ref passes) or than a given
 commit (`Rev`), naming both revisions and both timestamps. The ref-binding check

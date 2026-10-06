@@ -314,7 +314,9 @@ impl Repo {
     /// prefix, and as local refs under [`MIRROR`](PullFlags::MIRROR). A mirror
     /// pull that took every ref the summary lists also copies the remote's
     /// summary bytes to this repository's `summary`, and its `summary.sig` bytes
-    /// where the remote holds them.
+    /// where the remote holds them. Under
+    /// [`no_ref_writes`](PullOptions::no_ref_writes) the pull writes neither
+    /// the refs nor the summary.
     pub async fn pull(&self, remote: &str, opts: PullOptions) -> Result<PullStats> {
         let started = Instant::now();
         // A subpath the walk cannot read is refused before anything else, so it
@@ -494,8 +496,10 @@ impl Repo {
                     summary,
                     signature,
                 } = fetched;
-                for (name, tip) in &targets {
-                    txn.set_ref(&refspec(prefix, name), Some(tip));
+                if !opts.no_ref_writes {
+                    for (name, tip) in &targets {
+                        txn.set_ref(&refspec(prefix, name), Some(tip));
+                    }
                 }
                 txn.commit().await.map(|stats| (stats, summary, signature))
             }
@@ -521,9 +525,11 @@ impl Repo {
         // A mirror pull of every ref holds the whole of what the remote
         // publishes, so the remote's summary describes this repository too and
         // is copied verbatim. A mirror pull of named refs holds part of it and
-        // writes no summary.
+        // writes no summary. A pull that writes no ref writes no summary either,
+        // since the summary lists refs the pull did not write.
         if mirror
             && opts.refs.is_empty()
+            && !opts.no_ref_writes
             && let Some(bytes) = summary_bytes
         {
             let fsync = self.config().fsync()? && !opts.disable_fsync;

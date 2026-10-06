@@ -3644,3 +3644,116 @@ fn a_part_file_past_its_declared_size_is_refused() {
         assert_nothing_left(&dst_dir, &dst, &c2).await;
     });
 }
+
+// --- writing no ref ------------------------------------------------------
+
+/// Assert that `commit` is complete in `dst`: its state is normal, it keeps no
+/// `.commitpartial` marker, and every object it reaches in `src` is present.
+async fn assert_complete(src: &Repo, dst: &Repo, dst_dir: &Path, commit: &Checksum) {
+    assert_eq!(dst.commit_state(commit).await.unwrap(), CommitState::Normal);
+    assert!(!has_partial_marker(dst_dir, commit));
+    for name in &src.traverse_commit(commit, 0).await.unwrap() {
+        assert!(
+            dst.has_object(name.ty, &name.checksum).await.unwrap(),
+            "{name} missing from the destination"
+        );
+    }
+}
+
+/// A pull that writes no ref leaves the ref the destination holds as it
+/// stands, and stores the pulled commit complete with its detached metadata.
+#[test]
+fn a_pull_with_no_ref_writes_keeps_the_ref_and_completes_the_commit() {
+    let tmp = TmpDir::new("pull-no-ref-writes");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
+            .await
+            .unwrap();
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let txn = dst.transaction().await.unwrap();
+        txn.set_ref("main", Some(&c1));
+        txn.commit().await.unwrap();
+        let refs = file_inventory(&dst_dir, "refs");
+
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                no_ref_writes: true,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(file_inventory(&dst_dir, "refs"), refs);
+        assert_eq!(dst.resolve_rev("main", false).await.unwrap(), Some(c1));
+        assert_complete(&src, &dst, &dst_dir, &c2).await;
+        assert_eq!(
+            dst.read_commit_detached_metadata(&c2).await.unwrap(),
+            Some(two_property_metadata())
+        );
+    });
+}
+
+/// A pull that writes no ref writes none under the remote prefix either.
+#[test]
+fn a_pull_with_no_ref_writes_writes_no_remote_ref() {
+    let tmp = TmpDir::new("pull-no-ref-writes-remote");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let refs = file_inventory(&dst_dir, "refs");
+
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                remote: Some("origin".to_owned()),
+                no_ref_writes: true,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(file_inventory(&dst_dir, "refs"), refs);
+        assert!(!dst_dir.join("refs/remotes/origin").exists());
+        assert_eq!(dst.resolve_rev("origin:main", true).await.unwrap(), None);
+        assert_complete(&src, &dst, &dst_dir, &c2).await;
+    });
+}
+
+/// A pull that writes no ref still follows `depth` and completes every
+/// commit of the chain.
+#[test]
+fn a_pull_with_no_ref_writes_completes_every_parent_under_depth() {
+    let tmp = TmpDir::new("pull-no-ref-writes-depth");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        let refs = file_inventory(&dst_dir, "refs");
+
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                depth: -1,
+                no_ref_writes: true,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(file_inventory(&dst_dir, "refs"), refs);
+        assert_eq!(dst.resolve_rev("main", true).await.unwrap(), None);
+        for commit in [&c1, &c2] {
+            assert_complete(&src, &dst, &dst_dir, commit).await;
+        }
+    });
+}

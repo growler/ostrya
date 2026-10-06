@@ -5096,3 +5096,157 @@ fn required_deltas_look_for_a_delta_for_a_commit_held_partial() {
         assert!(seen.iter().any(|p| p.ends_with(".filez")), "{seen:?}");
     });
 }
+
+// --- writing no ref --------------------------------------------------------
+
+/// A remote archive repository under `dir/remote` with two commits on
+/// `test/main`, the second a child of the first, and a summary.
+async fn build_remote_chain(dir: &Path) -> (Repo, Checksum, Checksum) {
+    let (remote, first, second) = build_remote_two_commits(dir).await;
+    remote
+        .regenerate_summary(&SummaryOptions {
+            last_modified: Some(FIXED_TS),
+            ..SummaryOptions::default()
+        })
+        .await
+        .unwrap();
+    (remote, first, second)
+}
+
+/// Assert that `repo` holds no ref, local or under `refs/remotes`.
+async fn assert_no_refs(repo: &Repo) {
+    assert!(repo.list_refs(None).await.unwrap().is_empty());
+    assert!(
+        repo.list_refs(Some("refs/remotes"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Assert that `commit` is complete in `dest`: its state is normal, it keeps
+/// no `.commitpartial` marker, and every object it reaches in `remote` is
+/// present.
+async fn assert_complete(remote: &Repo, dest: &Repo, dest_dir: &Path, commit: &Checksum) {
+    assert_eq!(
+        dest.commit_state(commit).await.unwrap(),
+        CommitState::Normal
+    );
+    let marker = format!("state/{}.commitpartial", commit.to_hex());
+    assert!(!dest_dir.join(marker).exists());
+    for name in &remote.traverse_commit(commit, 0).await.unwrap() {
+        assert!(
+            dest.has_object(name.ty, &name.checksum).await.unwrap(),
+            "{name} missing from the destination"
+        );
+    }
+}
+
+/// A pull that writes no ref leaves the ref the destination holds as it
+/// stands, and stores the pulled commit complete with its detached metadata.
+#[test]
+fn a_pull_with_no_ref_writes_keeps_the_ref_and_completes_the_commit() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-no-ref-writes");
+        let (remote, first, second) = build_remote_chain(dir.path()).await;
+        remote
+            .write_commit_detached_metadata(&second, Some(&detached_dict()))
+            .await
+            .unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        let txn = dest.transaction().await.unwrap();
+        txn.set_ref("origin:test/main", Some(&first));
+        txn.commit().await.unwrap();
+        let dest_dir = dir.path().join("dest");
+        let refs = file_inventory(&dest_dir, "refs");
+
+        dest.pull(
+            "origin",
+            PullOptions {
+                refs: vec!["test/main".to_owned()],
+                no_ref_writes: true,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(file_inventory(&dest_dir, "refs"), refs);
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(first)
+        );
+        assert_complete(&remote, &dest, &dest_dir, &second).await;
+        assert_eq!(
+            dest.read_commit_detached_metadata(&second).await.unwrap(),
+            Some(detached_dict())
+        );
+    });
+}
+
+/// A pull that writes no ref still follows `depth`, writes nothing under
+/// `refs/remotes/origin`, and completes every commit of the chain.
+#[test]
+fn a_pull_with_no_ref_writes_completes_every_parent_under_depth() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-no-ref-writes-depth");
+        let (remote, first, second) = build_remote_chain(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        let dest_dir = dir.path().join("dest");
+        let refs = file_inventory(&dest_dir, "refs");
+
+        dest.pull(
+            "origin",
+            PullOptions {
+                refs: vec!["test/main".to_owned()],
+                depth: -1,
+                no_ref_writes: true,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(file_inventory(&dest_dir, "refs"), refs);
+        assert!(!dest_dir.join("refs/remotes/origin").exists());
+        assert_no_refs(&dest).await;
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        for commit in [&first, &second] {
+            assert_complete(&remote, &dest, &dest_dir, commit).await;
+        }
+    });
+}
+
+/// A mirror pull of every ref that writes no ref copies no summary and no
+/// summary signature either.
+#[test]
+fn a_mirror_pull_with_no_ref_writes_copies_no_summary() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-no-ref-writes-mirror");
+        let (remote, commit) = build_remote(dir.path()).await;
+        std::fs::write(dir.path().join("remote/summary.sig"), SUMMARY_SIG).unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        let dest_dir = dir.path().join("dest");
+        let refs = file_inventory(&dest_dir, "refs");
+
+        dest.pull(
+            "origin",
+            PullOptions {
+                flags: PullFlags::MIRROR,
+                no_ref_writes: true,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(file_inventory(&dest_dir, "refs"), refs);
+        assert_no_refs(&dest).await;
+        assert!(!dest_dir.join("summary").exists());
+        assert!(!dest_dir.join("summary.sig").exists());
+        assert_complete(&remote, &dest, &dest_dir, &commit).await;
+    });
+}

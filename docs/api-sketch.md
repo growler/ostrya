@@ -4906,6 +4906,17 @@ pub enum VerityPolicy { Computed, Disabled }
 /// Options for a composefs export.
 pub struct ComposefsOptions { pub verity: VerityPolicy }
 
+impl ComposefsOptions {
+    /// The options of the image whose fs-verity digest a commit records under
+    /// `ostree.composefs.digest.v0`. The policy is `Computed`. Under it, each
+    /// backed file in the image carries the fs-verity digest of its content, so
+    /// the image digest covers the content of each backed file. The two digest
+    /// paths use these options and not the default, so a change of the default
+    /// does not change the recorded digest.
+    pub const RECORDED: ComposefsOptions =
+        ComposefsOptions { verity: VerityPolicy::Computed };
+}
+
 impl Repo {
     /// Produce the EROFS/composefs image for a commit and its fs-verity digest.
     /// Inode metadata comes from each file object as `load_file` reads it in
@@ -4936,7 +4947,9 @@ impl Repo {
         opts: &ComposefsOptions, out: BorrowedFd<'_>) -> Result<[u8; 32]>;
     /// Compute and store `ostree.composefs.digest.v0` in the commit's metadata.
     /// The digest derives from the tree alone, so this builds no image and runs
-    /// in every repository mode, as `Transaction::composefs_digest` does.
+    /// in every repository mode, as `Transaction::composefs_digest` does. The
+    /// digest is that of the image an export with `ComposefsOptions::RECORDED`
+    /// writes.
     pub async fn commit_add_composefs_metadata(&self, txn: &Transaction,
         commit: &Checksum) -> Result<Checksum>;
 }
@@ -4946,7 +4959,9 @@ impl Transaction {
     /// has staged, for a commit that carries the key in its own metadata. The
     /// image derives from the tree alone, so the value is the same in every
     /// repository mode holding that tree. The image goes through
-    /// `std::io::sink`, so the digest costs no image-sized buffer.
+    /// `std::io::sink`, so the digest costs no image-sized buffer. The digest is
+    /// that of the image an export with `ComposefsOptions::RECORDED` writes for
+    /// the same tree.
     pub async fn composefs_digest(&self, root: &RepoTree) -> Result<[u8; 32]>;
 }
 ```

@@ -34,9 +34,10 @@
 //! fs-verity digest, distinct from the value a commit records under
 //! `ostree.composefs.digest.v0`. The recorded value is the digest of the
 //! verity-form image, which is what a target machine reproduces at boot, so
-//! the two are not compared. Every backing object is still opened under both
-//! policies, because the inode's mode, ownership, size, and xattrs come from
-//! the file object.
+//! the two are not compared. [`ComposefsOptions::RECORDED`] holds the options
+//! of the image whose digest a commit records. Every backing object is still
+//! opened under both policies, because the inode's mode, ownership, size, and
+//! xattrs come from the file object.
 //!
 //! [`Repo::commit_add_composefs_metadata`] computes the image digest for an
 //! existing commit and writes a new commit whose metadata dict carries
@@ -185,18 +186,29 @@ pub struct ComposefsOptions {
     pub verity: VerityPolicy,
 }
 
-/// The policy the recorded digest is taken under. `ostree.composefs.digest.v0`
-/// holds the digest of the verity-form image, the artifact a target machine
-/// reproduces at boot, so the two sites that compute the recorded value name
-/// [`VerityPolicy::Computed`] rather than take it from the default.
-const RECORDED_POLICY: ComposefsOptions = ComposefsOptions {
-    verity: VerityPolicy::Computed,
-};
+impl ComposefsOptions {
+    /// The options of the image whose fs-verity digest a commit records.
+    ///
+    /// `ostree.composefs.digest.v0` holds the fs-verity digest of the image
+    /// that [`Repo::export_composefs`] and [`Repo::export_composefs_to`] write
+    /// with these options. The policy is [`VerityPolicy::Computed`]. Under it,
+    /// each backed file in the image carries the fs-verity digest of its
+    /// content, so the image digest covers the content of each backed file.
+    /// [`Repo::commit_add_composefs_metadata`] and
+    /// [`Transaction::composefs_digest`] use these options and not the
+    /// default, so a change of the default does not change the recorded
+    /// digest.
+    pub const RECORDED: ComposefsOptions = ComposefsOptions {
+        verity: VerityPolicy::Computed,
+    };
+}
 
 impl Transaction {
     /// The fs-verity digest of the composefs image for a tree this transaction
     /// has staged, the value `ostree.composefs.digest.v0` holds.
     ///
+    /// The digest is that of the image an export with
+    /// [`ComposefsOptions::RECORDED`] writes for the same tree.
     /// The image is built from the staged objects, so the digest is available
     /// before the transaction publishes and can go into the metadata of the
     /// commit the tree belongs to. The value depends on the tree alone, so a
@@ -204,7 +216,12 @@ impl Transaction {
     /// The image is written through [`std::io::sink`], so the digest costs no
     /// image-sized buffer.
     pub async fn composefs_digest(&self, root: &RepoTree) -> Result<[u8; 32]> {
-        let dir = composefs_model(ObjectSource::Staged(self), root, &RECORDED_POLICY).await?;
+        let dir = composefs_model(
+            ObjectSource::Staged(self),
+            root,
+            &ComposefsOptions::RECORDED,
+        )
+        .await?;
         image_digest(dir).await
     }
 }
@@ -221,7 +238,9 @@ impl Repo {
     /// `opts.verity` decides whether each backed file carries the fs-verity
     /// digest of its content. Under [`VerityPolicy::Disabled`] the image's own
     /// digest differs from the value a commit records under
-    /// `ostree.composefs.digest.v0`.
+    /// `ostree.composefs.digest.v0`. With [`ComposefsOptions::RECORDED`] the
+    /// image's digest is the value [`Repo::commit_add_composefs_metadata`]
+    /// records for the tree of the commit.
     pub async fn export_composefs(
         &self,
         commit: &Checksum,
@@ -285,6 +304,8 @@ impl Repo {
     /// whose metadata carries `ostree.composefs.digest.v0`, returning the new
     /// commit's checksum. The new commit is published when `txn` commits.
     ///
+    /// The digest is that of the image [`Repo::export_composefs`] writes with
+    /// [`ComposefsOptions::RECORDED`].
     /// The image derives from the commit's tree alone, so the digest is
     /// independent of the metadata it is stored in and of the repository's mode;
     /// every mode holding that tree reaches the same value. The digest key is
@@ -303,7 +324,7 @@ impl Repo {
             )));
         }
         let dir = self
-            .composefs_commit_model(&commit_obj, &RECORDED_POLICY)
+            .composefs_commit_model(&commit_obj, &ComposefsOptions::RECORDED)
             .await?;
         let fs_verity = image_digest(dir).await?;
         let digest_type = Type::parse(DIGEST_SIGNATURE).map_err(ostrya_core::Error::from)?;

@@ -489,6 +489,36 @@ fn the_writes_of_the_guard_are_visible_under_the_guard() {
     );
 }
 
+/// A guard of one handle reads the config that the guard of another handle
+/// wrote, while the first handle keeps the config it was opened with.
+#[test]
+fn a_guard_reads_the_config_another_handle_wrote() {
+    let tmp = TmpDir::new("guard-config-other-handle");
+    let path = create(&tmp, RepoMode::BareUser, "lock-timeout-secs=0\n");
+    let a = open(&path);
+    let b = open(&path);
+    block_on(async {
+        let guard = b.begin_update().await.unwrap();
+        let mut keyfile = guard.read_config().await.unwrap().keyfile().clone();
+        keyfile.set_value("ex-test", "written", "by-b").unwrap();
+        guard.write_config(&keyfile).await.unwrap();
+        guard.finish().await.unwrap();
+
+        let guard = a.begin_update().await.unwrap();
+        assert_eq!(
+            guard
+                .read_config()
+                .await
+                .unwrap()
+                .keyfile()
+                .get_value("ex-test", "written"),
+            Some("by-b")
+        );
+        assert_eq!(a.config().keyfile().get_value("ex-test", "written"), None);
+        guard.finish().await.unwrap();
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Remotes.
 // ---------------------------------------------------------------------------

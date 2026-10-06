@@ -107,6 +107,51 @@ impl Drop for TmpDir {
     }
 }
 
+/// The time limit of each wait on a writer that an update guard holds back.
+pub const GUARD_WAIT: Duration = Duration::from_secs(30);
+
+/// Run `fut`, and fail the test when it takes longer than [`GUARD_WAIT`].
+pub async fn within<T>(what: &str, fut: impl Future<Output = T>) -> T {
+    futures_lite::future::or(fut, async {
+        ostrya_rt::Timer::after(GUARD_WAIT).await;
+        panic!("{what} took longer than {GUARD_WAIT:?}");
+    })
+    .await
+}
+
+/// How long a test keeps an update guard held after the commit object of a
+/// pull under that guard lands.
+pub const GUARD_HOLD: Duration = Duration::from_millis(500);
+
+/// Wait until the commit object `commit` is in `repo`, then hold for
+/// [`GUARD_HOLD`]. Fail the test when the pull `task` ends while the commit
+/// object is absent, or when the commit object takes longer than
+/// [`GUARD_WAIT`].
+pub async fn wait_for_commit_under_guard<F>(
+    repo: &ostrya::Repo,
+    commit: &ostrya::Checksum,
+    task: &mut F,
+) where
+    F: Future + Unpin,
+    F::Output: std::fmt::Debug,
+{
+    let deadline = Instant::now() + GUARD_WAIT;
+    while !repo
+        .has_object(ostrya::ObjectType::Commit, commit)
+        .await
+        .unwrap()
+    {
+        if let Some(result) = futures_lite::future::poll_once(&mut *task).await {
+            panic!("the pull ended under the guard: {result:?}");
+        }
+        assert!(Instant::now() < deadline, "no commit after {GUARD_WAIT:?}");
+        ostrya_rt::Timer::after(Duration::from_millis(10)).await;
+    }
+    // The commit object lands before the pull reaches the lock step, so the
+    // hold lets the pull reach that step while the guard is held.
+    ostrya_rt::Timer::after(GUARD_HOLD).await;
+}
+
 // ---------------------------------------------------------------------------
 // A lock that another process holds.
 // ---------------------------------------------------------------------------

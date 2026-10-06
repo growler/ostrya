@@ -22,16 +22,17 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use common::{
-    TmpDir, file_inventory, ostree_available, ostree_supports_ed25519, writer_child_main,
-    writer_child_with,
+    TmpDir, file_inventory, ostree_available, ostree_supports_ed25519, wait_for_commit_under_guard,
+    within, writer_child_main, writer_child_with,
 };
+use futures_lite::future::poll_once;
 use ostrya::{
     Checksum, CommitModifierFlags, CommitState, CreateOptions, DeltaEndianness, DeltaOptions,
     DetachedMetadataFilter, Ed25519Signer, Error, FilterResult, FsckOptions, PullFlags,
     PullOptions, PullStats, PullVerify, Repo, RepoMode, SummaryOptions, TimestampCheck, TreeEntry,
     Type, Value, static_delta_relative_dir,
 };
-use ostrya_rt::block_on;
+use ostrya_rt::{block_on, spawn};
 use proxy::{TestProxy, Tunnel};
 use pull::*;
 
@@ -268,6 +269,66 @@ fn a_pull_that_times_out_at_the_ref_step_keeps_its_markers() {
         assert_eq!(
             dest.resolve_ref_tip("origin:test/main").await.unwrap(),
             Some(commit)
+        );
+    });
+}
+
+/// An HTTP pull into one handle of a repository whose other handle holds a
+/// guard publishes its objects and waits at the step that writes detached
+/// metadata and refs. With `lock-timeout-secs=-1` it completes that step once
+/// the guard is finished.
+#[test]
+fn a_pull_under_a_guard_publishes_its_objects_and_waits_at_the_ref_step() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-under-guard");
+        let (remote, commit) = build_remote(dir.path()).await;
+        remote
+            .write_commit_detached_metadata(&commit, Some(&detached_dict()))
+            .await
+            .unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        drop(build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await);
+        let dest_dir = dir.path().join("dest");
+        let config = dest_dir.join("config");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(
+            &config,
+            text.replacen("[core]\n", "[core]\nlock-timeout-secs=-1\n", 1),
+        )
+        .unwrap();
+        let a = Repo::open(&dest_dir).await.unwrap();
+        let b = Repo::open(&dest_dir).await.unwrap();
+        let commitmeta = |root: &Path| root.join(meta_path(&commit, "commitmeta"));
+
+        let guard = a.begin_update().await.unwrap();
+        let mut task = spawn(async move {
+            let opts = PullOptions {
+                refs: vec!["test/main".to_owned()],
+                ..PullOptions::default()
+            };
+            b.pull("origin", opts).await
+        });
+        wait_for_commit_under_guard(&a, &commit, &mut task).await;
+        assert_eq!(a.resolve_ref_tip("origin:test/main").await.unwrap(), None);
+        assert_partial_marker(&dest_dir, &commit);
+        assert!(!commitmeta(&dest_dir).exists(), "no detached metadata");
+        assert!(poll_once(&mut task).await.is_none(), "the pull waits");
+        guard.finish().await.unwrap();
+
+        within("the pull", task).await.unwrap();
+        assert_eq!(
+            a.resolve_ref_tip("origin:test/main").await.unwrap(),
+            Some(commit)
+        );
+        assert!(
+            !dest_dir
+                .join("state")
+                .join(format!("{}.commitpartial", commit.to_hex()))
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read(commitmeta(&dest_dir)).unwrap(),
+            std::fs::read(commitmeta(&dir.path().join("remote"))).unwrap()
         );
     });
 }

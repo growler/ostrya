@@ -2379,11 +2379,12 @@ async fn read_pem(path: &str) -> Result<Vec<u8>> {
     ostrya_rt::unblock(move || std::fs::read(&path).map_err(Error::from)).await
 }
 
-/// The future of a pull runs on a multi-threaded executor, over HTTP and
-/// through the ssh source.
+/// The future of a pull runs on a multi-threaded executor, over HTTP, through
+/// the ssh source, and from a local repository.
 const _: fn() = || {
     fn assert_send<T: Send>(_: &T) {}
     let _ = |repo: &Repo| assert_send(&repo.pull("origin", PullOptions::default()));
+    let _ = |repo: &Repo, src: &Repo| assert_send(&repo.pull_local(src, PullOptions::default()));
     let _ = |repo: &Repo| {
         assert_send(&repo.pull_over_stream(
             "origin",

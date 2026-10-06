@@ -13,14 +13,15 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{TmpDir, file_inventory, ostree_available};
+use common::{TmpDir, file_inventory, ostree_available, wait_for_commit_under_guard, within};
+use futures_lite::future::poll_once;
 use ostrya::{
     Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CommitState,
     CreateOptions, DeltaOptions, DetachedMetadataFilter, DetachedMetadataFilterFn, Ed25519Signer,
     Error, FilterResult, FsckOptions, MutableTree, ObjectName, ObjectType, PullFlags, PullOptions,
     PullStats, PullVerify, Repo, RepoMode, SummaryOptions, Type, Value,
 };
-use ostrya_rt::block_on;
+use ostrya_rt::{block_on, spawn};
 
 /// A fixed timestamp, so a source repository's commits are reproducible.
 const FIXED_TS: u64 = 1_700_000_000;
@@ -2240,6 +2241,59 @@ fn a_pull_that_times_out_at_the_ref_step_keeps_its_markers() {
             std::fs::read(commitmeta_path(&src_dir, &c2)).unwrap()
         );
         assert_eq!(dst.resolve_ref_tip("main").await.unwrap(), Some(c2));
+    });
+}
+
+/// A pull into one handle of a repository whose other handle holds a guard
+/// publishes its objects and waits at the step that writes detached metadata
+/// and refs. With `lock-timeout-secs=-1` it completes that step once the guard
+/// is finished.
+#[test]
+fn a_pull_under_a_guard_publishes_its_objects_and_waits_at_the_ref_step() {
+    let tmp = TmpDir::new("pull-under-guard");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
+            .await
+            .unwrap();
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        drop(dst);
+        let config = dst_dir.join("config");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(
+            &config,
+            text.replacen("[core]\n", "[core]\nlock-timeout-secs=-1\n", 1),
+        )
+        .unwrap();
+        let a = Repo::open(&dst_dir).await.unwrap();
+        let b = Repo::open(&dst_dir).await.unwrap();
+
+        let guard = a.begin_update().await.unwrap();
+        let mut task = spawn(async move {
+            let opts = PullOptions {
+                refs: vec!["main".to_owned()],
+                ..PullOptions::default()
+            };
+            b.pull_local(&src, opts).await
+        });
+        wait_for_commit_under_guard(&a, &c2, &mut task).await;
+        assert_eq!(a.resolve_ref_tip("main").await.unwrap(), None);
+        assert!(has_partial_marker(&dst_dir, &c2), "the marker stays");
+        assert!(
+            !commitmeta_path(&dst_dir, &c2).exists(),
+            "no detached metadata"
+        );
+        assert!(poll_once(&mut task).await.is_none(), "the pull waits");
+        guard.finish().await.unwrap();
+
+        within("the pull", task).await.unwrap();
+        assert_eq!(a.resolve_ref_tip("main").await.unwrap(), Some(c2));
+        assert!(!has_partial_marker(&dst_dir, &c2));
+        assert_eq!(
+            std::fs::read(commitmeta_path(&dst_dir, &c2)).unwrap(),
+            std::fs::read(commitmeta_path(&src_dir, &c2)).unwrap()
+        );
     });
 }
 

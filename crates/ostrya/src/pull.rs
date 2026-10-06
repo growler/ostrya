@@ -180,6 +180,7 @@ use crate::error::{Error, Result};
 use crate::file::FileKind;
 use crate::modifier::FilterResult;
 use crate::perm;
+use crate::refs::{CollectionRef, collection_ref_to_relpath};
 use crate::repo::Repo;
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
@@ -512,12 +513,13 @@ pub struct PullOptions {
     /// it does without the option. The caller writes the refs itself.
     ///
     /// [`PullStats`] does not report the commits a pull takes. A local pull
-    /// resolves each name in [`refs`](PullOptions::refs) on the source with
-    /// revision syntax, so a caller pins the commit it writes a ref to by
-    /// passing its checksum as the name. An HTTP or ssh pull resolves each
-    /// name as a ref name, through the remote's summary or its ref file, so a
-    /// checksum names no commit there and fails with [`Error::RefNotFound`]
-    /// unless the remote holds a ref of that name.
+    /// without [`collection_id`](PullOptions::collection_id) resolves each
+    /// name in [`refs`](PullOptions::refs) on the source with revision syntax,
+    /// so a caller pins the commit it writes a ref to by passing its checksum
+    /// as the name. With `collection_id`, each name is a ref name alone. An
+    /// HTTP or ssh pull resolves each name as a ref name, through the remote's
+    /// summary or its ref file, so a checksum names no commit there and fails
+    /// with [`Error::RefNotFound`] unless the remote holds a ref of that name.
     ///
     /// An HTTP or ssh pull still reads the ref it would write: delta
     /// discovery takes the commit that ref names as the source of a delta,
@@ -532,6 +534,29 @@ pub struct PullOptions {
     /// holds an [`UpdateGuard`](crate::UpdateGuard) of the destination during
     /// the pull waits for its own guard until the lock timeout.
     pub no_ref_writes: bool,
+    /// The collection id of the refs a local pull reads. With an id set,
+    /// [`Repo::pull_local`] resolves each name in [`refs`](PullOptions::refs)
+    /// as the collection ref `refs/mirrors/<id>/<name>` of the source. The name
+    /// is a ref name alone: a checksum, an abbreviated checksum, and an
+    /// ancestry suffix are read as part of the name. A name the source holds no
+    /// collection ref for fails with [`Error::RefNotFound`], which carries the
+    /// path of the collection ref. A path that names a directory, or that
+    /// passes through a file, fails the same way.
+    ///
+    /// The ref-binding check and delta discovery read the name alone, as
+    /// without the option. The pull does not read `ostree.collection-binding`.
+    ///
+    /// The id needs [`no_ref_writes`](PullOptions::no_ref_writes) and at least
+    /// one name in [`refs`](PullOptions::refs). Without them the local pull
+    /// fails with [`Error::Unsupported`]. An id or a name that the ref store
+    /// refuses, and a name that holds `:`, fails with
+    /// [`Error::InvalidRefspec`], which carries `<id>:<name>`. Delta discovery
+    /// reads the name as a refspec, where a `:` changes what it names. The
+    /// local pull makes these checks in this order, before it reads the
+    /// source.
+    /// [`Repo::pull`] and [`Repo::pull_over_stream`] refuse an id with
+    /// [`Error::Unsupported`] before they send a request.
+    pub collection_id: Option<String>,
     /// The flag set.
     pub flags: PullFlags,
     /// How many parents of each pulled commit to follow: `0` for the named
@@ -950,6 +975,22 @@ impl Repo {
     /// source does not hold ends that chain without error, so a source with
     /// truncated history pulls what it has.
     ///
+    /// With [`collection_id`](PullOptions::collection_id) set, each name in
+    /// [`refs`](PullOptions::refs) is the collection ref
+    /// `refs/mirrors/<id>/<name>` of `src`, read as a ref name alone, and a
+    /// name `src` holds no such ref for fails with [`Error::RefNotFound`]. A
+    /// pull with the id fails before it reads a ref or an object of `src`:
+    /// with [`Error::Unsupported`] when
+    /// [`no_ref_writes`](PullOptions::no_ref_writes) is not set or when
+    /// [`refs`](PullOptions::refs) is empty, and then with
+    /// [`Error::InvalidRefspec`] for an invalid id, an invalid name, or a name
+    /// that holds `:`.
+    ///
+    /// The pull trusts the objects this repository holds. An object this
+    /// repository holds is not imported, and a dirtree this repository holds
+    /// and no source holds is taken as complete below it. A gap below such a
+    /// dirtree makes the first operation that reaches it fail.
+    ///
     /// Under [`require_static_deltas`](PullOptions::require_static_deltas) the
     /// pull reads the source's summary and the deltas it advertises, refuses a
     /// source with no summary and one outside archive mode with
@@ -966,6 +1007,7 @@ impl Repo {
             return Err(Error::Unsupported("a local pull takes no subpath".into()));
         }
         check_depth(opts.depth)?;
+        let collection_relpaths = check_local_collection(&opts)?;
         // The signature policy is built before the source is read: a check the
         // options ask for with no remote to take keys from is refused here,
         // rather than after a chain has been walked.
@@ -1022,7 +1064,7 @@ impl Repo {
             _ => None,
         };
 
-        let targets = resolve_targets(src, &opts).await?;
+        let targets = resolve_targets(src, &opts, collection_relpaths).await?;
         let flags = opts.flags;
         let verify_bindings = !flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS);
 
@@ -1474,18 +1516,46 @@ fn refspec(remote: Option<&str>, ref_name: &str) -> String {
 }
 
 /// Resolve the refs to pull against the source: the requested names, or every
-/// ref under the source's `refs/heads` when none were named.
-async fn resolve_targets(src: &Repo, opts: &PullOptions) -> Result<Vec<(String, Checksum)>> {
+/// ref under the source's `refs/heads` when none were named. With
+/// `collection_relpaths`, the paths [`check_local_collection`] gives, each
+/// name is the collection ref at its path, and the target keeps the name
+/// alone. A path that names a directory, or that passes through a file, holds
+/// no ref and fails as an absent one does.
+async fn resolve_targets(
+    src: &Repo,
+    opts: &PullOptions,
+    collection_relpaths: Option<Vec<String>>,
+) -> Result<Vec<(String, Checksum)>> {
     if opts.refs.is_empty() {
         return src.list_refs(None).await;
     }
     let mut out = Vec::with_capacity(opts.refs.len());
-    for name in &opts.refs {
-        let checksum = src
-            .resolve_rev(name, false)
-            .await?
-            .ok_or_else(|| Error::RefNotFound(name.clone()))?;
-        out.push((name.clone(), checksum));
+    match collection_relpaths {
+        Some(relpaths) => {
+            for (name, relpath) in opts.refs.iter().zip(relpaths) {
+                let checksum = match src.resolve_relpath_tip(relpath.clone()).await {
+                    Err(Error::Io(e))
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::IsADirectory | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        None
+                    }
+                    other => other?,
+                };
+                out.push((name.clone(), checksum.ok_or(Error::RefNotFound(relpath))?));
+            }
+        }
+        None => {
+            for name in &opts.refs {
+                let checksum = src
+                    .resolve_rev(name, false)
+                    .await?
+                    .ok_or_else(|| Error::RefNotFound(name.clone()))?;
+                out.push((name.clone(), checksum));
+            }
+        }
     }
     Ok(out)
 }
@@ -1714,6 +1784,51 @@ async fn load_dirtree_from(sources: &[&Repo], checksum: &Checksum) -> Result<Opt
         }
     }
     Ok(None)
+}
+
+/// Refuse a local pull of collection refs that would write refs, since no rule
+/// names the ref such a pull writes, and one that names no ref, since an empty
+/// list reads `refs/heads` and no collection ref. Then refuse each name that
+/// gives no collection ref path, and each name that holds `:`, since delta
+/// discovery reads the name as a refspec and a `:` changes what it names.
+///
+/// The checks read nothing. The result holds the path of the collection ref
+/// of each name, in order, and is `None` without a collection id.
+fn check_local_collection(opts: &PullOptions) -> Result<Option<Vec<String>>> {
+    let Some(id) = &opts.collection_id else {
+        return Ok(None);
+    };
+    if !opts.no_ref_writes {
+        return Err(Error::Unsupported(
+            "a local pull with a collection id needs no_ref_writes".into(),
+        ));
+    }
+    if opts.refs.is_empty() {
+        return Err(Error::Unsupported(
+            "a local pull with a collection id needs at least one ref name".into(),
+        ));
+    }
+    opts.refs
+        .iter()
+        .map(|name| {
+            if name.contains(':') {
+                return Err(Error::InvalidRefspec(format!("{id}:{name}")));
+            }
+            collection_ref_to_relpath(&CollectionRef::new(id.as_str(), name.as_str()))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// Refuse a collection id on a pull from a remote, which reads no collection
+/// ref.
+fn refuse_remote_collection(opts: &PullOptions) -> Result<()> {
+    if opts.collection_id.is_some() {
+        return Err(Error::Unsupported(
+            "only a local pull takes a collection id".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse a depth below -1.

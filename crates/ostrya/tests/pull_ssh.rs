@@ -885,3 +885,50 @@ fn the_ssh_source_with_no_ref_writes_writes_no_ref() {
         }
     });
 }
+
+/// The ssh pull refuses a collection id: the pull over a pair of streams
+/// before it writes to the server, and the pull from an ssh address before
+/// the ssh client starts. Neither publishes anything.
+#[test]
+fn the_ssh_pull_refuses_a_collection_id() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-collection");
+        let (remote, _commit) = build_remote(dir.path()).await;
+        let dest_path = dir.path().join("dest");
+        let dest = dest_at(&dest_path, RepoMode::Archive, None).await;
+        let before = snapshot(&dest_path);
+        let collection = || PullOptions {
+            collection_id: Some("org.example.Os".to_owned()),
+            no_ref_writes: true,
+            ..main_ref(0)
+        };
+        let expected = "only a local pull takes a collection id";
+
+        let (pulled, served) = pull_ssh(&dest, &remote, collection()).await;
+        match pulled {
+            Err(Error::Unsupported(msg)) => assert_eq!(msg, expected),
+            other => panic!("{other:?}"),
+        }
+        // The server read the end of its input before any `PullHello`.
+        served.unwrap();
+
+        let record = dir.path().join("record");
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    url: Some("ssh://localhost/srv/repo".to_owned()),
+                    connect: recording_ssh(&record),
+                    ..collection()
+                },
+            )
+            .await
+            .unwrap_err();
+        match err {
+            Error::Unsupported(msg) => assert_eq!(msg, expected),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(recorded(&record), None);
+        assert_eq!(snapshot(&dest_path), before);
+    });
+}

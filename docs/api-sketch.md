@@ -2213,14 +2213,34 @@ sourced from `src` first and then each of
 each commit and dirtree through the same order, so a subtree `src` has lost is
 enumerated from a cache that holds it. Refs are written after the objects are
 published. With `no_ref_writes` set, the pull writes no ref, and the caller
-writes the refs itself. `PullStats` does not report the pulled commits. The
-local pull resolves each name in `refs` on `src` with revision syntax, so the
-caller pins a commit when it gives the checksum as the name. The local pull
-reads the ref it would write only for delta discovery under
-`require_static_deltas`. When a pulled commit has detached metadata, a pull
-with `no_ref_writes` still takes the update lock to write it. A caller that
-holds an `UpdateGuard` of the destination during the pull then waits for its
-own guard until the lock timeout.
+writes the refs itself. `PullStats` does not report the pulled commits. Without
+`collection_id`, the local pull resolves each name in `refs` on `src` with
+revision syntax, so the caller pins a commit when it gives the checksum as the
+name. The local pull reads the ref it would write only for delta discovery
+under `require_static_deltas`. When a pulled commit has detached metadata, a
+pull with `no_ref_writes` still takes the update lock to write it. A caller
+that holds an `UpdateGuard` of the destination during the pull then waits for
+its own guard until the lock timeout.
+
+With `collection_id` set, the local pull resolves each name in `refs` as the
+collection ref `refs/mirrors/<collection-id>/<name>` of `src`. The name is a
+ref name alone: a checksum, an abbreviated checksum, and an ancestry suffix
+are read as part of the name. A name `src` holds no such ref for fails with
+`RefNotFound`, which carries the path of the collection ref. A path that names
+a directory, or that passes through a file, fails the same way. The
+ref-binding check and delta discovery read the name alone, and the pull does
+not read `ostree.collection-binding`. Before it reads `src`, the pull makes
+these checks in this order. It refuses `collection_id` with `Unsupported` when
+`no_ref_writes` is not set, since no rule names the ref such a pull writes,
+and when `refs` is empty. Then it refuses an id or a name the ref store
+refuses, and a name that holds `:`, with `InvalidRefspec`, which carries
+`<collection-id>:<name>`. Delta discovery reads the name as a refspec, where a
+`:` changes what it names.
+
+The local pull trusts the objects the destination holds. An object the
+destination holds is not imported, and a dirtree the destination holds and no
+source holds is taken as complete below it. A gap below such a dirtree makes
+the first operation that reaches it fail.
 
 `pull` fetches the same thing from an HTTP remote named in the repository's
 config, or over ssh from a remote with an ssh address, into one transaction, with up to `max_outstanding_fetches` objects in
@@ -2262,7 +2282,9 @@ summary. It stores the objects and the `.commitmeta` files, and removes the
 `TimestampCheck::CurrentRef` still read the ref the pull would write. The pull
 resolves each name as a ref name, through the summary or the ref file. A
 checksum given as a name fails with `RefNotFound`, unless the remote holds a
-ref of that name.
+ref of that name. `pull` and `pull_over_stream` refuse `collection_id` with
+`Unsupported` before the first request, so no ssh client starts and the remote
+needs no section in the configuration.
 
 A remote that publishes static deltas delivers a commit as one delta instead of
 one request per object. A pull looks for one delta per tip: `<from>-<to>`, where
@@ -2364,6 +2386,9 @@ pub struct PullOptions {
     pub remote: Option<String>,           // refs/remotes/<remote>/<ref>
     pub no_ref_writes: bool,              // write no ref and no mirror summary;
                                           // the caller writes the refs
+    pub collection_id: Option<String>,    // local pull: refs/mirrors/<id>/<ref>;
+                                          // needs no_ref_writes and named refs;
+                                          // pull / pull_over_stream: Unsupported
     pub flags: PullFlags,
     pub depth: i32,                       // 0 = the commit alone, -1 = all;
                                           // below -1: InvalidInput, nothing written

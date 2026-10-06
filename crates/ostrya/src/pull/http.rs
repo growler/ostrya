@@ -243,6 +243,7 @@ use super::verify::{Defaults, Verification};
 use super::{
     DetachedMetadataFilter, ModeChecks, PullCounters, PullFlags, PullOptions, PullStats,
     READ_CHUNK, TimestampCheck, apply_durability, check_depth, check_ref_binding, refspec,
+    refuse_remote_collection,
 };
 
 /// How many fetches are in flight when the caller names no limit.
@@ -303,7 +304,10 @@ impl Repo {
     /// against `refs/heads/<ref>`; a ref neither yields fails with
     /// [`Error::RefNotFound`] before anything is fetched. A
     /// [`depth`](PullOptions::depth) below `-1` fails with
-    /// [`Error::InvalidInput`] before the first request. An empty
+    /// [`Error::InvalidInput`] before the first request, and a
+    /// [`collection_id`](PullOptions::collection_id) fails with
+    /// [`Error::Unsupported`] before the first request and before the ssh
+    /// client starts: the pull reads no collection ref. An empty
     /// [`refs`](PullOptions::refs) list takes every ref the summary lists under
     /// [`MIRROR`](PullFlags::MIRROR), and the remote's configured `branches`
     /// otherwise; neither being available fails with [`Error::Pull`].
@@ -323,6 +327,7 @@ impl Repo {
         // costs no request and opens no transaction.
         let subpaths = Subpaths::parse(&opts.subpaths)?;
         check_depth(opts.depth)?;
+        refuse_remote_collection(&opts)?;
         let section = self.config().remote(remote);
         // The address is resolved first, so a remote the config does not
         // describe reports that before a policy is resolved for it.
@@ -400,8 +405,10 @@ impl Repo {
     ///
     /// [`url`](PullOptions::url) and the ssh command and the send command of
     /// [`connect`](PullOptions::connect) are [`Error::InvalidInput`]: the
-    /// caller already connected the streams. The session puts no time limit
-    /// on a read.
+    /// caller already connected the streams. A
+    /// [`collection_id`](PullOptions::collection_id) is
+    /// [`Error::Unsupported`] before the session opens, as for
+    /// [`pull`](Repo::pull). The session puts no time limit on a read.
     pub async fn pull_over_stream<R, W>(
         &self,
         remote: &str,
@@ -416,6 +423,7 @@ impl Repo {
         let started = Instant::now();
         let subpaths = Subpaths::parse(&opts.subpaths)?;
         check_depth(opts.depth)?;
+        refuse_remote_collection(&opts)?;
         if opts.url.is_some() {
             return Err(Error::InvalidInput(
                 "a pull over a pair of streams takes no url".into(),

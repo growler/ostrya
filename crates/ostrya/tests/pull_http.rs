@@ -5250,3 +5250,50 @@ fn a_mirror_pull_with_no_ref_writes_copies_no_summary() {
         assert_complete(&remote, &dest, &dest_dir, &commit).await;
     });
 }
+
+// --- collection refs -------------------------------------------------------
+
+/// An HTTP pull refuses a collection id before its first request, and
+/// publishes nothing. A remote with no section in the configuration gets the
+/// same refusal.
+#[test]
+fn an_http_pull_refuses_a_collection_id() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-collection");
+        build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        let dest_dir = dir.path().join("dest");
+        let snapshot = || {
+            let mut out = file_inventory(&dest_dir, "objects");
+            out.extend(file_inventory(&dest_dir, "refs"));
+            out.extend(file_inventory(&dest_dir, "state"));
+            out
+        };
+        let before = snapshot();
+
+        for remote in ["origin", "absent"] {
+            let err = dest
+                .pull(
+                    remote,
+                    PullOptions {
+                        refs: vec!["test/main".to_owned()],
+                        collection_id: Some("org.example.Os".to_owned()),
+                        no_ref_writes: true,
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            match err {
+                Error::Unsupported(msg) => {
+                    assert_eq!(msg, "only a local pull takes a collection id", "{remote}")
+                }
+                other => panic!("{remote}: {other:?}"),
+            }
+        }
+
+        assert!(server.seen().is_empty(), "{:?}", server.seen());
+        assert_eq!(snapshot(), before);
+    });
+}

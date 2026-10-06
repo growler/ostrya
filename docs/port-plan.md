@@ -2693,7 +2693,8 @@ Split into sub-phases:
   source-agnostic; 16c reuses them.
 - 16d Delta-accelerated pull and the delta-part cap of 2 (DONE, see below). The
   config and mount repo finders moved out of this sub-phase: a finder resolves a
-  collection ref, and collection refs are not yet scheduled.
+  collection ref. The local pull resolves collection refs, and the HTTP and ssh
+  pulls refuse them. The ref a collection pull writes is not yet scheduled.
 - 16e Commit and summary signature verification during a pull (DONE, see
   below): the GPG and sign-api axes, their configuration keys and key sources,
   and the delta signature check 16d left open.
@@ -3095,10 +3096,31 @@ queue, so no ref names a commit whose objects are not yet durable, matching the
 durability contract Phase 7d set. With `PullOptions::no_ref_writes` set, the
 pull queues no ref. It imports the objects and the detached metadata and
 removes the markers as without the option, and the caller writes the refs
-itself. The pull resolves each name in `refs` on the source with revision
-syntax, so the caller pins a commit when it gives the checksum as the name.
-It reads the ref it would write only for delta discovery under
-`require_static_deltas`.
+itself. Without `PullOptions::collection_id`, the pull resolves each name in
+`refs` on the source with revision syntax, so the caller pins a commit when it
+gives the checksum as the name. It reads the ref it would write only for delta
+discovery under `require_static_deltas`.
+
+With `PullOptions::collection_id` set, the local pull resolves each name in
+`refs` as the collection ref `refs/mirrors/<collection-id>/<name>` of the
+source, through `collection_ref_to_relpath` and the ref-store read. The name is
+a ref name alone, with no checksum and no revision syntax. A miss is
+`RefNotFound` with the path of the collection ref. A path that names a
+directory, or that passes through a file, is a miss too. The target keeps the
+name alone, so the ref-binding check and delta discovery read it as without
+the option, and the pull does not read `ostree.collection-binding`. The checks
+of the id run in this order after the subpath and depth checks and before the
+signature policy is built, so they read nothing of the source. The pull
+refuses the id with `Unsupported` when `no_ref_writes` is not set, since no
+rule names the ref such a pull writes, and when `refs` is empty. Then
+`collection_ref_to_relpath` gives the path of each name, and an id or a name
+the ref store refuses is `InvalidRefspec` with `<collection-id>:<name>`. A name
+that holds `:` is `InvalidRefspec` with the same payload, since delta discovery
+reads the name as a refspec and a `:` changes what it names. The read of each
+collection ref takes the paths these checks give. The local pull trusts the
+destination: it imports no object the destination holds, and it takes a
+dirtree the destination holds and no source holds as complete below it, so a
+gap below that dirtree makes the first operation that reaches it fail.
 
 Each tip is followed to `depth` on its own. The chain walk records the number of
 parents a commit still had to follow when it was reached, and a chain arriving at
@@ -3428,7 +3450,11 @@ The CLI grows `ostrya pull-local`, with `--remote`, `--depth`,
 
 Deferred past 16b: the summary, mirror mode, and the timestamp checks land in
 16c; delta-accelerated pull in 16d; GPG and sign-engine commit verification in
-16e; collection refs, `refs/mirrors`, and subpath pulls are not yet scheduled.
+16e. The local pull resolves collection refs under `refs/mirrors` with
+`PullOptions::collection_id` and writes no ref for them. The ref a collection
+pull writes and the `ostree.collection-binding` check are not yet scheduled.
+`Repo::pull` takes a subpath through `PullOptions::subpaths`, and the local
+pull refuses a subpath with `Unsupported`.
 
 #### Phase 16c -- HTTP pull (DONE)
 
@@ -3568,6 +3594,10 @@ the `.commitpartial` markers, as without the option. Delta discovery and
 resolves each name as a ref name, through the summary or the ref file, and
 `PullStats` does not report the pulled commits. A checksum given as a name
 fails with `RefNotFound`, unless the remote holds a ref of that name.
+The HTTP pull, the ssh pull, and `pull_over_stream` refuse
+`PullOptions::collection_id` with `Unsupported` after the depth check, before
+the first request, before the ssh client starts, and before the remote's
+configuration is read.
 `TimestampCheck` refuses a fetched tip strictly older than the commit the ref
 currently names here (`CurrentRef`, where an absent ref passes) or than a given
 commit (`Rev`), naming both revisions and both timestamps. The ref-binding check
@@ -3672,8 +3702,8 @@ conformance cases land in `conformance/m10-cli-behavior.matrix` at the
 CLI-compatibility phase.
 
 Deferred: `contenturl`, `metalink`, and mirrorlists; subpath pulls; collection
-refs and `refs/mirrors`; the summary cache under `tmp/cache/summaries/`; the
-archive-to-archive pass-through, which is 16g.
+refs and `refs/mirrors` in the HTTP pull; the summary cache under
+`tmp/cache/summaries/`; the archive-to-archive pass-through, which is 16g.
 
 #### Phase 16d -- Delta-accelerated pull (DONE)
 
@@ -8461,9 +8491,11 @@ Resolved:
    publishes its objects, only when it writes a ref or detached metadata.
 
 9. Repo finders: the config and mount finders land with the phase that brings
-   collection refs, which a finder resolves and which is not yet scheduled; they
+   the pull of collection refs from a remote, which is not yet scheduled; they
    were originally slated for Phase 16d and moved out of it. Avahi discovery is
-   out of scope.
+   out of scope. A finder resolves a collection ref. The local pull resolves
+   collection refs, and the HTTP and ssh pulls refuse them. The ref a
+   collection pull writes is not yet scheduled.
 10. HTTP/2: required for pull. The fetcher is built on `hyper` 1.11
     (`client`, `http1`, `http2`) with ALPN over `rustls` 0.23, the crypto
     provider being `rustls-graviola` (Rust plus formally-verified assembly, no

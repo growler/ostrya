@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::collections::HashSet;
 use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
@@ -14,10 +15,10 @@ use std::process::Command;
 
 use common::{TmpDir, file_inventory, ostree_available};
 use ostrya::{
-    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitState, CreateOptions,
-    DeltaOptions, DetachedMetadataFilter, DetachedMetadataFilterFn, Ed25519Signer, Error,
-    FilterResult, FsckOptions, MutableTree, PullFlags, PullOptions, PullStats, PullVerify, Repo,
-    RepoMode, SummaryOptions, Type, Value,
+    Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CommitState,
+    CreateOptions, DeltaOptions, DetachedMetadataFilter, DetachedMetadataFilterFn, Ed25519Signer,
+    Error, FilterResult, FsckOptions, MutableTree, ObjectName, ObjectType, PullFlags, PullOptions,
+    PullStats, PullVerify, Repo, RepoMode, SummaryOptions, Type, Value,
 };
 use ostrya_rt::block_on;
 
@@ -3754,6 +3755,404 @@ fn a_pull_with_no_ref_writes_completes_every_parent_under_depth() {
         assert_eq!(dst.resolve_rev("main", true).await.unwrap(), None);
         for commit in [&c1, &c2] {
             assert_complete(&src, &dst, &dst_dir, commit).await;
+        }
+    });
+}
+
+// --- collection refs -----------------------------------------------------
+
+/// The collection id the collection-ref tests read.
+const COLLECTION: &str = "org.example.Os";
+
+/// The options of a pull of `refs` as collection refs of [`COLLECTION`], under
+/// the remote name `origin`, that writes no ref.
+fn collection_pull(refs: &[&str]) -> PullOptions {
+    PullOptions {
+        refs: refs.iter().map(|name| (*name).to_owned()).collect(),
+        remote: Some("origin".to_owned()),
+        collection_id: Some(COLLECTION.to_owned()),
+        no_ref_writes: true,
+        ..PullOptions::default()
+    }
+}
+
+/// Point the collection ref `name` of `collection` in `repo` at `commit`.
+async fn set_collection_ref(repo: &Repo, collection: &str, name: &str, commit: &Checksum) {
+    let txn = repo.transaction().await.unwrap();
+    txn.set_collection_ref(&CollectionRef::new(collection, name), Some(commit));
+    txn.commit().await.unwrap();
+}
+
+/// An archive source under `base/thin` that holds only the objects `c2`
+/// reaches in `src` and `c1` does not, copied from the archive `src` at
+/// `src_dir`, with `c2` under the collection ref `main` of [`COLLECTION`].
+/// Returns its path, a handle opened after the copy, and the objects the two
+/// commits share.
+async fn thin_source(
+    base: &Path,
+    src_dir: &Path,
+    src: &Repo,
+    c1: &Checksum,
+    c2: &Checksum,
+) -> (PathBuf, Repo, HashSet<ObjectName>) {
+    let old = src.traverse_commit(c1, 0).await.unwrap();
+    let new = src.traverse_commit(c2, 0).await.unwrap();
+    let (path, thin) = make_repo(base, "thin", RepoMode::Archive).await;
+    for name in new.difference(&old) {
+        let to = object_path(&path, name, RepoMode::Archive);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(object_path(src_dir, name, RepoMode::Archive), &to).unwrap();
+    }
+    set_collection_ref(&thin, COLLECTION, "main", c2).await;
+    drop(thin);
+    let thin = Repo::open(&path).await.unwrap();
+    let shared = old.intersection(&new).copied().collect();
+    (path, thin, shared)
+}
+
+/// Copy the files under `from` to `to`, creating the directories.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap().flatten() {
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// A pull of a collection ref from a source that holds only the objects the
+/// new commit adds takes the shared objects from the destination: it reads
+/// no object the destination holds and leaves the commit complete.
+#[test]
+fn a_collection_pull_takes_the_shared_objects_from_the_destination() {
+    let tmp = TmpDir::new("pull-collection-thin");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (_thin_dir, thin, shared) = thin_source(base, &src_dir, &src, &c1, &c2).await;
+        assert!(shared.contains(&subdir_dirtree(&src, &c2).await));
+        assert!(shared.iter().any(|name| name.ty == ObjectType::File));
+        for name in &shared {
+            assert!(!thin.has_object(name.ty, &name.checksum).await.unwrap());
+        }
+        let held = thin.list_objects().await.unwrap();
+        let (dst_dir, dst) = dst_holding(base, "dst", &src, &c1).await;
+        let refs = file_inventory(&dst_dir, "refs");
+
+        let stats = dst
+            .pull_local(&thin, collection_pull(&["main"]))
+            .await
+            .unwrap();
+
+        assert_eq!(file_inventory(&dst_dir, "refs"), refs);
+        assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
+        assert!(!has_partial_marker(&dst_dir, &c2));
+        let mut expected = src.traverse_commit(&c1, 0).await.unwrap();
+        expected.extend(src.traverse_commit(&c2, 0).await.unwrap());
+        assert_eq!(dst.list_objects().await.unwrap(), expected);
+        let content = held.iter().filter(|n| n.ty == ObjectType::File).count();
+        assert_eq!(stats.content_imported as usize, content);
+        assert_eq!(stats.metadata_imported as usize, held.len() - content);
+        assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// The same pull into an empty destination fails, since no repository holds
+/// the shared objects, and publishes nothing.
+#[test]
+fn a_collection_pull_from_a_thin_source_into_an_empty_destination_fails() {
+    let tmp = TmpDir::new("pull-collection-thin-empty");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (_thin_dir, thin, _shared) = thin_source(base, &src_dir, &src, &c1, &c2).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+
+        let err = dst
+            .pull_local(&thin, collection_pull(&["main"]))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::ObjectNotFound { .. }), "{err:?}");
+        assert_nothing_left(&dst_dir, &dst, &c2).await;
+    });
+}
+
+/// A collection pull reads the collection ref alone: the ref of the same name
+/// under `refs/heads` is not read.
+#[test]
+fn a_collection_pull_reads_the_ref_under_refs_mirrors() {
+    let tmp = TmpDir::new("pull-collection-mirrors");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        assert_eq!(src.resolve_rev("main", false).await.unwrap(), Some(c2));
+        set_collection_ref(&src, COLLECTION, "main", &c1).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+
+        dst.pull_local(&src, collection_pull(&["main"]))
+            .await
+            .unwrap();
+
+        assert_complete(&src, &dst, &dst_dir, &c1).await;
+        assert!(!dst.has_object(ObjectType::Commit, &c2).await.unwrap());
+    });
+}
+
+/// A name the source holds no collection ref for fails with the path of the
+/// collection ref, also where the source holds the name under `refs/heads` or
+/// under another collection, and a checksum is read as a ref name.
+#[test]
+fn an_absent_collection_ref_is_not_found() {
+    let tmp = TmpDir::new("pull-collection-absent");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        set_collection_ref(&src, "org.example.Other", "main", &c2).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let hex = c2.to_hex();
+
+        for name in ["main", hex.as_str()] {
+            let err = dst
+                .pull_local(&src, collection_pull(&[name]))
+                .await
+                .unwrap_err();
+            match err {
+                Error::RefNotFound(path) => {
+                    assert_eq!(path, format!("refs/mirrors/{COLLECTION}/{name}"))
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+            assert_nothing_left(&dst_dir, &dst, &c2).await;
+        }
+    });
+}
+
+/// A collection pull that requires static deltas takes the delta from the
+/// commit the ref under the remote name holds, and leaves that ref as it is.
+#[test]
+fn a_collection_pull_takes_a_required_delta() {
+    let tmp = TmpDir::new("pull-collection-delta");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let delta = delta_with(&src, Some(&c1), &c2, DeltaOptions::default()).await;
+        let (thin_dir, thin, _shared) = thin_source(base, &src_dir, &src, &c1, &c2).await;
+        copy_tree(
+            &delta,
+            &thin_dir.join(delta.strip_prefix(&src_dir).unwrap()),
+        );
+        thin.reindex_static_deltas().await.unwrap();
+        summarize(&thin).await;
+        let (_dst_dir, dst) = dst_holding(base, "dst", &src, &c1).await;
+        let txn = dst.transaction().await.unwrap();
+        txn.set_ref("origin:main", Some(&c1));
+        txn.commit().await.unwrap();
+
+        let stats = dst
+            .pull_local(
+                &thin,
+                PullOptions {
+                    remote: Some("origin".to_owned()),
+                    collection_id: Some(COLLECTION.to_owned()),
+                    no_ref_writes: true,
+                    ..required(PullFlags::empty())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(stats.delta_parts, 1);
+        assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
+        assert_eq!(
+            dst.resolve_rev("origin:main", false).await.unwrap(),
+            Some(c1)
+        );
+        assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// The ref-binding check reads the name of the collection ref: a commit bound
+/// to `main` is refused under `other`, and is taken with the check off.
+#[test]
+fn a_collection_pull_checks_the_ref_binding_against_the_name() {
+    let tmp = TmpDir::new("pull-collection-binding");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        set_collection_ref(&src, COLLECTION, "other", &c2).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+
+        let err = dst
+            .pull_local(&src, collection_pull(&["other"]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Pull(_)), "{err}");
+        assert!(err.to_string().contains("other"), "{err}");
+        assert_nothing_left(&dst_dir, &dst, &c2).await;
+
+        dst.pull_local(
+            &src,
+            PullOptions {
+                flags: PullFlags::DISABLE_VERIFY_BINDINGS,
+                ..collection_pull(&["other"])
+            },
+        )
+        .await
+        .unwrap();
+        assert_complete(&src, &dst, &dst_dir, &c2).await;
+    });
+}
+
+/// A collection pull that would write refs, and one that names no ref, are
+/// refused before the source is read, and change nothing in the destination.
+/// The source holds no collection ref, so a refusal after the read of the
+/// collection ref would fail with [`Error::RefNotFound`], and an empty list
+/// would pull the refs under `refs/heads`.
+#[test]
+fn a_collection_pull_is_refused_without_no_ref_writes_or_a_ref() {
+    let tmp = TmpDir::new("pull-collection-refused");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, _c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        let inventory = |dir: &Path| {
+            let mut out = file_inventory(dir, "objects");
+            out.extend(file_inventory(dir, "refs"));
+            out.extend(file_inventory(dir, "state"));
+            out
+        };
+        let before = inventory(&dst_dir);
+
+        for (case, opts, expected) in [
+            (
+                "ref writes",
+                PullOptions {
+                    no_ref_writes: false,
+                    ..collection_pull(&["main"])
+                },
+                "a local pull with a collection id needs no_ref_writes",
+            ),
+            (
+                "no ref",
+                collection_pull(&[]),
+                "a local pull with a collection id needs at least one ref name",
+            ),
+        ] {
+            match dst.pull_local(&src, opts).await {
+                Err(Error::Unsupported(msg)) => assert_eq!(msg, expected, "{case}"),
+                other => panic!("{case}: {other:?}"),
+            }
+            assert_eq!(inventory(&dst_dir), before, "{case}");
+        }
+    });
+}
+
+/// A collection ref path that names a directory, or that passes through a
+/// file, holds no ref: the pull fails with the path of the collection ref, as
+/// for an absent one.
+#[test]
+fn a_collection_ref_path_through_a_directory_or_a_file_is_not_found() {
+    let tmp = TmpDir::new("pull-collection-not-a-ref");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        set_collection_ref(&src, COLLECTION, "main/sub", &c2).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+
+        for name in ["main", "main/sub/x"] {
+            let err = dst
+                .pull_local(&src, collection_pull(&[name]))
+                .await
+                .unwrap_err();
+            match err {
+                Error::RefNotFound(path) => {
+                    assert_eq!(path, format!("refs/mirrors/{COLLECTION}/{name}"))
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+            assert_nothing_left(&dst_dir, &dst, &c2).await;
+        }
+    });
+}
+
+/// With a collection id, an abbreviated checksum and an ancestry suffix are
+/// part of the ref name. The source holds `main` under `refs/heads` and as a
+/// collection ref, so a revision read of either name would find a commit.
+#[test]
+fn a_collection_ref_name_takes_no_revision_syntax() {
+    let tmp = TmpDir::new("pull-collection-revision");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        set_collection_ref(&src, COLLECTION, "main", &c2).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let hex = c2.to_hex();
+
+        for name in [&hex[..10], "main^"] {
+            let err = dst
+                .pull_local(&src, collection_pull(&[name]))
+                .await
+                .unwrap_err();
+            match err {
+                Error::RefNotFound(path) => {
+                    assert_eq!(path, format!("refs/mirrors/{COLLECTION}/{name}"))
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+            assert_nothing_left(&dst_dir, &dst, &c2).await;
+        }
+    });
+}
+
+/// An invalid collection id, and a name that holds `:`, are refused with the
+/// pair as the payload before the source is read. The pull requires static
+/// deltas and the source holds no summary, so a check after the first read
+/// of the source would fail with the error of the absent summary, as the
+/// valid pair does.
+#[test]
+fn an_invalid_collection_id_or_name_is_refused_before_the_source_is_read() {
+    let tmp = TmpDir::new("pull-collection-invalid");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        let inventory = |dir: &Path| {
+            let mut out = file_inventory(dir, "objects");
+            out.extend(file_inventory(dir, "refs"));
+            out.extend(file_inventory(dir, "state"));
+            out
+        };
+        let before = inventory(&dst_dir);
+        let opts = |id: &str, name: &str| PullOptions {
+            refs: vec![name.to_owned()],
+            collection_id: Some(id.to_owned()),
+            no_ref_writes: true,
+            require_static_deltas: true,
+            ..PullOptions::default()
+        };
+
+        let err = dst.pull_local(&src, opts(COLLECTION, "main")).await;
+        assert!(matches!(err, Err(Error::Pull(_))), "{err:?}");
+
+        for (id, name) in [
+            ("", "main"),
+            ("..", "main"),
+            ("a/b", "main"),
+            (COLLECTION, "a:b"),
+            (COLLECTION, "x:"),
+            (COLLECTION, ":y"),
+        ] {
+            match dst.pull_local(&src, opts(id, name)).await {
+                Err(Error::InvalidRefspec(pair)) => {
+                    assert_eq!(pair, format!("{id}:{name}"), "{id:?} {name:?}")
+                }
+                other => panic!("{id:?} {name:?}: {other:?}"),
+            }
+            assert_eq!(inventory(&dst_dir), before, "{id:?} {name:?}");
         }
     });
 }

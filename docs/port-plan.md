@@ -7721,6 +7721,21 @@ Proxy from the environment:
   `http_proxy` naming a proxy that answers, fails the pull with `[7] Could not
   connect to server`, and the proxy the variable names logs no request. A
   `no_proxy` that matches the origin host overrides the key.
+- A proxy value with white space at its start or end fails the pull with
+  `[5] Could not resolve proxy name`, writes no ref, and sends no request to
+  the proxy. The rule holds for the remote `proxy` key, with trailing spaces
+  or with a `\s` escape at the start, and for `http_proxy` with trailing
+  spaces.
+
+The port diverges from the last record. A `no_proxy` that matches the origin
+host does not override the remote `proxy` key. The port maps the key onto
+`Proxy::Url`, which reads no exemptions, so a pull through the key reaches
+every origin through the proxy.
+
+The port also diverges from the record of white space for the environment
+variables. The fetcher trims the value of each proxy variable, so a pull
+connects through `http_proxy` with trailing spaces. The remote `proxy` key
+follows the record.
 
 `tls-permissive` on a remote:
 
@@ -7793,13 +7808,20 @@ The proxy the port implements:
 - The decision is made per hop from that hop's origin, so a redirect onto
   another origin is served the way a route naming that origin would be, and a
   proxied hop may redirect onto an exempt origin reached directly.
-- The remote `proxy` config key is not carried, so an HTTP pull reads the
-  environment alone. A later phase that carries it maps it onto
-  `Proxy::Variables`, which states the variables in the options: the key's
-  value goes into `http_proxy` and `https_proxy`, and `no_proxy` keeps the
-  value the environment holds, which is the exemption the record above
-  measured over the key. `Proxy::Url` reads no exemptions, so it cannot
-  express that exemption. The mapping needs no new variant.
+- `remote_fetcher` reads the remote `proxy` config key. A non-empty value
+  gives `Proxy::Url` with that value. An absent key and an empty value give
+  `Proxy::Environment`. The keyfile drops the spaces and tabs at the start of
+  a value, so a value of spaces alone is empty. A non-empty value with white
+  space at its start or end is `Error::Unsupported` before the first request,
+  and the message does not hold the value. The fetcher of an HTTP pull,
+  of its static deltas, and of `Repo::remote_fetch_summary`, which the CLI
+  `remote summary` and `remote refs` call, comes from `remote_fetcher`. A pull
+  whose `PullOptions::url` overrides the address of a configured remote reads
+  the key of that remote too. `Proxy::Url` reads no exemptions, so `no_proxy`
+  does not exempt an origin from the key. A value that is not
+  `http://host[:port]` fails `Fetcher::new` with `Error::Unsupported`, before
+  the first request and before the pull opens a transaction. A push and a
+  pull over ssh do not read the key.
 
 The verification bypass:
 
@@ -7911,6 +7933,10 @@ The suite's proxy exemption:
   pull included. `force` stops a host value from narrowing it.
 - The setting exempts a proxy a `cargo run` would use as well. An installed
   binary reads the environment it is given.
+- The setting does not exempt an origin from the remote `proxy` key, so the
+  tests of the key run in the test process. The tests of a pull that reads
+  the proxy from the environment run the pull in a child process. The child
+  starts with no proxy variable and with `http_proxy` naming the test proxy.
 
 Dependency set for the phase, both in `crates/ostrya` and both pure Rust with
 no C in the graph. `CLAUDE.md` states the measured graph of each.

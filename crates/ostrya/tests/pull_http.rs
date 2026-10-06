@@ -13,13 +13,18 @@
 //! what the connection-reuse assertion reads.
 
 mod common;
+#[path = "common/proxy.rs"]
+mod proxy;
 #[path = "common/pull.rs"]
 mod pull;
 
 use std::collections::HashSet;
 use std::path::Path;
 
-use common::{TmpDir, file_inventory, ostree_available, ostree_supports_ed25519};
+use common::{
+    TmpDir, file_inventory, ostree_available, ostree_supports_ed25519, writer_child_main,
+    writer_child_with,
+};
 use ostrya::{
     Checksum, CommitModifierFlags, CommitState, CreateOptions, DeltaEndianness, DeltaOptions,
     DetachedMetadataFilter, Ed25519Signer, Error, FilterResult, FsckOptions, PullFlags,
@@ -27,6 +32,7 @@ use ostrya::{
     Type, Value, static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
+use proxy::{TestProxy, Tunnel};
 use pull::*;
 
 // --- tests -----------------------------------------------------------------
@@ -5296,4 +5302,271 @@ fn an_http_pull_refuses_a_collection_id() {
         assert!(server.seen().is_empty(), "{:?}", server.seen());
         assert_eq!(snapshot(), before);
     });
+}
+
+// --- the remote's proxy key ------------------------------------------------
+
+/// The variables the fetcher reads to find a proxy, under both spellings. A
+/// child process that pulls through the environment starts with none of them.
+const PROXY_VARIABLES: [&str; 8] = [
+    "http_proxy",
+    "HTTP_PROXY",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+];
+
+/// The writer child pulls the ref its argument names from `origin`.
+#[test]
+#[ignore = "helper process for the proxy environment tests"]
+fn writer_child_subprocess() {
+    writer_child_main(|path, arg| {
+        block_on(async {
+            let repo = Repo::open(path).await.unwrap();
+            repo.pull(
+                "origin",
+                PullOptions {
+                    refs: vec![arg.to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        });
+    });
+}
+
+/// A cleartext pull from a remote with a `proxy` key sends every request to
+/// that proxy in absolute form. The suite runs with `no_proxy="*"`, which
+/// exempts every origin from an environment proxy, so the pull also shows that
+/// the key ignores `no_proxy`.
+#[test]
+fn a_pull_goes_through_the_proxy_key() {
+    assert_eq!(
+        std::env::var("no_proxy").as_deref(),
+        Ok("*"),
+        "the claim on no_proxy needs the suite's no_proxy=\"*\""
+    );
+    block_on(async {
+        let dir = TmpDir::new("pull-http-proxy-key");
+        let (_remote, commit) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let proxy = TestProxy::start(Tunnel::Open).await;
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            &format!("proxy={}\n", proxy.url()),
+        )
+        .await;
+
+        dest.pull(
+            "origin",
+            PullOptions {
+                refs: vec!["test/main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(commit)
+        );
+        assert!(proxy.requests() > 0);
+        assert_eq!(proxy.requests(), server.seen().len());
+        let origin = format!("{}/", server.url());
+        for seen in proxy.seen() {
+            assert_eq!(seen.method, "GET");
+            assert!(seen.target.starts_with(&origin), "{}", seen.target);
+        }
+    });
+}
+
+/// A pull from an `https://` remote with a `proxy` key opens a tunnel to the
+/// remote through the proxy, and the proxy sees nothing else.
+#[test]
+fn a_tls_pull_tunnels_through_the_proxy_key() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-proxy-key-tls");
+        let (_remote, commit) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), true).await;
+        let proxy = TestProxy::start(Tunnel::Open).await;
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, CA_PEM).unwrap();
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            &format!("tls-ca-path={}\nproxy={}\n", ca.display(), proxy.url()),
+        )
+        .await;
+
+        dest.pull(
+            "origin",
+            PullOptions {
+                refs: vec!["test/main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(commit)
+        );
+        let authority = server.url().strip_prefix("https://").unwrap().to_owned();
+        let seen = proxy.seen();
+        assert!(!seen.is_empty());
+        for seen in seen {
+            assert_eq!(seen.method, "CONNECT");
+            assert_eq!(seen.target, authority);
+        }
+    });
+}
+
+/// `remote_fetch_summary` reaches the remote through its `proxy` key.
+#[test]
+fn remote_fetch_summary_goes_through_the_proxy_key() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-proxy-key-summary");
+        build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let proxy = TestProxy::start(Tunnel::Open).await;
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            &format!("proxy={}\n", proxy.url()),
+        )
+        .await;
+
+        let (summary, _) = dest.remote_fetch_summary("origin").await.unwrap();
+        assert!(summary.is_some());
+        let target = format!("{}/summary", server.url());
+        assert!(
+            proxy.seen().iter().any(|seen| seen.target == target),
+            "{:?}",
+            proxy.seen()
+        );
+    });
+}
+
+/// A `proxy` key the fetcher cannot connect through fails the pull before its
+/// first request, and the pull publishes nothing.
+#[test]
+fn a_pull_refuses_a_proxy_key_it_cannot_use() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-proxy-key-refused");
+        build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            "proxy=https://127.0.0.1:1\n",
+        )
+        .await;
+
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        assert!(server.seen().is_empty(), "{:?}", server.seen());
+        assert_nothing_published(&dest).await;
+    });
+}
+
+/// A `proxy` key with white space at the end of its value, or a value that
+/// the `\s` escape makes one space, fails the pull before its first request,
+/// and the pull publishes nothing. The message leaves the credential out.
+#[test]
+fn a_pull_refuses_a_proxy_key_with_white_space_around_it() {
+    for (tag, value) in [
+        ("trailing", "http://user:pw@127.0.0.1:1   "),
+        ("escape", "\\s"),
+    ] {
+        block_on(async {
+            let dir = TmpDir::new(&format!("pull-http-proxy-key-space-{tag}"));
+            build_remote(dir.path()).await;
+            let server = RepoServer::start(&dir.path().join("remote"), false).await;
+            let dest = build_dest(
+                dir.path(),
+                RepoMode::Archive,
+                &server.url(),
+                &format!("proxy={value}\n"),
+            )
+            .await;
+
+            let err = dest
+                .pull(
+                    "origin",
+                    PullOptions {
+                        refs: vec!["test/main".to_owned()],
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{tag}: {err:?}");
+            assert!(!err.to_string().contains("pw"), "{tag}: {err}");
+            assert!(server.seen().is_empty(), "{tag}: {:?}", server.seen());
+            assert_nothing_published(&dest).await;
+        });
+    }
+}
+
+/// Run the pull of `test/main` in a child process whose environment names
+/// the test proxy in `http_proxy` alone, with the `[remote]` keys `extra`.
+/// The pull goes through the proxy and writes the ref.
+fn pull_through_the_environment_proxy(tag: &str, extra: &str) {
+    block_on(async {
+        let dir = TmpDir::new(tag);
+        let (_remote, commit) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let proxy = TestProxy::start(Tunnel::Open).await;
+        drop(build_dest(dir.path(), RepoMode::Archive, &server.url(), extra).await);
+
+        let path = dir.path().join("dest");
+        let proxy_url = proxy.url();
+        let child = writer_child_with(&path, "test/main", |command| {
+            for name in PROXY_VARIABLES {
+                command.env_remove(name);
+            }
+            command.env("http_proxy", proxy_url);
+        });
+        // The proxy and the server run on this thread's runtime, so the wait
+        // must not block it.
+        ostrya_rt::unblock(move || child.wait()).await;
+
+        assert!(proxy.requests() > 0);
+        assert_eq!(proxy.requests(), server.seen().len());
+        let dest = Repo::open(&path).await.unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(commit)
+        );
+    });
+}
+
+/// An empty `proxy` key leaves the proxy to the environment.
+#[test]
+fn an_empty_proxy_key_reads_the_environment() {
+    pull_through_the_environment_proxy("pull-http-proxy-key-empty", "proxy=\n");
+}
+
+/// A remote with no `proxy` key reads the proxy from the environment.
+#[test]
+fn no_proxy_key_reads_the_environment() {
+    pull_through_the_environment_proxy("pull-http-proxy-key-absent", "");
 }

@@ -2577,9 +2577,9 @@ such a remote with `error: No "url" option in remote "NAME"`. Over ssh:
   `--`: `error: invalid input: http-header applies to a pull over HTTP, and
   'ADDRESS' is an ssh address`. `--disable-retry-on-network-errors` is
   accepted, because a pull over ssh never sends a request again.
-- The pull reads no `tls-*` key, no `contenturl` key, and no `metalink` key
-  of the remote. A pull over HTTP reads neither `ssh-command` nor
-  `send-command`.
+- The pull reads no `tls-*` key, no `contenturl` key, no `metalink` key,
+  and no `proxy` key of the remote. A pull over HTTP reads neither
+  `ssh-command` nor `send-command`.
 - An ssh address in the `url` key is refused at exit 1, and no ssh client
   starts: `error: pull: remote 'NAME': url 'VALUE' is an ssh address; the
   port reads an ssh address from pull-url alone`. The tool refuses the same

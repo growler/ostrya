@@ -2257,6 +2257,16 @@ stored under the name it was requested by and the write path compares what it
 hashed against that name, so an HTTP pull verifies whatever the flags say.
 `localcache_repos` are consulted before the network, per object.
 
+The fetcher of an HTTP pull takes its proxy from the remote key `proxy`, which
+`Remote::proxy` reads. A non-empty value gives `Proxy::Url`, which reaches
+every origin through that proxy and reads no `no_proxy` exemption. An absent
+key and an empty value give `Proxy::Environment`. The same rule applies to the
+static deltas of the pull, to `remote_fetch_summary`, and to a pull whose
+`url` overrides the address of a configured remote. A value that is not
+`http://host[:port]`, and a value with white space at its start or end, is
+`Error::Unsupported` before the first request. The message of the second
+refusal does not hold the value.
+
 The driver of `pull` reads the remote through a source, one of two: the HTTP
 source, over the fetcher, and the ssh source, over a `PullSession` of
 `ostrya-push`. `pull_over_stream` runs the same pull through the ssh source
@@ -2525,6 +2535,12 @@ impl Repo {
     /// over HTTP or over ssh by the address rule of `pull`, with no `url`.
     pub async fn remote_fetch_summary(&self, remote: &str)
         -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)>;
+}
+
+impl Remote<'_> {
+    /// The `proxy` key: the `http://` proxy URL of an HTTP pull, as written.
+    /// An empty value counts as an absent key.
+    pub fn proxy(&self) -> Result<Option<String>>;
 }
 ```
 
@@ -3744,7 +3760,8 @@ the connect options of a push:
   - For an `http://` or `https://` address, `push-token-file`, `push-user`,
     `tls-ca-path`, `tls-client-cert-path`, and `tls-client-key-path` fill
     the fields of the same names. The ssh keys are not read, so a
-    `receive-command` key in such a section causes no refusal.
+    `receive-command` key in such a section causes no refusal. The `proxy`
+    key is not read.
   - For an `https://` address, `tls-permissive=true` is `Error::Push` with
     `push::Error::InvalidInput`, before any request. A push verifies the
     certificate chain of the server. An `http://` address uses no TLS, and
@@ -4676,7 +4693,7 @@ The pull over ssh to an address:
 - The remote keys `ssh-command` and `send-command` fill
   `connect.remote_ssh_command` and `connect.send_command` where they are
   `None`, also when the address comes from `url`. The pull reads no
-  `contenturl`, `metalink`, or `tls-*` key.
+  `contenturl`, `metalink`, `proxy`, or `tls-*` key.
 - `Repo::pull` resolves the signature policy, then starts the ssh client with
   `PullSession::connect`, at the point where the HTTP pull sends its first
   request, and then runs the pull of `pull_over_stream`.

@@ -337,15 +337,26 @@ impl Drop for WriterChild {
 /// binary on the repository at `repo`, with the argument `arg`. The call
 /// returns at once.
 pub fn writer_child(repo: &Path, arg: &str) -> WriterChild {
-    let child = Command::new(std::env::current_exe().unwrap())
+    writer_child_with(repo, arg, |_| {})
+}
+
+/// Start the writer process of [`writer_child`], after `configure` changes
+/// its command, for example its environment.
+pub fn writer_child_with(
+    repo: &Path,
+    arg: &str,
+    configure: impl FnOnce(&mut Command),
+) -> WriterChild {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .args([WRITER_CHILD_TEST, "--exact", "--ignored", "--nocapture"])
         .env(WRITER_CHILD_REPO, repo)
         .env(WRITER_CHILD_ARG, arg)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn the writer");
+        .stderr(Stdio::inherit());
+    configure(&mut command);
+    let child = command.spawn().expect("spawn the writer");
     WriterChild { child: Some(child) }
 }
 

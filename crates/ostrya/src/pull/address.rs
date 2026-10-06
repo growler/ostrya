@@ -13,8 +13,8 @@
 //! remote keys `ssh-command` and `send-command`, each only where the caller
 //! leaves the field of [`PullOptions::connect`] `None`, as a push takes them.
 //! It refuses a field of [`PullOptions`] that applies to HTTP alone, and it
-//! reads no remote key of HTTP alone: `contenturl`, `metalink`, and the
-//! `tls-*` keys.
+//! reads no remote key of HTTP alone: `contenturl`, `metalink`, `proxy`, and
+//! the `tls-*` keys.
 
 use crate::config::Remote;
 use crate::error::{Error, Result};

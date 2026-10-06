@@ -221,8 +221,8 @@ use crate::delta::IO_CHUNK;
 use crate::error::{Error, Result};
 use crate::fetch::gate::Gate;
 use crate::fetch::{
-    ClientIdentity, FetchRequest, Fetched, Fetcher, FetcherOptions, LowSpeed, Priority, TlsOptions,
-    TrustRoots,
+    ClientIdentity, FetchRequest, Fetched, Fetcher, FetcherOptions, LowSpeed, Priority, Proxy,
+    TlsOptions, TrustRoots,
 };
 use crate::inflate::BufSource;
 use crate::object::{MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
@@ -273,7 +273,7 @@ impl Repo {
     /// remote whose address is an ssh address.
     ///
     /// `remote` names a `[remote "<name>"]` section of this repository's config,
-    /// which supplies the address and the TLS material;
+    /// which supplies the address, the TLS material, and the proxy;
     /// [`url`](PullOptions::url) overrides the address, which lets a caller pull
     /// from a remote the config does not describe. The address is
     /// [`url`](PullOptions::url), then the remote key `pull-url`, then the
@@ -283,14 +283,21 @@ impl Repo {
     /// remote. An ssh address in `url` is [`Error::Pull`], and so is a section
     /// with neither key.
     ///
+    /// An HTTP pull connects through the `http://` proxy URL of the remote key
+    /// `proxy`, for every origin, and ignores `no_proxy`. When the key is
+    /// absent or empty, the pull reads the proxy environment variables. A
+    /// value with white space at its start or end, and a value the fetcher
+    /// cannot connect through, is [`Error::Unsupported`] before the first
+    /// request.
+    ///
     /// A pull over ssh runs the ssh client after the signature policy is
     /// resolved, with the ssh command and the send command of
     /// [`connect`](PullOptions::connect). The remote keys `ssh-command` and
     /// `send-command` fill the fields that `connect` leaves `None`, and the
     /// precedence of [`PullConnectOptions`] applies. The pull reads no remote
-    /// key of HTTP alone: `contenturl`, `metalink`, and the `tls-*` keys. A
-    /// field of HTTP alone is [`Error::InvalidInput`] before the ssh client
-    /// starts: [`http_headers`](PullOptions::http_headers),
+    /// key of HTTP alone: `contenturl`, `metalink`, `proxy`, and the `tls-*`
+    /// keys. A field of HTTP alone is [`Error::InvalidInput`] before the ssh
+    /// client starts: [`http_headers`](PullOptions::http_headers),
     /// [`n_network_retries`](PullOptions::n_network_retries) above 0,
     /// [`low_speed_limit_bytes`](PullOptions::low_speed_limit_bytes), and
     /// [`low_speed_time`](PullOptions::low_speed_time). The pull keeps the
@@ -336,9 +343,9 @@ impl Repo {
         let (source, verification) = match address {
             PullAddress::Http(url) => {
                 refuse_ssh_fields(&opts)?;
-                // `remote_fetcher` reads the TLS material and sends no request,
-                // so a refused policy still stops the pull before its first
-                // fetch.
+                // `remote_fetcher` reads the TLS material and the proxy and
+                // sends no request, so a refused policy still stops the pull
+                // before its first fetch.
                 let fetcher = self
                     .remote_fetcher(
                         remote,
@@ -659,11 +666,11 @@ impl Repo {
     /// The remote's `summary` and `summary.sig` bytes, an absent one as `None`.
     ///
     /// The remote is reached the way [`pull`](Repo::pull) reaches it, with no
-    /// override: its `pull-url` or its `url`, and its TLS material over HTTP.
-    /// Over ssh, the remote keys `ssh-command` and `send-command` give the
-    /// commands, and the `OSTRYA_SSH_COMMAND` environment variable wins over
-    /// `ssh-command`. The two files are asked for together, and the session
-    /// ends before the call returns.
+    /// override: its `pull-url` or its `url`, and its TLS material and its
+    /// proxy over HTTP. Over ssh, the remote keys `ssh-command` and
+    /// `send-command` give the commands, and the `OSTRYA_SSH_COMMAND`
+    /// environment variable wins over `ssh-command`. The two files are asked
+    /// for together, and the session ends before the call returns.
     pub async fn remote_fetch_summary(
         &self,
         remote: &str,
@@ -697,7 +704,10 @@ impl Repo {
 
     /// Build the fetcher of `url` for one remote from its config section and
     /// `opts`, adding the bytes of each body it reads to each counter of
-    /// `received`.
+    /// `received`. The section gives the TLS material and the proxy, and a
+    /// `proxy` value with white space at its start or end is
+    /// [`Error::Unsupported`]. With no section, the fetcher trusts the host
+    /// trust store and reads the proxy environment variables.
     async fn remote_fetcher(
         &self,
         remote: &str,
@@ -706,14 +716,18 @@ impl Repo {
         opts: &PullOptions,
         received: Vec<Arc<AtomicU64>>,
     ) -> Result<Fetcher> {
-        let tls = match section {
-            Some(section) => remote_tls(remote, section).await?,
-            None => TlsOptions::default(),
+        let (tls, proxy) = match section {
+            Some(section) => (
+                remote_tls(remote, section).await?,
+                remote_proxy(remote, section)?,
+            ),
+            None => (TlsOptions::default(), Proxy::Environment),
         };
         Fetcher::with_counters(
             FetcherOptions {
                 headers: opts.http_headers.clone(),
                 tls,
+                proxy,
                 max_retries: opts.n_network_retries.unwrap_or(DEFAULT_RETRIES),
                 max_outstanding: opts.max_outstanding_fetches.unwrap_or(DEFAULT_OUTSTANDING),
                 low_speed: low_speed(opts),
@@ -2291,6 +2305,26 @@ pub(crate) async fn check_stream_end<R: AsyncRead + Unpin>(
         )));
     }
     Ok(())
+}
+
+/// Read the proxy a remote's `proxy` key names. An empty or absent key leaves
+/// the proxy to the environment variables.
+///
+/// A value with white space at its start or end is refused, as the reference
+/// tool refuses it. The fetcher trims a proxy URL, so it would connect through
+/// such a value. The message leaves the value out, because the userinfo of the
+/// value can hold a password.
+fn remote_proxy(remote: &str, section: &crate::config::Remote<'_>) -> Result<Proxy> {
+    Ok(match section.proxy()? {
+        Some(url) if url.trim() != url => {
+            return Err(Error::Unsupported(format!(
+                "remote '{remote}': the proxy key has white space at the start or \
+                 the end of its value"
+            )));
+        }
+        Some(url) if !url.is_empty() => Proxy::Url(url),
+        _ => Proxy::Environment,
+    })
 }
 
 /// Read the trust anchors and the client identity a remote's TLS keys name.

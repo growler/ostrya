@@ -1987,7 +1987,8 @@ A pull over ssh reads `ssh-command` too, with the precedence of a push: the
 ssh command of the pull options, then `OSTRYA_SSH_COMMAND`, then the key.
 Each of `ssh-command` and `send-command` applies only when the pull options
 do not set the same value. It ignores the keys that apply to HTTP alone:
-`contenturl`, `metalink`, the TLS keys, `push-token-file`, and `push-user`.
+`contenturl`, `metalink`, `proxy`, the TLS keys, `push-token-file`, and
+`push-user`.
 A pull over HTTP ignores `ssh-command` and `send-command`.
 
 The port reads the seven keys as strings, as written. The tool reads `url` to

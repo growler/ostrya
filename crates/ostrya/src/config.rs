@@ -693,6 +693,17 @@ impl Remote<'_> {
         self.string("send-command")
     }
 
+    /// The `http://` proxy URL an HTTP pull from this remote connects
+    /// through, `proxy`. An empty value counts as an absent key, and the pull
+    /// then reads the proxy environment variables. A pull that uses the key
+    /// connects through the proxy for every origin and ignores `no_proxy`. The
+    /// value is returned as written, and an HTTP pull refuses a non-empty
+    /// value with white space at its start or end. A push and a pull over ssh
+    /// do not read the key.
+    pub fn proxy(&self) -> Result<Option<String>> {
+        self.string("proxy")
+    }
+
     /// The raw value of an arbitrary key in this remote's section.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.keyfile.get_value(&self.group, key)
@@ -1179,6 +1190,43 @@ mod tests {
             Some("/etc/client.key")
         );
         assert!(remote.tls_permissive().unwrap());
+    }
+
+    /// The `proxy` key of a remote section, read as written with its trailing
+    /// spaces and its escapes, empty when the value is empty or spaces, and
+    /// absent when the section does not set it.
+    #[test]
+    fn reads_remote_proxy_key() {
+        let text = "[core]\nrepo_version=1\nmode=archive-z2\n\n\
+                    [remote \"set\"]\nurl=http://ex.com/r\n\
+                    proxy=http://user:pw@proxy.ex.com:3128\n\n\
+                    [remote \"empty\"]\nurl=http://ex.com/r\nproxy=\n\n\
+                    [remote \"blank\"]\nurl=http://ex.com/r\nproxy=  \n\n\
+                    [remote \"trail\"]\nurl=http://ex.com/r\nproxy=http://p:1  \n\n\
+                    [remote \"escape\"]\nurl=http://ex.com/r\nproxy=\\s\n\n\
+                    [remote \"plain\"]\nurl=http://ex.com/r\n";
+        let cfg = RepoConfig::parse(text).unwrap();
+        assert_eq!(
+            cfg.remote("set").unwrap().proxy().unwrap().as_deref(),
+            Some("http://user:pw@proxy.ex.com:3128")
+        );
+        assert_eq!(
+            cfg.remote("empty").unwrap().proxy().unwrap().as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            cfg.remote("blank").unwrap().proxy().unwrap().as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            cfg.remote("trail").unwrap().proxy().unwrap().as_deref(),
+            Some("http://p:1  ")
+        );
+        assert_eq!(
+            cfg.remote("escape").unwrap().proxy().unwrap().as_deref(),
+            Some(" ")
+        );
+        assert_eq!(cfg.remote("plain").unwrap().proxy().unwrap(), None);
     }
 
     /// The push keys and the pull keys of the port in a remote section, each

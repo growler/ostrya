@@ -22,6 +22,7 @@ use ostrya::{
     RepoMode, UpdateGuard,
 };
 use ostrya_rt::block_on;
+use rustix::process::{Flock, FlockType, Pid};
 
 /// The update lock file, relative to the repository root.
 const UPDATE_LOCK_FILE: &str = ".update.lock";
@@ -123,23 +124,18 @@ async fn assert_locks_free(path: &Path) {
     guard.finish().await.unwrap();
 }
 
-/// The record locks that `/proc/locks` records for the process `pid` on the
-/// inode `ino`, as their access words (`READ` or `WRITE`).
-fn record_locks(pid: u32, ino: u64) -> Vec<String> {
-    let pid = pid.to_string();
-    let ino = ino.to_string();
-    std::fs::read_to_string("/proc/locks")
-        .unwrap()
-        .lines()
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            (fields.len() > 5
-                && fields[1] == "POSIX"
-                && fields[4] == pid
-                && fields[5].rsplit(':').next() == Some(ino.as_str()))
-            .then(|| fields[3].to_owned())
-        })
-        .collect()
+/// The first record lock that another process holds on the file at `path`,
+/// or `None` when no other process holds one.
+///
+/// The probe tests a write lock over the whole file, so a read or write lock
+/// of another process is reported, and the classic record locks of this
+/// process are not. The kernel answers from one consistent state, which
+/// `/proc/locks` is not, as it is read in several calls. Call it only where
+/// this process holds no record lock on the file: closing the probe
+/// descriptor drops each one.
+fn foreign_record_lock(path: &Path) -> Option<Flock> {
+    let file = std::fs::File::open(path).unwrap();
+    rustix::process::fcntl_getlk(&file, &Flock::from(FlockType::WriteLock)).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -391,13 +387,23 @@ fn locking_false_still_takes_the_update_lock() {
 
     let holder = guard_holder(&path);
     assert_timeout(block_on(repo.begin_update()));
-    let pid = holder.pid();
-    let update_ino = std::fs::metadata(path.join(UPDATE_LOCK_FILE))
-        .unwrap()
-        .ino();
-    let repo_ino = std::fs::metadata(path.join(".lock")).unwrap().ino();
-    assert_eq!(record_locks(pid, update_ino), ["WRITE"]);
-    assert!(record_locks(pid, repo_ino).is_empty(), "no lock on .lock");
+    // The attempt above failed and `locking=false` takes no repository lock,
+    // so this process holds no record lock on either file, as
+    // `foreign_record_lock` requires. A write lock of the holder over the
+    // whole file excludes any other lock of the holder on it.
+    let whole_file_write_lock = Flock {
+        pid: Pid::from_raw(holder.pid().try_into().unwrap()),
+        ..Flock::from(FlockType::WriteLock)
+    };
+    assert_eq!(
+        foreign_record_lock(&path.join(UPDATE_LOCK_FILE)),
+        Some(whole_file_write_lock)
+    );
+    assert_eq!(
+        foreign_record_lock(&path.join(".lock")),
+        None,
+        "no lock on .lock"
+    );
     holder.release();
 }
 

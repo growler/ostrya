@@ -513,7 +513,7 @@ pub(crate) async fn acquire(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsFd;
+    use std::os::fd::{AsFd, AsRawFd};
 
     /// A repository root fd over a throwaway directory, for lock unit tests.
     struct Scratch {
@@ -697,18 +697,19 @@ mod tests {
         );
     }
 
-    /// Whether the kernel records an exclusive record lock of this process on
-    /// the inode `ino`.
-    fn holds_write_lock(ino: u64) -> bool {
-        let pid = std::process::id().to_string();
-        let locks = std::fs::read_to_string("/proc/locks").unwrap();
-        locks.lines().any(|line| {
+    /// Whether the kernel records an exclusive record lock of this process
+    /// that `lock` set through its descriptor.
+    ///
+    /// The fdinfo of a descriptor lists only the locks this process set
+    /// through that descriptor. It is built in one pass, so it is a
+    /// consistent snapshot. `/proc/locks` is read in several calls, and a
+    /// line goes missing when other locks change between two of them.
+    fn holds_write_lock(lock: &RepoLock) -> bool {
+        let path = format!("/proc/self/fdinfo/{}", lock.fd().as_raw_fd());
+        let info = std::fs::read_to_string(path).unwrap();
+        info.lines().any(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            fields.len() > 5
-                && fields[1] == "POSIX"
-                && fields[3] == "WRITE"
-                && fields[4] == pid
-                && fields[5].rsplit(':').next() == Some(&ino.to_string())
+            fields.len() > 4 && fields[0] == "lock:" && fields[2] == "POSIX" && fields[4] == "WRITE"
         })
     }
 
@@ -717,14 +718,9 @@ mod tests {
     /// record lock of the new one.
     #[test]
     fn a_new_lock_survives_the_close_of_a_dropped_one() {
-        use std::os::unix::fs::MetadataExt;
-
         for _ in 0..20 {
             let scratch = Scratch::new("redrop");
             let old = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
-            let ino = std::fs::metadata(scratch._dir.join(LOCK_FILE))
-                .unwrap()
-                .ino();
             let weak = Arc::downgrade(&old);
 
             // The held registry mutex stops the drop of `old` before it
@@ -742,7 +738,7 @@ mod tests {
             ));
             dropper.join().unwrap();
 
-            assert!(holds_write_lock(ino), "the close dropped the new lock");
+            assert!(holds_write_lock(&new), "the close dropped the new lock");
             new.release(LockKind::Exclusive);
         }
     }

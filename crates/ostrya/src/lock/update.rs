@@ -778,12 +778,12 @@ mod tests {
 
     #[test]
     fn a_lock_file_linked_to_the_repository_lock_is_refused() {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::fd::AsRawFd;
 
         let scratch = Scratch::new("linked");
         let repo = scratch.create(RepoMode::BareUser);
         ostrya_rt::block_on(async {
-            let _held = repo.lock_repo(LockKind::Shared).await.unwrap();
+            let guard = repo.lock_repo(LockKind::Shared).await.unwrap();
             let lock_file = scratch.path().join(".lock");
             std::fs::hard_link(&lock_file, scratch.path().join(UPDATE_LOCK_FILE)).unwrap();
 
@@ -791,19 +791,20 @@ mod tests {
             assert!(matches!(err, Error::Io(_)), "{err:?}");
 
             // The kernel still records the shared lock of this process on the
-            // inode of `.lock`.
-            let ino = std::fs::metadata(&lock_file).unwrap().ino();
-            let pid = std::process::id().to_string();
-            let locks = std::fs::read_to_string("/proc/locks").unwrap();
-            let held = locks.lines().any(|line| {
+            // inode of `.lock`. The fdinfo of the descriptor that set the lock
+            // lists only the locks this process set through that descriptor,
+            // and it is a consistent snapshot, which `/proc/locks` is not.
+            let (lock, _) = guard.hold.as_ref().unwrap();
+            let path = format!("/proc/self/fdinfo/{}", lock.fd().as_raw_fd());
+            let info = std::fs::read_to_string(path).unwrap();
+            let held = info.lines().any(|line| {
                 let fields: Vec<&str> = line.split_whitespace().collect();
-                fields.len() > 5
-                    && fields[1] == "POSIX"
-                    && fields[3] == "READ"
-                    && fields[4] == pid
-                    && fields[5].rsplit(':').next() == Some(&ino.to_string())
+                fields.len() > 4
+                    && fields[0] == "lock:"
+                    && fields[2] == "POSIX"
+                    && fields[4] == "READ"
             });
-            assert!(held, "the repository lock was dropped:\n{locks}");
+            assert!(held, "the repository lock was dropped:\n{info}");
         });
     }
 }

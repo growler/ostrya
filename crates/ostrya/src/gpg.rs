@@ -4,7 +4,7 @@
 //! verified, and a remote's trusted keyring is managed in the process with the
 //! `pgp` crate (rPGP). The `sign-gpg` feature adds signing through
 //! `gpg --detach-sign` and turns on `verify-gpg` with it. The signer is
-//! [`GpgSigner`] of the `ostrya-sign` crate, re-exported here. Its signing run
+//! `GpgSigner` of the `ostrya-sign` crate, re-exported here. Its signing run
 //! and its secret-key listing are the `gpg` runs the library makes, with one
 //! more under the `receive` feature: a server signing key's public certificate
 //! is read with `gpg --export`, so the receive path can recognize a signature

@@ -969,8 +969,8 @@ struct SignArgs {
     /// every file read.
     #[arg(long, value_name = "PATH")]
     keys_file: Vec<std::ffi::OsString>,
-    /// Read trusted.<type> and revoked.<type> from this directory in place of
-    /// the system key directories, for ed25519/spki verify. Given more than
+    /// Read `trusted.<type>` and `revoked.<type>` from this directory in place
+    /// of the system key directories, for ed25519/spki verify. Given more than
     /// once, the last value wins. An empty value names the working directory.
     /// Not used by the gpg engine.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
@@ -1059,8 +1059,8 @@ struct SummaryArgs {
     /// file is read.
     #[arg(long, value_name = "PATH")]
     keys_file: Vec<std::ffi::OsString>,
-    /// Read trusted.<type> and revoked.<type> from this directory in place of
-    /// the system key directories, for ed25519/spki verify. Given more than
+    /// Read `trusted.<type>` and `revoked.<type>` from this directory in place
+    /// of the system key directories, for ed25519/spki verify. Given more than
     /// once, the last value wins. An empty value names the working directory.
     /// Refused by gpg verify.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
@@ -1146,9 +1146,9 @@ struct DeltaVerifyArgs {
     /// given and refused as no regular file.
     #[arg(long, value_name = "PATH", overrides_with = "keys_file")]
     keys_file: Option<std::ffi::OsString>,
-    /// Read trusted.<type> and revoked.<type> from this directory in place of
-    /// the system key directories. Given more than once, the last value wins.
-    /// An empty value names the working directory.
+    /// Read `trusted.<type>` and `revoked.<type>` from this directory in place
+    /// of the system key directories. Given more than once, the last value
+    /// wins. An empty value names the working directory.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
     keys_dir: Option<std::ffi::OsString>,
     /// A delta name, `TO` or `FROM-TO` in full lowercase hex, or the path of a
@@ -1170,8 +1170,8 @@ struct DeltaApplyArgs {
     /// not read.
     #[arg(long, value_name = "PATH", overrides_with = "keys_file")]
     keys_file: Option<std::ffi::OsString>,
-    /// Read trusted.<type> and revoked.<type> from this directory. Given more
-    /// than once, the last value wins. An empty value names the working
+    /// Read `trusted.<type>` and `revoked.<type>` from this directory. Given
+    /// more than once, the last value wins. An empty value names the working
     /// directory.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
     keys_dir: Option<std::ffi::OsString>,
@@ -1530,7 +1530,7 @@ struct PushArgs {
     /// with a push address, or an ssh, `http://`, or `https://` address.
     /// Required; checked after the repository resolves.
     remote: Option<String>,
-    /// The refspecs, each SRC[:DST]. SRC is a revision of this repository and
+    /// The refspecs, each `SRC[:DST]`. SRC is a revision of this repository and
     /// DST the ref of the server that takes its commit; DST defaults to SRC
     /// when SRC is a ref. `:DST` deletes the ref DST of the server. At least
     /// one is required.

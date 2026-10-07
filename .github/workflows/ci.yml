@@ -23,6 +23,25 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # A workspace build turns on in each crate the features its dependents
+      # ask for, so a link to an item behind a feature resolves there and
+      # breaks in a build of that crate with its default features. This step
+      # builds the workspace with every feature, then each published crate
+      # alone with its default features, then `ostrya` with `verify-gpg`
+      # without `sign-gpg`, which holds the `gpg` module without `GpgSigner`.
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --workspace --no-deps --all-features
+          crates=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.publish != []) | .name')
+          test -n "$crates"
+          for crate in $crates; do
+            cargo doc -p "$crate" --no-deps
+          done
+          cargo doc -p ostrya --no-deps --no-default-features --features smol,verify-gpg
+
       # PCRE2 is the second C library in the tree, and it belongs to the
       # unpublished binary alone: `ostrya-cli` compiles the `commit
       # --tar-pathname-filter` expression with it and sets `publish = false`, so

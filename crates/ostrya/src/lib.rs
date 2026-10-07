@@ -96,16 +96,16 @@
 //! deterministic ed25519 signatures, and [`load_sign_keys`], which reads the
 //! `trusted.<type>` / `revoked.<type>` files and `.d` directories (a verifier
 //! trusts the loaded set minus the revoked set). Under the `sign-spki` feature
-//! it also covers the spki engine (Phase 13c): [`SpkiSigner`] / [`SpkiVerifier`]
+//! it also covers the spki engine (Phase 13c): `SpkiSigner` / `SpkiVerifier`
 //! over ECDSA on NIST P-256 with SHA-256, DER-encoded signatures, and
 //! SubjectPublicKeyInfo public keys, reusing the sign-api key store as
 //! `trusted.spki` / `revoked.spki`. Under the `verify-gpg` feature it also
-//! covers the GPG engine (Phase 13d): [`GpgVerifier`] holds binary or armored
+//! covers the GPG engine (Phase 13d): `GpgVerifier` holds binary or armored
 //! keyrings, parses each into certificates as it loads it, and answers the
 //! verdict in the process over the `pgp` crate (rPGP); detached OpenPGP
 //! signatures accumulate under `ostree.gpgsigs` with per-signature metadata
 //! read from the certificate and the signature packet. The `sign-gpg` feature
-//! adds [`GpgSigner`], which runs `gpg --detach-sign` with the key resolved by
+//! adds `GpgSigner`, which runs `gpg --detach-sign` with the key resolved by
 //! fingerprint, key id, or user id in an optional GnuPG home directory
 //! (agent-held and hardware-token keys included), and turns on `verify-gpg`
 //! with it. It also covers static deltas
@@ -191,7 +191,7 @@
 //! section owns. Under the `verify-gpg` feature, `Repo::gpg_import_keys` and
 //! `Repo::gpg_list_keys` add certificates to a remote's
 //! `<remote>.trustedkeys.gpg` and read back the key records it holds (see the
-//! [`gpg`] module). It also covers the bootable commit metadata (Phase 21):
+//! `gpg` module). It also covers the bootable commit metadata (Phase 21):
 //! [`Transaction::kernel_version`] and [`RepoTree::kernel_version`] derive the
 //! value `ostree.linux` holds from a tree, staged and published respectively,
 //! answering the shapes that name no kernel with a [`BootableRefusal`], and

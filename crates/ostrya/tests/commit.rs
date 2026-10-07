@@ -642,6 +642,224 @@ fn list_refs_refuses_a_symlink_naming_a_directory() {
     });
 }
 
+/// Assert that `result` failed with the OS error `errno`.
+fn assert_errno(result: ostrya::Result<()>, errno: rustix::io::Errno, what: &str) {
+    assert!(
+        matches!(&result, Err(ostrya::Error::Io(e)) if e.raw_os_error() == Some(errno.raw_os_error())),
+        "{what}: expected {errno:?}, got {result:?}"
+    );
+}
+
+/// The names in the directory `dir`, sorted, or none where `dir` is absent.
+fn dir_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn ref_writes_place_no_temp_beside_the_target() {
+    // A ref write, an alias write, and a detached-metadata write create their
+    // temp entry in `tmp/`. With `tmp/` replaced by a regular file, each write
+    // fails before it touches `refs/` or `objects/`.
+    let tmp = TmpDir::new("commit-temp-in-tmp");
+    let root_dir = tmp.path().join("repo");
+    let a = csum(COMMIT);
+    block_on(async {
+        let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        repo.set_ref_immediate("base", Some(&a)).await.unwrap();
+        let fanout = root_dir.join("objects").join(&COMMIT[..2]);
+        assert!(!fanout.exists(), "the fanout directory starts absent");
+
+        std::fs::remove_dir_all(root_dir.join("tmp")).unwrap();
+        std::fs::write(root_dir.join("tmp"), b"").unwrap();
+
+        let notdir = rustix::io::Errno::NOTDIR;
+        assert_errno(
+            repo.set_ref_immediate("dir/one", Some(&a)).await,
+            notdir,
+            "immediate ref write",
+        );
+        assert_errno(
+            repo.set_ref_alias_immediate("dir/alias", "base").await,
+            notdir,
+            "immediate alias write",
+        );
+        let guard = repo.begin_update().await.unwrap();
+        assert_errno(
+            guard.set_ref("dir/two", Some(&a)).await,
+            notdir,
+            "guarded ref write",
+        );
+        guard.finish().await.unwrap();
+        assert_errno(
+            repo.write_commit_detached_metadata(&a, None).await,
+            notdir,
+            "detached metadata write",
+        );
+
+        assert!(
+            !root_dir.join("refs/heads/dir").exists(),
+            "a failed write creates no ref parent directory"
+        );
+        assert_eq!(dir_names(&root_dir.join("refs/heads")), ["base"]);
+        assert!(
+            !fanout.exists(),
+            "a failed write creates no fanout directory"
+        );
+    });
+}
+
+#[test]
+fn ref_writes_create_a_missing_tmp() {
+    // A ref, alias, or detached-metadata write in a repository with no `tmp/`
+    // creates it, and leaves it empty. A ref removal does not create it.
+    let tmp = TmpDir::new("commit-missing-tmp");
+    let root_dir = tmp.path().join("repo");
+    let a = csum(COMMIT);
+    let tmp_dir = root_dir.join("tmp");
+    block_on(async {
+        let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        repo.set_ref_immediate("gone", Some(&a)).await.unwrap();
+
+        std::fs::remove_dir_all(&tmp_dir).unwrap();
+        repo.set_ref_immediate("gone", None).await.unwrap();
+        assert!(!tmp_dir.exists(), "a ref removal does not create tmp/");
+
+        repo.set_ref_immediate("dir/one", Some(&a)).await.unwrap();
+        assert!(tmp_dir.is_dir());
+        assert_eq!(dir_names(&tmp_dir), Vec::<String>::new());
+
+        std::fs::remove_dir_all(&tmp_dir).unwrap();
+        repo.set_ref_alias_immediate("dir/alias", "dir/one")
+            .await
+            .unwrap();
+        assert!(tmp_dir.is_dir());
+        assert_eq!(dir_names(&tmp_dir), Vec::<String>::new());
+
+        std::fs::remove_dir_all(&tmp_dir).unwrap();
+        repo.write_commit_detached_metadata(&a, None).await.unwrap();
+        assert!(tmp_dir.is_dir());
+        assert_eq!(dir_names(&tmp_dir), Vec::<String>::new());
+
+        assert_eq!(
+            repo.list_refs(None).await.unwrap(),
+            vec![("dir/alias".to_owned(), a), ("dir/one".to_owned(), a)]
+        );
+        let meta = root_dir.join("objects").join(loose_path(
+            &a,
+            ObjectType::CommitMeta,
+            RepoMode::Archive,
+        ));
+        assert_eq!(std::fs::metadata(&meta).unwrap().len(), 0);
+    });
+}
+
+#[test]
+fn a_ref_name_of_name_max_bytes_is_written() {
+    // The temp entry carries its own name in `tmp/`, so a ref leaf of 255
+    // bytes, the longest file name, is written and listed.
+    let tmp = TmpDir::new("commit-name-max");
+    let root_dir = tmp.path().join("repo");
+    let a = csum(COMMIT);
+    let leaf = "r".repeat(255);
+    let alias = "a".repeat(255);
+    block_on(async {
+        let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let name = format!("long/{leaf}");
+        let alias_name = format!("long/{alias}");
+        repo.set_ref_immediate(&name, Some(&a)).await.unwrap();
+        repo.set_ref_alias_immediate(&alias_name, &name)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.list_refs(None).await.unwrap(),
+            vec![(alias_name, a), (name, a)]
+        );
+    });
+}
+
+#[test]
+fn writes_fail_with_exdev_when_tmp_is_on_another_filesystem() {
+    // `tmp/` on another filesystem makes the rename of each temp entry fail
+    // with EXDEV. The write fails, the temp entry is removed, and the target
+    // stays as it was.
+    let tmp = TmpDir::new("commit-tmp-xdev");
+    let root_dir = tmp.path().join("repo");
+    let a = csum(COMMIT);
+    let b = csum(CONTENT);
+
+    // A second filesystem is needed, and `/dev/shm` is one where the host
+    // gives it. Whether it is a second filesystem is read after the first
+    // write succeeds, so a host that has one cannot pass by skipping.
+    let other = Path::new("/dev/shm").join(format!("ostrya-tmp-xdev-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&other);
+    if std::fs::create_dir_all(&other).is_err() {
+        eprintln!("skipped: /dev/shm is not writable, so no second filesystem is reachable");
+        return;
+    }
+    block_on(async {
+        let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        repo.set_ref_immediate("kept", Some(&a)).await.unwrap();
+        std::fs::remove_dir_all(root_dir.join("tmp")).unwrap();
+        std::os::unix::fs::symlink(&other, root_dir.join("tmp")).unwrap();
+
+        let first = repo.set_ref_immediate("kept", Some(&b)).await;
+        if first.is_ok() {
+            use std::os::unix::fs::MetadataExt;
+            let same_device = std::fs::metadata(&other).unwrap().dev()
+                == std::fs::metadata(&root_dir).unwrap().dev();
+            let _ = std::fs::remove_dir_all(&other);
+            assert!(same_device, "a ref was renamed across filesystems");
+            eprintln!("skipped: /dev/shm is the repository's own filesystem");
+            return;
+        }
+        let xdev = rustix::io::Errno::XDEV;
+        assert_errno(first, xdev, "ref write over an existing ref");
+        assert_errno(
+            repo.set_ref_immediate("dir/new", Some(&b)).await,
+            xdev,
+            "ref write of a new ref",
+        );
+        assert_errno(
+            repo.set_ref_alias_immediate("kept", "dir/new").await,
+            xdev,
+            "alias write",
+        );
+        assert_errno(
+            repo.write_commit_detached_metadata(&a, None).await,
+            xdev,
+            "detached metadata write",
+        );
+
+        assert_eq!(
+            repo.list_refs(None).await.unwrap(),
+            vec![("kept".to_owned(), a)]
+        );
+        let meta = root_dir.join("objects").join(loose_path(
+            &a,
+            ObjectType::CommitMeta,
+            RepoMode::Archive,
+        ));
+        assert!(!meta.exists(), "no detached metadata is written");
+        assert_eq!(dir_names(&other), Vec::<String>::new());
+    });
+    let _ = std::fs::remove_dir_all(&other);
+}
+
 #[test]
 fn two_transactions_commit_concurrently() {
     // A repository holds concurrent transactions in one process: two

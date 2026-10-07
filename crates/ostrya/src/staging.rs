@@ -32,6 +32,14 @@
 //! no live [`StagingDir`] in hand. A process that ends without running
 //! destructors reaches it through
 //! [`reap_process_staging`](crate::reap_process_staging).
+//!
+//! A ref write and a detached-metadata write create a [`TempEntry`] at the
+//! top level of `tmp/`, named `.ostrya-ref-<pid>-<n>-XXXXXX` or
+//! `.ostrya-meta-<pid>-<n>-XXXXXX`, and rename it over its target. The reaper
+//! takes such an entry by the age test, as any other entry. With a very small
+//! or negative `tmp-expiry-secs`, a reaper can unlink the entry before its
+//! rename. The write then fails with `ENOENT`, and the ref or the object stays
+//! unchanged.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -96,6 +104,116 @@ fn remove_staging(tmp_fd: BorrowedFd<'_>, name: &str) {
     let _ = rustix::fs::unlinkat(tmp_fd, lock_name.as_str(), AtFlags::empty());
 }
 
+/// Open the `tmp/` directory of the repository rooted at `repo_fd`, and
+/// create it where it is absent. A created `tmp/` takes [`STAGING_DIR_MODE`]
+/// reduced by the umask, and in a `bare-user-shared` repository it is forced
+/// to [`perm::SHARED_DIR_MODE`]. A `tmp/` that is a symlink is followed.
+pub(crate) fn open_tmp_dir(repo_fd: BorrowedFd<'_>, repo_mode: RepoMode) -> io::Result<OwnedFd> {
+    match rustix::fs::mkdirat(repo_fd, "tmp", Mode::from_raw_mode(STAGING_DIR_MODE)) {
+        Ok(()) => perm::force_created_dir(repo_fd, "tmp", repo_mode)?,
+        Err(Errno::EXIST) => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(rustix::fs::openat(
+        repo_fd,
+        "tmp",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?)
+}
+
+/// The name prefix of the temp entry of a ref file or of an alias symlink.
+pub(crate) const REF_TEMP_PREFIX: &str = ".ostrya-ref-";
+
+/// The name prefix of the temp file of a `.commitmeta` or a
+/// `.tombstone-commit` object.
+pub(crate) const META_TEMP_PREFIX: &str = ".ostrya-meta-";
+
+/// A temp entry in `tmp/` that a write renames over its target.
+///
+/// The name is `<prefix><pid>-<counter>-XXXXXX`, where `XXXXXX` is a random
+/// suffix, so a process in another PID namespace that has the same pid and
+/// counter draws a different name. When the value drops before
+/// [`rename_into`](TempEntry::rename_into) succeeds, the entry is unlinked.
+pub(crate) struct TempEntry<'a> {
+    tmp_fd: BorrowedFd<'a>,
+    /// The name of the entry under `tmp_fd`. It is empty after the rename.
+    name: String,
+}
+
+impl<'a> TempEntry<'a> {
+    /// Create a regular file with the permission bits `mode`, reduced by the
+    /// umask, and return the entry and the descriptor open for writing.
+    pub(crate) fn create_file(
+        tmp_fd: BorrowedFd<'a>,
+        prefix: &str,
+        mode: u32,
+    ) -> io::Result<(TempEntry<'a>, OwnedFd)> {
+        Self::create(tmp_fd, prefix, |name| {
+            rustix::fs::openat(
+                tmp_fd,
+                name,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::from_raw_mode(mode),
+            )
+        })
+    }
+
+    /// Create a symlink whose body is `link`.
+    pub(crate) fn create_symlink(
+        tmp_fd: BorrowedFd<'a>,
+        prefix: &str,
+        link: &str,
+    ) -> io::Result<TempEntry<'a>> {
+        let (entry, ()) = Self::create(tmp_fd, prefix, |name| {
+            rustix::fs::symlinkat(link, tmp_fd, name)
+        })?;
+        Ok(entry)
+    }
+
+    /// Run `make` with a fresh name, and draw a new name where the name is
+    /// taken, up to [`MKDTEMP_ATTEMPTS`] times.
+    fn create<T>(
+        tmp_fd: BorrowedFd<'a>,
+        prefix: &str,
+        mut make: impl FnMut(&str) -> rustix::io::Result<T>,
+    ) -> io::Result<(TempEntry<'a>, T)> {
+        for _ in 0..MKDTEMP_ATTEMPTS {
+            let name = format!(
+                "{prefix}{}-{}-{}",
+                std::process::id(),
+                crate::write::unique(),
+                random_suffix()
+            );
+            match make(&name) {
+                Ok(made) => return Ok((TempEntry { tmp_fd, name }, made)),
+                Err(Errno::EXIST) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique temp name",
+        ))
+    }
+
+    /// Rename the entry over `dest` under `dir_fd`. A rename that fails
+    /// leaves the entry to the drop, which unlinks it.
+    pub(crate) fn rename_into(mut self, dir_fd: BorrowedFd<'_>, dest: &str) -> io::Result<()> {
+        rustix::fs::renameat(self.tmp_fd, self.name.as_str(), dir_fd, dest)?;
+        self.name.clear();
+        Ok(())
+    }
+}
+
+impl Drop for TempEntry<'_> {
+    fn drop(&mut self) {
+        if !self.name.is_empty() {
+            let _ = rustix::fs::unlinkat(self.tmp_fd, self.name.as_str(), AtFlags::empty());
+        }
+    }
+}
+
 /// A transaction's staging area: the directory, its held sibling lock, and the
 /// `tmp/` descriptor they live under.
 #[derive(Debug)]
@@ -121,17 +239,7 @@ impl StagingDir {
         expiry_secs: i64,
         repo_mode: RepoMode,
     ) -> io::Result<StagingDir> {
-        match rustix::fs::mkdirat(repo_fd, "tmp", Mode::from_raw_mode(STAGING_DIR_MODE)) {
-            Ok(()) => perm::force_created_dir(repo_fd, "tmp", repo_mode)?,
-            Err(Errno::EXIST) => {}
-            Err(e) => return Err(e.into()),
-        }
-        let tmp_fd = rustix::fs::openat(
-            repo_fd,
-            "tmp",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
+        let tmp_fd = open_tmp_dir(repo_fd, repo_mode)?;
 
         reap_stale(tmp_fd.as_fd(), expiry_secs);
 
@@ -162,6 +270,12 @@ impl StagingDir {
     /// into `objects/` at commit.
     pub(crate) fn dir_fd(&self) -> BorrowedFd<'_> {
         self.dir_fd.as_fd()
+    }
+
+    /// The descriptor of the repository's `tmp/` directory, which holds the
+    /// staging directory.
+    pub(crate) fn tmp_fd(&self) -> BorrowedFd<'_> {
+        self.tmp_fd.as_fd()
     }
 }
 
@@ -342,7 +456,8 @@ fn random_suffix() -> String {
 ///
 /// A `staging-*` directory goes through [`reap_one`], and its `-lock` sibling
 /// is left to that directory's reap. `cache` is never touched. Every other
-/// entry is removed through [`reap_aged`] once it is past `expiry_secs`.
+/// entry, a [`TempEntry`] in flight included, is removed through [`reap_aged`]
+/// once it is past `expiry_secs`.
 fn reap_stale(tmp_fd: BorrowedFd<'_>, expiry_secs: i64) {
     let Ok(entries) = Dir::read_from(tmp_fd) else {
         return;

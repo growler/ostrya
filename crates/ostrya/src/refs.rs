@@ -14,21 +14,22 @@
 //! more `^` characters, each of which steps one generation back along the
 //! commit's `parent` field.
 //!
-//! Writes are individually atomic -- a fresh file written, `fdatasync`-ed when
-//! fsync is enabled, and renamed over the target, with the parent directories
-//! created for a `/`-bearing name. Under fsync the directory holding the ref is
-//! `fsync`-ed after the rename, so the name is durable together with the
-//! content. Where the write created parent directories, the directory holding
-//! each created name is `fsync`-ed too, deepest first, so the whole path of a
-//! `/`-bearing name is durable and not the leaf entry alone. A removal and an
-//! alias write carry no content of their own and sync directories alone. A
-//! `None` checksum removes the ref file. A transaction queues its ref writes
-//! with [`Transaction::set_ref`] and applies them at commit after object
-//! publication, under the fsync policy the transaction resolved for its object
-//! writes. It writes every queued ref first and then `fsync`s each directory
-//! that changed once, deepest first, before the commit returns;
-//! [`Repo::set_ref_immediate`](Repo::set_ref_immediate) writes one
-//! outside a transaction and reads `[core] fsync` itself.
+//! Writes are individually atomic -- a fresh file written in the repository's
+//! `tmp/` directory, `fdatasync`-ed when fsync is enabled, and renamed over the
+//! target, with the parent directories created for a `/`-bearing name. No temp
+//! entry stands under `refs/`, so a listing never reads one. Under fsync the
+//! directory holding the ref is `fsync`-ed after the rename, so the name is
+//! durable together with the content. Where the write created parent
+//! directories, the directory holding each created name is `fsync`-ed too,
+//! deepest first, so the whole path of a `/`-bearing name is durable and not
+//! the leaf entry alone. A removal and an alias write carry no content of their
+//! own and sync directories alone. A `None` checksum removes the ref file. A
+//! transaction queues its ref writes with [`Transaction::set_ref`] and applies
+//! them at commit after object publication, under the fsync policy the
+//! transaction resolved for its object writes. It writes every queued ref first
+//! and then `fsync`s each directory that changed once, deepest first, before
+//! the commit returns; [`Repo::set_ref_immediate`](Repo::set_ref_immediate)
+//! writes one outside a transaction and reads `[core] fsync` itself.
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
@@ -41,6 +42,7 @@ use rustix::io::Errno;
 use crate::error::{Error, Result};
 use crate::perm;
 use crate::repo::Repo;
+use crate::staging::{REF_TEMP_PREFIX, TempEntry, open_tmp_dir};
 use crate::transaction::Transaction;
 use crate::traverse::read_dir_names;
 
@@ -183,16 +185,25 @@ impl Transaction {
 /// name durable before the call, so no ref is durable ahead of what it names.
 /// A write that fails still syncs the directories of the refs written before
 /// it.
+///
+/// `tmp_fd` is the open `tmp/` of the repository, where each ref write creates
+/// its temp file.
 pub(crate) fn write_resolved_refs_blocking(
     repo_fd: BorrowedFd<'_>,
+    tmp_fd: BorrowedFd<'_>,
     refs: &[(String, Option<Checksum>)],
     fsync: bool,
     repo_mode: RepoMode,
 ) -> Result<()> {
     let mut dirs = Vec::new();
-    let written = refs.iter().try_for_each(|(relpath, checksum)| {
-        put_ref_blocking(repo_fd, relpath, *checksum, fsync, repo_mode, &mut dirs)
-    });
+    let written = refs
+        .iter()
+        .try_for_each(|(relpath, checksum)| match checksum {
+            Some(checksum) => put_ref_file_blocking(
+                repo_fd, tmp_fd, relpath, *checksum, fsync, repo_mode, &mut dirs,
+            ),
+            None => remove_ref_blocking(repo_fd, relpath, fsync, &mut dirs),
+        });
     if !fsync {
         return written;
     }
@@ -1040,15 +1051,17 @@ const REF_DIR_MODE: u32 = 0o777;
 
 /// Write or remove one ref file relative to `repo_fd`, atomically.
 ///
-/// `Some(checksum)` writes the 65-byte `<hex>\n` content to a fresh temp file
-/// in the target's parent directory (created as needed), `fdatasync`-es it when
-/// `fsync` is set, and renames it over the target. `None` unlinks the ref,
-/// treating an already-absent file as success. Under `fsync` the directory
-/// holding the ref is `fsync`-ed after the rename or the unlink, so the name
-/// the operation created or removed is durable and not only the file's content,
-/// and the name of every parent directory this write created is made durable
-/// too, deepest first. A write that fails still syncs the directories it
-/// changed before the failure.
+/// `Some(checksum)` opens `tmp/` (created as needed), creates the target's
+/// parent directories as needed, writes the 65-byte `<hex>\n` content to a
+/// fresh temp file in `tmp/`, `fdatasync`-es the temp file when `fsync` is set,
+/// and renames it over the target. A `tmp/` on another filesystem makes the
+/// rename fail with `EXDEV`, and the temp file is removed. `None` unlinks the
+/// ref, treating an already-absent file as success, and does not use `tmp/`.
+/// Under `fsync` the directory holding the ref is `fsync`-ed after the rename
+/// or the unlink, so the name the operation created or removed is durable and
+/// not only the file's content, and the name of every parent directory this
+/// write created is made durable too, deepest first. A write that fails still
+/// syncs the directories it changed before the failure.
 fn write_ref_blocking(
     repo_fd: BorrowedFd<'_>,
     relpath: &str,
@@ -1074,47 +1087,66 @@ pub(crate) fn put_ref_blocking(
     repo_mode: RepoMode,
     dirs: &mut Vec<String>,
 ) -> Result<()> {
-    let Some(checksum) = checksum else {
-        return match rustix::fs::unlinkat(repo_fd, relpath, AtFlags::empty()) {
-            Ok(()) => {
-                if fsync {
-                    dirs.push(ref_parent(relpath).to_owned());
-                }
-                Ok(())
-            }
-            Err(Errno::NOENT) => Ok(()),
-            Err(e) => Err(e.into()),
-        };
-    };
+    match checksum {
+        Some(checksum) => {
+            let tmp_fd = open_tmp_dir(repo_fd, repo_mode)?;
+            put_ref_file_blocking(
+                repo_fd,
+                tmp_fd.as_fd(),
+                relpath,
+                checksum,
+                fsync,
+                repo_mode,
+                dirs,
+            )
+        }
+        None => remove_ref_blocking(repo_fd, relpath, fsync, dirs),
+    }
+}
 
+/// Unlink the ref file `relpath`, treating an already-absent file as success.
+/// Under `fsync` the directory holding the ref is added to `dirs`.
+fn remove_ref_blocking(
+    repo_fd: BorrowedFd<'_>,
+    relpath: &str,
+    fsync: bool,
+    dirs: &mut Vec<String>,
+) -> Result<()> {
+    match rustix::fs::unlinkat(repo_fd, relpath, AtFlags::empty()) {
+        Ok(()) => {
+            if fsync {
+                dirs.push(ref_parent(relpath).to_owned());
+            }
+            Ok(())
+        }
+        Err(Errno::NOENT) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Write the ref file `relpath` through a temp file in the open `tmp/` at
+/// `tmp_fd`, as [`put_ref_blocking`] writes a `Some` checksum.
+fn put_ref_file_blocking(
+    repo_fd: BorrowedFd<'_>,
+    tmp_fd: BorrowedFd<'_>,
+    relpath: &str,
+    checksum: Checksum,
+    fsync: bool,
+    repo_mode: RepoMode,
+    dirs: &mut Vec<String>,
+) -> Result<()> {
     create_ref_parents(repo_fd, relpath, repo_mode, fsync, dirs)?;
     let content = format!("{}\n", checksum.to_hex());
-    let tmp = format!(
-        "{relpath}.tmp-{}-{}",
-        std::process::id(),
-        crate::write::unique()
-    );
-    let fd = rustix::fs::openat(
-        repo_fd,
-        tmp.as_str(),
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::from_raw_mode(REF_FILE_MODE),
-    )?;
-    let write_and_rename = || -> Result<()> {
-        let mut file = std::fs::File::from(fd);
-        file.write_all(content.as_bytes())?;
-        file.flush()?;
-        rustix::fs::fchmod(file.as_fd(), Mode::from_raw_mode(REF_FILE_MODE))?;
-        if fsync {
-            rustix::fs::fdatasync(file.as_fd())?;
-        }
-        drop(file);
-        rustix::fs::renameat(repo_fd, tmp.as_str(), repo_fd, relpath)?;
-        Ok(())
-    };
-    write_and_rename().inspect_err(|_| {
-        let _ = rustix::fs::unlinkat(repo_fd, tmp.as_str(), AtFlags::empty());
-    })?;
+    let (temp, fd) = TempEntry::create_file(tmp_fd, REF_TEMP_PREFIX, REF_FILE_MODE)?;
+    let mut file = std::fs::File::from(fd);
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    rustix::fs::fchmod(file.as_fd(), Mode::from_raw_mode(REF_FILE_MODE))?;
+    if fsync {
+        rustix::fs::fdatasync(file.as_fd())?;
+    }
+    drop(file);
+    temp.rename_into(repo_fd, relpath)?;
     if fsync {
         dirs.push(ref_parent(relpath).to_owned());
     }
@@ -1216,9 +1248,10 @@ pub(crate) mod test_syncs {
 
 /// Write one alias symlink relative to `repo_fd`, atomically.
 ///
-/// The link is created under a fresh temp name in the target's parent
-/// directory, then renamed over the target, so an existing ref file or an
-/// existing alias is replaced in one step. A symlink carries no content of its
+/// The write opens `tmp/` (created as needed), creates the target's parent
+/// directories as needed, creates the link under a fresh temp name in `tmp/`,
+/// and renames it over the target, so an existing ref file or an existing
+/// alias is replaced in one step. A symlink carries no content of its
 /// own to sync, so `fsync` reaches the directory holding the link and the
 /// directory holding each parent this write created. A write that fails still
 /// syncs the directories it changed before the failure.
@@ -1246,16 +1279,10 @@ pub(crate) fn put_alias_blocking(
     repo_mode: RepoMode,
     dirs: &mut Vec<String>,
 ) -> Result<()> {
+    let tmp_fd = open_tmp_dir(repo_fd, repo_mode)?;
     create_ref_parents(repo_fd, relpath, repo_mode, fsync, dirs)?;
-    let tmp = format!(
-        "{relpath}.tmp-{}-{}",
-        std::process::id(),
-        crate::write::unique()
-    );
-    rustix::fs::symlinkat(link, repo_fd, tmp.as_str())?;
-    rustix::fs::renameat(repo_fd, tmp.as_str(), repo_fd, relpath).inspect_err(|_| {
-        let _ = rustix::fs::unlinkat(repo_fd, tmp.as_str(), AtFlags::empty());
-    })?;
+    TempEntry::create_symlink(tmp_fd.as_fd(), REF_TEMP_PREFIX, link)?
+        .rename_into(repo_fd, relpath)?;
     if fsync {
         dirs.push(ref_parent(relpath).to_owned());
     }
@@ -1606,13 +1633,13 @@ mod tests {
     }
 
     /// A write that fails after it created parent directories still records
-    /// the directories that hold them.
+    /// the directories that hold them, and leaves no temp entry in `tmp/`.
     #[test]
     fn a_failed_write_records_the_parents_it_created() {
         let root = Root::new("created");
-        // The temp name of a ref whose name is 250 bytes long is longer than
-        // a file name can be, so the open of the temp file fails.
-        let long = "r".repeat(250);
+        // A ref name of 256 bytes is longer than a file name can be. The temp
+        // file in `tmp/` is created, and the rename over the ref name fails.
+        let long = "r".repeat(256);
         let mut dirs = Vec::new();
         let relpath = format!("refs/heads/new/deep/{long}");
         let checksum = Some(Checksum::from_bytes([7; 32]));
@@ -1627,6 +1654,9 @@ mod tests {
         .unwrap_err();
         dirs.sort();
         assert_eq!(dirs, ["refs/heads", "refs/heads/new"]);
+        let tmp = root.dir.join("tmp");
+        assert!(tmp.is_dir());
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
 
         // A link body longer than a path can be fails the `symlinkat`.
         let mut dirs = Vec::new();
@@ -1643,5 +1673,6 @@ mod tests {
         .unwrap_err();
         dirs.sort();
         assert_eq!(dirs, ["refs/heads", "refs/heads/other"]);
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
     }
 }

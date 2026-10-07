@@ -1800,8 +1800,15 @@ fn commit_fsync_policy_controls_the_syscalls() {
                      ref's temp file takes one: {calls:?}",
                     ref_syncs.len(),
                 );
+                // The port creates the ref's temp file in `tmp/`, and the tool
+                // creates it in the directory that holds the ref.
+                let ref_temp = if *who == "port" {
+                    "tmp/.ostrya-ref-"
+                } else {
+                    "refs/heads/"
+                };
                 assert!(
-                    ref_syncs[0].starts_with("refs/heads/"),
+                    ref_syncs[0].starts_with(ref_temp),
                     "`{who}` did not `fdatasync` the ref's temp file in the `{tag}` row: {}",
                     ref_syncs[0],
                 );
@@ -1907,12 +1914,12 @@ fn commit_per_object_fsync_syncs_content_objects_alone() {
                 String::from_utf8_lossy(&run.stderr),
             );
             assert_eq!(regular_content_objects(&repo), content, "{label}");
-            let (extra, total): (&[&str], usize) = if *who == "port" {
-                (&["refs/heads"], 12 + content)
+            let (ref_temp, extra, total): (&str, &[&str], usize) = if *who == "port" {
+                ("tmp/.ostrya-ref-", &["refs/heads"], 12 + content)
             } else {
-                (&[], 11 + content)
+                ("refs/heads/", &[], 11 + content)
             };
-            assert_durability_syncs(&label, &repo, &calls, content, "refs/heads/", extra, total);
+            assert_durability_syncs(&label, &repo, &calls, content, ref_temp, extra, total);
         }
     }
 }
@@ -5987,21 +5994,23 @@ fn stored_bytes(repo: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 
 /// Hold the sync calls of one syncing run to the inventory the tables in
 /// `docs/format-reference.md`, "The fsync vocabulary", record: `per_object`
-/// calls on a staged temporary file under `tmp/`, one `fsync` per fanout
-/// directory under `objects/`, one of `objects/`, one of each directory in
-/// `extra_dirs`, one `fdatasync` of the ref's temporary file under `ref_dir`,
-/// one `syncfs` of the repository, and `total` calls in all.
+/// calls on a staged temporary file under `tmp/staging-*`, one `fsync` per
+/// fanout directory under `objects/`, one of `objects/`, one of each directory
+/// in `extra_dirs`, one `fdatasync` of the ref's temporary file whose path
+/// starts with `ref_temp`, one `syncfs` of the repository, and `total` calls
+/// in all.
 fn assert_durability_syncs(
     label: &str,
     repo: &Path,
     calls: &[(&'static str, String)],
     per_object: usize,
-    ref_dir: &str,
+    ref_temp: &str,
     extra_dirs: &[&str],
     total: usize,
 ) {
-    let (staged, rest): (Vec<_>, Vec<_>) =
-        calls.iter().partition(|(_, path)| path.starts_with("tmp/"));
+    let (staged, rest): (Vec<_>, Vec<_>) = calls
+        .iter()
+        .partition(|(_, path)| path.starts_with("tmp/staging-"));
     assert_eq!(
         staged.len(),
         per_object,
@@ -6026,8 +6035,8 @@ fn assert_durability_syncs(
         .map(|(_, path)| path)
         .collect();
     assert!(
-        datasyncs.len() == 1 && datasyncs[0].starts_with(ref_dir),
-        "{label}: the ref's temporary file under {ref_dir} takes one `fdatasync`: {datasyncs:?}",
+        datasyncs.len() == 1 && datasyncs[0].starts_with(ref_temp),
+        "{label}: the ref's temporary file at {ref_temp}* takes one `fdatasync`: {datasyncs:?}",
     );
     let syncfs: Vec<&String> = rest
         .iter()
@@ -6137,20 +6146,16 @@ fn pull_fsync_switches_control_the_syscalls() {
                     } else {
                         0
                     };
-                    let (extra, total): (&[&str], usize) = if *who == "port" {
-                        (&["refs/remotes", "refs/remotes/origin"], 13 + content)
+                    let (ref_temp, extra, total): (&str, &[&str], usize) = if *who == "port" {
+                        (
+                            "tmp/.ostrya-ref-",
+                            &["refs/remotes", "refs/remotes/origin"],
+                            13 + content,
+                        )
                     } else {
-                        (&[], 11 + content)
+                        ("refs/remotes/origin/", &[], 11 + content)
                     };
-                    assert_durability_syncs(
-                        &label,
-                        &repo,
-                        &calls,
-                        content,
-                        "refs/remotes/origin/",
-                        extra,
-                        total,
-                    );
+                    assert_durability_syncs(&label, &repo, &calls, content, ref_temp, extra, total);
                     if per_object {
                         assert_eq!(content, 4, "{label}: corpus C0 holds four content objects");
                     }
@@ -6365,20 +6370,12 @@ fn pull_local_fsync_switches_control_the_syscalls() {
                     } else {
                         0
                     };
-                    let (extra, total): (&[&str], usize) = if *who == "port" {
-                        (&["refs/heads"], 12 + content)
+                    let (ref_temp, extra, total): (&str, &[&str], usize) = if *who == "port" {
+                        ("tmp/.ostrya-ref-", &["refs/heads"], 12 + content)
                     } else {
-                        (&[], 11 + content)
+                        ("refs/heads/", &[], 11 + content)
                     };
-                    assert_durability_syncs(
-                        &label,
-                        &repo,
-                        &calls,
-                        content,
-                        "refs/heads/",
-                        extra,
-                        total,
-                    );
+                    assert_durability_syncs(&label, &repo, &calls, content, ref_temp, extra, total);
                     if per_object && copied {
                         assert_eq!(content, 4, "{label}: corpus C0 holds four content objects");
                     }

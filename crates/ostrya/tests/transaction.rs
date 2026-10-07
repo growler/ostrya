@@ -257,6 +257,11 @@ fn a_transaction_reaps_aged_tmp_entries() {
     stamp(&tmp.join("oldfile"), OLD);
     std::fs::write(tmp.join(".tmp-old"), b"o").unwrap();
     stamp(&tmp.join(".tmp-old"), OLD);
+    // The temp entries of a ref write and of a detached-metadata write.
+    for name in [".ostrya-ref-1-1-aBc123", ".ostrya-meta-1-1-aBc123"] {
+        std::fs::write(tmp.join(name), b"o").unwrap();
+        stamp(&tmp.join(name), OLD);
+    }
     std::fs::write(tmp.join("staging-not-a-dir"), b"o").unwrap();
     stamp(&tmp.join("staging-not-a-dir"), OLD);
     let fifo = Command::new("mkfifo")
@@ -276,6 +281,8 @@ fn a_transaction_reaps_aged_tmp_entries() {
 
     // Entries the reap keeps.
     std::fs::write(tmp.join("newfile"), b"n").unwrap();
+    std::fs::write(tmp.join(".ostrya-ref-2-2-aBc123"), b"n").unwrap();
+    std::fs::write(tmp.join(".ostrya-meta-2-2-aBc123"), b"n").unwrap();
     std::fs::create_dir(tmp.join("newdir")).unwrap();
     std::fs::write(tmp.join("newdir/oldkid"), b"o").unwrap();
     stamp(&tmp.join("newdir/oldkid"), OLD);
@@ -298,7 +305,14 @@ fn a_transaction_reaps_aged_tmp_entries() {
         left.retain(|n| !own.contains(n));
         assert_eq!(
             left,
-            ["cache", "newdir", "newfile", "staging-orphan-lock"],
+            [
+                ".ostrya-meta-2-2-aBc123",
+                ".ostrya-ref-2-2-aBc123",
+                "cache",
+                "newdir",
+                "newfile",
+                "staging-orphan-lock"
+            ],
             "the reap at transaction start removes the aged entries only"
         );
         txn.commit().await.unwrap();

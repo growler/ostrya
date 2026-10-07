@@ -127,7 +127,7 @@
 //! their defaults is the tool's.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::Arc;
 
 use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode, loose_path};
@@ -842,8 +842,16 @@ impl Repo {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
             let objects_fd = repo.objects_fd();
+            let tmp = tombstone_tmp(&repo, &sweep)?;
             let mut touched = BTreeSet::new();
-            remove_commit(objects_fd, &sweep, &commit, true, &mut touched)?;
+            remove_commit(
+                tmp.as_ref().map(AsFd::as_fd),
+                objects_fd,
+                &sweep,
+                &commit,
+                true,
+                &mut touched,
+            )?;
             if sweep.fsync {
                 sync_dirs(objects_fd, &touched)?;
             }
@@ -901,9 +909,22 @@ fn sweep_orphan_markers_blocking(
     Ok(())
 }
 
-/// Remove one commit: write its tombstone where the run writes tombstones,
-/// then unlink the commit object and, where `meta` is true, its detached
-/// metadata, in that order. Each `objects/` fanout directory in which an entry
+/// Open the `tmp/` of the repository where the run writes tombstones, for the
+/// temp file of each tombstone write. A run that writes no tombstone does not
+/// open `tmp/` and does not create it.
+fn tombstone_tmp(repo: &Repo, sweep: &Sweep) -> Result<Option<OwnedFd>> {
+    if !sweep.tombstones {
+        return Ok(None);
+    }
+    Ok(Some(crate::staging::open_tmp_dir(
+        repo.repo_fd(),
+        sweep.mode,
+    )?))
+}
+
+/// Remove one commit: write its tombstone where `tmp_fd`, the open `tmp/` of
+/// the repository, is given, then unlink the commit object and, where `meta`
+/// is true, its detached metadata, in that order. Each `objects/` fanout directory in which an entry
 /// was unlinked is added to `touched`, named relative to `objects/`.
 ///
 /// The commit's `state/<commit>.commitpartial` marker stays. The commit can
@@ -916,14 +937,15 @@ fn sweep_orphan_markers_blocking(
 /// with no commit is unreachable and the next prune removes it, while the
 /// reverse order leaves a commit with no signatures.
 fn remove_commit(
+    tmp_fd: Option<BorrowedFd<'_>>,
     objects_fd: BorrowedFd<'_>,
     sweep: &Sweep,
     commit: &Checksum,
     meta: bool,
     touched: &mut BTreeSet<String>,
 ) -> Result<()> {
-    if sweep.tombstones {
-        write_tombstone(objects_fd, commit, sweep.mode, sweep.fsync)?;
+    if let Some(tmp_fd) = tmp_fd {
+        write_tombstone(tmp_fd, objects_fd, commit, sweep.mode, sweep.fsync)?;
     }
     let commit_path = loose_path(commit, ObjectType::Commit, sweep.mode);
     let mut unlinked = unlink_optional(objects_fd, &commit_path)?;
@@ -997,13 +1019,25 @@ fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(
         .collect();
     let mut touched = BTreeSet::new();
     let mut removed_commits = HashSet::new();
+    let tmp = if sweep.no_prune || !doomed.iter().any(|o| o.ty == ObjectType::Commit) {
+        None
+    } else {
+        tombstone_tmp(repo, sweep)?
+    };
     for name in doomed.iter().filter(|o| o.ty == ObjectType::Commit) {
         let Some(size) = object_size(objects_fd, &name.loose_path(sweep.mode))? else {
             continue;
         };
         if !sweep.no_prune {
             let meta = doomed_meta.contains(&name.checksum);
-            remove_commit(objects_fd, sweep, &name.checksum, meta, &mut touched)?;
+            remove_commit(
+                tmp.as_ref().map(AsFd::as_fd),
+                objects_fd,
+                sweep,
+                &name.checksum,
+                meta,
+                &mut touched,
+            )?;
         }
         removed_commits.insert(name.checksum);
         tally(name.ty, size);

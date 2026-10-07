@@ -145,6 +145,43 @@ fn shared_repo_forces_the_staging_fanout_and_object_modes() {
     });
 }
 
+/// A ref write and a detached-metadata write outside a transaction in a
+/// `bare-user-shared` repository with no `tmp/`: the write creates `tmp/` at
+/// the forced directory mode, and the ref file and the `.commitmeta` take
+/// `0644`.
+#[test]
+fn shared_repo_forces_the_mode_of_a_tmp_a_ref_write_creates() {
+    let dir = TmpDir::new("shared-ref-tmp");
+    let repo_path = dir.path().join("repo");
+    let tmp = repo_path.join("tmp");
+    let checksum = ostrya::Checksum::from_bytes([7; 32]);
+    block_on(async {
+        let repo = Repo::create(&repo_path, CreateOptions::new(RepoMode::BareUserShared))
+            .await
+            .expect("create the repository");
+        std::fs::remove_dir_all(&tmp).expect("remove tmp/");
+        repo.set_ref_immediate("dir/one", Some(&checksum))
+            .await
+            .expect("write the ref");
+        assert_eq!(mode_of(&tmp), 0o2770, "the tmp directory");
+        assert_eq!(
+            mode_of(&repo_path.join("refs/heads/dir/one")),
+            0o644,
+            "the ref file"
+        );
+
+        repo.write_commit_detached_metadata(&checksum, None)
+            .await
+            .expect("write the detached metadata");
+        let loose = loose_path(&checksum, ObjectType::CommitMeta, RepoMode::BareUserShared);
+        assert_eq!(
+            mode_of(&repo_path.join("objects").join(&loose)),
+            0o644,
+            "the .commitmeta file"
+        );
+    });
+}
+
 /// The control: a `bare-user` repository keeps the masked modes. This is what
 /// scopes the forcing to the one repository mode.
 #[test]

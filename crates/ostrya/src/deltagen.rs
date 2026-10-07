@@ -1039,8 +1039,13 @@ impl Repo {
     }
 
     /// Open the repository's `tmp/` directory, where spill files are created.
+    /// [`crate::staging::open_tmp_dir`] creates it where it is absent.
     pub(crate) async fn open_tmp_dir(&self) -> Result<OwnedFd> {
-        self.open_repo_subdir("tmp").await
+        let repo = self.clone();
+        ostrya_rt::unblock(move || {
+            crate::staging::open_tmp_dir(repo.repo_fd(), repo.mode()).map_err(Error::Io)
+        })
+        .await
     }
 
     /// Create and open the directory the delta's files are written to, and

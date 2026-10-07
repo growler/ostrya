@@ -487,6 +487,8 @@ which the tool refuses every write ("Not allowed due to repo mode").
   refs/mirrors/<collection>/<ref> collection refs (lazy)
   state/<checksum>.commitpartial  incomplete-commit markers
   tmp/                            staging (staging-<bootid>-XXXXXX + -lock), cache/
+  tmp/.ostrya-ref-<pid>-<n>-XXXXXX  port temp entry of a ref or alias write
+  tmp/.ostrya-meta-<pid>-<n>-XXXXXX port temp file of a .commitmeta or .tombstone-commit
   tmp/cache/summaries/            summary cache
   extensions/                     reserved, created empty
   deltas/                         static deltas (lazy)
@@ -781,13 +783,20 @@ file holding the new checksum, and `refs/heads/bar` kept its old checksum. The
 tool writes the ref by renaming a fresh temp file over the target name, and the
 rename replaces the symlink at that name instead of following it.
 
-Ref durability (traced). The tool's ref write issues `fdatasync` of the temp
-file, then `renameat` over the ref name, and no directory sync anywhere: not of
-the ref's own parent, of `refs/heads`, or of the repository root. This is the
+Ref durability (traced). The tool's ref write creates its temp file in the
+directory that holds the ref. It issues `fdatasync` of the temp file, then
+`renameat` over the ref name, and no directory sync anywhere: not of the ref's
+own parent, of `refs/heads`, or of the repository root. This is the
 same sequence for `refs --create` and for a commit's ref write, and
 `fsync=false` drops the `fdatasync`, leaving the rename alone. An alias write
 (`refs -A --create`) issues `symlinkat` into `<repo>/tmp` and `renameat` over
 the ref name, with no sync at all, and `refs --delete` issues `unlinkat` alone.
+The port creates the temp file of a ref write and the symlink of an alias write
+in `<repo>/tmp`, and renames each over the ref name. A ref listing reads every
+entry under `refs/`, so the port keeps no temp entry there. The port creates
+`<repo>/tmp` where it is absent. When `<repo>/tmp` is on a different filesystem
+from the ref, the rename fails with `EXDEV`: the write fails, the port removes
+the temp entry, and the ref stays unchanged. A ref removal does not use `tmp/`.
 The port `fdatasync`-es the ref file the same way and adds an `fsync` of the
 directory holding the ref after the rename, after an alias rename, and after a
 removal, so the name the operation created or removed survives a crash and not
@@ -938,6 +947,12 @@ its age exceeds `tmp-expiry-secs`, because another process can be between the
 directory create and the lock create. The port does not reuse a staging
 directory: each transaction creates a new one. `conformance/cli-surface.md`,
 "Global conventions" records the divergences.
+
+The temp entries `.ostrya-ref-*` and `.ostrya-meta-*` of a ref write, an alias
+write, and a `.commitmeta` or `.tombstone-commit` write take the age test like
+any other entry. With a very small or negative `tmp-expiry-secs`, the reap of
+another transaction can unlink such an entry before its rename. The write then
+fails with `ENOENT`, and the ref or the object stays unchanged.
 
 Static delta directories use base64-checksum fanout. From-scratch:
 `deltas/<to_b64[0:2]>/<to_b64[2:]>/<target>`. From->to:
@@ -1628,8 +1643,12 @@ its own, and renames it into `objects/<xx>/` at that step. With fsync on, the
 `syncfs` that opens publication makes the staged file durable, and where
 publication runs no `syncfs` the step runs one before the rename. After the
 renames the step `fsync`s each fanout directory that gained a `.commitmeta`
-once, and `objects/` once when it created a fanout directory. The staging directory layout is
-transient and is not part of the on-disk format.
+once, and `objects/` once when it created a fanout directory. Every other
+`.commitmeta` write, and each `.tombstone-commit` write, creates a temp file in
+`tmp/` and renames it into `objects/<xx>/`. When `tmp/` is on a different
+filesystem from `objects/`, the rename fails with `EXDEV` and the write fails.
+The staging directory layout is transient and is not part of the on-disk
+format.
 
 ## Write path: fs-verity (ex-integrity)
 
@@ -3906,7 +3925,9 @@ process file-creation mask does not reach them:
   objects, and can publish a ref. The setgid bit is part of the forced mode,
   so the group descends to each directory created below. The sticky bit stays
   off, because the stale-staging reaper removes staging trees that other
-  members own.
+  members own. A ref file, an alias symlink, a `.commitmeta`, and a
+  `.tombstone-commit` start as a temp entry in `tmp/` or in a staging
+  directory, so each takes the group of that directory.
 - `.lock`, `.update.lock`, and each per-transaction staging sibling lock
   take 0660, so every group member opens them `O_RDWR`, takes the repository
   lock and the update lock, and reaps a staging tree whose owner has died.
@@ -4017,9 +4038,10 @@ and is a property of the writer and not of the format. The `fdatasync` is of
 the ref's temp file, and the tool syncs no directory for the ref.
 
 The port issues that same `syncfs`, those same fanout and `objects/` syncs, and
-that same ref `fdatasync`, and adds the directory syncs a ref write needs: one
-`fsync` of the directory holding the ref, plus one per directory the ref write
-created for a `/`-bearing name, deepest first (see "Ref durability" above).
+that same ref `fdatasync`, of the port's temp file under `tmp/`, and adds the
+directory syncs a ref write needs: one `fsync` of the directory holding the
+ref, plus one per directory the ref write created for a `/`-bearing name,
+deepest first (see "Ref durability" above).
 Under `main` the write creates no directory, so the port's count on the syncing
 row is 12 (10 fsync, 1 fdatasync, 1 syncfs). Under `deep/nest/leaf` the write
 creates `deep` and `nest`, which makes three directory syncs and a count of 14

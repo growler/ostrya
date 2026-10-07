@@ -496,10 +496,11 @@ outside a transaction waits for its own lock the same way.
 Reproduce the commit ordering the tool exhibits (observable by tracing its
 syscalls): `syncfs(repo)` then rename staged objects into `objects/xx/` then
 fsync each `objects/xx/` and `objects/` then write refs. Objects are durable
-before any ref points at them. Ref writes are individually atomic (tmpfile +
-fdatasync + rename + fsync of the directory holding the ref) but not atomic as a
-set. A transaction renames all its refs first and then fsyncs each directory
-that changed once, deepest first, before its commit returns. Honor `fsync=false` (all fsync becomes no-op) and `per-object-fsync`.
+before any ref points at them. Ref writes are individually atomic (tmpfile in
+`tmp/` + fdatasync + rename over the ref + fsync of the directory holding the
+ref) but not atomic as a set. A transaction renames all its refs first and then
+fsyncs each directory that changed once, deepest first, before its commit
+returns. Honor `fsync=false` (all fsync becomes no-op) and `per-object-fsync`.
 
 ## New repository mode: bare-user-shared
 
@@ -813,7 +814,9 @@ The handle holds the repo-root and `objects/` fds, which every repository has.
 the boot-id staging prefix are acquired at transaction time (Phase 6), not at
 open: the tool creates `tmp/` and reads the boot id when a transaction starts,
 and a repository served read-only can lack `tmp/` entirely, so requiring those
-fds at open would reject repositories the tool opens.
+fds at open would reject repositories the tool opens. A ref write and a
+detached-metadata write create their temp entry in `tmp/`, so they create
+`tmp/` too where it is absent.
 
 ### Phase 5 -- Reading path (DONE)
 
@@ -900,7 +903,10 @@ live transaction that runs longer than `tmp-expiry-secs`; the port reaps at
 transaction start where the tool reaps at transaction end; and the tool reuses
 a staging directory of the current boot where the port creates a new one for
 each transaction. `format-reference.md`, "Object store layout" states both
-rules.
+rules. The temp entries of ref writes and detached-metadata writes in `tmp/`
+take the age test. With a very small or negative `tmp-expiry-secs`, a reap can
+unlink such an entry before its rename: the write then fails with `ENOENT`, and
+the ref or the object stays unchanged.
 
 ### Phase 6a -- Mode refactor: bare-user-shared and bare-split-xattrs read (DONE)
 
@@ -1203,13 +1209,13 @@ Definition:
   the marked commit's bytes are identical to an unmarked one.
 - Detached metadata: `Repo::write_commit_detached_metadata` and
   `read_commit_detached_metadata`; a bare `a{sv}` at the `.commitmeta`
-  loose path, replaced atomically (tmpfile, fdatasync, rename); `None`
+  loose path, replaced atomically (tmpfile in `tmp/`, fdatasync, rename); `None`
   writes the documented zero-length file.
 - Refs: `Transaction::set_ref` and `set_collection_ref` queue
   refspec-to-checksum entries applied at commit;
   `Repo::set_ref_immediate` writes outside a transaction. A ref file is
-  64 hex chars plus `\n` (65 bytes), written tmpfile + fdatasync +
-  rename + fsync of the directory holding the ref, parent directories
+  64 hex chars plus `\n` (65 bytes), written tmpfile in `tmp/` +
+  fdatasync + rename + fsync of the directory holding the ref, parent directories
   created for `/`-bearing names; a `None` checksum removes the ref file
   and syncs that directory too.
 - The completed `Transaction::commit()`: 7a's object publication

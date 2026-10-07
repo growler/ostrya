@@ -1149,13 +1149,23 @@ impl Transaction {
         let repo_mode = self.repo.mode();
         let repo_fd = self.repo.repo_fd().try_clone_to_owned()?;
         let stats = self.staged.lock().unwrap().stats;
-        let staging = self.staging.take();
+        let staging = self
+            .staging
+            .take()
+            .expect("staging directory present during the transaction");
         let lock = self.lock;
         ostrya_rt::unblock(move || {
             #[cfg(test)]
             test_tail::pass(repo_fd.as_fd());
-            let written = detached.run().and_then(|()| {
-                crate::refs::write_resolved_refs_blocking(repo_fd.as_fd(), &refs, fsync, repo_mode)
+            let tmp_fd = staging.tmp_fd();
+            let written = detached.run(tmp_fd).and_then(|()| {
+                crate::refs::write_resolved_refs_blocking(
+                    repo_fd.as_fd(),
+                    tmp_fd,
+                    &refs,
+                    fsync,
+                    repo_mode,
+                )
             });
             drop(held);
             drop(staging);
@@ -1263,8 +1273,9 @@ impl DetachedJob {
     /// the install where the publication step ran none. Each other edit is
     /// written and, with fsync on, made durable before the next one starts,
     /// and each takes the process-wide guard of detached-metadata edits for
-    /// itself alone. The caller holds the update lock.
-    fn run(self) -> Result<()> {
+    /// itself alone. `tmp_fd` is the open `tmp/` of the repository, where
+    /// each edit creates its temp file. The caller holds the update lock.
+    fn run(self, tmp_fd: BorrowedFd<'_>) -> Result<()> {
         let staged: Vec<(&Checksum, &str)> = self
             .queued
             .iter()
@@ -1291,6 +1302,7 @@ impl DetachedJob {
                 continue;
             }
             crate::commit::merge_detached_blocking(
+                tmp_fd,
                 self.objects_fd.as_fd(),
                 &checksum,
                 edit.replace,

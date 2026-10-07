@@ -22,8 +22,10 @@ const TOMBSTONE_KEY: &str = "commit";
 ///
 /// The object is the `a{sv}` holding one `commit` key whose `ay` value is the
 /// commit checksum in lowercase hex, NUL-terminated
-/// (`docs/format-reference.md`, "Object types").
+/// (`docs/format-reference.md`, "Object types"). `tmp_fd` is the open `tmp/`
+/// of the repository, where the write creates its temp file.
 pub(crate) fn write_tombstone(
+    tmp_fd: BorrowedFd<'_>,
     objects_fd: BorrowedFd<'_>,
     commit: &Checksum,
     mode: RepoMode,
@@ -36,5 +38,5 @@ pub(crate) fn write_tombstone(
     let ty = Type::parse(TOMBSTONE_SIGNATURE).map_err(ostrya_core::Error::from)?;
     let bytes = to_bytes(&ty, &builder.build()).map_err(ostrya_core::Error::from)?;
     let dest = loose_path(commit, ObjectType::TombstoneCommit, mode);
-    crate::commit::write_detached_blocking(objects_fd, &dest, &bytes, fsync, mode)
+    crate::commit::write_detached_blocking(tmp_fd, objects_fd, &dest, &bytes, fsync, mode)
 }

@@ -35,13 +35,14 @@ use ostrya_core::sizes::SizeEntry;
 use ostrya_core::{
     Checksum, Commit, DirTree, ObjectType, RepoMode, Type, Value, loose_path, to_bytes,
 };
-use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 use crate::file::FileKind;
 use crate::perm;
 use crate::repo::Repo;
+use crate::staging::{META_TEMP_PREFIX, TempEntry, open_tmp_dir};
 use crate::transaction::Transaction;
 use crate::tree::RepoTree;
 
@@ -294,7 +295,15 @@ impl Repo {
         let repo_mode = self.mode();
         let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
         self.write_locked(move |repo| {
-            write_detached_blocking(repo.objects_fd(), &dest, &bytes, fsync, repo_mode)
+            let tmp_fd = open_tmp_dir(repo.repo_fd(), repo_mode)?;
+            write_detached_blocking(
+                tmp_fd.as_fd(),
+                repo.objects_fd(),
+                &dest,
+                &bytes,
+                fsync,
+                repo_mode,
+            )
         })
         .await
     }
@@ -328,7 +337,9 @@ pub(crate) fn append_dict_entry(metadata: &mut Value, key: &str, value: Value) -
 /// The read, the merge and the replacing write run as one step under
 /// [`DETACHED_MERGE`], for this edit alone, so a caller can apply several
 /// edits in one trip to the blocking pool. The caller holds the update lock.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn merge_detached_blocking(
+    tmp_fd: BorrowedFd<'_>,
     objects_fd: BorrowedFd<'_>,
     checksum: &Checksum,
     replace: Option<Value>,
@@ -338,7 +349,7 @@ pub(crate) fn merge_detached_blocking(
     repo_mode: RepoMode,
 ) -> Result<()> {
     let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
-    edit_detached_blocking(objects_fd, &dest, fsync, repo_mode, |read| {
+    edit_detached_blocking(tmp_fd, objects_fd, &dest, fsync, repo_mode, |read| {
         let base = match replace {
             Some(dict) => Some(dict),
             None => read()?,
@@ -369,7 +380,9 @@ pub(crate) fn merge_detached_blocking(
 /// zero leaves the file as it stands, and a dict the removal empties is
 /// written as the zero-length "no metadata" marker. The caller holds the
 /// update lock.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prune_detached_signatures_blocking(
+    tmp_fd: BorrowedFd<'_>,
     objects_fd: BorrowedFd<'_>,
     checksum: &Checksum,
     metadata_key: &str,
@@ -379,7 +392,7 @@ pub(crate) fn prune_detached_signatures_blocking(
     repo_mode: RepoMode,
 ) -> Result<usize> {
     let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
-    edit_detached_blocking(objects_fd, &dest, fsync, repo_mode, |read| {
+    edit_detached_blocking(tmp_fd, objects_fd, &dest, fsync, repo_mode, |read| {
         let Some(mut dict) = read()? else {
             return Ok((DetachedWrite::Keep, 0));
         };
@@ -488,6 +501,7 @@ enum DetachedWrite {
 /// back. The reader, `edit` and the write all run inside the guard, so no other
 /// edit of this process lands between them.
 fn edit_detached_blocking<T>(
+    tmp_fd: BorrowedFd<'_>,
     objects_fd: BorrowedFd<'_>,
     dest: &str,
     fsync: bool,
@@ -500,9 +514,11 @@ fn edit_detached_blocking<T>(
     match write {
         DetachedWrite::Dict(dict) => {
             let bytes = to_bytes(&ty, &dict).map_err(ostrya_core::Error::from)?;
-            write_detached_blocking(objects_fd, dest, &bytes, fsync, repo_mode)?;
+            write_detached_blocking(tmp_fd, objects_fd, dest, &bytes, fsync, repo_mode)?;
         }
-        DetachedWrite::Marker => write_detached_blocking(objects_fd, dest, &[], fsync, repo_mode)?,
+        DetachedWrite::Marker => {
+            write_detached_blocking(tmp_fd, objects_fd, dest, &[], fsync, repo_mode)?
+        }
         DetachedWrite::Keep => {}
     }
     Ok(value)
@@ -532,14 +548,18 @@ fn read_detached_blocking(
 /// Write metadata bytes to a loose path atomically. The detached-metadata
 /// writers reach it for a `.commitmeta`, and the prune sweep reaches it for a
 /// `.tombstone-commit`; both objects carry the `0644` every metadata object
-/// carries. The fanout directory is created on demand (`0777` reduced by the umask, and
-/// forced to [`perm::SHARED_DIR_MODE`] where this call creates it in a
-/// `bare-user-shared` repository), the bytes go to a temp file (`fchmod` 0644,
-/// `fdatasync` when fsync is on), and the temp is renamed over the target. When
-/// fsync is on, the fanout directory is fsynced after the rename so the new name
-/// survives a crash, and `objects/` is fsynced too when the fanout directory was
-/// newly created, matching the durability the object publication path honors.
+/// carries. `tmp_fd` is the open `tmp/` of the repository. The fanout
+/// directory is created on demand (`0777` reduced by the umask, and forced to
+/// [`perm::SHARED_DIR_MODE`] where this call creates it in a
+/// `bare-user-shared` repository), the bytes go to a temp file in `tmp/`
+/// (`fchmod` 0644, `fdatasync` when fsync is on), and the temp is renamed over
+/// the target. A `tmp/` on another filesystem makes the rename fail with
+/// `EXDEV`, and the temp is removed. When fsync is on, the fanout directory is
+/// fsynced after the rename so the new name survives a crash, and `objects/` is
+/// fsynced too when the fanout directory was newly created, matching the
+/// durability the object publication path honors.
 pub(crate) fn write_detached_blocking(
+    tmp_fd: BorrowedFd<'_>,
     objects_fd: BorrowedFd<'_>,
     dest: &str,
     bytes: &[u8],
@@ -551,35 +571,20 @@ pub(crate) fn write_detached_blocking(
     let fanout = &dest[..2];
     let fanout_created = create_fanout(objects_fd, fanout, repo_mode)?;
 
-    let tmp = format!(
-        "{dest}.tmp-{}-{}",
-        std::process::id(),
-        crate::write::unique()
-    );
-    let fd = rustix::fs::openat(
-        objects_fd,
-        tmp.as_str(),
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::from_raw_mode(COMMITMETA_MODE),
-    )?;
-    let write_and_rename = || -> Result<()> {
-        let mut file = std::fs::File::from(fd);
-        file.write_all(bytes)?;
-        file.flush()?;
-        rustix::fs::fchmod(file.as_fd(), Mode::from_raw_mode(COMMITMETA_MODE))?;
-        if fsync {
-            rustix::fs::fdatasync(file.as_fd())?;
-        }
-        drop(file);
-        rustix::fs::renameat(objects_fd, tmp.as_str(), objects_fd, dest)?;
-        if fsync {
-            sync_fanout(objects_fd, fanout, fanout_created)?;
-        }
-        Ok(())
-    };
-    write_and_rename().inspect_err(|_| {
-        let _ = rustix::fs::unlinkat(objects_fd, tmp.as_str(), AtFlags::empty());
-    })
+    let (temp, fd) = TempEntry::create_file(tmp_fd, META_TEMP_PREFIX, COMMITMETA_MODE)?;
+    let mut file = std::fs::File::from(fd);
+    file.write_all(bytes)?;
+    file.flush()?;
+    rustix::fs::fchmod(file.as_fd(), Mode::from_raw_mode(COMMITMETA_MODE))?;
+    if fsync {
+        rustix::fs::fdatasync(file.as_fd())?;
+    }
+    drop(file);
+    temp.rename_into(objects_fd, dest)?;
+    if fsync {
+        sync_fanout(objects_fd, fanout, fanout_created)?;
+    }
+    Ok(())
 }
 
 /// Create the fanout directory `fanout` under `objects/` where it is absent

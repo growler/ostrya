@@ -40,6 +40,7 @@
 //! a system search path -- parameterized by sign-type name so the spki engine
 //! reuses it; a verifier trusts the loaded set minus the revoked set.
 
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 
 use ostrya_core::{Checksum, ObjectType, Value, base64};
@@ -84,7 +85,9 @@ impl Repo {
         let checksum = *checksum;
         let appends = vec![(signer.metadata_key().to_owned(), signature)];
         self.write_locked(move |repo| {
+            let tmp_fd = crate::staging::open_tmp_dir(repo.repo_fd(), repo_mode)?;
             crate::commit::merge_detached_blocking(
+                tmp_fd.as_fd(),
                 repo.objects_fd(),
                 &checksum,
                 None,
@@ -160,7 +163,9 @@ impl Repo {
         let checksum = *checksum;
         let metadata_key = metadata_key.to_owned();
         self.write_locked(move |repo| {
+            let tmp_fd = crate::staging::open_tmp_dir(repo.repo_fd(), repo_mode)?;
             crate::commit::prune_detached_signatures_blocking(
+                tmp_fd.as_fd(),
                 repo.objects_fd(),
                 &checksum,
                 &metadata_key,

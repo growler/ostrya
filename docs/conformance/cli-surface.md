@@ -3935,6 +3935,14 @@ Observed by running the tool (2026.1).
     take. The port creates a new staging directory for each transaction and
     reuses none. "P2", in the signing divergences, records what each leaves
     in `tmp/` after a run.
+- The port creates the temp file of a ref write in `tmp/`, and the tool
+  creates it in the directory that holds the ref. The `fdatasync` of a ref
+  write therefore reaches a file under `tmp/` in the port and a file under
+  `refs/` in the tool (`commit_fsync_policy_controls_the_syscalls` in
+  `crates/ostrya-cli/tests/cli.rs`). The port also creates the temp symlink
+  of an alias write in `tmp/`. It writes each `.commitmeta` it does not
+  stage, and each `.tombstone-commit`, through a temp file in `tmp/`. No
+  published byte differs.
 - `init --mode=<mode>` rejects a mode it does not recognize with `error:
   Invalid mode '<mode>' in repository configuration` and exits 1, before
   writing anything to the target directory. Confirmed for an unknown string

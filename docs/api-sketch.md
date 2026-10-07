@@ -447,8 +447,9 @@ impl Repo {
         dest_dir: BorrowedFd<'_>, dest_path: &Path, commit: &Checksum) -> Result<()>;
 
     // --- immediate ref writes (outside a transaction) ---
-    // Each honors `[core] fsync`: the ref file is `fdatasync`-ed and the
-    // directory holding it is `fsync`-ed after the rename or the unlink.
+    // Each honors `[core] fsync`: the ref's temp file in `tmp/` is
+    // `fdatasync`-ed, and the directory holding the ref is `fsync`-ed after
+    // the rename over the ref or the unlink.
     // Each writes under the update lock.
     pub async fn set_ref_immediate(&self, refspec: &str, checksum: Option<&Checksum>) -> Result<()>;
     pub async fn set_collection_ref_immediate(&self, cref: &CollectionRef,
@@ -496,7 +497,7 @@ impl UpdateGuard {
     pub async fn read_ref(&self, refspec: &str) -> Result<Option<Checksum>>;
     pub async fn read_collection_ref(&self, cref: &CollectionRef)
         -> Result<Option<Checksum>>;
-    /// Each write is atomic and visible when it returns: a tmpfile,
+    /// Each write is atomic and visible when it returns: a tmpfile in `tmp/`,
     /// `fdatasync` under `[core] fsync`, and a rename. The guard records each
     /// directory that changed, and `finish` syncs it.
     pub async fn set_ref(&self, refspec: &str, checksum: Option<&Checksum>)

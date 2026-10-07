@@ -1090,48 +1090,54 @@ impl Repo {
         drop(summary);
         let mut deltas = deltas;
 
-        // The commit chains, in the order the refs were given, each commit once.
-        let mut commits: Vec<Checksum> = Vec::new();
-        let mut seen: HashMap<Checksum, i32> = HashMap::new();
-        for (ref_name, tip) in &targets {
-            let commit = load_commit(src, tip).await?;
-            if verify_bindings {
-                check_ref_binding(tip, &commit, ref_name)?;
-            }
-            collect_chain(src, *tip, commit, opts.depth, &mut commits, &mut seen).await?;
-        }
-
         let sources: Vec<&Repo> = std::iter::once(src)
             .chain(opts.localcache_repos.iter())
             .collect();
 
         // Every commit of the chain is checked before the transaction opens,
         // so a source whose signatures do not satisfy the policy imports
-        // nothing at all. A check binds to the source objects as they stand
-        // while it runs. The import loop reads them a second time: a commit
-        // where it walks the tree, and the `.commitmeta` where it copies the
-        // bytes. A source rewritten between the check and the import is
-        // imported as it stands at the import, and a concurrent sign of the
-        // source commit is the writer that replaces a `.commitmeta` in place.
-        // Carrying the checked bytes to the import would hold one entry per
-        // commit of the chain, which a `depth=-1` pull leaves unbounded, so the
-        // metadata is read twice instead.
-        if verification.checks_commits() {
-            for commit in &commits {
-                let bytes = load_object_from(&sources, ObjectType::Commit, commit).await?;
-                // The check reads the detached metadata as the source holds
-                // it: a source's `.commitmeta` where one holds it, and this
-                // repository's own where none does. A filter narrows what the
-                // pull then stores, so a later verify of the stored commit
-                // reads what the filter left.
-                let detached = match detached_bytes_from(&sources, commit).await? {
-                    Some(bytes) => crate::summary::parse_signature_dict(&bytes)?,
-                    None => self.read_commit_detached_metadata(commit).await?,
-                };
-                verification
-                    .check_commit(commit, &bytes, detached.as_ref())
-                    .await?;
+        // nothing at all. The walk of the chain checks each commit over the
+        // bytes it read to find the parent, and a check binds to the source
+        // objects as they stand while it runs. The import loop reads them a
+        // second time: a commit where it walks the tree, and the `.commitmeta`
+        // where it copies the bytes. A source rewritten between the check and
+        // the import is imported as it stands at the import, and a concurrent
+        // sign of the source commit is the writer that replaces a
+        // `.commitmeta` in place. Carrying the checked bytes to the import
+        // would hold one entry per commit of the chain, which a `depth=-1`
+        // pull leaves unbounded, so the metadata is read twice instead.
+        let mut check = verification.checks_commits().then(|| ChainCheck {
+            repo: self,
+            sources: &sources,
+            verification: &verification,
+            failed: None,
+        });
+
+        // The commit chains, in the order the refs were given, each commit once.
+        let mut commits: Vec<Checksum> = Vec::new();
+        let mut seen: HashMap<Checksum, i32> = HashMap::new();
+        for (ref_name, tip) in &targets {
+            let (bytes, commit) = load_commit(src, tip).await?;
+            if verify_bindings {
+                check_ref_binding(tip, &commit, ref_name)?;
             }
+            collect_chain(
+                src,
+                *tip,
+                (bytes, commit),
+                opts.depth,
+                &mut commits,
+                &mut seen,
+                check.as_mut(),
+            )
+            .await?;
+        }
+        // A defect the walk finds is reported ahead of a failed check.
+        if let Some(ChainCheck {
+            failed: Some(err), ..
+        }) = check
+        {
+            return Err(err);
         }
 
         let mut txn = self.transaction().await?;
@@ -1569,17 +1575,22 @@ async fn resolve_targets(
 /// previous one had is walked on from rather than stopped at, and the commits a
 /// pull collects do not depend on the order the refs were given. A commit is
 /// appended the first time it is reached and not again.
+///
+/// `tip_commit` holds the tip's bytes and the commit parsed from them. `check`,
+/// where present, runs on each commit as it is appended, over the bytes the
+/// walk read.
 async fn collect_chain(
     src: &Repo,
     tip: Checksum,
-    tip_commit: Commit,
+    tip_commit: (Vec<u8>, Commit),
     depth: i32,
     out: &mut Vec<Checksum>,
     seen: &mut HashMap<Checksum, i32>,
+    mut check: Option<&mut ChainCheck<'_>>,
 ) -> Result<()> {
     let mut current = Some((tip, tip_commit));
     let mut remaining = depth;
-    while let Some((checksum, commit)) = current {
+    while let Some((checksum, (bytes, commit))) = current {
         if let Some(&prev) = seen.get(&checksum)
             && reaches_at_least(prev, remaining)
         {
@@ -1587,7 +1598,11 @@ async fn collect_chain(
         }
         if seen.insert(checksum, remaining).is_none() {
             out.push(checksum);
+            if let Some(check) = check.as_deref_mut() {
+                check.check(&checksum, &bytes).await;
+            }
         }
+        drop(bytes);
         if remaining == 0 {
             return Ok(());
         }
@@ -1602,6 +1617,47 @@ async fn collect_chain(
         }
     }
     Ok(())
+}
+
+/// The signature check a local pull runs on each commit of the chain while it
+/// walks the chain.
+struct ChainCheck<'a> {
+    /// The repository the pull writes into, whose detached metadata a commit
+    /// is checked against where no source holds a `.commitmeta`.
+    repo: &'a Repo,
+    /// The source and the localcache repositories, in the order they are read.
+    sources: &'a [&'a Repo],
+    verification: &'a verify::Verification,
+    /// The first check that failed. The commits after it go unchecked, and the
+    /// walk goes on, so a defect the walk finds is reported ahead of it.
+    failed: Option<Error>,
+}
+
+impl ChainCheck<'_> {
+    /// Check `commit`, whose object holds `bytes`, unless a check already
+    /// failed, and record a failure.
+    async fn check(&mut self, commit: &Checksum, bytes: &[u8]) {
+        if self.failed.is_none()
+            && let Err(err) = self.check_one(commit, bytes).await
+        {
+            self.failed = Some(err);
+        }
+    }
+
+    /// Hold `commit`, whose object holds `bytes`, to the commit policy.
+    async fn check_one(&self, commit: &Checksum, bytes: &[u8]) -> Result<()> {
+        // The check reads the detached metadata as the source holds it: a
+        // source's `.commitmeta` where one holds it, and this repository's own
+        // where none does. A filter narrows what the pull then stores, so a
+        // later verify of the stored commit reads what the filter left.
+        let detached = match detached_bytes_from(self.sources, commit).await? {
+            Some(bytes) => crate::summary::parse_signature_dict(&bytes)?,
+            None => self.repo.read_commit_detached_metadata(commit).await?,
+        };
+        self.verification
+            .check_commit(commit, bytes, detached.as_ref())
+            .await
+    }
 }
 
 /// What a pull's plans have covered so far: the dirtrees descended into and the
@@ -1707,16 +1763,17 @@ async fn source_size(repo: &Repo, ty: ObjectType, checksum: &Checksum) -> Result
     }
 }
 
-/// Load and parse a commit from a repository.
-async fn load_commit(repo: &Repo, checksum: &Checksum) -> Result<Commit> {
+/// Load a commit from a repository: its bytes and the commit parsed from them.
+async fn load_commit(repo: &Repo, checksum: &Checksum) -> Result<(Vec<u8>, Commit)> {
     let bytes = repo.load_object_bytes(ObjectType::Commit, checksum).await?;
-    Ok(Commit::parse(&bytes)?)
+    let commit = Commit::parse(&bytes)?;
+    Ok((bytes, commit))
 }
 
 /// Load a commit, treating an absent object as `None`.
-async fn try_load_commit(repo: &Repo, checksum: &Checksum) -> Result<Option<Commit>> {
+async fn try_load_commit(repo: &Repo, checksum: &Checksum) -> Result<Option<(Vec<u8>, Commit)>> {
     match load_commit(repo, checksum).await {
-        Ok(commit) => Ok(Some(commit)),
+        Ok(loaded) => Ok(Some(loaded)),
         Err(Error::ObjectNotFound { .. }) => Ok(None),
         Err(e) => Err(e),
     }
@@ -1725,32 +1782,13 @@ async fn try_load_commit(repo: &Repo, checksum: &Checksum) -> Result<Option<Comm
 /// Load a commit from the first source holding it.
 async fn load_commit_from(sources: &[&Repo], checksum: &Checksum) -> Result<Commit> {
     for src in sources {
-        if let Some(commit) = try_load_commit(src, checksum).await? {
+        if let Some((_, commit)) = try_load_commit(src, checksum).await? {
             return Ok(commit);
         }
     }
     Err(Error::ObjectNotFound {
         checksum: *checksum,
         ty: ObjectType::Commit,
-    })
-}
-
-/// Load an object's bytes from the first source holding it.
-async fn load_object_from(
-    sources: &[&Repo],
-    ty: ObjectType,
-    checksum: &Checksum,
-) -> Result<Vec<u8>> {
-    for src in sources {
-        match src.load_object_bytes(ty, checksum).await {
-            Ok(bytes) => return Ok(bytes),
-            Err(Error::ObjectNotFound { .. }) => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(Error::ObjectNotFound {
-        checksum: *checksum,
-        ty,
     })
 }
 

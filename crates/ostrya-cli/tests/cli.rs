@@ -37100,6 +37100,100 @@ fn pull_local_gpg_switches_refuse_where_the_tool_refuses() {
     }
 }
 
+/// `pull-local --gpg-verify` opens each source commit object as many times as
+/// the same pull with no check: the check reads the bytes the walk of the
+/// chain read to find the parent. The opens are counted under `strace`, over
+/// a chain of two signed commits pulled whole.
+#[cfg(feature = "gpg")]
+#[test]
+fn pull_local_gpg_verify_adds_no_commit_read() {
+    if !gpg_available() || !strace_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-local-gpg-commit-reads");
+    let base = tmp.path();
+    let home = GpgHome::create(base, "Pull Reads <reads@example.invalid>");
+    let homedir = format!("--gpg-homedir={}", home.dir.display());
+    let sign = format!("--gpg-sign={}", home.fingerprint());
+    let keyring = base.join("export.gpg");
+    home.export_to(&keyring);
+    let import = format!("--gpg-import={}", keyring.display());
+
+    let src = base.join("src");
+    let src_s = src.to_str().unwrap();
+    ostrya(&["init", "--repo", src_s, "--mode=archive"], None, &[]).ok();
+    let tree = base.join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    let tree_arg = format!("--tree=dir={}", tree.display());
+    let mut commits = Vec::new();
+    for subject in ["one", "two"] {
+        std::fs::write(tree.join("a"), subject).unwrap();
+        let run = ostrya(
+            &[
+                "commit", "--repo", src_s, "-b", "main", "-s", subject, &sign, &homedir, &tree_arg,
+            ],
+            None,
+            &[("SOURCE_DATE_EPOCH", SOURCE_DATE_EPOCH)],
+        );
+        commits.push(run.ok().stdout_trimmed());
+    }
+
+    // The opens of each source commit object, in the order `commits` holds.
+    // `strace -y` prints the path behind the directory descriptor an open is
+    // relative to, so a line names the source repository and the object.
+    let opens = |name: &str, extra: &[&str]| -> Vec<usize> {
+        let dest = base.join(name);
+        let dest_s = dest.to_str().unwrap();
+        ostrya(&["init", "--repo", dest_s, "--mode=archive"], None, &[]).ok();
+        ostrya(
+            &[
+                "remote",
+                "add",
+                "--repo",
+                dest_s,
+                &import,
+                "o",
+                "file:///nonexistent",
+            ],
+            None,
+            &[],
+        )
+        .ok();
+        let trace = base.join(format!("{name}.trace"));
+        let run = Command::new("strace")
+            .args(["-y", "-f", "-e", "trace=open,openat,openat2", "-o"])
+            .arg(&trace)
+            .arg(env!("CARGO_BIN_EXE_ostrya"))
+            .args(["pull-local", "--repo", dest_s, "--remote=o", "--depth=-1"])
+            .args(extra)
+            .args([src_s, "main"])
+            .output()
+            .expect("strace runs");
+        assert!(
+            run.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let text = std::fs::read_to_string(&trace).expect("the trace is written");
+        commits
+            .iter()
+            .map(|commit| {
+                let object = format!("{}/{}.commit\"", &commit[..2], &commit[2..]);
+                text.lines()
+                    .filter(|line| line.contains(src_s) && line.contains(&object))
+                    .count()
+            })
+            .collect()
+    };
+    let unchecked = opens("unchecked", &[]);
+    let checked = opens("checked", &["--gpg-verify"]);
+    assert!(unchecked.iter().all(|&count| count > 0), "{unchecked:?}");
+    assert_eq!(
+        checked, unchecked,
+        "the opens of each source commit object, checked and unchecked"
+    );
+}
+
 /// `pull-local` against a source holding a ref named by 64 lowercase hex
 /// digits: the tool reads the name as a checksum and fails, with the ref named
 /// and with no ref named, where the port reads the name as a checksum when it

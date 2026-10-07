@@ -3719,8 +3719,8 @@ priority ordering end to end through `Fetcher::fetch`. Equivalent pull
 conformance cases land in `conformance/m10-cli-behavior.matrix` at the
 CLI-compatibility phase.
 
-Deferred: `contenturl`, `metalink`, and mirrorlists; subpath pulls; collection
-refs and `refs/mirrors` in the HTTP pull; the summary cache under
+Deferred: `contenturl`, `metalink`, and mirrorlists; collection refs and
+`refs/mirrors` in the HTTP pull; the summary cache under
 `tmp/cache/summaries/`; the archive-to-archive pass-through, which is 16g.
 
 #### Phase 16d -- Delta-accelerated pull (DONE)
@@ -4195,11 +4195,9 @@ with the key that signed it, refused by one configured with another, and accepte
 by that second destination when `--sign-verify=false` overrides it. The suite runs
 under both runtime backends.
 
-Deferred: `--subpath`, `--dry-run`, and `--cache-dir`, which name machinery the
-library does not have; the `--gpg-verify` and `--gpg-verify-summary` switches on
-`ostrya pull-local`, which the library accepts and the CLI does not yet pass;
-`PullOptions::remote`, the ref-prefix override `pull-local` exposes as
-`--remote`, which has no switch on `pull` since the positional `<REMOTE>`
+Deferred: `--dry-run` and `--cache-dir`, which name machinery the library does
+not have; `PullOptions::remote`, the ref-prefix override `pull-local` exposes
+as `--remote`, which has no switch on `pull` since the positional `<REMOTE>`
 supplies the prefix; and the `ostree`-compatible spellings, exit codes, and
 progress output, which are Phase 17.
 

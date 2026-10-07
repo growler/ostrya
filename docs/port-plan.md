@@ -3136,9 +3136,21 @@ the ref store refuses is `InvalidRefspec` with `<collection-id>:<name>`. A name
 that holds `:` is `InvalidRefspec` with the same payload, since delta discovery
 reads the name as a refspec and a `:` changes what it names. The read of each
 collection ref takes the paths these checks give. The local pull trusts the
-destination: it imports no object the destination holds, and it takes a
-dirtree the destination holds and no source holds as complete below it, so a
-gap below that dirtree makes the first operation that reaches it fail.
+destination: it imports no object the destination holds, and it reads a
+dirtree the destination holds from the destination. The walk descends into
+that dirtree, also when no source holds it, so an object below it that the
+destination lacks is imported from the first source that holds it, and one
+that no source holds fails the pull with `ObjectNotFound`. An object is held
+where a `stat` of its path finds an entry, without following a symlink. A held
+dirtree that the pull cannot read or parse fails the pull with the read or
+parse error, as in the HTTP pull, also when a source holds a good copy: a file
+the process cannot read, an entry that is not a regular file, a symlink that
+points to no file, a file above `MAX_METADATA_SIZE`, and bytes that do not
+parse as a dirtree. `fsck --delete` does not remove such a dirtree: the walk of
+`fsck` returns the read error, stops with `MissingDirTree` at a symlink that
+points to no file, and reports unparseable bytes without unlinking them. When
+the entry is removed from `objects/`, a pull that walks a commit that reaches
+the dirtree imports it from the first source that holds it.
 
 Each tip is followed to `depth` on its own. The chain walk records the number of
 parents a commit still had to follow when it was reached, and a chain arriving at
@@ -3268,12 +3280,35 @@ it shares the source's bytes and its inode.
   localcache repository in order, the first holder winning. The tool consults
   its `-L` caches only on an HTTP pull, where the primary source is remote;
   the port consults them on a local pull too, so a source with a hole is
-  completed rather than failed. The walk that decides what to import resolves
-  each commit and each dirtree through the same order, so the objects under a
-  subtree the source has lost are enumerated from the cache that holds it. A
-  dirtree no source holds contributes its own name and nothing beneath it, which
-  fails the pull when the import reaches that name, so a commit this repository
-  publishes is complete.
+  completed rather than failed. The walk that decides what to import takes the
+  root of each tree from the commit object the chain walk read. For the root
+  dirtree and dirmeta of a commit, and then for the children each dirtree
+  names, it drops each name the walk has met before and checks the rest in one
+  blocking call: a name `txn` has staged is held, and each other name is held
+  where a `stat` that does not follow a symlink finds it in this repository, the
+  check `import_object` makes. Only the names this repository lacks are planned.
+  The walk reads each held dirtree from this repository, from staging where
+  `txn` has staged it, and each other dirtree through the source order, so the
+  objects under a subtree the source has lost are enumerated from the cache
+  that holds it. The walk opens no dirtree in this repository that the check
+  found absent. It descends into each dirtree it reads, also one this
+  repository holds and no source holds. A dirtree that neither this repository
+  nor a source holds contributes its own name and nothing beneath it. An object
+  that no repository holds fails the pull when the import reaches its name, so
+  a commit this repository publishes is complete.
+- A commit this repository holds complete -- the commit object is present and
+  no `.commitpartial` marker names it -- contributes no object of its tree to
+  the plan, as in the HTTP pull. The pull reads no object of that tree, and it
+  handles the commit object and the detached metadata as for any other commit.
+  A pull therefore does not fill a gap in such a commit: `fsck` marks a commit
+  with a missing content or dirmeta object partial, and the next pull walks its
+  tree and imports what it lacks. At a missing dirtree `fsck` stops with
+  `MissingDirTree` and marks nothing, so no pull repairs that commit. The tool
+  was observed to do the same: a `pull-local` of a commit its target holds
+  complete opens no dirtree, leaves a deleted content object absent, and
+  imports it after `ostree fsck` marks the commit partial. With a deleted
+  dirtree, `ostree fsck` fails with "No such metadata object", writes no
+  `.commitpartial`, and the next `pull-local` imports 0 objects.
 - The commits of one pull are planned as one walk: a dirtree descended into for
   one commit is not descended into again for another, so a `depth = -1` pull of a
   chain of near-identical trees reads each dirtree once, and each commit's plan
@@ -3450,7 +3485,25 @@ own rule, and accepted by an archive destination without the flag. Detached meta
 with its commit; a localcache repository supplies an object the source no
 longer holds, and supplies a dirtree it no longer holds, whose subtree the walk
 enumerates from the cache and imports whole, while the same pull without the
-cache fails with `ObjectNotFound`, publishes no ref, and clears the marker. Three interop tests need the tool: the port pulls a tool-built
+cache fails with `ObjectNotFound`, publishes no ref, and clears the marker.
+What the destination holds, with each source object made unreadable by mode
+`0000` and the destination filled with `FORCE_COPY`, so that it shares no inode
+with the source: a pull of a commit the destination holds complete, with each
+dirtree of that commit also unreadable in the destination, so that a walk of
+the tree fails at its root, completes and imports the detached metadata alone,
+while the same pull into a destination that holds the commit partial fails with
+`EACCES`; a pull into an archive and a bare-user destination that hold the
+first commit reads each dirtree the two commits share from the destination; a
+content object the destination lacks below a dirtree it holds is imported from
+the source; a pull from a source that holds only what the second commit adds
+fails with `ObjectNotFound` for a content object no repository holds below a
+dirtree the destination holds, leaves the destination as it found it, and
+imports the object once the source holds it; a dirtree the destination holds as
+a symlink that points to no file fails the pull of the second commit with
+`ObjectNotFound` for that dirtree, although the source holds it, and the pull
+writes no commit object, no marker, and no ref; a pull of a complete commit that
+lost a content object leaves the object absent, and a pull after `fsck` marks
+the commit partial imports it. Three interop tests need the tool: the port pulls a tool-built
 archive repository into an archive and a bare-user destination, and the tool
 then resolves the ref, passes `fsck`, and reads the tree back; the port pulls
 its own bare repository into a bare-user destination, where every regular file
@@ -3524,8 +3577,8 @@ reader observes. The markers a failed pull wrote for commits this repository
 does not hold are removed on the way out, under 16b's rule, so a commit a later
 step refuses leaves nothing behind. An object several commits reach is fetched
 once. A commit already here complete has no object of its tree queued, since
-what it references is present, and its parent is followed all the same, so a pull
-extends the history a shallower pull left. A commit's `.commitmeta` is requested ahead of the commit object and written
+what it references is present, as in the local pull, and its parent is followed
+all the same, so a pull extends the history a shallower pull left. A commit's `.commitmeta` is requested ahead of the commit object and written
 once that object is here, so the detached metadata precedes the ref naming its
 commit and a parent the remote answers 404 for leaves none behind; the file is
 outside the transaction, so a pull that fails after a commit object landed leaves
@@ -4011,10 +4064,11 @@ choices.
 
 A local pull checks the summary and every commit of the chain before it opens
 its transaction, so a source the policy refuses imports nothing at all. Such a
-check binds to the source objects as they stand while it runs. The import reads
-them a second time, a commit where it walks the tree and the `.commitmeta` where
-it copies the bytes, and a trusted local import shares a source object by
-hardlink or reflink without hashing it. A source rewritten between the check and
+check binds to the source objects as they stand while it runs. The walk of the
+chain keeps the root dirtree and the root dirmeta of each commit it read, so the
+walk of a tree reads no source commit a second time. The import reads the
+`.commitmeta` a second time, where it copies the bytes, and a trusted local
+import shares a source object by hardlink or reflink without hashing it. A source rewritten between the check and
 the import is stored as it stands at the import; a concurrent sign of the source
 commit is the writer that replaces a `.commitmeta` in place. Carrying the checked
 bytes to the import would hold one entry per commit of the chain, which a

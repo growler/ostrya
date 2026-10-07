@@ -37102,8 +37102,10 @@ fn pull_local_gpg_switches_refuse_where_the_tool_refuses() {
 
 /// `pull-local --gpg-verify` opens each source commit object as many times as
 /// the same pull with no check: the check reads the bytes the walk of the
-/// chain read to find the parent. The opens are counted under `strace`, over
-/// a chain of two signed commits pulled whole.
+/// chain read to find the parent. The pull opens each source commit object
+/// once: the walk of the chain reads it, and the walk of its tree takes the
+/// root from that read. The opens are counted under `strace`, over a chain of
+/// two signed commits pulled whole.
 #[cfg(feature = "gpg")]
 #[test]
 fn pull_local_gpg_verify_adds_no_commit_read() {
@@ -37187,7 +37189,11 @@ fn pull_local_gpg_verify_adds_no_commit_read() {
     };
     let unchecked = opens("unchecked", &[]);
     let checked = opens("checked", &["--gpg-verify"]);
-    assert!(unchecked.iter().all(|&count| count > 0), "{unchecked:?}");
+    assert_eq!(
+        unchecked,
+        vec![1; commits.len()],
+        "the opens of each source commit object, unchecked"
+    );
     assert_eq!(
         checked, unchecked,
         "the opens of each source commit object, checked and unchecked"

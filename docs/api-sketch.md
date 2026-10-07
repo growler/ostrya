@@ -2209,9 +2209,11 @@ budget, so such a pull needs no room for a second copy of those objects;
 destination already held is absent from each and a `COMMIT_ONLY` pull reports its
 commit objects alone. Objects are
 sourced from `src` first and then each of
-`localcache_repos` in order, and the walk that decides what to import resolves
-each commit and dirtree through the same order, so a subtree `src` has lost is
-enumerated from a cache that holds it. Refs are written after the objects are
+`localcache_repos` in order. The walk that decides what to import takes the root
+of each tree from the commit object it read in `src` to follow the chain. It
+reads a dirtree from the destination where the destination holds it, and through
+the source order otherwise, so a subtree `src` has lost is enumerated from a
+cache that holds it. Refs are written after the objects are
 published. With `no_ref_writes` set, the pull writes no ref, and the caller
 writes the refs itself. `PullStats` does not report the pulled commits. Without
 `collection_id`, the local pull resolves each name in `refs` on `src` with
@@ -2238,9 +2240,32 @@ refuses, and a name that holds `:`, with `InvalidRefspec`, which carries
 `:` changes what it names.
 
 The local pull trusts the objects the destination holds. An object the
-destination holds is not imported, and a dirtree the destination holds and no
-source holds is taken as complete below it. A gap below such a dirtree makes
-the first operation that reaches it fail.
+destination holds is not imported, and a dirtree the destination holds is read
+from the destination. The walk descends into such a dirtree, also when no
+source holds it, and imports each object below it that the destination lacks
+from the first source that holds it. An object below it that the destination
+lacks and no source holds fails the pull with `ObjectNotFound`.
+
+The pull takes an object as held where a `stat` of its path finds an entry,
+without following a symlink. The walk makes one blocking call for each dirtree
+it reads, with a `stat` of each name it has not met before, and plans only the
+objects the destination lacks. A held dirtree that the pull cannot read or parse
+fails the pull with the read or parse error, as in the HTTP pull, also when a
+source holds a good copy: a file the process cannot read, an entry that is not
+a regular file, a symlink that points to no file, a file above
+`MAX_METADATA_SIZE`, and bytes that do not parse as a dirtree. `fsck` with
+`delete` does not remove such a dirtree. When the entry is removed from
+`objects/`, a pull that walks a commit that reaches the dirtree imports it from
+the first source that holds it.
+
+A commit the destination holds complete -- the commit object is present and no
+`.commitpartial` marker names it -- contributes no object of its tree, as in
+the HTTP pull. The pull reads no object of that tree and imports the detached
+metadata of the commit alone. A pull therefore does not fill a gap in such a
+commit. `fsck` marks a commit with a missing content or dirmeta object partial,
+and the next pull walks the tree of the commit and imports what it lacks. At a
+missing dirtree, `fsck` stops with `FsckFailure::MissingDirTree` and marks
+nothing, so no pull repairs that commit.
 
 `pull` fetches the same thing from an HTTP remote named in the repository's
 config, or over ssh from a remote with an ssh address, into one transaction, with up to `max_outstanding_fetches` objects in

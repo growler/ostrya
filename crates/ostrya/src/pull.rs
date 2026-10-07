@@ -102,11 +102,19 @@
 //!
 //! Source order: the source repository first, then each of
 //! [`PullOptions::localcache_repos`] in turn. An object is taken from the first
-//! source holding it, and the walk that decides what to import resolves each
-//! commit and dirtree through the same order, so a subtree the source has lost is
-//! enumerated from the cache that still holds it. An object no source holds is
-//! named by the walk and fails the pull when the import reaches it, so a
-//! published commit is complete.
+//! source holding it. The walk that decides what to import checks which objects
+//! of a tree this repository holds with one blocking call for each dirtree it
+//! reads, a `stat` of each name the walk has not met before, and plans the
+//! objects this repository lacks and no other. It reads each dirtree from this
+//! repository where this repository holds it, and through the source order
+//! otherwise, so a subtree the source has lost is enumerated from the cache that
+//! still holds it. The walk descends into each dirtree it reads. An object that
+//! neither this repository nor a source holds is named by the walk and fails the
+//! pull when the import reaches it, so a published commit is complete.
+//!
+//! A commit this repository holds complete -- the commit object is here and no
+//! `.commitpartial` marker names it -- is not walked: its tree contributes no
+//! object to the import, and the pull reads no object of that tree.
 //!
 //! The commits of one pull are walked as one tree: a dirtree descended into for
 //! one commit is not descended into again for another, so a deep pull of a chain
@@ -987,9 +995,32 @@ impl Repo {
     /// that holds `:`.
     ///
     /// The pull trusts the objects this repository holds. An object this
-    /// repository holds is not imported, and a dirtree this repository holds
-    /// and no source holds is taken as complete below it. A gap below such a
-    /// dirtree makes the first operation that reaches it fail.
+    /// repository holds is not imported, and a dirtree this repository holds is
+    /// read from this repository. The walk descends into such a dirtree, also
+    /// when no source holds it, and imports each object below it that this
+    /// repository lacks from the first source holding it. An object below it
+    /// that this repository lacks and no source holds fails the pull with
+    /// [`Error::ObjectNotFound`].
+    ///
+    /// The pull takes an object as held where a `stat` of its path finds an
+    /// entry, without following a symlink. A held dirtree that the pull cannot
+    /// read or parse fails the pull with the read or parse error, also where a
+    /// source holds a good copy: a file this process cannot read, an entry that
+    /// is not a regular file, a symlink that points to no file, a file above
+    /// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), and bytes that do not
+    /// parse as a dirtree. [`fsck`](Repo::fsck) with
+    /// [`delete`](crate::FsckOptions::delete) does not remove such a dirtree.
+    /// Once the entry is removed from `objects/`, a pull that walks a commit
+    /// reaching the dirtree imports it from the first source holding it.
+    ///
+    /// A commit this repository holds complete, with no `.commitpartial`
+    /// marker, contributes no object of its tree: the pull reads none of them
+    /// and imports its detached metadata alone. A gap in such a commit stays
+    /// until [`fsck`](Repo::fsck) marks the commit partial, after which a pull
+    /// walks its tree and fills the gap. `fsck` marks a commit partial over a
+    /// missing content or dirmeta object, and it ends at a missing dirtree with
+    /// [`FsckFailure::MissingDirTree`](crate::FsckFailure::MissingDirTree) and
+    /// marks nothing, so no pull repairs that commit.
     ///
     /// Under [`require_static_deltas`](PullOptions::require_static_deltas) the
     /// pull reads the source's summary and the deltas it advertises, refuses a
@@ -1098,14 +1129,16 @@ impl Repo {
         // so a source whose signatures do not satisfy the policy imports
         // nothing at all. The walk of the chain checks each commit over the
         // bytes it read to find the parent, and a check binds to the source
-        // objects as they stand while it runs. The import loop reads them a
-        // second time: a commit where it walks the tree, and the `.commitmeta`
-        // where it copies the bytes. A source rewritten between the check and
-        // the import is imported as it stands at the import, and a concurrent
-        // sign of the source commit is the writer that replaces a
-        // `.commitmeta` in place. Carrying the checked bytes to the import
-        // would hold one entry per commit of the chain, which a `depth=-1`
-        // pull leaves unbounded, so the metadata is read twice instead.
+        // objects as they stand while it runs. The walk also keeps the root
+        // dirtree and dirmeta of each commit, so the plan of the tree reads
+        // no source commit again. The import loop reads the `.commitmeta` a
+        // second time, where it copies the bytes. A source rewritten between
+        // the check and the import is imported as it stands at the import,
+        // and a concurrent sign of the source commit is the writer that
+        // replaces a `.commitmeta` in place. Carrying the checked metadata to
+        // the import would hold one entry per commit of the chain, which a
+        // `depth=-1` pull leaves unbounded, so the metadata is read twice
+        // instead.
         let mut check = verification.checks_commits().then(|| ChainCheck {
             repo: self,
             sources: &sources,
@@ -1114,7 +1147,7 @@ impl Repo {
         });
 
         // The commit chains, in the order the refs were given, each commit once.
-        let mut commits: Vec<Checksum> = Vec::new();
+        let mut commits: Vec<ChainCommit> = Vec::new();
         let mut seen: HashMap<Checksum, i32> = HashMap::new();
         for (ref_name, tip) in &targets {
             let (bytes, commit) = load_commit(src, tip).await?;
@@ -1148,14 +1181,15 @@ impl Repo {
         let mut marked: Vec<Checksum> = Vec::new();
         let published = async {
             // Mark each commit partial before its objects are imported, skipping
-            // one this repository already holds intact: a commit that was
-            // already complete must not be demoted by an unrelated failure.
-            for commit in &commits {
-                if !self.has_object(ObjectType::Commit, commit).await?
-                    || self.commit_state(commit).await? == crate::read::CommitState::Partial
-                {
-                    self.write_partial_marker(commit).await?;
-                    marked.push(*commit);
+            // one this repository already holds complete: a commit that was
+            // already complete must not be demoted by an unrelated failure. The
+            // plan of the tree reads the same answer and plans nothing for a
+            // commit held complete.
+            for commit in &mut commits {
+                commit.held = delta::complete_here(self, &commit.checksum).await?;
+                if !commit.held {
+                    self.write_partial_marker(&commit.checksum).await?;
+                    marked.push(commit.checksum);
                 }
             }
 
@@ -1192,8 +1226,9 @@ impl Repo {
             // across every object of the pull and sized on its first use, so a
             // pull that verifies nothing allocates nothing.
             let mut verify_buf: Vec<u8> = Vec::new();
-            for commit in &commits {
-                for name in plan_commit(&txn, &sources, *commit, flags, &mut plan).await? {
+            for chain_commit in &commits {
+                let commit = &chain_commit.checksum;
+                for name in plan_commit(&txn, &sources, chain_commit, flags, &mut plan).await? {
                     let imported = self
                         .import_object(&txn, &sources, name, flags, &mut verify_buf)
                         .await?;
@@ -1578,13 +1613,14 @@ async fn resolve_targets(
 ///
 /// `tip_commit` holds the tip's bytes and the commit parsed from them. `check`,
 /// where present, runs on each commit as it is appended, over the bytes the
-/// walk read.
+/// walk read. Each commit is appended with the root of its tree, so the plan
+/// of the tree reads the commit object no second time.
 async fn collect_chain(
     src: &Repo,
     tip: Checksum,
     tip_commit: (Vec<u8>, Commit),
     depth: i32,
-    out: &mut Vec<Checksum>,
+    out: &mut Vec<ChainCommit>,
     seen: &mut HashMap<Checksum, i32>,
     mut check: Option<&mut ChainCheck<'_>>,
 ) -> Result<()> {
@@ -1597,7 +1633,12 @@ async fn collect_chain(
             return Ok(());
         }
         if seen.insert(checksum, remaining).is_none() {
-            out.push(checksum);
+            out.push(ChainCommit {
+                checksum,
+                root_dirtree: commit.root_dirtree,
+                root_dirmeta: commit.root_dirmeta,
+                held: false,
+            });
             if let Some(check) = check.as_deref_mut() {
                 check.check(&checksum, &bytes).await;
             }
@@ -1617,6 +1658,18 @@ async fn collect_chain(
         }
     }
     Ok(())
+}
+
+/// A commit the walk of the chain collected, with the root of its tree as the
+/// commit object the walk read names it.
+struct ChainCommit {
+    checksum: Checksum,
+    root_dirtree: Checksum,
+    root_dirmeta: Checksum,
+    /// Whether this repository holds the commit complete: it holds the commit
+    /// object and keeps no `.commitpartial` marker for it. Set once the
+    /// transaction is open, where the markers are written.
+    held: bool,
 }
 
 /// The signature check a local pull runs on each commit of the chain while it
@@ -1660,20 +1713,21 @@ impl ChainCheck<'_> {
     }
 }
 
-/// What a pull's plans have covered so far: the dirtrees descended into and the
-/// object names an earlier commit's plan carried. Held across the commit loop so
-/// the chain's trees are walked as one.
+/// What a pull's plans have met so far: each object name a walk reached,
+/// planned or found present. Held across the commit loop so the chain's trees
+/// are walked as one.
 #[derive(Default)]
 struct PlanState {
-    dirtrees: HashSet<Checksum>,
-    emitted: HashSet<ObjectName>,
+    seen: HashSet<ObjectName>,
 }
 
 impl PlanState {
-    /// Add a name to the plan being built unless an earlier plan carried it.
-    fn push(&mut self, name: ObjectName, out: &mut Vec<ObjectName>) {
-        if self.emitted.insert(name) {
-            out.push(name);
+    /// Add a name to `out` unless a walk met it before. The answer to whether
+    /// this repository holds it starts as `false` and is set by
+    /// [`plan_absent`].
+    fn meet(&mut self, name: ObjectName, out: &mut Vec<(ObjectName, bool)>) {
+        if self.seen.insert(name) {
+            out.push((name, false));
         }
     }
 }
@@ -1682,63 +1736,121 @@ impl PlanState {
 /// content first, the commit object last, so a partially imported transaction
 /// never holds a commit ahead of what it references. Under
 /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) the tree is not walked and the commit
-/// object is the whole plan.
+/// object is the whole plan. A commit this repository holds complete
+/// contributes no object: what it references is present, and the walk reads
+/// nothing.
 ///
-/// The commit and every dirtree under it are read from the first source holding
-/// them, so a subtree the source has lost is enumerated from a localcache
-/// repository that still holds it. A dirtree `txn` has staged, which a delta
-/// part produced, is read from the staging directory instead. A dirtree no source holds contributes its own
-/// name and nothing beneath it, which fails the pull once the import reaches that
-/// name.
+/// The root of the tree comes from the commit object the walk of the chain
+/// read. The plan carries each object of the tree that this repository lacks
+/// and no other. [`plan_absent`] decides this for the root dirtree and the root
+/// dirmeta, and then for the children each dirtree names, with one blocking
+/// call for each dirtree. A dirtree that `txn` has staged, which a delta part
+/// did, or that this repository holds is read from this repository, and a read
+/// or parse of it that fails fails the pull. A dirtree this repository lacks is
+/// read from the first source holding it, so a subtree the source has lost is
+/// enumerated from a localcache repository that still holds it. The walk
+/// descends into each dirtree it reads, also one that this repository holds and
+/// no source holds, so an object below it that this repository lacks is
+/// planned and imported from the first source holding it. A dirtree that
+/// neither this repository nor a source holds contributes its own name and
+/// nothing beneath it. Each object no repository holds fails the pull once the
+/// import reaches its name.
 ///
-/// `state` carries what the commits ahead of this one covered, so a dirtree
-/// shared along the chain is descended into once and the objects under it appear
-/// in a single commit's plan.
+/// `state` carries what the commits ahead of this one met, so a dirtree shared
+/// along the chain is descended into once and each object is checked once.
 async fn plan_commit(
     txn: &Transaction,
     sources: &[&Repo],
-    commit: Checksum,
+    commit: &ChainCommit,
     flags: PullFlags,
     state: &mut PlanState,
 ) -> Result<Vec<ObjectName>> {
-    let commit_name = ObjectName::new(commit, ObjectType::Commit);
+    if commit.held {
+        return Ok(Vec::new());
+    }
+    let commit_name = ObjectName::new(commit.checksum, ObjectType::Commit);
     if flags.contains(PullFlags::COMMIT_ONLY) {
         return Ok(vec![commit_name]);
     }
     // This commit's own tree; the chain walk supplies the parents.
-    let parsed = load_commit_from(sources, &commit).await?;
     let mut names: Vec<ObjectName> = Vec::new();
-    state.push(
-        ObjectName::new(parsed.root_dirmeta, ObjectType::DirMeta),
-        &mut names,
+    // The dirtrees still to read, each with whether this repository holds it.
+    let mut stack: Vec<(Checksum, bool)> = Vec::new();
+    let mut met: Vec<(ObjectName, bool)> = Vec::new();
+    state.meet(
+        ObjectName::new(commit.root_dirmeta, ObjectType::DirMeta),
+        &mut met,
     );
-    let mut stack = vec![parsed.root_dirtree];
-    while let Some(checksum) = stack.pop() {
-        if !state.dirtrees.insert(checksum) {
-            continue;
-        }
-        state.push(ObjectName::new(checksum, ObjectType::DirTree), &mut names);
-        let dirtree = if txn.is_staged(&checksum, ObjectType::DirTree) {
-            Some(txn.load_dirtree_staged_first(&checksum).await?)
+    state.meet(
+        ObjectName::new(commit.root_dirtree, ObjectType::DirTree),
+        &mut met,
+    );
+    plan_absent(txn, met, &mut names, &mut stack).await?;
+    while let Some((checksum, here)) = stack.pop() {
+        let dirtree = if here {
+            txn.load_dirtree_staged_first(&checksum).await?
         } else {
-            load_dirtree_from(sources, &checksum).await?
+            match load_dirtree_from(sources, &checksum).await? {
+                Some(dirtree) => dirtree,
+                None => continue,
+            }
         };
-        let Some(dirtree) = dirtree else {
-            continue;
-        };
+        let mut met: Vec<(ObjectName, bool)> = Vec::new();
         for (_, file) in dirtree.files {
-            state.push(ObjectName::new(file, ObjectType::File), &mut names);
+            state.meet(ObjectName::new(file, ObjectType::File), &mut met);
         }
         for (_, subtree, submeta) in dirtree.dirs {
-            state.push(ObjectName::new(submeta, ObjectType::DirMeta), &mut names);
-            stack.push(subtree);
+            state.meet(ObjectName::new(submeta, ObjectType::DirMeta), &mut met);
+            state.meet(ObjectName::new(subtree, ObjectType::DirTree), &mut met);
         }
+        plan_absent(txn, met, &mut names, &mut stack).await?;
     }
     // `Checksum` orders by its raw bytes, which reproduces the ASCII order of
     // the hex names, so the key needs no formatting.
     names.sort_by_key(|name| (name.ty.as_u32(), name.checksum));
     names.push(commit_name);
     Ok(names)
+}
+
+/// Add each name of `met` that this repository lacks to `names`, and push each
+/// dirtree of `met` on `stack` with whether this repository holds it.
+///
+/// A name `txn` has staged is held. Each other name is held where
+/// [`Repo::has_object`] finds it: a `stat` that does not follow a symlink,
+/// the check the import makes. The names `txn` has not staged are checked in
+/// one blocking call, and a `met` that holds none of them makes no call.
+async fn plan_absent(
+    txn: &Transaction,
+    mut met: Vec<(ObjectName, bool)>,
+    names: &mut Vec<ObjectName>,
+    stack: &mut Vec<(Checksum, bool)>,
+) -> Result<()> {
+    let mut unstaged = false;
+    for (name, here) in &mut met {
+        *here = txn.is_staged(&name.checksum, name.ty);
+        unstaged |= !*here;
+    }
+    if unstaged {
+        let repo = txn.repo().clone();
+        met = ostrya_rt::unblock(move || -> Result<Vec<(ObjectName, bool)>> {
+            for (name, here) in &mut met {
+                if !*here {
+                    *here = repo.has_object_blocking(name.ty, &name.checksum)?;
+                }
+            }
+            Ok(met)
+        })
+        .await?;
+    }
+    for (name, here) in met {
+        if name.ty == ObjectType::DirTree {
+            stack.push((name.checksum, here));
+        }
+        if !here {
+            names.push(name);
+        }
+    }
+    Ok(())
 }
 
 /// Count one object a local pull read from its source as a fetch counts it:
@@ -1777,19 +1889,6 @@ async fn try_load_commit(repo: &Repo, checksum: &Checksum) -> Result<Option<(Vec
         Err(Error::ObjectNotFound { .. }) => Ok(None),
         Err(e) => Err(e),
     }
-}
-
-/// Load a commit from the first source holding it.
-async fn load_commit_from(sources: &[&Repo], checksum: &Checksum) -> Result<Commit> {
-    for src in sources {
-        if let Some((_, commit)) = try_load_commit(src, checksum).await? {
-            return Ok(commit);
-        }
-    }
-    Err(Error::ObjectNotFound {
-        checksum: *checksum,
-        ty: ObjectType::Commit,
-    })
 }
 
 /// Read a commit's `.commitmeta` bytes from the first source holding that

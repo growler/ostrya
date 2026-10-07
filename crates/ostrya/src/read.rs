@@ -226,9 +226,15 @@ impl Repo {
 
     /// Whether a loose object of the given type is present.
     pub async fn has_object(&self, ty: ObjectType, checksum: &Checksum) -> Result<bool> {
-        let path = loose_path(checksum, ty, self.mode());
         let repo = self.clone();
-        ostrya_rt::unblock(move || object::object_exists(repo.objects_fd(), &path)).await
+        let key = *checksum;
+        ostrya_rt::unblock(move || repo.has_object_blocking(ty, &key)).await
+    }
+
+    /// [`has_object`](Repo::has_object) on the calling thread.
+    pub(crate) fn has_object_blocking(&self, ty: ObjectType, checksum: &Checksum) -> Result<bool> {
+        let path = loose_path(checksum, ty, self.mode());
+        object::object_exists(self.objects_fd(), &path)
     }
 
     /// The completeness state of a commit: [`Partial`](CommitState::Partial)

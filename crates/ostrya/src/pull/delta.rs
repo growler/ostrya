@@ -268,7 +268,7 @@ pub(crate) async fn discover(
 }
 
 /// Whether this repository already holds a commit and everything it references.
-async fn complete_here(repo: &Repo, commit: &Checksum) -> Result<bool> {
+pub(super) async fn complete_here(repo: &Repo, commit: &Checksum) -> Result<bool> {
     Ok(repo.has_object(ObjectType::Commit, commit).await?
         && repo.commit_state(commit).await? == CommitState::Normal)
 }

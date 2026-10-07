@@ -4210,3 +4210,382 @@ fn an_invalid_collection_id_or_name_is_refused_before_the_source_is_read() {
         }
     });
 }
+
+// --- what the destination holds ------------------------------------------
+
+/// Whether the tests run as root, which reads a file of mode `0000`.
+fn is_root() -> bool {
+    rustix::process::geteuid().is_root()
+}
+
+/// Give a loose object of `repo_dir` mode `0000`, so a read of it fails with
+/// `EACCES` for a user other than root.
+fn make_unreadable(repo_dir: &Path, name: &ObjectName, mode: RepoMode) {
+    std::fs::set_permissions(
+        object_path(repo_dir, name, mode),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+}
+
+/// A destination of `mode` under `base/<name>` holding `commit` of `src`
+/// complete, with no ref. Each object is copied, so the destination shares
+/// no inode with the source and a mode change in the source does not reach
+/// it.
+async fn dst_copy_holding(
+    base: &Path,
+    name: &str,
+    mode: RepoMode,
+    src: &Repo,
+    commit: &Checksum,
+) -> (PathBuf, Repo) {
+    let (path, dst) = make_repo(base, name, mode).await;
+    dst.pull_local(
+        src,
+        PullOptions {
+            refs: vec![commit.to_hex()],
+            flags: PullFlags::DISABLE_VERIFY_BINDINGS | PullFlags::FORCE_COPY,
+            no_ref_writes: true,
+            ..PullOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(dst.list_refs(None).await.unwrap().is_empty());
+    (path, dst)
+}
+
+/// Assert that a dirtree of the destination is a separate inode from the
+/// same dirtree in the source.
+fn assert_own_inode(src_dir: &Path, dst_dir: &Path, dirtree: &ObjectName, dst_mode: RepoMode) {
+    let ino = |path: PathBuf| {
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        (meta.dev(), meta.ino())
+    };
+    assert_ne!(
+        ino(object_path(src_dir, dirtree, RepoMode::Archive)),
+        ino(object_path(dst_dir, dirtree, dst_mode)),
+        "{dirtree} is one inode in the source and the destination"
+    );
+}
+
+/// The content object of `nested.txt`, the one file of the subdirectory
+/// `build_tree` makes.
+async fn nested_content(repo: &Repo, commit: &Checksum) -> ObjectName {
+    let subdir = subdir_dirtree(repo, commit).await;
+    let dirtree = repo.load_dirtree(&subdir.checksum).await.unwrap();
+    let (_, file) = dirtree
+        .files
+        .into_iter()
+        .find(|(name, _)| name == "nested.txt")
+        .expect("the subdirectory holds nested.txt");
+    ObjectName::new(file, ObjectType::File)
+}
+
+/// A pull of a commit the destination holds complete reads no object of its
+/// tree: each dirtree, dirmeta, and content object of the commit is
+/// unreadable in the source, each dirtree of the commit is unreadable in the
+/// destination too, so a walk of the tree fails wherever it reads its root,
+/// and the pull imports the detached metadata alone. A commit the destination
+/// holds partial is walked, and the same pull fails on the first unreadable
+/// dirtree.
+#[test]
+fn a_commit_the_destination_holds_complete_reads_no_object_of_its_tree() {
+    if is_root() {
+        eprintln!("skipping: root reads a file of mode 0000");
+        return;
+    }
+    let tmp = TmpDir::new("pull-held-commit");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = dst_copy_holding(base, "dst", RepoMode::BareUser, &src, &c2).await;
+        let (partial_dir, partial) = make_repo(base, "partial", RepoMode::BareUser).await;
+        partial
+            .pull_local(
+                &src,
+                PullOptions {
+                    refs: vec!["main".to_owned()],
+                    flags: PullFlags::COMMIT_ONLY | PullFlags::FORCE_COPY,
+                    no_ref_writes: true,
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            partial.commit_state(&c2).await.unwrap(),
+            CommitState::Partial
+        );
+        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
+            .await
+            .unwrap();
+        let tree = src.traverse_commit(&c2, 0).await.unwrap();
+        let mut held: Vec<(PathBuf, std::fs::Permissions)> = Vec::new();
+        for name in tree.iter().filter(|name| name.ty == ObjectType::DirTree) {
+            assert_own_inode(&src_dir, &dst_dir, name, RepoMode::BareUser);
+            let path = object_path(&dst_dir, name, RepoMode::BareUser);
+            held.push((
+                path.clone(),
+                std::fs::metadata(&path).unwrap().permissions(),
+            ));
+            make_unreadable(&dst_dir, name, RepoMode::BareUser);
+        }
+        assert!(held.len() > 1, "the commit holds a root and a subdirectory");
+        for name in &tree {
+            if name.ty != ObjectType::Commit {
+                make_unreadable(&src_dir, name, RepoMode::Archive);
+            }
+        }
+        let opts = || PullOptions {
+            refs: vec!["main".to_owned()],
+            no_ref_writes: true,
+            ..PullOptions::default()
+        };
+
+        let stats = dst.pull_local(&src, opts()).await.unwrap();
+
+        assert_eq!(stats.content_imported, 0);
+        assert_eq!(
+            dst.read_commit_detached_metadata(&c2).await.unwrap(),
+            Some(two_property_metadata())
+        );
+        assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
+        assert!(!has_partial_marker(&dst_dir, &c2));
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        for (path, permissions) in held {
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+        assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+
+        let err = partial.pull_local(&src, opts()).await.unwrap_err();
+        match err {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
+            other => panic!("{other:?}"),
+        }
+        assert!(has_partial_marker(&partial_dir, &c2));
+    });
+}
+
+/// A dirtree the destination holds is read from the destination: each
+/// dirtree the two commits share is unreadable in the source, and a pull of
+/// the second commit into a destination that holds the first completes it.
+#[test]
+fn a_dirtree_the_destination_holds_is_read_from_the_destination() {
+    if is_root() {
+        eprintln!("skipping: root reads a file of mode 0000");
+        return;
+    }
+    for mode in [RepoMode::Archive, RepoMode::BareUser] {
+        let tmp = TmpDir::new("pull-held-dirtree");
+        block_on(async {
+            let base = tmp.path();
+            let (src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+            let (dst_dir, dst) = dst_copy_holding(base, "dst", mode, &src, &c1).await;
+            let old = src.traverse_commit(&c1, 0).await.unwrap();
+            let new = src.traverse_commit(&c2, 0).await.unwrap();
+            let shared: Vec<ObjectName> = old
+                .intersection(&new)
+                .filter(|name| name.ty == ObjectType::DirTree)
+                .copied()
+                .collect();
+            assert!(shared.contains(&subdir_dirtree(&src, &c2).await));
+            for name in &shared {
+                assert_own_inode(&src_dir, &dst_dir, name, mode);
+                make_unreadable(&src_dir, name, RepoMode::Archive);
+            }
+
+            dst.pull_local(
+                &src,
+                PullOptions {
+                    refs: vec!["main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
+            assert!(!has_partial_marker(&dst_dir, &c2));
+            for name in &new {
+                assert!(
+                    dst.has_object(name.ty, &name.checksum).await.unwrap(),
+                    "{mode:?}: {name} missing from the destination"
+                );
+            }
+            assert_eq!(dst.resolve_rev("main", false).await.unwrap(), Some(c2));
+            assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        });
+    }
+}
+
+/// The walk descends into a dirtree the destination holds: a content object
+/// below it that the destination lacks is imported from the source, which
+/// holds the dirtree unreadable.
+#[test]
+fn a_hole_below_a_dirtree_the_destination_holds_is_filled_from_the_source() {
+    if is_root() {
+        eprintln!("skipping: root reads a file of mode 0000");
+        return;
+    }
+    let tmp = TmpDir::new("pull-held-dirtree-hole");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = dst_copy_holding(base, "dst", RepoMode::BareUser, &src, &c1).await;
+        let nested = nested_content(&src, &c2).await;
+        std::fs::remove_file(object_path(&dst_dir, &nested, RepoMode::BareUser)).unwrap();
+        let new = src.traverse_commit(&c2, 0).await.unwrap();
+        let subdir = subdir_dirtree(&src, &c2).await;
+        assert_own_inode(&src_dir, &dst_dir, &subdir, RepoMode::BareUser);
+        make_unreadable(&src_dir, &subdir, RepoMode::Archive);
+
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(dst.has_object(nested.ty, &nested.checksum).await.unwrap());
+        assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
+        assert!(!has_partial_marker(&dst_dir, &c2));
+        for name in &new {
+            assert!(
+                dst.has_object(name.ty, &name.checksum).await.unwrap(),
+                "{name} missing from the destination"
+            );
+        }
+        assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// A dirtree the destination holds and no source holds is descended into
+/// too. A content object below it that neither the destination nor a source
+/// holds fails the pull with [`Error::ObjectNotFound`], and the pull leaves
+/// the destination as it found it. Once the source holds the object, the
+/// same pull imports it.
+#[test]
+fn a_hole_below_a_dirtree_no_source_holds_fails_the_pull() {
+    let tmp = TmpDir::new("pull-held-dirtree-thin");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (thin_dir, thin, shared) = thin_source(base, &src_dir, &src, &c1, &c2).await;
+        let subdir = subdir_dirtree(&src, &c2).await;
+        let nested = nested_content(&src, &c2).await;
+        assert!(shared.contains(&subdir));
+        assert!(shared.contains(&nested));
+        let (dst_dir, dst) = dst_copy_holding(base, "dst", RepoMode::BareUser, &src, &c1).await;
+        std::fs::remove_file(object_path(&dst_dir, &nested, RepoMode::BareUser)).unwrap();
+        let before = object_names(&dst_dir);
+
+        let err = dst
+            .pull_local(&thin, collection_pull(&["main"]))
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::ObjectNotFound { checksum, ty } => {
+                assert_eq!(ObjectName::new(checksum, ty), nested)
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!dst.has_object(ObjectType::Commit, &c2).await.unwrap());
+        assert!(!has_partial_marker(&dst_dir, &c2));
+        assert_eq!(object_names(&dst_dir), before);
+
+        let to = object_path(&thin_dir, &nested, RepoMode::Archive);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(object_path(&src_dir, &nested, RepoMode::Archive), &to).unwrap();
+
+        dst.pull_local(&thin, collection_pull(&["main"]))
+            .await
+            .unwrap();
+
+        assert!(dst.has_object(nested.ty, &nested.checksum).await.unwrap());
+        assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
+        assert!(!has_partial_marker(&dst_dir, &c2));
+        assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// A dirtree the destination holds as a dangling symlink is read from the
+/// destination, and the read fails the pull with [`Error::ObjectNotFound`]
+/// for that dirtree, although the source holds it. The pull publishes no
+/// commit object, no marker, and no ref.
+#[test]
+fn a_dangling_symlink_at_a_dirtree_the_destination_holds_fails_the_pull() {
+    let tmp = TmpDir::new("pull-held-dirtree-symlink");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = dst_copy_holding(base, "dst", RepoMode::BareUser, &src, &c1).await;
+        let subdir = subdir_dirtree(&src, &c2).await;
+        assert!(src.traverse_commit(&c1, 0).await.unwrap().contains(&subdir));
+        let path = object_path(&dst_dir, &subdir, RepoMode::BareUser);
+        std::fs::remove_file(&path).unwrap();
+        symlink(dst_dir.join("absent"), &path).unwrap();
+
+        let err = dst
+            .pull_local(
+                &src,
+                PullOptions {
+                    refs: vec!["main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::ObjectNotFound { checksum, ty } => {
+                assert_eq!(ObjectName::new(checksum, ty), subdir)
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!dst.has_object(ObjectType::Commit, &c2).await.unwrap());
+        assert!(!has_partial_marker(&dst_dir, &c2));
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+    });
+}
+
+/// A pull of a commit the destination holds complete does not walk its tree,
+/// so it leaves a content object the destination lost absent. fsck marks the
+/// commit partial, and the next pull walks the tree and imports the object.
+#[test]
+fn a_hole_in_a_commit_held_complete_is_filled_after_fsck_marks_it() {
+    let tmp = TmpDir::new("pull-held-commit-hole");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = dst_copy_holding(base, "dst", RepoMode::BareUser, &src, &c2).await;
+        let nested = nested_content(&src, &c2).await;
+        std::fs::remove_file(object_path(&dst_dir, &nested, RepoMode::BareUser)).unwrap();
+        let opts = || PullOptions {
+            refs: vec!["main".to_owned()],
+            no_ref_writes: true,
+            ..PullOptions::default()
+        };
+
+        let stats = dst.pull_local(&src, opts()).await.unwrap();
+
+        assert_eq!(stats.content_imported, 0);
+        assert!(!dst.has_object(nested.ty, &nested.checksum).await.unwrap());
+        assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
+
+        assert!(!dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Partial);
+
+        let stats = dst.pull_local(&src, opts()).await.unwrap();
+
+        assert_eq!(stats.content_imported, 1);
+        assert!(dst.has_object(nested.ty, &nested.checksum).await.unwrap());
+        assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
+        assert!(!has_partial_marker(&dst_dir, &c2));
+        assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}

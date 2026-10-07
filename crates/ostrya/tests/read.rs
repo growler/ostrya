@@ -1,11 +1,11 @@
 //! Reading-path integration tests against the checked-in tool fixtures.
 //!
-//! These exercise the Phase 5 gate: read objects, refs, and full trees from a
-//! tool-created repository and match the tool's own view. The metadata and
-//! traversal assertions are mode-independent (the fixtures share object bytes),
-//! so they run for both fixture repositories. The bare-user `load_file` path
-//! depends on the `user.ostreemeta` xattr; the bare-user fixture ships as a
-//! tarball that carries it (unpacked on demand), so these assertions always run.
+//! These read objects, refs, and full trees from a tool-created repository and
+//! match the tool's own view. The metadata and traversal assertions are
+//! mode-independent (the fixtures share object bytes), so they run for both
+//! fixture repositories. The bare-user `load_file` path depends on the
+//! `user.ostreemeta` xattr; the bare-user fixture ships as a tarball that
+//! carries it (unpacked on demand), so these assertions always run.
 
 mod common;
 

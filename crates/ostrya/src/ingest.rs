@@ -973,8 +973,8 @@ mod tests {
         }
     }
 
-    /// `GENERATE_SIZES` marks the transaction so commit assembly (Phase 7d) can
-    /// emit `ostree.sizes`.
+    /// `GENERATE_SIZES` marks the transaction so commit assembly can emit
+    /// `ostree.sizes`.
     #[test]
     fn generate_sizes_flag_marks_the_transaction() {
         let scratch = Scratch::new("gensizes");
@@ -1006,7 +1006,7 @@ mod tests {
             txn.abort().await.unwrap();
 
             // Outside archive mode GENERATE_SIZES is a silent no-op: the flag is
-            // left unset, so Phase 7d emits no empty `ostree.sizes`.
+            // left unset, so commit assembly emits no empty `ostree.sizes`.
             let repo = Repo::create(
                 &scratch.0.join("repo-bare"),
                 CreateOptions::new(RepoMode::BareUser),

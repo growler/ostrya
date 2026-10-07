@@ -1,4 +1,4 @@
-//! `SOURCE_DATE_EPOCH` timestamp pinning (Phase 7d).
+//! `SOURCE_DATE_EPOCH` timestamp pinning.
 //!
 //! This lives in its own test binary with a single test so the environment
 //! write is sound: it runs before any blocking-pool thread is spawned, on the

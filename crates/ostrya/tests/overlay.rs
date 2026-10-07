@@ -1,4 +1,4 @@
-//! Overlay changeset import integration tests (Phase 7e).
+//! Overlay changeset import integration tests.
 //!
 //! These synthesize overlayfs upperdir changesets on disk -- whiteout devices
 //! through `mknodat` (char 0:0, unprivileged) and opacity through

@@ -1,4 +1,4 @@
-//! GPG (OpenPGP) commit-signing engine (Phase 13d).
+//! GPG (OpenPGP) commit-signing engine.
 //!
 //! Behind the `verify-gpg` feature: keyrings are parsed, signatures are
 //! verified, and a remote's trusted keyring is managed in the process with the

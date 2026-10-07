@@ -22,8 +22,8 @@
 //! durability").
 //! A regular-file content object is sealed with fs-verity before its logical
 //! mode and owner are applied, because `FS_IOC_ENABLE_VERITY` needs write
-//! permission on the inode (see `port-plan.md`, Phase pre13). In bare mode the
-//! logical xattrs go on after the seal, between the owner and the mode.
+//! permission on the inode. In bare mode the logical xattrs go on after the
+//! seal, between the owner and the mode.
 
 use std::future::poll_fn;
 use std::io::{self, SeekFrom};

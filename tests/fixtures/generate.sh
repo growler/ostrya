@@ -125,11 +125,11 @@ for mode in "${MODES[@]}"; do
     fi
 done
 
-# --- tar export fixture (Phase 10) ---
+# --- tar export fixture ---
 # The tool's `ostree export` of the shared commit: a plain filesystem tar of the
 # tree (the root is the member `./`, every other member a bare relative path,
 # every mtime the commit timestamp, identical content coalesced into hardlinks).
-# The Phase 10 import path reads this to prove tool -> port tree fidelity.
+# The tar import path reads this to prove tool -> port tree fidelity.
 ostree --repo="$WORK/repo-$first" export "${CHECKSUM[$first]}" >"$OUT_DIR/export.tar"
 
 # --- bare fixture for the write path ---
@@ -149,7 +149,7 @@ ostree --repo="$bare_repo" commit \
     --no-xattrs --timestamp="$TIMESTAMP" "$SRC" >/dev/null
 emit_tree "$bare_repo" "bare"
 
-# --- canonical-permissions fixture (Phase 7c) ---
+# --- canonical-permissions fixture ---
 # A tree of assorted modes committed with --canonical-permissions. The tool
 # forces owner 0:0 and reduces each permission set to `perm & 0755` (group and
 # other write and the setuid/setgid/sticky bits are dropped), so the objects are
@@ -172,7 +172,7 @@ CANON_COMMIT="$(ostree --repo="$canon_repo" commit \
     --canonical-permissions --no-xattrs --timestamp="$TIMESTAMP" "$CANON_SRC")"
 emit_tar "$canon_repo" "canon"
 
-# --- user.* xattr fixture (Phase 7c) ---
+# --- user.* xattr fixture ---
 # A bare-user commit capturing a user.demo xattr (committed without --no-xattrs).
 # Owner is fixed to 0:0 so the object identity is host-independent. Generated on
 # a host without SELinux labeling, so the only captured xattr is user.demo.
@@ -188,7 +188,7 @@ XATTR_COMMIT="$(ostree --repo="$xattr_repo" commit \
     --owner-uid=0 --owner-gid=0 --timestamp="$TIMESTAMP" "$XATTR_SRC")"
 emit_tar "$xattr_repo" "xattr"
 
-# --- archive size-generation fixture (Phase 7d) ---
+# --- archive size-generation fixture ---
 # The deterministic source tree committed into an archive repo with
 # --generate-sizes. The tool records an ostree.sizes metadata key covering every
 # object reachable in the commit -- content objects and the dirtree/dirmeta
@@ -204,7 +204,7 @@ SIZES_COMMIT="$(ostree --repo="$sizes_repo" commit \
     --no-xattrs --generate-sizes --timestamp="$TIMESTAMP" "$SRC")"
 emit_tree "$sizes_repo" "sizes"
 
-# --- composefs / EROFS export fixture (Phase 9) ---
+# --- composefs / EROFS export fixture ---
 # ostree built with composefs exports a commit's tree to an EROFS image whose
 # fs-verity digest (SHA-256, 4096-byte block, 0 salt) is the value it stores in
 # commit metadata under ostree.composefs.digest.v0 and verifies at boot. The
@@ -350,7 +350,7 @@ else
          "skipping composefs fixture" >&2
 fi
 
-# --- summary fixtures (Phase 14) ---
+# --- summary fixtures ---
 # Two golden summaries the tool wrote, for the byte-identity gate. The tool's
 # ostree.summary.last-modified is wall-clock, so it is patched to the fixed
 # TIMESTAMP epoch to keep regeneration byte-reproducible; the port is asked to

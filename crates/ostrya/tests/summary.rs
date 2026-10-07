@@ -1,4 +1,4 @@
-//! Summary generation, signing, and verification (Phase 14).
+//! Summary generation, signing, and verification.
 //!
 //! Byte-identity is checked against golden summaries the `ostree` tool wrote for
 //! the same repositories (`tests/fixtures/generated/summary` and

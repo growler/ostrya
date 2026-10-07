@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Phase 9d composefs export tests (see docs/port-plan.md).
+//! Composefs export tests.
 //!
 //! The tree the composefs fixture was exported from is the same source tree the
 //! bare-user fixture commits, so [`Repo::export_composefs`] over the bare-user

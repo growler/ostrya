@@ -182,7 +182,7 @@ pub struct Transaction {
     per_object_fsync_override: Option<bool>,
     /// Set by a filesystem ingest under
     /// [`GENERATE_SIZES`](crate::CommitModifierFlags::GENERATE_SIZES). Read by
-    /// commit assembly (Phase 7d) to decide whether to emit `ostree.sizes`.
+    /// commit assembly to decide whether to emit `ostree.sizes`.
     generate_sizes: AtomicBool,
     /// A caller's answer for the whole transaction, from
     /// [`set_generate_sizes`](Transaction::set_generate_sizes). It wins over

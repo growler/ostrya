@@ -1,4 +1,4 @@
-//! GPG commit-signing integration tests (Phase 13d).
+//! GPG commit-signing integration tests.
 //!
 //! These exercise [`GpgSigner`] / [`GpgVerifier`] against the system GnuPG
 //! installation: a throwaway signing key is generated in a private GnuPG home
@@ -429,8 +429,9 @@ fn a_revoked_re_export_revokes_the_held_key() {
 ///
 /// One reader reads the keyring for every path, so the refusal covers the whole
 /// file: a revoked re-export of a key it holds and a certificate for a key it
-/// does not hold are refused alike. `port-plan.md`, "Phase 13d", carries what
-/// the reference tools answer over a file of this shape.
+/// does not hold are refused alike. Over a keyring with one `0xff` byte
+/// appended, the `ostree` tool reads no certificate either: its own import
+/// reports a count of zero and writes nothing (`cli-surface.md`, "P3").
 #[test]
 fn an_unframeable_remote_keyring_is_refused() {
     if !gpg_available() {

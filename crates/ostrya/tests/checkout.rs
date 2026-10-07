@@ -1,4 +1,4 @@
-//! Checkout-path integration tests (Phase 8).
+//! Checkout-path integration tests.
 //!
 //! These check the port's [`Repo::checkout_at`] against the `ostree` tool's
 //! checkout (mode, ownership, content, symlink targets, and hardlinking) for

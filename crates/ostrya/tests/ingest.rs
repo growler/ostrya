@@ -1,4 +1,4 @@
-//! Filesystem-ingest integration tests (Phase 7c).
+//! Filesystem-ingest integration tests.
 //!
 //! These build source trees on disk and ingest them through
 //! `write_dfd_to_mtree` under a `CommitModifier`: reproducing the fixture

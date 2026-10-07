@@ -5,7 +5,8 @@
 //! This crate has no ostree knowledge. It serializes and deserializes the
 //! fixed set of GVariant type signatures ostree uses, in GVariant normal
 //! form. The checksum of every metadata object is the hash of these bytes,
-//! so byte exactness here is the bedrock for every downstream phase.
+//! so every metadata checksum the port computes depends on the byte
+//! exactness of this crate.
 //!
 //! The on-disk format uses booleans (`b`), bytes (`y`), 32- and 64-bit
 //! unsigned integers (`u`, `t`), strings (`s`), variants (`v`), arrays,

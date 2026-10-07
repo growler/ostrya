@@ -1,4 +1,4 @@
-//! Fetcher integration tests (Phase 16a).
+//! Fetcher integration tests.
 //!
 //! Every test serves requests from an in-process server built on hyper's server
 //! half, over cleartext HTTP/1.1 and over TLS where ALPN selects HTTP/1.1 or

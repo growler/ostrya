@@ -1,4 +1,4 @@
-//! Mutable-tree and write_mtree integration tests (Phase 7b).
+//! Mutable-tree and write_mtree integration tests.
 //!
 //! These build trees in memory and serialize them through `write_mtree`:
 //! reproducing the fixture's dirtree and dirmeta objects byte-for-byte from

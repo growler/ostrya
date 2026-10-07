@@ -15,10 +15,9 @@
 //! ([`MAX_METADATA_SIZE`]).
 //! It compiles on Linux, macOS, and Windows.
 //!
-//! This crate covers phases 2 and 3 of the port plan (see
-//! `docs/port-plan.md`): the format primitives (checksum, varint, loose
-//! paths, sizes, xattrs, keyfile) and the typed object structs (commit,
-//! dirtree, dirmeta, file headers) with their borrowed read-path views.
+//! This crate holds the format primitives (checksum, varint, loose paths,
+//! sizes, xattrs, keyfile) and the typed object structs (commit, dirtree,
+//! dirmeta, file headers) with their borrowed read-path views.
 
 pub mod base64;
 mod be;

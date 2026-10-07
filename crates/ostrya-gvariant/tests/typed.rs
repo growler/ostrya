@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! Phase 1a verification gate (see docs/port-plan.md): for every metadata
-//! object the `ostree` tool wrote into tests/fixtures/generated/, the typed
-//! codec must decode borrow-first, re-encode to identical bytes, and agree
-//! field-for-field with the `Value` path.
+//! For every metadata object the `ostree` tool wrote into
+//! tests/fixtures/generated/, the typed codec must decode borrow-first,
+//! re-encode to identical bytes, and agree field-for-field with the `Value`
+//! path.
 
 use std::path::Path;
 

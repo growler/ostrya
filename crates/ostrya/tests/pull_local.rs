@@ -1,4 +1,4 @@
-//! Local pull between two repositories (Phase 16b).
+//! Local pull between two repositories.
 //!
 //! The source repositories are built with the port itself, so the flag and
 //! traversal behavior is covered without the `ostree` tool; the interop tests
@@ -2712,7 +2712,7 @@ fn the_tool_pulls_from_a_repository_the_port_wrote() {
     });
 }
 
-// --- signature verification (Phase 16e) -------------------------------------
+// --- signature verification ----------------------------------------------
 
 /// The fixed ed25519 keypair the signed sources sign with.
 const SECRET_B64: &str =

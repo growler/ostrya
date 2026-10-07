@@ -15,9 +15,9 @@
 //! value decoded here re-encodes to the identical bytes.
 //!
 //! This crate stays free of ostree knowledge. The impls here cover the scalar
-//! and container building blocks; the ostree object structs implement the
-//! traits in a later phase, where the value-level conventions (big-endian
-//! scalars, checksum-length and sort-order validation) are applied.
+//! and container building blocks. The ostree object structs in `ostrya-core`
+//! implement the traits and apply the value-level conventions (big-endian
+//! scalars, checksum-length and sort-order validation).
 
 use std::marker::PhantomData;
 
@@ -1135,7 +1135,7 @@ mod tests {
     #[test]
     fn array_decode_defers_element_checks_to_iteration() {
         // Valid outer framing around a corrupt element: decode succeeds and
-        // the element error surfaces when the element is visited (D3).
+        // the element error surfaces when the element is visited.
         let data = [0xff, 0, 2];
         let mut it = <ArrayIter<&str> as GvDecode>::decode(&data).unwrap();
         assert_eq!(

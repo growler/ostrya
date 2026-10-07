@@ -1,4 +1,4 @@
-//! ed25519 commit-signing integration tests (Phase 13b).
+//! ed25519 commit-signing integration tests.
 //!
 //! These exercise [`Ed25519Signer`] / [`Ed25519Verifier`] and the sign-api key
 //! store against the `ostree` tool: a signature the port writes verifies under

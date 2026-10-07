@@ -1,6 +1,6 @@
-//! Commit-assembly, refs, and detached-metadata integration tests (Phase 7d).
+//! Commit-assembly, refs, and detached-metadata integration tests.
 //!
-//! These replay the fixture source tree through the 7a-7d write path and check
+//! These replay the fixture source tree through the write path and check
 //! the commit object byte-for-byte against the tool's fixtures: the sizes-free
 //! commit across archive, bare-user, and bare-user-shared (the commit object is
 //! mode-independent), the archive `--generate-sizes` commit, the ref files the
@@ -644,8 +644,8 @@ fn list_refs_refuses_a_symlink_naming_a_directory() {
 
 #[test]
 fn two_transactions_commit_concurrently() {
-    // The Phase 6 concurrency promise completes: two transactions in one
-    // process publish their objects and refs independently, both intact.
+    // A repository holds concurrent transactions in one process: two
+    // transactions publish their objects and refs independently, both intact.
     let tmp = TmpDir::new("commit-concurrent");
     let root_dir = tmp.path().join("repo");
     let repo = block_on(Repo::create(

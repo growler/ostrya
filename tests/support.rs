@@ -22,8 +22,8 @@ pub const DIRMETA_SIG: &str = "(uuua(ayay))";
 pub const ARCHIVE_FILE_HEADER_SIG: &str = "(tuuuusa(ayay))";
 
 /// The ostree object shapes as borrowed views: strings and checksums borrow
-/// the object buffer, arrays decode lazily. These are the shapes the object
-/// structs formalize in a later phase; the golden tests decode into them and
+/// the object buffer, arrays decode lazily. These are the tuple shapes behind
+/// the `ostrya-core` object structs; the golden tests decode into them and
 /// re-encode to check byte identity.
 pub type DirMetaView<'a> = (u32, u32, u32, ArrayIter<'a, (&'a [u8], &'a [u8])>);
 pub type DirTreeView<'a> = (
@@ -123,8 +123,8 @@ impl LooseObject {
 /// `user.ostreemeta` xattrs are present). The other fixtures are cross-checked
 /// elsewhere: `bare` is owned by the invoking user (see the `bare_owner` note in
 /// MANIFEST) and the write-path test checks it against the tool at runtime, and
-/// `canon`/`xattr` are Phase 7c ingest fixtures with a different tree shape,
-/// checked by the `ostrya` crate's ingest tests.
+/// `canon`/`xattr` are ingest fixtures with a different tree shape, checked by
+/// the `ostrya` crate's ingest tests.
 ///
 /// This is the single fixture-directory traversal for the golden tests: a
 /// broken layout surfaces here in one place rather than in each test.

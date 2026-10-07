@@ -1,4 +1,4 @@
-//! Path-addressed tree construction over a transaction (Phase 7f).
+//! Path-addressed tree construction over a transaction.
 //!
 //! A [`StagingTree`] builds a directory tree by path rather than by hand-walking
 //! a [`MutableTree`]. It borrows the transaction it stages

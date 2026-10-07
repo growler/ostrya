@@ -1,11 +1,10 @@
 //! The library error type.
 //!
 //! One `Error` enum for the whole crate, deriving `Display` and
-//! `std::error::Error` via `thiserror`. The enum is `#[non_exhaustive]` because
-//! later phases add variants (object not-found, checksum mismatch, signature,
-//! lock, and so on). The signing engines and the fetcher have their own error
-//! types, [`ostrya_sign::Error`] and [`fetch::Error`](crate::fetch::Error),
-//! which convert into this one.
+//! `std::error::Error` via `thiserror`. The enum is `#[non_exhaustive]`, so a
+//! release can add a variant without a breaking change. The signing engines
+//! and the fetcher have their own error types, [`ostrya_sign::Error`] and
+//! [`fetch::Error`](crate::fetch::Error), which convert into this one.
 
 use ostrya_core::{Checksum, ObjectType};
 use thiserror::Error;

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! A fetcher on a host with no CA bundle (Phase 16a).
+//! A fetcher on a host with no CA bundle.
 //!
 //! `SSL_CERT_FILE` and `SSL_CERT_DIR` are what the system trust store is read
 //! from, so pointing both at paths that do not exist presents the fetcher with
@@ -9,8 +9,8 @@
 //! `set_var`, and keeps the store the child runs with -- one that trusts nothing
 //! -- away from every other test.
 //!
-//! The same child covers the verification bypass (Phase 23): a bypass variant
-//! of `TrustRoots` reads no store, so it builds an `https` fetcher where
+//! The same child covers the verification bypass: a bypass variant of
+//! `TrustRoots` reads no store, so it builds an `https` fetcher where
 //! `TrustRoots::System` fails.
 
 use std::process::Command;

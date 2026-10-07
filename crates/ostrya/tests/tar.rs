@@ -1,4 +1,4 @@
-//! Phase 10 tar import/export integration tests.
+//! Tar import/export integration tests.
 //!
 //! The gate is interoperability and round-trip stability, not byte-identity
 //! with `ostree export` (the tool writes old-GNU-magic headers; smol-tar writes

@@ -1,5 +1,5 @@
-//! Static-delta reading and offline application (Phase 15a), and the reading a
-//! delta-accelerated pull does over the network (Phase 16d).
+//! Static-delta reading and offline application, and the reading a
+//! delta-accelerated pull does over the network.
 //!
 //! A static delta is a compact description of the objects that make up a target
 //! commit, optionally expressed as a patch against a source commit. The format
@@ -30,7 +30,7 @@
 //!
 //! Signed deltas wrap the superblock in a magic-prefixed envelope carrying the
 //! detached signatures; [`Repo::verify_static_delta`] checks them with the
-//! Phase 13 signing engines over the raw superblock bytes, and
+//! signing engines over the raw superblock bytes, and
 //! [`DeltaSuperblock::verify`] does the same for a superblock file read under
 //! any name.
 //! [`Repo::apply_static_delta`] applies a superblock already read, with the

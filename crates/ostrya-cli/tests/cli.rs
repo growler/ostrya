@@ -1,4 +1,4 @@
-//! Phase 11 verification for the `ostrya` binary.
+//! Integration tests for the `ostrya` binary.
 //!
 //! These tests drive the built binary as a subprocess over repositories the
 //! library creates, checking the three subcommands against the golden fixture
@@ -4418,7 +4418,7 @@ fn static_delta_generate_refuses_output_dir_with_reindex() {
     );
 }
 
-// --- pull over HTTP (Phase 16f) ----------------------------------------------
+// --- pull over HTTP ----------------------------------------------------------
 
 /// A static file server over HTTP/1.1, serving one directory. The threads are
 /// detached and the listener closes with the process.
@@ -5431,7 +5431,7 @@ fn pull_sign_verify_switch_overrides_the_configuration() {
     );
 }
 
-// --- Phase 17f: `pull` network tuning against the tool -------------------------
+// --- `pull` network tuning against the tool ----------------------------------
 //
 // Each implementation pulls from a server of its own, which injects one fault
 // into its answers for one object and counts the requests for that object. The
@@ -7220,7 +7220,7 @@ fn pull_refuses_a_depth_below_minus_one() {
     assert!(server.seen().is_empty(), "{:?}", server.seen());
 }
 
-// --- Phase 17b: refs, rev-parse, and cat against the tool ---------------------
+// --- refs, rev-parse, and cat against the tool -------------------------------
 //
 // These five tests are the `evidence:` the M10 records
 // `refs/nested-prefix-stripping`, `refs/alias-round-trip`,
@@ -9668,8 +9668,8 @@ fn rev_parse_ancestry_matches_the_tool() {
     let repo = create_repo(base, RepoMode::Archive);
     let src = base.join("src");
     // The chain is built by committing three times onto one branch, each commit
-    // taking the branch's tip as its parent with no `--parent` of its own, which
-    // is the parenting Phase 17b1 landed (`docs/port-plan.md`).
+    // taking the branch's tip as its parent with no `--parent` of its own: a
+    // commit onto an existing branch takes the branch's tip as its parent.
     let root = commit_tree(&repo, "chain", &src, None);
     std::fs::write(src.join("hello.txt"), b"second revision\n").unwrap();
     commit_tree(&repo, "chain", &src, None);
@@ -10837,7 +10837,7 @@ fn cat_keeps_the_payload_written_before_a_refusal() {
     }
 }
 
-// --- show, log, ls, config (Phase 17d) ----------------------------------------
+// --- show, log, ls, config ---------------------------------------------------
 
 /// The fixture repository read through `show` and `ls`, without the reference
 /// tool: the reports the port produces for the commit, its tree, and one file
@@ -12782,8 +12782,8 @@ fn remote_gpg_import_carries_a_designated_revokers_revocation() {
 ///   revokes nothing, and the port reports a good signature where the tool
 ///   reports `Key revoked`.
 ///
-/// `cli-surface.md`, "P3", records both, and `docs/port-plan.md`,
-/// "Phase 13d", states the rule they follow from.
+/// Both follow from the rule of the port's import stated above.
+/// `cli-surface.md`, "P3", records both.
 #[cfg(feature = "gpg")]
 #[test]
 fn remote_gpg_import_leaves_an_unverifiable_revocation_out() {
@@ -13440,7 +13440,7 @@ fn show_refuses_a_variant_type_that_is_not_a_type() {
     }
 }
 
-// --- Phase 17f: `commit` message, metadata, and ref bindings ------------------
+// --- `commit` message, metadata, and ref bindings ----------------------------
 //
 // Each test builds one repository per implementation, runs the same invocation
 // against both, and compares the exit status and both streams. `commit` prints
@@ -15251,7 +15251,7 @@ fn show_prints_every_variant_type_the_tool_prints() {
     }
 }
 
-// --- Phase 17f, F5 and F6: the walk modifiers and the checkout speedup -------
+// --- the walk modifiers and the checkout speedup -----------------------------
 //
 // These five tests are the `evidence:` the M10 records under `commit` cite for
 // the cases a single `run:` line cannot state: every one of them needs a
@@ -15259,9 +15259,9 @@ fn show_prints_every_variant_type_the_tool_prints() {
 // Each builds one source tree and gives each implementation its own repository,
 // so the commit checksum both print is the comparison.
 
-/// Build the F5 source tree: two directories, a symlink, and regular files
-/// covering the execute-bit and special-bit cases `--mode-ro-executables`
-/// distinguishes.
+/// Build the walk-modifier source tree: two directories, a symlink, and
+/// regular files covering the execute-bit and special-bit cases
+/// `--mode-ro-executables` distinguishes.
 fn build_walk_source(base: &Path) -> PathBuf {
     let src = base.join("walk");
     std::fs::create_dir_all(src.join("dir1/sub")).unwrap();
@@ -16843,7 +16843,7 @@ fn commit_checkout_speedup_matches_the_tool() {
     }
 }
 
-// --- Phase 17f: `commit` derived metadata ------------------------------------
+// --- `commit` derived metadata -----------------------------------------------
 //
 // `--generate-sizes`, `--bootable`, and `--generate-composefs-metadata` each
 // derive a metadata key from the tree the commit carries, so the claim is
@@ -17892,7 +17892,7 @@ fn commit_derived_metadata_key_order() {
     }
 }
 
-/// Build the two overlay sources F4's composition cases use: `t1` and `t2`
+/// Build the two overlay sources the composition cases use: `t1` and `t2`
 /// share `f.txt` and `common/`, and each carries a directory the other does
 /// not. Returns the parent holding both.
 fn build_overlay_sources(base: &Path) -> PathBuf {
@@ -21026,7 +21026,7 @@ fn commit_sign_keypair_mismatch_is_refused_cleanly() {
     }
 }
 
-// --- Phase 17f, X1 and F10a: abbreviated checksum resolution ------------------
+// --- abbreviated checksum resolution -----------------------------------------
 //
 // A revision shorter than a full checksum names the one commit object whose
 // checksum starts with it, wherever a revision is taken
@@ -21189,9 +21189,9 @@ fn abbreviated_checksum_resolves_like_the_tool() {
 }
 
 /// `commit -b NAME`, where NAME is a prefix of a commit the repository holds and
-/// names no ref, parents the new commit on that commit. This is item `F10a`: the
-/// checksum both implementations print is the oracle, since a differing parent
-/// gives a differing commit object.
+/// names no ref, parents the new commit on that commit. The checksum both
+/// implementations print is the oracle, since a differing parent gives a
+/// differing commit object.
 #[test]
 fn commit_branch_name_as_abbreviated_checksum_matches_the_tool() {
     if !ostree_available() {
@@ -22776,7 +22776,7 @@ fn prune_repeated_boolean_flags_part_from_the_tool() {
 
 // ---------------------------------------------------------------------------
 // fsck -- the option set, the progress format, and the two verification
-// passes (Phase 17f, F19).
+// passes.
 // ---------------------------------------------------------------------------
 
 /// The environment every `fsck` comparison runs under, so the quotation marks
@@ -24066,9 +24066,9 @@ fn fsck_leaves_a_broken_framing_dirtree_alone() {
     );
 }
 
-/// The port's `--no-mark-partial` extension keeps working under the options
-/// `F19` adds: `--delete` removes the object and writes no marker, so the next
-/// run verifies the commit again. Carries `fsck/no-mark-partial-extension`.
+/// The port's `--no-mark-partial` extension keeps working with the other
+/// `fsck` options: `--delete` removes the object and writes no marker, so the
+/// next run verifies the commit again. Carries `fsck/no-mark-partial-extension`.
 #[test]
 fn fsck_no_mark_partial_survives_the_new_options() {
     let tmp = TmpDir::new("fsck-no-mark");
@@ -30791,7 +30791,7 @@ fn summary_argument_handling_parts_from_the_tool() {
     }
 }
 
-// --- summary: the writing options (Phase 17f, F22a/F22b/F22c) ----------------
+// --- summary: the writing options --------------------------------------------
 //
 // `summary -u` with `--sign`, `-m/--add-metadata`, and `--gpg-sign`. The tool
 // writes `ostree.summary.last-modified` from the wall clock, so each

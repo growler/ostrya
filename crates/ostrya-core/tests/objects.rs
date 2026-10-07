@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! Phase 3 verification gate (see docs/port-plan.md): read the real objects
-//! the `ostree` tool wrote into tests/fixtures/generated/, recompute their
-//! checksums, and require byte-identical reserialization. The content-object
+//! Read the real objects the `ostree` tool wrote into
+//! tests/fixtures/generated/, recompute their checksums, and require
+//! byte-identical reserialization. The content-object
 //! checksums are additionally recomputed from first principles -- the known
 //! deterministic tree the fixture generator commits -- and must equal the
 //! object names the tool chose.

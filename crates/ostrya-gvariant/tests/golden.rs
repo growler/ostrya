@@ -2,7 +2,7 @@
 
 //! Golden-fixture tests: every metadata object the `ostree` tool wrote into
 //! tests/fixtures/generated/ must deserialize and re-serialize to identical
-//! bytes. This is the phase 1 verification gate (see docs/port-plan.md).
+//! bytes.
 
 use std::path::Path;
 

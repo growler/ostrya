@@ -132,10 +132,9 @@ fn vocabulary(record: &Record, errors: &mut Vec<String>) {
 /// to a field that must accompany them: `unobserved` to `question`, `lossy`
 /// to `loss`, and `unimplemented-cli` to `cli-gap`.
 ///
-/// The `cli-gap` tie holds in both directions. The shared verification gate of
-/// `phase-17-cli-conformance-plan.md` moves a cell off `unimplemented-cli` as
-/// the command it names lands, and a `cli-gap:` left on the record then names
-/// a gap that is closed. The other two fields carry no converse rule:
+/// The `cli-gap` tie holds in both directions. A cell moves off
+/// `unimplemented-cli` when the command it names lands, and a `cli-gap:` left
+/// on the record then names a gap that is closed. The other two fields carry no converse rule:
 /// `question:` records what is still to observe under any outcome.
 fn outcome_fields(record: &Record, errors: &mut Vec<String>) {
     let origin = record.origin();

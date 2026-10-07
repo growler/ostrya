@@ -1,4 +1,4 @@
-//! Abbreviated-checksum resolution (Phase 17f, item X1).
+//! Abbreviated-checksum resolution.
 //!
 //! A revision shorter than a full checksum names the one commit object whose
 //! checksum starts with it. These tests pin the rule at the library boundary:

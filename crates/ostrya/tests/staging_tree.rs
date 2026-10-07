@@ -1,4 +1,4 @@
-//! Staging-tree integration tests (Phase 7f).
+//! Staging-tree integration tests.
 //!
 //! These drive the path-addressed [`StagingTree`] surface: the equivalence
 //! between a tree built through staging operations and the same tree ingested

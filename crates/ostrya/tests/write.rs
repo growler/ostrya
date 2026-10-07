@@ -1,4 +1,4 @@
-//! Write-path integration tests (Phase 7a).
+//! Write-path integration tests.
 //!
 //! These exercise the object-store write layer against real repositories:
 //! byte-identical loose objects versus the checked-in fixtures for archive and
@@ -733,8 +733,9 @@ fn bare_objects_match_the_tool() {
     ]);
 
     // Every content object the tool wrote is present in the port's repo with
-    // identical bytes, inode mode, and ownership. Tree and commit metadata
-    // objects arrive in Phases 7b-7d, so they are not compared here.
+    // identical bytes, inode mode, and ownership. The port side writes content
+    // objects alone, so the tree and commit metadata objects the tool wrote
+    // are not compared here.
     for entry in walk_objects(&tool_root.join("objects")) {
         if entry.extension().and_then(|e| e.to_str()) != Some("file") {
             continue;

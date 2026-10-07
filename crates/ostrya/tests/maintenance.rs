@@ -1,4 +1,4 @@
-//! Prune, fsck, traversal, and diff integration tests (Phase 12).
+//! Prune, fsck, traversal, and diff integration tests.
 //!
 //! The reachability, prune, and diff results are cross-checked against the
 //! `ostree` tool: the port and the tool prune identical repositories and must

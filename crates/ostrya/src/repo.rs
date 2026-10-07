@@ -105,8 +105,8 @@ pub struct Repo {
 #[derive(Debug)]
 struct RepoInner {
     // The repository root and `objects/` directory fds anchor all fd-relative
-    // I/O; they are opened once here and used by the reading path (Phase 5)
-    // and, later, the write path (Phase 7).
+    // I/O; they are opened once here and used by the reading path and the
+    // write path.
     repo_fd: OwnedFd,
     objects_fd: OwnedFd,
     config: RepoConfig,

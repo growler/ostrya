@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Golden-image test for phase 9c (see docs/port-plan.md).
+//! Golden-image test for the composefs image writer.
 //!
 //! The tree model is reconstructed from a `composefs-info dump` and serialized.
 //! The result must be byte-identical to the tool's image, and its fs-verity

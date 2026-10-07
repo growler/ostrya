@@ -1,4 +1,4 @@
-//! Static-delta offline application and signature verification (Phase 15a).
+//! Static-delta offline application and signature verification.
 //!
 //! These drive the `ostree` tool as a black box: it builds an archive
 //! repository, commits two trees, and generates static deltas; the port then

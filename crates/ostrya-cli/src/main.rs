@@ -2,9 +2,9 @@
 
 //! The `ostrya` command-line front-end.
 //!
-//! A thin binary over the ingest, checkout, and export paths of the `ostrya`
-//! library (Phase 11 of `docs/port-plan.md`), growing an `ostree`-compatible
-//! surface since Phase 17. `--repo`, `-v`/`--verbose`, and `--version` are
+//! A thin binary over the `ostrya` library, with a command-line surface that
+//! is functionally compatible with the `ostree` tool for the subcommands it
+//! carries. `--repo`, `-v`/`--verbose`, and `--version` are
 //! global: each is accepted both before and after the subcommand name, the
 //! subcommand-position value winning when both are given, matching the tool
 //! (`docs/conformance/cli-surface.md`, "Global conventions"). With no `--repo`
@@ -3887,11 +3887,10 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // edit, because the transaction opens once the editor has returned. The
     // tool reads them when it opens the repository, so a value their reader
     // refuses stands ahead of `--parent`, ahead of the metadata options, and
-    // ahead of the editor on both sides (`docs/port-plan.md`, Phase 17f). The
-    // first four are the set the transaction open reads; the fsync pair is the
-    // set its write paths read, and it is parsed here too so that `--fsync`
-    // does not move where a refusal lands (`docs/format-reference.md`, "The
-    // fsync vocabulary").
+    // ahead of the editor on both sides. The first four are the set the
+    // transaction open reads; the fsync pair is the set its write paths read,
+    // and it is parsed here too so that `--fsync` does not move where a
+    // refusal lands (`docs/format-reference.md`, "The fsync vocabulary").
     let config = repo.config();
     config.locking()?;
     config.lock_timeout_secs()?;
@@ -3901,7 +3900,7 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     config.per_object_fsync()?;
 
     // `--parent` takes a revision, so it carries the resolution wording every
-    // subcommand taking one gives (`docs/port-plan.md`, Phase 17b).
+    // subcommand taking one gives.
     let parent = match args.parent.as_deref() {
         Some(NO_PARENT) => None,
         Some(rev) => match repo.resolve_rev(rev, false).await {
@@ -3973,7 +3972,7 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // The message is settled, so the repository lock is taken now: an editing
     // session holds no lock, and an exclusive operation on the same repository
     // runs while the message is being written. The tool takes its lock at this
-    // same point (`docs/port-plan.md`, Phase 17f).
+    // same point.
     let mut txn = repo.transaction().await?;
     // The option narrows the configured policy and never widens it: a repository
     // holding `[core] fsync=false` syncs nothing under `--fsync=true`, so only

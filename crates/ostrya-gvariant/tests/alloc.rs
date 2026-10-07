@@ -1,7 +1,6 @@
 #![deny(unsafe_code)]
 
-//! Phase 1a verification gate (see docs/port-plan.md): borrowed dirtree and
-//! xattr traversal must perform zero heap allocations.
+//! Borrowed dirtree and xattr traversal must perform zero heap allocations.
 //!
 //! This is the one test binary that installs a global allocator, so nothing
 //! else runs concurrently to perturb the count. The allocator wraps the system

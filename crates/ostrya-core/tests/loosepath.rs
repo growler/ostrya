@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Phase 2 verification gate (see docs/port-plan.md): golden loose paths.
+//! Golden loose paths.
 //!
 //! For every loose object the `ostree` tool wrote into
 //! tests/fixtures/generated/, reconstruct the loose path from the checksum
@@ -44,11 +44,10 @@ fn reconstructs_every_fixture_loose_path() {
 /// stored uncompressed, so their loose-path extension is fixed and
 /// mode-independent and never gains a trailing `z`.
 ///
-/// This pins review finding 2 (decision D1), resolved against black-box
-/// observation: an archive repo populated by commit or `pull-local` holds only
-/// `.filez` content objects, and the tool refuses every write to
-/// `bare-split-xattrs`, so it never materializes those auxiliary types in
-/// archive mode.
+/// Black-box observation supports this rule: an archive repo populated by
+/// commit or `pull-local` holds only `.filez` content objects, and the tool
+/// refuses every write to `bare-split-xattrs`, so it never materializes those
+/// auxiliary types in archive mode.
 #[test]
 fn z_suffix_is_file_and_archive_only() {
     let c = Checksum::from_hex("b3c8e8525e8a5c3409bf6e6db5f5d656da77ae76d08cbc4f8b75b71879757a89")

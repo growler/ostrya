@@ -1,4 +1,4 @@
-//! Transaction and locking integration tests (Phase 6).
+//! Transaction and locking integration tests.
 //!
 //! These exercise the transaction lifecycle against real repositories: staging
 //! directory allocation and teardown, reaping of stale staging directories,

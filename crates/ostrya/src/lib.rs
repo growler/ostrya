@@ -8,64 +8,62 @@
 //! feature. The crate is designed to hold multiple concurrent transactions
 //! within a single process.
 //!
-//! So far the crate covers repository open/create and config parsing (Phase 4
-//! of `docs/port-plan.md`), the reading path (Phase 5): loading objects,
-//! commits, and file content, resolving and listing refs, and traversing a
-//! commit's tree, and the runtime backend and streaming primitives (Phase 5a):
-//! the [`HashingReader`]/[`HashingWriter`] streams and a [`ContentReader`] that
-//! streams from `rt::FileReader`, inflating archive objects on the fly. It also
-//! covers transactions and locking (Phase 6): the owned [`Transaction`] handle,
-//! boot-id-keyed staging directories, and the two-layer repository lock, and the
-//! object-store write layer (Phase 7a): streaming content ingestion through
-//! [`ContentWriter`], metadata and symlink writers, per-mode on-disk
-//! application, dedup, free-space accounting, and publication of staged objects
-//! into `objects/` at commit. It also covers in-memory tree assembly (Phase
-//! 7b): the [`MutableTree`] with lazy hydration and dirty tracking, and
+//! The crate covers repository open/create and config parsing, the reading
+//! path: loading objects, commits, and file content, resolving and listing
+//! refs, and traversing a commit's tree, and the runtime backend and streaming
+//! primitives: the [`HashingReader`]/[`HashingWriter`] streams and a
+//! [`ContentReader`] that streams from `rt::FileReader`, inflating archive
+//! objects on the fly. It also covers transactions and locking: the owned
+//! [`Transaction`] handle, boot-id-keyed staging directories, and the two-layer
+//! repository lock, and the object-store write layer: streaming content
+//! ingestion through [`ContentWriter`], metadata and symlink writers, per-mode
+//! on-disk application, dedup, free-space accounting, and publication of staged
+//! objects into `objects/` at commit. It also covers in-memory tree assembly:
+//! the [`MutableTree`] with lazy hydration and dirty tracking, and
 //! [`Transaction::write_mtree`], which serializes dirty subtrees into dirtree
-//! objects. It also covers filesystem ingest (Phase 7c):
+//! objects. It also covers filesystem ingest:
 //! [`Transaction::write_dfd_to_mtree`], which walks an on-disk tree into a
 //! [`MutableTree`] under a [`CommitModifier`] that shapes what is committed
 //! (canonical permissions, an include/prune filter, xattr and SELinux label
 //! callbacks, a [`DevInoCache`], and source consumption). It also covers commit
-//! assembly and durable publication (Phase 7d): [`Transaction::write_commit`]
-//! and [`CommitOptions`] (with `ostree.sizes` emission), detached commit
-//! metadata on [`Repo`], the ref queue ([`Transaction::set_ref`],
+//! assembly and durable publication: [`Transaction::write_commit`] and
+//! [`CommitOptions`] (with `ostree.sizes` emission), detached commit metadata
+//! on [`Repo`], the ref queue ([`Transaction::set_ref`],
 //! [`Transaction::set_collection_ref`]) and immediate ref writes
-//! ([`Repo::set_ref_immediate`]), and the completed transaction commit
-//! sequence -- objects published, then refs written. It also covers overlay
-//! changeset import (Phase 7e): [`Transaction::merge_overlay_dfd_to_mtree`],
-//! which merges an overlayfs upperdir into a [`MutableTree`] holding the lower
-//! layer, applying whiteouts and opaque directories as it walks. It also covers
-//! path-addressed tree construction (Phase 7f): the [`StagingTree`] built over a
-//! transaction, with file, symlink, directory, and hardlink operations that
-//! resolve paths through symlinks, tree [`merge`](StagingTree::merge) with
-//! symlink resolution, and staged-first [`read_file`](StagingTree::read_file) /
-//! [`read_dir`](StagingTree::read_dir) that see objects staged in the current
-//! transaction before they publish. It also covers the checkout path (Phase 8):
+//! ([`Repo::set_ref_immediate`]), and the completed transaction commit sequence
+//! -- objects published, then refs written. It also covers overlay changeset
+//! import: [`Transaction::merge_overlay_dfd_to_mtree`], which merges an
+//! overlayfs upperdir into a [`MutableTree`] holding the lower layer, applying
+//! whiteouts and opaque directories as it walks. It also covers path-addressed
+//! tree construction: the [`StagingTree`] built over a transaction, with file,
+//! symlink, directory, and hardlink operations that resolve paths through
+//! symlinks, tree [`merge`](StagingTree::merge) with symlink resolution, and
+//! staged-first [`read_file`](StagingTree::read_file)
+//! /[`read_dir`](StagingTree::read_dir) that see objects staged in the current
+//! transaction before they publish. It also covers the checkout path:
 //! [`Repo::checkout_at`], which materializes a commit's tree onto a filesystem
 //! under a [`CheckoutOptions`] -- the [`CheckoutMode`] (faithful or
 //! unprivileged), the [`OverwriteMode`] over an existing destination, an
 //! optional subpath, hardlink-versus-copy with a `FICLONE` reflink on the copy
 //! path, Docker-style whiteouts, a populated [`DevInoCache`], and an optional
-//! filter. It also covers composefs export (Phase 9d):
-//! [`Repo::export_composefs`], which builds the EROFS/composefs image for a
-//! commit over the [`ostrya_composefs`] writer -- the tree model comes from the
-//! commit's [`RepoTree`], the five top-level directories are injected, and each
-//! regular file redirects to its `.file` loose object and, under the default
-//! [`ComposefsOptions`] verity policy, carries the fs-verity digest of that
-//! file's content -- [`Repo::export_composefs_to`], which writes that image
-//! through a file descriptor and returns its fs-verity digest without holding
-//! the image, [`Repo::commit_add_composefs_metadata`],
-//! which stores the image digest in a commit's `ostree.composefs.digest.v0`
-//! metadata, and [`Transaction::composefs_digest`], which computes the digest
-//! over a tree the transaction has staged, for a commit that carries the key in
-//! its own metadata. It
-//! also covers tar import and export (Phase 10): [`Repo::export_tar`], which
+//! filter. It also covers composefs export: [`Repo::export_composefs`], which
+//! builds the EROFS/composefs image for a commit over the [`ostrya_composefs`]
+//! writer -- the tree model comes from the commit's [`RepoTree`], the five
+//! top-level directories are injected, and each regular file redirects to its
+//! `.file` loose object and, under the default [`ComposefsOptions`] verity
+//! policy, carries the fs-verity digest of that file's content --
+//! [`Repo::export_composefs_to`], which writes that image through a file
+//! descriptor and returns its fs-verity digest without holding the image,
+//! [`Repo::commit_add_composefs_metadata`], which stores the image digest in a
+//! commit's `ostree.composefs.digest.v0` metadata, and
+//! [`Transaction::composefs_digest`], which computes the digest over a tree the
+//! transaction has staged, for a commit that carries the key in its own
+//! metadata. It also covers tar import and export: [`Repo::export_tar`], which
 //! writes a commit's tree as a filesystem tar stream (numeric ownership,
 //! commit-timestamp mtimes, `SCHILY.xattr.*` PAX records, content-checksum
 //! hardlink coalescing), and [`Repo::import_tar`], which reads a filesystem tar
 //! into a [`MutableTree`] with deferred hardlink resolution and an optional
-//! `/etc` -> `/usr/etc` remap. It also covers maintenance (Phase 12):
+//! `/etc` -> `/usr/etc` remap. It also covers maintenance:
 //! [`Repo::list_objects`] and the reachability walks
 //! [`Repo::traverse_commit`]/[`Repo::traverse_reachable`], [`Repo::prune`]
 //! ([`PruneOptions`]/[`PruneStats`]) which holds the repository lock exclusive
@@ -73,94 +71,88 @@
 //! optionally every commit, to a depth, with an optional `delete_commit`, and
 //! with the extra roots [`PruneOptions::gc_root_metadata_keys`] names under an
 //! optional [`PruneOptions::traverse_parent`]), and deletes each ref the walk
-//! did not reach that [`PruneOptions::weak_ref_filter`] classified weak,
-//! naming it in [`PruneStats::deleted_refs`],
-//! [`Repo::fsck`] ([`FsckOptions`]/[`FsckReport`]) which
-//! verifies object integrity and completeness and marks incomplete commits
-//! partial, [`Repo::diff`] ([`DiffSide`]/[`DiffOptions`]/[`DiffEntry`]/
-//! [`DiffChange`]) which reports the paths that changed between two commits or
-//! between a commit and a directory on the filesystem, and
-//! [`Repo::diff_stats`] ([`DiffStats`]) which reports the object counts and
-//! the shared size of two commits. It also covers
-//! repository fs-verity (Phase pre13): with `[ex-integrity] fsverity` set to
-//! `maybe` or `yes` (see [`RepoConfig::fsverity`] and [`Tristate`]), each loose
-//! object stored as a regular file is sealed with fs-verity as it is staged,
-//! through the audited `ostrya-sys` ioctl wrappers. It also covers the signing
-//! framework (Phase 13a): the [`Signer`]/[`Verifier`] engine surface,
-//! [`Repo::sign_commit`] and [`Repo::verify_commit`], which sign and verify a
-//! commit's canonical bytes and accumulate signatures in the per-engine `aay`
-//! array of the commit's detached metadata, [`Repo::delete_signatures`], which
-//! removes stored blobs from an engine's array, and the test-only
-//! [`DummySigner`] / [`DummyVerifier`] engine. It also covers the ed25519 engine and the sign-api
-//! key store (Phase 13b): [`Ed25519Signer`] / [`Ed25519Verifier`] over
-//! deterministic ed25519 signatures, and [`load_sign_keys`], which reads the
-//! `trusted.<type>` / `revoked.<type>` files and `.d` directories (a verifier
-//! trusts the loaded set minus the revoked set). Under the `sign-spki` feature
-//! it also covers the spki engine (Phase 13c): `SpkiSigner` / `SpkiVerifier`
-//! over ECDSA on NIST P-256 with SHA-256, DER-encoded signatures, and
-//! SubjectPublicKeyInfo public keys, reusing the sign-api key store as
-//! `trusted.spki` / `revoked.spki`. Under the `verify-gpg` feature it also
-//! covers the GPG engine (Phase 13d): `GpgVerifier` holds binary or armored
-//! keyrings, parses each into certificates as it loads it, and answers the
-//! verdict in the process over the `pgp` crate (rPGP); detached OpenPGP
-//! signatures accumulate under `ostree.gpgsigs` with per-signature metadata
-//! read from the certificate and the signature packet. The `sign-gpg` feature
-//! adds `GpgSigner`, which runs `gpg --detach-sign` with the key resolved by
-//! fingerprint, key id, or user id in an optional GnuPG home directory
-//! (agent-held and hardware-token keys included), and turns on `verify-gpg`
-//! with it. It also covers static deltas
-//! in both directions (Phase 15): [`Repo::apply_static_delta_offline`] reads a
-//! delta -- the superblock, the xz-compressed parts, from part files or carried
-//! inline in the superblock, and the operation stream (splice, open/close,
-//! set-read-source, rollsum write, and bspatch) -- and
-//! produces the target commit's objects, asserting each checksum as written,
-//! [`Repo::apply_static_delta`] applies a superblock already read, with the
-//! parts in a directory the caller names,
-//! while [`Repo::generate_static_delta`] writes one, choosing per object
-//! between a splice, a rollsum copy-from-source stream, a bspatch stream, and
-//! a loose fallback, writes the parts to files or inline, in either byte
-//! order, and signs the superblock through [`DeltaOptions::signers`] before it
-//! writes it. [`Repo::sign_static_delta`] wraps a superblock in the
-//! signed envelope, [`Repo::verify_static_delta`] checks those signatures with
-//! the signing engines over the raw superblock bytes,
-//! [`Repo::reindex_static_deltas`] rebuilds the `delta-indexes/` cache,
-//! [`Repo::reindex_static_deltas_to`] rewrites the index of one target,
-//! [`Repo::list_static_delta_indexes`] lists it, and
-//! [`Repo::delete_static_delta`] removes one delta. [`DeltaSuperblock`] reads a
-//! superblock and what each part holds without applying the delta, and
+//! did not reach that [`PruneOptions::weak_ref_filter`] classified weak, naming
+//! it in [`PruneStats::deleted_refs`], [`Repo::fsck`]
+//! ([`FsckOptions`]/[`FsckReport`]) which verifies object integrity and
+//! completeness and marks incomplete commits partial, [`Repo::diff`]
+//! ([`DiffSide`]/[`DiffOptions`]/[`DiffEntry`]/[`DiffChange`]) which reports
+//! the paths that changed between two commits or between a commit and a
+//! directory on the filesystem, and [`Repo::diff_stats`] ([`DiffStats`]) which
+//! reports the object counts and the shared size of two commits. It also covers
+//! repository fs-verity: with `[ex-integrity] fsverity` set to `maybe` or `yes`
+//! (see [`RepoConfig::fsverity`] and [`Tristate`]), each loose object stored as
+//! a regular file is sealed with fs-verity as it is staged, through the audited
+//! `ostrya-sys` ioctl wrappers. It also covers the signing framework: the
+//! [`Signer`]/[`Verifier`] engine surface, [`Repo::sign_commit`] and
+//! [`Repo::verify_commit`], which sign and verify a commit's canonical bytes
+//! and accumulate signatures in the per-engine `aay` array of the commit's
+//! detached metadata, [`Repo::delete_signatures`], which removes stored blobs
+//! from an engine's array, and the test-only [`DummySigner`] /
+//! [`DummyVerifier`] engine. It also covers the ed25519 engine and the sign-api
+//! key store: [`Ed25519Signer`] / [`Ed25519Verifier`] over deterministic
+//! ed25519 signatures, and [`load_sign_keys`], which reads the `trusted.<type>`
+//! / `revoked.<type>` files and `.d` directories (a verifier trusts the loaded
+//! set minus the revoked set). Under the `sign-spki` feature it also covers the
+//! spki engine: `SpkiSigner` / `SpkiVerifier` over ECDSA on NIST P-256 with
+//! SHA-256, DER-encoded signatures, and SubjectPublicKeyInfo public keys,
+//! reusing the sign-api key store as `trusted.spki` / `revoked.spki`. Under the
+//! `verify-gpg` feature it also covers the GPG engine: `GpgVerifier` holds
+//! binary or armored keyrings, parses each into certificates as it loads it,
+//! and answers the verdict in the process over the `pgp` crate (rPGP); detached
+//! OpenPGP signatures accumulate under `ostree.gpgsigs` with per-signature
+//! metadata read from the certificate and the signature packet. The `sign-gpg`
+//! feature adds `GpgSigner`, which runs `gpg --detach-sign` with the key
+//! resolved by fingerprint, key id, or user id in an optional GnuPG home
+//! directory (agent-held and hardware-token keys included), and turns on
+//! `verify-gpg` with it. It also covers static deltas in both directions:
+//! [`Repo::apply_static_delta_offline`] reads a delta -- the superblock, the
+//! xz-compressed parts, from part files or carried inline in the superblock,
+//! and the operation stream (splice, open/close, set-read-source, rollsum
+//! write, and bspatch) -- and produces the target commit's objects, asserting
+//! each checksum as written, [`Repo::apply_static_delta`] applies a superblock
+//! already read, with the parts in a directory the caller names, while
+//! [`Repo::generate_static_delta`] writes one, choosing per object between a
+//! splice, a rollsum copy-from-source stream, a bspatch stream, and a loose
+//! fallback, writes the parts to files or inline, in either byte order, and
+//! signs the superblock through [`DeltaOptions::signers`] before it writes it.
+//! [`Repo::sign_static_delta`] wraps a superblock in the signed envelope,
+//! [`Repo::verify_static_delta`] checks those signatures with the signing
+//! engines over the raw superblock bytes, [`Repo::reindex_static_deltas`]
+//! rebuilds the `delta-indexes/` cache, [`Repo::reindex_static_deltas_to`]
+//! rewrites the index of one target, [`Repo::list_static_delta_indexes`] lists
+//! it, and [`Repo::delete_static_delta`] removes one delta. [`DeltaSuperblock`]
+//! reads a superblock and what each part holds without applying the delta, and
 //! [`DeltaSuperblock::verify`] checks the signatures of a superblock file read
-//! under any name. It also
-//! covers the fetcher pull is built on (Phase 16a): [`Fetcher`] serves
-//! [`FetchRequest`]s naming a [`Target`] -- a path under a remote's mirrors, or
-//! an absolute URL of the request's own -- over HTTP/1.1 and HTTP/2 -- ALPN
-//! picks the version, connections are pooled per origin, requests carry a
-//! [`Priority`] the fetcher's admission queue honors, a request's headers and
+//! under any name. It also covers the fetcher pull is built on: [`Fetcher`]
+//! serves [`FetchRequest`]s naming a [`Target`] -- a path under a remote's
+//! mirrors, or an absolute URL of the request's own -- over HTTP/1.1 and HTTP/2
+//! -- ALPN picks the version, connections are pooled per origin, requests carry
+//! a [`Priority`] the fetcher's admission queue honors, a request's headers and
 //! credentials replace the fetcher's for that one request, conditional requests
 //! resolve to [`Fetched::NotModified`], retryable failures are repeated across
 //! destinations, and a response arrives as a streaming [`Body`] under an
-//! optional size cap -- and [`VerifyingReader`], the stream
-//! that checks a payload against its expected digest at EOF. It also covers
-//! local pull (Phase 16b): [`Repo::pull_local`] imports refs, their commit
-//! chains, and every object those commits reach out of another local
-//! repository under a [`PullOptions`] -- an object the two repositories store
-//! identically, inode included, is hardlinked where the source inode already
-//! carries the ownership a write here produces; a refused link takes a metadata
-//! object to a reflink-then-copy and a content object to its logical header; a
-//! content object crossing modes within the bare family has its payload cloned
-//! under this repository's own inode policy; one crossing the archive boundary
-//! is re-ingested through the ordinary write path; [`PullFlags`] selects
-//! checksum verification, commit-metadata-only pulls, copying instead of
-//! linking, and the mode and binding checks; and
-//! [`localcache_repos`](PullOptions::localcache_repos) adds further local
-//! repositories to source objects from. It also covers HTTP pull (Phase 16c):
+//! optional size cap -- and [`VerifyingReader`], the stream that checks a
+//! payload against its expected digest at EOF. It also covers local pull:
+//! [`Repo::pull_local`] imports refs, their commit chains, and every object
+//! those commits reach out of another local repository under a [`PullOptions`]
+//! -- an object the two repositories store identically, inode included, is
+//! hardlinked where the source inode already carries the ownership a write here
+//! produces; a refused link takes a metadata object to a reflink-then-copy and
+//! a content object to its logical header; a content object crossing modes
+//! within the bare family has its payload cloned under this repository's own
+//! inode policy; one crossing the archive boundary is re-ingested through the
+//! ordinary write path; [`PullFlags`] selects checksum verification,
+//! commit-metadata-only pulls, copying instead of linking, and the mode and
+//! binding checks; and [`localcache_repos`](PullOptions::localcache_repos) adds
+//! further local repositories to source objects from. It also covers HTTP pull:
 //! [`Repo::pull`] fetches refs, their commit chains, and every object those
 //! commits reach from an archive remote named in this repository's config --
 //! `summary.sig`, `summary`, and `config` first, then the objects, with a
 //! content object always requested in the `.filez` form an HTTP client can read
 //! and a non-archive remote refused on its config mode. Up to
-//! [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches) objects are
-//! in flight over a plan drained commits first, then the metadata the scan is
-//! blocked on, then the content; a commit object is staged where it arrives,
+//! [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches) objects
+//! are in flight over a plan drained commits first, then the metadata the scan
+//! is blocked on, then the content; a commit object is staged where it arrives,
 //! behind its own `.commitpartial` marker and ahead of its tree, and the marker
 //! is removed after the transaction publishes; three write permits bound the
 //! concurrent writers on the destination; every object is stored under the name
@@ -169,29 +161,28 @@
 //! summary and its signature; and [`TimestampCheck`] refuses a tip older than
 //! what the ref already names. [`Repo::remote_fetch_summary`] reads a remote's
 //! `summary` and `summary.sig` on their own, and [`Summary`] parses one. A pull
-//! also takes a static delta where the remote publishes one (Phase 16d): the
-//! delta index, or the summary's `ostree.static-deltas` map, names the delta from
-//! a commit held here (or from scratch), its superblock is checked
-//! against the advertised digest, its parts are fetched two at a time and applied
-//! into the pull's transaction, and the objects it hands over loose are fetched as
+//! also takes a static delta where the remote publishes one: the delta index,
+//! or the summary's `ostree.static-deltas` map, names the delta from a commit
+//! held here (or from scratch), its superblock is checked against the
+//! advertised digest, its parts are fetched two at a time and applied into the
+//! pull's transaction, and the objects it hands over loose are fetched as
 //! ordinary content objects;
 //! [`disable_static_deltas`](PullOptions::disable_static_deltas) and
-//! [`require_static_deltas`](PullOptions::require_static_deltas) control it, the
-//! second also for a local pull, which reads a delta from the source directory
-//! under it alone, and
-//! [`Repo::regenerate_summary`] writes the map that advertises this repository's
-//! own deltas. Either pull checks signatures (Phase 16e): the remote's
-//! `gpg-verify`, `gpg-verify-summary`, `sign-verify`, and `sign-verify-summary`
-//! keys state the policy, [`PullVerify`] overrides it, and the keys come from
-//! that remote's trusted keyrings and its `verification-<engine>-*` entries.
-//! It also covers the configuration write side (Phase 17e):
-//! [`Repo::write_config`] replaces `config` atomically with a document edited
-//! through [`KeyFile`](ostrya_core::KeyFile), which is how a remote's section is
-//! added or removed, and [`Repo::remove_remote_keyring`] deletes the keyring that
-//! section owns. Under the `verify-gpg` feature, `Repo::gpg_import_keys` and
-//! `Repo::gpg_list_keys` add certificates to a remote's
-//! `<remote>.trustedkeys.gpg` and read back the key records it holds (see the
-//! `gpg` module). It also covers the bootable commit metadata (Phase 21):
+//! [`require_static_deltas`](PullOptions::require_static_deltas) control it,
+//! the second also for a local pull, which reads a delta from the source
+//! directory under it alone, and [`Repo::regenerate_summary`] writes the map
+//! that advertises this repository's own deltas. Either pull checks signatures:
+//! the remote's `gpg-verify`, `gpg-verify-summary`, `sign-verify`, and
+//! `sign-verify-summary` keys state the policy, [`PullVerify`] overrides it,
+//! and the keys come from that remote's trusted keyrings and its
+//! `verification-<engine>-*` entries. It also covers the configuration write
+//! side: [`Repo::write_config`] replaces `config` atomically with a document
+//! edited through [`KeyFile`](ostrya_core::KeyFile), which is how a remote's
+//! section is added or removed, and [`Repo::remove_remote_keyring`] deletes the
+//! keyring that section owns. Under the `verify-gpg` feature,
+//! `Repo::gpg_import_keys` and `Repo::gpg_list_keys` add certificates to a
+//! remote's `<remote>.trustedkeys.gpg` and read back the key records it holds
+//! (see the `gpg` module). It also covers the bootable commit metadata:
 //! [`Transaction::kernel_version`] and [`RepoTree::kernel_version`] derive the
 //! value `ostree.linux` holds from a tree, staged and published respectively,
 //! answering the shapes that name no kernel with a [`BootableRefusal`], and

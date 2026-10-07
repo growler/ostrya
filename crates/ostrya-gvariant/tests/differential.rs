@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Phase R5 verification gate: the `Value` path (`from_bytes`/`to_bytes`) and
+//! Differential test: the `Value` path (`from_bytes`/`to_bytes`) and
 //! the typed path (`GvDecode`/`GvEncode`) share one framing engine, so for
 //! generated values across every ostree object shape the two must agree
 //! byte-for-byte. Each case checks, on the same generated value:

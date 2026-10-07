@@ -1,4 +1,4 @@
-//! Static-delta generation (Phase 15b), cross-checked against the `ostree` tool.
+//! Static-delta generation, cross-checked against the `ostree` tool.
 //!
 //! The port commits trees, generates deltas, and then both directions are
 //! exercised: the port applies its own delta and reproduces the target commit's

@@ -1,4 +1,4 @@
-//! spki (ECDSA/SPKI) commit-signing integration tests (Phase 13c).
+//! spki (ECDSA/SPKI) commit-signing integration tests.
 //!
 //! These exercise [`SpkiSigner`] / [`SpkiVerifier`] and the sign-api key store.
 //!

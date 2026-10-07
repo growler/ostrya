@@ -45,7 +45,7 @@
 //!
 //! Regeneration writes `summary` atomically and removes any stale `summary.sig`,
 //! since a new summary invalidates an old signature. [`Repo::sign_summary`] and
-//! [`Repo::verify_summary`] reuse the Phase 13 signing framework over the exact
+//! [`Repo::verify_summary`] reuse the commit signing framework over the exact
 //! `summary` bytes; the signatures live in `summary.sig`, a bare `a{sv}` with the
 //! same engine keys as detached commit metadata.
 //!

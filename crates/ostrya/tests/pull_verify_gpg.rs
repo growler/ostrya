@@ -1,4 +1,4 @@
-//! GPG verification during a pull (Phase 16e).
+//! GPG verification during a pull.
 //!
 //! The GPG axis is the same whichever source a pull reads, so these run over a
 //! local pull, which needs no server: what they cover is where the trusted

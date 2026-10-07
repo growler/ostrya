@@ -1,4 +1,4 @@
-//! Static-delta generation (Phase 15b).
+//! Static-delta generation.
 //!
 //! [`Repo::generate_static_delta`] writes the delta that turns one commit into
 //! another (or produces a commit from scratch) in the wire format

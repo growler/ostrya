@@ -112,7 +112,7 @@ pub enum FilterResult {
 
 /// A `(device, inode)` to content-checksum map.
 ///
-/// Populated by checkout (Phase 8), which records the inode of each object it
+/// Populated by checkout, which records the inode of each object it
 /// writes, and by [`Repo::devino_cache`](crate::Repo::devino_cache), which
 /// reads the same mapping out of a repository's own loose objects. A source
 /// file whose `(device, inode)` is present is taken to be that object and its

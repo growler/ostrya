@@ -2330,12 +2330,11 @@ fn remote_proxy(remote: &str, section: &crate::config::Remote<'_>) -> Result<Pro
 /// Read the trust anchors and the client identity a remote's TLS keys name.
 async fn remote_tls(remote: &str, section: &crate::config::Remote<'_>) -> Result<TlsOptions> {
     // `tls-permissive` keeps the host name check and ignores `tls-ca-path`.
-    // Both are measured of the reference tool (`docs/port-plan.md`, Phase 23,
-    // "tls-permissive on a remote"): a CA that signed nothing in the chain
-    // serves, and so does a path naming a file that is absent. The path is
-    // therefore left unread here rather than read and discarded, so an absent
-    // one is no failure. `DangerousAcceptAnyChain` holds the name check and
-    // takes the chain as presented, so it is the setting that mapping asks
+    // Both are measured of the reference tool: a CA that signed nothing in
+    // the chain serves, and so does a path naming a file that is absent. The
+    // path is therefore left unread here rather than read and discarded, so an
+    // absent one is no failure. `DangerousAcceptAnyChain` holds the name check
+    // and takes the chain as presented, so it is the setting that mapping asks
     // for. It drops the expiry check as well, which is the port's own reading
     // and not a measurement: a peer verification that ignores the CA path is
     // libcurl peer verification switched off, and that setting takes the

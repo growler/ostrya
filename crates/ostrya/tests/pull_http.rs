@@ -1,4 +1,4 @@
-//! HTTP pull from a remote repository (Phase 16c).
+//! HTTP pull from a remote repository.
 //!
 //! Every test serves a repository directory from an in-process static file
 //! server, over cleartext HTTP/1.1 and, where the transport matters, over TLS
@@ -537,11 +537,11 @@ fn pulls_a_multi_read_payload_from_a_tool_built_remote() {
 
 /// An archive-to-archive pull stores every `.filez` object exactly as the
 /// remote holds it, rather than inflating and recompressing it at the
-/// destination's own `zlib-level` (Phase 16g). The destination is configured
-/// with a level far from the remote's default, over a payload long and
-/// repetitive enough that recompressing it at a different level would leave a
-/// visibly different byte sequence: a match here can only mean the fetched
-/// bytes were stored verbatim.
+/// destination's own `zlib-level`. The destination is configured with a level
+/// far from the remote's default, over a payload long and repetitive enough
+/// that recompressing it at a different level would leave a visibly different
+/// byte sequence: a match here can only mean the fetched bytes were stored
+/// verbatim.
 #[test]
 fn an_archive_pull_reproduces_filez_bytes_at_a_different_zlib_level() {
     block_on(async {
@@ -604,10 +604,10 @@ fn an_archive_pull_reproduces_filez_bytes_at_a_different_zlib_level() {
 }
 
 /// An archive-to-archive pull from a remote the `ostree` tool built stores
-/// every `.filez` object exactly as the tool wrote it (Phase 16g). The tool's
-/// zlib encoder and the port's own raw-DEFLATE encoder are different
-/// implementations, so bytes that match can only mean the destination stored
-/// the fetched bytes verbatim rather than inflating and recompressing them.
+/// every `.filez` object exactly as the tool wrote it. The tool's zlib encoder
+/// and the port's own raw-DEFLATE encoder are different implementations, so
+/// bytes that match can only mean the destination stored the fetched bytes
+/// verbatim rather than inflating and recompressing them.
 #[test]
 fn an_archive_pull_reproduces_filez_bytes_from_a_tool_built_remote() {
     if !ostree_available() {
@@ -674,10 +674,10 @@ fn an_archive_pull_reproduces_filez_bytes_from_a_tool_built_remote() {
     });
 }
 
-/// A bare-family destination still stores the inflated payload (Phase 16g):
-/// the pass-through path applies only to an archive destination, so a
-/// bare-user destination's content object holds the plain, uncompressed bytes
-/// rather than the remote's raw-DEFLATE ones.
+/// A bare-family destination still stores the inflated payload: the
+/// pass-through path applies only to an archive destination, so a bare-user
+/// destination's content object holds the plain, uncompressed bytes rather
+/// than the remote's raw-DEFLATE ones.
 #[test]
 fn a_bare_family_destination_still_stores_the_inflated_payload() {
     block_on(async {
@@ -719,8 +719,8 @@ fn a_bare_family_destination_still_stores_the_inflated_payload() {
 }
 
 /// The declared size the pass-through path stores is held to equality, not
-/// treated as a ceiling (Phase 16g): a payload that inflates to fewer bytes
-/// than its header declares is refused just as one that inflates to more is.
+/// treated as a ceiling: a payload that inflates to fewer bytes than its
+/// header declares is refused just as one that inflates to more is.
 #[test]
 fn a_payload_underrunning_its_declared_size_fails_the_pull() {
     block_on(async {
@@ -816,12 +816,11 @@ fn a_bare_family_destination_refuses_a_payload_under_its_declared_size() {
 }
 
 /// The overrun check reports its own message even when the compressed payload
-/// is long enough to arrive over more than one read (Phase 16g): the
-/// pass-through path decodes into a decoder that buffers decoded bytes and
-/// only forwards them on a later call, so a small fixture object -- one read,
-/// one decode, one forward -- cannot tell an overrun's own message apart from
-/// one folded into a generic "trailing bytes" report the way a multi-read
-/// object can.
+/// is long enough to arrive over more than one read: the pass-through path
+/// decodes into a decoder that buffers decoded bytes and only forwards them on
+/// a later call, so a small fixture object -- one read, one decode, one
+/// forward -- cannot tell an overrun's own message apart from one folded into
+/// a generic "trailing bytes" report the way a multi-read object can.
 #[test]
 fn an_overrunning_payload_over_multiple_reads_reports_the_overrun() {
     block_on(async {
@@ -1098,8 +1097,8 @@ fn an_empty_ref_list_with_no_branches_fails() {
 
 /// A mirror pull of every ref takes them from the summary, writes them under
 /// `refs/heads`, and copies the summary and its signature verbatim. The
-/// signature bytes are arbitrary here: the pull copies them without reading
-/// them, and verifying them is a later phase.
+/// signature bytes are arbitrary here: the remote turns no summary
+/// verification on, so the pull copies them without reading them.
 #[test]
 fn a_mirror_pull_writes_local_refs_and_copies_the_summary() {
     block_on(async {
@@ -3625,7 +3624,7 @@ fn a_tampered_inline_part_fails_discovery_before_any_part_request() {
     });
 }
 
-// --- signature verification (Phase 16e) -------------------------------------
+// --- signature verification --------------------------------------------------
 
 /// A fixed ed25519 keypair the remotes sign with.
 const SECRET_B64: &str =

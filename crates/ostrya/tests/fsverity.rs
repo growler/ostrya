@@ -1,5 +1,4 @@
-//! Repository fs-verity (ex-integrity) write-path integration tests (Phase
-//! pre13).
+//! Repository fs-verity (ex-integrity) write-path integration tests.
 //!
 //! These drive commits through the write path with `[ex-integrity] fsverity`
 //! set and observe the loose objects: every object stored as a regular file is

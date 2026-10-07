@@ -1,4 +1,4 @@
-//! Commit signing framework and the dummy test engine (Phase 13a).
+//! Commit signing framework and the dummy test engine.
 //!
 //! The engines, the [`Signer`] and [`Verifier`] traits, [`SignKeys`], and the
 //! key reader are items of the `ostrya-sign` crate, re-exported here with its
@@ -10,7 +10,7 @@
 //! its engine and its detached-metadata key and signs an opaque byte payload; a
 //! verifier checks a set of signature blobs against a payload and reports a
 //! [`VerifyOutcome`]. Both operate on opaque bytes, so the commit path here and
-//! the summary path in a later phase share one surface.
+//! the summary path of the `summary` module share one surface.
 //!
 //! The signed payload for a commit is the canonical serialized commit GVariant
 //! bytes -- the same normal-form bytes that hash to the commit checksum
@@ -30,8 +30,8 @@
 //! stored blob against a trusted key byte string. It exercises the framework
 //! and cross-checks against the tool's `ostree.sign.dummy` engine.
 //!
-//! The ed25519 engine ([`Ed25519Signer`] / [`Ed25519Verifier`], Phase 13b) is
-//! the first real engine: a 32-byte public key, a 64-byte signature, and a
+//! The ed25519 engine ([`Ed25519Signer`] / [`Ed25519Verifier`]) is the first
+//! real engine: a 32-byte public key, a 64-byte signature, and a
 //! 64-byte secret key (32-byte seed followed by the 32-byte public key), all per
 //! `format-reference.md`. ed25519 is deterministic, so signing needs no RNG and
 //! the same key over the same commit yields byte-identical detached metadata.

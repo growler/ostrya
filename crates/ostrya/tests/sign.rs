@@ -1,4 +1,4 @@
-//! Commit-signing integration tests (Phase 13a).
+//! Commit-signing integration tests.
 //!
 //! These exercise the [`Signer`]/[`Verifier`] framework through the dummy
 //! engine: a dummy signature the port appends is accepted by `ostree sign

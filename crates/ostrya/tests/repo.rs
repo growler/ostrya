@@ -1,9 +1,9 @@
 //! Repository open/create integration tests.
 //!
-//! These exercise the Phase 4 gate: open a tool-created repository and read its
-//! mode and config; create a repository whose `config` bytes and layout match
-//! what the `ostree` tool writes; and cross-check that the tool opens and
-//! operates on a repository this crate creates.
+//! These open a tool-created repository and read its mode and config; create a
+//! repository whose `config` bytes and layout match what the `ostree` tool
+//! writes; and cross-check that the tool opens and operates on a repository
+//! this crate creates.
 
 mod common;
 

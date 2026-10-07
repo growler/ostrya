@@ -1,4 +1,4 @@
-//! spki (ECDSA over SubjectPublicKeyInfo) commit-signing engine (Phase 13c).
+//! spki (ECDSA over SubjectPublicKeyInfo) commit-signing engine.
 //!
 //! Behind the `sign-spki` feature. The engine signs and verifies through the
 //! shared [`Signer`]/[`Verifier`] framework: [`SpkiSigner`] produces a detached

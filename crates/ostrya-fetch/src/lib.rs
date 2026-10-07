@@ -89,6 +89,15 @@
 //! fetcher connects through. Lower case wins over upper case, and an empty
 //! value counts as unset. Nothing re-reads the environment per request.
 //!
+//! A proxy variable whose value has white space at its start or end fails
+//! [`Fetcher::new`] with [`Error::Unsupported`]. A value of white space alone
+//! is refused too: it is not empty, so it counts as set and hides the
+//! upper-case name. The check is made when the fetcher is built, on the value
+//! of each variable the lookup reads, whether or not a request would go
+//! through that proxy. The message names the variable and holds nothing of the
+//! value, which can hold a password. The URL of [`Proxy::Url`] and each
+//! `no_proxy` entry are trimmed instead.
+//!
 //! A proxy URL is `http://host[:port]`, port 80 by default, with no path other
 //! than `/`, no query, and no fragment. Userinfo is percent-decoded and sent to
 //! the proxy as `Proxy-Authorization: Basic`. Anything else -- an `https://` or
@@ -691,17 +700,21 @@ pub enum Proxy {
     /// Connect directly, whatever the environment says.
     None,
     /// Read `http_proxy`, `https_proxy`, `all_proxy`, and `no_proxy` from the
-    /// process environment, once, at construction.
+    /// process environment, once, at construction. A proxy variable read with
+    /// white space at the start or the end of its value fails the
+    /// construction, and the message names the variable alone.
     #[default]
     Environment,
     /// The same variables, stated as name and value pairs rather than read from
     /// the process. A name the environment forms do not read is ignored here as
     /// well, and among two entries of one name the first with a value is the one
-    /// read.
+    /// read. White space around a proxy value is refused as it is in the
+    /// environment.
     Variables(Vec<(String, String)>),
     /// One `http://` proxy URL for every origin, whose userinfo is sent as
     /// `Proxy-Authorization: Basic`. No origin is exempt: the environment is
-    /// read for neither the proxy nor the exemptions.
+    /// read for neither the proxy nor the exemptions. White space around the
+    /// URL is trimmed.
     Url(String),
 }
 
@@ -758,7 +771,8 @@ pub struct FetcherOptions {
     pub tls: TlsOptions,
     /// Which proxy an origin is reached through, which defaults to the one the
     /// process environment names. The value is resolved by [`Fetcher::new`],
-    /// which refuses a proxy URL that is not `http://host[:port]`; nothing
+    /// which refuses a proxy URL that is not `http://host[:port]` and a proxy
+    /// variable with white space at the start or the end of its value; nothing
     /// re-reads it per request.
     pub proxy: Proxy,
     /// Whether to offer HTTP/2 in ALPN. With this false the fetcher speaks
@@ -1937,7 +1951,8 @@ impl Fetcher {
     /// layer sets is configured; when credentials are configured alongside a
     /// cleartext mirror; when credentials are configured alongside an
     /// `Authorization` header; when a proxy URL, from the options or from the
-    /// environment, is not `http://host[:port]`; when a
+    /// environment, is not `http://host[:port]`; when a proxy variable has
+    /// white space at the start or the end of its value; when a
     /// [`low_speed`](FetcherOptions::low_speed) rule holds a zero; or when the
     /// TLS material does not parse.
     ///
@@ -4282,20 +4297,32 @@ fn resolve_variables(variables: &[(String, String)]) -> Result<Proxies> {
     // scheme-specific variables is named and read by no fetch. One URL serving
     // both schemes is parsed once and held as one endpoint, so the pool key of
     // a proxy connection is the same whichever variable named it.
+    //
+    // A value with white space at its start or end is refused before the
+    // parse, which would trim it, and by the same rule: the value of every
+    // variable read, whether or not a fetch uses it. The message names the
+    // variable and not the value, which can hold a password.
     let mut endpoints: Vec<(&str, Arc<ProxyEndpoint>)> = Vec::new();
-    for url in [all, http, https].into_iter().flatten() {
+    for (name, url) in [all, http, https].into_iter().flatten() {
+        if url.trim() != url {
+            return Err(Error::Unsupported(format!(
+                "the proxy variable {name} has white space at the start or the end of \
+                 its value"
+            )));
+        }
         if !endpoints.iter().any(|(named, _)| *named == url) {
             endpoints.push((url, Arc::new(parse_proxy(url)?)));
         }
     }
-    let parsed = |url: Option<&str>| {
-        url.and_then(|url| endpoints.iter().find(|(named, _)| *named == url))
+    let parsed = |held: Option<(&str, &str)>| {
+        held.and_then(|(_, url)| endpoints.iter().find(|(named, _)| *named == url))
             .map(|(_, endpoint)| endpoint.clone())
     };
     let (http, https) = (parsed(http.or(all)), parsed(https.or(all)));
     let mut exempt_all = false;
     let mut exempt = Vec::new();
     for entry in variable(variables, "no_proxy", Some("NO_PROXY"))
+        .map(|(_, value)| value)
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
@@ -4315,8 +4342,8 @@ fn resolve_variables(variables: &[(String, String)]) -> Result<Proxies> {
     })
 }
 
-/// The value of one proxy variable: the lower-case name first, then the
-/// upper-case name where one is read.
+/// The name and the value of one proxy variable: the lower-case name first,
+/// then the upper-case name where one is read.
 ///
 /// An empty value counts as unset, and among two entries of one name the first
 /// with a value is the one read.
@@ -4324,12 +4351,12 @@ fn variable<'a>(
     variables: &'a [(String, String)],
     lower: &str,
     upper: Option<&str>,
-) -> Option<&'a str> {
+) -> Option<(&'a str, &'a str)> {
     let held = |name: &str| {
         variables
             .iter()
             .find(|(held, value)| held == name && !value.is_empty())
-            .map(|(_, value)| value.as_str())
+            .map(|(held, value)| (held.as_str(), value.as_str()))
     };
     held(lower).or_else(|| upper.and_then(held))
 }
@@ -6186,6 +6213,82 @@ mod tests {
             absolute("http://any.example:3128")
         );
         assert_eq!(via_of(&proxies, tls), tunnel("http://any.example:3128"));
+    }
+
+    /// A proxy variable with white space at the start or the end of its value
+    /// fails the resolution, a value of white space alone included. The
+    /// message names the variable read and holds nothing of the value. Every
+    /// variable the selection reads is checked, whether or not a fetch would
+    /// use it, and a variable the selection does not read is not.
+    #[test]
+    fn a_proxy_variable_with_white_space_around_it_is_refused() {
+        let url = "http://alice:s3cret@proxy.example:3128";
+        let refused = |pairs: &[(&str, &str)], name: &str| {
+            let err = resolve_variables(&variables(pairs)).unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{pairs:?}: {err}");
+            let message = err.to_string();
+            assert!(message.contains(name), "{pairs:?}: {message}");
+            assert!(!message.contains("s3cret"), "{pairs:?}: {message}");
+            assert!(!message.contains("proxy.example"), "{pairs:?}: {message}");
+        };
+
+        for name in [
+            "http_proxy",
+            "https_proxy",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "ALL_PROXY",
+        ] {
+            for value in [
+                format!(" {url}"),
+                format!("{url} "),
+                format!("{url}\t"),
+                format!("{url}\n"),
+                format!("{url}\u{a0}"),
+                "   ".to_owned(),
+            ] {
+                refused(&[(name, &value)], name);
+            }
+        }
+        // An empty lower-case value leaves the upper-case name the one read,
+        // and the refusal names it.
+        refused(
+            &[("all_proxy", ""), ("ALL_PROXY", "http://p:1 ")],
+            "ALL_PROXY",
+        );
+        // The check comes before the parse, so a value the parse refuses as
+        // well gets the white-space refusal.
+        refused(
+            &[("all_proxy", "socks5://alice:s3cret@proxy.example:1080 ")],
+            "all_proxy",
+        );
+        // The refusal is made when the fetcher is built, so an exemption of
+        // every origin does not keep it off.
+        refused(
+            &[("http_proxy", &format!("{url} ")), ("no_proxy", "*")],
+            "http_proxy",
+        );
+        // `all_proxy` beside both scheme-specific variables is read by no
+        // fetch, and its value is checked all the same.
+        refused(
+            &[
+                ("all_proxy", &format!("{url} ")),
+                ("http_proxy", "http://plain.example:3128"),
+                ("https_proxy", "http://secure.example:3128"),
+            ],
+            "all_proxy",
+        );
+
+        // An upper-case name shadowed by its lower-case one is not read, and
+        // `HTTP_PROXY` is read by nothing.
+        resolve_variables(&variables(&[
+            ("https_proxy", "http://secure.example:3128"),
+            ("HTTPS_PROXY", "http://upper.example:3128 "),
+        ]))
+        .unwrap();
+        resolve_variables(&variables(&[("HTTP_PROXY", "http://cgi.example:3128 ")])).unwrap();
+        // A URL the caller states in the options keeps its trim.
+        resolve_proxy(&Proxy::Url("http://p:3128 ".into())).unwrap();
     }
 
     /// What `no_proxy` exempts: an exact host, a host under a listed domain, a

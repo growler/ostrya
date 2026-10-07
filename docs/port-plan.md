@@ -7799,17 +7799,53 @@ Proxy from the environment:
   `[5] Could not resolve proxy name`, writes no ref, and sends no request to
   the proxy. The rule holds for the remote `proxy` key, with trailing spaces
   or with a `\s` escape at the start, and for `http_proxy` with trailing
-  spaces.
+  spaces. A later observation of libostree 2026.1 gives these facts for the
+  proxy variables. In this list, a padded value is a value with white space
+  at its start or end.
+  - A leading or trailing space, tab, LF, CR, VT, FF, U+00A0, or U+2003 is
+    refused.
+  - A value of white space alone counts as set. It hides the upper-case name,
+    and it is refused.
+  - The message holds no part of the value.
+  - `no_proxy` entries are trimmed. `no_proxy=" 127.0.0.1 "` exempts a
+    `127.0.0.1` origin, and `no_proxy=" "` exempts nothing.
+  - A remote `proxy` key with a clean value wins, and the variable is not
+    read.
+  - The tool refuses only the variable that the request uses. These cases do
+    not fail the pull: a padded `http_proxy` with a `no_proxy` entry that
+    matches the origin or with `no_proxy=*`, a padded `https_proxy` or
+    `HTTPS_PROXY` for an `http` origin, a padded `all_proxy` beside a clean
+    `http_proxy`, a padded `ALL_PROXY` beside a clean `all_proxy`, and a
+    padded `HTTP_PROXY`.
 
-The port diverges from the last record. A `no_proxy` that matches the origin
-host does not override the remote `proxy` key. The port maps the key onto
-`Proxy::Url`, which reads no exemptions, so a pull through the key reaches
-every origin through the proxy.
+The port diverges from the record of the remote `proxy` key. A `no_proxy`
+that matches the origin host does not override the key. The port maps the
+key onto `Proxy::Url`, which reads no exemptions, so a pull through the key
+reaches every origin through the proxy.
 
-The port also diverges from the record of white space for the environment
-variables. The fetcher trims the value of each proxy variable, so a pull
-connects through `http_proxy` with trailing spaces. The remote `proxy` key
-follows the record.
+The port refuses white space in the proxy variables. A padded value of
+`http_proxy`, `https_proxy`, `HTTPS_PROXY`, `all_proxy`, or `ALL_PROXY` fails
+`Fetcher::new` with `Error::Unsupported`. White space is the Unicode
+`White_Space` property, the set that `str::trim` removes. The remote `proxy`
+key uses the same check. A value of white space alone counts as set, hides
+the upper-case name, and is refused. The message names the variable that the
+fetcher read, for example `ALL_PROXY` where `all_proxy` is empty, and holds no
+part of the value. The check is made before the URL parse, so a padded value
+that the parse also refuses gets the white-space message. The check applies
+to `Proxy::Environment` and to `Proxy::Variables`. The fetcher does not read
+a shadowed upper-case name or `HTTP_PROXY`, so it does not check them. The URL
+of `Proxy::Url` and each `no_proxy` entry are trimmed. The fetcher reads the
+process environment with `std::env::var`, and `environment()` treats a value
+that is not UTF-8 as unset.
+
+One divergence from the record of white space remains. The port checks each
+variable that it reads when the fetcher is built, and the tool checks only
+the variable that a request uses. Thus the port refuses a padded variable
+that the request does not use: a padded `http_proxy` that `no_proxy`
+exempts, a padded `https_proxy` or `HTTPS_PROXY` for an `http` origin, and a
+padded `all_proxy` beside a clean `http_proxy`. A padded `ALL_PROXY` beside a
+clean `all_proxy` and a padded `HTTP_PROXY` do not fail the pull, as in the
+tool.
 
 `tls-permissive` on a remote:
 
@@ -7854,7 +7890,8 @@ The proxy the port implements:
   `Error::Unsupported`, and the message names the value with any userinfo left
   out. Every variable holding a value is parsed, including one the selection
   passes over, so an unreadable `all_proxy` beside both scheme-specific
-  variables fails the constructor too.
+  variables fails the constructor too. The refusal of a value with white space
+  at its start or end follows the same rule.
 - Userinfo is the proxy's credential. It is percent-decoded and sent as
   `Proxy-Authorization: Basic`, it belongs to the connection layer, and it is
   no part of the merged header list: the cleartext-credential check and the

@@ -1896,6 +1896,12 @@ and the entry, one leading `.` on the entry stripped first, and it may carry
 `*` as a whole entry exempts every host and is the one wildcard the list reads,
 so `*.example.com` is a host text no origin holds, and an entry in CIDR
 notation names no network, which is where this parts from curl 7.86 and later.
+A proxy variable whose value has white space at its start or end fails
+`Fetcher::new` with `Error::Unsupported`, and a value of white space alone
+counts as set and is refused too. The check is made when the fetcher is
+built, on each variable the lookup reads, whether or not a request would use
+it. The message names the variable and holds no part of the value. The URL of
+`Proxy::Url` and each `no_proxy` entry are trimmed.
 Every form is resolved once, by `Fetcher::new`.
 
 A cleartext origin behind a proxy is reached over a connection to the proxy,
@@ -2290,7 +2296,8 @@ static deltas of the pull, to `remote_fetch_summary`, and to a pull whose
 `url` overrides the address of a configured remote. A value that is not
 `http://host[:port]`, and a value with white space at its start or end, is
 `Error::Unsupported` before the first request. The message of the second
-refusal does not hold the value.
+refusal does not hold the value. Where the key is absent or empty, the same
+white-space refusal applies to the proxy variables of the environment.
 
 The driver of `pull` reads the remote through a source, one of two: the HTTP
 source, over the fetcher, and the ssh source, over a `PullSession` of

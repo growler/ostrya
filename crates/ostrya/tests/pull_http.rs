@@ -5380,22 +5380,41 @@ const PROXY_VARIABLES: [&str; 8] = [
     "NO_PROXY",
 ];
 
-/// The writer child pulls the ref its argument names from `origin`.
+/// The prefix of a writer child argument that expects the pull to fail on
+/// the `http_proxy` of the child.
+const REFUSED: &str = "refused:";
+
+/// The writer child pulls the ref its argument names from `origin`. Under the
+/// [`REFUSED`] prefix the pull must fail with a refusal that names
+/// `http_proxy` and leaves its credential out.
 #[test]
 #[ignore = "helper process for the proxy environment tests"]
 fn writer_child_subprocess() {
     writer_child_main(|path, arg| {
         block_on(async {
             let repo = Repo::open(path).await.unwrap();
-            repo.pull(
-                "origin",
-                PullOptions {
-                    refs: vec![arg.to_owned()],
-                    ..PullOptions::default()
-                },
-            )
-            .await
-            .unwrap();
+            let (refused, rev) = match arg.strip_prefix(REFUSED) {
+                Some(rev) => (true, rev),
+                None => (false, arg),
+            };
+            let pulled = repo
+                .pull(
+                    "origin",
+                    PullOptions {
+                        refs: vec![rev.to_owned()],
+                        ..PullOptions::default()
+                    },
+                )
+                .await;
+            if !refused {
+                pulled.unwrap();
+                return;
+            }
+            let err = pulled.unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+            let message = err.to_string();
+            assert!(message.contains("http_proxy"), "{message}");
+            assert!(!message.contains("s3cret"), "{message}");
         });
     });
 }
@@ -5618,6 +5637,48 @@ fn pull_through_the_environment_proxy(tag: &str, extra: &str) {
             Some(commit)
         );
     });
+}
+
+/// Run the pull of `test/main` in a child process whose environment holds
+/// `http_proxy` alone, set to the test proxy URL with a credential, which
+/// `around` puts white space around. The pull fails before its first request
+/// and publishes nothing.
+fn pull_refuses_the_environment_proxy(tag: &str, around: impl Fn(&str) -> String) {
+    block_on(async {
+        let dir = TmpDir::new(tag);
+        build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let proxy = TestProxy::start(Tunnel::Open).await;
+        drop(build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await);
+
+        let path = dir.path().join("dest");
+        let value = around(&proxy.url_with("alice:s3cret"));
+        let child = writer_child_with(&path, &format!("{REFUSED}test/main"), |command| {
+            for name in PROXY_VARIABLES {
+                command.env_remove(name);
+            }
+            command.env("http_proxy", value);
+        });
+        // The proxy and the server run on this thread's runtime, so the wait
+        // must not block it.
+        ostrya_rt::unblock(move || child.wait()).await;
+
+        assert_eq!(proxy.requests(), 0);
+        assert!(server.seen().is_empty(), "{:?}", server.seen());
+        assert_nothing_published(&Repo::open(&path).await.unwrap()).await;
+    });
+}
+
+/// An `http_proxy` with white space at the end of its value fails the pull.
+#[test]
+fn a_pull_refuses_an_http_proxy_with_trailing_white_space() {
+    pull_refuses_the_environment_proxy("pull-http-proxy-env-trailing", |url| format!("{url}  "));
+}
+
+/// An `http_proxy` with white space at the start of its value fails the pull.
+#[test]
+fn a_pull_refuses_an_http_proxy_with_leading_white_space() {
+    pull_refuses_the_environment_proxy("pull-http-proxy-env-leading", |url| format!(" {url}"));
 }
 
 /// An empty `proxy` key leaves the proxy to the environment.

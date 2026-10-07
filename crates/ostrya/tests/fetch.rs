@@ -15,7 +15,8 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io::{self, IoSlice};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,6 +38,7 @@ use ostrya::{
 };
 use ostrya_rt::{TcpListener, TcpStream, Timer, block_on, spawn};
 use proxy::{TestProxy, Tunnel};
+use rustix::net;
 use sha2::{Digest, Sha256};
 
 const CA_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/ca.pem");
@@ -917,14 +919,17 @@ fn fetches_a_body_over_cleartext_http1() {
 #[test]
 fn fetches_from_an_ipv6_literal_mirror() {
     block_on(async {
+        // A client of another test that dials `localhost` tries `::1` first,
+        // so the port number is held on 127.0.0.1 as well.
+        let reserved = reserved_port();
+        let port = reserved.port;
         let server = TestServer::start_on(
-            "[::1]:0".parse().unwrap(),
+            format!("[::1]:{port}").parse().unwrap(),
             Leaf::Fixture,
             Transport::Cleartext,
             always(b"object bytes"),
         )
         .await;
-        let port = server.addr.port();
         let fetcher = Fetcher::new(direct_options(format!("http://[::1]:{port}/repo")))
             .await
             .unwrap();
@@ -4091,12 +4096,32 @@ fn tls_transport(alpn: &'static str) -> Transport {
     }
 }
 
-/// A loopback port nothing listens on: bound once, and released.
-async fn reserved_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
-    listener.local_addr().unwrap().port()
+/// A loopback port held by a socket that is bound and does not listen.
+///
+/// While the value lives, a connect to the port is refused and no IPv4 or
+/// dual-stack bind to port 0 gets the port number. A server that sets
+/// `SO_REUSEADDR`, as both runtime backends do, can still bind the port
+/// explicitly.
+struct ReservedPort {
+    port: u16,
+    _socket: OwnedFd,
+}
+
+fn reserved_port() -> ReservedPort {
+    let socket = net::socket_with(
+        net::AddressFamily::INET,
+        net::SocketType::STREAM,
+        net::SocketFlags::CLOEXEC,
+        None,
+    )
+    .unwrap();
+    net::sockopt::set_socket_reuseaddr(&socket, true).unwrap();
+    net::bind(&socket, &SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let bound = SocketAddrV4::try_from(net::getsockname(&socket).unwrap()).unwrap();
+    ReservedPort {
+        port: bound.port(),
+        _socket: socket,
+    }
 }
 
 /// Read `body` until at least `bytes` have arrived or it ends, and give the
@@ -4562,7 +4587,8 @@ fn a_followed_upload_redirect_leaves_the_credentials_at_the_named_origin() {
 #[test]
 fn a_refused_connection_is_retried_with_the_body_intact() {
     block_on(bounded(async {
-        let port = reserved_port().await;
+        let reserved = reserved_port();
+        let port = reserved.port;
         let late = spawn(async move {
             Timer::after(Duration::from_millis(100)).await;
             TestServer::start_on(
@@ -4595,7 +4621,8 @@ fn a_refused_connection_is_retried_with_the_body_intact() {
 #[test]
 fn an_unsent_upload_moves_on_to_the_next_mirror() {
     block_on(bounded(async {
-        let port = reserved_port().await;
+        let reserved = reserved_port();
+        let port = reserved.port;
         let live = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
         let fetcher = Fetcher::new(FetcherOptions {
             mirrors: vec![format!("http://127.0.0.1:{port}"), live.url(false)],
@@ -4691,7 +4718,8 @@ fn a_refused_tunnel_is_retried_at_503_and_final_at_407() {
 #[test]
 fn retries_that_run_out_before_sending_report_a_fetch_error() {
     block_on(bounded(async {
-        let port = reserved_port().await;
+        let reserved = reserved_port();
+        let port = reserved.port;
         let fetcher = Fetcher::new(FetcherOptions {
             progress_timeout: Duration::from_millis(100),
             max_retries: 1,
@@ -4722,7 +4750,8 @@ fn retries_that_run_out_before_sending_report_a_fetch_error() {
 #[test]
 fn a_writer_waiting_through_the_retry_rounds_does_not_time_out() {
     block_on(bounded(async {
-        let port = reserved_port().await;
+        let reserved = reserved_port();
+        let port = reserved.port;
         let late = spawn(async move {
             Timer::after(Duration::from_millis(600)).await;
             TestServer::start_on(

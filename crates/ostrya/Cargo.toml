@@ -114,8 +114,11 @@ futures-rustls = { version = "0.26", default-features = false }
 rustls-pemfile = "2"
 # The root-dependent tests call `process::geteuid`. The smol backend reaches
 # rustix's `process` feature through its own dependencies and the tokio
-# backend does not, so the test build asks for it here.
+# backend does not, so the test build asks for it here. The fetcher tests that
+# need a refused port ask for `net`: they hold a TCP socket that is bound and
+# does not listen, which std cannot make.
 rustix = { version = "1", default-features = false, features = [
     "std",
     "process",
+    "net",
 ] }

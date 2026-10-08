@@ -51,7 +51,7 @@ pub trait Signer: Send + Sync {
     fn sign<'a>(&'a self, data: &'a [u8]) -> SignFuture<'a>;
 }
 
-/// An engine that checks detached signatures over an opaque payload.
+/// An engine that verifies detached signatures over an opaque payload.
 pub trait Verifier: Send + Sync {
     /// Returns the key in the detached-metadata dict that holds the signatures.
     ///

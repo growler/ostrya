@@ -14,8 +14,8 @@ use crate::endpoint::ReceiveEndpoint;
 use crate::receive;
 use crate::stall::Stall;
 
-/// The response to one request. A stream body is recorded in `stall`, the
-/// deadline of its connection.
+/// Returns the response to one request. The function records a stream body
+/// in `stall`, the deadline of its connection.
 ///
 /// With a receive endpoint, a request under its raw path prefix with a
 /// method other than `GET` and `HEAD` goes to the endpoint. A `GET` or a
@@ -53,8 +53,8 @@ pub(crate) async fn handle(
     }
 }
 
-/// The response for an answer of the view to a `GET`. A not-found and a
-/// refusal take one path, so their responses are the same bytes.
+/// Returns the response for an answer of the view to a `GET`. A not-found
+/// and a refusal take one path, so their responses are the same bytes.
 fn respond(answer: ostrya::Result<ArchiveAnswer>, stall: &Arc<Stall>) -> Response<ServeBody> {
     let (len, body) = match answer {
         Ok(ArchiveAnswer::Bytes(bytes)) => (
@@ -72,8 +72,8 @@ fn respond(answer: ostrya::Result<ArchiveAnswer>, stall: &Arc<Stall>) -> Respons
     with_length(Response::new(body), len)
 }
 
-/// The response for an answer of the view to a `HEAD`: the status and the
-/// `Content-Length` a `GET` gives, and no body.
+/// Returns the response for an answer of the view to a `HEAD`. It has the
+/// status and the `Content-Length` that a `GET` gives, and no body.
 fn respond_head(answer: ostrya::Result<ArchiveHead>) -> Response<ServeBody> {
     match answer {
         Ok(ArchiveHead::Found { len }) => with_length(Response::new(ServeBody::Empty), len),
@@ -82,7 +82,8 @@ fn respond_head(answer: ostrya::Result<ArchiveHead>) -> Response<ServeBody> {
     }
 }
 
-/// `response` with a `Content-Length` of `len`, when it is known.
+/// Returns `response` with a `Content-Length` of `len`. If `len` is `None`,
+/// the response gets no `Content-Length`.
 fn with_length(mut response: Response<ServeBody>, len: Option<u64>) -> Response<ServeBody> {
     if let Some(len) = len {
         response
@@ -92,7 +93,8 @@ fn with_length(mut response: Response<ServeBody>, len: Option<u64>) -> Response<
     response
 }
 
-/// A response of `status` with an empty body.
+/// Returns a response of `status` with an empty body and a `Content-Length`
+/// of 0.
 pub(crate) fn empty(status: StatusCode) -> Response<ServeBody> {
     let mut response = Response::new(ServeBody::Empty);
     *response.status_mut() = status;
@@ -102,9 +104,9 @@ pub(crate) fn empty(status: StatusCode) -> Response<ServeBody> {
     response
 }
 
-/// The repository path of a request path: the leading `/` taken off and the
-/// percent escapes decoded. A path with no leading `/`, a bad escape, a NUL,
-/// or bytes that are not UTF-8 gives `None`.
+/// Returns the repository path of a request path. It removes the leading `/`
+/// and decodes the percent escapes. If the path has no leading `/`, a bad
+/// escape, a NUL, or bytes that are not UTF-8, it returns `None`.
 fn decode_path(raw: &str) -> Option<String> {
     let raw = raw.strip_prefix('/')?.as_bytes();
     let mut out = Vec::with_capacity(raw.len());
@@ -162,7 +164,7 @@ mod tests {
         }
     }
 
-    /// A `HEAD` keeps the length a `GET` sends and has no body. A refusal
+    /// A `HEAD` keeps the length that a `GET` sends and has no body. A refusal
     /// and a not-found give one response, and an error gives 500.
     #[test]
     fn a_head_has_the_length_and_no_body() {

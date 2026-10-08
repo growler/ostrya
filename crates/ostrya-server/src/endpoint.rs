@@ -17,49 +17,56 @@ use crate::receive_auth::ReceiveAuth;
 use crate::session::SessionTable;
 use crate::shutdown::Shutdown;
 
-/// The values of `parallel_uploads` an endpoint takes.
+/// The values of `parallel_uploads` that an endpoint takes.
 const PARALLEL_UPLOADS: RangeInclusive<u32> = 1..=31;
 
 /// The HTTP/2 receive window of one stream of a connection to an endpoint.
 /// The window of the connection is this value times `parallel_uploads`.
 const UPLOAD_WINDOW: u32 = 2 * 1024 * 1024;
 
-/// The options of [`ReceiveEndpoint::new`]. Start from
-/// [`EndpointOptions::default`] and set the fields.
+/// The options of [`ReceiveEndpoint::new`].
+///
+/// [`EndpointOptions::default`] holds the default value of each field.
 #[derive(Clone)]
 pub struct EndpointOptions {
-    /// The number of object streams one session runs at the same time, which
-    /// `HelloReply` announces. The value is in `1..=31`, and the default
-    /// is 4. [`ReceiveEndpoint::h2_windows`] gives the HTTP/2 windows that
-    /// follow from it.
+    /// The number of object streams that one session runs at the same time.
+    ///
+    /// `HelloReply` announces this number. The value is in `1..=31`, and the
+    /// default is 4. [`ReceiveEndpoint::h2_windows`] gives the HTTP/2
+    /// windows that follow from it.
     pub parallel_uploads: u32,
-    /// The time a session may stay with no request in progress, and the time
-    /// a request body of a session may deliver no byte. Past it the endpoint
-    /// aborts the session. The default is 300 seconds, and zero is refused.
+    /// The longest time that a session stays with no request in progress.
+    ///
+    /// It is also the longest time that a request body of a session delivers
+    /// no byte. After this time, the endpoint aborts the session. The default
+    /// is 300 seconds, and [`ReceiveEndpoint::new`] refuses zero.
     pub session_idle_timeout: Duration,
-    /// The most sessions open at the same time. The default is 16, and zero
-    /// is refused.
+    /// The largest number of sessions that are open at the same time.
+    ///
+    /// The default is 16, and [`ReceiveEndpoint::new`] refuses zero.
     pub max_sessions: usize,
-    /// Called with the report of each session that committed, after the
-    /// endpoint sent `CommitReply` or failed to send it. A reply that the
-    /// connection did not take adds a warning of the step
-    /// [`ReplyNotDelivered`](ostrya::ReceiveStep::ReplyNotDelivered). The
-    /// call runs on a task of the host, so it must return soon. The default
-    /// is `None`.
+    /// The callback that gets the report of each session that committed.
+    ///
+    /// The endpoint calls it when the response body of the commit drops. If
+    /// the connection did not take the `CommitReply` frame, the report holds a
+    /// warning of the step
+    /// [`ReplyNotDelivered`](ostrya::ReceiveStep::ReplyNotDelivered). hyper
+    /// can take the frame and still fail to write it, so a reply that the
+    /// client did not get can come with no warning.
+    ///
+    /// The call runs on a task of the host, so the callback must return soon.
+    /// The default is `None`.
     ///
     /// In a session with hooks, the call comes after
     /// [`ReceiveHooks::after_update`](ostrya::ReceiveHooks::after_update),
-    /// and only when `after_update` succeeds. When `after_update` returns an
-    /// error, the client gets 500 with `internal`, the refs and the detached
-    /// metadata stay written, the session ends as aborted, and the call does
-    /// not occur. The host has the report in `after_update`. The client gets
-    /// the message of the error in the `Error` frame, as the hook wrote it,
-    /// cut at 4096 bytes. A host must thus not put secrets or internal
-    /// details in it.
+    /// and only if `after_update` succeeds. If `after_update` returns an
+    /// error, only `after_update` gets the report.
+    /// [`SessionSetup::hooks`](crate::SessionSetup::hooks) states the other
+    /// effects of that error.
     pub on_report: Option<Arc<dyn Fn(ReceiveReport) + Send + Sync>>,
 }
 
-/// The report callback is stated by whether it is set.
+/// The debug text shows `<callback>` for a report callback that is set.
 impl fmt::Debug for EndpointOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EndpointOptions")
@@ -82,10 +89,156 @@ impl Default for EndpointOptions {
     }
 }
 
-/// The receive endpoint of a push over one repository, with the
-/// authentication `A`, which a host mounts in its own router. The endpoint
-/// opens no listener and does no TLS. The crate docs state how to mount
-/// it.
+/// The receive endpoint of a push, which a host mounts in its own router.
+///
+/// The endpoint serves one repository and uses the authentication `A`. It
+/// opens no listener and does no TLS. [`Server`](crate::Server) runs the
+/// same endpoint with its built-in authentication methods.
+///
+/// # Mounting
+///
+/// - [`handle`](ReceiveEndpoint::handle) takes a raw path that starts with
+///   `/_ostrya/receive/v1/`. If a host mounts the endpoint under a prefix,
+///   for example `/api/v1/push`, the host removes the prefix before the call.
+///   `Router::nest_service` of axum removes the prefix itself. The push
+///   address of a client is then `https://HOST/api/v1/push`.
+/// - The request body does not need to be `Sync`, so the body of axum fits.
+///   The response body is [`ReceiveBody`].
+/// - Run the future of [`sweep`](ReceiveEndpoint::sweep) once, in a task of
+///   its own, when the host starts. If no task runs it, no session reaches
+///   its idle timeout.
+/// - Call [`shutdown`](ReceiveEndpoint::shutdown) before the graceful
+///   shutdown of the listener.
+/// - Serve the endpoint on a dedicated listener, with a port or an SNI name
+///   of its own. A listener for other routes keeps its own windows.
+/// - On that listener, set the HTTP/2 windows of
+///   [`h2_windows`](ReceiveEndpoint::h2_windows). Set the maximum number of
+///   concurrent streams of one connection to 32, the value of the server.
+///   Both HTTP/2 settings apply only to a TLS listener that offers `h2`
+///   through ALPN, because the push client speaks HTTP/1.1 over cleartext.
+/// - The request bytes that the host did not read are at most the
+///   connection window times the number of open connections. The host grants
+///   the windows when it sets up a connection, before it authenticates a
+///   request.
+/// - The runtime backend of the crate must be the runtime of the host: the
+///   `tokio` feature for a host on tokio. Under tokio,
+///   [`handle`](ReceiveEndpoint::handle) and
+///   [`sweep`](ReceiveEndpoint::sweep) must run within a tokio runtime with
+///   the time driver enabled.
+///
+/// # Responses
+///
+/// Each request under the raw path prefix `/_ostrya/receive/v1/` is one
+/// step of a push session of [`ReceiveService`](ostrya::ReceiveService). The
+/// path is not percent-decoded.
+///
+/// - `POST session`, with a body of one `Hello` frame, opens a session. The
+///   response is 200 with the `HelloReply` frame. The header
+///   `Ostrya-Session` carries the session id: 64 lowercase hex digits of 32
+///   bytes from the random source of the operating system.
+/// - `POST session/ID/have`, with one `Have` frame, gets `HaveReply`.
+/// - `POST session/ID/objects`, with one object stream, gets
+///   `ObjectsReply`. Up to [`EndpointOptions::parallel_uploads`] of these run
+///   at the same time in one session, and one more gets `limit-exceeded`.
+/// - `POST session/ID/commit`, with one `Commit` frame, gets `CommitReply`.
+///   The commit runs in a task of its own, so a disconnect, a `DELETE`, or
+///   the idle timeout does not stop it. If the session already commits, a
+///   second `commit` gets 422 with `protocol`, and the first commit goes on.
+/// - `DELETE session/ID` ends the session and the requests of the session
+///   in flight. It gets 204 with no body and no `Content-Length`. If the
+///   session commits, the `DELETE` gets 422 with `protocol`, and the commit
+///   goes on.
+///
+/// These requests get 404 with no body:
+///
+/// - a path under the prefix that names no route
+/// - an id that is not a session of the owner of the request
+/// - a session that ended
+///
+/// A known path with another method, also `GET` and `HEAD`, gets 405 with
+/// `Allow: POST` or `Allow: DELETE`. The body of `session`, `have`, and
+/// `commit` holds one frame of at most 1 MiB. An empty body or a byte after
+/// the frame is a `protocol` error.
+///
+/// Each other response body is one frame. An error is an `Error` frame, and
+/// its code sets the status:
+///
+/// - `ref-mismatch` and `non-fast-forward` get 409.
+/// - `internal` gets 500.
+/// - Every other code gets 422.
+/// - An error of the server with no wire code gets 500 with `internal` and
+///   the text of the error.
+/// - If [`EndpointOptions::max_sessions`] sessions are open, a `session`
+///   request whose `Hello` passes its checks gets 503 with `limit-exceeded`.
+/// - If the authentication refuses a request, the request gets 401 or 403
+///   with `unauthorized`.
+///
+/// No response that the endpoint builds itself carries `Content-Type` or
+/// `Retry-After`. A refusal of the authentication carries the headers that
+/// the authentication adds to it.
+///
+/// A refusal can come before the endpoint reads the body, for example a 404
+/// or a 405. Before such a refusal, the endpoint reads and drops up to 1 MiB
+/// of the body. The time limit of this read is the idle timeout or 5
+/// seconds, whichever is shorter. On HTTP/1.1, if the body did not reach its
+/// end, the response gets `Connection: close`.
+///
+/// # Sessions
+///
+/// A failed step ends its session. The other requests of the session in
+/// flight get 422 with `protocol` and the cause.
+///
+/// If a request ends before its response, for example because the client
+/// closes the connection, its session ends too, unless the session commits.
+/// A request body can fail, for example because the client closes the
+/// connection in the middle of the body. The cause is then that of a request
+/// that ended before its response.
+///
+/// If a session has no request in progress for
+/// [`EndpointOptions::session_idle_timeout`], the endpoint aborts it. The
+/// endpoint also aborts a session with a request body that delivers no byte
+/// for that time. While the endpoint does not read a request body, that body
+/// does not count as silent. The body of a `session` request must arrive in
+/// full within the idle timeout.
+///
+/// The future of [`sweep`](ReceiveEndpoint::sweep) applies the timeout. A
+/// session that commits is never aborted. It holds its slot until the commit
+/// ends, also if the commit fails or panics.
+///
+/// [`shutdown`](ReceiveEndpoint::shutdown) aborts every session that does
+/// not commit. A `session` request after the call gets 503. A commit that
+/// runs goes on to its end.
+///
+/// The endpoint reads the repository settings once, at start. A change of
+/// the settings applies at the next start.
+///
+/// # Examples
+///
+/// A host that mounts the endpoint under the prefix `/api/v1/push`:
+///
+/// ```no_run
+/// use std::sync::Arc;
+///
+/// use hyper::body::Incoming;
+/// use hyper::{Request, Response};
+/// use ostrya_server::{ReceiveAuth, ReceiveBody, ReceiveEndpoint};
+///
+/// // Runs the idle sweep in a task of its own, once, when the host starts.
+/// fn start<A: ReceiveAuth>(endpoint: &Arc<ReceiveEndpoint<A>>) {
+///     let endpoint = endpoint.clone();
+///     drop(ostrya_rt::spawn(async move { endpoint.sweep().await }));
+/// }
+///
+/// // Removes the prefix of the host, then lets the endpoint answer.
+/// async fn route<A: ReceiveAuth>(
+///     endpoint: &ReceiveEndpoint<A>,
+///     mut req: Request<Incoming>,
+/// ) -> Response<ReceiveBody> {
+///     let path = req.uri().path().strip_prefix("/api/v1/push").unwrap_or("/");
+///     *req.uri_mut() = path.parse().expect("a path is a valid URI");
+///     endpoint.handle(req).await
+/// }
+/// ```
 pub struct ReceiveEndpoint<A: ReceiveAuth> {
     inner: Receive<A>,
     /// Fires at [`shutdown`](ReceiveEndpoint::shutdown), and ends
@@ -93,7 +246,8 @@ pub struct ReceiveEndpoint<A: ReceiveAuth> {
     stop: Arc<Shutdown>,
 }
 
-/// The repository and the authentication are left out.
+/// The debug text shows the options. It leaves out the repository and the
+/// authentication.
 impl<A: ReceiveAuth> fmt::Debug for ReceiveEndpoint<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReceiveEndpoint")
@@ -105,9 +259,18 @@ impl<A: ReceiveAuth> fmt::Debug for ReceiveEndpoint<A> {
 }
 
 impl<A: ReceiveAuth> ReceiveEndpoint<A> {
-    /// An endpoint over `repo` with the authentication `auth`. A
-    /// `parallel_uploads` outside `1..=31`, a zero idle timeout, and a zero
-    /// `max_sessions` are [`Error::Options`].
+    /// Creates an endpoint over `repo` with the authentication `auth`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Options`] if
+    ///   [`parallel_uploads`](EndpointOptions::parallel_uploads) is outside
+    ///   `1..=31`.
+    /// - [`Error::Options`] if
+    ///   [`session_idle_timeout`](EndpointOptions::session_idle_timeout) is
+    ///   zero.
+    /// - [`Error::Options`] if
+    ///   [`max_sessions`](EndpointOptions::max_sessions) is zero.
     pub fn new(repo: Repo, auth: A, options: EndpointOptions) -> Result<ReceiveEndpoint<A>> {
         if !PARALLEL_UPLOADS.contains(&options.parallel_uploads) {
             return Err(Error::Options(format!(
@@ -135,32 +298,36 @@ impl<A: ReceiveAuth> ReceiveEndpoint<A> {
         })
     }
 
-    /// The response to one request of the endpoint.
+    /// Returns the response to one request of the endpoint.
     ///
-    /// The raw request path must start with `/_ostrya/receive/v1/`. A host
-    /// that mounts the endpoint under a prefix removes the prefix before the
-    /// call: `Router::nest_service` of axum does this. The path is not
-    /// percent-decoded, and the query is ignored. Another path gets 404,
-    /// and a `GET` or a `HEAD` of a route gets 405 with `Allow`. Before
-    /// such an answer, the endpoint reads and drops up to 1 MiB of the
-    /// body. The crate docs state the routes and the answers.
+    /// The raw request path must start with `/_ostrya/receive/v1/`. The path
+    /// is not percent-decoded, and the endpoint ignores the query.
+    /// [Mounting](ReceiveEndpoint#mounting) states how a host removes its
+    /// prefix. [Responses](ReceiveEndpoint#responses) states the routes and
+    /// the responses.
     ///
-    /// A request body that fails is a request that ended before its
-    /// response: the request gets 500 with `internal`, and its session
-    /// ends.
-    ///
-    /// A panic in the commit, also in a hook of the session, is not caught.
-    /// The commit runs in a task of its own, and the panic resumes in this
-    /// call when the call joins that task. It thus panics the request task of
-    /// the host: over HTTP/2 hyper resets the stream, and over HTTP/1.1 it
-    /// closes the connection. The session ends and frees its slot. A panic in
-    /// [`ReceiveHooks::after_update`](ostrya::ReceiveHooks::after_update)
-    /// comes after the refs are written.
+    /// A request body that fails counts as a request that ended before its
+    /// response. The request gets 500 with `internal`, and its session ends.
     ///
     /// Under the tokio backend, the call must run within a tokio runtime
-    /// with the time driver enabled: the commit runs in a task of its own,
+    /// with the time driver enabled. The commit runs in a task of its own,
     /// and the time limits use the timer. A server signer that runs the
     /// GnuPG binaries also needs the IO driver.
+    ///
+    /// # Panics
+    ///
+    /// A panic in the commit or in a hook of the session is not caught. The
+    /// commit runs in a task of its own. The panic resumes in this call when
+    /// the call joins that task, so it panics the request task of the host.
+    ///
+    /// Over HTTP/2, hyper then resets the stream. Over HTTP/1.1, hyper closes
+    /// the connection. The session ends and frees its slot. A panic in
+    /// [`ReceiveHooks::after_update`](ostrya::ReceiveHooks::after_update)
+    /// occurs after the endpoint writes the refs.
+    ///
+    /// If the future of `handle` is dropped first, for example because the
+    /// client resets the stream, the commit task becomes detached. The
+    /// runtime then catches the panic and drops it.
     pub async fn handle<B>(&self, req: Request<B>) -> Response<ReceiveBody>
     where
         B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -169,33 +336,39 @@ impl<A: ReceiveAuth> ReceiveEndpoint<A> {
         self.inner.handle(req).await.map(ReceiveBody)
     }
 
-    /// Abort each session past its idle timeout, and each session with a
-    /// request body that delivered no byte for that time, until
-    /// [`shutdown`](ReceiveEndpoint::shutdown). A session that commits is
-    /// never aborted. Run the future once, in a task of its own, while the
-    /// endpoint serves: without it no session reaches its idle timeout.
-    /// After `shutdown` the future completes at once.
+    /// Aborts each session past its idle timeout, until
+    /// [`shutdown`](ReceiveEndpoint::shutdown).
     ///
-    /// Under the tokio backend, the future must run within a tokio runtime
-    /// with the time driver enabled.
+    /// The future also aborts each session with a request body that delivered
+    /// no byte for that time. A session that commits is never aborted. After
+    /// `shutdown`, the future completes at once.
+    ///
+    /// The host runs the future once, in a task of its own, while the
+    /// endpoint serves. If no task runs it, no session reaches its idle
+    /// timeout. Under the tokio backend, the future must run within a tokio
+    /// runtime with the time driver enabled.
     pub async fn sweep(&self) {
         future::or(self.stop.wait(), self.inner.table.sweep()).await
     }
 
-    /// Stop the endpoint: abort each session that does not commit, and end
+    /// Stops the endpoint.
+    ///
+    /// The call aborts each session that does not commit, and ends
     /// [`sweep`](ReceiveEndpoint::sweep). A commit that runs goes on to its
-    /// end, also through the hooks of its session, and a `session` request
-    /// after the call gets 503. A second call does nothing more.
+    /// end, also through the hooks of its session. A `session` request after
+    /// the call gets 503. A second call has no further effect.
     pub fn shutdown(&self) {
         self.stop.fire();
         self.inner.table.close_all();
     }
 
-    /// The HTTP/2 receive windows for a connection that carries the
-    /// endpoint: the window of each stream, 2 MiB, and the window of the
-    /// connection, 2 MiB for each of the `parallel_uploads` object streams of
-    /// a session. The request bodies of one connection thus hold at most
-    /// that many bytes that the host did not read.
+    /// Returns the HTTP/2 receive windows for a connection to the endpoint.
+    ///
+    /// The first value is the window of each stream, 2 MiB. The second value
+    /// is the window of the connection: 2 MiB for each of the
+    /// [`parallel_uploads`](EndpointOptions::parallel_uploads) object streams
+    /// of a session. The request bodies of one connection hold at most this
+    /// number of bytes that the host did not read.
     pub fn h2_windows(&self) -> (u32, u32) {
         (UPLOAD_WINDOW, UPLOAD_WINDOW * self.inner.parallel_uploads)
     }
@@ -272,7 +445,7 @@ mod tests {
     }
 
     /// The window of a connection follows `parallel_uploads`, and the widest
-    /// one is below the HTTP/2 maximum.
+    /// one is less than the HTTP/2 maximum.
     #[test]
     fn the_h2_windows_follow_parallel_uploads() {
         let tmp = TmpRepo::new("endpoint-windows");

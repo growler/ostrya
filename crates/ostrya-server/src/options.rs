@@ -9,8 +9,9 @@ use ostrya::{ReceivePolicy, ReceiveReport};
 
 use crate::endpoint::EndpointOptions;
 
-/// The PEM bytes of the server TLS files. The caller reads each file once at
-/// start.
+/// The PEM bytes of the server TLS files.
+///
+/// The caller reads each file once at start.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ServerTls {
     /// The server certificate, followed by any intermediates.
@@ -18,15 +19,16 @@ pub struct ServerTls {
     /// The private key of the certificate: plain, or encrypted PKCS#8 under
     /// PBES2.
     pub key_pem: Vec<u8>,
-    /// Decrypts an encrypted key.
+    /// The passphrase of an encrypted key.
     pub key_passphrase: Option<String>,
-    /// The CA that client certificates are verified against. A client that
-    /// presents no certificate is served.
+    /// The CA against which the server verifies client certificates. The
+    /// server also serves a client that presents no certificate.
     pub client_ca_pem: Option<Vec<u8>>,
 }
 
-/// The private key and the passphrase are held out of the formatted text.
-/// The key is stated by its length, and the passphrase by whether it is set.
+/// The debug text holds no byte of the private key or of the passphrase. It
+/// shows the key as `<N bytes redacted>`, and a passphrase that is set as
+/// `<redacted>`.
 impl fmt::Debug for ServerTls {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServerTls")
@@ -44,79 +46,163 @@ impl fmt::Debug for ServerTls {
     }
 }
 
-/// The options of [`bind`](crate::bind). Start from
-/// [`ServeOptions::default`] and set the fields.
+/// The options of [`bind`](crate::bind).
+///
+/// The struct is `#[non_exhaustive]`, so a caller starts from
+/// [`ServeOptions::default`] and sets the fields.
+///
+/// The fields `parallel_uploads`, `session_idle_timeout`, `max_sessions`, and
+/// `on_report` go to the [`EndpointOptions`] of the receive endpoint. Their
+/// defaults are the defaults of [`EndpointOptions::default`]. If
+/// [`receive`](ServeOptions::receive) is `None`, [`bind`](crate::bind) does
+/// not read these four fields, `allow_anonymous_push`, `credentials`, or
+/// `allow_cleartext_credentials`. It then refuses no value of them.
+///
+/// # Authentication
+///
+/// The server runs the receive endpoint with built-in authentication methods.
+/// Each session gets the policy of [`receive`](ServeOptions::receive) and no
+/// hooks. The methods are:
+///
+/// - A bearer token, `Authorization: Bearer TOKEN`. It matches a line of
+///   [`credentials`](ServeOptions::credentials) by the SHA-256 digest of the
+///   token. An empty token matches no line.
+/// - A Basic credential, `Authorization: Basic` with the base64 of
+///   `NAME:TOKEN`. It matches the line of `NAME` by the digest of the token.
+///   The token runs from the first `:` to the end, so it can hold `:`. A
+///   credential with no `:`, a name that is not UTF-8, and an empty token
+///   match no line.
+/// - A client certificate that the TLS handshake verified against the client
+///   CA of [`tls`](ServeOptions::tls).
+/// - [`allow_anonymous_push`](ServeOptions::allow_anonymous_push), for a
+///   request with no credential.
+///
+/// [`bind`](crate::bind) refuses an endpoint with no method. If the server
+/// has no TLS, [`bind`](crate::bind) also refuses an endpoint whose one method
+/// is the credential file, unless
+/// [`allow_cleartext_credentials`](ServeOptions::allow_cleartext_credentials)
+/// is set. No request can pass that method, because the endpoint refuses
+/// each credential over plain HTTP.
+///
+/// The server compares the digest of a request with the digest of each line
+/// in constant time. It does not stop at a match. The checks run in this
+/// order:
+///
+/// 1. A request with more than one `Authorization` header gets 401.
+/// 2. If the connection has no TLS, a bearer or Basic credential gets 403,
+///    unless
+///    [`allow_cleartext_credentials`](ServeOptions::allow_cleartext_credentials)
+///    is set. This check also applies where anonymous push is allowed.
+/// 3. An `Authorization` header that matches no line gets 401, also when the
+///    request has a client certificate.
+/// 4. A request with no `Authorization` header gets the first result that
+///    applies:
+///    - the owner of its client certificate
+///    - the owner `anonymous`, if anonymous push is allowed
+///    - 401, if the server has credential lines
+///    - 403, if the client CA is the one method of the server
+///
+/// Each 401 of the built-in methods carries two headers:
+/// `WWW-Authenticate: Bearer realm="ostrya"` and
+/// `WWW-Authenticate: Basic realm="ostrya"`.
+///
+/// The owner key of a request has a prefix for each method:
+///
+/// - `token:NAME` for a bearer token or a Basic credential, where `NAME` is
+///   the name of its credential line.
+/// - `cert:HEX` for a client certificate, where `HEX` is the SHA-256 digest
+///   of its DER bytes in lowercase hex.
+/// - `anonymous` for anonymous push.
+///
+/// A name can be equal to a digest, so the prefix keeps the keys of two
+/// methods apart. A bearer token and a Basic credential of one line give one
+/// key.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ServeOptions {
-    /// The addresses to listen on. Port 0 lets the kernel choose a port,
-    /// which [`Server::local_addrs`](crate::Server::local_addrs) reports. The
-    /// default is `127.0.0.1:8080`.
+    /// The addresses to listen on.
+    ///
+    /// Port 0 lets the kernel choose a port, which
+    /// [`Server::local_addrs`](crate::Server::local_addrs) reports.
+    /// [`bind`](crate::bind) refuses an empty list. The default is
+    /// `127.0.0.1:8080`.
     pub listen: Vec<SocketAddr>,
-    /// The TLS files, or `None` for plain HTTP.
+    /// The TLS files, or `None` for plain HTTP. The default is `None`.
     pub tls: Option<ServerTls>,
-    /// The time a response body may wait for the client to take its next
-    /// bytes. A connection with a body that waits longer ends, and the file
-    /// and the compressor the body holds are released. An HTTP/2 connection
-    /// sends a ping after half this time with no frame from the peer, and
-    /// ends when the peer does not answer within this time. The default is 60
-    /// seconds, and zero is refused.
+    /// The longest time that a response body waits for the client to take its
+    /// next bytes.
+    ///
+    /// If a body waits longer, its connection ends. The bodies of the
+    /// connection then drop and release the files and the compressors that
+    /// they hold. An HTTP/2 connection sends a ping after half this time with
+    /// no frame from the peer. It ends if the peer does not answer within
+    /// this time.
+    ///
+    /// A body that waits for its own reader, for example for a compressor of
+    /// the archive view, does not wait for the client. The time does not
+    /// count for such a body until it gives its next frame.
+    ///
+    /// The default is 60 seconds. [`bind`](crate::bind) refuses zero.
     pub body_timeout: Duration,
     /// The receive policy of the receive endpoint, or `None` for a read-only
-    /// server, which is the default. Every session of the endpoint shares
-    /// the policy. The server reads no policy and no repository setting of
-    /// the endpoint again while it runs, so a change applies at the next
+    /// server.
+    ///
+    /// The default is `None`. Every session of the endpoint shares the
+    /// policy. The server does not read the policy or a repository setting of
+    /// the endpoint again while it runs. A change takes effect at the next
     /// start.
     pub receive: Option<Arc<ReceivePolicy>>,
-    /// Let a request with no credential push. The default is `false`.
+    /// The switch that lets a request with no credential push.
     ///
-    /// The authentication methods of the receive endpoint are this switch,
-    /// the lines of [`credentials`](ServeOptions::credentials), and the
-    /// client CA of [`tls`](ServeOptions::tls). [`bind`](crate::bind)
-    /// refuses a receive endpoint with no method. With no TLS, it also
-    /// refuses an endpoint whose one method is the credential lines unless
-    /// [`allow_cleartext_credentials`](ServeOptions::allow_cleartext_credentials)
-    /// is set, because no request can pass it.
+    /// The default is `false`. The switch is one of the methods in
+    /// [Authentication](ServeOptions#authentication).
     pub allow_anonymous_push: bool,
-    /// The bytes of the push credential file, or `None`, which is the
-    /// default. The file holds one credential on each line, `NAME:HEX`, where
-    /// `HEX` is the SHA-256 digest of the secret in 64 lowercase hex digits.
-    /// A line that starts with `#` and an empty line hold no credential.
-    /// With [`receive`](ServeOptions::receive) set, [`bind`](crate::bind)
-    /// parses the file, and a malformed line is
-    /// [`Error::Credentials`](crate::Error::Credentials). A file with no
-    /// credential line gives no authentication method. A read-only server
-    /// does not read the field.
+    /// The bytes of the push credential file.
+    ///
+    /// The default is `None`. Each line of the file holds one credential,
+    /// `NAME:HEX`. `NAME` is one or more visible ASCII characters other than
+    /// `:`. `HEX` is the SHA-256 digest of the secret in 64 lowercase hex
+    /// digits.
+    ///
+    /// A line that starts with `#` and an empty line hold no credential. A
+    /// file with no credential line gives no authentication method.
+    ///
+    /// If [`receive`](ServeOptions::receive) is set, [`bind`](crate::bind)
+    /// parses the file. A read-only server does not read the field. A
+    /// malformed line, a name on two lines, and a digest on two lines are
+    /// [`Error::Credentials`](crate::Error::Credentials). This error names
+    /// the line by its number and holds no byte of the line.
     pub credentials: Option<Vec<u8>>,
-    /// Take a bearer or Basic credential of the receive endpoint on a
-    /// connection without TLS. The default is `false`, and the endpoint then
-    /// refuses such a credential with 403. Set it for a server on a loopback
-    /// address or behind a proxy that terminates TLS. A read-only server does
-    /// not read the field.
+    /// The switch that takes a bearer or Basic credential on a connection
+    /// without TLS.
+    ///
+    /// The default is `false`. If the switch is `false`, the endpoint refuses
+    /// such a credential with 403. A server on a loopback address or behind a
+    /// proxy that terminates TLS can set it. A read-only server does not read
+    /// the field.
     pub allow_cleartext_credentials: bool,
-    /// The number of object streams one session runs at the same time, which
-    /// `HelloReply` announces. The value is in `1..=31`, and the default
-    /// is 4. The HTTP/2 receive window of a connection is 2 MiB for each
-    /// stream, and the window of one stream is 2 MiB.
+    /// The number of object streams of one session, as in
+    /// [`EndpointOptions::parallel_uploads`].
+    ///
+    /// The default is 4.
     pub parallel_uploads: u32,
-    /// The time a session may stay with no request in progress, and the time
-    /// a request body of a session may deliver no byte. Past it the server
-    /// aborts the session. The default is 300 seconds, and zero is refused.
+    /// The idle timeout of a session, as in
+    /// [`EndpointOptions::session_idle_timeout`].
+    ///
+    /// The default is 300 seconds.
     pub session_idle_timeout: Duration,
-    /// The most sessions open at the same time. The default is 16, and zero
-    /// is refused.
+    /// The most sessions open at the same time, as in
+    /// [`EndpointOptions::max_sessions`].
+    ///
+    /// The default is 16.
     pub max_sessions: usize,
-    /// Called with the report of each session that committed, after the
-    /// server sent `CommitReply` or failed to send it. A reply that the
-    /// connection did not take adds a warning of the step
-    /// [`ReplyNotDelivered`](ostrya::ReceiveStep::ReplyNotDelivered). The
-    /// call runs on a task of the server, so it must return soon. The
-    /// default is `None`.
+    /// The callback for the report of a committed session, as in
+    /// [`EndpointOptions::on_report`].
     pub on_report: Option<Arc<dyn Fn(ReceiveReport) + Send + Sync>>,
 }
 
-/// The report callback is stated by whether it is set, and the credential
-/// file by its length.
+/// The debug text holds no byte of the credential file. It shows the file as
+/// `<N bytes redacted>`, and a report callback that is set as `<callback>`.
 impl fmt::Debug for ServeOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServeOptions")

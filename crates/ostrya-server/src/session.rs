@@ -1,12 +1,17 @@
 //! The sessions of the receive endpoint.
 //!
-//! The table holds one entry for each open session: the
-//! [`ReceiveService`] of the session, its owner, the time of its last
-//! activity, the count of its requests in progress, the request bodies in
-//! flight with the time each one started to wait for the client, and a
-//! cancel signal that ends the requests of the session in flight. One sweep
-//! task applies the idle timeout to every entry. The lock of the table is
-//! never held while a service is aborted or dropped.
+//! The table holds one entry for each open session. An entry holds:
+//!
+//! - the [`ReceiveService`] of the session
+//! - the owner key of the session
+//! - the time of the last activity
+//! - the count of the requests in progress
+//! - each request body in flight, with the time it started to wait for the
+//!   client
+//! - a cancel signal that ends the requests of the session in flight
+//!
+//! One sweep task applies the idle timeout to every entry. No code holds the
+//! lock of the table while it aborts or drops a service.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -48,15 +53,15 @@ pub(crate) struct SessionId {
 }
 
 impl SessionId {
-    /// A new id from the random source of the operating system.
+    /// Creates a new id from the random source of the operating system.
     pub(crate) fn new() -> Result<SessionId, getrandom::Error> {
         let mut inner = [0u8; 32];
         getrandom::fill(&mut inner)?;
         Ok(SessionId { inner })
     }
 
-    /// The id that `text` shows. The text is exactly 64 lowercase hex
-    /// digits, and any other text gives `None`.
+    /// Returns the id that `text` shows. The text must be exactly 64
+    /// lowercase hex digits. Any other text gives `None`.
     pub(crate) fn parse(text: &str) -> Option<SessionId> {
         let checksum = Checksum::from_hex_lower(text).ok()?;
         Some(SessionId {
@@ -72,7 +77,7 @@ impl fmt::Display for SessionId {
 }
 
 /// The signal that ends the requests of one session in flight, and the
-/// cause the requests report.
+/// cause that the requests report.
 pub(crate) struct Cancel {
     signal: Arc<Shutdown>,
     cause: OnceLock<&'static str>,
@@ -86,19 +91,20 @@ impl Cancel {
         })
     }
 
-    /// Record `cause`, unless a cause is already recorded, and wake each
+    /// Records `cause`, unless a cause is already recorded, and wakes each
     /// waiter.
     fn fire(&self, cause: &'static str) {
         let _ = self.cause.set(cause);
         self.signal.fire();
     }
 
-    /// A future that completes when the session ends.
+    /// Returns a future that completes when the session ends.
     pub(crate) fn wait(&self) -> Wait {
         self.signal.wait()
     }
 
-    /// Why the session ended.
+    /// Returns the cause of the end of the session. If no cause is
+    /// recorded, it returns the cause of the stop of the server.
     pub(crate) fn cause(&self) -> &'static str {
         self.cause.get().copied().unwrap_or(STOPPED)
     }
@@ -117,18 +123,19 @@ struct Entry {
     /// wait for the client, or `None` while it does not wait.
     bodies: HashMap<u64, Option<Instant>>,
     cancel: Arc<Cancel>,
-    /// The commit of the session runs. The sweep and a `DELETE` leave the
-    /// session alone.
+    /// `true` while the commit of the session runs. The sweep and a
+    /// `DELETE` do not end the session then.
     committing: bool,
-    /// A request body of the session failed, as when the client closed the
-    /// connection. A failed request then ends the session with the cause of
-    /// a request that ended before its response.
+    /// `true` if a request body of the session failed, for example when the
+    /// client closed the connection. A failed request then ends the session
+    /// with the cause of a request that ended before its response.
     cut: bool,
 }
 
 impl Entry {
-    /// End the session with `cause`: wake its requests in flight and abort
-    /// its service. The caller holds no lock of the table.
+    /// Ends the session with `cause`. It wakes the requests of the session
+    /// in flight and aborts the service. The caller must hold no lock of the
+    /// table.
     fn close(self, cause: &'static str) {
         self.cancel.fire(cause);
         self.service.abort();
@@ -137,10 +144,10 @@ impl Entry {
 
 struct State {
     entries: HashMap<SessionId, Entry>,
-    /// The slots reserved for sessions that open now.
+    /// The count of the slots reserved for sessions that open now.
     pending: usize,
     next_body: u64,
-    /// The server stopped. The table takes no session from now on.
+    /// `true` after the server stopped. The table then takes no session.
     closed: bool,
 }
 
@@ -162,8 +169,8 @@ pub(crate) enum Deleted {
 }
 
 impl SessionTable {
-    /// A table of at most `max` sessions, each aborted after `idle` with no
-    /// request in progress.
+    /// Creates a table of at most `max` sessions. The sweep aborts a session
+    /// after `idle` with no request in progress.
     pub(crate) fn new(max: usize, idle: Duration) -> Arc<SessionTable> {
         Arc::new(SessionTable {
             max,
@@ -177,12 +184,12 @@ impl SessionTable {
         })
     }
 
-    /// The idle timeout.
+    /// Returns the idle timeout.
     pub(crate) fn idle(&self) -> Duration {
         self.idle
     }
 
-    /// The most sessions open at the same time.
+    /// Returns the maximum count of sessions open at the same time.
     pub(crate) fn max(&self) -> usize {
         self.max
     }
@@ -191,9 +198,9 @@ impl SessionTable {
         self.state.lock().expect("session table mutex")
     }
 
-    /// Reserve the slot of a session that opens now, or `None` when the open
-    /// sessions and the reserved slots are at the limit, or the server
-    /// stopped.
+    /// Reserves the slot of a session that opens now. If the open sessions
+    /// and the reserved slots are at the limit, or if the server stopped, it
+    /// returns `None`.
     pub(crate) fn reserve(self: &Arc<SessionTable>) -> Option<Reservation> {
         let mut state = self.lock();
         if state.closed || state.entries.len() + state.pending >= self.max {
@@ -206,9 +213,9 @@ impl SessionTable {
         })
     }
 
-    /// The session `id` of the owner key `owner`, counted as active until the
-    /// returned value drops. An unknown id and a session of another owner
-    /// both give `None`.
+    /// Returns the session `id` of the owner key `owner`. The session counts
+    /// as active until the returned value drops. An unknown id and a session
+    /// of another owner both give `None`.
     pub(crate) fn lookup(self: &Arc<SessionTable>, id: &SessionId, owner: &str) -> Option<Active> {
         let mut state = self.lock();
         let entry = state.entries.get_mut(id).filter(|e| e.owner == owner)?;
@@ -222,8 +229,8 @@ impl SessionTable {
         })
     }
 
-    /// End the session `id` of the owner key `owner` for a `DELETE`. A
-    /// session that commits is left as it is.
+    /// Ends the session `id` of the owner key `owner` for a `DELETE`. A
+    /// session that commits stays as it is.
     pub(crate) fn delete(&self, id: &SessionId, owner: &str) -> Deleted {
         let entry = {
             let mut state = self.lock();
@@ -243,8 +250,8 @@ impl SessionTable {
         Deleted::Done
     }
 
-    /// Remove the session `id` and end it with `cause`. An id that is not in
-    /// the table does nothing.
+    /// Removes the session `id` and ends it with `cause`. If the id is not
+    /// in the table, the call does nothing.
     pub(crate) fn end(&self, id: &SessionId, cause: &'static str) {
         let entry = self.lock().entries.remove(id);
         if let Some(entry) = entry {
@@ -252,10 +259,10 @@ impl SessionTable {
         }
     }
 
-    /// Remove the session `id` and end it after a failed request. A session
-    /// that commits is left as it is, because its commit goes on and removes
-    /// it at the end. A session with a request body that failed ends with
-    /// the cause of a request that ended before its response.
+    /// Removes the session `id` and ends it after a failed request. A
+    /// session that commits stays, because its commit goes on and removes it
+    /// at the end. If a request body of the session failed, the session ends
+    /// with the cause of a request that ended before its response.
     pub(crate) fn fail(&self, id: &SessionId) {
         let entry = {
             let mut state = self.lock();
@@ -270,9 +277,9 @@ impl SessionTable {
         }
     }
 
-    /// End every session that does not commit, when the server stops. A
+    /// Ends every session that does not commit, when the server stops. A
     /// session that commits stays, because its commit goes on and removes it
-    /// at the end. The table takes no session after it.
+    /// at the end. The table takes no session after this call.
     pub(crate) fn close_all(&self) {
         let entries: Vec<Entry> = {
             let mut state = self.lock();
@@ -288,12 +295,13 @@ impl SessionTable {
         }
     }
 
-    /// Abort each session past its idle timeout, and each session with a
-    /// request body that waited for the idle timeout, until the future is
-    /// dropped. A session that commits is never aborted. The task sleeps to
-    /// the earliest deadline, and at most one idle timeout. A deadline that
-    /// arises while it sleeps is one idle timeout or more after its start,
-    /// so it is never before the end of the sleep.
+    /// Aborts each session past its idle timeout, and each session with a
+    /// request body that waited for the idle timeout. The loop runs until
+    /// the future drops. The sweep never aborts a session that commits.
+    ///
+    /// The task sleeps until the earliest deadline, for at most one idle
+    /// timeout. A deadline that arises during the sleep is one idle timeout
+    /// or more after its start, so it never comes before the sleep ends.
     pub(crate) async fn sweep(&self) {
         loop {
             let (expired, wait) = self.expire(Instant::now());
@@ -304,8 +312,9 @@ impl SessionTable {
         }
     }
 
-    /// Remove each session past a deadline at `now`, with its cause, and give
-    /// the time from `now` to the next deadline, at most one idle timeout.
+    /// Removes each session past a deadline at `now` and returns it with its
+    /// cause. It also returns the time from `now` to the next deadline, at
+    /// most one idle timeout.
     fn expire(&self, now: Instant) -> (Vec<(Entry, &'static str)>, Duration) {
         let mut state = self.lock();
         let mut next = self.idle;
@@ -336,17 +345,18 @@ impl SessionTable {
     }
 }
 
-/// A slot of the table for a session that opens now. Dropping it unused
-/// frees the slot.
+/// A slot of the table for a session that opens now. If the value drops
+/// unused, the slot becomes free.
 pub(crate) struct Reservation {
     table: Arc<SessionTable>,
     used: bool,
 }
 
 impl Reservation {
-    /// Put the session `id` of the owner key `owner` into the slot. `false`
-    /// when the server stopped after the slot was reserved: the service is
-    /// then aborted and dropped, and the table holds no entry for it.
+    /// Puts the session `id` of the owner key `owner` into the slot. If the
+    /// server stopped after the reservation, it returns `false`. The call
+    /// then aborts and drops the service, and the table holds no entry for
+    /// it.
     pub(crate) fn insert(mut self, id: SessionId, service: ReceiveService, owner: String) -> bool {
         let mut state = self.table.lock();
         state.pending -= 1;
@@ -382,21 +392,22 @@ impl Drop for Reservation {
     }
 }
 
-/// A request of a session in progress. Dropping it ends the count, and the
-/// idle time of the session starts again. A request dropped before its
-/// response, as when the client closes the connection, ends the session
-/// unless the session commits.
+/// A request of a session in progress. The drop of the value removes the
+/// request from the count of requests in progress, and the idle time of the
+/// session starts again. If the request drops before its response, for
+/// example when the client closes the connection, the session ends. A
+/// session that commits does not end this way.
 pub(crate) struct Active {
     table: Arc<SessionTable>,
     id: SessionId,
     service: Arc<ReceiveService>,
     cancel: Arc<Cancel>,
-    /// The request has its response.
+    /// `true` after the request has its response.
     complete: bool,
 }
 
 impl Active {
-    /// Record that the request has its response.
+    /// Records that the request has its response.
     pub(crate) fn complete(&mut self) {
         self.complete = true;
     }
@@ -417,7 +428,8 @@ impl Active {
         &self.table
     }
 
-    /// Record a request body of the session, which waits for nothing yet.
+    /// Records a request body of the session. The new body does not wait
+    /// for the client yet.
     pub(crate) fn track(&self) -> BodyTrack {
         let mut state = self.table.lock();
         let body = state.next_body;
@@ -432,7 +444,7 @@ impl Active {
         }
     }
 
-    /// Mark the session as committing, unless it commits already or it
+    /// Marks the session as committing, unless it commits already or it
     /// ended.
     pub(crate) fn begin_commit(&self) -> Begin {
         let mut state = self.table.lock();
@@ -462,10 +474,10 @@ pub(crate) enum Begin {
     Ended,
 }
 
-/// The end of a session that commits. When it drops, it removes the session
-/// and ends it with the cause of a commit, or with the cause of a failed
-/// request unless [`committed`](Self::committed) ran. A commit that panics
-/// or is dropped thus frees its slot.
+/// The guard of a session that commits. When the guard drops, it removes the
+/// session and ends it. If [`committed`](Self::committed) ran, the cause is
+/// that of a commit. If not, the cause is that of a failed request. A commit
+/// that panics or drops also frees its slot, because the guard drops with it.
 pub(crate) struct CommitEnd {
     table: Arc<SessionTable>,
     id: SessionId,
@@ -473,7 +485,7 @@ pub(crate) struct CommitEnd {
 }
 
 impl CommitEnd {
-    /// Record that the commit succeeded.
+    /// Records that the commit succeeded.
     pub(crate) fn committed(&mut self) {
         self.cause = COMMITTED;
     }
@@ -513,17 +525,18 @@ pub(crate) struct BodyTrack {
 }
 
 impl BodyTrack {
-    /// Record that the body waits for the client from now on.
+    /// Records that the body waits for the client from now on.
     pub(crate) fn waiting(&self) {
         self.set(Some(Instant::now()));
     }
 
-    /// Record that the body delivered bytes now.
+    /// Records that the body delivered bytes now. This also sets the time of
+    /// the last activity of the session.
     pub(crate) fn progress(&self) {
         self.set(None);
     }
 
-    /// Record that the body failed, as when the client closed the
+    /// Records that the body failed, for example when the client closed the
     /// connection.
     pub(crate) fn cut(&self) {
         if let Some(entry) = self.table.lock().entries.get_mut(&self.id) {
@@ -564,8 +577,8 @@ pub(crate) mod tests {
 
     use super::*;
 
-    /// A repository in a directory of its own, removed with the value once
-    /// no staging directory is left.
+    /// A repository in a directory of its own. The drop of the value removes
+    /// the directory when no staging directory is left.
     pub(crate) struct TmpRepo {
         path: PathBuf,
         pub(crate) repo: Repo,
@@ -583,7 +596,7 @@ pub(crate) mod tests {
             TmpRepo { path, repo }
         }
 
-        /// A new open session over the repository.
+        /// Returns a new open session over the repository.
         fn service(&self) -> ReceiveService {
             let hello = Hello {
                 version: 1,
@@ -600,7 +613,9 @@ pub(crate) mod tests {
 
     impl Drop for TmpRepo {
         /// The core of an ended session goes on the blocking pool, so the
-        /// staging directory can stay for a short time.
+        /// staging directory can stay for a short time. The drop waits up to
+        /// 30 seconds for the `staging-` entries of `tmp` to go, then removes
+        /// the repository.
         fn drop(&mut self) {
             let deadline = Instant::now() + Duration::from_secs(30);
             while Instant::now() < deadline {
@@ -617,7 +632,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// A table of one session over `repo`, and the id of the session.
+    /// Returns a table of one session over `repo`, and the id of the session.
     fn one_session(repo: &TmpRepo) -> (Arc<SessionTable>, SessionId) {
         let table = SessionTable::new(1, Duration::from_secs(60));
         let id = SessionId::new().unwrap();
@@ -661,8 +676,8 @@ pub(crate) mod tests {
     }
 
     /// A request that drops before its response ends its session with the
-    /// cause of a cut request, and the other requests of the session see the
-    /// cause. A request with its response leaves the session.
+    /// cause of a cut request. The other requests of the session see the
+    /// cause. A request with its response does not end the session.
     #[test]
     fn a_request_dropped_before_its_response_ends_the_session() {
         let repo = TmpRepo::new("cut");
@@ -678,9 +693,8 @@ pub(crate) mod tests {
         assert!(table.reserve().is_some(), "the slot is free");
     }
 
-    /// A failed request ends its session with the cause of a failed request,
-    /// and with the cause of a cut request when a body of the session
-    /// failed.
+    /// A failed request ends its session with the cause of a failed request.
+    /// If a body of the session failed, the cause is that of a cut request.
     #[test]
     fn a_failed_request_names_a_cut_body() {
         let repo = TmpRepo::new("fail");
@@ -699,9 +713,9 @@ pub(crate) mod tests {
     }
 
     /// A second commit leaves the session to the first. The end of a commit
-    /// frees the slot with the cause of a commit when it succeeded, and with
-    /// the cause of a failed request when it failed or never reached its
-    /// end, as after a panic.
+    /// frees the slot. If the commit succeeded, the cause is that of a
+    /// commit. If the commit failed or never reached its end, as after a
+    /// panic, the cause is that of a failed request.
     #[test]
     fn the_end_of_a_commit_frees_its_slot() {
         let repo = TmpRepo::new("commit");

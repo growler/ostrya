@@ -3,38 +3,41 @@
 use std::io;
 use std::net::SocketAddr;
 
-/// Result alias of the server.
+/// The result type of the crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The error the server fails with. Each one arises in [`bind`](crate::bind)
-/// or in [`ReceiveEndpoint::new`](crate::ReceiveEndpoint::new), before the
-/// server or the host accepts a connection. An error on one connection ends
-/// that connection and no other.
+/// The error of [`bind`](crate::bind) and of
+/// [`ReceiveEndpoint::new`](crate::ReceiveEndpoint::new).
+///
+/// Each error occurs before the server or the host accepts a connection. An
+/// error on one connection ends that connection and no other.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// A listen address could not be bound.
+    /// A listen address that cannot be bound, or whose local address cannot
+    /// be read.
     #[error("bind {addr}: {source}")]
     Bind {
-        /// The address of the options.
+        /// The listen address from the options.
         addr: SocketAddr,
-        /// The error of the bind.
+        /// The I/O error of the bind or of the read of the local address.
         #[source]
         source: io::Error,
     },
-    /// The TLS files do not give a server configuration.
+    /// TLS files that give no server configuration.
     #[error("server tls: {0}")]
     Tls(String),
-    /// The options cannot be served.
+    /// Options that the server refuses. The text states the reason.
     #[error("invalid serve options: {0}")]
     Options(String),
-    /// A line of the push credential file is malformed. The error names the
-    /// line by its number and holds no byte of it.
+    /// A malformed line of the push credential file.
+    ///
+    /// The error names the line by its number and holds no byte of it.
     #[error("push credentials: line {line}: {message}")]
     Credentials {
         /// The number of the line, from 1.
         line: usize,
-        /// What is wrong with the line.
+        /// The defect of the line.
         message: String,
     },
     /// An error of the repository.

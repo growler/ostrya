@@ -1,14 +1,17 @@
 //! The deadline on the response bodies of one connection.
 //!
-//! A response body that streams a file holds its descriptor, and a `.filez`
-//! built on request also holds a compressor of the view. A client that stops
-//! reading keeps hyper from taking frames of the body, and so keeps those
-//! resources. Each stream body of a connection records the time hyper last
-//! took a frame from it, and [`Stall::expired`] completes when one of them
-//! has waited for the whole window. The connection then ends, and its bodies
-//! drop. A body that waits for its own reader, for example for a compressor
-//! of the view, is not waiting for the client, so its time does not run
-//! until it gives its next frame.
+//! A response body that streams a file holds its descriptor. A `.filez`
+//! built on request also holds a compressor of the view. If a client stops
+//! reading, hyper takes no frame of the body, so the body keeps these
+//! resources.
+//!
+//! Each stream body of a connection records the time when hyper last took a
+//! frame from it. [`Stall::expired`] completes when one body waited for the
+//! whole window. Then the connection ends, and its bodies drop.
+//!
+//! A body that waits for its own reader, for example for a compressor of the
+//! view, does not wait for the client. Its time does not run until it gives
+//! its next frame.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -31,15 +34,15 @@ struct State {
 
 /// One live body.
 struct Entry {
-    /// The time the body was made or last gave a frame.
+    /// The time when the body was made, or when it last gave a frame.
     at: Instant,
-    /// Whether the body waits for its own reader.
+    /// `true` if the body waits for its own reader.
     reading: bool,
 }
 
 impl Stall {
-    /// The bodies of a new connection, which may each wait `window` for
-    /// hyper to take a frame.
+    /// Creates the record of the bodies of a new connection. Each body can
+    /// wait for `window` until hyper takes a frame.
     pub(crate) fn new(window: Duration) -> Arc<Stall> {
         Arc::new(Stall {
             window,
@@ -50,7 +53,7 @@ impl Stall {
         })
     }
 
-    /// Record a new body, made now.
+    /// Records a new body, made now.
     pub(crate) fn track(self: &Arc<Stall>) -> Tracker {
         let mut state = self.state.lock().expect("stall mutex");
         let id = state.next_id;
@@ -68,10 +71,10 @@ impl Stall {
         }
     }
 
-    /// Complete when a live body that does not wait for its reader has
-    /// given no frame for the window. The future sleeps until the oldest such
-    /// body would reach the window, or for one window while there is none,
-    /// and checks again.
+    /// Completes when a live body that does not wait for its reader gives no
+    /// frame for the window. The future sleeps until the oldest such body
+    /// reaches the window, or for one window if there is no such body. Then
+    /// it checks again.
     pub(crate) async fn expired(&self) {
         loop {
             let wait = {
@@ -102,7 +105,7 @@ pub(crate) struct Tracker {
 }
 
 impl Tracker {
-    /// Record that hyper took a frame of the body now.
+    /// Records that hyper took a frame of the body now.
     pub(crate) fn progress(&self) {
         let mut state = self.stall.state.lock().expect("stall mutex");
         if let Some(entry) = state.bodies.get_mut(&self.id) {
@@ -111,8 +114,8 @@ impl Tracker {
         }
     }
 
-    /// Record that the body waits for its reader. The time of the body does
-    /// not run until its next frame.
+    /// Records that the body waits for its reader. The time of the body
+    /// does not run until its next frame.
     pub(crate) fn reading(&self) {
         let mut state = self.stall.state.lock().expect("stall mutex");
         if let Some(entry) = state.bodies.get_mut(&self.id) {
@@ -138,9 +141,10 @@ mod tests {
     use futures_lite::future;
     use ostrya_rt::block_on;
 
-    /// A body that gives frames keeps the deadline away, and so does a body
-    /// that waits for its reader. A body that gives none for the window
-    /// makes it expire. With no body live it never expires.
+    /// A body that gives frames keeps the deadline away. A body that waits
+    /// for its reader also keeps it away. A body that gives no frame for the
+    /// window makes the deadline expire. With no live body, the deadline
+    /// never expires.
     #[test]
     fn a_body_with_no_frame_for_the_window_expires() {
         block_on(async {

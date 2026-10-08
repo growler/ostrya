@@ -50,11 +50,11 @@ pub(crate) struct Receive<A> {
 /// A request path under [`PREFIX`].
 #[derive(Clone, Copy)]
 enum Route {
-    /// `session`: open a session.
+    /// The path `session`, which opens a session.
     Open,
-    /// `session/ID`: end a session.
+    /// The path `session/ID`, which ends a session.
     Session(SessionId),
-    /// `session/ID/STEP`: one step of a session.
+    /// The path `session/ID/STEP`, which runs one step of a session.
     Step(SessionId, Step),
 }
 
@@ -116,8 +116,9 @@ impl Route {
 }
 
 impl<A: ReceiveAuth> Receive<A> {
-    /// The response to a request. A path outside [`PREFIX`] gets 404. The
-    /// authentication runs before a byte of the body is read.
+    /// Returns the response to a request. A path that is not a route under
+    /// [`PREFIX`] gets 404. The authentication runs before a byte of the body
+    /// is read.
     pub(crate) async fn handle<B>(&self, req: Request<B>) -> Response<ServeBody>
     where
         B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -172,11 +173,11 @@ impl<A: ReceiveAuth> Receive<A> {
         }
     }
 
-    /// Answer a request of `version` with `response` before its `body` is
-    /// read. The body is read and dropped first, up to 1 MiB within the idle
-    /// timeout or 5 seconds, whichever is shorter, so the client can read
-    /// the response. On HTTP/1 a body that did not reach its end closes the
-    /// connection after the response.
+    /// Returns `response` to a request of `version` whose `body` the endpoint
+    /// does not use. The function first reads and drops up to 1 MiB of the
+    /// body, within the idle timeout or 5 seconds, whichever is shorter. This
+    /// drain lets the client read the response. On HTTP/1, if the body did
+    /// not reach its end, the connection closes after the response.
     async fn refuse<B>(
         &self,
         version: Version,
@@ -196,12 +197,16 @@ impl<A: ReceiveAuth> Receive<A> {
         response
     }
 
-    /// `POST session` of `principal`: read `Hello`, refuse a `Hello` with
-    /// `one-way` true, check `Hello`, take a slot of the session limit, get
-    /// the setup of the session from the authentication, and open the
-    /// session with the policy and the hooks of the setup. The body must
-    /// arrive in full within the idle timeout. A refusal of the
-    /// authentication frees the slot.
+    /// Serves `POST session` for `principal`. The steps, in order:
+    ///
+    /// 1. It reads `Hello`. The body must arrive in full within the idle
+    ///    timeout.
+    /// 2. It refuses a `Hello` with `one-way` `true`.
+    /// 3. It checks the `Hello`.
+    /// 4. It takes a slot of the session limit.
+    /// 5. It gets the setup of the session from the authentication. A refusal
+    ///    of the authentication frees the slot.
+    /// 6. It opens the session with the policy and the hooks of the setup.
     async fn open<B>(&self, principal: &A::Principal, body: B) -> Response<ServeBody>
     where
         B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -284,12 +289,15 @@ impl<A: ReceiveAuth> Receive<A> {
         response
     }
 
-    /// `POST session/ID/commit`: read `Commit`, and run the commit in a task
-    /// of its own, which no disconnect, `DELETE`, or idle timeout stops. A
-    /// session that commits already gets `protocol`, and its commit goes on.
-    /// The task ends the session when the commit ends: with the cause of a
-    /// commit when it succeeded, and with the cause of a failed request when
-    /// it failed, panicked, or was dropped.
+    /// Serves `POST session/ID/commit`. It reads `Commit` and runs the commit
+    /// in a task of its own. No disconnect, `DELETE`, or idle timeout stops
+    /// this task. If the session commits already, the request gets
+    /// `protocol`, and the commit in progress goes on.
+    ///
+    /// When the commit ends, the task ends the session. If the commit
+    /// succeeds, the cause of the end is the cause of a commit. If the commit
+    /// fails or panics, or if its task drops, the cause is the cause of a
+    /// failed request.
     async fn commit<B>(&self, active: &Active, mut body: RequestBody<B>) -> Response<ServeBody>
     where
         B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -335,8 +343,8 @@ impl<A: ReceiveAuth> Receive<A> {
                 let reply = Message::CommitReply(delivery.report().refs.clone());
                 match encode(&reply) {
                     Ok(bytes) => reply_response(bytes, delivery),
-                    // The commit refuses updates whose longest reply is over
-                    // the frame limit before it writes a ref, so this arm is
+                    // Before it writes a ref, the commit refuses updates whose
+                    // longest reply is over the frame limit, so this arm is
                     // not reached. It stays as a guard: an error here follows
                     // a commit that wrote its refs.
                     Err(e) => {
@@ -350,7 +358,7 @@ impl<A: ReceiveAuth> Receive<A> {
     }
 }
 
-/// `POST session/ID/have`: read `Have`, and answer it.
+/// Serves `POST session/ID/have`. It reads `Have` and returns the reply.
 async fn have<B>(active: &Active, mut body: RequestBody<B>) -> Response<ServeBody>
 where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -368,7 +376,7 @@ where
     step_response(active, result.map(|r| r.map(Message::HaveReply)))
 }
 
-/// `POST session/ID/objects`: read one object stream.
+/// Serves `POST session/ID/objects`. It reads one object stream.
 async fn objects<B>(active: &Active, body: RequestBody<B>) -> Response<ServeBody>
 where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -397,10 +405,10 @@ fn step_response(active: &Active, result: Option<ostrya::Result<Message>>) -> Re
     }
 }
 
-/// Run `step` until it completes, or until the session ends. `None` when the
-/// session ended first, and the step is dropped. The end of the session is
-/// checked first, so a step that the end of the session fails reports the
-/// cause of the end.
+/// Runs `step` until it completes or the session ends. If the session ends
+/// first, the function drops the step and returns `None`. The function polls
+/// the end of the session first, so a step that fails because the session
+/// ended reports the cause of the end.
 async fn cancellable<T>(cancel: &Cancel, step: impl Future<Output = T>) -> Option<T> {
     future::or(
         async {
@@ -435,12 +443,16 @@ fn error_message(code: ErrorCode, message: String) -> ErrorMessage {
     }
 }
 
-/// The status and the `Error` message of a failed request.
-/// `ref-mismatch` and `non-fast-forward` get 409, `internal` and each error
-/// with no wire code get 500, `unauthorized` gets 403, and every other code
-/// gets 422. An error with no wire code is `internal` with its text. The
-/// service gives no `unauthorized`: the refusal of the authorization states
-/// its own status, 401 or 403.
+/// Returns the status and the `Error` message of a failed request:
+///
+/// - `ref-mismatch` and `non-fast-forward` get 409.
+/// - `internal` and each error with no wire code get 500. An error with no
+///   wire code becomes `internal` with its text.
+/// - `unauthorized` gets 403.
+/// - Every other code gets 422.
+///
+/// The service gives no `unauthorized`. A refusal of the authentication
+/// states its own status, 401 or 403.
 pub(crate) fn status(e: &ostrya::Error) -> (StatusCode, ErrorMessage) {
     let message = match e {
         ostrya::Error::Push(e) => e.to_message(),
@@ -455,9 +467,10 @@ pub(crate) fn status(e: &ostrya::Error) -> (StatusCode, ErrorMessage) {
     (status, message)
 }
 
-/// The response of a refusal of the authentication: its status, an
-/// `unauthorized` frame with its message, and its headers in order, except
-/// the headers that the endpoint sets itself.
+/// The response of a refusal of the authentication. It has the status of
+/// the refusal and an `unauthorized` frame with its message. It has the
+/// headers of the refusal in order, except the headers that the endpoint
+/// sets itself.
 fn refusal_response(refusal: Refusal) -> Response<ServeBody> {
     let Refusal {
         status,
@@ -498,8 +511,9 @@ fn failure(e: &ostrya::Error) -> Response<ServeBody> {
     frame(status, &message)
 }
 
-/// A response of `status` with the `Error` frame of `message`. A message
-/// past the frame limit goes as `internal` with a short text.
+/// A response of `status` with the `Error` frame of `message`. If the frame
+/// is over the frame limit, the response is a 500 with an `internal` message
+/// and a short text.
 fn frame(status: StatusCode, message: &ErrorMessage) -> Response<ServeBody> {
     match encode(&Message::Error(message.clone())) {
         Ok(bytes) => full(status, bytes),
@@ -514,8 +528,9 @@ fn frame(status: StatusCode, message: &ErrorMessage) -> Response<ServeBody> {
     }
 }
 
-/// The frame of `msg`: the length, the kind, and the body. A frame past
-/// [`MAX_FRAME`] is `limit-exceeded`.
+/// The frame of `msg`: a 4-byte big-endian length, the kind byte, and the
+/// body. The length counts the kind byte and the body. If the length is more
+/// than [`MAX_FRAME`], the error is `limit-exceeded`.
 fn encode(msg: &Message) -> Result<Bytes, push::Error> {
     let body = msg.encode_body()?;
     let len = u32::try_from(body.len() + 1)
@@ -560,11 +575,11 @@ fn reply_response(bytes: Bytes, delivery: Delivery) -> Response<ServeBody> {
 }
 
 /// The report of a commit on its way to the client. When it drops, it gives
-/// the report to `on_report`, with a warning of the step
-/// [`ReceiveStep::ReplyNotDelivered`] unless the connection took the
-/// `CommitReply` frame. The connection took the frame when hyper polled it
-/// from the body. hyper can still fail to write it, so the warning is best
-/// effort.
+/// the report to `on_report`. If the connection did not take the
+/// `CommitReply` frame, the report first gets a warning of the step
+/// [`ReceiveStep::ReplyNotDelivered`]. The connection took the frame if hyper
+/// polled it from the body. hyper can still fail to write the frame, so the
+/// warning is best effort.
 pub(crate) struct Delivery {
     report: Option<ReceiveReport>,
     on_report: Option<OnReport>,
@@ -749,8 +764,9 @@ mod tests {
         }
     }
 
-    /// The report of a commit reaches `on_report` once, with a warning of
-    /// `ReplyNotDelivered` when the body dropped before hyper took its frame.
+    /// The report of a commit reaches `on_report` once. If the body drops
+    /// before hyper takes its frame, the report has a warning of
+    /// `ReplyNotDelivered`.
     #[test]
     fn an_undelivered_reply_adds_a_warning() {
         let seen = Arc::new(Mutex::new(Vec::<ReceiveReport>::new()));
@@ -866,8 +882,8 @@ mod tests {
         }
     }
 
-    /// `Pieces` is `Send` and `Unpin`, and not `Sync`. The second check is
-    /// ambiguous, and does not compile, for a type that is `Sync`.
+    /// `Pieces` is `Send` and `Unpin`, and not `Sync`. If a type is `Sync`,
+    /// the second check is ambiguous and does not compile.
     const _: fn() = || {
         fn send_unpin<T: Send + Unpin>() {}
         send_unpin::<Pieces>();
@@ -881,7 +897,7 @@ mod tests {
         <Pieces as NotSync<_>>::check();
     };
 
-    /// `future`, which must be `Send`.
+    /// Returns `future`, which must be `Send`.
     fn send<F: Future + Send>(future: F) -> F {
         future
     }
@@ -972,12 +988,12 @@ mod tests {
         })
     }
 
-    /// Open a session, and give its id.
+    /// Opens a session and returns its id.
     async fn open<A: ReceiveAuth>(receive: &Receive<A>) -> String {
         open_as(receive, "anonymous").await
     }
 
-    /// Open a session of `principal`, and give its id.
+    /// Opens a session of `principal` and returns its id.
     async fn open_as<A: ReceiveAuth>(receive: &Receive<A>, principal: &str) -> String {
         let response = post_as(receive, principal, "session", &hello(), None).await;
         let id = response.headers()[SESSION_HEADER]
@@ -1000,8 +1016,8 @@ mod tests {
 
     /// Each step of a session takes a body that is not `Sync`, and the
     /// future of the request is `Send`. A body that fails inside its frame
-    /// is `internal` and ends the session, and after its response an
-    /// `open` whose body fails holds no slot.
+    /// gets `internal` and ends the session. After its response, an `open`
+    /// whose body fails holds no slot.
     #[test]
     fn the_steps_take_a_body_that_is_not_sync() {
         let tmp = TmpRepo::new("receive-steps");
@@ -1186,7 +1202,7 @@ mod tests {
     }
 
     /// A refusal of `authenticate` comes before a byte of the body is read,
-    /// also before the lookup of a session. The endpoint then reads at most
+    /// and before the lookup of a session. The endpoint then reads at most
     /// the drain limit and one frame of an endless body, and closes the
     /// connection. The response has the status and the headers of the
     /// refusal and an `unauthorized` frame, and no header of the endpoint.
@@ -1260,9 +1276,9 @@ mod tests {
         });
     }
 
-    /// A refusal with a message of 2 MiB keeps its status and its headers,
-    /// and its `unauthorized` frame carries the message cut to at most
-    /// 4096 bytes at a character boundary.
+    /// A refusal with a message of 2 MiB keeps its status and its headers.
+    /// Its `unauthorized` frame carries the message cut to at most 4096
+    /// bytes at a character boundary.
     #[test]
     fn a_long_refusal_message_is_cut_to_fit_its_frame() {
         let long = format!("a{}", "é".repeat(1 << 20));
@@ -1306,9 +1322,9 @@ mod tests {
         });
     }
 
-    /// A `Hello` with a bad ref name gets `invalid-ref` with 422 before
-    /// `open` runs and before a slot is taken, so a full table does not
-    /// change the answer.
+    /// A `Hello` with a bad ref name gets `invalid-ref` with 422. The endpoint
+    /// answers before `open` runs and before it takes a slot, so a full table
+    /// does not change the answer.
     #[test]
     fn a_bad_ref_name_is_invalid_ref_before_open() {
         let tmp = TmpRepo::new("receive-bad-name");
@@ -1335,7 +1351,7 @@ mod tests {
         });
     }
 
-    /// A `Hello` with `one-way` true gets `protocol` with the text of the
+    /// A `Hello` with `one-way` `true` gets `protocol` with the text of the
     /// two-way service, before the check of its version and before `open`.
     #[test]
     fn a_one_way_hello_is_protocol_before_its_version() {
@@ -1361,8 +1377,8 @@ mod tests {
         });
     }
 
-    /// A `session` request past the session limit, and one after the stop,
-    /// gets 503 before `open` runs.
+    /// A `session` request past the session limit gets 503 before `open`
+    /// runs. A `session` request after the stop gets the same answer.
     #[test]
     fn a_full_table_gets_503_before_open() {
         let tmp = TmpRepo::new("receive-full");
@@ -1384,8 +1400,8 @@ mod tests {
     }
 
     /// The future of a request is `Send` for every authentication and a
-    /// body that is not `Sync`. The return type of the generic function is
-    /// checked for every `A`.
+    /// body that is not `Sync`. The compiler checks the return type of the
+    /// generic function for every `A`.
     const _: fn() = || {
         fn handle_is_send<A: ReceiveAuth>(
             receive: &Receive<A>,

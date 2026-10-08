@@ -16,35 +16,42 @@ use ostrya_rt as rt;
 
 use crate::session::BodyTrack;
 
-/// The most bytes of a request body the server reads and drops before it
-/// answers a request that it refuses before the body.
+/// The most bytes of a request body that the server reads and drops before
+/// it answers a request that it refuses before the body.
 pub(crate) const MAX_DRAIN: u64 = 1024 * 1024;
 
-/// The longest time the server reads and drops a request body before it
-/// answers a request that it refuses before the body. A shorter idle
-/// timeout of the sessions bounds the read too.
+/// The longest time that the server reads and drops a request body before
+/// it answers a request that it refuses before the body. If the idle
+/// timeout of the sessions is shorter, the idle timeout limits the read.
 const MAX_DRAIN_TIME: Duration = Duration::from_secs(5);
 
-/// The most frames that give no bytes, empty data frames and trailers, that
-/// one read takes before it gives the task back to the runtime.
+/// The most frames that give no bytes that one read takes before it gives
+/// the task back to the runtime. Empty data frames and trailers give no
+/// bytes.
 const MAX_EMPTY_FRAMES: usize = 64;
 
-/// A request body as an `AsyncRead`. One read takes the frames that the
-/// body has ready until the buffer of the read is full, and the bytes of a
-/// frame that a read does not take wait for the next read. Trailers are
-/// ignored. A read gives the task back to the runtime after
-/// [`MAX_EMPTY_FRAMES`] frames that give no bytes. With a tracker, the body
-/// records in its session when it starts to wait for the client, when it
-/// delivers bytes again, and when it fails.
-/// A body that the server does not poll does not wait, and a read that
-/// returns bytes does not wait either.
+/// A request body as an `AsyncRead`.
+///
+/// One read takes the frames that the body has ready, until the buffer of
+/// the read is full. The bytes of a frame that a read does not take wait for
+/// the next read. A read ignores trailers. After [`MAX_EMPTY_FRAMES`] frames
+/// that give no bytes, a read gives the task back to the runtime.
+///
+/// With a tracker, the body records these events in its session:
+///
+/// - the start of a wait for the client,
+/// - the next delivery of bytes after a wait,
+/// - a failure.
+///
+/// A body that the server does not poll does not wait. A read that returns
+/// bytes does not wait either.
 pub(crate) struct RequestBody<B> {
     inner: B,
     /// The bytes of the last frame that no read took yet.
     rest: Bytes,
     ended: bool,
     track: Option<BodyTrack>,
-    /// The tracker holds the body as waiting.
+    /// `true` if the tracker holds the body as waiting.
     waiting: bool,
 }
 
@@ -59,7 +66,7 @@ impl<B> RequestBody<B> {
         }
     }
 
-    /// Record a change of the wait for the client in the session.
+    /// Records a change of the wait for the client in the session.
     fn set_waiting(&mut self, waiting: bool) {
         if self.waiting == waiting {
             return;
@@ -142,11 +149,19 @@ fn protocol(message: impl Into<String>) -> push::Error {
     push::Error::Protocol(message.into())
 }
 
-/// Read the one message of `body`: one frame of at most [`MAX_FRAME`]
-/// bytes, and then the end of the body. An empty body, a body that ends
-/// inside its frame, and a byte after the frame are `protocol`. The buffer
-/// of the frame grows with the bytes that arrive, and not with the length
-/// that the frame states.
+/// Reads the one message of `body`: one frame of at most [`MAX_FRAME`]
+/// bytes, and then the end of the body.
+///
+/// The error is `protocol` for:
+///
+/// - an empty body,
+/// - a body that ends inside its frame,
+/// - a frame of length 0,
+/// - a byte after the frame.
+///
+/// A frame over [`MAX_FRAME`] is `push::Error::LimitExceeded`. The buffer of
+/// the frame grows with the bytes that arrive, so a stated length allocates
+/// no memory before its bytes arrive.
 pub(crate) async fn read_message<B>(body: &mut RequestBody<B>) -> Result<Message, push::Error>
 where
     B: Body<Data = Bytes> + Unpin,
@@ -189,15 +204,15 @@ where
     Message::decode(Kind::from_u8(frame[0])?, &frame[1..])
 }
 
-/// The time [`drain`] reads a body for, with the session idle timeout
-/// `idle`: the shorter of `idle` and [`MAX_DRAIN_TIME`].
+/// Returns the time that [`drain`] reads a body: the shorter of the session
+/// idle timeout `idle` and [`MAX_DRAIN_TIME`].
 fn drain_time(idle: Duration) -> Duration {
     idle.min(MAX_DRAIN_TIME)
 }
 
-/// Read and drop the bytes of `body`, up to [`MAX_DRAIN`] bytes and for at
-/// most the shorter of `idle` and [`MAX_DRAIN_TIME`]. `true` when the body
-/// reached its end.
+/// Reads and drops the bytes of `body`, up to [`MAX_DRAIN`] bytes and for
+/// at most the shorter of `idle` and [`MAX_DRAIN_TIME`]. Returns `true` if
+/// the body reaches its end within these limits.
 pub(crate) async fn drain<B>(mut body: B, idle: Duration) -> bool
 where
     B: Body<Data = Bytes> + Send + Unpin + 'static,
@@ -277,10 +292,12 @@ mod tests {
         }
     }
 
-    /// A body that gives `first` as one data frame when it is not empty,
-    /// and then frames that give no bytes without end: trailers when
-    /// `trailers` is set, and empty data frames otherwise. `polls` counts
-    /// the frames that the body gave.
+    /// A body that gives frames that give no bytes, with no end.
+    ///
+    /// If `first` is not empty, the body gives it first as one data frame.
+    /// If `trailers` is `true`, the frames that give no bytes are trailers.
+    /// Otherwise they are empty data frames. `polls` counts the frames that
+    /// the body gave.
     struct Endless {
         first: Bytes,
         trailers: bool,
@@ -317,10 +334,9 @@ mod tests {
         }
     }
 
-    /// A read of a body that gives frames without bytes without end gives
-    /// the task back after [`MAX_EMPTY_FRAMES`] such frames. The read is
-    /// `Pending` when it has no bytes, and gives the bytes that it has
-    /// otherwise.
+    /// If a body gives frames that give no bytes with no end, a read gives
+    /// the task back after [`MAX_EMPTY_FRAMES`] such frames. If the read has
+    /// no bytes, it is `Pending`. Otherwise it returns the bytes that it has.
     #[test]
     fn a_read_yields_on_frames_without_bytes() {
         let mut cx = Context::from_waker(Waker::noop());
@@ -341,8 +357,8 @@ mod tests {
         }
     }
 
-    /// A drain of a body that gives frames without bytes without end stops
-    /// at the byte limit, because each frame counts as one byte at least.
+    /// If a body gives frames with no bytes and no end, a drain stops at the
+    /// byte limit. Each frame counts as at least one byte.
     #[test]
     fn a_drain_stops_on_frames_without_bytes() {
         for trailers in [false, true] {
@@ -351,8 +367,8 @@ mod tests {
         }
     }
 
-    /// The drain of a refusal reads for the idle timeout when it is short,
-    /// and for 5 seconds at most.
+    /// The drain of a refusal reads for the idle timeout of the session, and
+    /// for 5 seconds at most.
     #[test]
     fn the_drain_time_is_the_idle_timeout_up_to_5_seconds() {
         let ms = Duration::from_millis;
@@ -363,8 +379,8 @@ mod tests {
         assert_eq!(MAX_DRAIN_TIME, Duration::from_secs(5));
     }
 
-    /// One read takes the frames that are ready until its buffer is full,
-    /// and returns the bytes it has when the body waits.
+    /// One read takes the frames that are ready, until its buffer is full.
+    /// If the body waits, the read returns the bytes that it has.
     #[test]
     fn a_read_takes_every_ready_frame() {
         let frame = |b: u8| Some(vec![b; 16 * 1024]);
@@ -399,9 +415,11 @@ mod tests {
         block_on(read_message(&mut Script::new(steps)))
     }
 
-    /// A body of one frame gives its message, also in pieces. An empty
-    /// body, a body that ends inside its frame, a frame of length 0, and a
-    /// byte after the frame are `protocol`, and a frame past the limit is
+    /// A body of one frame gives its message, also if the frame arrives in
+    /// pieces.
+    ///
+    /// An empty body, a body that ends inside its frame, a frame of length 0,
+    /// and a byte after the frame are `protocol`. A frame over the limit is
     /// `limit-exceeded` before its body arrives.
     #[test]
     fn a_body_holds_one_message() {

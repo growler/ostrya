@@ -1,11 +1,16 @@
-//! The receive endpoint mounted in the router of a host: a push of a tree
-//! over HTTPS and HTTP/2 to a path prefix that the host removes, with the
-//! authentication of the host and the HTTP/2 windows of the endpoint, and
-//! the stop of the endpoint. The hooks of the host run through the same
-//! mount: an entry of the host in the detached metadata, a per-name lock in
-//! the carried value, an error of `after_update`, and a ref that moves during
-//! `before_update`. The client is `push_tree`. The assertions at the end pin
-//! the auto traits of the public types.
+//! Tests of the receive endpoint mounted in the router of a host.
+//!
+//! The client is `push_tree`. It pushes a tree over HTTPS and HTTP/2 to a
+//! path prefix, and the host removes the prefix. The tests cover these parts
+//! of the mount:
+//!
+//! - the authentication of the host and the HTTP/2 windows of the endpoint
+//! - the stop of the endpoint with `shutdown`
+//! - the hooks of the host: an entry of the host in the detached metadata, a
+//!   per-name lock in the carried value, an error of `after_update`, and a
+//!   ref that moves during `before_update`
+//!
+//! A compile-time check pins the auto traits of the public types.
 
 use std::any::Any;
 use std::cell::Cell;
@@ -49,10 +54,10 @@ const CA_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/ca.pem");
 const SERVER_CERT_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/server.pem");
 const SERVER_KEY_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/server.key.pem");
 
-/// The path prefix the host mounts the endpoint under.
+/// The path prefix that the host mounts the endpoint under.
 const MOUNT: &str = "/api/v1/push";
 
-/// The bearer token the host takes.
+/// The bearer token that the host takes.
 const TOKEN: &str = "host-token";
 
 struct TmpDir(PathBuf);
@@ -127,7 +132,8 @@ struct Seen {
 }
 
 impl Seen {
-    /// The status of each `commit` request, in order.
+    /// Returns the status of each `commit` request, in the order of the
+    /// responses.
     fn commit_statuses(&self) -> Vec<StatusCode> {
         let statuses = self.statuses.lock().unwrap();
         statuses
@@ -138,7 +144,7 @@ impl Seen {
     }
 }
 
-/// Accept connections on `listener` and serve each in a task of its own.
+/// Accepts connections on `listener` and serves each in a task of its own.
 async fn host<A: ReceiveAuth>(
     listener: rt::TcpListener,
     config: Arc<ServerConfig>,
@@ -154,7 +160,7 @@ async fn host<A: ReceiveAuth>(
     }
 }
 
-/// Serve one TLS connection over HTTP/2 with the windows of the endpoint
+/// Serves one TLS connection over HTTP/2 with the windows of the endpoint
 /// and at most 32 streams at the same time.
 async fn connection<A: ReceiveAuth>(
     stream: rt::TcpStream,
@@ -205,9 +211,9 @@ async fn mounted<A: ReceiveAuth>(
     response
 }
 
-/// A tree of small files and one file of 3 MiB of pseudo-random bytes, so
-/// one object stream carries more than the 2 MiB window of a stream. The
-/// big file is written in chunks.
+/// A tree of small files and one file of 3 MiB of pseudo-random bytes. One
+/// object stream then carries more than the 2 MiB window of a stream. The
+/// function writes the big file in 48 chunks of 64 KiB.
 fn tree(base: &Path) -> PathBuf {
     let root = base.join("tree");
     std::fs::create_dir_all(root.join("etc")).unwrap();
@@ -242,7 +248,9 @@ fn small_tree(base: &Path) -> PathBuf {
     root
 }
 
-/// Wait until `done` holds, for at most 10 seconds.
+/// Waits until `done` returns `true`, for at most 10 seconds.
+///
+/// After 10 seconds, it panics with the message `what`.
 async fn eventually(what: &str, done: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !done() {
@@ -252,9 +260,9 @@ async fn eventually(what: &str, done: impl Fn() -> bool) {
 }
 
 /// A push of a tree with `push_tree` to `https://HOST/api/v1/push` goes
-/// through the host route over HTTP/2, with the windows of the endpoint,
-/// and sets the ref. A wrong token is `unauthorized`. After `shutdown` the
-/// sweep ends, and a push gets `limit-exceeded`.
+/// through the host route over HTTP/2 with the windows of the endpoint. The
+/// push sets the ref. A push with a wrong token gets `unauthorized`. After
+/// `shutdown`, the sweep ends, and a push gets `limit-exceeded`.
 #[test]
 fn a_push_through_a_mounted_endpoint_commits_over_http2() {
     let tmp = TmpDir::new("push");
@@ -385,7 +393,7 @@ struct NameLocks {
 }
 
 impl NameLocks {
-    /// Take the locks of all `names`, or of none when one of them is held.
+    /// Takes the locks of all `names`, or of none if one of them is held.
     fn try_lock(self: &Arc<Self>, mut names: Vec<String>) -> Option<NameGuard> {
         names.sort();
         names.dedup();
@@ -400,13 +408,13 @@ impl NameLocks {
         })
     }
 
-    /// The names that are held, in order.
+    /// Returns the names that are held, in sorted order.
     fn held(&self) -> Vec<String> {
         self.held.lock().unwrap().iter().cloned().collect()
     }
 }
 
-/// The locks of some names. They are released when the guard drops.
+/// The locks of some names. The drop of the guard releases them.
 struct NameGuard {
     locks: Arc<NameLocks>,
     names: Vec<String>,
@@ -424,7 +432,7 @@ impl Drop for NameGuard {
 /// The state that the hooks of all sessions share with the test.
 #[derive(Default)]
 struct HostState {
-    /// When set, `after_update` returns an error.
+    /// If `true`, `after_update` returns an error.
     fail_after: AtomicBool,
     /// A ref that the next `before_update` sets, to move a ref after the
     /// checks of the session and before the update lock.
@@ -440,10 +448,10 @@ struct HostState {
 const AFTER_FAILED: &str = "the host failed after the update";
 
 /// The hooks of the host for one session of `uploader`. `before_update`
-/// first sets the ref of [`HostState::move_ref`], where one is given. It then
-/// locks the names of the refs, and gives a `centrex.uploader` entry with
-/// `keep_existing` true for each new commit. `after_update` releases the
-/// locks.
+/// first sets the ref of [`HostState::move_ref`], if one is given. Then it
+/// locks the names of the refs. It gives a `centrex.uploader` entry with
+/// `keep_existing` set to `true` for each new commit. `after_update` releases
+/// the locks.
 struct HostHooks {
     uploader: String,
     repo: Repo,
@@ -554,7 +562,8 @@ impl ReceiveAuth for HookAuth {
     }
 }
 
-/// The string under `centrex.uploader` in the detached metadata of `commit`.
+/// Returns the string under `centrex.uploader` in the detached metadata of
+/// `commit`.
 async fn uploader(repo: &Repo, commit: &Checksum) -> Option<String> {
     let dict = repo.read_commit_detached_metadata(commit).await.unwrap()?;
     dict.dict_get("centrex.uploader")
@@ -565,10 +574,12 @@ async fn uploader(repo: &Repo, commit: &Checksum) -> Option<String> {
 /// The hooks that `ReceiveAuth::open` gives run in the commit of a push
 /// through a mounted endpoint. Every push sends the same tree with no
 /// parent, no bindings, and one timestamp, so all the pushes give the same
-/// commit. The entry of the first uploader stays at the second push. An
-/// error of `after_update` gets 500 with the ref written and no report. A
-/// ref that `before_update` moves gets 409 with `ref-mismatch`. The locks of
-/// the host are held in `after_update`, and free after each push.
+/// commit.
+///
+/// The entry of the first uploader stays at the second push. An error of
+/// `after_update` gets 500 with the ref written and no report. A ref that
+/// `before_update` moves gets 409 with `ref-mismatch`. The locks of the host
+/// are held in `after_update`, and free after each push.
 #[test]
 fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
     let tmp = TmpDir::new("hooks");
@@ -668,7 +679,7 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
                 assert!(locks.held().is_empty());
                 eventually("the second report", || reports.load(Ordering::SeqCst) == 2).await;
 
-                // An error of `after_update` comes after the ref is written.
+                // An error of `after_update` comes after the write of the ref.
                 state.fail_after.store(true, Ordering::SeqCst);
                 let failed = push_tree(&remote, &small, connect(&bob), push_options("rel/c")).await;
                 match &failed {
@@ -730,12 +741,13 @@ impl Body for NotSync {
     }
 }
 
-/// The endpoint is `Send + Sync` for every authentication, and the futures
-/// of `handle` and `sweep` are `Send`, also with a request body that is not
-/// `Sync`. The response body is `Send + Unpin + 'static`. `NotSync` is
-/// `Send` and `Unpin`, and not `Sync`: the last check is ambiguous, and does
-/// not compile, for a type that is `Sync`. Each generic function is checked
-/// for every `A`.
+/// The endpoint is `Send + Sync` for every authentication. The futures of
+/// `handle` and `sweep` are `Send`, also with a request body that is not
+/// `Sync`. The response body is `Send + Unpin + 'static`.
+///
+/// `NotSync` is `Send` and `Unpin`, and not `Sync`. For a type that is
+/// `Sync`, the last check is ambiguous and does not compile. The compiler
+/// checks each generic function for every `A`.
 const _: fn() = || {
     fn send_sync<T: Send + Sync>() {}
     fn endpoint_is_send_sync<A: ReceiveAuth>() {

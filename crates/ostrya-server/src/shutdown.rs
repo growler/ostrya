@@ -1,8 +1,8 @@
 //! The signal that stops the connections of a server.
 //!
-//! The connections run as tasks of their own, so dropping the future of
+//! The connections run as tasks of their own, so a drop of the future of
 //! [`Server::run`](crate::Server::run) does not reach them. Each connection
-//! races a [`Wait`] of the server's [`Shutdown`], and the [`Trigger`] that
+//! races a [`Wait`] of the [`Shutdown`] of the server. The [`Trigger`] that
 //! `run` holds fires the signal when the future drops.
 
 use std::collections::HashMap;
@@ -15,8 +15,8 @@ use std::task::{Context, Poll, Waker};
 /// A signal that fires once and wakes each waiter.
 #[derive(Default)]
 pub(crate) struct Shutdown {
-    /// Set under the lock of `state` when the signal fires, and read with no
-    /// lock by a waiter that already holds a waker slot.
+    /// The flag that `fire` sets under the lock of `state`. A waiter that
+    /// already holds a waker slot reads it with no lock.
     fired: AtomicBool,
     state: Mutex<State>,
 }
@@ -27,13 +27,14 @@ struct State {
     next_id: u64,
     /// The waker of each waiter that is pending, by its id.
     waiters: HashMap<u64, Waker>,
-    /// How many times a waiter stored a waker, for the test of the reuse.
+    /// The count of the wakers that waiters stored, for the test of the
+    /// reuse.
     #[cfg(test)]
     stores: usize,
 }
 
 impl Shutdown {
-    /// Fire the signal and wake each waiter.
+    /// Fires the signal and wakes each waiter.
     pub(crate) fn fire(&self) {
         let waiters = {
             let mut state = self.state.lock().expect("shutdown mutex");
@@ -46,7 +47,7 @@ impl Shutdown {
         }
     }
 
-    /// A future that completes when the signal fires.
+    /// Returns a future that completes when the signal fires.
     pub(crate) fn wait(self: &Arc<Shutdown>) -> Wait {
         Wait {
             shutdown: self.clone(),
@@ -56,7 +57,7 @@ impl Shutdown {
     }
 }
 
-/// Fires the signal when it drops.
+/// The guard that fires the signal when it drops.
 pub(crate) struct Trigger(pub(crate) Arc<Shutdown>);
 
 impl Drop for Trigger {
@@ -65,8 +66,8 @@ impl Drop for Trigger {
     }
 }
 
-/// The future of [`Shutdown::wait`]. It holds one waker slot, so polling it
-/// with another waker replaces its waker. A poll with the waker it stored
+/// The future of [`Shutdown::wait`]. It holds one waker slot, so a poll with
+/// another waker replaces the stored waker. A poll with the stored waker
 /// takes no lock.
 pub(crate) struct Wait {
     shutdown: Arc<Shutdown>,
@@ -83,8 +84,8 @@ impl Future for Wait {
         if me.shutdown.fired.load(Ordering::Acquire) {
             return Poll::Ready(());
         }
-        // The stored waker is woken when the signal fires, and the flag is
-        // set before that wake, so the flag read above sees the signal.
+        // `fire` sets the flag before it wakes the stored waker, so the flag
+        // read at the start of this poll sees the signal.
         if me.waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
             return Poll::Pending;
         }
@@ -126,8 +127,8 @@ mod tests {
     use futures_lite::future::poll_once;
     use ostrya_rt::block_on;
 
-    /// A waiter completes when the trigger drops, and a waiter that drops
-    /// leaves no waker behind.
+    /// A waiter completes when the trigger drops. A waiter that drops leaves
+    /// no waker behind.
     #[test]
     fn a_dropped_trigger_completes_every_waiter() {
         block_on(async {
@@ -139,7 +140,7 @@ mod tests {
             assert!(poll_once(&mut first).await.is_none());
             assert!(poll_once(&mut second).await.is_none());
             assert_eq!(shutdown.state.lock().unwrap().waiters.len(), 2);
-            // A poll with the waker the slot holds stores nothing.
+            // A poll with the waker that the slot holds stores nothing.
             assert_eq!(shutdown.state.lock().unwrap().stores, 2);
             drop(second);
             assert_eq!(shutdown.state.lock().unwrap().waiters.len(), 1);

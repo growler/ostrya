@@ -38,6 +38,44 @@ const MAX_CONCURRENT_STREAMS: u32 = 32;
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// A server with its listeners bound, ready to [`run`](Server::run).
+///
+/// # HTTP behavior
+///
+/// - The server answers `GET` and `HEAD`. Outside the receive endpoint,
+///   another method gets 405 with `Allow: GET, HEAD`.
+/// - With a receive endpoint, a request under the raw path prefix
+///   `/_ostrya/receive/v1/` goes to the endpoint if its method is not `GET`
+///   or `HEAD`. A `GET` or a `HEAD` under the prefix goes to the archive
+///   view and gets 404.
+/// - A `GET` and a `HEAD` of the archive view ignore `Authorization`.
+/// - The server percent-decodes the request path and ignores the query. If
+///   the path has a bad escape, a NUL, or bytes that are not UTF-8, the
+///   response is 404.
+/// - A path that the view does not find gets 404 with an empty body. A path
+///   that the view refuses gets the same response, so a client cannot tell
+///   a private path from an absent one.
+/// - If the view returns an error, the response is 500 with an empty body.
+/// - A response with a known length carries `Content-Length`. A `.filez`
+///   built on request carries no `Content-Length`.
+/// - The server reads a response body in frames of at most 64 KiB. It never
+///   collects the body whole.
+/// - A `HEAD` takes the answer of [`ArchiveView::head`], which reads no byte
+///   of the file. For a `.filez` built on request, it reads no xattr and
+///   does no deflate work.
+/// - Plain HTTP serves HTTP/1.1. Over TLS, ALPN selects HTTP/2 or HTTP/1.1.
+///   An HTTP/2 connection carries at most 32 streams at the same time.
+/// - A TLS handshake has 30 seconds to complete. An HTTP/1.1 connection has
+///   30 seconds to send the headers of each request.
+/// - With a receive endpoint, the HTTP/2 windows are the windows of
+///   [`ReceiveEndpoint::h2_windows`]. A read-only server keeps the windows
+///   of hyper.
+/// - If a response body waits longer than [`ServeOptions::body_timeout`]
+///   for the client, the server ends its connection. If an HTTP/2 peer does
+///   not answer a ping within that time, the server ends the connection.
+/// - A body that streams gives at most 256 KiB in one run of polls. Then it
+///   yields to the executor.
+/// - With a client CA, the server verifies a client certificate against the
+///   CA. The server also serves a client that presents no certificate.
 pub struct Server {
     listeners: Vec<rt::TcpListener>,
     addrs: Vec<SocketAddr>,
@@ -47,10 +85,11 @@ pub struct Server {
     body_timeout: Duration,
 }
 
-/// Check the options of the receive endpoint of `opts`, and build it over
-/// `repo` when `opts` has a receive policy. The authentication methods are
-/// checked first, as [`FileAuth::new`] checks them, then the other options,
-/// as [`ReceiveEndpoint::new`] checks them.
+/// Returns the receive endpoint of `opts` over `repo`, or `None` if `opts`
+/// has no receive policy. With a policy, the function checks the
+/// authentication methods first, with [`FileAuth::new`]. Then it checks the
+/// other options, with [`ReceiveEndpoint::new`]. With no policy, it checks
+/// nothing.
 fn receive(repo: &Repo, opts: &ServeOptions) -> Result<Option<Arc<ReceiveEndpoint<FileAuth>>>> {
     let Some(policy) = &opts.receive else {
         return Ok(None);
@@ -66,10 +105,29 @@ fn receive(repo: &Repo, opts: &ServeOptions) -> Result<Option<Arc<ReceiveEndpoin
     Ok(Some(Arc::new(endpoint)))
 }
 
-/// Check the options, build the TLS configuration of `opts`, then bind each
-/// listen address of `opts`, in order. The server serves the archive view of
-/// `repo`, and with [`ServeOptions::receive`] the receive endpoint over
-/// `repo`.
+/// Binds the listeners of `opts` and returns a server over `repo`.
+///
+/// The function checks the options and builds the TLS configuration of
+/// `opts`. Then it binds each listen address of `opts`, in order. The server
+/// serves the archive view of `repo`. With [`ServeOptions::receive`], it also
+/// serves the receive endpoint over `repo`.
+///
+/// # Errors
+///
+/// The checks run in this order:
+///
+/// - [`Error::Options`] if `listen` is empty, or if `body_timeout` is zero.
+/// - [`Error::Credentials`] if `receive` is set and a line of `credentials`
+///   is malformed.
+/// - [`Error::Options`] if `receive` is set and the endpoint has no
+///   [authentication method](ServeOptions#authentication).
+/// - [`Error::Options`] if `receive` is set, `tls` is `None`, and both
+///   `allow_anonymous_push` and `allow_cleartext_credentials` are `false`.
+/// - [`Error::Options`] if `receive` is set and `parallel_uploads` is
+///   outside `1..=31`, or `session_idle_timeout` or `max_sessions` is zero.
+/// - [`Error::Tls`] if the TLS files give no server configuration.
+/// - [`Error::Bind`] if a listen address cannot be bound, or if its local
+///   address cannot be read.
 pub async fn bind(repo: Repo, opts: ServeOptions) -> Result<Server> {
     if opts.listen.is_empty() {
         return Err(Error::Options("no listen address".into()));
@@ -112,25 +170,42 @@ pub async fn bind(repo: Repo, opts: ServeOptions) -> Result<Server> {
     })
 }
 
-/// [`bind`], then [`Server::run`].
+/// Binds the listeners of `opts` and runs the server until the future drops.
+///
+/// The function calls [`bind`], then [`Server::run`].
+///
+/// # Errors
+///
+/// The errors of [`bind`](bind#errors). The future of [`Server::run`] never
+/// completes, so it gives no error.
 pub async fn serve(repo: Repo, opts: ServeOptions) -> Result<()> {
     bind(repo, opts).await?.run().await
 }
 
 impl Server {
-    /// The address each listener is bound to, in the order of the options.
-    /// A port 0 of the options is the port the kernel chose.
+    /// Returns the address of each listener, in the order of the options.
+    ///
+    /// If the options give port 0, the address holds the port that the
+    /// kernel chose.
     pub fn local_addrs(&self) -> &[SocketAddr] {
         &self.addrs
     }
 
-    /// Accept and serve connections until the future is dropped. Dropping it
-    /// closes the listeners, ends every connection it accepted, and aborts
-    /// every session of the receive endpoint that does not commit. A commit
-    /// that runs goes on to its end, and a session that opens after that
-    /// gets 503. Each listener accepts in a task of its own, and the idle
-    /// sweep of the sessions runs in a task of its own. An accept that fails
-    /// is tried again after a short wait, so the future does not complete.
+    /// Serves connections until the future drops.
+    ///
+    /// Each listener accepts in a task of its own. The idle sweep of the
+    /// sessions runs in a task of its own. If an accept fails, the listener
+    /// accepts again after 100 ms.
+    ///
+    /// When the future drops, the server closes the listeners and ends each
+    /// connection that it accepted. It also stops the receive endpoint,
+    /// which aborts each session that does not commit. The
+    /// [session rules](ReceiveEndpoint#sessions) of the endpoint state the
+    /// other effects.
+    ///
+    /// # Errors
+    ///
+    /// The future never completes, so it returns no error.
     pub async fn run(self) -> Result<()> {
         let shutdown = Arc::new(Shutdown::default());
         let _trigger = Trigger(shutdown.clone());
@@ -156,7 +231,7 @@ impl Server {
     }
 }
 
-/// What each connection of a server shares.
+/// The state that each connection of a server shares.
 struct Serving {
     view: Arc<ArchiveView>,
     receive: Option<Arc<ReceiveEndpoint<FileAuth>>>,
@@ -164,8 +239,8 @@ struct Serving {
     body_timeout: Duration,
 }
 
-/// Accept connections on `listener` and serve each in a task of its own,
-/// until `shutdown` fires.
+/// Accepts connections on `listener` and serves each one in a task of its
+/// own, until `shutdown` fires.
 async fn accept_loop(listener: rt::TcpListener, serving: Arc<Serving>, shutdown: Arc<Shutdown>) {
     loop {
         match listener.accept().await {
@@ -179,7 +254,7 @@ async fn accept_loop(listener: rt::TcpListener, serving: Arc<Serving>, shutdown:
     }
 }
 
-/// Serve one connection until it ends, or until one of its response bodies
+/// Serves one connection until it ends, or until one of its response bodies
 /// waits longer than the body timeout for the client.
 async fn connection(stream: rt::TcpStream, serving: Arc<Serving>) {
     let stall = Stall::new(serving.body_timeout);
@@ -190,9 +265,9 @@ async fn connection(stream: rt::TcpStream, serving: Arc<Serving>) {
     .await
 }
 
-/// Serve one connection. An error ends the connection alone. With a receive
-/// endpoint, each request carries the [`Peer`] of the connection in its
-/// extensions.
+/// Serves one connection. An error ends this connection and no other. With
+/// a receive endpoint, each request carries the [`Peer`] of the connection
+/// in its extensions.
 async fn serve_connection(stream: rt::TcpStream, serving: Arc<Serving>, stall: Arc<Stall>) {
     let shared = serving.clone();
     let service = move |peer: Peer| {

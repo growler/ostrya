@@ -1,6 +1,10 @@
-//! The server over a `bare-user` repository: the archive view over HTTP/1.1
-//! and over TLS with HTTP/2 and HTTP/1.1, the 404 of a refused and of an
-//! absent path, `HEAD`, client certificates, and the stop on drop.
+//! Tests of the server over a `bare-user` repository:
+//!
+//! - the archive view over HTTP/1.1, and over TLS with HTTP/2 and HTTP/1.1
+//! - the 404 of a refused path and of an absent path
+//! - `HEAD`
+//! - client certificates
+//! - the stop on drop
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -103,7 +107,7 @@ fn object_path(ty: ObjectType, checksum: &Checksum) -> String {
     format!("objects/{}", loose_path(checksum, ty, RepoMode::Archive))
 }
 
-/// Run `test` with the addresses of a server over `repo`, then drop the
+/// Runs `test` with the addresses of a server over `repo`, then drops the
 /// server.
 fn with_server<F, Fut>(repo: Repo, opts: ServeOptions, test: F)
 where
@@ -179,8 +183,8 @@ fn status(result: ostrya::fetch::Result<(Vec<u8>, Option<u64>, Protocol)>) -> u1
     }
 }
 
-/// Send `request` on a new connection and read the response until the
-/// server closes it.
+/// Sends `request` on a new connection and reads the response until the
+/// server closes the connection.
 async fn raw(addr: SocketAddr, request: &str) -> String {
     let mut stream = ostrya_rt::TcpStream::connect("127.0.0.1", addr.port())
         .await
@@ -207,9 +211,9 @@ fn header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
         .find_map(|line| line.strip_prefix(&format!("{name}: ")))
 }
 
-/// Over plain HTTP the built `config`, a stored object with its length, and
-/// a `.filez` built on request with no length are served; the paths the view
-/// refuses or does not find get 404.
+/// Over plain HTTP, the server serves the built `config`, a stored object
+/// with its length, and a `.filez` built on request with no length. A path
+/// that the view refuses or does not find gets 404.
 #[test]
 fn the_archive_view_is_served_over_http() {
     let tmp = TmpDir::new("http");
@@ -256,9 +260,10 @@ fn the_archive_view_is_served_over_http() {
     });
 }
 
-/// A refused path and an absent path get the same response, a `HEAD` sends
-/// the length of a stored file and no body, and a `HEAD` for a built `.filez`
-/// sends neither. A method other than `GET` and `HEAD` gets 405.
+/// A refused path and an absent path get the same response. A `HEAD` of a
+/// stored file sends the length and no body. A `HEAD` of a built `.filez`
+/// sends no length and no body. A method other than `GET` and `HEAD` gets
+/// 405.
 #[test]
 fn raw_responses_hide_refused_paths() {
     let tmp = TmpDir::new("raw");
@@ -322,9 +327,9 @@ fn tls_serves_http2_and_http1() {
     });
 }
 
-/// With a client CA, a client with a certificate the CA signed and a client
-/// with no certificate are served, and a client with a certificate of
-/// another CA is not.
+/// With a client CA, the server serves a client with a certificate that the
+/// CA signed, and a client with no certificate. A fetch of a client with a
+/// certificate of another CA fails.
 #[test]
 fn a_client_certificate_is_optional_and_verified() {
     let tmp = TmpDir::new("client-ca");
@@ -345,8 +350,8 @@ fn a_client_certificate_is_optional_and_verified() {
     });
 }
 
-/// Dropping the future of `run` closes the listener and ends the connections
-/// it accepted.
+/// A drop of the future of `run` closes the listener and ends the
+/// connections that the listener accepted.
 #[test]
 fn dropping_the_server_stops_it() {
     let tmp = TmpDir::new("drop");
@@ -386,8 +391,8 @@ fn dropping_the_server_stops_it() {
     });
 }
 
-/// The options refuse an empty listen list and TLS files that give no
-/// configuration, before any listener is bound.
+/// `bind` refuses an empty listen list and TLS files that give no
+/// configuration. It refuses them before it binds a listener.
 #[test]
 fn bad_options_are_refused() {
     let tmp = TmpDir::new("options");
@@ -404,8 +409,8 @@ fn bad_options_are_refused() {
     });
 }
 
-/// Read one HTTP/1.1 response with a `Content-Length` from `stream`, which
-/// stays open, and give its status line and its body.
+/// Reads one HTTP/1.1 response with a `Content-Length` from `stream`, and
+/// returns its status line and its body. The stream stays open.
 async fn read_response(stream: &mut ostrya_rt::TcpStream) -> (String, Vec<u8>) {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
@@ -420,7 +425,7 @@ async fn read_response(stream: &mut ostrya_rt::TcpStream) -> (String, Vec<u8>) {
     (head.lines().next().unwrap().to_owned(), body)
 }
 
-/// Run `fut`, and fail the test when it takes longer than `limit`.
+/// Runs `fut`. If `fut` takes longer than `limit`, the test fails.
 async fn within<T>(limit: std::time::Duration, what: &str, fut: impl Future<Output = T>) -> T {
     future::or(fut, async {
         ostrya_rt::Timer::after(limit).await;
@@ -429,8 +434,8 @@ async fn within<T>(limit: std::time::Duration, what: &str, fut: impl Future<Outp
     .await
 }
 
-/// Three thousand `GET`s of a small stored file, one after the other on one
-/// keep-alive connection, each get the whole body at once.
+/// Three thousand `GET`s of a small stored file go one after the other on
+/// one keep-alive connection. Each one gets the whole body at once.
 #[test]
 fn keep_alive_gets_of_a_stored_file_complete() {
     let tmp = TmpDir::new("keep-alive");
@@ -457,9 +462,9 @@ fn keep_alive_gets_of_a_stored_file_complete() {
     });
 }
 
-/// A `bare-user` repository at `zlib-level=1` with a file of `size` bytes
-/// that do not compress and a small file, and the checksums of the two file
-/// objects.
+/// A `bare-user` repository at `zlib-level=1`, and the checksums of its two
+/// file objects. One file has `size` bytes that do not compress, and the
+/// other file is small.
 async fn repo_with_big_file(base: &Path, size: usize) -> (Repo, Checksum, Checksum) {
     let src = base.join("big-src");
     std::fs::create_dir_all(&src).unwrap();
@@ -509,9 +514,9 @@ async fn repo_with_big_file(base: &Path, size: usize) -> (Repo, Checksum, Checks
     (repo, big.unwrap(), small.unwrap())
 }
 
-/// Clients that ask for a large `.filez` built on request and read none of
-/// it hold every compressor of the view until the body timeout ends their
-/// connections. A request after them is then served.
+/// Clients ask for a large `.filez` built on request and read none of it.
+/// They hold every compressor of the view until the body timeout ends their
+/// connections. Then the server serves a request after them.
 #[test]
 fn a_stalled_body_releases_its_compressor() {
     let tmp = TmpDir::new("stall");

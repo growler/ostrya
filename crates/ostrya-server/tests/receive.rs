@@ -1,9 +1,12 @@
-//! The receive endpoint over HTTP/1.1, and `DELETE` over HTTP/2: a push
-//! through the steps of one session, the routes, the status of each error,
-//! the session limit, the idle timeout, the silent body, `DELETE`, the
-//! commit that holds its session, the refusals of the steps in flight, and
-//! the authentication of each request. The client is the upload request of
-//! the fetcher.
+//! Tests of the receive endpoint over HTTP/1.1 and HTTP/2. The client is the
+//! upload request of the fetcher. The tests cover these subjects:
+//!
+//! - a push through the steps of one session
+//! - the routes, and the status of each error
+//! - the session limit, the idle timeout, and the silent body
+//! - `DELETE`, and the commit that holds its session
+//! - the refusals of the steps in flight
+//! - the authentication of each request
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -71,7 +74,7 @@ impl Drop for TmpDir {
 // Repositories and objects.
 // ---------------------------------------------------------------------------
 
-/// One object a client sends.
+/// One object that a client sends.
 #[derive(Clone)]
 struct Obj {
     name: ObjectName,
@@ -79,10 +82,12 @@ struct Obj {
     bytes: Vec<u8>,
 }
 
-/// An `archive` source repository with two commits with no parent, each over
-/// a tree of its own, and the objects of each commit as a client sends them:
-/// the stored `.filez` of a content object in the `deflate` encoding, and a
-/// metadata object raw.
+/// An `archive` source repository with two commits that have no parent. Each
+/// commit is over a tree of its own. The source also holds the objects of
+/// each commit as a client sends them:
+///
+/// - a content object as its stored `.filez`, in the `deflate` encoding
+/// - a metadata object as its raw bytes
 struct Source {
     commits: [Checksum; 2],
     objects: [Vec<Obj>; 2],
@@ -173,7 +178,7 @@ fn staging_entries(root: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Wait until `done` holds, and fail the test after 30 seconds.
+/// Waits until `done` holds, and fails the test after 30 seconds.
 fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !done() {
@@ -182,8 +187,9 @@ fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// The session ended with no commit: its staging directory goes, and the
-/// repository lock is released, so a prune takes the lock at once.
+/// Checks that the session ended with no commit. Its staging directory goes,
+/// and the server releases the repository lock, so a prune takes the lock at
+/// once.
 fn assert_released(repo: &Repo) {
     eventually("the removal of the staging directory", || {
         staging_entries(repo.path()).is_empty()
@@ -247,7 +253,7 @@ async fn object_start() -> Vec<u8> {
 }
 
 /// A body that waits inside an object after the whole object `first`. The
-/// session has `first` once the server read it.
+/// session has `first` after the server reads it.
 async fn waiting_body(first: &Obj) -> Vec<u8> {
     let mut writer = FrameWriter::new(Vec::new());
     write_object(&mut writer, first).await;
@@ -387,7 +393,7 @@ impl Client {
             .await
     }
 
-    /// Open a session, and give its id.
+    /// Opens a session and returns its id.
     async fn open(&self) -> String {
         let reply = self.post(SESSION, encode(&[hello()]).await).await;
         assert!(matches!(reply.ok(), Message::HelloReply(_)));
@@ -409,8 +415,8 @@ impl Client {
             .await
     }
 
-    /// Wait until the session `id` has `name`. The server read the object
-    /// then, so the request that carries it is in flight.
+    /// Waits until the session `id` has `name`. At the return, the server read
+    /// the object, so the request that carries the object is in flight.
     async fn until_read(&self, id: &str, name: ObjectName) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -429,8 +435,8 @@ impl Client {
     }
 
     /// An `objects` request whose body `write` streams. The request and the
-    /// writer run together, and the writer is dropped when the response
-    /// arrives.
+    /// writer run together. When the response arrives, the function drops the
+    /// writer.
     async fn objects_streamed<F, Fut>(&self, id: &str, write: F) -> Reply
     where
         F: FnOnce(ostrya::fetch::UploadWriter) -> Fut,
@@ -447,7 +453,7 @@ impl Client {
     }
 }
 
-/// Run `test` with a client of a server over `repo`, then drop the server.
+/// Runs `test` with a client of a server over `repo`, then drops the server.
 fn with_server<F, Fut>(repo: Repo, opts: ServeOptions, test: F)
 where
     F: FnOnce(Client, SocketAddr) -> Fut,
@@ -475,14 +481,14 @@ fn options() -> ServeOptions {
     opts
 }
 
-/// Write `bytes` to `writer` and flush, ignoring a failure: the server can
-/// answer before the body ends.
+/// Writes `bytes` to `writer` and flushes it. A failure gives `false` and no
+/// panic, because the server can answer before the body ends.
 async fn send_piece(writer: &mut ostrya::fetch::UploadWriter, bytes: &[u8]) -> bool {
     writer.write_all(bytes).await.is_ok() && writer.flush().await.is_ok()
 }
 
-/// Send `rest` raw on a new connection and read the response until the
-/// server closes it.
+/// Sends `request` raw on a new connection, and reads the response until the
+/// server closes the connection.
 async fn raw(addr: SocketAddr, request: &str) -> String {
     let mut stream = ostrya_rt::TcpStream::connect("127.0.0.1", addr.port())
         .await
@@ -513,8 +519,8 @@ fn header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
 // ---------------------------------------------------------------------------
 
 /// A push through `session`, `have`, two concurrent `objects` requests, and
-/// `commit` sets the ref, and the report goes to `on_report` with no
-/// warning. The session then is gone.
+/// `commit` sets the ref. The report goes to `on_report` with no warning.
+/// Then the session is gone.
 #[test]
 fn a_push_through_the_endpoint_commits() {
     let tmp = TmpDir::new("push");
@@ -586,10 +592,11 @@ fn a_push_through_the_endpoint_commits() {
     assert!(reports[0].warnings.is_empty(), "{:?}", reports[0].warnings);
 }
 
-/// An unknown session id gets an empty 404 on each route, the same bytes
-/// as a step. A path under the prefix that names no route gets 404, a
-/// known path with a wrong method 405 with `Allow`, and a `GET` the 404 of
-/// the archive view. A read-only server has no endpoint.
+/// An unknown session id gets an empty 404 on each route. A path under the
+/// prefix that names no route gets the same bytes. A known path with a wrong
+/// method gets 405 with `Allow`. A `GET` gets the 404 of the archive view.
+///
+/// A read-only server has no endpoint.
 #[test]
 fn routes_unknown_ids_and_methods() {
     let tmp = TmpDir::new("routes");
@@ -655,8 +662,8 @@ fn routes_unknown_ids_and_methods() {
 }
 
 /// With a limit of one session, a second `session` request gets 503 with
-/// `limit-exceeded`. A `DELETE` of the first one gets 204 with no body and
-/// no `Content-Length`, and then a new session opens.
+/// `limit-exceeded`. A `DELETE` of the first session gets 204 with no body
+/// and no `Content-Length`. Then a new session opens.
 #[test]
 fn a_session_past_the_limit_gets_503() {
     let tmp = TmpDir::new("limit");
@@ -679,8 +686,8 @@ fn a_session_past_the_limit_gets_503() {
     });
 }
 
-/// A `Hello` is checked before it takes a slot, so a bad `Hello` gets its
-/// 422 also when the sessions are at the limit.
+/// The endpoint checks a `Hello` before the session takes a slot. A bad
+/// `Hello` gets its 422 also when the sessions are at the limit.
 #[test]
 fn a_bad_hello_is_422_also_when_the_sessions_are_at_the_limit() {
     let tmp = TmpDir::new("limit-bad-hello");
@@ -702,8 +709,8 @@ fn a_bad_hello_is_422_also_when_the_sessions_are_at_the_limit() {
     });
 }
 
-/// Over HTTP/2, a `DELETE` gets 204 with no `Content-Length`, and an unknown
-/// session the empty 404.
+/// Over HTTP/2, a `DELETE` gets 204 with no `Content-Length`. A `DELETE` of
+/// an unknown session gets the empty 404.
 #[test]
 fn a_delete_over_http2_has_no_length() {
     let tmp = TmpDir::new("h2-delete");
@@ -732,9 +739,13 @@ fn a_delete_over_http2_has_no_length() {
     });
 }
 
-/// `ref-mismatch` and `non-fast-forward` get 409, `protocol`,
-/// `missing-objects`, and `mode-refused` 422, and a server-side failure 500
-/// with `internal`. A failed step ends the session.
+/// The status of each error code:
+///
+/// - `ref-mismatch` and `non-fast-forward` get 409.
+/// - `protocol`, `missing-objects`, and `mode-refused` get 422.
+/// - A server-side failure gets 500 with `internal`.
+///
+/// A failed step ends the session.
 #[test]
 fn errors_map_to_their_status() {
     let tmp = TmpDir::new("status");
@@ -757,7 +768,7 @@ fn errors_map_to_their_status() {
         reply.error(409, ErrorCode::RefMismatch);
         assert_eq!(client.have(&id, Vec::new()).await.status, 404);
 
-        // `main` at c1, and then c2, which does not descend from it.
+        // `main` goes to c1, and then to c2, which does not descend from c1.
         let id = client.open().await;
         client.step(&id, "objects", stream(&o1).await).await.ok();
         let reply = client
@@ -794,7 +805,8 @@ fn errors_map_to_their_status() {
             .await;
         reply.error(422, ErrorCode::MissingObjects);
 
-        // Another holder of the update lock, with no wait for it.
+        // Another holder of the update lock. The lock timeout is 0, so the
+        // commit does not wait for the lock.
         let id = client.open().await;
         client.step(&id, "objects", stream(&o2).await).await.ok();
         let guard = held.begin_update().await.unwrap();
@@ -821,7 +833,8 @@ fn errors_map_to_their_status() {
     }
 }
 
-/// Whether the process runs as root, read from `/proc/self/status`.
+/// Returns `true` if the process runs as root. The function reads the user
+/// id from `/proc/self/status`.
 fn is_root() -> bool {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     status
@@ -832,7 +845,8 @@ fn is_root() -> bool {
 }
 
 /// With one upload in flight and `parallel_uploads` 1, a second `objects`
-/// request gets `limit-exceeded`, and the first fails as the session ends.
+/// request gets `limit-exceeded`. This refusal ends the session, so the first
+/// request fails with `protocol`.
 #[test]
 fn objects_past_parallel_uploads_is_limit_exceeded() {
     let tmp = TmpDir::new("parallel");
@@ -895,7 +909,7 @@ fn a_commit_during_objects_is_protocol() {
 }
 
 /// An object that does not hash to its name fails its request with
-/// `checksum-mismatch`, and the other `objects` request of the session fails.
+/// `checksum-mismatch`. The other `objects` request of the session fails too.
 #[test]
 fn an_error_in_one_stream_fails_the_other() {
     let tmp = TmpDir::new("one-fails");
@@ -928,9 +942,9 @@ fn an_error_in_one_stream_fails_the_other() {
     assert_released(&repo);
 }
 
-/// A `DELETE` during an upload ends the session: the upload gets `protocol`,
-/// the next request 404, the staging directory goes, and the repository
-/// lock is released.
+/// A `DELETE` during an upload ends the session. The upload gets `protocol`,
+/// and the next request gets 404. The staging directory goes, and the server
+/// releases the repository lock.
 #[test]
 fn a_delete_during_an_upload_aborts_the_session() {
     let tmp = TmpDir::new("delete");
@@ -961,8 +975,8 @@ fn a_delete_during_an_upload_aborts_the_session() {
 }
 
 /// While the session commits, a second `commit` and a `DELETE` get
-/// `protocol`, and the session keeps its slot: with a limit of one session,
-/// a new session gets 503. The commit goes on to its end, and then frees the
+/// `protocol`. The session keeps its slot, so with a limit of one session, a
+/// new session gets 503. The commit continues to its end and then frees the
 /// slot.
 #[test]
 fn a_session_that_commits_keeps_its_commit_and_its_slot() {
@@ -981,7 +995,7 @@ fn a_session_that_commits_keeps_its_commit_and_its_slot() {
             .await
             .ok();
         // The commit waits for the update lock that the test holds. Of two
-        // commits, the one that comes second finds the session committing.
+        // commits, the one that comes second finds that the session commits.
         let guard = held.begin_update().await.unwrap();
         let body = encode(&[update(Expected::Absent, commit)]).await;
         let mut first = Box::pin(client.step(&id, "commit", body.clone()));
@@ -1008,8 +1022,9 @@ fn a_session_that_commits_keeps_its_commit_and_its_slot() {
     );
 }
 
-/// A session with no request for the idle timeout is aborted. A session
-/// whose upload delivers bytes slowly, over several idle timeouts, is not.
+/// The endpoint aborts a session with no request for the idle timeout. The
+/// endpoint does not abort a session whose upload delivers bytes slowly,
+/// over several idle timeouts.
 #[test]
 fn an_idle_session_is_aborted_and_a_slow_upload_is_not() {
     let tmp = TmpDir::new("idle");
@@ -1072,8 +1087,8 @@ fn a_silent_body_aborts_the_session() {
 
 /// A connection that closes in the middle of an `objects` body ends the
 /// session long before the idle timeout. The other request of the session
-/// gets the cause of a request that ended before its response, and the
-/// session then gets 404.
+/// gets the cause of a request that ended before its response. Then a
+/// request of the session gets 404.
 #[test]
 fn a_cut_request_ends_the_session() {
     let tmp = TmpDir::new("cut");
@@ -1122,8 +1137,9 @@ fn a_cut_request_ends_the_session() {
     assert_released(&repo);
 }
 
-/// The bytes before and after the value of a detached metadata dict whose one
-/// entry `k` holds an `ay` of `len` zero bytes, for `len` of 64 KiB or more.
+/// The bytes before and after the value of a detached metadata dict with the
+/// one entry `k`. The value is an `ay` of `len` zero bytes. `len` must be
+/// 64 KiB or more.
 fn one_entry_dict(len: usize) -> ([u8; 8], Vec<u8>) {
     let prefix = *b"k\0\0\0\0\0\0\0";
     let mut suffix = vec![0, b'a', b'y'];
@@ -1132,8 +1148,9 @@ fn one_entry_dict(len: usize) -> ([u8; 8], Vec<u8>) {
     (prefix, suffix)
 }
 
-/// Two detached metadata objects of 65 MiB each, in two `objects` requests of
-/// one session, pass the session cap: the second gets `limit-exceeded`.
+/// In one session, two `objects` requests that each carry a detached metadata
+/// object of 65 MiB are more than the session cap. The second request gets
+/// `limit-exceeded`.
 #[test]
 fn detached_metadata_past_the_session_cap_is_limit_exceeded() {
     let tmp = TmpDir::new("metacap");
@@ -1167,8 +1184,8 @@ fn detached_metadata_past_the_session_cap_is_limit_exceeded() {
             panic!("no ObjectsReply");
         };
         assert_eq!(r.objects, 1);
-        // The second dict needs no valid form: the cap refuses it before its
-        // end, and the response ends the writer.
+        // The second dict does not need a valid form, because the cap refuses
+        // it before its end. The response then ends the writer.
         let second = client
             .objects_streamed(&id, |w| async move {
                 let mut writer = FrameWriter::new(w);
@@ -1236,8 +1253,8 @@ fn credentials() -> Vec<u8> {
     .into_bytes()
 }
 
-/// The server TLS files, with the fixture CA as the client CA when
-/// `client_ca` is set.
+/// The server TLS files. If `client_ca` is `true`, the fixture CA is also the
+/// client CA.
 fn server_tls(client_ca: bool) -> ServerTls {
     ServerTls {
         cert_chain_pem: SERVER_CERT_PEM.to_vec(),
@@ -1278,7 +1295,8 @@ fn challenges(reply: &Reply) -> Vec<&str> {
         .collect()
 }
 
-/// `reply` is 401 with an `unauthorized` frame and the two challenges.
+/// Checks that `reply` is 401 with an `unauthorized` frame and the two
+/// challenges.
 fn assert_401(reply: &Reply) {
     reply.error(401, ErrorCode::Unauthorized);
     assert_eq!(
@@ -1299,10 +1317,11 @@ fn absent() -> ObjectName {
     ObjectName::new(Checksum::sha256(b"absent"), ObjectType::DirTree)
 }
 
-/// Over TLS, `Hello` is accepted with a bearer token, with Basic, and with a
-/// client certificate, and the session takes the next step of its owner.
-/// With no credential and with a credential that matches no line, also
-/// beside a valid client certificate, it gets 401 with `unauthorized`.
+/// Over TLS, the endpoint accepts `Hello` with a bearer token, with Basic,
+/// and with a client certificate. The session then takes the next step of
+/// its owner. A `Hello` with no credential gets 401 with `unauthorized`. A
+/// credential that matches no line gets the same 401, also beside a valid
+/// client certificate.
 #[test]
 fn each_method_opens_a_session_and_a_bad_credential_is_401() {
     let tmp = TmpDir::new("methods");
@@ -1337,8 +1356,8 @@ fn each_method_opens_a_session_and_a_bad_credential_is_401() {
 }
 
 /// With a client CA as the one method, a client with no certificate gets
-/// 403 with `unauthorized` and no challenge, and a client with a
-/// certificate opens a session.
+/// 403 with `unauthorized` and no challenge. A client with a certificate
+/// opens a session.
 #[test]
 fn a_client_ca_alone_refuses_a_client_with_no_certificate() {
     let tmp = TmpDir::new("client-ca");
@@ -1357,9 +1376,9 @@ fn a_client_ca_alone_refuses_a_client_with_no_certificate() {
 }
 
 /// Over plain HTTP, a bearer or Basic credential gets 403 with
-/// `unauthorized`, also where anonymous push is allowed, and a request with
-/// no credential pushes anonymously. With `allow_cleartext_credentials`
-/// both credentials are accepted.
+/// `unauthorized`, also on a server that allows anonymous push. On that
+/// server, a request with no credential pushes anonymously. With
+/// `allow_cleartext_credentials`, the endpoint accepts both credentials.
 #[test]
 fn a_credential_over_plain_http_is_403_unless_allowed() {
     let tmp = TmpDir::new("cleartext");
@@ -1389,8 +1408,8 @@ fn a_credential_over_plain_http_is_403_unless_allowed() {
 }
 
 /// A request of a session with another credential, or with none, gets the
-/// bytes of an unknown id, and the session stays. Basic with the name of
-/// the line of a bearer token is the same owner.
+/// bytes of an unknown id. The session stays. A Basic credential with the
+/// name of the line of a bearer token is the same owner as that token.
 #[test]
 fn another_credential_gets_the_404_of_an_unknown_id() {
     let tmp = TmpDir::new("owner");
@@ -1448,9 +1467,9 @@ fn more_than_one_authorization_header_is_401() {
     });
 }
 
-/// A `GET` and a `HEAD` of the archive view ignore `Authorization`: a read
-/// with Basic over plain HTTP succeeds on a server with a receive endpoint
-/// that takes no credential over plain HTTP.
+/// A `GET` and a `HEAD` of the archive view ignore `Authorization`. A read
+/// with Basic over plain HTTP succeeds on a server whose receive endpoint
+/// takes no credential over plain HTTP.
 #[test]
 fn a_read_ignores_authorization() {
     let tmp = TmpDir::new("read");
@@ -1476,7 +1495,7 @@ fn a_read_ignores_authorization() {
 
 /// `bind` refuses a malformed credential line with `Error::Credentials`,
 /// which names the line and holds no byte of it. A file with no credential
-/// line is no authentication method.
+/// line gives no authentication method.
 #[test]
 fn a_malformed_credential_line_is_refused_at_bind() {
     let tmp = TmpDir::new("malformed");
@@ -1535,9 +1554,9 @@ fn a_credential_file_alone_over_plain_http_is_refused_at_bind() {
 }
 
 /// With a client CA that did not sign the client certificate, the TLS
-/// handshake of a client that presents that certificate fails, and the
-/// request gets no response. A client with no certificate is served and
-/// gets 403.
+/// handshake of a client that presents that certificate fails. The request
+/// gets no response. The handshake of a client with no certificate
+/// succeeds, and its request gets 403.
 #[test]
 fn a_client_certificate_the_client_ca_did_not_sign_fails_the_handshake() {
     let tmp = TmpDir::new("other-ca");
@@ -1563,12 +1582,16 @@ fn a_client_certificate_the_client_ca_did_not_sign_fails_the_handshake() {
     });
 }
 
-/// Each stream of one HTTP/2 connection is authorized again. A session of a
-/// bearer token gets 401 with no header, the 404 of an unknown id with the
-/// token of another line, and its step with Basic of the same line. A
-/// session of the client certificate and a session of a token, on the
-/// connection of one client, each get the 404 of an unknown id from the
-/// other owner.
+/// The endpoint authorizes each stream of one HTTP/2 connection again. A
+/// request to the session of a bearer token gets these responses:
+///
+/// - with no `Authorization` header: 401
+/// - with the token of another line: the 404 of an unknown id
+/// - with Basic of the same line: the reply of its step
+///
+/// One client opens a session with its client certificate and a session
+/// with a token, on one connection. A request of each owner to the session of
+/// the other owner gets the 404 of an unknown id.
 #[test]
 fn each_stream_of_one_http2_connection_is_authorized_again() {
     let tmp = TmpDir::new("h2-owners");
@@ -1612,10 +1635,10 @@ fn each_stream_of_one_http2_connection_is_authorized_again() {
     });
 }
 
-/// A refusal before the body waits for the body at most 5 seconds, also with
-/// the default idle timeout of 300 seconds, and then answers with
-/// `Connection: close`. With an idle timeout below 5 seconds, it waits for
-/// the idle timeout.
+/// A refusal before the body waits at most 5 seconds for the body, also with
+/// the default idle timeout of 300 seconds. Then the refusal goes out with
+/// `Connection: close`. If the idle timeout is less than 5 seconds, the
+/// refusal waits for the idle timeout.
 #[test]
 fn a_refusal_with_a_silent_body_answers_within_5_seconds() {
     let tmp = TmpDir::new("drain");

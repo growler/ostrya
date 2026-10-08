@@ -1,11 +1,8 @@
 //! The authorization of the requests of the receive endpoint.
 //!
-//! The credential file holds one credential on each line, `NAME:HEX`, where
-//! `HEX` is the SHA-256 digest of the secret in 64 lowercase hex digits. A
-//! bearer token matches a line by the digest of the token. A Basic
-//! credential matches a line by its name and the digest of its password.
-//! Each request compares its digest with every line in constant time and
-//! does not stop at a match.
+//! The doc of [`ServeOptions`] states the credential file, the methods, and
+//! the order of the checks. The server compares the digest of a request with
+//! every credential line in constant time, and does not stop at a match.
 
 use std::collections::HashMap;
 use std::future::{Future, ready};
@@ -29,7 +26,7 @@ const CHALLENGES: [&str; 2] = [r#"Bearer realm="ostrya""#, r#"Basic realm="ostry
 /// it into the extensions of each request.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Peer {
-    /// Whether the connection runs over TLS.
+    /// `true` if the connection runs over TLS.
     pub(crate) tls: bool,
     /// The SHA-256 digest of the DER bytes of the end-entity certificate that
     /// the client presented in the TLS handshake. The handshake verified the
@@ -44,11 +41,9 @@ pub(crate) struct Credential {
     digest: [u8; 32],
 }
 
-/// The credential lines of the credential file `bytes`. A line that starts
-/// with `#` and an empty line hold no credential. Each other line is
-/// `NAME:HEX`: `NAME` is one or more visible ASCII characters other than
-/// `:`, and `HEX` is 64 lowercase hex digits. A malformed line, a name on
-/// two lines, and a digest on two lines are [`Error::Credentials`], which
+/// The credential lines of the credential file `bytes`, in the format that
+/// [`ServeOptions::credentials`] states. A malformed line, a name on two
+/// lines, and a digest on two lines are [`Error::Credentials`]. The error
 /// names the line by its number and holds no byte of it.
 pub(crate) fn parse_credentials(bytes: &[u8]) -> Result<Vec<Credential>, Error> {
     let mut lines = Vec::new();
@@ -108,9 +103,9 @@ thread_local! {
     static COMPARES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Whether two digests are equal, in a time that does not depend on their
-/// bytes: each digest is read as four 64-bit words, the XOR of each word
-/// pair is ORed into one word, and no step branches on a byte.
+/// Returns `true` if two digests are equal, in a time that does not depend
+/// on their bytes. The function reads each digest as four 64-bit words and
+/// ORs the XOR of each word pair into one word. No step branches on a byte.
 fn digest_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     #[cfg(test)]
     COMPARES.with(|n| n.set(n.get() + 1));
@@ -124,7 +119,7 @@ fn digest_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 }
 
 /// The index of the first line of `lines` with the digest `digest`. The
-/// digest of every line is compared, also after a match.
+/// function compares the digest of every line, also after a match.
 fn match_line(lines: &[Credential], digest: &[u8; 32]) -> Option<usize> {
     let mut found = None;
     for (index, line) in lines.iter().enumerate() {
@@ -136,19 +131,17 @@ fn match_line(lines: &[Credential], digest: &[u8; 32]) -> Option<usize> {
 }
 
 /// The authentication methods of `ostrya serve`: the credential file, the
-/// client certificate, and anonymous push. The owner key of a principal has a
-/// prefix for each method: `token:NAME` for a bearer token or a Basic
-/// credential, by the name of its line, `cert:HEX` for a client certificate,
-/// by the SHA-256 digest of its DER bytes in lowercase hex, and `anonymous`.
-/// A name can be equal to a digest, and the prefix keeps the keys of two
-/// methods apart. A bearer token and a Basic credential of one line give one
-/// key. Each session gets the policy of the server.
+/// client certificate, and anonymous push. Each session gets the policy of
+/// the server. [`ServeOptions`] states the owner key of each method and the
+/// order of the checks.
 pub(crate) struct FileAuth {
-    /// A request with no credential may push.
+    /// `true` if a request with no credential can push.
     anonymous: bool,
-    /// The TLS layer verifies a client certificate against a client CA.
+    /// `true` if the TLS layer verifies a client certificate against a
+    /// client CA.
     client_ca: bool,
-    /// A bearer or Basic credential is taken over plain HTTP.
+    /// `true` if the server takes a bearer or Basic credential over plain
+    /// HTTP.
     cleartext: bool,
     /// The lines of the credential file.
     credentials: Vec<Credential>,
@@ -157,11 +150,13 @@ pub(crate) struct FileAuth {
 }
 
 impl FileAuth {
-    /// The methods of `opts`, with `policy` for each session. A malformed
-    /// line of the credential file is [`Error::Credentials`]. A server with
-    /// no method is refused, and so is a server with no TLS whose one method
-    /// is the credential file and that takes no credential over plain HTTP,
-    /// because no request can pass it.
+    /// The methods of `opts`, with `policy` for each session.
+    ///
+    /// A malformed line of the credential file is [`Error::Credentials`]. A
+    /// server with no method is [`Error::Options`]. A server with no TLS and
+    /// no anonymous push has the credential file as its one method. If it
+    /// also takes no credential over plain HTTP, no request can pass it, so
+    /// it is [`Error::Options`].
     pub(crate) fn new(opts: &ServeOptions, policy: Arc<ReceivePolicy>) -> Result<FileAuth, Error> {
         let credentials = match &opts.credentials {
             Some(bytes) => parse_credentials(bytes)?,
@@ -183,7 +178,7 @@ impl FileAuth {
             ));
         }
         // With no TLS there is no client CA, so the credential lines are the one
-        // method, and the endpoint refuses each of them over plain HTTP.
+        // method. The endpoint refuses each credential over plain HTTP.
         if opts.tls.is_none() && !auth.anonymous && !auth.cleartext {
             return Err(Error::Options(
                 "a receive endpoint over plain HTTP with the credential file as its one method \
@@ -194,21 +189,14 @@ impl FileAuth {
         Ok(auth)
     }
 
-    /// Whether one method or more can accept a request.
+    /// Returns `true` if one method or more can accept a request.
     fn has_method(&self) -> bool {
         self.anonymous || self.client_ca || !self.credentials.is_empty()
     }
 
     /// The owner key of a request with `headers` from `peer`, or the refusal
-    /// of the request.
-    ///
-    /// More than one `Authorization` header is 401. A bearer or Basic
-    /// credential on a connection without TLS is 403, unless the server
-    /// takes credentials over plain HTTP. A credential that matches no line
-    /// is 401, also beside a client certificate. With no `Authorization`
-    /// header, a verified client certificate gives its owner, then
-    /// anonymous push where it is allowed. Else the request is 401 where the
-    /// server has credential lines, and 403 where it has a client CA alone.
+    /// of the request. The checks run in the order that
+    /// [`ServeOptions`](ServeOptions#authentication) states.
     fn authorize(&self, headers: &HeaderMap, peer: &Peer) -> Result<String, Refusal> {
         let mut values = headers.get_all(AUTHORIZATION).iter();
         let Some(value) = values.next() else {
@@ -313,8 +301,10 @@ impl ReceiveAuth for FileAuth {
 
     /// The owner key of the request, from its headers and the [`Peer`] in
     /// its extensions. The server puts a peer into each request of its
-    /// receive endpoint. A request with no peer is taken as plain HTTP with
-    /// no client certificate. The route does not change the answer.
+    /// receive endpoint. The route does not change the answer.
+    ///
+    /// If a request has no peer, a build with debug assertions panics. Other
+    /// builds take the request as plain HTTP with no client certificate.
     fn authenticate(
         &self,
         parts: &Parts,
@@ -632,8 +622,8 @@ mod tests {
     }
 
     /// A bearer or Basic credential over plain HTTP is 403 before any
-    /// compare, also where anonymous push is allowed, unless the server takes
-    /// credentials over plain HTTP.
+    /// compare, also where anonymous push is allowed. If the server takes
+    /// credentials over plain HTTP, the credential passes.
     #[test]
     fn a_credential_over_plain_http_is_403() {
         let mut auth = auth(&line("alice", "a-token"));
@@ -786,9 +776,9 @@ mod tests {
         }
     }
 
-    /// `FileAuth::new` refuses a server with no method, and a server with
-    /// no TLS whose one method is the credential file, unless it takes
-    /// credentials over plain HTTP. A malformed line is
+    /// `FileAuth::new` refuses a server with no method. It also refuses a
+    /// server with no TLS whose one method is the credential file, unless it
+    /// takes credentials over plain HTTP. A malformed line is
     /// [`Error::Credentials`].
     #[test]
     fn new_refuses_a_server_that_no_request_can_pass() {

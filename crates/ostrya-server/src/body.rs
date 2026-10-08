@@ -14,9 +14,10 @@ use crate::stall::Tracker;
 /// The largest frame a stream body yields.
 const MAX_FRAME: usize = 64 * 1024;
 
-/// The bytes a stream body gives in one run of polls before it yields to the
-/// executor, so a body whose reader is always ready, such as a `.filez` built
-/// on request, does not hold the executor thread for long.
+/// The bytes that a stream body gives in one run of polls before it yields
+/// to the executor. With this limit, a body whose reader is always ready does
+/// not hold the executor thread for long. A `.filez` built on request is such
+/// a body.
 const YIELD_AFTER: usize = 256 * 1024;
 
 /// A response body: empty, bytes held whole, a stream read in frames, or the
@@ -30,9 +31,10 @@ pub(crate) enum ServeBody {
 }
 
 impl ServeBody {
-    /// A body over `reader`. With `len`, the body ends after `len` bytes, and
-    /// a reader that ends sooner fails the body, so a short body is never
-    /// sent as a whole one. `tracker` records each frame hyper takes.
+    /// Creates a body over `reader`. If `len` is set, the body ends after
+    /// `len` bytes. If the reader ends sooner, the body fails, so a short
+    /// body is never sent as a whole one. `tracker` records each frame that
+    /// hyper takes.
     pub(crate) fn stream(
         reader: Box<dyn AsyncRead + Unpin + Send>,
         len: Option<u64>,
@@ -106,21 +108,22 @@ impl StreamBody {
 }
 
 /// The response body of
-/// [`ReceiveEndpoint::handle`](crate::ReceiveEndpoint::handle). It is `Send`
-/// and `Unpin`. A body is empty or holds one frame of the push protocol,
-/// whole. The body of a `CommitReply` gives the report of the commit to
-/// [`EndpointOptions::on_report`](crate::EndpointOptions::on_report) when
-/// it drops.
+/// [`ReceiveEndpoint::handle`](crate::ReceiveEndpoint::handle).
+///
+/// The body is `Send` and `Unpin`. It is empty, or it holds one whole frame
+/// of the push protocol. When the body of a `CommitReply` drops, it gives
+/// the report of the commit to
+/// [`EndpointOptions::on_report`](crate::EndpointOptions::on_report).
 pub struct ReceiveBody(pub(crate) ServeBody);
 
 impl ReceiveBody {
-    /// The body as a response body of the server.
+    /// Returns the body as a response body of the server.
     pub(crate) fn into_serve(self) -> ServeBody {
         self.0
     }
 }
 
-/// The body is opaque.
+/// Formats the body as `ReceiveBody { .. }`, with no content.
 impl fmt::Debug for ReceiveBody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReceiveBody").finish_non_exhaustive()
@@ -198,7 +201,7 @@ pub(crate) mod tests {
     use futures_lite::io::Cursor;
     use ostrya_rt::block_on;
 
-    /// Every frame of `body`, or the error that ended it.
+    /// Returns every frame of `body`, or the error that ended the body.
     pub(crate) async fn frames(mut body: ServeBody) -> io::Result<Vec<Bytes>> {
         let mut out = Vec::new();
         while let Some(frame) = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
@@ -231,8 +234,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A known length ends the body there, and a reader that ends sooner
-    /// fails it.
+    /// A known length ends the body at that length. A reader that ends
+    /// sooner fails the body.
     #[test]
     fn a_known_length_bounds_the_body() {
         let body = stream(b"0123456789".to_vec(), Some(4));

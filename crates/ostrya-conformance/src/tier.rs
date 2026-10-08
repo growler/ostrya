@@ -1,9 +1,7 @@
-//! Privilege-tier detection.
+//! The privilege tier of the host.
 //!
-//! `docs/conformance/README.md` defines the tiers. A tier is a property of the
-//! (mode, corpus) pair a cell names; this module reports the tier the running
-//! process provides, so a cell needing more reports as skipped rather than
-//! failing for a reason the host caused.
+//! [`detect`] returns the [`Host`], with the tier that the process provides.
+//! [`Tier`] names the tiers.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -11,14 +9,17 @@ use std::sync::OnceLock;
 
 use crate::record::Tier;
 
-/// The path the reference tool compiles in as its third `--repo` source, after
-/// the current directory and `OSTREE_REPO`.
+/// The path of the system repository.
+///
+/// The `ostree` command has this path compiled in as its third `--repo`
+/// source, after the current directory and `OSTREE_REPO`.
 pub const SYSTEM_REPO: &str = "/sysroot/ostree/repo";
 
-/// The system repository, when the host carries one.
+/// Returns the system repository, if the host has one.
 ///
-/// The host carries one when `SYSTEM_REPO` exists and is a directory. Every
-/// invocation consults this fact, so it is detected once per process.
+/// The host has one if [`SYSTEM_REPO`] exists and is a directory.
+/// [`exec::run`](crate::exec::run) reads this fact for each invocation, so the
+/// function checks it one time for each process and keeps the result.
 pub fn system_repo() -> Option<&'static Path> {
     static DETECTED: OnceLock<Option<PathBuf>> = OnceLock::new();
     DETECTED
@@ -29,28 +30,33 @@ pub fn system_repo() -> Option<&'static Path> {
         .as_deref()
 }
 
-/// What the host grants the running process.
+/// The privileges that the host gives to the running process.
 #[derive(Clone, Debug)]
 pub struct Host {
-    /// The highest tier this host reaches.
+    /// The tier that the running process provides, by the rules of [`detect`].
     pub tier: Tier,
     /// The effective uid of the process.
     pub euid: u32,
-    /// How many supplementary groups the process holds.
+    /// The number of supplementary groups of the process.
     pub groups: usize,
-    /// Whether the process runs in the initial user namespace.
+    /// The flag that is `true` if the process runs in the initial user
+    /// namespace.
     pub initial_namespace: bool,
-    /// Whether the kernel reports SELinux in enforcing state.
+    /// The flag that is `true` if the kernel reports SELinux in enforcing
+    /// state.
     pub selinux_enforcing: bool,
-    /// Whether `unshare -r true` succeeds, so T2 is reachable by re-running.
+    /// The flag that is `true` if `unshare -r true` succeeds.
+    ///
+    /// If it is `true`, a new run under `unshare -r` reaches T2.
     pub namespaces_available: bool,
-    /// The repository the reference tool's third `--repo` source resolves,
-    /// when the host carries one.
+    /// The system repository, if the host has one.
+    ///
+    /// The `ostree` command resolves it as its third `--repo` source.
     pub system_repo: Option<PathBuf>,
 }
 
 impl Host {
-    /// One line naming the tier and the reason it is that tier.
+    /// Returns one line that names the tier and the facts that give it.
     pub fn describe(&self) -> String {
         format!(
             "tier {} (euid {}, {} group(s), {} namespace, SELinux {}, {})",
@@ -74,7 +80,18 @@ impl Host {
         )
     }
 
-    /// The advice a `skip: tier` report carries.
+    /// Returns the advice of a skip with the reason `tier`.
+    ///
+    /// `required` is the tier that the cell needs. The advice is:
+    ///
+    /// - T1: `the process belongs to one group only`.
+    /// - T2: if [`namespaces_available`] is `true`,
+    ///   `` re-run under `unshare -r` ``, else `the host grants no user namespace`.
+    /// - T3: `re-run as root`.
+    /// - T4: `needs root on an SELinux-enforcing kernel`.
+    /// - T0: an empty string.
+    ///
+    /// [`namespaces_available`]: Host::namespaces_available
     pub fn advice(&self, required: Tier) -> String {
         match required {
             Tier::T2 if self.namespaces_available => "re-run under `unshare -r`".to_owned(),
@@ -87,7 +104,34 @@ impl Host {
     }
 }
 
-/// Detect the host's tier.
+/// Returns the [`Host`], with the tier that the running process provides.
+///
+/// A cell needs a tier: the higher of the `tier` field of its record and the
+/// tier of its corpus ([`required_tier`](crate::runner::required_tier)). If a
+/// cell needs a higher tier than the host provides, the cell reports a skip
+/// with the reason `tier`. The cell does not fail because of a limit of the
+/// host.
+///
+/// # Tiers
+///
+/// - If the effective uid is 0 in the initial user namespace, the tier is T3.
+///   If SELinux also enforces, the tier is T4.
+/// - If the effective uid is 0 in another user namespace, the tier is T2.
+/// - If the process has more than one supplementary group, the tier is T1.
+/// - Else the tier is T0.
+///
+/// [`Tier`] states what each tier means.
+///
+/// # Detection
+///
+/// - The initial user namespace has the `/proc/self/uid_map` line
+///   `0 0 4294967295`. If the file cannot be read, the process counts as in
+///   the initial namespace.
+/// - If `/sys/fs/selinux/enforce` holds `1`, SELinux enforces. If the file
+///   cannot be read, SELinux counts as not enforcing.
+/// - If `getgroups` fails, the group count is 1.
+/// - The function runs `unshare -r true` once to set
+///   [`Host::namespaces_available`].
 pub fn detect() -> Host {
     let euid = rustix::process::geteuid().as_raw();
     let groups = rustix::process::getgroups()
@@ -126,15 +170,16 @@ pub fn detect() -> Host {
 /// The initial user namespace maps the whole id space onto itself.
 fn in_initial_namespace() -> bool {
     let Ok(text) = std::fs::read_to_string("/proc/self/uid_map") else {
-        // No procfs: treat a root euid as real root, which is the only case
-        // the caller distinguishes.
+        // If procfs is absent, a root euid counts as real root. The caller
+        // distinguishes only this case.
         return true;
     };
     let fields: Vec<&str> = text.split_whitespace().collect();
     fields == ["0", "0", "4294967295"]
 }
 
-/// Whether a user namespace with a mapped root can be entered.
+/// Returns `true` if the process can enter a user namespace with a mapped
+/// root.
 fn namespaces_available() -> bool {
     Command::new("unshare")
         .args(["-r", "true"])

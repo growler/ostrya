@@ -1,22 +1,45 @@
 #![forbid(unsafe_code)]
 
-//! The runner for the interoperability conformance matrix.
+//! The runner of the conformance matrix of `ostrya` and the `ostree` command.
 //!
-//! `docs/conformance/README.md` defines the matrix: the custody axes, the
-//! outcome vocabulary, the corpora, and the privilege tiers.
-//! `docs/conformance/harness.md` defines this program: the record is the
-//! program, a verdict states what the run observed, and a cell the run could
-//! not observe reports as skipped with the reason. Conformance is reported
-//! only when both implementations ran and their observations agreed.
+//! Each record of a matrix directory expands into cells. A cell runs the
+//! `ostrya` binary and the `ostree` command as subprocesses and compares what
+//! they did. If a run cannot observe a cell, the cell reports a skip with the reason.
 //!
-//! The crate links neither implementation. It drives the `ostrya` and
-//! `ostree` binaries as subprocesses, so it observes the surface a user
-//! observes.
+//! # Entry points
 //!
-//! The library exists so the cargo test targets can call the same code the
-//! binary calls; the binary runs standalone, because cells at tiers T2
-//! through T4 run under `unshare -r` or as root on a machine that holds no
-//! cargo installation and no source tree.
+//! - [`record::load`] reads a matrix directory, and [`default_matrix_dir`] names the default.
+//! - [`check::check`] checks the records and runs no binary.
+//! - [`runner::run`] runs the cells, and [`report::run_report`] renders the results.
+//! - [`observe::observe`] runs the `ostree` command alone and prints a record skeleton.
+//! - [`t0_gate`] runs the T0 cells in a cargo test.
+//!
+//! # Modules
+//!
+//! - [`check`]: the static check of the record files.
+//! - [`corpus`]: the source trees that the cells commit.
+//! - [`deb822`]: the paragraph format of the record files.
+//! - [`exec`]: the resolution and the run of the two implementations.
+//! - [`json`]: the JSON document of `--format json`.
+//! - [`observe`]: the observation of the `ostree` command alone.
+//! - [`oracle`]: the comparison of the state that each implementation leaves after a run.
+//! - [`probe`]: the cells that a `run:` line cannot state.
+//! - [`record`]: the record vocabulary and the expansion of a record into cells.
+//! - [`report`]: the output formats and the mode grids.
+//! - [`runner`]: the run of the cells and their verdicts.
+//! - [`setup`]: the start state of a cell and the placeholders that it binds.
+//! - [`sha256`]: the SHA-256 digest of the `manifest` oracle.
+//! - [`syntax`]: the grammar of a `run:` line and of an `expect-*` claim.
+//! - [`tier`]: the privilege tier of the host.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use ostrya_conformance::{check, default_matrix_dir, record};
+//! let matrix = record::load(&default_matrix_dir())?;
+//! assert!(check::check(&matrix).ok());
+//! # Ok::<(), String>(())
+//! ```
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,7 +60,14 @@ pub mod sha256;
 pub mod syntax;
 pub mod tier;
 
-/// The record directory this crate was built beside.
+/// Returns the matrix directory that a run reads by default.
+///
+/// The directory is the first of these:
+///
+/// - The value of `OSTRYA_MATRIX_DIR`, if it is set.
+/// - `docs/conformance` in the workspace that this crate was built in, if it
+///   is a directory.
+/// - `docs/conformance`, relative to the current directory.
 pub fn default_matrix_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("OSTRYA_MATRIX_DIR") {
         return PathBuf::from(dir);
@@ -49,10 +79,11 @@ pub fn default_matrix_dir() -> PathBuf {
     PathBuf::from("docs/conformance")
 }
 
-/// `path` made absolute against the current directory.
+/// Returns `path` as an absolute path, relative to the current directory.
 ///
-/// Every invocation runs in a cell's scratch directory, so a relative
-/// artifact path would resolve against the wrong root.
+/// Each invocation runs in the scratch directory of a cell, so a relative
+/// artifact path resolves against the wrong directory there. If the current
+/// directory cannot be read, the function returns `path` unchanged.
 pub fn absolute(path: &Path) -> PathBuf {
     if path.is_absolute() {
         return path.to_path_buf();
@@ -62,13 +93,18 @@ pub fn absolute(path: &Path) -> PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// The workspace root this crate was built in.
+/// Returns the root of the workspace that this crate was built in.
+///
+/// The path comes from the build, so it names a directory of the build host.
 pub fn workspace_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The run identifier the default artifact directory carries:
-/// `YYYYmmdd-HHMMSS`, in UTC.
+/// Returns an identifier for a run, from the current UTC time.
+///
+/// The form is `YYYYmmdd-HHMMSS`. The binary writes the artifacts of a run to
+/// `target/conformance/<run-id>` by default. If the clock is before 1970, the
+/// identifier is `19700101-000000`.
 pub fn run_id() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -85,7 +121,7 @@ pub fn run_id() -> String {
     )
 }
 
-/// The proleptic Gregorian date `days` after 1970-01-01.
+/// Returns the proleptic Gregorian date `days` after 1970-01-01.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let shifted = days + 719_468;
     let era = shifted.div_euclid(146_097);
@@ -104,21 +140,57 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
-/// The result of the workspace test gate.
+/// The result of [`t0_gate`].
 pub struct Gate {
-    /// One entry per cell the gate ran.
+    /// The result of each cell of the matrix, in matrix order.
+    ///
+    /// A cell that does not need T0 has a skip with the reason `filtered`.
     pub results: Vec<runner::CellResult>,
-    /// The rendered report.
+    /// The report of the run, in the human format.
     pub text: String,
-    /// Whether any cell failed.
+    /// The flag that is `true` if a failure gates the run.
+    ///
+    /// [`runner::gating_failure`] decides it, with no `--strict-identity`. A
+    /// failure of a cell with the severity `identity` does not set it.
     pub failed: bool,
 }
 
-/// Run every cell the host's tier admits at T0, with `port` as the port
-/// handle and the reference resolved from `OSTREE_BIN` or `PATH`.
+/// Runs the T0 cells of the default matrix against the `ostrya` binary at `port`.
 ///
-/// This is what `crates/ostrya-cli/tests/conformance.rs` calls, so the
-/// workspace test run gates on the matrix with no workflow change.
+/// A cargo test target of `ostrya-cli` calls this function, so `cargo test`
+/// runs the T0 cells. The cells of a higher tier run with the
+/// `ostrya-conformance` binary. At T2 to T4, it runs under `unshare -r` or as
+/// root.
+///
+/// # Run
+///
+/// - The matrix is [`default_matrix_dir`].
+/// - The `ostree` command is the file that `OSTREE_BIN` names, else the first
+///   executable `ostree` in `PATH`. [`exec::resolve`] states the rule. If no
+///   command resolves, each cell that needs it reports a skip with the reason
+///   `reference-absent`.
+/// - The cells run on as many threads as [`available_parallelism`] gives.
+/// - The run writes the artifacts to `artifact_dir`, as an absolute path. It
+///   removes the artifacts of a cell that passes.
+///
+/// # Errors
+///
+/// - An error from [`record::load`] if the matrix does not load.
+/// - An error if `port` is not an executable file.
+/// - An error with the text of [`exec::locale_codeset_defect`] if an `ostree`
+///   command resolves and [`exec::LOCALE`] has no UTF-8 codeset on the host.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+/// let port = Path::new("target/debug/ostrya");
+/// let gate = ostrya_conformance::t0_gate(port, Path::new("target/conformance/t0"))?;
+/// assert!(!gate.failed, "{}", gate.text);
+/// # Ok::<(), String>(())
+/// ```
+///
+/// [`available_parallelism`]: std::thread::available_parallelism
 pub fn t0_gate(port: &Path, artifact_dir: &Path) -> Result<Gate, String> {
     let artifact_dir = absolute(artifact_dir);
     let matrix = record::load(&default_matrix_dir())?;

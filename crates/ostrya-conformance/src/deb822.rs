@@ -1,36 +1,34 @@
-//! The deb822 paragraph form the record files use.
+//! The deb822 paragraph format of the record files.
 //!
-//! A file holds paragraphs separated by blank lines. A paragraph holds
-//! `key: value` lines; a line starting with one space continues the value of
-//! the preceding key, joined with a single space. A line whose first
-//! non-blank character is `#` is a comment.
+//! [`parse`] reads a file into [`Paragraph`] values. [Format](parse#format)
+//! gives the rules of the format.
 
 use std::path::{Path, PathBuf};
 
-/// One `key: value` field, with the line it started on.
+/// A `key: value` field and the line on which it starts.
 #[derive(Clone, Debug)]
 pub struct Field {
-    /// The field name, as written.
+    /// The name of the field, as written.
     pub name: String,
-    /// The field value, with continuation lines joined.
+    /// The value of the field, with the continuation lines joined.
     pub value: String,
-    /// The 1-based line the field started on.
+    /// The 1-based line on which the field starts.
     pub line: usize,
 }
 
-/// One paragraph: the fields in file order.
+/// A paragraph of fields.
 #[derive(Clone, Debug)]
 pub struct Paragraph {
-    /// The file the paragraph was read from.
+    /// The file that holds the paragraph.
     pub file: PathBuf,
-    /// The 1-based line the paragraph started on.
+    /// The 1-based line of the first field of the paragraph.
     pub line: usize,
     /// The fields, in file order.
     pub fields: Vec<Field>,
 }
 
 impl Paragraph {
-    /// The value of `name`, or `None` when the paragraph has no such field.
+    /// Returns the value of the first field named `name`, or `None` if there is none.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.fields
             .iter()
@@ -38,14 +36,19 @@ impl Paragraph {
             .map(|field| field.value.as_str())
     }
 
-    /// The whitespace-separated values of `name`, empty when absent.
+    /// Returns the value of the field `name`, split at white space.
+    ///
+    /// If the paragraph has no field `name`, the vector is empty.
     pub fn list(&self, name: &str) -> Vec<&str> {
         self.get(name)
             .map(|value| value.split_whitespace().collect())
             .unwrap_or_default()
     }
 
-    /// The line `name` starts on, for an error message.
+    /// Returns the 1-based line of the field `name`, for an error message.
+    ///
+    /// If the paragraph has no field `name`, the line is the line of the first
+    /// field of the paragraph.
     pub fn field_line(&self, name: &str) -> usize {
         self.fields
             .iter()
@@ -54,20 +57,22 @@ impl Paragraph {
             .unwrap_or(self.line)
     }
 
-    /// `file:line`, the prefix of every message about this paragraph.
+    /// Returns `file:line` of the paragraph, the prefix of each message about it.
     pub fn origin(&self) -> String {
         format!("{}:{}", self.file.display(), self.line)
     }
 }
 
-/// A syntax error, carrying the position that produced it.
+/// A syntax error in a deb822 file, with its position.
+///
+/// The error displays as `FILE:LINE: MESSAGE`.
 #[derive(Debug)]
 pub struct ParseError {
-    /// The file the error was found in.
+    /// The file that holds the error.
     pub file: PathBuf,
-    /// The 1-based line the error was found on.
+    /// The 1-based line of the error.
     pub line: usize,
-    /// What was wrong.
+    /// The description of the error.
     pub message: String,
 }
 
@@ -77,7 +82,27 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-/// Split `text` into paragraphs.
+/// Parses the text of the file `file` into paragraphs.
+///
+/// # Format
+///
+/// - One or more blank lines separate two paragraphs.
+/// - A paragraph holds `key: value` lines. The first `:` ends the key. The key
+///   and the value lose their leading and trailing white space.
+/// - A line that starts with a space continues the value of the field before
+///   it. The function joins the value and the trimmed line with one space.
+/// - A line whose first non-blank character is `#` is a comment. A comment
+///   does not end a paragraph.
+///
+/// # Errors
+///
+/// The function stops at the first error and returns a [`ParseError`] with its
+/// line.
+///
+/// - An error if a continuation line has no field before it in its paragraph.
+/// - An error if a line holds no `:`.
+/// - An error if a field name is empty.
+/// - An error if a paragraph gives the same field name two times.
 pub fn parse(file: &Path, text: &str) -> Result<Vec<Paragraph>, ParseError> {
     let mut paragraphs = Vec::new();
     let mut fields: Vec<Field> = Vec::new();

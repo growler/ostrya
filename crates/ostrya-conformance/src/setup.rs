@@ -1,9 +1,7 @@
 //! The setups a record names, and the placeholders they bind.
 //!
-//! A setup builds the state a cell starts from. `created-by` and
-//! `populated-by` select which binary performs each step; a record naming
-//! neither has each side build its own subtree with its own implementation,
-//! which is what an M10 cell wants.
+//! A setup builds the state that a cell starts from. [`SETUPS`] names each
+//! setup and its placeholders, and [`apply`] runs the setups of one side.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -12,29 +10,47 @@ use crate::corpus;
 use crate::exec::{self, Tool};
 use crate::record::Actor;
 
-/// The branch every setup that commits writes to.
+/// The branch of each setup commit.
 pub const BRANCH: &str = "conformance";
 
-/// The commit timestamp every setup that commits states. Both implementations
-/// read the `@SECONDS` form, so a setup commit is reproducible: the two sides
-/// commit the same corpus and reach the same checksum, which is what lets a cell
-/// name the `checksum-agreement` oracle.
+/// The commit timestamp of each setup commit.
+///
+/// Both implementations read the `@SECONDS` form, so a setup commit is
+/// reproducible. The two sides commit the same corpus and get the same
+/// checksum. This lets a cell name the `checksum-agreement` oracle.
 pub const TIMESTAMP: &str = "@1700000000";
 
-/// The corpus a setup commits when the record names none.
+/// The corpus of a setup if the cell names no corpus.
 pub const DEFAULT_CORPUS: &str = "C0";
 
-/// The mode a setup creates a repository in when the cell names none.
+/// The mode of a repository that a setup creates if the cell names no mode.
 pub const DEFAULT_MODE: &str = "bare";
 
-/// The file `two-repos` writes, and the content that tells the two apart.
+/// The name of the file that `two-repos` commits to each repository.
 pub const MARKER_FILE: &str = "which.txt";
-/// The content that names the first repository.
+/// The first line of [`MARKER_FILE`] in the first repository of `two-repos`.
 pub const MARKER_ONE: &str = "distinguish-repo-1";
-/// The content that names the second repository.
+/// The first line of [`MARKER_FILE`] in the second repository of `two-repos`.
 pub const MARKER_TWO: &str = "distinguish-repo-2";
 
-/// Every setup name, with the placeholders it binds.
+/// The registered setups, each with the placeholders that it binds.
+///
+/// [`apply`] runs the setups in the order that the record names them. Each
+/// path is in the subtree of the side ([`Context::root`]):
+///
+/// - `empty-dir` binds `$REPO` to `repo`, a path that does not exist.
+/// - `repo` creates the repository `repo` in [`Context::mode`] and binds
+///   `$REPO`.
+/// - `repo-with-commit` creates `repo` and commits the corpus to [`BRANCH`].
+///   It binds `$REPO`, `$BRANCH`, and `$REV`, the checksum of the commit.
+/// - `two-repos` creates `repo1` and `repo2` in [`Context::mode`]. Each gets
+///   one commit to [`BRANCH`] of a tree with [`MARKER_FILE`] in it. It binds
+///   `$REPO`, `$REPO2`, and `$BRANCH`.
+/// - `src-dst` creates `src` in [`Context::src_mode`] with one commit of the
+///   corpus to [`BRANCH`]. It also creates the empty repository `dst` in
+///   [`Context::dst_mode`]. It binds `$SRC` and `$DST`.
+/// - `tree` builds the corpus at [`corpus::tree_path`] and binds `$TREE`.
+/// - `out-dir` creates the empty directory `out` and binds `$OUT`.
 pub const SETUPS: [(&str, &[&str]); 7] = [
     ("empty-dir", &["REPO"]),
     ("repo", &["REPO"]),
@@ -45,15 +61,16 @@ pub const SETUPS: [(&str, &[&str]); 7] = [
     ("out-dir", &["OUT"]),
 ];
 
-/// The placeholder the runner binds for every cell, whatever its setups.
+/// The placeholder that [`apply`] binds for each cell, also with no setup.
 pub const IMPLICIT: &str = "SCRATCH";
 
-/// Whether `name` is a registered setup.
+/// Returns `true` if `name` is a registered setup.
 pub fn is_registered(name: &str) -> bool {
     SETUPS.iter().any(|(known, _)| *known == name)
 }
 
-/// The placeholders `name` binds, or `None` when it is not registered.
+/// Returns the placeholders that `name` binds, or `None` if it is not
+/// registered.
 pub fn bindings_of(name: &str) -> Option<&'static [&'static str]> {
     SETUPS
         .iter()
@@ -61,27 +78,27 @@ pub fn bindings_of(name: &str) -> Option<&'static [&'static str]> {
         .map(|(_, bound)| *bound)
 }
 
-/// What one side's setup needs to know.
+/// The input of [`apply`] for the side of one implementation.
 pub struct Context<'a> {
-    /// The side's own subtree, and the value of `$SCRATCH`.
+    /// The subtree of the side, and the value of `$SCRATCH`.
     pub root: &'a Path,
-    /// The implementation whose subtree this is.
+    /// The implementation of this subtree.
     pub own: &'a Tool,
-    /// The port, where the run has one.
+    /// The `ostrya` binary, if the run has one.
     pub port: Option<&'a Tool>,
-    /// The reference implementation, where the run has one.
+    /// The `ostree` command, if the run has one.
     pub reference: Option<&'a Tool>,
-    /// The repository mode the setup creates.
+    /// The mode of each repository that a setup creates.
     pub mode: &'a str,
-    /// The source repository's mode, for a two-repository setup.
+    /// The mode of the source repository of `src-dst`.
     pub src_mode: &'a str,
-    /// The destination repository's mode, for a two-repository setup.
+    /// The mode of the destination repository of `src-dst`.
     pub dst_mode: &'a str,
-    /// The corpus the setup populates from.
+    /// The corpus that a setup commits or builds.
     pub corpus: &'a str,
-    /// Which implementation creates the repository.
+    /// The implementation that creates each repository.
     pub created_by: Actor,
-    /// Which implementation populates it.
+    /// The implementation that commits to each repository.
     pub populated_by: Actor,
 }
 
@@ -99,7 +116,34 @@ impl Context<'_> {
     }
 }
 
-/// Run every named setup and return the bindings.
+/// Runs the named setups for one side and returns the placeholder bindings.
+///
+/// [`SETUPS`] states what each setup builds. The bindings also hold
+/// [`IMPLICIT`].
+///
+/// # Custody
+///
+/// [`Context::created_by`] selects the implementation that runs each `init`.
+/// [`Context::populated_by`] selects the implementation that runs each
+/// `commit`. The two values come from the `created-by` and `populated-by`
+/// fields of the record.
+///
+/// If a record names neither field, each side builds its own subtree with its
+/// own implementation ([`Actor::Own`]). An `M10` cell uses this default.
+///
+/// # Errors
+///
+/// - An error if a name is not a registered setup.
+/// - An error if a custody field names an implementation that did not
+///   resolve.
+/// - An error if two setups bind one placeholder.
+/// - An error from [`exec::run`] for an `init` or a `commit`.
+/// - An error if an `init` or a `commit` does not exit with status 0.
+/// - An error if the last line of the `commit` output is not a 64-digit
+///   hexadecimal checksum.
+/// - An error from [`corpus::materialize`] if the corpus does not build.
+/// - An error if a directory or a file cannot be created, or if a path is not
+///   UTF-8.
 pub fn apply(names: &[&str], context: &Context<'_>) -> Result<BTreeMap<String, String>, String> {
     let mut bindings = BTreeMap::new();
     bindings.insert(IMPLICIT.to_owned(), path_text(context.root)?);
@@ -220,11 +264,12 @@ fn bind(bindings: &mut BTreeMap<String, String>, name: &str, path: &Path) -> Res
     insert(bindings, name, path_text(path)?)
 }
 
-/// The corpus tree of one side, materialized on first use. Every setup that
-/// needs the corpus names one path for it, so two setups in the same record
-/// share the tree the first of them wrote. A second materialization over one
-/// path fails: `C0` and `C3` end at a symlink and `C8` at a hard link, and
-/// each reports `EEXIST` once the entry stands.
+/// The corpus tree of one side. The first setup that needs it builds it.
+///
+/// All setups that need the corpus use one path, so two setups of one record
+/// share the tree that the first one built. A second build at one path can
+/// fail. For example, the symlink of `C0` and `C3`, the hard link of `C8`,
+/// and the special files of `C11` and `C12` give `EEXIST`.
 #[derive(Default)]
 struct CorpusTree {
     path: Option<PathBuf>,
@@ -259,7 +304,10 @@ fn path_text(path: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("{} is not a UTF-8 path", path.display()))
 }
 
-/// The repository a cell's oracles read, given its bindings.
+/// Returns the repository that the oracles of a cell read.
+///
+/// The repository is the value of `$REPO` in `bindings`, else the value of
+/// `$DST`. If neither is bound, the function returns `None`.
 pub fn primary_repo(bindings: &BTreeMap<String, String>) -> Option<PathBuf> {
     bindings
         .get("REPO")

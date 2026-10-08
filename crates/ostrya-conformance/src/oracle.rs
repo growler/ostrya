@@ -1,10 +1,7 @@
 //! The oracles a record names.
 //!
-//! An oracle reads one side's post-execution state and produces a comparable
-//! artifact. The set is closed and matches the vocabulary in
-//! `docs/conformance/README.md`. Each name states that the two
-//! implementations produced an equal artifact; the runner compares the two
-//! texts this module returns.
+//! [`ORACLES`] names each oracle, and [`apply`] runs one oracle on one
+//! [`Side`].
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -12,7 +9,81 @@ use std::path::{Path, PathBuf};
 use crate::exec::{self, Outcome, Tool};
 use crate::sha256;
 
-/// Every oracle name.
+/// The names of all oracles.
+///
+/// An oracle reads the state of one [`Side`] after the invocation of a cell
+/// and gives a text. The set is closed. A record that names an oracle states
+/// that the texts of the two sides are equal.
+/// [`runner::run`](crate::runner::run) compares the two texts.
+///
+/// # Oracles
+///
+/// - `exit-status`: the exit status of the invocation as one line. This is
+///   the exit code, `signal N`, or `unknown`.
+/// - `stdout-text` and `stderr-text`: the standard output or the standard
+///   error of the invocation, after [`normalize`].
+/// - `config-bytes`: the text of the `config` file of the repository, with
+///   no change.
+/// - `refs-bytes`: one line for each file under `refs/`, sorted. A line
+///   holds the relative path and the content of the file, trimmed.
+/// - `inventory`: one line for each file under `objects/`, sorted. A line
+///   holds the relative path, the file name extension, and the size in bytes.
+/// - `manifest`: one line for each path of a checkout of the commit of the
+///   cell.
+/// - `checksum-agreement`: the commit checksum that the operation made, as
+///   one line.
+/// - `fsck`: the exit status of `fsck` on the repository, as `exit N`.
+///
+/// The walks of `refs-bytes` and `inventory` do not enter a symbolic link to
+/// a directory. If `refs/` or `objects/` does not exist, the text is empty.
+///
+/// # The `refs-bytes` oracle
+///
+/// The content of each ref file goes through the same substitution as
+/// [`normalize`]. The value of a bound placeholder becomes its name, so the
+/// branch ref reads `$REV`. Each other 64-character checksum becomes
+/// `<checksum>`, unless [`Side::keep_checksums`] is `true`.
+///
+/// The mask is necessary because each side makes its own commits, and
+/// neither side gives a timestamp. So the commit checksums of the two sides
+/// differ by the wall-clock time.
+///
+/// # The `manifest` oracle
+///
+/// The oracle checks out `$REV`, or `$BRANCH` if no setup bound `$REV`. It
+/// runs `checkout` of the implementation of the side into
+/// `manifest-checkout` in [`Side::work`], and removes an earlier checkout
+/// first. Each path of the checkout, directories included, gives one line,
+/// sorted by path. A line holds these fields, separated by spaces:
+///
+/// - the relative path
+/// - the kind: `dir`, `link`, or `file`
+/// - the permission bits as four octal digits
+/// - the uid and the gid
+/// - the extended attributes in brackets, sorted, each one as `name=` and the
+///   SHA-256 digest of the value
+/// - `-` for a directory, the target for a link, or the SHA-256 digest of the
+///   content for a file.
+///
+/// If a link target, a digest, or an attribute value cannot be read, the
+/// field is `?`. The oracle reads at most 64 KiB of attribute names for each
+/// path, and at most 64 KiB for each attribute value.
+///
+/// # The `checksum-agreement` oracle
+///
+/// If the last line of the standard output of the invocation is a
+/// 64-character hex checksum, the oracle gives that line. A commit prints its
+/// checksum there. If not, the oracle runs `rev-parse` of the implementation of the side on
+/// `$BRANCH`, or on `$REV` if no setup bound `$BRANCH`. The oracle then gives
+/// the checksum that `rev-parse` prints.
+///
+/// # The `fsck` oracle
+///
+/// Each implementation runs its own `fsck` on its own repository. The
+/// compared text is the exit status alone. The two implementations write
+/// different progress and summary lines, and the cell states only that both
+/// find the repository sound. The oracle writes the output to `fsck.stdout`
+/// and `fsck.stderr` in [`Side::work`] for diagnosis.
 pub const ORACLES: [&str; 9] = [
     "exit-status",
     "stdout-text",
@@ -25,37 +96,47 @@ pub const ORACLES: [&str; 9] = [
     "fsck",
 ];
 
-/// Whether `name` is a registered oracle.
+/// Returns `true` if `name` is in [`ORACLES`].
 pub fn is_registered(name: &str) -> bool {
     ORACLES.contains(&name)
 }
 
-/// What an oracle produced for one side.
+/// The result of one oracle for one side.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
-    /// The artifact, ready to compare.
+    /// The text to compare.
     Text(String),
-    /// The oracle could not read this side, with the reason. A missing CLI
-    /// command reports here rather than failing the cell.
+    /// The reason why the oracle cannot read this side.
+    ///
+    /// If one side is `Unavailable`, and no claim and no other oracle of the
+    /// cell fails, [`runner::run`](crate::runner::run) reports a skip. This is
+    /// the result when an oracle runs a command that the side does not have.
     Unavailable(String),
 }
 
-/// One side's post-execution state.
+/// The state of one side of a cell after the invocation.
+///
+/// A side is one of the two implementations in one cell, with its own
+/// scratch root.
 pub struct Side<'a> {
-    /// The implementation this side ran.
+    /// The implementation of this side.
     pub tool: &'a Tool,
-    /// The side's subtree, the working directory of every extra invocation.
+    /// The scratch root of this side.
+    ///
+    /// Each command that an oracle runs has this working directory.
     pub root: &'a Path,
-    /// The repository the oracles read, when the setups bound one.
+    /// The repository that the oracles read, if the setups bound one.
     pub repo: Option<PathBuf>,
-    /// The setup bindings the cell resolved.
+    /// The setup bindings that the cell resolved.
     pub bindings: &'a BTreeMap<String, String>,
-    /// What the cell's invocation produced.
+    /// The outcome of the invocation of the cell.
     pub outcome: &'a Outcome,
-    /// Where an oracle that needs scratch space of its own may write.
+    /// A directory where an oracle can write scratch files of its own.
     pub work: &'a Path,
-    /// Whether the cell compares checksums, which keeps them out of the
-    /// normalizer.
+    /// The flag that is `true` if the cell compares checksums.
+    ///
+    /// If it is `true`, [`normalize`] and the `refs-bytes` oracle do not
+    /// replace checksums with `<checksum>`.
     pub keep_checksums: bool,
 }
 
@@ -67,7 +148,21 @@ impl Side<'_> {
     }
 }
 
-/// Apply one oracle.
+/// Runs the oracle `name` on one side and returns its value.
+///
+/// [`ORACLES`] states what each oracle gives. The value is
+/// [`Value::Unavailable`] in these cases:
+///
+/// - `name` is not in [`ORACLES`].
+/// - The oracle reads the repository, and the `repo` field of the side is
+///   `None`.
+/// - The oracle needs a placeholder that the setups did not bind.
+/// - The `config` file cannot be read, or a directory that the oracle lists
+///   cannot be read.
+/// - [`exec::run`] refuses a command of the oracle, or the command
+///   cannot start.
+/// - `checkout` or `rev-parse` exits with a status other than 0.
+/// - `rev-parse` prints no checksum.
 pub fn apply(name: &str, side: &Side<'_>) -> Value {
     match name {
         "exit-status" => Value::Text(format!("{}\n", side.outcome.status_text())),
@@ -102,13 +197,11 @@ fn config_bytes(side: &Side<'_>) -> Value {
     }
 }
 
-/// Every path under `refs/`, sorted, with the checksum each ref file holds.
+/// Returns the `refs-bytes` text: each path under `refs/`, sorted, with the
+/// content of the ref file.
 ///
-/// The content goes through the same rewriting the text oracles apply: a bound
-/// placeholder's value becomes its name, so the branch ref reads `$REV`, and
-/// any other 64-character checksum is masked. Without that, two repositories
-/// each side committed for itself never compare -- neither passes a timestamp,
-/// so the two commit checksums differ by wall-clock time.
+/// The doc of `ORACLES` states the substitution and the checksum mask, and
+/// the reason for the mask.
 fn refs_bytes(side: &Side<'_>) -> Value {
     let repo = match side.repo() {
         Ok(repo) => repo,
@@ -169,7 +262,7 @@ fn inventory(side: &Side<'_>) -> Value {
     Value::Text(joined(lines))
 }
 
-/// Check the cell's commit out and reduce the tree to one line per path.
+/// Checks out the commit of the cell and returns one line for each path.
 fn manifest(side: &Side<'_>) -> Value {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
@@ -253,11 +346,11 @@ fn manifest(side: &Side<'_>) -> Value {
     Value::Text(joined(lines))
 }
 
-/// The commit checksum the operation produced.
+/// Returns the commit checksum that the operation made.
 ///
-/// A commit prints it as the last line of its standard output, so a commit
-/// cell reads it there. Any other operation resolves it through `rev-parse`
-/// against the revision the cell's setups bound.
+/// A commit prints the checksum as the last line of its standard output, so
+/// the oracle reads it there for a commit cell. For other operations, the
+/// oracle runs `rev-parse` on the revision that the setups of the cell bound.
 fn checksum_agreement(side: &Side<'_>) -> Value {
     if let Some(checksum) = checksum_line(&side.outcome.stdout) {
         return Value::Text(checksum);
@@ -297,20 +390,20 @@ fn checksum_agreement(side: &Side<'_>) -> Value {
     }
 }
 
-/// The last line of `stdout` when it is a bare 64-character hex checksum, with
-/// a trailing newline so the artifact compares as one line.
+/// Returns the last line of `stdout` if it is a bare 64-character hex
+/// checksum. The line ends with a newline, so the text compares as one line.
 fn checksum_line(stdout: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(stdout);
     let line = text.lines().map(str::trim).next_back()?;
     (line.len() == 64 && line.chars().all(|c| c.is_ascii_hexdigit())).then(|| format!("{line}\n"))
 }
 
-/// Each implementation's own `fsck` run against its own repository.
+/// Runs `fsck` of the implementation of the side on its own repository and
+/// returns the exit status.
 ///
-/// The compared artifact is the exit status alone. The two implementations
-/// word their progress and summary lines differently, and the claim the cell
-/// makes is that both find the repository sound, so the captured text goes to
-/// the side's work directory for diagnosis rather than into the comparison.
+/// The two implementations write different progress and summary lines. The
+/// cell states only that both find the repository sound. So the output goes
+/// to the work directory of the side for diagnosis.
 fn fsck(side: &Side<'_>) -> Value {
     let repo = match side.repo() {
         Ok(repo) => repo,
@@ -327,7 +420,8 @@ fn fsck(side: &Side<'_>) -> Value {
     }
 }
 
-/// The sorted `name=value` list of one path's extended attributes.
+/// Returns the extended attributes of one path as a sorted `name=value` list.
+/// The value is its SHA-256 digest, or `?` if it cannot be read.
 fn xattrs(path: &Path) -> Vec<String> {
     let mut buffer = vec![0u8; 64 * 1024];
     let Ok(length) = rustix::fs::llistxattr(path, &mut buffer[..]) else {
@@ -352,7 +446,8 @@ fn xattrs(path: &Path) -> Vec<String> {
     out
 }
 
-/// Every regular file under `root`, empty when `root` does not exist.
+/// Returns each path under `root` that is not a directory. The list is empty
+/// if `root` does not exist.
 fn walk(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     if !root.exists() {
@@ -376,7 +471,7 @@ fn walk(root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
-/// Every path under `root`, directories included.
+/// Returns each path under `root`, directories included.
 fn walk_all(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     if !root.exists() {
@@ -408,11 +503,28 @@ fn joined(lines: Vec<String>) -> String {
     text
 }
 
-/// Normalize captured text before comparison.
+/// Returns captured output in the form that an oracle compares.
 ///
-/// A bound placeholder's path becomes the placeholder name, a 64-character
-/// lowercase hex run becomes `<checksum>` unless the cell compares checksums,
-/// and a progress line carrying a rate or an elapsed time is dropped.
+/// The function decodes `bytes` as UTF-8 with lossy replacement, then does
+/// these steps in this order:
+///
+/// 1. It changes each `\r\n` and each `\r` to `\n`.
+/// 2. It replaces the value of each placeholder in `bindings` with `$NAME`.
+///    It replaces the longest value first, so a value that holds another
+///    value changes as one unit. It ignores an empty value.
+/// 3. It removes each progress line.
+/// 4. It removes the white space at the end of each line.
+/// 5. If `keep_checksums` is `false`, it replaces each run of exactly 64
+///    lowercase hex characters with `<checksum>`. A shorter or a longer run
+///    stays.
+/// 6. It ends each line with `\n`.
+///
+/// # Progress lines
+///
+/// The check ignores case. A line is a progress line if it starts with
+/// `fsck objects (`, or contains `elapsed`, or contains one of these rates:
+/// `b/s`, `kb/s`, `mb/s`, `gb/s`, `kib/s`, `mib/s`. The `ostree` command
+/// writes the `fsck objects (` progress line, and `ostrya` does not.
 pub fn normalize(
     bytes: &[u8],
     bindings: &BTreeMap<String, String>,
@@ -439,8 +551,8 @@ pub fn normalize(
     out
 }
 
-/// Replace every bound placeholder's value with its name, longest value first
-/// so a value holding another one is rewritten whole.
+/// Replaces the value of each bound placeholder with its name. The longest
+/// value goes first, so a value that holds another value changes as one unit.
 fn substitute(text: &str, bindings: &BTreeMap<String, String>) -> String {
     let mut ordered: Vec<(&String, &String)> = bindings.iter().collect();
     ordered.sort_by_key(|(_, value)| std::cmp::Reverse(value.len()));
@@ -453,11 +565,11 @@ fn substitute(text: &str, bindings: &BTreeMap<String, String>) -> String {
     text
 }
 
-/// Whether one line reports progress rather than a result.
+/// Returns `true` if one line reports progress.
 ///
-/// A rate or an elapsed time names one. `fsck` names its own, which the tool
-/// writes and the port does not
-/// (`docs/conformance/cli-surface.md`, "fsck").
+/// A rate or an elapsed time marks a progress line. `fsck` has its own
+/// progress line, `fsck objects (`, which the `ostree` command writes and
+/// `ostrya` does not.
 fn is_progress(line: &str) -> bool {
     let lowered = line.to_ascii_lowercase();
     lowered.starts_with("fsck objects (")
@@ -467,7 +579,8 @@ fn is_progress(line: &str) -> bool {
             .any(|rate| lowered.contains(rate))
 }
 
-/// Replace every 64-character lowercase hex run with `<checksum>`.
+/// Replaces each run of exactly 64 lowercase hex characters with
+/// `<checksum>`.
 fn mask_checksums(line: &str) -> String {
     let bytes = line.as_bytes();
     let hex = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
@@ -541,13 +654,11 @@ mod tests {
 
     // --- `checksum-agreement` ------------------------------------------------
     //
-    // No cell names this oracle before `commit --timestamp` makes a commit
-    // reproducible (`docs/conformance/harness.md`, "Availability by
-    // sub-phase"), so these three tests are the resolution path's only guard.
-    // They stand in for the implementation with a script that answers the way
-    // `rev-parse` does, which keeps the harness's own no-linkage rule.
+    // These three tests check how the oracle finds the checksum. A script
+    // that answers as `rev-parse` does stands in for the implementation, so
+    // this crate links no implementation.
 
-    /// A directory of this test's own, empty at the start of each run.
+    /// Returns a directory for one test, empty at the start of each run.
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "ostrya-conformance-oracle-{tag}-{}",
@@ -558,8 +669,8 @@ mod tests {
         dir
     }
 
-    /// A handle to a script that records the arguments it received in
-    /// `<dir>/argv` and prints `checksum` the way `rev-parse` does.
+    /// Returns a handle to a script. The script records its arguments in
+    /// `<dir>/argv` and prints `checksum` as `rev-parse` does.
     fn rev_parse_stub(dir: &Path, checksum: &str) -> Tool {
         use std::os::unix::fs::PermissionsExt;
 
@@ -578,7 +689,7 @@ mod tests {
         Tool { role: "port", path }
     }
 
-    /// An outcome carrying `stdout` and nothing else.
+    /// Returns an outcome with `stdout` and no other output.
     fn outcome(stdout: &[u8]) -> Outcome {
         Outcome {
             argv: vec!["stub".to_owned()],
@@ -596,8 +707,8 @@ mod tests {
         let checksum = "b".repeat(64);
         let printed = outcome(format!("{checksum}\n").as_bytes());
         let bindings = BTreeMap::new();
-        // The handle names no file, so reaching the fallback would report the
-        // oracle unavailable instead.
+        // The handle names no file. If the oracle runs `rev-parse`, the value
+        // is `Unavailable` and the assertion fails.
         let tool = Tool {
             role: "port",
             path: PathBuf::from("/nonexistent-by-design"),
@@ -622,7 +733,8 @@ mod tests {
         let repo = dir.join("repo");
         let quiet = outcome(b"Deleting refs\n");
 
-        // `$BRANCH` is resolved where a setup bound one, and `$REV` otherwise.
+        // The oracle resolves `$BRANCH` if a setup bound it, and `$REV` if
+        // not.
         for (name, revision) in [("BRANCH", "conformance"), ("REV", &checksum)] {
             let mut bindings = BTreeMap::new();
             bindings.insert(name.to_owned(), revision.to_string());

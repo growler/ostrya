@@ -1,8 +1,9 @@
-//! The JSON document `--format json` writes and `report` reads.
+//! The JSON document of `--format json`, which [`grids`](crate::report::grids) reads.
 //!
-//! Enough of JSON for the report document: objects with ordered keys, arrays,
-//! strings, integers, booleans, and null. No floating point appears in a
-//! report, so none is produced or accepted.
+//! [`Json`] holds the part of JSON that a report uses: objects with ordered
+//! keys, arrays, strings, integers, booleans, and null. A report holds no
+//! floating-point number, so [`Json::render`] writes none and [`parse`] refuses
+//! one.
 
 use std::fmt::Write as _;
 
@@ -13,18 +14,18 @@ pub enum Json {
     Null,
     /// `true` or `false`.
     Bool(bool),
-    /// A whole number.
+    /// An integer in the range of `i64`.
     Int(i64),
     /// A string.
     Str(String),
     /// An array, in document order.
     Array(Vec<Json>),
-    /// An object, in document order.
+    /// An object, with its members in document order.
     Object(Vec<(String, Json)>),
 }
 
 impl Json {
-    /// A convenience for building an object from an ordered field list.
+    /// Creates an object from a list of members, in list order.
     pub fn object(fields: Vec<(&str, Json)>) -> Json {
         Json::Object(
             fields
@@ -34,12 +35,14 @@ impl Json {
         )
     }
 
-    /// A string value.
+    /// Creates a string value.
     pub fn string(text: impl Into<String>) -> Json {
         Json::Str(text.into())
     }
 
-    /// The member of an object, or `None`.
+    /// Returns the first member named `name` of an object, or `None`.
+    ///
+    /// If `self` is not an object, the result is `None`.
     pub fn get(&self, name: &str) -> Option<&Json> {
         match self {
             Json::Object(fields) => fields
@@ -50,7 +53,7 @@ impl Json {
         }
     }
 
-    /// The value as a string, or `""`.
+    /// Returns the text of a string value, or `""` for any other value.
     pub fn as_str(&self) -> &str {
         match self {
             Json::Str(text) => text,
@@ -58,7 +61,7 @@ impl Json {
         }
     }
 
-    /// The value as an array, or an empty slice.
+    /// Returns the items of an array value, or an empty slice for any other value.
     pub fn as_array(&self) -> &[Json] {
         match self {
             Json::Array(items) => items,
@@ -66,7 +69,11 @@ impl Json {
         }
     }
 
-    /// The document in indented form, with a trailing newline.
+    /// Returns the value as indented JSON text with a trailing newline.
+    ///
+    /// Each level indents by two spaces. In a string, the function escapes `"`,
+    /// `\`, newline, carriage return, and tab. It writes each other control
+    /// character as `\uXXXX`, with lowercase hexadecimal digits.
     pub fn render(&self) -> String {
         let mut out = String::new();
         write_value(&mut out, self, 0);
@@ -136,7 +143,28 @@ fn write_string(out: &mut String, text: &str) {
     out.push('"');
 }
 
-/// Parse a JSON document.
+/// Parses a JSON document.
+///
+/// White space is space, tab, newline, and carriage return. A `\u` escape that
+/// names no Unicode scalar value, for example one half of a surrogate pair,
+/// gives U+FFFD.
+///
+/// # Errors
+///
+/// Each error is a `String` message. Most messages hold the byte offset of the
+/// error.
+///
+/// - An error if the text ends where a value must start.
+/// - An error if a byte starts no value, or a literal is not `null`, `true`, or
+///   `false`.
+/// - An error if a number is not an integer in the range of `i64`. A fraction or
+///   an exponent gives an error at its first byte.
+/// - An error if a string does not close, holds an unknown escape, or holds a
+///   `\u` escape that is not followed by four hexadecimal digits.
+/// - An error if an array or an object has no `,` between two items, or no
+///   closing `]` or `}`.
+/// - An error if an object member has no `:`.
+/// - An error if text other than white space follows the value.
 pub fn parse(text: &str) -> Result<Json, String> {
     let mut cursor = Cursor {
         bytes: text.as_bytes(),

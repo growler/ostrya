@@ -1,11 +1,7 @@
-//! Static validation, running no binaries.
+//! The static check of the record files, which runs no binary.
 //!
-//! `check` confirms the deb822 syntax, that every field name is recognized,
-//! that the completeness rule in `docs/conformance/README.md` holds for each
-//! family, that every placeholder in a `run:` line is bound by the record's
-//! setups, that every named corpus, setup, oracle, and probe is registered,
-//! that every registered probe is named by some record, and that every
-//! `spec:` value names a heading a design document holds.
+//! [`check`] checks a matrix and returns a [`Report`]. [`verify_evidence`]
+//! checks the `evidence:` values against the tests that cargo lists.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,24 +12,95 @@ use crate::record::{DESCRIPTIVE_FIELDS, EXECUTABLE_FIELDS, MODES, Matrix, OUTCOM
 use crate::setup;
 use crate::syntax;
 
-/// What `check` found.
+/// The result of [`check`].
 pub struct Report {
-    /// How many records the matrix files hold.
+    /// The number of records in the matrix files.
     pub records: usize,
-    /// How many cells those records expand into.
+    /// The number of cells that the records expand into.
     pub cells: usize,
-    /// Every rule violation found, one message each.
+    /// One message for each rule violation.
     pub errors: Vec<String>,
 }
 
 impl Report {
-    /// Whether the check found no violation.
+    /// Returns `true` if the check found no rule violation.
     pub fn ok(&self) -> bool {
         self.errors.is_empty()
     }
 }
 
-/// Validate every record and every expanded cell.
+/// Checks every record and every expanded cell of a matrix.
+///
+/// The check runs no binary. It adds one message to [`Report::errors`] for
+/// each rule violation. [`record::load`](crate::record::load) checks the
+/// deb822 syntax before this function gets the matrix.
+///
+/// # Checks
+///
+/// The rules for the fields and their values:
+///
+/// - Each field name is in [`DESCRIPTIVE_FIELDS`] or [`EXECUTABLE_FIELDS`].
+/// - `tier` names a [`Tier`]. `outcome` is in [`OUTCOMES`].
+/// - `severity` is `interop` or `identity`.
+/// - `identity` is `full`, `not-required`, `n-a`, or `unobserved`.
+/// - `created-by`, `populated-by`, and `operated-by` are `t` or `p`.
+/// - Each value of `modes`, `src-mode`, and `dst-mode` is in [`MODES`].
+/// - Each corpus that a record names is in [`CORPORA`](corpus::CORPORA), and
+///   each oracle is in [`ORACLES`](oracle::ORACLES).
+/// - Each setup that a record names is in [`SETUPS`](setup::SETUPS), and the
+///   probe is in [`PROBES`](probe::PROBES).
+///
+/// The rules for the outcome:
+///
+/// - `outcome: unobserved` needs a `question` field.
+/// - `outcome: lossy` needs a `loss` field.
+/// - `outcome: unimplemented-cli` needs a `cli-gap` field.
+/// - A `cli-gap` field needs `outcome: unimplemented-cli`. When ostrya gets
+///   the command that a cell names, the cell gets a different outcome, and a
+///   `cli-gap` field that stays names a closed gap.
+///
+/// The `question` and `loss` fields have no converse rule. A `question` field
+/// records what is still to observe, under any outcome.
+///
+/// The rules for the executable fields:
+///
+/// - A record does not state both `run` and `probe`.
+/// - No two setups of one record bind the same placeholder.
+/// - Each `run` and `ref-run` line is valid for [`split`](syntax::split) and
+///   names a command. A line with the value `n-a` is not checked.
+/// - A setup of the record binds each placeholder of a `run` or `ref-run`
+///   line. The placeholder [`IMPLICIT`](setup::IMPLICIT) is always bound.
+/// - `expect-exit` and `ref-expect-exit` are integers.
+/// - `expect-stdout`, `expect-stderr`, `ref-expect-stdout`, and
+///   `ref-expect-stderr` are valid for [`parse_claim`](syntax::parse_claim).
+/// - `ref-may-abort` is a signal number, and the record has a `note` field
+///   that records the observed crash.
+/// - A record with `ref-run: n-a` has no `ref-expect-exit`,
+///   `ref-expect-stdout`, `ref-expect-stderr`, or `ref-may-abort` field.
+///
+/// The rules for the whole matrix:
+///
+/// - No two cells have the same id.
+/// - In the families `M0` and `M1`, the `modes` values of each row cover the
+///   six [`MODES`] once each.
+/// - A record names each probe of [`PROBES`](probe::PROBES).
+/// - Each `spec:` value names a heading of a design document. See
+///   [Spec anchors](#spec-anchors).
+///
+/// # Spec anchors
+///
+/// A `spec:` value is `<document>#<anchor>`. The document name resolves first
+/// in the matrix directory, which holds `cli-surface.md` and `harness.md`.
+/// Then it resolves in the parent directory, which holds `format-reference.md`,
+/// `port-plan.md`, and `api-sketch.md`.
+///
+/// The anchor is the fragment that GitHub makes from the heading text, so a
+/// resolved value links to the section in the rendered document.
+///
+/// If the parent directory has no `format-reference.md`, `check` does not
+/// check the `spec:` values. This is the case when the record files are apart
+/// from the design documents, for example in a privileged run from a copied
+/// directory.
 pub fn check(matrix: &Matrix) -> Report {
     let mut errors = Vec::new();
 
@@ -128,14 +195,14 @@ fn vocabulary(record: &Record, errors: &mut Vec<String>) {
     }
 }
 
-/// The outcome vocabulary in `docs/conformance/README.md` ties three outcomes
-/// to a field that must accompany them: `unobserved` to `question`, `lossy`
-/// to `loss`, and `unimplemented-cli` to `cli-gap`.
+/// Checks the field that each of three outcomes needs: `unobserved` needs
+/// `question`, `lossy` needs `loss`, and `unimplemented-cli` needs `cli-gap`.
 ///
-/// The `cli-gap` tie holds in both directions. A cell moves off
-/// `unimplemented-cli` when the command it names lands, and a `cli-gap:` left
-/// on the record then names a gap that is closed. The other two fields carry no converse rule:
-/// `question:` records what is still to observe under any outcome.
+/// The `cli-gap` tie holds in both directions. When ostrya gets the command
+/// that a cell names, the cell gets a different outcome. A `cli-gap:` that
+/// stays on the record then names a closed gap. The other two fields have no
+/// converse rule. `question:` records what is still to observe, under any
+/// outcome.
 fn outcome_fields(record: &Record, errors: &mut Vec<String>) {
     let origin = record.origin();
     let required = match record.get("outcome") {
@@ -282,8 +349,8 @@ fn duplicates(matrix: &Matrix, errors: &mut Vec<String>) {
     }
 }
 
-/// Within one family, for each row key, the `modes` values cover all six modes
-/// exactly once.
+/// Checks that the `modes` values of each row of `M0` and `M1` cover the six
+/// modes once each.
 fn completeness(matrix: &Matrix, errors: &mut Vec<String>) {
     let mut counts: BTreeMap<(String, String), BTreeMap<String, usize>> = BTreeMap::new();
     for cell in &matrix.cells {
@@ -328,19 +395,10 @@ fn unused_probes(matrix: &Matrix, errors: &mut Vec<String>) {
     }
 }
 
-/// Confirm every `spec:` value names a heading its document holds.
+/// Checks that each `spec:` value names a heading of its document.
 ///
-/// A `spec:` value is `<document>#<anchor>`. The document name resolves in
-/// the matrix directory, which holds `cli-surface.md` and `harness.md`, and
-/// then in the parent directory, which holds `format-reference.md`,
-/// `port-plan.md`, and `api-sketch.md`. The anchor is the fragment GitHub
-/// derives from the heading text, so a value that resolves here is a link
-/// that lands on the section in the rendered document.
-///
-/// The presence of `format-reference.md` in the parent directory states that
-/// the design documents sit beside the records. Where it is absent the run
-/// holds the record files on their own, a privileged run from a copied
-/// directory does so, and the whole check reports nothing.
+/// The `# Spec anchors` section of [`check`] states the rules. A file that
+/// cannot be read gives an empty set of headings.
 fn spec_anchors(matrix: &Matrix, errors: &mut Vec<String>) {
     if !matrix.dir.join("../format-reference.md").is_file() {
         return;
@@ -391,10 +449,11 @@ fn spec_anchors(matrix: &Matrix, errors: &mut Vec<String>) {
     }
 }
 
-/// Every anchor the headings of a Markdown document generate.
+/// Returns each anchor that the headings of a Markdown document give.
 ///
-/// A heading inside a fenced code block is text, so the fences are tracked
-/// and their contents skipped.
+/// A heading in a fenced code block is text, so the function skips the
+/// content of each fence. A repeated anchor gets the suffix `-1`, then `-2`,
+/// and up.
 fn heading_anchors(text: &str) -> BTreeSet<String> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut anchors = BTreeSet::new();
@@ -427,12 +486,12 @@ fn heading_anchors(text: &str) -> BTreeSet<String> {
     anchors
 }
 
-/// The anchor GitHub derives from one heading's text.
+/// Returns the anchor that GitHub makes from the text of one heading.
 ///
-/// The text is lowercased, every character outside letters, digits, hyphens,
-/// and underscores is dropped, and every space becomes a hyphen. A heading
-/// ending in `-- words` therefore yields four consecutive hyphens: one for
-/// the space, two for the dashes, and one for the space after them.
+/// The function changes the text to lower case and changes each space to a
+/// hyphen. It drops each character that is not a letter, a digit, a hyphen,
+/// or an underscore. A heading that ends in `-- words` gives four hyphens in
+/// sequence: one for the space, two for the dashes, and one for the next space.
 fn anchor_of(title: &str) -> String {
     title
         .to_lowercase()
@@ -446,12 +505,31 @@ fn anchor_of(title: &str) -> String {
         .collect()
 }
 
-/// Confirm every `evidence:` value that looks like a test path names a test
-/// `cargo test -- --list` reports.
+/// Checks each test path of the `evidence:` values against the tests that
+/// cargo lists.
 ///
-/// A value that is not a test path -- a fixture file, a document reference,
-/// or a loose area reference (`crate::area`) rather than a specific test --
-/// is reported as unchecked rather than as an error.
+/// The function runs `cargo test --workspace --all-features -- --list` in
+/// `workspace`, so it compiles the tests of the workspace. The `Ok` vector
+/// holds one message for each test path that names no listed test.
+///
+/// # Test paths
+///
+/// - The value `-` of `evidence:` is not checked.
+/// - Commas split a value into citations. A comma in parentheses does not
+///   split. The first word of each citation is its path.
+/// - A test path has two or more `::` separators and holds only ASCII
+///   letters, digits, `_`, and `:`.
+/// - A path with one `::` (`crate::area`) names an area of tests. This
+///   function does not check it, and it gives no message.
+/// - A fixture file or a document name is not a test path. This function
+///   does not check it, and it gives no message.
+/// - A test path matches a listed test if the last `::` segments are equal.
+///
+/// # Errors
+///
+/// - An error if `cargo` does not start.
+/// - An error if `cargo test --list` exits with a failure status. The message
+///   holds the status and the standard error of cargo.
 pub fn verify_evidence(
     matrix: &Matrix,
     workspace: &std::path::Path,
@@ -495,16 +573,19 @@ pub fn verify_evidence(
     Ok(problems)
 }
 
-/// The bare function name of every test `cargo test -- --list` reports.
+/// Returns the bare function name of each test that `cargo test -- --list`
+/// reports.
 ///
-/// Each line is a full test name followed by `: test` or `: bench`; a unit
-/// test's name carries its module path (`module::tests::function`) while an
-/// integration test's does not (`function`). Reducing every listed name to
-/// its own trailing segment gives one set comparable to a citation's trailing
-/// segment, so a citation naming a real test's suffix as if it stood alone
-/// (`commit_matches_the_tool` against the real
-/// `bare_user_only_commit_matches_the_tool`) does not match: the real test's
-/// own trailing segment is the whole name, not that suffix.
+/// Each line is a full test name and then `: test` or `: bench`. The name of a
+/// unit test has its module path (`module::tests::function`). The name of an
+/// integration test is the function name alone (`function`). The function
+/// keeps the last segment of each name, so the set compares with the last
+/// segment of a citation.
+///
+/// A citation that names only the end of a real test name does not match.
+/// For example, `commit_matches_the_tool` does not match the real
+/// `bare_user_only_commit_matches_the_tool`. The last segment of that test is
+/// its whole name.
 fn listed_functions(listing: &str) -> BTreeSet<&str> {
     listing
         .lines()
@@ -516,8 +597,9 @@ fn listed_functions(listing: &str) -> BTreeSet<&str> {
         .collect()
 }
 
-/// Split an `evidence:` value on the commas that separate citations, leaving
-/// a comma inside a parenthetical remark alone.
+/// Splits an `evidence:` value at the commas that separate citations.
+///
+/// A comma in a remark in parentheses does not split.
 fn split_citations(evidence: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
@@ -537,15 +619,18 @@ fn split_citations(evidence: &str) -> Vec<&str> {
     parts
 }
 
-/// The bare function name a test-path citation names, or `None` when `path`
-/// is not a test path.
+/// Returns the bare function name that a test-path citation names, or `None`
+/// if `path` is not a test path.
 ///
-/// A test path has at least two `::` separators: `crate::file::function` for
-/// an integration test, `crate::module::function` for a unit test. A single
-/// `::` (`crate::area`, as in `ostrya::read_modes`) names an area, not one
-/// test, and is not a path to verify. `cargo test -- --list` always ends a
-/// test's name at the function, whether or not the crate's own module path
-/// leads up to it, so matching the trailing segment covers both shapes.
+/// A test path has two or more `::` separators. The form is
+/// `crate::file::function` for an integration test and
+/// `crate::module::function` for a unit test. A path with one `::`
+/// (`crate::area`, as in `ostrya::read_modes`) names an area of tests, and
+/// this function does not check it.
+///
+/// A match on the last segment covers both forms, because
+/// `cargo test -- --list` always ends a test name at the function name. The
+/// module path of the crate can be in front of it or not.
 fn test_function_name(path: &str) -> Option<&str> {
     let looks_like_a_test = path.matches("::").count() >= 2
         && path
@@ -808,8 +893,11 @@ mod tests {
         assert!(anchors.contains("trailing-"));
     }
 
-    /// A directory pair shaped like `docs/` and `docs/conformance/`, holding
-    /// `format-reference.md` beside the records and one `doc.md` among them.
+    /// Creates a scratch directory and its child `conformance`, and returns
+    /// the child.
+    ///
+    /// The layout is that of the design documents and the record files. The
+    /// parent holds `format-reference.md`, and the child holds one `doc.md`.
     fn scratch_docs(tag: u32) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "ostrya-conformance-spec-{}-{tag}",
@@ -886,9 +974,9 @@ mod tests {
 
     #[test]
     fn a_citation_matching_a_real_tests_suffix_is_still_flagged() {
-        // `commit_matches_the_tool` never names a test on its own; the only
-        // real test that shares those trailing characters is
-        // `bare_user_only_commit_matches_the_tool`, a different, whole name.
+        // `commit_matches_the_tool` names no test. The one real test that ends
+        // in these characters is `bare_user_only_commit_matches_the_tool`,
+        // which is a different name.
         let functions = listed_functions("bare_user_only_commit_matches_the_tool: test\n");
         assert!(!functions.contains("commit_matches_the_tool"));
         assert!(functions.contains("bare_user_only_commit_matches_the_tool"));

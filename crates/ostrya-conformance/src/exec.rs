@@ -1,7 +1,8 @@
-//! Resolving the two implementation handles and running them.
+//! The resolution of the two implementations, and the run of one invocation.
 //!
-//! The harness links neither implementation. Every observation comes from a
-//! process's exit status, its output, or the bytes it left on disk.
+//! This crate links neither implementation. Each observation comes from the
+//! exit status of a process, its output, or the bytes that it left on disk.
+//! [`resolve`] finds an implementation, and [`run`] runs one invocation.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -10,17 +11,33 @@ use std::time::Instant;
 
 use crate::tier;
 
-/// One implementation handle.
+/// A resolved implementation: its role and the path of its executable.
 #[derive(Clone, Debug)]
 pub struct Tool {
-    /// `port` or `reference`.
+    /// The role: `port` for the `ostrya` binary, or `reference` for the
+    /// `ostree` command.
     pub role: &'static str,
-    /// The executable this role runs.
+    /// The executable that this role runs.
+    ///
+    /// [`resolve`] canonicalizes the path if it can.
     pub path: PathBuf,
 }
 
-/// Resolve a handle: the explicit path, then the environment variable, then a
-/// `PATH` lookup of `name`.
+/// Returns the implementation for `role`, or `None` if no executable is found.
+///
+/// The function takes the first candidate from these sources, in this order:
+///
+/// 1. `explicit`, if it is `Some`.
+/// 2. The value of the environment variable `variable`, if it is set.
+/// 3. The first executable file `name` in the directories of `PATH`.
+///
+/// An executable file is a regular file with at least one execute permission
+/// bit. The function checks only the first candidate. If this candidate is not
+/// an executable file, the function returns `None` and does not try the next
+/// source.
+///
+/// If possible, the function canonicalizes the path, because each invocation
+/// runs in the scratch directory of a cell.
 pub fn resolve(
     role: &'static str,
     explicit: Option<&Path>,
@@ -34,8 +51,8 @@ pub fn resolve(
     if !executable(&candidate) {
         return None;
     }
-    // Every invocation runs in a cell's scratch directory, so the handle must
-    // hold an absolute path.
+    // Each invocation runs in the scratch directory of a cell, so the handle
+    // must hold an absolute path.
     let path = std::fs::canonicalize(&candidate).unwrap_or(candidate);
     Some(Tool { role, path })
 }
@@ -54,32 +71,35 @@ fn executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// What one invocation produced.
+/// The result of one invocation.
 #[derive(Clone, Debug)]
 pub struct Outcome {
-    /// The argument vector, program name first.
+    /// The argument vector, with the path of the program first.
     pub argv: Vec<String>,
-    /// The working directory the process ran in.
+    /// The working directory of the process.
     pub cwd: PathBuf,
-    /// The exit status, or `None` when a signal ended the process.
+    /// The exit status, or `None` if a signal ended the process.
     pub status: Option<i32>,
-    /// The signal that ended the process, when one did.
+    /// The signal that ended the process, or `None` if no signal ended it.
     pub signal: Option<i32>,
-    /// What the process wrote to standard output.
+    /// The bytes that the process wrote to standard output.
     pub stdout: Vec<u8>,
-    /// What the process wrote to standard error.
+    /// The bytes that the process wrote to standard error.
     pub stderr: Vec<u8>,
-    /// How long the process took, in milliseconds.
+    /// The duration of the run, in milliseconds.
     pub elapsed_ms: u64,
 }
 
 impl Outcome {
-    /// Whether the process ended by its own exit call.
+    /// Returns `true` if no signal ended the process.
     pub fn terminated_normally(&self) -> bool {
         self.signal.is_none()
     }
 
-    /// The exit status as a report prints it.
+    /// Returns the exit status as text for a report.
+    ///
+    /// The text is the exit code, or `signal N` if a signal ended the process.
+    /// If neither is known, the text is `unknown`.
     pub fn status_text(&self) -> String {
         match (self.status, self.signal) {
             (Some(code), _) => code.to_string(),
@@ -88,30 +108,54 @@ impl Outcome {
         }
     }
 
-    /// The command line as a report prints it.
+    /// Returns the command line as text for a report.
+    ///
+    /// One space separates two arguments.
     pub fn command_text(&self) -> String {
         self.argv.join(" ")
     }
 }
 
-/// The refusal an invocation earns when it would let an implementation resolve
-/// the host's system repository, and `None` when it would not.
+/// Returns a refusal message if the invocation can reach the system repository.
 ///
-/// The reference tool resolves a repository from the current directory, then
-/// `OSTREE_REPO`, then the compiled-in `tier::SYSTEM_REPO`. An invocation that
-/// binds no repository therefore reaches the host's own system repository on a
-/// host that carries one, and a writing subcommand acts on live state. The
-/// check refuses that invocation.
+/// `system_repo` is the system repository of the host, or `None` if the host
+/// has none. If it is `None`, or if the invocation binds a repository, the
+/// function returns `None`.
 ///
-/// The argv and the environment are read textually. The argv binds a
-/// repository when an argument begins with `--repo=` and carries a value, or
-/// when an argument equals `--repo` and another argument follows it. An argv
-/// ending in a bare `--repo` is an uncertain reading, and the check refuses
-/// where the reading is uncertain. The environment binds a repository when
-/// `env` carries `OSTREE_REPO` with a value; `run` removes that variable from
-/// the inherited environment, so the slice is the whole truth. `cwd` is read
-/// from disk, since it is the first source in the chain and an invocation that
-/// resolves there never reaches the third.
+/// # System repository
+///
+/// The `ostree` command resolves a repository from these sources, in this
+/// order:
+///
+/// 1. The current directory.
+/// 2. The environment variable `OSTREE_REPO`.
+/// 3. The compiled-in path [`SYSTEM_REPO`](tier::SYSTEM_REPO).
+///
+/// If an invocation binds no repository, it reaches the system repository on a
+/// host that has one. A subcommand that writes then changes live state. This
+/// function refuses that invocation.
+///
+/// # Binding rules
+///
+/// The function reads `args` and `env` as text. It reads `cwd` from disk.
+///
+/// - `args` binds a repository if an argument starts with `--repo=` and has a
+///   value.
+/// - `args` also binds a repository if an argument is `--repo` and another
+///   argument comes after it.
+/// - If `args` ends with a bare `--repo`, the reading is uncertain, and
+///   `args` binds no repository.
+/// - `env` binds a repository if it sets `OSTREE_REPO` to a value that is not
+///   empty. [`run`] removes `OSTREE_REPO` from the inherited environment, so
+///   `env` is the only source of this variable.
+/// - `cwd` binds a repository if it opens as a repository. The current
+///   directory is the first source, so an invocation that resolves there never
+///   reaches the third source.
+///
+/// A directory opens as a repository if it has an `objects` directory and a
+/// `config` file with a `[core]` section that has a `mode` key. This is the
+/// rule of the `ostree` command for its first source. If `cwd` has less than
+/// this, it does not open, and `cwd` binds no repository.
 pub fn system_repo_refusal(
     cwd: &Path,
     args: &[String],
@@ -130,8 +174,8 @@ pub fn system_repo_refusal(
     ))
 }
 
-/// Whether the argv binds a repository. An argv ending in a bare `--repo`
-/// reads as no binding, so the caller refuses it.
+/// Returns `true` if the argv binds a repository. If the argv ends with a bare
+/// `--repo`, the function returns `false`, so the caller refuses it.
 fn binds_repo_argument(args: &[String]) -> bool {
     let mut rest = args.iter();
     while let Some(argument) = rest.next() {
@@ -146,17 +190,19 @@ fn binds_repo_argument(args: &[String]) -> bool {
     false
 }
 
-/// Whether `env` binds `OSTREE_REPO` to a value.
+/// Returns `true` if `env` binds `OSTREE_REPO` to a value that is not empty.
 fn binds_repo_variable(env: &[(String, String)]) -> bool {
     env.iter()
         .any(|(key, value)| key == "OSTREE_REPO" && !value.is_empty())
 }
 
-/// Whether `directory` opens as a repository, by the rule
-/// `docs/conformance/cli-surface.md` records for the tool's first `--repo`
-/// source: the directory holds an `objects` directory and a `config` file
-/// whose text carries a `[core]` section with a `mode` key. Anything less does
-/// not open, so a directory that is only repository-shaped still refuses.
+/// Returns `true` if `directory` opens as a repository by the rule of the
+/// first source of the `ostree` command.
+///
+/// The directory must have an `objects` directory and a `config` file with a
+/// `[core]` section that has a `mode` key. A directory with less than this
+/// does not open, so the caller refuses a directory that only looks like a
+/// repository.
 fn opens_as_repository(directory: &Path) -> bool {
     if !directory.join("objects").is_dir() {
         return false;
@@ -181,30 +227,33 @@ fn opens_as_repository(directory: &Path) -> bool {
     false
 }
 
-/// The locale every invocation runs under.
+/// The locale of each invocation.
 ///
-/// The encoding is part of the comparison, not only the language. GLib holds its
-/// option-parser messages with U+201C and U+201D around the offending value and
-/// converts them to the locale's charset on the way to stderr. Under `C` the
-/// charset is ASCII, which cannot hold those characters, so a reference on a host
-/// carrying locale data prints `?` where one on a host carrying none prints the
-/// characters themselves. Pinning a UTF-8 locale keeps that conversion lossless,
-/// so the reference renders the same bytes on either host and the port, which
-/// writes UTF-8 throughout, matches it.
+/// The comparison of messages covers their encoding and their language. GLib
+/// puts U+201C and U+201D around the value that an option-parser message
+/// quotes. It converts these characters to the charset of the locale when it
+/// writes the message to stderr.
+///
+/// Under `C`, the charset is ASCII, and ASCII cannot hold these characters.
+/// The `ostree` command then prints `?` on a host with locale data, and the
+/// characters on a host with no locale data. A UTF-8 locale makes the
+/// conversion lossless. The `ostree` command then writes the same bytes on
+/// each host, and these bytes match the `ostrya` binary, which writes UTF-8 in
+/// all output.
 pub const LOCALE: &str = "C.UTF-8";
 
-/// The reason the host resolves [`LOCALE`] to something other than UTF-8, and
-/// `None` where it resolves it to UTF-8.
+/// Returns a message if [`LOCALE`] does not resolve to UTF-8 on the host.
 ///
-/// A host missing the locale falls back to ASCII, where GLib prints `?` for the
-/// characters it cannot hold. That would read as a difference in the message
-/// text rather than as the missing locale it is, so the caller reports it once
-/// ahead of the cells instead of leaving it to surface in every cell that quotes
-/// a value.
+/// The function runs `locale charmap` with `LC_ALL` set to [`LOCALE`]. This
+/// command names the codeset of the locale, and GLib converts its messages to
+/// this codeset. If the codeset is UTF-8, the function returns `None`. If
+/// `locale` cannot run or exits with a failure, the function also returns
+/// `None`.
 ///
-/// `locale charmap` names the codeset the locale resolves to, which is what GLib
-/// converts its messages into. A host where `locale` cannot be run states
-/// nothing either way and is left alone.
+/// A host with no such locale falls back to ASCII, and GLib prints `?` for
+/// each character that ASCII cannot hold. Each cell that quotes a value then
+/// shows a difference in the message text, and the cause is the missing
+/// locale. The caller reports the message one time, before the cells run.
 pub fn locale_codeset_defect() -> Option<String> {
     let output = Command::new("locale")
         .arg("charmap")
@@ -224,17 +273,30 @@ pub fn locale_codeset_defect() -> Option<String> {
     })
 }
 
-/// Run `tool` with `args` in `cwd`.
+/// Runs `tool` with `args` in `cwd` and returns the [`Outcome`].
 ///
-/// `OSTREE_REPO` is removed unless `env` sets it, so the current-directory and
-/// environment fallbacks a cell exercises are the cell's own doing. `G_DEBUG`
-/// is removed, so a `fatal-criticals` or `fatal-warnings` setting on the
-/// operator's host cannot turn a GLib critical in the reference into an abort.
-/// `LC_ALL` is set to [`LOCALE`] so the two implementations' messages compare in
-/// one language and one encoding.
+/// The function sets the environment of the process in this order:
 ///
-/// The run is refused, before the process starts, when `system_repo_refusal`
-/// reads the invocation as one that resolves the host's system repository.
+/// 1. It removes `OSTREE_REPO`. The repository fallbacks of a cell (the
+///    current directory and `OSTREE_REPO`) then come from the cell alone.
+/// 2. It removes `G_DEBUG`. A `fatal-criticals` or `fatal-warnings` value on
+///    the host of the operator then cannot turn a GLib critical in the
+///    `ostree` command into an abort.
+/// 3. It sets `LC_ALL` to [`LOCALE`], so the messages of the two
+///    implementations compare in one language and one encoding.
+/// 4. It applies `env`, so a variable in `env` replaces the values of the
+///    earlier steps.
+///
+/// Standard input is null. The function captures standard output and standard
+/// error.
+///
+/// # Errors
+///
+/// - The message of [`system_repo_refusal`] if the invocation can reach the
+///   system repository of the host. The function checks this before the
+///   process starts, with the result of [`system_repo`](tier::system_repo).
+/// - An error with the text `spawning PATH: ...` if the process cannot start,
+///   or if the wait for its output fails.
 pub fn run(
     tool: &Tool,
     cwd: &Path,
@@ -278,14 +340,14 @@ pub fn run(
 mod tests {
     use super::*;
 
-    /// The host fact is injected, so these run on a host with or without a
-    /// system repository.
+    /// Returns a system repository for the tests. The tests inject this host
+    /// fact, so they run on a host with or without a system repository.
     fn present() -> Option<&'static Path> {
         Some(Path::new(tier::SYSTEM_REPO))
     }
 
-    /// A working directory that does not open as a repository, so the cases
-    /// below turn on the argv and the environment alone.
+    /// Returns a working directory that does not open as a repository. With
+    /// it, the result of a test depends on the argv and the environment alone.
     fn elsewhere() -> &'static Path {
         Path::new("/ostrya-conformance-no-such-directory")
     }
@@ -294,7 +356,8 @@ mod tests {
         args.iter().map(|arg| (*arg).to_owned()).collect()
     }
 
-    /// A directory of this test's own, empty at the start of each run.
+    /// Returns a scratch directory for one test, empty at the start of each
+    /// run.
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "ostrya-conformance-exec-{tag}-{}",
@@ -376,8 +439,9 @@ mod tests {
     #[test]
     fn a_repo_less_argv_whose_cwd_does_not_open_is_refused() {
         let dir = scratch("cwd-not-a-repo");
-        // Repository-shaped and no more: the `objects` directory is there, and
-        // the `config` states no `[core]` section with a `mode` key.
+        // The directory looks like a repository and does not open. It has an
+        // `objects` directory, and its `config` has no `[core]` section with a
+        // `mode` key.
         std::fs::create_dir_all(dir.join("objects")).expect("create objects");
         std::fs::write(dir.join("config"), "[remote \"origin\"]\nurl=http://x/\n")
             .expect("write config");

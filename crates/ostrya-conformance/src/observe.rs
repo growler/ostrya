@@ -1,8 +1,6 @@
-//! `observe`: run the reference alone and print a record skeleton.
+//! The observation of the `ostree` command alone, for a record skeleton.
 //!
-//! This is the path from a declaration to an executable record. The 160 cells
-//! the matrix marks `unobserved` each need one observation pass, and the
-//! output of this subcommand is the record body that pass produces.
+//! [`observe`] runs one cell with the [`Options`] and returns the record text.
 
 use std::path::PathBuf;
 
@@ -12,21 +10,72 @@ use crate::record::Matrix;
 use crate::setup::{self, Context};
 use crate::syntax;
 
-/// What to observe.
+/// The options of an observation.
 pub struct Options {
-    /// The reference implementation to observe.
+    /// The `ostree` command to observe.
     pub reference: Tool,
-    /// The port, observed beside the reference when given.
+    /// The `ostrya` binary, for each setup step that the record assigns to `p`.
+    ///
+    /// If `created-by` is `p`, each `init` of the setups runs this binary. If
+    /// `populated-by` is `p`, each `commit` of the setups runs it. If this
+    /// field is `None`, such a step makes [`observe`] return an error. The
+    /// observed invocation always runs the `ostree` command.
     pub port: Option<Tool>,
-    /// Where the observation artifacts are written.
+    /// The directory that holds the files of the observation.
     pub artifact_dir: PathBuf,
-    /// The invocation to try, when the record states none.
+    /// The invocation to run, in place of the invocation of the record.
+    ///
+    /// If `None`, the invocation comes from
+    /// [`Record::reference_run`](crate::record::Record::reference_run).
     pub run: Option<String>,
-    /// The setups to build, when the record states none.
+    /// The setups to build, in place of the setups of the record.
+    ///
+    /// If the vector is empty, the setups are the `setup` field of the record.
     pub setup: Vec<String>,
 }
 
-/// Run the reference against one cell's setup and return the record skeleton.
+/// Runs the `ostree` command for one cell and returns a record skeleton.
+///
+/// An observation is the step from a declared record to an executable record.
+/// Each cell with the outcome `unobserved` needs one observation. The skeleton
+/// is the record body for that cell.
+///
+/// The function builds the setups and runs the invocation in
+/// `<artifact_dir>/observe/<id>/ref`. It removes an earlier directory of the
+/// cell first. It writes the two streams to `ref.stdout` and `ref.stderr` in
+/// `<artifact_dir>/observe/<id>`. If the cell has no mode or no corpus, the
+/// setups use [`DEFAULT_MODE`](setup::DEFAULT_MODE) and
+/// [`DEFAULT_CORPUS`](setup::DEFAULT_CORPUS).
+///
+/// # Skeleton
+///
+/// - Two comment lines name the `ostree` command and the artifact directory.
+/// - The fields `family`, `setup`, `run`, `tier`, and `severity` come from the
+///   record and the options. The fields `subcommand`, `cell`, and `oracle`
+///   appear if the record has them.
+/// - `expect-exit` is the observed exit status. `expect-stdout` and
+///   `expect-stderr` are `empty`, or an `equals` claim of the stream after
+///   [`normalize`](oracle::normalize).
+/// - If the exit status is 0, the outcome is `full`. Else it is `unobserved`,
+///   with a comment that asks for the correct outcome and its reason.
+/// - A comment block holds the value of each oracle of the record.
+///
+/// # Errors
+///
+/// - An error if the matrix has no cell `id`.
+/// - An error if [`Options::setup`] is empty and the record has no `setup`
+///   field.
+/// - An error if [`Options::run`] is `None` and
+///   [`Record::reference_run`](crate::record::Record::reference_run) returns
+///   `None`.
+/// - An error if the artifact directory cannot be created, or a stream file
+///   cannot be written.
+/// - An error from [`setup::apply`] for the setups.
+/// - An error from [`split`](syntax::split) or
+///   [`substitute`](syntax::substitute) for the invocation.
+/// - An error from [`exec::run`], for example the refusal of
+///   [`system_repo_refusal`](exec::system_repo_refusal) or a command that does
+///   not start.
 pub fn observe(matrix: &Matrix, id: &str, options: &Options) -> Result<String, String> {
     let cell = matrix
         .cells
@@ -158,7 +207,9 @@ pub fn observe(matrix: &Matrix, id: &str, options: &Options) -> Result<String, S
     Ok(out)
 }
 
-/// The claim a record would state for this observed stream.
+/// Returns the claim for an observed stream: `empty`, or `equals` and the text.
+///
+/// The text loses its trailing white space first.
 fn claim_for(text: &str) -> String {
     let trimmed = text.trim_end();
     if trimmed.is_empty() {

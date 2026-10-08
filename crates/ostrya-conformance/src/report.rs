@@ -1,5 +1,7 @@
-//! The output formats, and the `report` subcommand that renders a JSON
-//! document as the per-family mode grids.
+//! The output formats of a check and of a run, and the mode grids.
+//!
+//! [`run_report`] and [`check_report`] render a result in a [`Format`].
+//! [`grids`] renders a JSON document as one mode grid for each family.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -10,19 +12,21 @@ use crate::record::{MODES, Matrix, Tier};
 use crate::runner::{self, CellResult, OracleStatus, Verdict};
 use crate::tier::Host;
 
-/// Which format to write.
+/// The output format of a report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
-    /// A human-readable grid.
+    /// Text for a human reader.
     Human,
-    /// TAP version 14.
+    /// TAP version 13.
     Tap,
     /// One JSON document.
     Json,
 }
 
 impl Format {
-    /// The format `text` names, or `None` for an unknown name.
+    /// Returns the format that `text` names, or `None` for an unknown name.
+    ///
+    /// The names are `human`, `tap`, and `json`.
     pub fn parse(text: &str) -> Option<Format> {
         match text {
             "human" => Some(Format::Human),
@@ -33,19 +37,36 @@ impl Format {
     }
 }
 
-/// What the run itself recorded, for the report header.
+/// The facts of a run for the report header.
 pub struct RunInfo {
-    /// Where the run wrote its artifacts.
+    /// The directory where the run wrote its artifacts.
     pub artifact_dir: String,
-    /// The port executable the run used.
+    /// The `ostrya` binary of the run.
     pub port: String,
-    /// The reference executable, where the run found one.
+    /// The `ostree` command of the run, if the run found one.
     pub reference: Option<String>,
-    /// What the host offered the run.
+    /// The privileges that the host gave the run.
     pub host: Host,
 }
 
-/// Render a completed run.
+/// Returns the report of a completed run in `format`.
+///
+/// The human format holds:
+///
+/// - A header with the host, the `ostrya` binary, the `ostree` command (or
+///   `absent`), and the artifact directory.
+/// - One line for each cell, by family, with its verdict and its reason or
+///   the first line of its detail.
+/// - The full detail and the artifact directory of each failed cell.
+/// - A summary with the count of each verdict and of each skip reason.
+///
+/// The cell lines omit each cell with a skip of the reason `filtered`, and the
+/// summary counts it. For each tier that gates a cell, the summary also gives
+/// the [`Host::advice`].
+///
+/// The TAP format has one test point for each cell. A skip is `ok`, with a
+/// `# SKIP` directive and the reason. The JSON format holds the facts of the
+/// run, one object for each cell, and the summary counts.
 pub fn run_report(results: &[CellResult], info: &RunInfo, format: Format) -> String {
     match format {
         Format::Human => run_human(results, info),
@@ -73,7 +94,7 @@ fn run_human(results: &[CellResult], info: &RunInfo) -> String {
         .max()
         .unwrap_or(0)
         .max(20);
-    // A cell the selection excluded is counted in the summary and not listed.
+    // The summary counts a cell that the selection excluded. The list omits it.
     for result in results
         .iter()
         .filter(|result| result.reason.as_deref() != Some("filtered"))
@@ -154,8 +175,8 @@ fn summary_text(results: &[CellResult], host: &Host) -> String {
         }
     }
 
-    // The privilege gate is the one skip reason the operator can lift, so the
-    // summary states what lifting it needs.
+    // The tier gate is the only skip reason that the operator can remove, so
+    // the summary states what the removal needs.
     for (tier, count) in &gated {
         let _ = writeln!(
             out,
@@ -167,10 +188,11 @@ fn summary_text(results: &[CellResult], host: &Host) -> String {
     out
 }
 
-/// How many skipped cells each tier above the host's gates.
+/// Returns the number of cells with a skip of the reason `tier`, for each
+/// required tier.
 ///
-/// A cell whose tier skip a `--require` flag promoted is a failure, not a
-/// skip, so it is counted with the failures and not here.
+/// If a `--require` flag promotes a tier skip, the cell is a failure. The
+/// count of failures holds it, and this count does not.
 fn tier_gated(results: &[CellResult]) -> Vec<(Tier, usize)> {
     let mut counts: BTreeMap<Tier, usize> = BTreeMap::new();
     for result in results.iter().filter(|result| {
@@ -339,7 +361,12 @@ fn run_json(results: &[CellResult], info: &RunInfo) -> Json {
     ])
 }
 
-/// Render the result of `check`.
+/// Returns the report of [`check::check`] in `format`.
+///
+/// The human format holds one `error:` line for each error, and a summary line
+/// with the counts of records, cells, and errors. The TAP format has one test
+/// point. The JSON format holds one object for each cell, the summary counts,
+/// and the errors.
 pub fn check_report(matrix: &Matrix, report: &check::Report, format: Format) -> String {
     match format {
         Format::Human => {
@@ -418,8 +445,24 @@ fn check_json(matrix: &Matrix, report: &check::Report) -> Json {
     ])
 }
 
-/// Render a `check --format json` or `run --format json` document as the
-/// per-family mode grids.
+/// Returns the mode grids of a JSON document, one grid for each family.
+///
+/// The document is the output of `check --format json` or
+/// `run --format json`. The result is Markdown text:
+///
+/// - A family with no mode in its cells gets a list of its cells.
+/// - Each other family gets a table with one table row for each `row` value
+///   and one column for each mode of [`MODES`]. A cell that is absent shows
+///   `--`.
+///
+/// A grid entry is the verdict of the cell, with its reason if it has one, and
+/// the declared outcome. If the cell has no verdict, the entry is the declared
+/// outcome.
+///
+/// # Errors
+///
+/// - An error if the document has no `cells` member.
+/// - An error if `cells` is empty or is not an array.
 pub fn grids(document: &Json) -> Result<String, String> {
     let cells = document
         .get("cells")
@@ -491,7 +534,7 @@ pub fn grids(document: &Json) -> Result<String, String> {
     Ok(out)
 }
 
-/// A grid entry: the verdict when the document holds one, else the declared
+/// Returns a grid entry: the verdict if the cell has one, else the declared
 /// outcome.
 fn state(cell: &Json) -> String {
     let outcome = cell.get("outcome").map(Json::as_str).unwrap_or("");

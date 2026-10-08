@@ -1,9 +1,8 @@
-//! Static validation of every record, on every run of `cargo test`.
+//! The static check of every record file, on each run of `cargo test`.
 //!
-//! This test needs no built binary and no reference tool, so it gates the
-//! record files themselves: deb822 syntax, the field vocabulary, the
-//! completeness rule, placeholder binding, and the corpus, setup, oracle, and
-//! probe registries.
+//! The test loads the default matrix and runs `check::check` on it. The doc of
+//! `check::check` lists the rules. The test needs no built binary and no
+//! `ostree` command, so a record file that breaks a rule fails `cargo test`.
 
 use ostrya_conformance::{check, default_matrix_dir, record};
 

@@ -1,52 +1,74 @@
-//! The registered probes.
+//! The registered probes: the cells that a `run:` line cannot state.
 //!
-//! A probe is the escape hatch for a cell a `run:` line would distort: a
-//! command line holding a name the grammar cannot express, an interleaved
-//! sequence of invocations, or a comparison that reads state between two
-//! steps. Both probes here exist because the cell controls the working
-//! directory and the environment of the invocation, which a `run:` line does
-//! not state.
-//!
-//! `check` fails a probe no record names, so this registry cannot outgrow the
-//! matrix.
+//! [`PROBES`] names each [`Probe`], and [`lookup`] finds one by name.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::exec::{self, Outcome, Tool};
 
-/// One side, as a probe sees it.
+/// The side of one implementation, as a probe sees it.
 pub struct SideEnv<'a> {
-    /// The implementation this side runs.
+    /// The implementation that this side runs.
     pub tool: &'a Tool,
-    /// The side's subtree, and the working directory unless the probe changes
-    /// it.
+    /// The subtree of the side.
+    ///
+    /// It is the working directory if the probe sets no other directory.
     pub root: &'a Path,
-    /// The setup bindings the cell resolved.
+    /// The placeholder bindings of the setups of the cell for this side.
     pub bindings: &'a BTreeMap<String, String>,
 }
 
-/// What a probe receives.
+/// The input of a probe.
 pub struct Env<'a> {
-    /// One entry per side, in cell order.
+    /// One entry for each side: the `ostrya` side first, then the `ostree`
+    /// side if it runs.
     pub sides: Vec<SideEnv<'a>>,
 }
 
-/// A probe returns the observations it made, or the failure it found.
+/// A function that runs the steps of one probe cell.
+///
+/// A probe returns the observations that it made, or the failure that it
+/// found. A probe states a cell that a `run:` line cannot state without a
+/// change of meaning:
+///
+/// - A command line with a name that the grammar cannot express.
+/// - An interleaved sequence of invocations.
+/// - A comparison that reads state between two steps.
 pub type Probe = fn(&Env<'_>) -> Result<Vec<String>, String>;
 
-/// Every probe name.
+/// The registered probes, each with its name.
+///
+/// Each probe controls the working directory and the environment of its
+/// invocations. A `run:` line does not state them.
+///
+/// - `init-reuse-via-cwd-and-env` checks that `init` uses the same order of
+///   repository sources as the other subcommands. If the current directory or
+///   `OSTREE_REPO` resolves an existing repository, `init` reuses it. The
+///   `config` of the repository does not change.
+/// - `repo-position-precedence` checks that `--repo` before the subcommand,
+///   `--repo` after it, and `OSTREE_REPO` with no `--repo` resolve the same
+///   repository. The three `prune` invocations must write the same standard
+///   output.
+///
+/// The repository of `init-reuse-via-cwd-and-env` has a `collection-id`. If a
+/// repository has no `collection-id`, the `ostree` command crashes when it
+/// finds the repository through the current directory or `OSTREE_REPO`.
+/// ostrya does not reproduce that crash, and the probe does not reach it.
+///
+/// [`check`](crate::check::check) gives an error for each probe that no record
+/// names, so this list does not grow past the matrix.
 pub const PROBES: [(&str, Probe); 2] = [
     ("init-reuse-via-cwd-and-env", init_reuse_via_cwd_and_env),
     ("repo-position-precedence", repo_position_precedence),
 ];
 
-/// Whether `name` is a registered probe.
+/// Returns `true` if `name` is a registered probe.
 pub fn is_registered(name: &str) -> bool {
     PROBES.iter().any(|(known, _)| *known == name)
 }
 
-/// The probe `name` registers.
+/// Returns the probe with the name `name`, or `None` if it is not registered.
 pub fn lookup(name: &str) -> Option<Probe> {
     PROBES
         .iter()
@@ -54,14 +76,12 @@ pub fn lookup(name: &str) -> Option<Probe> {
         .map(|(_, probe)| *probe)
 }
 
-/// `init` shares the current-directory and `OSTREE_REPO` precedence every
-/// other subcommand uses: an existing repository resolved either way is
-/// reused, idempotently, with the config untouched.
+/// Checks that `init` reuses an existing repository that the current
+/// directory or `OSTREE_REPO` resolves, and that its `config` does not change.
 ///
-/// The repository carries a `collection-id`, so the cell does not also
-/// exercise the tool's fallback-only crash on a repository lacking one
-/// (`cli-surface.md`, "Global conventions"), which the port does not
-/// reproduce.
+/// The repository has a `collection-id`, so the cell does not reach the crash
+/// of the `ostree` command on a fallback to a repository with no
+/// `collection-id`. ostrya does not reproduce that crash.
 fn init_reuse_via_cwd_and_env(env: &Env<'_>) -> Result<Vec<String>, String> {
     let mut notes = Vec::new();
     for side in &env.sides {
@@ -114,8 +134,9 @@ fn init_reuse_via_cwd_and_env(env: &Env<'_>) -> Result<Vec<String>, String> {
     Ok(notes)
 }
 
-/// `--repo` before the subcommand, after it, and `OSTREE_REPO` with neither
-/// all resolve the same repository, and all three report the same thing.
+/// Checks that `--repo` before the subcommand, `--repo` after it, and
+/// `OSTREE_REPO` with no `--repo` resolve the same repository and give the
+/// same output.
 fn repo_position_precedence(env: &Env<'_>) -> Result<Vec<String>, String> {
     let mut notes = Vec::new();
     for side in &env.sides {

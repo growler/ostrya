@@ -1,17 +1,7 @@
-//! The corpora `docs/conformance/README.md` defines.
+//! The corpora: the source trees that the cells commit.
 //!
-//! A corpus is a source tree the harness materializes, together with the
-//! lowest privilege tier at which the tree can be built. Both implementations
-//! get their own copy, built by this code rather than by either binary, so a
-//! difference the run reports is a difference in what the implementations did
-//! with the tree.
-//!
-//! Two builders are absent. `C5` needs a `security.capability` value in the
-//! form real root writes, which the harness does not synthesize, and `C7`
-//! needs an SELinux-enforcing kernel. Both sit at tier T3 or above, so a
-//! host below that tier reports their cells as `skip: tier` and never reaches
-//! the builder; a host at that tier gets an explicit failure naming what is
-//! missing.
+//! [`CORPORA`] names each corpus and its tier. [`materialize`] builds the tree
+//! of a corpus.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -22,7 +12,39 @@ use rustix::fs::{CWD, FileType, Mode, XattrFlags};
 
 use crate::record::Tier;
 
-/// Every corpus name, with the tier its tree needs.
+/// The registered corpora, each with the tier that its tree needs.
+///
+/// A corpus is a source tree that this crate builds, with the lowest privilege
+/// tier at which the tree can be built. [`materialize`] builds the trees. The
+/// tier is T0 if the list states no other tier:
+///
+/// - `C0`: a regular file, an empty file, a nested regular file, and a
+///   symlink.
+/// - `C1`: regular files with the modes 0644, 0755, 0400, 0000, and 0664, and
+///   directories with the modes 0755, 0700, and 0711.
+/// - `C2`: files with the setuid, setgid, and sticky bits, and directories
+///   with the setgid and sticky bits.
+/// - `C3`: the tree of `C0`. It differs only in the commit options that a
+///   record states.
+/// - `C4`: user xattrs: a set whose stored order differs from its creation
+///   order, an empty value, and a 1024-byte value.
+/// - `C5` (T3): a `security.capability` value. It has no builder.
+/// - `C6` (T3): a file with the `trusted.demo` xattr, which needs real root.
+/// - `C7` (T4): SELinux. It has no builder.
+/// - `C8`: two paths on one inode, and a third path with the same content on
+///   its own inode.
+/// - `C9`: a 1 MiB file, large enough to cross a payload-link threshold, and
+///   a sparse file.
+/// - `C10`: names that the command line cannot carry. The tree has a name
+///   that is not UTF-8, a 255-byte name, and a name with a newline. It also
+///   has a name with a quote and a backslash, and a path 40 directories deep.
+/// - `C11`: a fifo and a Unix socket, which the repository format excludes.
+/// - `C12` (T3): a character device and a block device, which need real root.
+/// - `C13` (T2): files that the file system records as owned by 0:0, 1:1, and
+///   65534:65534.
+///
+/// [`materialize`](materialize#absent-builders) states why `C5` and `C7` have
+/// no builder.
 pub const CORPORA: [(&str, Tier); 14] = [
     ("C0", Tier::T0),
     ("C1", Tier::T0),
@@ -40,12 +62,12 @@ pub const CORPORA: [(&str, Tier); 14] = [
     ("C13", Tier::T2),
 ];
 
-/// Whether `name` is a registered corpus.
+/// Returns `true` if `name` is a registered corpus.
 pub fn is_registered(name: &str) -> bool {
     CORPORA.iter().any(|(known, _)| *known == name)
 }
 
-/// The tier the corpus needs, or `None` when it is not registered.
+/// Returns the tier of the corpus `name`, or `None` if it is not registered.
 pub fn tier(name: &str) -> Option<Tier> {
     CORPORA
         .iter()
@@ -53,10 +75,42 @@ pub fn tier(name: &str) -> Option<Tier> {
         .map(|(_, tier)| *tier)
 }
 
-/// Build the corpus tree at `root`, which must not exist yet.
+/// Builds the tree of the corpus `name` at `root`.
+///
+/// [`CORPORA`] states what each tree holds. Each implementation gets its own
+/// copy. This crate builds the copies, and neither binary takes part. As a
+/// result, a difference that a run reports comes from what the implementations
+/// did with the tree.
+///
+/// `root` must not exist. The function does not check this. A second build at
+/// one path can fail. For example, the symlink of `C0` and `C3`, the hard
+/// link of `C8`, and the special files of `C11` and `C12` give `EEXIST`.
+///
+/// The root directory gets the mode 0755, because its mode goes into the
+/// dirmeta of the committed root. The process umask has no effect on it.
+///
+/// # Absent builders
+///
+/// Two corpora have no builder:
+///
+/// - `C5` needs a `security.capability` value in the form that real root
+///   writes. This crate does not make one.
+/// - `C7` needs an SELinux-enforcing kernel.
+///
+/// `C5` is at tier T3 and `C7` at T4. If the tier of the host is lower, their
+/// cells report a skip with the reason `tier`, and the builder does not run.
+/// If the host has that tier, the function returns an error that names the
+/// missing item.
+///
+/// # Errors
+///
+/// - An error if `name` is not a registered corpus.
+/// - An error for `C5` and `C7`, which have no builder.
+/// - An error if `root` or an entry of the tree cannot be created.
+/// - An error if a mode, an owner, or an xattr cannot be set.
 pub fn materialize(name: &str, root: &Path) -> Result<(), String> {
-    // The root's own mode reaches the committed root dirmeta, so it is pinned
-    // like every other entry rather than left to the process umask.
+    // The mode of the root goes into the committed root dirmeta, so the root
+    // gets a fixed mode. The process umask has no effect on it.
     directory(root, 0o755)?;
     match name {
         "C0" | "C3" => basic(root),
@@ -118,8 +172,8 @@ fn special_bits(root: &Path) -> Result<(), String> {
     directory(&root.join("sticky-dir"), 0o1777)
 }
 
-/// `C4`: user xattrs, including a set whose stored order differs from its
-/// creation order, an empty value, and a 1024-byte value.
+/// `C4`: user xattrs: a set whose stored order differs from its creation
+/// order, an empty value, and a 1024-byte value.
 fn user_xattrs(root: &Path) -> Result<(), String> {
     let one = root.join("one");
     write(&one, b"corpus C4 one xattr\n", 0o644)?;
@@ -140,14 +194,14 @@ fn user_xattrs(root: &Path) -> Result<(), String> {
     set_xattr(&big, "user.big", &vec![b'x'; 1024])
 }
 
-/// `C6`: a file carrying `trusted.demo`, which needs real root.
+/// `C6`: a file with the `trusted.demo` xattr, which needs real root.
 fn trusted_xattrs(root: &Path) -> Result<(), String> {
     let path = root.join("trusted.txt");
     write(&path, b"corpus C6 trusted xattr\n", 0o644)?;
     set_xattr(&path, "trusted.demo", b"value")
 }
 
-/// `C8`: two paths on one inode, and a third path holding the same content on
+/// `C8`: two paths on one inode, and a third path with the same content on
 /// its own inode.
 fn hardlinks(root: &Path) -> Result<(), String> {
     let first = root.join("a.txt");
@@ -202,7 +256,7 @@ fn names(root: &Path) -> Result<(), String> {
     write(&deep.join("leaf.txt"), b"corpus C10 deep path\n", 0o644)
 }
 
-/// `C11`: a fifo and a unix socket, both of which the format excludes.
+/// `C11`: a fifo and a Unix socket, which the repository format excludes.
 fn unsupported_unprivileged(root: &Path) -> Result<(), String> {
     let fifo = root.join("fifo");
     rustix::fs::mknodat(CWD, &fifo, FileType::Fifo, Mode::from_raw_mode(0o644), 0)
@@ -234,7 +288,7 @@ fn unsupported_privileged(root: &Path) -> Result<(), String> {
     .map_err(|err| fail(&block, err))
 }
 
-/// `C13`: files the filesystem records as owned by 0:0, 1:1, and
+/// `C13`: files that the file system records as owned by 0:0, 1:1, and
 /// 65534:65534.
 fn real_ownership(root: &Path) -> Result<(), String> {
     for id in [0u32, 1, 65534] {
@@ -280,7 +334,9 @@ fn fail(path: &Path, err: impl std::fmt::Display) -> String {
     format!("{}: {err}", path.display())
 }
 
-/// The path a corpus tree is built at, under a cell's scratch root.
+/// Returns the path of the tree of the corpus `name` under `root`.
+///
+/// `root` is the scratch root of a side. The path is `<root>/corpus-<name>`.
 pub fn tree_path(root: &Path, name: &str) -> PathBuf {
     root.join(format!("corpus-{name}"))
 }

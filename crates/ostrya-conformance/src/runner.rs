@@ -1,9 +1,7 @@
-//! The execution model.
+//! The run of the cells of a matrix, and their verdicts.
 //!
-//! For one cell, in order: compute the required tier, resolve the
-//! implementations, create the scratch root, materialize the setups, bind the
-//! placeholders, substitute them into the invocation, run each side, apply the
-//! oracles, evaluate the assertions, and emit the verdict.
+//! [`run`] runs the cells that [`Options`] selects and returns a [`CellResult`]
+//! for each cell. [`gating_failure`] tells if the results fail the run.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,19 +17,25 @@ use crate::setup::{self, Context};
 use crate::syntax;
 use crate::tier::Host;
 
-/// What a cell reports.
+/// The verdict of a cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// The cell ran and met its expectation.
     Pass,
-    /// The cell ran and did not meet its expectation.
+    /// The cell did not meet its expectation.
+    ///
+    /// An error in the setup or the run of the cell also gives `Fail`. A skip
+    /// that a `--require` switch promotes is also a `Fail`, and
+    /// [`CellResult::promoted`] is `true`.
     Fail,
-    /// The cell did not run.
+    /// The cell did not run, or an oracle cannot read a side.
+    ///
+    /// [`CellResult::reason`] gives the reason of the skip.
     Skip,
 }
 
 impl Verdict {
-    /// The verdict's report spelling.
+    /// Returns the name of the verdict in a report: `pass`, `fail`, or `skip`.
     pub fn as_str(self) -> &'static str {
         match self {
             Verdict::Pass => "pass",
@@ -41,26 +45,41 @@ impl Verdict {
     }
 }
 
-/// What one oracle decided.
+/// The status that one oracle gives for a cell.
+///
+/// An oracle reads one text from the [`Side`] of each implementation, and the
+/// status compares the two texts.
 #[derive(Clone, Debug)]
 pub enum OracleStatus {
-    /// Both sides produced the same artifact.
+    /// The oracle gave the same text for the two sides.
     Equal,
-    /// The two artifacts differ.
+    /// The oracle gave a different text for each side.
+    ///
+    /// This status fails the cell.
     Different {
-        /// The port's artifact.
+        /// The text of the `ostrya` side.
         port: String,
-        /// The reference's artifact.
+        /// The text of the `ostree` side.
         reference: String,
     },
-    /// The reference has no equivalent invocation, so nothing was compared.
+    /// Only the `ostrya` side ran, so the oracle compared no texts.
+    ///
+    /// The record states `ref-run: n-a`, so no invocation of the `ostree`
+    /// command ran. This status is not a failure. A cell can pass on the
+    /// claims of the `ostrya` side alone.
     Unpaired,
-    /// The oracle could not read a side.
+    /// The oracle cannot read a side, for the reason that the string gives.
+    ///
+    /// If no claim and no oracle of the cell failed, the cell reports a skip.
+    /// The reason is `reference-abort` if the `ostree` command aborted on a
+    /// signal that the record tolerates, else `unimplemented-cli`.
     Unavailable(String),
 }
 
 impl OracleStatus {
-    /// The status's report spelling.
+    /// Returns the name of the status in a report.
+    ///
+    /// The names are `equal`, `different`, `unpaired`, and `unavailable`.
     pub fn as_str(&self) -> &'static str {
         match self {
             OracleStatus::Equal => "equal",
@@ -71,39 +90,78 @@ impl OracleStatus {
     }
 }
 
-/// One cell's result.
+/// The result of one cell.
 #[derive(Clone, Debug)]
 pub struct CellResult {
     /// The cell id.
     pub id: String,
-    /// The family the cell belongs to.
+    /// The family of the cell.
     pub family: String,
-    /// The row key the report grid uses.
+    /// The row key of the cell in the report grid.
     pub row: String,
-    /// The repository mode the cell ran in, where it named one.
+    /// The repository mode of the cell, if the cell names one.
     pub mode: Option<String>,
-    /// The outcome the record declared.
+    /// The outcome that the record declares.
     pub outcome: String,
-    /// The severity the record declared.
+    /// The severity that the record declares.
     pub severity: String,
-    /// The tier the cell needs: the highest of the record's `tier` and the
-    /// tier each named corpus declares.
+    /// The tier that the cell needs, from [`required_tier`].
     pub required_tier: Tier,
-    /// What the run decided.
+    /// The verdict of the cell.
     pub verdict: Verdict,
-    /// The skip reason, one of the seven the design names.
+    /// The reason of a skip, or `None` if the cell did not skip.
+    ///
+    /// [`run`] checks the gates of a cell in the order of this list. The
+    /// first gate that fails gives the reason.
+    ///
+    /// - `filtered`: [`Options::filters`] does not select the cell.
+    /// - `tier`: the tier of the host is lower than the required tier of the
+    ///   cell. [`Host::advice`] gives the detail.
+    /// - `proved-elsewhere`: the record states no `run` or `probe` field, and
+    ///   its `evidence` field names a test. The detail is that field.
+    /// - `declaration`: the record states no `run` or `probe` field, and no
+    ///   evidence.
+    /// - `reference-absent`: the cell needs the `ostree` command, and no
+    ///   `ostree` binary resolved. A cell needs it if the record does not
+    ///   state `ref-run: n-a`, or if `created-by` or `populated-by` names it.
+    /// - `system-repo`: the host has a system repository, and the `run` or
+    ///   `ref-run` line of a declared cell binds no repository.
+    ///
+    /// Two more reasons come after the cell ran. They apply only if no claim
+    /// and no oracle failed:
+    ///
+    /// - `reference-abort`: an oracle cannot read a side, and the `ostree`
+    ///   command aborted on the signal that `ref-may-abort` names.
+    /// - `unimplemented-cli`: an oracle cannot read a side for another
+    ///   reason.
+    ///
+    /// A skip that a `--require` switch promotes keeps its reason.
     pub reason: Option<String>,
-    /// The failure message, or the detail behind a skip.
+    /// The failure message, or the detail of a skip.
     pub detail: Option<String>,
-    /// Each oracle the cell ran, and what it found.
+    /// The name and the status of each oracle that the cell ran.
     pub oracles: Vec<(String, OracleStatus)>,
-    /// The cell's artifact directory, where one was kept.
+    /// The artifact directory of the cell, if [`run`] kept it.
+    ///
+    /// [`run`] removes the directory of a cell that passed, unless
+    /// [`Options::keep`] is `true`. A cell that skips at a gate has no
+    /// directory.
     pub artifact: Option<PathBuf>,
-    /// Anything the run recorded beside the verdict.
+    /// The notes of the run beside the verdict.
+    ///
+    /// Only a probe that passes gives notes.
     pub notes: Vec<String>,
-    /// How long the cell took, in milliseconds.
+    /// The time that the cell took, in milliseconds.
+    ///
+    /// A cell that skips at a gate has the value 0.
     pub elapsed_ms: u64,
-    /// Whether a `--require` flag turned this cell's skip into a failure.
+    /// The flag that is `true` if a `--require` switch made a skip a failure.
+    ///
+    /// [`Options::require_tool`] promotes a `reference-absent` skip, and
+    /// [`Options::require_tier`] promotes a `tier` skip. A promoted cell has
+    /// the verdict [`Verdict::Fail`], and its [`reason`](CellResult::reason)
+    /// keeps the skip reason. Its [`detail`](CellResult::detail) names the
+    /// switch.
     pub promoted: bool,
 }
 
@@ -135,18 +193,23 @@ impl CellResult {
     }
 }
 
-/// Which cells to run.
+/// The selection of the cells that a run executes.
+///
+/// A cell must match each filter that is set. [`run`] reports a cell that does
+/// not match as a skip with the reason `filtered`.
 #[derive(Clone, Debug, Default)]
 pub struct Filters {
-    /// Run the cells of this family alone.
+    /// The family of the selected cells, compared with no regard to ASCII case.
     pub family: Option<String>,
-    /// Run this cell alone.
+    /// The id of the one selected cell.
     pub cell: Option<String>,
-    /// Run the cells over this corpus alone.
+    /// The corpus of the selected cells.
     pub corpus: Option<String>,
-    /// Run the cells in this repository mode alone.
+    /// The repository mode of the selected cells.
     pub mode: Option<String>,
-    /// Run the cells this tier reaches alone.
+    /// The required tier of the selected cells.
+    ///
+    /// A cell matches only if its [`required_tier`] is equal to this tier.
     pub tier: Option<Tier>,
 }
 
@@ -181,32 +244,106 @@ impl Filters {
     }
 }
 
-/// How to run.
+/// The options of a run.
 pub struct Options {
-    /// The port to exercise.
+    /// The `ostrya` binary to run.
     pub port: Tool,
-    /// The reference implementation, where the host has one.
+    /// The `ostree` command, or `None` if no `ostree` binary resolved.
     pub reference: Option<Tool>,
-    /// Where the run writes its artifacts.
+    /// The directory for the artifacts of the run.
+    ///
+    /// Each cell gets the directory `<artifact_dir>/<cell id>`.
     pub artifact_dir: PathBuf,
-    /// Keep the artifact directory of a cell that passed.
+    /// The switch that keeps the artifact directory of a cell that passed.
     pub keep: bool,
-    /// How many cells run at a time.
+    /// The number of threads that run cells at the same time.
+    ///
+    /// The value 0 gives one thread.
     pub jobs: usize,
-    /// Which cells to run.
+    /// The selection of the cells to run.
     pub filters: Filters,
-    /// Fail a cell that a missing reference would have skipped.
+    /// The switch that fails a cell that skips with the reason
+    /// `reference-absent`.
+    ///
+    /// The command-line form is `--require tool=ostree`.
     pub require_tool: bool,
-    /// Fail a cell that a host below this tier would have skipped.
+    /// The tier up to which a skip with the reason `tier` becomes a failure.
+    ///
+    /// If a cell skips because of the tier of the host, and its required tier
+    /// is at or lower than this tier, the cell fails. The command-line form is
+    /// `--require tier=<tier>`.
     pub require_tier: Option<Tier>,
-    /// Hold every cell to byte identity, including the ones that record a
-    /// divergence.
+    /// The switch that makes a failure with the severity `identity` gate the
+    /// run.
+    ///
+    /// [`run`] does not read this field. The caller gives it to
+    /// [`gating_failure`].
     pub strict_identity: bool,
-    /// What the host offers.
+    /// The properties of the host, from [`detect`](crate::tier::detect).
     pub host: Host,
 }
 
-/// Run the selected cells.
+/// Runs the cells of a matrix and returns one result for each cell.
+///
+/// The results are in the order of the cells in `matrix`. A cell that
+/// [`Options::filters`] does not select gets a skip with the reason
+/// `filtered`. [`Options::jobs`] threads run the cells at the same time.
+///
+/// # Order
+///
+/// For each cell, `run` does these steps in this order:
+///
+/// 1. Gets the required tier of the cell from [`required_tier`].
+/// 2. Checks the gates: the filters, the tier of the host, an invocation in
+///    the record, the `ostree` command, and the system repository. If a gate
+///    fails, the cell skips with the reason that
+///    [`CellResult::reason`] gives.
+/// 3. Removes and creates the artifact directory of the cell.
+/// 4. Creates a scratch root and a work directory for each side, and applies
+///    the setups of the record with [`setup::apply`].
+/// 5. For a probe cell, runs the probe and gives its verdict.
+/// 6. For a declared cell, runs the sides one after the other. For each side,
+///    it substitutes the bindings into the invocation, runs it, and writes
+///    its stdout and stderr to the artifact directory.
+/// 7. Checks the claims of a side right after that side runs. The `ostrya`
+///    side has the `expect-*` claims, and the `ostree` side has the
+///    `ref-expect-*` claims. If the `ostree` command aborted on the signal
+///    that `ref-may-abort` names, this step skips the claims of the `ostree`
+///    side.
+/// 8. Applies each oracle of the record to each side and compares the two
+///    texts.
+/// 9. Gives the verdict. A failed claim or a different oracle text gives
+///    `Fail`. An oracle that cannot read a side gives a skip. All other
+///    cells pass.
+/// 10. Removes the artifact directory of a cell that passed, unless
+///     [`Options::keep`] is `true`.
+///
+/// If one of the steps 3 to 8 returns an error, the cell fails, and
+/// [`CellResult::detail`] holds the error message.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+/// use ostrya_conformance::{default_matrix_dir, exec, record, runner, tier};
+/// let matrix = record::load(&default_matrix_dir())?;
+/// let port = exec::resolve("port", None, "OSTRYA_BIN", "ostrya").ok_or("no ostrya")?;
+/// let options = runner::Options {
+///     port: port.clone(),
+///     reference: exec::resolve("reference", None, "OSTREE_BIN", "ostree"),
+///     artifact_dir: ostrya_conformance::absolute(Path::new("target/conformance/run")),
+///     keep: false,
+///     jobs: 4,
+///     filters: runner::Filters { family: Some("M10".to_owned()), ..Default::default() },
+///     require_tool: false,
+///     require_tier: None,
+///     strict_identity: false,
+///     host: tier::detect(),
+/// };
+/// let results = runner::run(&matrix, &options);
+/// assert!(!runner::gating_failure(&results, false));
+/// # Ok::<(), String>(())
+/// ```
 pub fn run(matrix: &Matrix, options: &Options) -> Vec<CellResult> {
     let results: Mutex<Vec<(usize, CellResult)>> = Mutex::new(Vec::new());
     let next = AtomicUsize::new(0);
@@ -249,10 +386,10 @@ fn one(matrix: &Matrix, cell: &Cell, options: &Options) -> CellResult {
         );
     }
 
-    // The privilege gate is decided first, so a cell this host cannot observe
-    // at all says so, whatever state its record is in. The same cell run at
-    // the tier it needs then reports what the record itself is missing, and
-    // the difference between the two runs is what the privilege unlocked.
+    // The tier gate comes first, so a cell that this host cannot observe
+    // reports the tier skip, whatever the state of its record. A run of the
+    // same cell at the tier it needs then reports the defects of the record.
+    // The difference between the two runs shows what the privilege unlocks.
     if options.host.tier < required {
         let mut result = CellResult::skip(
             cell,
@@ -316,21 +453,23 @@ fn one(matrix: &Matrix, cell: &Cell, options: &Options) -> CellResult {
         return result;
     }
 
-    // The reference tool resolves the compiled-in `tier::SYSTEM_REPO` when an
-    // invocation binds no repository, so on a host carrying one the cell's
-    // premise fails and the run would act on live system state. A cell whose
-    // premise fails for either implementation handle is a cell to skip whole,
-    // so both invocations are read here. A declared cell runs in the side's
-    // scratch root, which no setup makes a repository -- the setups bind
-    // `$REPO` to a path under it -- so the current directory resolves nothing
-    // there and the run line is the whole reading.
+    // If an invocation binds no repository, the `ostree` command opens the
+    // compiled-in `tier::SYSTEM_REPO`. On a host with that repository, the
+    // premise of the cell fails, and the run acts on live system state. If
+    // the premise fails for one of the two implementations, the whole cell
+    // skips, so this check reads the two invocations. A declared cell runs in
+    // the scratch root of its side. The setups bind `$REPO` to a path under
+    // that root, and no setup makes the root itself a repository. The
+    // current directory thus resolves no repository, and the run line is the
+    // only input to read.
     //
-    // A `probe:` cell carries no textual `run:` line, so the guard inside
-    // `exec::run` is its gate, one invocation at a time. Of the two registered
-    // probes, `repo-position-precedence` binds `--repo` or `OSTREE_REPO` in
-    // all three of its invocations (`probe.rs:127`, `:134`, `:142`), and
-    // `init-reuse-via-cwd-and-env` exercises the current-directory source
-    // deliberately (`probe.rs:84`), which the guard's `cwd` term admits.
+    // A `probe:` cell has no `run:` line, so the guard in `exec::run` checks
+    // each invocation of the probe. Of the two registered probes,
+    // `repo-position-precedence` binds `--repo` or `OSTREE_REPO` in each of
+    // the three invocations of `repo_position_precedence`. The `init` of
+    // `init_reuse_via_cwd_and_env` with the repository as the current
+    // directory uses the current-directory source on purpose. The `cwd` term
+    // of the guard admits it.
     let directory = options.artifact_dir.join(&cell.id);
     if !is_probe
         && let Some(detail) =
@@ -369,14 +508,17 @@ fn one(matrix: &Matrix, cell: &Cell, options: &Options) -> CellResult {
     result
 }
 
-/// The detail a `system-repo` skip carries, and `None` when the cell's two
-/// invocations both bind a repository or the host carries none.
+/// Returns the detail of a `system-repo` skip for a cell, or `None`.
 ///
-/// The invocations are read as the record states them, before substitution: a
-/// placeholder such as `--repo=$REPO` still reads as a binding. `directory` is
-/// the cell's artifact directory, which holds the two scratch roots the
-/// invocations run in; no setup makes a scratch root a repository, so the
-/// current-directory source resolves nothing for a declared cell.
+/// The result is `None` if each invocation of the cell binds a repository, or
+/// if the host has no system repository. The function reads the invocations
+/// as the record states them, before substitution. A placeholder such as
+/// `--repo=$REPO` thus reads as a binding.
+///
+/// `directory` is the artifact directory of the cell, which holds the two
+/// scratch roots of the invocations. No setup makes a scratch root a
+/// repository, so the current-directory source resolves no repository for a
+/// declared cell.
 fn system_repo_premise(
     record: &Record,
     directory: &Path,
@@ -387,8 +529,8 @@ fn system_repo_premise(
         .into_iter()
         .flatten()
     {
-        // A line the splitter rejects is left to the executor, which reports
-        // the syntax error itself.
+        // If `syntax::split` refuses a line, this check ignores it. The run
+        // of the cell reports the syntax error.
         let Ok(args) = syntax::split(line) else {
             continue;
         };
@@ -411,7 +553,10 @@ fn promote(result: &mut CellResult, flag: &str) {
     result.detail = Some(format!("skip `{reason}` promoted by {flag}: {detail}"));
 }
 
-/// The highest of the record's tier and the tier each named corpus declares.
+/// Returns the tier that a cell needs.
+///
+/// The tier is the higher of the `tier` field of the record and the tier of
+/// the corpus of the cell, from [`corpus::tier`].
 pub fn required_tier(cell: &Cell, record: &Record) -> Tier {
     let mut required = record.tier();
     if let Some(name) = &cell.corpus
@@ -425,10 +570,9 @@ pub fn required_tier(cell: &Cell, record: &Record) -> Tier {
 struct Prepared<'a> {
     tool: &'a Tool,
     root: PathBuf,
-    /// Where an oracle that needs scratch space of its own may write. It sits
-    /// beside the side's subtree rather than inside it, so a checkout the
-    /// `manifest` oracle makes is not itself part of what an oracle reads,
-    /// and the two sides never share a path.
+    /// The directory where an oracle can write scratch files. It is next to
+    /// the scratch root of the side, so no oracle reads a checkout that the
+    /// `manifest` oracle makes. The two sides never share a path.
     work: PathBuf,
     bindings: BTreeMap<String, String>,
 }
@@ -582,8 +726,8 @@ fn declared_cell(
         write_artifact(directory, &format!("{label}.stdout"), &outcome.stdout)?;
         write_artifact(directory, &format!("{label}.stderr"), &outcome.stderr)?;
 
-        // A tolerated reference crash carries no claims to check: the process
-        // never reached its own exit or messages.
+        // A tolerated crash of the `ostree` command gives no claims to check,
+        // because the process did not reach its own exit or messages.
         let tolerated = tolerated_abort(record, &outcome, is_port);
         if tolerated.is_none() {
             failures.extend(assertions(record, side, &outcome, is_port));
@@ -659,8 +803,8 @@ fn declared_cell(
         results.push(((*name).to_owned(), status));
     }
 
-    // An oracle that could not read a side leaves the cell unobserved, so it
-    // reports as skipped rather than as a pass on the assertions that did run.
+    // If an oracle cannot read a side and no claim failed, the cell is
+    // unobserved and reports a skip.
     let unavailable: Vec<String> = results
         .iter()
         .filter_map(|(name, status)| match status {
@@ -672,8 +816,9 @@ fn declared_cell(
     let (verdict, reason, detail) = if !failures.is_empty() {
         (Verdict::Fail, None, Some(failures.join("\n")))
     } else if !unavailable.is_empty() {
-        // A tolerated reference crash is its own category, so the summary names
-        // the reference build's defect rather than a missing port command.
+        // A tolerated crash of the `ostree` command has its own reason, so the
+        // summary names the defect of the `ostree` build. The reason
+        // `unimplemented-cli` names a command that `ostrya` does not have.
         let aborted = if outcomes.iter().any(|(_, _, tolerated)| tolerated.is_some()) {
             "reference-abort"
         } else {
@@ -707,14 +852,16 @@ fn declared_cell(
     })
 }
 
-/// The reason a record tolerates the reference's abnormal termination, and
-/// `None` where it does not.
+/// Returns the reason why the record tolerates the abnormal end of the
+/// `ostree` command, or `None`.
 ///
-/// A reference build that crashes on a cell's invocation states nothing about
-/// the port, so `ref-may-abort:` names the one signal the record tolerates and
-/// the cell reports as skipped. The record names a single signal, so a crash
-/// other than the observed one still fails the cell, and the port's own
-/// `expect-*` claims are asserted either way.
+/// If the `ostree` command crashes on the invocation of a cell, the crash
+/// states nothing about `ostrya`. `ref-may-abort:` names the one signal that
+/// the record tolerates, and the cell reports a skip. A crash on another
+/// signal still fails the cell.
+///
+/// The function returns `None` for the `ostrya` side. This crate checks the
+/// `expect-*` claims of the `ostrya` side in all cases.
 fn tolerated_abort(record: &Record, outcome: &Outcome, is_port: bool) -> Option<String> {
     if is_port {
         return None;
@@ -726,10 +873,10 @@ fn tolerated_abort(record: &Record, outcome: &Outcome, is_port: bool) -> Option<
     })
 }
 
-/// The absolute claims one side must satisfy.
+/// Returns the failures of the claims that one side must satisfy.
 ///
-/// Every executed side asserts that it terminated normally, and a record that
-/// omits its `expect-exit` claims exit status 0.
+/// Each side that ran must end normally. If the record has no exit claim for
+/// the side (`expect-exit` or `ref-expect-exit`), the claim is exit status 0.
 fn assertions(
     record: &Record,
     side: &Prepared<'_>,
@@ -806,7 +953,7 @@ fn write_artifact(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), Stri
     std::fs::write(&path, bytes).map_err(|err| format!("{}: {err}", path.display()))
 }
 
-/// A one-line rendering of a possibly long artifact, for a failure message.
+/// Returns a text on one line for a failure message, cut at 200 characters.
 fn summarize(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -820,11 +967,15 @@ fn summarize(text: &str) -> String {
     format!("{head}… ({} characters)", single.chars().count())
 }
 
-/// Whether the run holds a failure that gates it.
+/// Returns `true` if the results hold a failure that gates the run.
 ///
-/// An `identity` failure is reported and leaves the exit status alone, unless
-/// `--strict-identity` promotes it. A skip a `--require` flag promoted always
-/// gates, since the flag states that the host must observe the cell.
+/// A skip never gates the run. A failure with the severity `identity` gates
+/// the run only if `strict_identity` is `true`. The command-line switch is
+/// `--strict-identity`. [`run_report`](crate::report::run_report) shows each
+/// failure, also a failure that does not gate the run.
+///
+/// A skip that a `--require` switch promoted always gates the run, because the
+/// switch states that the host must observe the cell.
 pub fn gating_failure(results: &[CellResult], strict_identity: bool) -> bool {
     results.iter().any(|result| {
         result.verdict == Verdict::Fail
@@ -897,14 +1048,14 @@ mod tests {
 
         let bound = record(&[("run", "--repo=$REPO refs")]);
         assert!(system_repo_premise(&bound, directory, present).is_none());
-        // The host fact decides: the same record passes the premise where no
-        // system repository exists.
+        // The host decides. If no system repository exists, the same record
+        // passes the premise.
         let unbound = record(&[("run", "prune")]);
         assert!(system_repo_premise(&unbound, directory, None).is_none());
         assert!(system_repo_premise(&unbound, directory, present).is_some());
 
-        // `ref-run` states the reference's own invocation, and a repo-less one
-        // there fails the premise for the whole cell.
+        // `ref-run` states the invocation of the `ostree` command. If it binds
+        // no repository, the premise fails for the whole cell.
         let reference_only = record(&[("run", "--repo=$REPO refs"), ("ref-run", "refs")]);
         assert!(system_repo_premise(&reference_only, directory, present).is_some());
     }

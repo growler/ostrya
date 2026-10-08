@@ -1,8 +1,8 @@
-//! SHA-256, for the content digest the `manifest` oracle records.
+//! The SHA-256 digest that the `manifest` oracle records for file content.
 //!
-//! The harness links no repository-format code, so it carries its own digest
-//! rather than borrowing the library's. FIPS 180-4, streaming, no allocation
-//! beyond the returned string.
+//! This crate links no repository-format code of ostrya, so it has its own
+//! SHA-256 implementation. The implementation follows FIPS 180-4 and reads
+//! the message in a stream. [`Sha256::update`] allocates no memory.
 
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -30,7 +30,7 @@ impl Default for Sha256 {
 }
 
 impl Sha256 {
-    /// A digester over the empty message.
+    /// Creates a SHA-256 state for the empty message.
     pub fn new() -> Sha256 {
         Sha256 {
             state: [
@@ -43,7 +43,7 @@ impl Sha256 {
         }
     }
 
-    /// Feed `data` to the digester.
+    /// Adds `data` to the end of the message.
     pub fn update(&mut self, mut data: &[u8]) {
         self.length = self.length.wrapping_add(data.len() as u64);
         while !data.is_empty() {
@@ -59,7 +59,7 @@ impl Sha256 {
         }
     }
 
-    /// The digest in lowercase hexadecimal.
+    /// Returns the digest of the message as 64 lowercase hexadecimal digits.
     pub fn finish(mut self) -> String {
         let bits = self.length.wrapping_mul(8);
         self.update(&[0x80]);
@@ -131,14 +131,22 @@ impl Sha256 {
     }
 }
 
-/// The digest of one buffer.
+/// Returns the SHA-256 digest of `data` as 64 lowercase hexadecimal digits.
 pub fn digest(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hasher.finish()
 }
 
-/// The digest of a file, read in bounded chunks.
+/// Returns the SHA-256 digest of the file at `path` in lowercase hexadecimal.
+///
+/// The function reads the file in chunks of 64 KiB. The memory use does not
+/// grow with the size of the file.
+///
+/// # Errors
+///
+/// - An I/O error if the file cannot be opened.
+/// - An I/O error if a read of the file fails.
 pub fn digest_file(path: &std::path::Path) -> std::io::Result<String> {
     use std::io::Read;
 

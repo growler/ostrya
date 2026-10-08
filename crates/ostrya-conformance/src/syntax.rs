@@ -1,13 +1,20 @@
 //! The grammar of a `run:` line and of an `expect-*` claim.
 //!
-//! A `run:` line splits on whitespace. A single-quoted span becomes one
-//! argument and may hold spaces. No other shell syntax is interpreted, and no
-//! shell runs. `$NAME` names a placeholder a setup bound; `$$` produces a
-//! literal dollar sign.
+//! [`split`] and [`substitute`] read a `run:` line. [`parse_claim`] reads a
+//! claim.
 
 use std::collections::BTreeMap;
 
-/// Split a `run:` line into arguments.
+/// Splits a `run:` line into arguments.
+///
+/// The line splits at white space. A single-quoted span is part of one
+/// argument and can hold white space. This function reads no other shell
+/// syntax, and no shell runs. The placeholders stay in the arguments for
+/// [`substitute`].
+///
+/// # Errors
+///
+/// - An error if a single quote does not close.
 pub fn split(line: &str) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
     let mut current = String::new();
@@ -41,7 +48,15 @@ pub fn split(line: &str) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
-/// Every placeholder name the line names, in order, with duplicates kept.
+/// Returns each placeholder name of `line`, in order, with the duplicates.
+///
+/// A placeholder is `$NAME`, where `NAME` holds ASCII uppercase letters,
+/// digits, and `_`. A setup binds each placeholder. `$$` is a literal dollar
+/// sign and names no placeholder.
+///
+/// # Errors
+///
+/// - An error if a `$` is not followed by a name or by a second `$`.
 pub fn placeholders(line: &str) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     let mut rest = line.chars().peekable();
@@ -70,7 +85,14 @@ pub fn placeholders(line: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// Replace every placeholder in one argument with its binding.
+/// Replaces each placeholder in one argument with its binding.
+///
+/// `$$` gives a literal dollar sign.
+///
+/// # Errors
+///
+/// - An error if `bindings` holds no value for a placeholder. A `$` with no
+///   name after it is a placeholder with an empty name.
 pub fn substitute(argument: &str, bindings: &BTreeMap<String, String>) -> Result<String, String> {
     let mut out = String::new();
     let mut rest = argument.chars().peekable();
@@ -101,19 +123,19 @@ pub fn substitute(argument: &str, bindings: &BTreeMap<String, String>) -> Result
     Ok(out)
 }
 
-/// What an `expect-stdout` or `expect-stderr` field claims.
+/// The claim of an `expect-stdout` or `expect-stderr` field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Claim {
-    /// The stream held nothing.
+    /// The stream is empty.
     Empty,
-    /// The stream held this text somewhere.
+    /// The stream holds this text at some position.
     Contains(String),
-    /// The stream held exactly this text.
+    /// The stream is exactly this text.
     Equals(String),
 }
 
 impl Claim {
-    /// Whether `text` satisfies the claim.
+    /// Returns `true` if `text` satisfies the claim.
     pub fn holds(&self, text: &str) -> bool {
         match self {
             Claim::Empty => text.is_empty(),
@@ -122,7 +144,7 @@ impl Claim {
         }
     }
 
-    /// The claim as a record would write it.
+    /// Returns the claim in the form that a record uses.
     pub fn render(&self) -> String {
         match self {
             Claim::Empty => "empty".to_owned(),
@@ -132,7 +154,20 @@ impl Claim {
     }
 }
 
-/// Parse `empty`, `contains "TEXT"`, or `equals "TEXT"`.
+/// Parses a claim: `empty`, `contains "TEXT"`, or `equals "TEXT"`.
+///
+/// `TEXT` is a double-quoted string with the escapes `\\`, `\"`, `\n`, and
+/// `\t`. The function removes the leading and trailing white space of `text`.
+///
+/// # Errors
+///
+/// - An error if `text` is not `empty` and has no white space between the form
+///   and the quoted text.
+/// - An error if the form is not `contains` or `equals`.
+/// - An error if the quoted text does not start with `"` or does not close.
+/// - An error if the quoted text holds an unknown escape or ends inside an
+///   escape.
+/// - An error if text follows the closing quote.
 pub fn parse_claim(text: &str) -> Result<Claim, String> {
     let text = text.trim();
     if text == "empty" {
@@ -151,7 +186,7 @@ pub fn parse_claim(text: &str) -> Result<Claim, String> {
     }
 }
 
-/// Read a double-quoted string, honouring `\\`, `\"`, `\n`, and `\t`.
+/// Reads a double-quoted string with the escapes `\\`, `\"`, `\n`, and `\t`.
 fn unquote(text: &str) -> Result<String, String> {
     let mut characters = text.chars();
     if characters.next() != Some('"') {
@@ -179,7 +214,10 @@ fn unquote(text: &str) -> Result<String, String> {
     Ok(out)
 }
 
-/// Render a string as a claim's quoted text.
+/// Returns `text` as the double-quoted text of a claim.
+///
+/// The function escapes `"`, `\`, newline, and tab. In a claim,
+/// [`parse_claim`] reads this form back to the same text.
 pub fn quote(text: &str) -> String {
     let mut out = String::from("\"");
     for character in text.chars() {

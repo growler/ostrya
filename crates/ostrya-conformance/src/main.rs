@@ -2,13 +2,27 @@
 
 //! The `ostrya-conformance` binary.
 //!
-//! Four subcommands, defined in `docs/conformance/harness.md`: `check`
-//! validates the records and runs no binary, `run` executes the selected
-//! cells, `observe` runs the reference alone and prints a record skeleton,
-//! and `report` renders a JSON document as the per-family mode grids.
+//! The binary has four subcommands:
 //!
-//! Exit status: 0 when no `interop` failure occurred, 1 when one did or a
-//! `--require` flag promoted a skip, and 2 on a static or usage error.
+//! - `check` checks the records and runs no implementation.
+//! - `run` runs the selected cells.
+//! - `observe` runs the `ostree` command alone and prints a record skeleton.
+//! - `report` writes the mode grids of each family from a JSON document.
+//!
+//! The binary needs no cargo installation and no source tree, so the cells at
+//! T2 to T4 can run under `unshare -r` or as root. `--matrix` or
+//! `OSTRYA_MATRIX_DIR` names the record directory. Only
+//! `check --verify-evidence` runs `cargo`, in the workspace of the build.
+//!
+//! The exit statuses:
+//!
+//! - 0 if the subcommand succeeds.
+//! - 1 if `run` finds a failure that gates the run. This is a failure with the
+//!   severity `interop`, or a skip that a `--require` option promotes. With
+//!   `--strict-identity`, a failure with the severity `identity` also gates the
+//!   run.
+//! - 2 if `check` finds an error in the records, or on a usage error or another
+//!   error.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -68,7 +82,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Everything a subcommand may read from the command line.
+/// The options and operands that a subcommand can read from the command line.
 #[derive(Default)]
 struct Args {
     matrix: Option<PathBuf>,
@@ -237,8 +251,8 @@ fn command_run(args: &Args, format: Format) -> Result<ExitCode, String> {
             PathBuf::from("target/conformance").join(ostrya_conformance::run_id())
         }));
 
-    // Only the reference converts its messages through the locale, so a run
-    // without one is unaffected.
+    // Only the `ostree` command converts its messages through the locale. A run
+    // with no `ostree` command does not need the locale check.
     if reference.is_some()
         && let Some(defect) = exec::locale_codeset_defect()
     {

@@ -1,5 +1,5 @@
-//! The client session against a scripted server: the replies are encoded in
-//! advance, and the bytes the session writes are decoded after it.
+//! The client session against a scripted server. The tests encode the
+//! replies in advance, and decode the bytes that the session writes after it.
 
 use std::collections::HashMap;
 use std::io;
@@ -301,9 +301,9 @@ enum Item {
     Content(FileHeader, Option<Vec<u8>>),
     /// Encoded bytes.
     Encoded(Encoding, Vec<u8>),
-    /// A regular file that is content with this payload in `raw`, and these
-    /// stored bytes as they are in `deflate`, as an `archive` repository
-    /// gives it.
+    /// A regular file with this payload in `raw`, and these stored bytes
+    /// unchanged in `deflate`. An `archive` repository gives a file in this
+    /// form.
     Stored(Vec<u8>, Vec<u8>),
     /// A regular file whose payload fails after these bytes.
     Failing(Vec<u8>),
@@ -653,7 +653,7 @@ fn a_full_chunk_goes_out_with_its_length() {
         block_on(session.send(&source, &[file(1)], &[], compression)).unwrap();
         let writes = &out.writes()[hello..];
         assert!(writes.len() > 3, "{compression:?}: {writes:?}");
-        // The last write ends the stream and may be short.
+        // The last write ends the stream and can be short.
         assert!(
             writes[..writes.len() - 1].iter().all(|n| *n >= 16),
             "{compression:?}: {writes:?}"
@@ -662,8 +662,8 @@ fn a_full_chunk_goes_out_with_its_length() {
 }
 
 /// A large object reaches the transport in writes of at most 64 KiB, and no
-/// write carries a chunk length alone. Raw, each write after the first and
-/// before the last is a full buffer of 64 KiB.
+/// write carries a chunk length alone. In a raw push, each write after the
+/// first and before the last is a full buffer of 64 KiB.
 #[test]
 fn a_large_object_goes_out_in_writes_of_at_most_64_kib() {
     // Bytes that do not compress, so the compressor fills its output buffer.
@@ -808,8 +808,8 @@ fn deflated_content_equals_the_sink_output() {
             ),
         ];
         assert_eq!(got, want, "level {level}");
-        // The symlink carries the framed archive header alone, and the empty
-        // file a closed empty DEFLATE stream.
+        // The symlink carries the framed archive header alone. The empty file
+        // carries a closed empty DEFLATE stream.
         let symlink_header = frame(&symlink("t").serialize_archive(0).unwrap()).unwrap();
         assert_eq!(got[2].2, symlink_header);
         assert!(
@@ -1182,7 +1182,7 @@ fn a_commit_reply_for_other_refs_is_an_unknown_outcome() {
 
 #[test]
 fn a_failed_commit_write_reads_the_pending_reply() {
-    // A CommitReply read after the write failed is the reply.
+    // A CommitReply that the session reads after a failed write is the reply.
     let (session, out) = open(&["a"], BOTH, &[commit_reply(&["a"])]);
     out.break_writes();
     let outcome = block_on(session.commit(&[update("a")], false)).unwrap();
@@ -1198,7 +1198,7 @@ fn a_failed_commit_write_reads_the_pending_reply() {
         "other refs",
     );
 
-    // A pending Error is that error.
+    // A pending `Error` message gives the `Error` variant of its code.
     let (session, out) = open(&["a"], BOTH, &[error(ErrorCode::Unauthorized)]);
     out.break_writes();
     assert!(matches!(
@@ -1366,9 +1366,10 @@ fn the_progress_hook_runs_per_phase_per_object_and_per_100_kib() {
     }
 }
 
-/// The byte total is asked in the encoding the session sends in. A server
-/// that lists `raw` alone makes a deflate push ask for `raw`, and the content
-/// bytes then end at the payload size, not at the stored size.
+/// The session asks for the byte total in the encoding that it sends in. If
+/// the server lists `raw` alone, a deflate push asks for `raw`. The content
+/// bytes then end at the payload size, and the stored size is not part of the
+/// total.
 #[test]
 fn the_byte_total_follows_the_encoding_the_server_takes() {
     let data = payload(5000, 5);

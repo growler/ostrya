@@ -8,10 +8,10 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 use crate::session::stream::{Input, Output};
 
-/// The receive command when the options name none.
+/// The default receive command.
 const DEFAULT_RECEIVE_COMMAND: &str = "ostrya receive";
 
-/// The send command when the options name none.
+/// The default send command.
 const DEFAULT_SEND_COMMAND: &str = "ostrya send";
 
 fn invalid(msg: impl Into<String>) -> Error {
@@ -25,15 +25,17 @@ pub(super) struct SshAddr {
     /// The host, without the brackets of an IPv6 address.
     host: String,
     port: Option<u16>,
-    /// The path the remote command gets: absolute, or relative to the remote
-    /// home directory.
+    /// The path that the remote command gets. It is absolute, or relative to
+    /// the remote home directory.
     path: String,
 }
 
 impl SshAddr {
-    /// Parse an `ssh://` address or a scp-form address. `windows` refuses a
-    /// scp-form address that names a local path: a one-letter host, or a
-    /// `\` before the first `:`.
+    /// Parses an `ssh://` address or a scp-form address.
+    ///
+    /// If `windows` is `true`, the call refuses a scp-form address that names
+    /// a local path: a one-letter host, or a `\` before the first `:`. A
+    /// refusal is [`Error::InvalidInput`] with the address and the reason.
     pub(super) fn parse(address: &str, windows: bool) -> Result<SshAddr> {
         let bad = |why: &str| invalid(format!("address '{address}': {why}"));
         if let Some(rest) = address.strip_prefix("ssh://") {
@@ -122,9 +124,12 @@ impl SshAddr {
         })
     }
 
-    /// The command line that runs `command`, the receive command or the send
-    /// command, on the remote side: `program`, then `-p PORT`, then
-    /// `[USER@]HOST`, then one string with `command` and the quoted path.
+    /// Returns the command line that runs `command` on the remote side.
+    ///
+    /// `command` is the receive command or the send command. The line is
+    /// `program`, then `-p PORT` if the address has a port, then
+    /// `[USER@]HOST`. The last argument is one string: `command`, then
+    /// `--repo=` and the quoted path.
     pub(super) fn command_line(&self, program: Vec<String>, command: &str) -> Vec<String> {
         let mut argv = program;
         if let Some(port) = self.port {
@@ -162,7 +167,7 @@ impl fmt::Display for SshAddr {
     }
 }
 
-/// Split `USER@REST` at its one `@`.
+/// Splits `USER@REST` at its one `@`. More than one `@` is refused.
 fn split_user(s: &str) -> std::result::Result<(Option<&str>, &str), &'static str> {
     match s.split_once('@') {
         None => Ok((None, s)),
@@ -175,11 +180,12 @@ fn split_user(s: &str) -> std::result::Result<(Option<&str>, &str), &'static str
 #[derive(Clone, Copy)]
 struct Host<'a> {
     name: &'a str,
-    /// Whether the address gave the host in brackets.
+    /// `true` if the address gives the host in brackets.
     bracketed: bool,
 }
 
-/// Remove the brackets of an IPv6 host. A bracket anywhere else is refused.
+/// Removes the brackets of an IPv6 host. A bracket in any other position is
+/// refused.
 fn unbracket(host: &str) -> std::result::Result<Host<'_>, &'static str> {
     if let Some(inner) = host.strip_prefix('[') {
         return match inner.strip_suffix(']') {
@@ -199,13 +205,14 @@ fn unbracket(host: &str) -> std::result::Result<Host<'_>, &'static str> {
     })
 }
 
-/// A byte that a user and a host name may hold.
+/// Returns `true` if `b` is a byte that a user name or a host name can hold.
 fn name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')
 }
 
-/// Whether `s` is made of the characters of an IPv6 address: hex digits,
-/// `:`, and `.`, with an optional `%ZONE` of ASCII alphanumerics.
+/// Returns `true` if `s` holds only the characters of an IPv6 address: hex
+/// digits, `:`, and `.`. An optional `%ZONE` of one or more ASCII letters and
+/// digits can follow.
 fn ipv6_literal(s: &str) -> bool {
     let (addr, zone) = match s.split_once('%') {
         Some((addr, zone)) => (addr, Some(zone)),
@@ -216,8 +223,11 @@ fn ipv6_literal(s: &str) -> bool {
         && zone.is_none_or(|z| !z.is_empty() && z.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
-/// The path after a `~` home prefix: `/RELATIVE` gives `RELATIVE`, with each
-/// leading `/` removed, so the path stays relative to the home directory.
+/// Returns the path after a `~` home prefix.
+///
+/// `/RELATIVE` gives `RELATIVE`. The call removes each leading `/`, so the
+/// path stays relative to the home directory. A `home` that does not start
+/// with `/` is a path of the form `~` or `~USER`, which is refused.
 fn home_relative(home: &str) -> std::result::Result<&str, &'static str> {
     match home.strip_prefix('/') {
         Some(relative) => Ok(relative.trim_start_matches('/')),
@@ -225,7 +235,8 @@ fn home_relative(home: &str) -> std::result::Result<&str, &'static str> {
     }
 }
 
-/// Split `HOST[:PORT]` of an `ssh://` address.
+/// Splits `HOST[:PORT]` of an `ssh://` address. The port must be a number
+/// from 1 to 65535.
 fn split_port(s: &str) -> std::result::Result<(Host<'_>, Option<u16>), &'static str> {
     let (host, port) = if s.starts_with('[') {
         match s.find(']') {
@@ -259,8 +270,8 @@ fn split_port(s: &str) -> std::result::Result<(Host<'_>, Option<u16>), &'static 
     Ok((host, port))
 }
 
-/// The index of the `:` that ends the host of a scp-form address: the first
-/// `:` outside brackets.
+/// Returns the index of the `:` that ends the host of a scp-form address.
+/// That is the first `:` outside brackets.
 fn separator(s: &str) -> Option<usize> {
     let mut in_brackets = false;
     for (i, c) in s.char_indices() {
@@ -274,8 +285,8 @@ fn separator(s: &str) -> Option<usize> {
     None
 }
 
-/// Quote `s` for a POSIX shell: single quotes around it, and each `'` as
-/// `'\''`.
+/// Quotes `s` for a POSIX shell. The result puts single quotes around `s`
+/// and writes each `'` as `'\''`.
 pub(super) fn quote_posix(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
@@ -290,7 +301,8 @@ pub(super) fn quote_posix(s: &str) -> String {
     out
 }
 
-/// Split a command line at ASCII whitespace. An empty result is refused.
+/// Splits the command line `value` at ASCII whitespace. If the result is
+/// empty, the call returns [`Error::InvalidInput`], which names `source`.
 fn split_command(source: &str, value: &str) -> Result<Vec<String>> {
     let argv: Vec<String> = value.split_ascii_whitespace().map(str::to_owned).collect();
     if argv.is_empty() {
@@ -299,9 +311,11 @@ fn split_command(source: &str, value: &str) -> Result<Vec<String>> {
     Ok(argv)
 }
 
-/// The ssh command line: `explicit`, then the value `env` of the
-/// `OSTRYA_SSH_COMMAND` environment variable, then the remote key `key`, and
-/// `ssh` when none is set.
+/// Returns the ssh command line from the first source that is set.
+///
+/// The sources are `explicit`, the `OSTRYA_SSH_COMMAND` value `env`, and the
+/// remote key `key`, in this order. If none is set, the command line is
+/// `ssh`.
 pub(super) fn ssh_program(
     explicit: Option<&[String]>,
     env: Option<&OsStr>,
@@ -325,7 +339,10 @@ pub(super) fn ssh_program(
     Ok(vec!["ssh".to_owned()])
 }
 
-/// The receive command: `explicit`, or `ostrya receive`.
+/// Returns the receive command: `explicit`, or `ostrya receive` if
+/// `explicit` is `None`.
+///
+/// A command that is empty or holds only whitespace is refused.
 pub(super) fn receive_command(explicit: Option<&str>) -> Result<&str> {
     match explicit {
         Some(cmd) if cmd.trim().is_empty() => Err(invalid("the receive command is empty")),
@@ -334,7 +351,10 @@ pub(super) fn receive_command(explicit: Option<&str>) -> Result<&str> {
     }
 }
 
-/// The send command: `explicit`, or `ostrya send`.
+/// Returns the send command: `explicit`, or `ostrya send` if `explicit` is
+/// `None`.
+///
+/// A command that is empty or holds only whitespace is refused.
 pub(super) fn send_command(explicit: Option<&str>) -> Result<&str> {
     match explicit {
         Some(cmd) if cmd.trim().is_empty() => Err(invalid("the send command is empty")),
@@ -352,8 +372,11 @@ pub(crate) struct Transport {
 }
 
 impl Transport {
-    /// Start `argv` with piped standard input and standard output. Gives the
-    /// input from the child, the output to it, and the transport.
+    /// Starts `argv` with piped standard input and standard output.
+    ///
+    /// The call returns the input from the child, the output to the child,
+    /// and the transport. A program that cannot start is [`Error::Transport`],
+    /// which names the program.
     pub(super) fn spawn(argv: &[String], limit: Duration) -> Result<(Input, Output, Transport)> {
         let (program, args) = argv.split_first().expect("the command line has a program");
         let mut command = ostrya_rt::Command::new(program);
@@ -376,14 +399,19 @@ impl Transport {
         ))
     }
 
-    /// Wait for the child to exit, for at most the limit, and give the
+    /// Waits for the child to exit, for at most the limit, and returns the
     /// result of the session.
     ///
-    /// The streams of the session must be closed or dropped first, so the
-    /// child reads end of file. When `result` is an I/O error and the child
-    /// exited with a failure status, the result is [`Error::Transport`] with
-    /// the status. The status of an unknown commit outcome is added to its
-    /// message. Every other result is given as it is.
+    /// The caller must close or drop the streams of the session first, so
+    /// that the child reads end of file. If the child exits with a failure
+    /// status within the limit, the call changes two results:
+    ///
+    /// - An [`Error::Io`] becomes an [`Error::Transport`] with the status.
+    /// - The message of an [`Error::CommitOutcomeUnknown`] gets the status.
+    ///
+    /// The call returns each other result unchanged. It also returns `result`
+    /// unchanged if the child exits with success, if the wait fails, or if
+    /// the limit ends first.
     pub(crate) async fn finish<T>(mut self, result: Result<T>) -> Result<T> {
         let wait = async { self.child.wait().await.ok() };
         let timeout = async {

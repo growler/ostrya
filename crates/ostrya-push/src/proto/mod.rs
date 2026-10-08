@@ -1,9 +1,12 @@
-//! The wire protocol of the push and of the pull: messages, frames, the
-//! object stream, and the pull bodies.
+//! The wire format of the push and the pull, and its codec.
+//!
+//! Each wire code is the [`Error`] variant of the same name, for example
+//! [`Error::Protocol`] for the code `protocol`. [`ErrorCode`] names the
+//! codes.
 //!
 //! # Frames
 //!
-//! The peers exchange frames. A frame is:
+//! The peers exchange frames. A frame has this layout:
 //!
 //! ```text
 //! u32   length, big-endian, of the bytes that follow (kind byte + body)
@@ -11,15 +14,20 @@
 //! ...   GVariant body, normal form, of the type the kind names
 //! ```
 //!
-//! A frame length of 0 is the error `protocol`, because a frame holds at
-//! least the kind byte. A frame length greater than the current limit is the
-//! error `limit-exceeded`. The reader checks the length before it reads or
-//! allocates the body. Before the server announces a limit, the limit is
-//! [`MIN_FRAME_LIMIT`]. The server announces its limit as `max-frame` in
-//! `HelloReply`, and an announced limit is in
-//! `MIN_FRAME_LIMIT..=MAX_FRAME_LIMIT`. The limit applies in both directions.
-//! A client writes frames up to the announced limit, and reads frames up to
-//! a limit of its own, because the reader allocates each frame body in full.
+//! A frame holds at least the kind byte, so a frame length of 0 is
+//! [`Error::Protocol`]. A frame length greater than the current limit is
+//! [`Error::LimitExceeded`]. The reader checks the length before it reads or
+//! allocates the body.
+//!
+//! Before the server announces a limit, the limit is [`MIN_FRAME_LIMIT`]. The
+//! server announces its limit in the key `max-frame` of `HelloReply`. The
+//! value is from [`MIN_FRAME_LIMIT`] (1 MiB) to [`MAX_FRAME_LIMIT`]
+//! (`0xFFFFFFFE`), both included. A value out of this range is
+//! [`Error::Protocol`].
+//!
+//! The limit applies in both directions. A client writes frames up to the
+//! announced limit. It reads frames up to a limit of its own, because the
+//! reader allocates each frame body in full.
 //!
 //! The message kinds and their body types are:
 //!
@@ -39,95 +47,129 @@
 //! - 14 `Get` -- `s`
 //! - 15 `GetReply` -- `(bmt)`
 //!
-//! Kinds 1 to 9 and 11 belong to the push, kinds 12 to 15 to the pull, and
-//! `Error` to both. The codec reads and writes every kind. A session refuses
-//! a kind of the other protocol as `protocol`.
+//! The kinds belong to the two protocols as follows:
 //!
-//! A kind that is not in the list is the error `protocol`. A body that is
-//! not in normal form for its type, or that has trailing bytes, is the error
-//! `protocol`. A non-empty `ObjectsEnd` body, or an `Abort` body other than
-//! `0x00`, is the error `protocol`.
+//! - Kinds 1 to 9 and 11 belong to the push.
+//! - Kinds 12 to 15 belong to the pull.
+//! - Kind 10, the `Error` message, belongs to both.
+//!
+//! The codec reads and writes every kind. A session refuses a kind of the
+//! other protocol with [`Error::Protocol`].
+//!
+//! Each of these is [`Error::Protocol`]:
+//!
+//! - a kind that is not in the list
+//! - a body that is not in normal form for its type, or that has trailing
+//!   bytes
+//! - an `ObjectsEnd` body that is not empty
+//! - an `Abort` body other than `0x00`
 //!
 //! The integers in a message body are little-endian, which is the GVariant
 //! normal form. The protocol applies no value-level byte swap. The frame
 //! length and the chunk length are big-endian.
 //!
-//! Every checksum in a body is an `ay` of exactly 32 bytes. Another length is
-//! the error `protocol`. An `a{sv}` key that the decoder does not know is
-//! ignored. A known key whose value has the wrong type is the error
-//! `protocol`. When a key occurs twice, the first one counts.
+//! Every checksum in a body is an `ay` of exactly 32 bytes. A checksum of
+//! another length is [`Error::Protocol`].
+//!
+//! The decoder ignores an `a{sv}` key that it does not know. A known key whose
+//! value has the wrong type is [`Error::Protocol`]. If a key occurs twice, the
+//! first one counts.
 //!
 //! # Object stream
 //!
 //! After an `ObjectHeader` frame, the bytes of the object follow as chunks.
-//! A chunk is not a frame:
+//! A chunk is not a frame. It has this layout:
 //!
 //! ```text
 //! u32   length, big-endian
 //! ...   that number of object bytes
 //! ```
 //!
-//! - A chunk of length 0 ends the object. Frames follow again: the next
+//! The chunk length has these meanings:
+//!
+//! - A chunk of length 0 ends the object. Then frames follow again: the next
 //!   `ObjectHeader`, or `ObjectsEnd`, which closes the stream.
 //! - The length [`ABANDON`] (`0xFFFFFFFF`) abandons the object. The next frame
-//!   must be `Abort`. Any other frame is the error `protocol`.
-//! - Any other length greater than the current limit is the error
-//!   `limit-exceeded`. The chunk limit and the frame limit are the same
-//!   number. [`MAX_FRAME_LIMIT`] is one below the abandon marker, so a chunk
-//!   length never equals the marker.
+//!   must be `Abort`. Any other frame is [`Error::Protocol`].
+//! - Any other length greater than the current limit is
+//!   [`Error::LimitExceeded`]. The chunk limit and the frame limit are the
+//!   same number, at most [`MAX_FRAME_LIMIT`].
 //!
-//! The object type in `ObjectHeader` is 1 (file), 2 (dirtree), 3 (dirmeta),
-//! 4 (commit), or 6 (detached commit metadata). For type 6 the checksum is
-//! the checksum of the commit that the metadata belongs to. The encoding is
-//! 0 (`raw`) or 1 (`deflate`), and `deflate` is allowed for type 1 alone.
-//! `Have` names types 1 to 4 alone.
+//! The object type in `ObjectHeader` is one of these values:
+//!
+//! - 1, a file
+//! - 2, a dirtree
+//! - 3, a dirmeta
+//! - 4, a commit
+//! - 6, the detached metadata of a commit
+//!
+//! For type 6, the checksum is the checksum of the commit that the metadata
+//! belongs to. `Have` names only types 1 to 4.
+//!
+//! The encoding is 0 (`raw`) or 1 (`deflate`). Only type 1 can have the
+//! encoding `deflate`.
 //!
 //! # One-way stream
 //!
 //! A one-way stream carries the push messages in one direction, and the
-//! receiver sends no message. The stream is one `Hello` with the key
-//! `one-way` true, zero or more object streams, each closed by `ObjectsEnd`,
-//! one `Commit`, and the end of file. The frame limit and the chunk limit are
-//! [`MIN_FRAME_LIMIT`], because no `HelloReply` announces another one. `Have`
-//! is the error `protocol`, and so is an `Abort` frame between two objects. A
-//! sender that cannot complete an object writes the abandon marker and
+//! receiver sends no message. The stream holds these parts, in this order:
+//!
+//! 1. one `Hello` whose key `one-way` is `true`
+//! 2. zero or more object streams, each closed by `ObjectsEnd`
+//! 3. one `Commit`
+//! 4. the end of file
+//!
+//! No `HelloReply` announces a limit, so the frame limit and the chunk limit
+//! are [`MIN_FRAME_LIMIT`]. A `Have` is [`Error::Protocol`]. An `Abort` message
+//! between two objects is also [`Error::Protocol`].
+//!
+//! If a sender cannot complete an object, it writes the abandon marker and
 //! `Abort`, as in a two-way session. A two-way receiver refuses a `Hello`
-//! with `one-way` true as `protocol`.
+//! whose `one-way` is `true` with [`Error::Protocol`].
 //!
 //! # Pull
 //!
 //! The pull asks for files by their path, relative to the repository root.
-//! The client sends `PullHello` with the highest pull version it speaks,
-//! [`PULL_PROTOCOL_VERSION`]. The server replies `PullHelloReply` with the
-//! lower of that version and its own highest version, or `Error` with
-//! `version-unsupported` when it does not speak that version. The pull
-//! version is separate from the version of `Hello`. Version 1 sends an empty
-//! dict in `PullHelloReply`, and a decoder ignores a key of `PullHello` or of
-//! `PullHelloReply` that it does not know.
+//! The client sends `PullHello` with the highest pull version that it speaks,
+//! [`PULL_PROTOCOL_VERSION`]. The server sends one of these replies:
 //!
-//! The client then sends `Get` frames, and the server answers each with one
-//! `GetReply`, in the order of the `Get` frames. `GetReply` holds found and,
-//! when the server knows it, the length of the body. A reply with found
-//! false and a length is the error `protocol`, on encode and on decode. The
-//! frame limit of the pull is [`MIN_FRAME_LIMIT`] in both directions, and no
-//! message announces another one.
+//! - `PullHelloReply` with the lower of the version of the client and the
+//!   highest version of the server
+//! - an `Error` message with the code `version-unsupported` for a version
+//!   that the server does not speak. An ostrya server speaks each version
+//!   from 1 to its highest, so it refuses only version 0.
 //!
-//! A body follows a `GetReply` with found true. It is a sequence of chunks,
-//! as in the object stream: a chunk of length 0 ends it, and a chunk is at
-//! most the limit. The length [`ABANDON`] ends a body that fails partway, and
-//! the next frame must be `Error`. Any other frame after the marker is the
-//! error `protocol`. So the marker takes `Abort` after it in an object of the
-//! push, and `Error` in a body of the pull.
+//! In version 1, `PullHelloReply` holds an empty dict. A decoder ignores a
+//! key of `PullHello` or of `PullHelloReply` that it does not know.
+//!
+//! The client then sends `Get` frames. The server answers each `Get` with one
+//! `GetReply`, in the order of the `Get` frames. A [`GetReply`] holds `found`
+//! and, if the server knows it, the length of the body. The frame limit of
+//! the pull is [`MIN_FRAME_LIMIT`] in both directions, and no message
+//! announces another limit.
+//!
+//! A body follows a `GetReply` whose `found` is `true`. The body is a
+//! sequence of chunks, as in the object stream. A chunk of length 0 ends the
+//! body, and a chunk is at most the frame limit.
+//!
+//! The length [`ABANDON`] ends a body that fails partway. The next frame must
+//! be an `Error` message, and any other frame is [`Error::Protocol`]. After
+//! the marker, an object of the push takes `Abort`, and a body of the pull
+//! takes an `Error` message.
 //!
 //! # Codec
 //!
 //! [`FrameReader`] and [`FrameWriter`] implement the frames, the object
-//! stream, and the pull bodies over the `futures-io` traits. Both enter the
-//! body state after an `ObjectHeader` and after a `GetReply` with found true,
-//! and one set of methods reads and writes the bytes of both body kinds.
+//! stream, and the pull bodies over the `futures-io` traits, so the codec
+//! needs no async runtime. Both enter the body state after an `ObjectHeader`
+//! and after a `GetReply` whose `found` is `true`. One set of methods reads
+//! and writes the bytes of both body kinds.
+//!
 //! The bytes pass through a buffer of the caller in bounded pieces, so no
 //! call holds a whole object. [`ObjectBody`] presents the bytes of one body
 //! as an `AsyncRead`.
+//!
+//! [`ErrorCode`]: crate::ErrorCode
 
 mod frame;
 mod message;
@@ -144,97 +186,120 @@ use ostrya_gvariant::Value;
 
 use crate::error::{Error, Result};
 
-/// The protocol version this crate speaks.
+/// The push protocol version that this crate speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// The highest pull protocol version this crate speaks: the version of
-/// `PullHello` and `PullHelloReply`. It is separate from
-/// [`PROTOCOL_VERSION`], and each changes on its own.
+/// The highest pull protocol version that this crate speaks.
+///
+/// It is the version of `PullHello` and `PullHelloReply`. It is separate from
+/// [`PROTOCOL_VERSION`], and each version changes on its own.
 pub const PULL_PROTOCOL_VERSION: u32 = 1;
 
-/// The frame limit before the server announces one, the lowest limit a
-/// server may announce, and the limit of a stream that carries no
-/// announcement.
+/// The lowest frame limit: 1 MiB.
+///
+/// This value is:
+///
+/// - the frame limit before the server announces one
+/// - the lowest limit that a server can announce
+/// - the limit of a stream that carries no announcement
 pub const MIN_FRAME_LIMIT: u32 = 1 << 20;
 
-/// The `max-frame` value the port server announces: 1 MiB.
+/// The `max-frame` value that an ostrya server announces: 1 MiB.
 ///
-/// Object bytes travel as chunks, so a frame carries metadata messages
-/// alone. The largest bounded one is a `Have` of [`MAX_HAVE`] entries, with
-/// a frame length of 606,209 bytes. `Hello`, `HelloReply`, `Commit`, and
-/// `Error` hold lists with no count limit, so the frame limit alone bounds
-/// them. A chunk can be as long as the limit, so the framing costs 4 bytes
-/// for each MiB of object data.
+/// Object bytes travel as chunks, so a frame carries only metadata messages.
+/// The largest bounded message is a `Have` of [`MAX_HAVE`] entries, with a
+/// frame length of 606,209 bytes. `Hello`, `HelloReply`, `Commit`, and the
+/// `Error` message hold lists with no count limit. Only the frame limit
+/// bounds them.
 ///
-/// The reader allocates a frame body in full, and the decoder then keeps the
-/// body and the decoded message together. Measured on 1 MiB frames, the peak
-/// is 2 times the frame for a `Have`, 12 times for a `HelloReply` of refs
-/// with empty names, and 13 times for a `Commit` of ref updates with empty
-/// names. The decoder checks a dict value under a key it does not know
-/// through a value tree that it then drops. A `Hello` whose one unknown key
-/// holds an `ab` of 1 MiB peaks at 49 times the frame. The peak grows in
-/// proportion to the limit.
+/// A chunk can be as long as the limit, so the framing costs 4 bytes for
+/// each MiB of object data.
+///
+/// # Memory
+///
+/// The reader allocates a frame body in full. The decoder then keeps the body
+/// and the decoded message together. On 1 MiB frames, the measured peak is:
+///
+/// - 2 times the frame for a `Have`
+/// - 12 times the frame for a `HelloReply` of refs with empty names
+/// - 13 times the frame for a `Commit` of ref updates with empty names
+/// - 49 times the frame for a `Hello` whose one unknown key holds an `ab` of
+///   1 MiB
+///
+/// The decoder checks a dict value under an unknown key through a value tree,
+/// and then drops the tree. The peak grows in proportion to the limit.
 pub const MAX_FRAME: u32 = 1 << 20;
 
-/// The `max-have` value the port server announces: 16,384 entries.
+/// The `max-have` value that an ostrya server announces: 16,384 entries.
 ///
-/// A `Have` entry is 33 bytes plus a 4-byte offset, so a `Have` of 16,384
-/// entries has a frame length of 606,209 bytes, which fits in
-/// [`MAX_FRAME`]. 32,768 entries do not fit. A full `HaveReply` is then
-/// 2,048 bytes.
+/// A `Have` entry is 33 bytes plus a 4-byte offset. A `Have` of 16,384
+/// entries has a frame length of 606,209 bytes, which fits in [`MAX_FRAME`].
+/// A `Have` of 32,768 entries does not fit. A full `HaveReply` of 16,384
+/// entries is 2,048 bytes.
 pub const MAX_HAVE: u32 = 16_384;
 
-/// The chunk length that abandons an object.
+/// The chunk length that abandons an object or a pull body.
 pub const ABANDON: u32 = 0xFFFF_FFFF;
 
-/// The highest valid frame limit. It is one below [`ABANDON`], so a chunk
-/// length that the limit allows never equals the abandon marker.
+/// The highest valid frame limit.
+///
+/// It is one less than [`ABANDON`], so a chunk length that the limit allows
+/// never equals the abandon marker.
 pub const MAX_FRAME_LIMIT: u32 = 0xFFFF_FFFE;
 
-/// A message kind: the byte after the frame length.
+/// A message kind, the byte after the frame length.
 ///
-/// The enum is `#[non_exhaustive]`, because a later protocol version adds
-/// kinds.
+/// A later protocol version can add kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 #[non_exhaustive]
 pub enum Kind {
-    /// `Hello`, client to server.
+    /// The `Hello` message, from the client to the server.
     Hello = 1,
-    /// `HelloReply`, server to client.
+    /// The `HelloReply` message, from the server to the client.
     HelloReply = 2,
-    /// `Have`, client to server.
+    /// The `Have` message, from the client to the server.
     Have = 3,
-    /// `HaveReply`, server to client.
+    /// The `HaveReply` message, from the server to the client.
     HaveReply = 4,
-    /// `ObjectHeader`, client to server. Object chunks follow it.
+    /// The `ObjectHeader` message, from the client to the server.
+    ///
+    /// The chunks of the object follow it.
     ObjectHeader = 5,
-    /// `ObjectsEnd`, client to server. It closes the object stream.
+    /// The `ObjectsEnd` message, from the client to the server.
+    ///
+    /// It closes the object stream.
     ObjectsEnd = 6,
-    /// `ObjectsReply`, server to client.
+    /// The `ObjectsReply` message, from the server to the client.
     ObjectsReply = 7,
-    /// `Commit`, client to server.
+    /// The `Commit` message, from the client to the server.
     Commit = 8,
-    /// `CommitReply`, server to client.
+    /// The `CommitReply` message, from the server to the client.
     CommitReply = 9,
-    /// `Error`, server to client, in the push and in the pull.
+    /// The `Error` message, from the server to the client.
+    ///
+    /// The push and the pull both use it.
     Error = 10,
-    /// `Abort`, client to server.
+    /// The `Abort` message, from the client to the server.
     Abort = 11,
-    /// `PullHello`, pull client to server.
+    /// The `PullHello` message, from a pull client to the server.
     PullHello = 12,
-    /// `PullHelloReply`, server to pull client.
+    /// The `PullHelloReply` message, from the server to a pull client.
     PullHelloReply = 13,
-    /// `Get`, pull client to server.
+    /// The `Get` message, from a pull client to the server.
     Get = 14,
-    /// `GetReply`, server to pull client. A body follows a reply with found
-    /// true.
+    /// The `GetReply` message, from the server to a pull client.
+    ///
+    /// A body follows a reply whose `found` is `true`.
     GetReply = 15,
 }
 
 impl Kind {
-    /// The kind of a kind byte. A byte that is not a kind is the error
-    /// `protocol`.
+    /// Returns the kind of a kind byte.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Protocol`] if the byte is not a kind.
     pub fn from_u8(byte: u8) -> Result<Kind> {
         Ok(match byte {
             1 => Kind::Hello,
@@ -256,7 +321,7 @@ impl Kind {
         })
     }
 
-    /// The kind byte.
+    /// Returns the kind byte.
     pub fn as_u8(self) -> u8 {
         self as u8
     }
@@ -265,15 +330,17 @@ impl Kind {
 /// The encoding of an object in the object stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
-    /// The uncompressed object bytes: for a content object, the framed file
-    /// header and the payload.
+    /// The uncompressed object bytes.
+    ///
+    /// For a content object, the bytes are the framed file header and the
+    /// payload.
     Raw,
     /// A content object in the compressed form of an archive repository.
     Deflate,
 }
 
 impl Encoding {
-    /// The wire byte: 0 for `raw`, 1 for `deflate`.
+    /// Returns the wire byte: 0 for `raw`, 1 for `deflate`.
     pub fn as_u8(self) -> u8 {
         match self {
             Encoding::Raw => 0,
@@ -281,7 +348,11 @@ impl Encoding {
         }
     }
 
-    /// The encoding of a wire byte. Another byte is the error `protocol`.
+    /// Returns the encoding of a wire byte.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Protocol`] if the byte is not 0 or 1.
     pub fn from_u8(byte: u8) -> Result<Encoding> {
         match byte {
             0 => Ok(Encoding::Raw),
@@ -290,7 +361,7 @@ impl Encoding {
         }
     }
 
-    /// The name in the `encodings` list of `HelloReply`.
+    /// Returns the name in the `encodings` list of `HelloReply`.
     pub fn as_str(self) -> &'static str {
         match self {
             Encoding::Raw => "raw",
@@ -298,7 +369,8 @@ impl Encoding {
         }
     }
 
-    /// The encoding of a name, or `None` for a name that is not an encoding.
+    /// Returns the encoding of a name, or `None` if the name is not an
+    /// encoding.
     pub fn from_name(name: &str) -> Option<Encoding> {
         match name {
             "raw" => Some(Encoding::Raw),
@@ -313,18 +385,18 @@ impl Encoding {
 pub struct RefState {
     /// The ref name: `NAME` or `REMOTE:NAME`.
     pub name: String,
-    /// The commit of the ref, or `None` when the ref is absent.
+    /// The commit of the ref, or `None` if the ref is absent.
     pub commit: Option<Checksum>,
 }
 
-/// The state a ref update expects the ref to be in.
+/// The state that a ref update expects the ref to be in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expected {
-    /// The ref is absent. Wire state 0.
+    /// The ref is absent (wire state 0).
     Absent,
-    /// The ref points at this commit. Wire state 1.
+    /// The ref points at this commit (wire state 1).
     Commit(Checksum),
-    /// The ref is in any state. Wire state 2.
+    /// The ref is in any state (wire state 2).
     Any,
 }
 
@@ -333,20 +405,20 @@ pub enum Expected {
 pub struct RefUpdate {
     /// The ref name: `NAME` or `REMOTE:NAME`.
     pub name: String,
-    /// The state the ref must be in before the write.
+    /// The state that the ref must be in before the write.
     pub expected: Expected,
     /// The new commit, or `None` to delete the ref.
     pub new: Option<Checksum>,
 }
 
-/// The result of one ref update in `CommitReply`.
+/// The result of one ref update in a `CommitReply` message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefOutcome {
     /// The ref name.
     pub name: String,
-    /// The commit before the write, or `None` when the ref was absent.
+    /// The commit before the write, or `None` if the ref was absent.
     pub old: Option<Checksum>,
-    /// The commit after the write, or `None` when the ref is now absent.
+    /// The commit after the write, or `None` if the ref is now absent.
     pub new: Option<Checksum>,
 }
 
@@ -354,7 +426,7 @@ pub(crate) fn protocol(msg: impl Into<String>) -> Error {
     Error::Protocol(msg.into())
 }
 
-/// A checksum from an `ay` of 32 bytes.
+/// Returns a checksum from an `ay` of 32 bytes.
 fn checksum(bytes: &[u8]) -> Result<Checksum> {
     Checksum::from_ay(bytes).map_err(|_| protocol("checksum is not 32 bytes"))
 }
@@ -367,7 +439,8 @@ fn maybe_value(c: Option<Checksum>) -> Value {
     Value::Maybe(c.map(|c| Box::new(checksum_value(&c))))
 }
 
-/// An object name from a `(y, ay)` pair whose type `allowed` accepts.
+/// Returns an object name from a `(y, ay)` pair whose type `allowed`
+/// accepts.
 fn object_name((byte, sum): (u8, &[u8]), allowed: fn(ObjectType) -> bool) -> Result<ObjectName> {
     let ty = ObjectType::from_u32(u32::from(byte))
         .ok()
@@ -388,14 +461,17 @@ fn object_name_value(name: &ObjectName) -> Value {
 /// shorter body has offsets of 1 or 2 bytes.
 const HAVE_ENTRY_LEN: u32 = 37;
 
-/// The most entries of a `Have` whose frame fits in `limit`. The frame
-/// length counts the kind byte and the body. Fewer entries make a shorter
-/// frame.
+/// Returns the most entries of a `Have` whose frame fits in `limit`.
+///
+/// The frame length counts the kind byte and the body. Fewer entries make a
+/// shorter frame.
 pub(crate) fn have_entries_within(limit: u32) -> u32 {
     (limit - 1) / HAVE_ENTRY_LEN
 }
 
-/// The types a `Have` entry or a `missing` entry may name: 1 to 4.
+/// Returns `true` if a `Have` entry or a `missing` entry can name the type.
+///
+/// These are the types 1 to 4.
 pub(crate) fn have_type(ty: ObjectType) -> bool {
     matches!(
         ty,
@@ -403,7 +479,9 @@ pub(crate) fn have_type(ty: ObjectType) -> bool {
     )
 }
 
-/// The types an `ObjectHeader` may name: 1 to 4 and 6.
+/// Returns `true` if an `ObjectHeader` can name the type.
+///
+/// These are the types 1 to 4 and 6.
 fn header_type(ty: ObjectType) -> bool {
     have_type(ty) || ty == ObjectType::CommitMeta
 }

@@ -1,5 +1,12 @@
-//! The commit of a tree push: the parent, the metadata dict, the states of the
-//! target refs, the signatures, and the ref updates.
+//! The commit of a tree push.
+//!
+//! The functions of this module make these parts of the commit:
+//!
+//! - the parent
+//! - the metadata dict
+//! - the check of the states of the target refs
+//! - the signatures
+//! - the ref updates
 
 use std::sync::LazyLock;
 
@@ -20,11 +27,18 @@ static DICT_TYPE: LazyLock<Type> =
 /// The type of the signature array of an engine in a detached dict.
 const SIGNATURE_ARRAY: &str = "aay";
 
-/// The entries of an `a{sv}` dict, in order, as `(key, value)` tuples, and
-/// the size of the serialized dict. An empty key, entries that do not
-/// serialize as an `a{sv}` dict, and a dict over [`MAX_METADATA_SIZE`] are
-/// [`Error::InvalidInput`]. The object that holds the dict is never smaller
-/// than the dict. `what` names the dict in the message.
+/// Returns the entries of an `a{sv}` dict and the size of the serialized dict.
+///
+/// The entries keep their order, as `(key, value)` tuples. These are
+/// [`Error::InvalidInput`]:
+///
+/// - an empty key
+/// - entries that do not serialize as an `a{sv}` dict
+/// - a dict of more than [`MAX_METADATA_SIZE`] bytes
+///
+/// The object that holds the dict is never smaller than the dict, so an object
+/// that holds a refused dict is also over the limit. `what` names the dict in
+/// the message.
 pub(crate) fn entry_dict(entries: Vec<(String, Value)>, what: &str) -> Result<(Vec<Value>, u64)> {
     if entries.iter().any(|(key, _)| key.is_empty()) {
         return Err(invalid(format!("the {what} holds an empty key")));
@@ -49,7 +63,7 @@ pub(crate) fn entry_dict(entries: Vec<(String, Value)>, what: &str) -> Result<(V
     }
 }
 
-/// The key and the value of an entry that [`entry_dict`] gave.
+/// Returns the key and the value of an entry from [`entry_dict`].
 fn split_entry(entry: Value) -> (String, Value) {
     match entry {
         Value::Tuple(fields) => match <[Value; 2]>::try_from(fields) {
@@ -60,8 +74,10 @@ fn split_entry(entry: Value) -> (String, Value) {
     }
 }
 
-/// The parent of the commit under `policy`. `CurrentTip` is the server tip of
-/// the first target ref, or `None` when that ref is absent.
+/// Returns the parent of the commit under `policy`.
+///
+/// For `CurrentTip`, the parent is the server tip of the first target ref. If
+/// that ref is absent, the parent is `None`.
 pub(crate) fn resolve_parent(
     policy: ParentPolicy,
     server: &ServerInfo,
@@ -74,9 +90,10 @@ pub(crate) fn resolve_parent(
     }
 }
 
-/// Refuse target refs in mixed states: each target ref must have the state of
-/// the first one, all absent or all at one tip. The message names each ref and
-/// its tip.
+/// Refuses target refs in mixed states with [`Error::InvalidInput`].
+///
+/// Each target ref must have the state of the first one: all absent, or all at
+/// one tip. The message names each ref and its tip.
 pub(crate) fn check_ref_states(server: &ServerInfo, refs: &[String]) -> Result<()> {
     debug_assert!(names_match(server, refs));
     let Some((first, rest)) = server.refs.split_first() else {
@@ -100,8 +117,11 @@ pub(crate) fn check_ref_states(server: &ServerInfo, refs: &[String]) -> Result<(
     )))
 }
 
-/// Whether the session reported the state of each ref of `refs`, in the
-/// order of `refs`. The session open refuses a `HelloReply` that does not.
+/// Returns `true` if the session reported the state of each ref of `refs`, in
+/// order.
+///
+/// The session open refuses a `HelloReply` whose refs differ from these names
+/// or from their order.
 fn names_match(server: &ServerInfo, refs: &[String]) -> bool {
     server.refs.len() == refs.len() && server.refs.iter().zip(refs).all(|(s, n)| s.name == *n)
 }
@@ -116,7 +136,7 @@ pub(crate) struct CommitInputs<'a> {
     pub(crate) metadata: Vec<Value>,
     /// The target refs, which the ref binding names.
     pub(crate) refs: &'a [String],
-    /// Leave out the ref binding and the collection binding.
+    /// If `true`, the metadata holds no ref binding and no collection binding.
     pub(crate) no_bindings: bool,
     /// The collection id of the server.
     pub(crate) collection_id: Option<&'a str>,
@@ -124,13 +144,17 @@ pub(crate) struct CommitInputs<'a> {
     pub(crate) root_dirmeta: Checksum,
 }
 
-/// The checksum and the serialized bytes of the commit object over `inputs`.
+/// Returns the checksum and the serialized bytes of the commit object.
 ///
-/// The metadata dict holds the entries of the caller, in order, then
-/// `ostree.ref-binding` with the target refs sorted, then
-/// `ostree.collection-binding` when the server has a collection id. With
-/// `no_bindings` it holds the entries of the caller alone. A commit over
-/// [`MAX_METADATA_SIZE`] is [`Error::InvalidInput`].
+/// The metadata dict holds these entries, in this order:
+///
+/// 1. the entries of the caller, in their order
+/// 2. `ostree.ref-binding`, with the target refs sorted
+/// 3. `ostree.collection-binding`, if the server has a collection id
+///
+/// If `no_bindings` is `true`, the dict holds the entries of the caller alone.
+/// If the commit does not serialize, or is more than [`MAX_METADATA_SIZE`]
+/// bytes, the error is [`Error::InvalidInput`].
 pub(crate) fn build_commit(inputs: CommitInputs<'_>) -> Result<(Checksum, Vec<u8>)> {
     let names: Vec<&str> = inputs.refs.iter().map(String::as_str).collect();
     let bindings = (!inputs.no_bindings).then_some(names.as_slice());
@@ -160,21 +184,35 @@ pub(crate) fn build_commit(inputs: CommitInputs<'_>) -> Result<(Checksum, Vec<u8
     Ok((Checksum::sha256(&bytes), bytes))
 }
 
-/// The framing offsets of a commit object: one for each member of variable
-/// size other than the last. These are the metadata dict, the parent, the
-/// related objects, the subject, the body, and the root dirtree.
+/// The number of framing offsets in a commit object.
+///
+/// A commit object has one offset for each member of variable size other than
+/// the last. These members are:
+///
+/// - the metadata dict
+/// - the parent
+/// - the related objects
+/// - the subject
+/// - the body
+/// - the root dirtree
 const COMMIT_FRAMING_OFFSETS: usize = 6;
 
-/// A lower bound of the size of the commit object that [`build_commit`]
-/// serializes, from the inputs that do not depend on `HelloReply`.
+/// Returns a lower bound of the size of the commit object of [`build_commit`].
 ///
+/// The bound uses only the inputs that do not depend on `HelloReply`.
 /// `metadata_len` is the size of the serialized dict of the caller. The bound
-/// counts that dict, the parent of [`ParentPolicy::Commit`], the subject and
-/// the body with their NUL terminators, the padding before the timestamp, the
-/// timestamp, the two root checksums, and the framing offsets. The bindings
-/// and a parent from the server only add bytes. With no bindings and a parent
-/// that does not come from the server, the bound is the size of the commit
-/// object.
+/// counts these parts:
+///
+/// - the dict of the caller
+/// - the parent of [`ParentPolicy::Commit`]
+/// - the subject and the body, with their NUL terminators
+/// - the padding before the timestamp, and the timestamp
+/// - the two root checksums
+/// - the framing offsets
+///
+/// The bindings and a parent from the server only add bytes. If the commit has
+/// no bindings and its parent does not come from the server, the bound is
+/// equal to the size of the commit object.
 pub(crate) fn commit_size_floor(
     metadata_len: u64,
     subject: &str,
@@ -192,8 +230,10 @@ pub(crate) fn commit_size_floor(
     data + (COMMIT_FRAMING_OFFSETS * offset) as u64
 }
 
-/// Refuse a commit object whose lower bound, [`commit_size_floor`], is over
-/// `limit` bytes, with [`Error::InvalidInput`].
+/// Refuses a commit object whose lower bound is more than `limit` bytes.
+///
+/// `floor` is the bound from [`commit_size_floor`]. The error is
+/// [`Error::InvalidInput`].
 pub(crate) fn check_commit_floor(floor: u64, limit: u64) -> Result<()> {
     if floor > limit {
         return Err(invalid(format!(
@@ -203,16 +243,25 @@ pub(crate) fn check_commit_floor(floor: u64, limit: u64) -> Result<()> {
     Ok(())
 }
 
-/// The detached metadata dict of the commit `bytes`: the entries of the
-/// caller, in order, then the signature of each signer of `signers`, in
-/// order, under its `metadata_key`. `None` when the dict is empty.
+/// Returns the detached metadata dict of the commit `bytes`.
 ///
-/// A signature goes into the `aay` array of its key, after the blobs that
-/// the array already holds, the array of an entry of the caller included.
-/// A value of the caller under the key of a signer that is not an `aay` is
-/// [`Error::Sign`] with `InvalidFormat`, and so is a failed signer. The key
-/// of each signer is checked before the first signer signs. A dict
-/// over [`MAX_METADATA_SIZE`] is [`Error::InvalidInput`].
+/// The dict holds the entries of the caller, in their order. Then it holds the
+/// signature of each signer of `signers`, in order, under the `metadata_key`
+/// of the signer. If the dict is empty, the result is `None`.
+///
+/// A signature goes at the end of the `aay` array of its key, after the blobs
+/// that the array already holds. This is also true for the array of an entry
+/// of the caller. The function checks the key of each signer before the first
+/// signer signs.
+///
+/// # Errors
+///
+/// - [`Error::Sign`] with `InvalidFormat` if a value of the caller under the
+///   key of a signer is not an `aay`.
+/// - [`Error::Sign`] with the error of the signer if a signer fails, and with
+///   the error of `append_signature` if the append of a signature fails.
+/// - [`Error::InvalidInput`] if the dict does not serialize, or is more than
+///   [`MAX_METADATA_SIZE`] bytes.
 pub(crate) async fn detached_dict(
     entries: Vec<Value>,
     signers: &[Box<dyn Signer>],
@@ -249,8 +298,10 @@ pub(crate) async fn detached_dict(
     Ok(Some(dict))
 }
 
-/// The ref updates that set each target ref to `commit`. Each expects the
-/// state the server reported, or any state with `force`.
+/// Returns the ref updates that set each target ref to `commit`.
+///
+/// Each update expects the state that the server reported. If `force` is
+/// `true`, each update expects any state.
 pub(crate) fn ref_updates(
     server: &ServerInfo,
     refs: &[String],
@@ -330,7 +381,7 @@ mod tests {
         }
     }
 
-    /// The keys of a dict, in order.
+    /// Returns the keys of a dict, in order.
     fn keys(dict: &Value) -> Vec<String> {
         dict.as_array()
             .unwrap()
@@ -423,7 +474,7 @@ mod tests {
         assert!(commit.related.is_empty());
     }
 
-    /// The dict of [`caller_entries`] and its size.
+    /// Returns the dict of [`caller_entries`] and its size.
     fn measured_caller_entries() -> (Vec<Value>, u64) {
         let (entries, len) = entry_dict(
             vec![
@@ -440,8 +491,8 @@ mod tests {
     #[test]
     fn the_commit_size_floor_is_the_commit_size_without_the_server_inputs() {
         let refs = strings(&["main"]);
-        // The body lengths move the padding before the timestamp, and cross
-        // the sizes where the framing offsets grow from one byte to two.
+        // The body lengths move the padding before the timestamp. They also
+        // cross the sizes where the framing offsets grow from one byte to two.
         for body_len in (0..=300).chain(65_380..=65_480) {
             let body = "b".repeat(body_len);
             for parent in [None, Some(csum(9))] {
@@ -581,7 +632,7 @@ mod tests {
     const SECRET_B64: &str =
         "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
 
-    /// The blobs of the `aay` under `key`.
+    /// Returns the blobs of the `aay` under `key`.
     fn blobs(dict: &Value, key: &str) -> Vec<Vec<u8>> {
         let (_, inner) = dict.dict_get(key).unwrap().as_variant().unwrap();
         inner
@@ -657,7 +708,7 @@ mod tests {
         }
     }
 
-    /// A signer that records whether `sign` was called.
+    /// A signer that records a call of `sign`.
     struct Recording {
         called: Arc<AtomicBool>,
     }

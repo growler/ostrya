@@ -1,31 +1,21 @@
-//! The client session of a push.
+//! The client sessions of the push and of the pull, and the one-way stream.
 //!
 //! A [`PushSession`] opens with `Hello` and gives the facts of the server as
-//! [`ServerInfo`]. [`missing`](PushSession::missing) asks the server which
-//! objects it needs, [`send`](PushSession::send) sends them from an
-//! [`ObjectSource`] with the detached metadata of their commits, and
-//! [`commit`](PushSession::commit) asks the server to update its refs in one
-//! transaction.
+//! [`ServerInfo`]. Its calls are:
 //!
-//! The session does not verify the objects it sends. It computes no checksum
-//! and checks no size, and the server verifies each object as it arrives. A
-//! source that fails while the session sends an object makes the session
-//! abandon the object with the abandon marker and end the session with
-//! `Abort`.
+//! - [`missing`](PushSession::missing) asks the server which objects it needs.
+//! - [`send`](PushSession::send) sends them from an [`ObjectSource`], with the
+//!   detached metadata of their commits.
+//! - [`commit`](PushSession::commit) asks the server to update its refs in
+//!   one transaction.
 //!
-//! On a stream transport the session runs one call at a time. A call to
-//! [`missing`](PushSession::missing) or [`send`](PushSession::send) while
-//! another one runs fails at once with [`Error::InvalidInput`]. A call that
-//! fails, or whose future is dropped before it completes, leaves the session
-//! broken, and each later call fails with [`Error::InvalidInput`].
+//! [`PushProgress`] counts the progress of a session, and [`PushOutcome`]
+//! gives the result of a session that committed.
 //!
-//! Over HTTP, several [`send`](PushSession::send) calls can run at the same
-//! time, and a [`missing`](PushSession::missing) call can run beside them.
-//! A second `missing` call while one runs fails at once with
-//! [`Error::InvalidInput`]. A call that fails, or whose future is dropped
-//! before it completes, leaves the session broken, as on a stream.
+//! A [`PullSession`] reads files of a server repository by their path, and
+//! gives the body of each file as a [`PullBody`].
 //!
-//! [`export_stream`] writes one one-way stream: the messages of a session in
+//! [`export_stream`] writes a one-way stream: the messages of a push session in
 //! one direction, for a receiver that sends no reply.
 
 pub(crate) mod http;
@@ -61,38 +51,41 @@ use crate::proto::{
 };
 use crate::transport::Transport;
 
-/// A boxed future that is `Send`, the return type of the [`ObjectSource`]
-/// methods.
+/// A boxed `Send` future, the return type of the [`ObjectSource`] methods.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// The encoding a session sends content objects in.
+/// The encoding of the content objects that a session sends.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Compression {
     /// The `raw` encoding: the framed file header and the payload.
     #[default]
     None,
-    /// The `deflate` encoding at `level`, 1 through 9, when the server lists
-    /// it. A server that lists `raw` alone gets `raw`.
+    /// The `deflate` encoding at `level`, 1 through 9.
+    ///
+    /// The session uses it if the server lists `deflate`. If the server lists
+    /// `raw` alone, the session sends `raw`.
     Deflate {
-        /// The compression level.
+        /// The compression level, 1 through 9.
         level: u8,
     },
 }
 
-/// A stream of object bytes that a source gives the session.
+/// A stream of object bytes that a source gives to the session.
 pub trait ObjectReader: AsyncRead + Send + Sync + Unpin {}
 
 impl<T: AsyncRead + Send + Sync + Unpin + ?Sized> ObjectReader for T {}
 
 /// The data of one object, as an [`ObjectSource`] gives it.
 pub enum ObjectData {
-    /// A content object that the session encodes. `header` is its file
-    /// header and `size` the length of its payload. A regular file has a
-    /// `payload`, and a symlink has none and a `size` of 0.
+    /// A content object that the session encodes.
     ///
-    /// The session sends the framed header and the payload for `raw`, and the
-    /// framed archive header and the payload through its own raw-DEFLATE
-    /// compressor for `deflate`.
+    /// `header` is the file header of the object, and `size` is the length of
+    /// its payload. A regular file has a `payload`. A symlink has no `payload`
+    /// and a `size` of 0.
+    ///
+    /// For `raw`, the session sends the framed header and the payload. For
+    /// `deflate`, it sends the framed archive header, and then the payload
+    /// through its own raw-DEFLATE compressor.
     Content {
         /// The file header.
         header: FileHeader,
@@ -102,8 +95,11 @@ pub enum ObjectData {
         payload: Option<Box<dyn ObjectReader>>,
     },
     /// The object bytes in `encoding`, which the session copies as they are.
-    /// A metadata object is `raw` alone. A content object in `raw` is sent as
-    /// `raw` also when the session deflates.
+    ///
+    /// A metadata object is `raw` alone. The session sends a content object in
+    /// `raw` as `raw`, also if it deflates. Bytes in `deflate` for a metadata
+    /// object, or for a server that does not list `deflate`, are
+    /// [`Error::InvalidInput`].
     Encoded {
         /// The encoding of the bytes.
         encoding: Encoding,
@@ -133,46 +129,86 @@ impl fmt::Debug for ObjectData {
     }
 }
 
-/// The objects a session can send.
+/// A source of the objects that a session sends.
 pub trait ObjectSource: Send + Sync {
-    /// Every object reachable from `commit`, the commit object included.
+    /// Returns the name of each object that `commit` reaches, and of the commit.
+    ///
+    /// No session method calls `objects`. A caller gives the list to
+    /// [`missing`](PushSession::missing) to find the objects to
+    /// [`send`](PushSession::send).
+    ///
+    /// # Errors
+    ///
+    /// The error depends on the implementation:
+    ///
+    /// - [`TreeModel`](crate::tree::TreeModel) returns [`Error::InvalidInput`]
+    ///   if the model holds no commit, or if `commit` is not the commit of the
+    ///   model.
+    /// - The repository source of the `ostrya` crate returns
+    ///   [`Error::Source`] if the walk of `commit` in the repository fails.
     fn objects<'a>(&'a self, commit: &'a Checksum) -> BoxFuture<'a, Result<Vec<ObjectName>>>;
 
-    /// The data of the object `name`. `encoding` is the encoding the session
-    /// sends the object in: `deflate` for a content object when the session
-    /// deflates, `raw` otherwise. A source that holds the object in that
-    /// encoding can give its bytes as [`ObjectData::Encoded`].
+    /// Returns the data of the object `name`.
+    ///
+    /// `encoding` is the encoding in which the session sends the object:
+    /// `deflate` for a content object if the session deflates, and `raw` for
+    /// all other objects. A source that holds the object in that encoding can
+    /// give its bytes as [`ObjectData::Encoded`].
+    ///
+    /// # Errors
+    ///
+    /// An error of the source stops the object stream.
+    /// [`send`](PushSession::send) and [`export_stream`] return it as
+    /// [`Error::Source`].
     fn open<'a>(
         &'a self,
         name: &'a ObjectName,
         encoding: Encoding,
     ) -> BoxFuture<'a, Result<ObjectData>>;
 
-    /// The detached metadata the session sends for `commit`, an `a{sv}`
-    /// dict, after the source applied its own filter.
+    /// Returns the detached metadata for `commit`, an `a{sv}` dict.
+    ///
+    /// The source applies its own filter first. For `None`, the session sends
+    /// no detached metadata for `commit`. If the dict is not a valid `a{sv}`
+    /// value, or if its bytes are more than 128 MiB, the object stream stops
+    /// with [`Error::InvalidInput`].
+    ///
+    /// # Errors
+    ///
+    /// An error of the source stops the object stream.
+    /// [`send`](PushSession::send) and [`export_stream`] return it as
+    /// [`Error::Source`].
     fn detached_metadata<'a>(
         &'a self,
         commit: &'a Checksum,
     ) -> BoxFuture<'a, Result<Option<Value>>>;
 
-    /// The content bytes of the file objects of `names` when the session
-    /// sends them in `encoding`, or `None` when the source does not know
-    /// them. The other names count no byte.
+    /// Returns the content bytes of the file objects of `names` in `encoding`.
     ///
-    /// The content bytes of one file object are the bytes the session reads
-    /// from the reader that [`open`](ObjectSource::open) gives for it with
-    /// the same `encoding`: the payload of [`ObjectData::Content`], 0 for a
-    /// symlink, and the bytes of [`ObjectData::Encoded`]. Each
-    /// [`send`](PushSession::send) call and each [`export_stream`] call asks
-    /// at most once, before the first object, and adds the answer to
-    /// [`bytes_total`](PushProgressSnapshot::bytes_total). A call asks only
-    /// when the session has a [`PushProgress`] and `names` holds at least
-    /// one file object. An error makes the total unknown for the call, as
-    /// `None` does, and the session goes on to send the objects.
+    /// `None` means that the source does not know the number. The names that
+    /// are not file objects count no byte. The default implementation returns
+    /// `None`.
     ///
-    /// The answer must not read the content of an object: a source reads
-    /// what it already holds, or the metadata of each object. The default
-    /// is `None`.
+    /// The content bytes of one file object are the bytes that the session
+    /// reads from the reader that [`open`](ObjectSource::open) gives for it
+    /// with the same `encoding`:
+    ///
+    /// - the payload of [`ObjectData::Content`]
+    /// - 0 for a symlink
+    /// - the bytes of [`ObjectData::Encoded`]
+    ///
+    /// If the session has a [`PushProgress`] and `names` holds at least one
+    /// file object, each [`send`](PushSession::send) call and each
+    /// [`export_stream`] call asks once, before the first object. The call
+    /// adds the answer to [`bytes_total`](PushProgressSnapshot::bytes_total).
+    ///
+    /// The method must not read the content of an object. It reads what the
+    /// source already holds, or the metadata of each object.
+    ///
+    /// # Errors
+    ///
+    /// The session treats an error as `None`. The call adds nothing to the
+    /// total and sends the objects.
     fn content_size<'a>(
         &'a self,
         names: &'a [ObjectName],
@@ -192,21 +228,24 @@ pub struct ServerInfo {
     pub mode: String,
     /// The collection id of the repository.
     pub collection_id: Option<String>,
-    /// The frame and chunk limit the session writes with.
+    /// The frame and chunk limit that the session writes with.
+    ///
+    /// The [frame rules](crate::proto#frames) give the range of the value.
     pub max_frame: u32,
-    /// The most object names in one `Have`.
+    /// The highest number of object names in one `Have`.
     pub max_have: u32,
-    /// The content encodings the server accepts.
+    /// The content encodings that the server accepts.
     pub encodings: Vec<Encoding>,
-    /// The most object streams the server serves at the same time.
+    /// The most object streams that the server serves at the same time.
     pub parallel_uploads: u32,
-    /// The state of each ref the session named, in the order of the names.
+    /// The state of each ref that the session named, in the order of the names.
     pub refs: Vec<RefState>,
 }
 
 impl ServerInfo {
-    /// The current commit of the ref `name` on the server. `None` when the
-    /// ref is absent, or when the session did not name it.
+    /// Returns the current commit of the ref `name` on the server.
+    ///
+    /// Returns `None` if the ref is absent, or if the session did not name it.
     pub fn tip(&self, name: &str) -> Option<Checksum> {
         self.refs
             .iter()
@@ -218,18 +257,20 @@ impl ServerInfo {
 /// The options of a session.
 #[derive(Debug, Clone, Default)]
 pub struct SessionOptions {
-    /// The `agent` the session sends in `Hello`. The default is
-    /// `ostrya/<version>`.
+    /// The `agent` that the session sends in `Hello`.
+    ///
+    /// The default is `ostrya/<version>`.
     pub agent: Option<String>,
-    /// A handle the session also counts its progress into.
+    /// A handle that the session also counts its progress into.
     pub progress: Option<PushProgress>,
 }
 
 /// The result of a push that committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushOutcome {
-    /// The commit the client built, when it built one. A session that sends
-    /// objects of a source builds none.
+    /// The commit that the client built, if it built one.
+    ///
+    /// A session that sends the objects of a source builds no commit.
     pub commit: Option<Checksum>,
     /// One outcome for each ref update, in the order of the updates.
     pub refs: Vec<RefOutcome>,
@@ -237,15 +278,42 @@ pub struct PushOutcome {
     pub stats: PushStats,
 }
 
-/// One client session of a push, over a stream transport or over HTTP.
+/// A client session of a push, over a stream transport or over HTTP.
 ///
-/// The session is `Send + Sync`. See the module docs for the rules of
-/// concurrent calls.
+/// [`connect`](PushSession::connect) opens a session over ssh or HTTP, and
+/// [`prepare`](PushSession::prepare) checks the transport before the open.
+/// [`over_stream`](PushSession::over_stream) opens a session over a pair of
+/// byte streams.
 ///
-/// A session dropped without [`commit`](PushSession::commit) or
-/// [`abort`](PushSession::abort) sends nothing more. A stream transport then
-/// closes its output, so the server reads the end of the stream. Over HTTP
-/// the server ends the session when its idle timeout ends.
+/// If the caller drops a session without [`commit`](PushSession::commit) or
+/// [`abort`](PushSession::abort), the session sends nothing more. A stream
+/// transport then closes its output, so the server reads the end of the
+/// stream. Over HTTP, the server ends the session when its idle timeout ends.
+///
+/// # Verification
+///
+/// The session does not verify the objects that it sends. It computes no
+/// checksum and checks no size. The server verifies each object when it
+/// arrives. If a source fails while the session sends an object, the session
+/// abandons the object with the abandon marker and ends the session with
+/// `Abort`.
+///
+/// # Concurrent calls
+///
+/// The session is `Send + Sync`. On a stream transport, the session runs one
+/// call at a time. A call to [`missing`](PushSession::missing) or
+/// [`send`](PushSession::send) while another call runs fails at once with
+/// [`Error::InvalidInput`].
+///
+/// Over HTTP, several [`send`](PushSession::send) calls can run at the same
+/// time, and a [`missing`](PushSession::missing) call can run beside them. A
+/// second `missing` call while one runs fails at once with
+/// [`Error::InvalidInput`].
+///
+/// On both transports, a call that fails, or whose future the caller drops
+/// before it completes, leaves the session broken. Each later call then fails
+/// with [`Error::InvalidInput`]. If `missing` or `send` refuses an argument,
+/// the call sends nothing and the session stays usable.
 pub struct PushSession {
     inner: SessionInner,
 }
@@ -331,8 +399,8 @@ pub(crate) fn deflate_level(compression: Compression) -> Result<Option<u8>> {
     }
 }
 
-/// Ask `source` for the content bytes of the file objects of `names`, sent
-/// at `level`, and add them to the byte total of `counters`. A session with
+/// Asks `source` for the content bytes of the file objects of `names`, sent
+/// at `level`, and adds them to the byte total of `counters`. A session with
 /// no caller's handle, and names with no file object, ask nothing. An
 /// unknown size and a failure add nothing.
 async fn count_content_total(
@@ -353,7 +421,7 @@ async fn count_content_total(
     }
 }
 
-/// Refuse a name of a type that `Have` and the objects of a source cannot
+/// Refuses a name of a type that `Have` and the objects of a source cannot
 /// carry. The session sends detached metadata for a commit on its own.
 fn refuse_off_wire(names: &[ObjectName]) -> Result<()> {
     match names.iter().find(|n| !have_type(n.ty)) {
@@ -365,7 +433,7 @@ fn refuse_off_wire(names: &[ObjectName]) -> Result<()> {
     }
 }
 
-/// Take the stream of `slot` for one call.
+/// Takes the stream of `slot` for one call.
 fn take(slot: &Mutex<Slot>) -> Result<Taken<'_>> {
     let mut held = slot.lock().unwrap_or_else(PoisonError::into_inner);
     match std::mem::replace(&mut *held, Slot::Busy) {
@@ -414,18 +482,32 @@ fn server_info(reply: HelloReply, refs: &[String]) -> Result<ServerInfo> {
     })
 }
 
+/// The open of a session over a pair of byte streams, and its calls.
 impl PushSession {
-    /// Open a session over a pair of byte streams: `input` from the server
-    /// and `output` to it. The session sends `Hello` with `refs`, the refs it
-    /// intends to update, and reads `HelloReply`.
+    /// Opens a session over a pair of byte streams.
     ///
-    /// An `Error` from the server is returned as its error. A reply whose
-    /// version is not the version of the session, or whose refs are not the
-    /// refs of `Hello` in order, is [`Error::Protocol`].
+    /// `input` comes from the server, and `output` goes to the server. The
+    /// session sends `Hello` with `refs`, the refs that it intends to update,
+    /// and reads `HelloReply`.
     ///
     /// The caller owns the liveness of the two streams. The session puts no
-    /// time limit on a read: a peer that stays silent keeps a call waiting
+    /// time limit on a read. A peer that stays silent keeps a call waiting
     /// until the caller drops its future or closes the streams.
+    ///
+    /// A session over a stream uses the `futures-io` traits alone, so it needs
+    /// no async runtime.
+    ///
+    /// # Errors
+    ///
+    /// - An `Error` message from the server, as the [`Error`] variant of its
+    ///   code, for example [`Error::VersionUnsupported`].
+    /// - [`Error::Protocol`] if the version of `HelloReply` is not the version
+    ///   of the session, or if its refs are not the refs of `Hello` in order.
+    /// - [`Error::Protocol`] for a malformed frame, or for a reply that is not
+    ///   `HelloReply`.
+    /// - [`Error::LimitExceeded`] for a frame over the frame limit.
+    /// - [`Error::Io`] for a failure of a stream. An end of `input` before
+    ///   the reply has the kind `UnexpectedEof`.
     pub async fn over_stream<R, W>(
         input: R,
         output: W,
@@ -439,7 +521,7 @@ impl PushSession {
         PushSession::open(Box::new(input), Box::new(output), refs, opts, None).await
     }
 
-    /// Open a session over `input` and `output`. `pending_limit` bounds the
+    /// Opens a session over `input` and `output`. `pending_limit` bounds the
     /// wait for a pending message after a failed write.
     pub(crate) async fn open(
         input: stream::Input,
@@ -485,8 +567,8 @@ impl PushSession {
         })
     }
 
-    /// Open a session over HTTP at `endpoint`: send `Hello` with `refs` and
-    /// read `HelloReply`.
+    /// Opens a session over HTTP at `endpoint`: sends `Hello` with `refs` and
+    /// reads `HelloReply`.
     pub(crate) async fn open_http(
         endpoint: Endpoint,
         refs: &[String],
@@ -508,7 +590,7 @@ impl PushSession {
         })
     }
 
-    /// Attach the child process the streams of the session belong to.
+    /// Attaches the child process the streams of the session belong to.
     pub(crate) fn with_transport(mut self, child: Transport) -> PushSession {
         if let Link::Stream { transport, .. } = &mut self.inner.link {
             *transport = Some(child);
@@ -516,20 +598,40 @@ impl PushSession {
         self
     }
 
-    /// The facts of the server.
+    /// Returns the facts of the server.
     pub fn server(&self) -> &ServerInfo {
         &self.inner.server
     }
 
-    /// The objects of `names` that the server does not hold, in the order of
-    /// `names`. The session sends `Have` messages of at most `max-have`
-    /// names each, and of at most the names whose frame fits in
-    /// `max-frame`. A name whose type is not a file, a dirtree, a dirmeta,
-    /// or a commit is [`Error::InvalidInput`], nothing is sent, and the
-    /// session stays usable.
+    /// Returns the objects of `names` that the server does not hold.
     ///
-    /// Over HTTP each `Have` is one request, and the session sends the next
-    /// one after the response to the one before it.
+    /// The order of the result is the order of `names`. The session sends
+    /// `Have` messages of at most `max-have` names each. A `Have` also holds
+    /// no more names than its frame can hold within `max-frame`.
+    ///
+    /// Over HTTP, each `Have` is one request. The session sends the next
+    /// `Have` after the response to the one before it.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if the type of a name is not a file, a
+    ///   dirtree, a dirmeta, or a commit. The call sends nothing, and the
+    ///   session stays usable.
+    /// - [`Error::InvalidInput`] if another call runs, as the rules of
+    ///   [concurrent calls](PushSession#concurrent-calls) state, or if the
+    ///   session is broken.
+    /// - An `Error` message from the server, as the [`Error`] variant of its
+    ///   code.
+    /// - [`Error::Protocol`] for a malformed reply, for a reply that is not
+    ///   `HaveReply`, or for a `HaveReply` whose length does not match its
+    ///   `Have`.
+    /// - [`Error::LimitExceeded`] on a stream transport, for a frame over the
+    ///   frame limit.
+    /// - [`Error::Io`] for a failure of the stream, or for a failed read of a
+    ///   response body over HTTP.
+    /// - [`Error::Fetch`] over HTTP, for a failure of the HTTP client.
+    /// - [`Error::Transport`] over HTTP, for a status that the endpoint does
+    ///   not give, or for a body that is not one frame.
     pub async fn missing(&self, names: &[ObjectName]) -> Result<Vec<ObjectName>> {
         refuse_off_wire(names)?;
         let slot = match &self.inner.link {
@@ -573,35 +675,68 @@ impl PushSession {
         Ok(missing)
     }
 
-    /// Send `names` from `source` in one object stream, then the detached
-    /// metadata of each commit in `commits` that has some and whose detached
-    /// metadata the session has not sent yet.
+    /// Sends the objects `names` from `source`, then the detached metadata of
+    /// `commits`.
     ///
-    /// `commits` holds the commits of `names` and the new value of each ref
-    /// update, whether `names` holds that commit or not. A call with nothing
-    /// to send writes nothing. A level outside 1 through 9, and a name whose
-    /// type is not a file, a dirtree, a dirmeta, or a commit, are
-    /// [`Error::InvalidInput`]. Nothing is sent, and the session stays
-    /// usable.
+    /// On a stream transport, the objects go in one object stream. The call
+    /// sends the detached metadata of each commit in `commits` that has
+    /// detached metadata, if the session did not send it before. `commits`
+    /// holds the commits of `names` and the new value of each ref update, also
+    /// if `names` does not hold that commit. A call with nothing to send
+    /// writes nothing.
     ///
-    /// A source that fails ends the session with `Abort`, and the call
-    /// returns [`Error::Source`]. Data of the source that the session cannot
-    /// send ends the session the same way, and the call returns
-    /// [`Error::InvalidInput`].
+    /// If the session has a [`PushProgress`] and `names` holds at least one
+    /// file object, the call first asks [`ObjectSource::content_size`]. The
+    /// answer is the number of content bytes that the call sends.
     ///
-    /// When the session has a [`PushProgress`] and `names` holds at least
-    /// one file object, the call first asks the source for the content bytes
-    /// it is to send, with [`ObjectSource::content_size`].
+    /// # HTTP
     ///
-    /// Over HTTP the call sends the objects in up to `parallel-uploads`
-    /// object streams at the same time, each in one request, and the objects
-    /// of `names` can arrive in another order. The detached metadata goes in
-    /// one of the streams, after its objects. The object streams of all the
-    /// calls of the session stay within `parallel-uploads`, at most 31: a
-    /// stream waits for a permit. After the first failure no stream starts a
-    /// new object, and each stream reads its response. The call then returns
-    /// a failure of the client first, then an error that the server gave
-    /// for its own cause, then any other error.
+    /// Over HTTP, the call sends the objects in at most `parallel-uploads`
+    /// object streams at the same time, and in no more streams than the
+    /// objects that it sends. Each object stream is one request, and the
+    /// objects of `names` can arrive in another order. The detached metadata
+    /// goes in one of the streams, after its objects.
+    ///
+    /// The object streams of all the calls of the session stay within
+    /// `parallel-uploads`, at most 31. A stream waits for a permit. After the
+    /// first failure, no stream starts a new object, and each stream reads its
+    /// response.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if the level of `compression` is not 1
+    ///   through 9, or if the type of a name is not a file, a dirtree, a
+    ///   dirmeta, or a commit. The call sends nothing, and the session stays
+    ///   usable.
+    /// - [`Error::InvalidInput`] if another call runs, as the rules of
+    ///   [concurrent calls](PushSession#concurrent-calls) state, or if the
+    ///   session is broken.
+    /// - [`Error::Source`] if the source fails. The session ends with
+    ///   `Abort`.
+    /// - [`Error::InvalidInput`] if the source gives data that the session
+    ///   cannot send, for example a symlink with a payload. The session ends
+    ///   with `Abort`.
+    /// - An `Error` message from the server, as the [`Error`] variant of its
+    ///   code.
+    /// - [`Error::Protocol`] for a malformed reply, or for a reply that is
+    ///   not `ObjectsReply`.
+    /// - [`Error::LimitExceeded`] on a stream transport, for a frame over the
+    ///   frame limit.
+    /// - [`Error::Io`] for a failure of the stream, or for a failed read of a
+    ///   response body over HTTP.
+    /// - [`Error::Fetch`] over HTTP, for a failure of the HTTP client.
+    /// - [`Error::Transport`] over HTTP, for a status that the endpoint does
+    ///   not give, or for a body that is not one frame.
+    ///
+    /// If more than one object stream fails over HTTP, the call returns one
+    /// error, in this order:
+    ///
+    /// 1. [`Error::Source`] or [`Error::InvalidInput`], a failure of the client
+    /// 2. an error with a wire code, for example an error that the server gave
+    ///    for its own cause
+    /// 3. any other error, also the [`Error::Protocol`] of a stream that ends
+    ///    because the server aborted the session for the failure of another
+    ///    stream
     pub async fn send(
         &self,
         source: &dyn ObjectSource,
@@ -638,38 +773,53 @@ impl PushSession {
         Ok(())
     }
 
-    /// Send `Commit` with `updates` and read the reply.
+    /// Sends `Commit` with `updates`, and returns the outcome from the reply.
     ///
-    /// Empty `updates`, a ref that `Hello` did not name, and a ref named
-    /// twice are [`Error::InvalidInput`]. The call consumes the session and
-    /// sends nothing, so the server reads the end of the stream. A call that
-    /// failed, or whose future was dropped, left the stream broken: the call
-    /// then sends nothing too, and returns [`Error::InvalidInput`]. Over
-    /// HTTP, in each of these cases the call sends `DELETE` and no `Commit`.
+    /// The call consumes the session. The call sends no `Commit` if it refuses
+    /// `updates`, if the session is broken, or if the `Commit` frame is over
+    /// the frame limit. On a stream transport it then sends nothing, so the
+    /// server reads the end of the stream. Over HTTP, it sends `DELETE`.
     ///
-    /// An `Error` from the server is returned as its error, and the server
-    /// changed no ref. A `CommitReply` whose refs are not the refs of
-    /// `updates` in order is [`Error::CommitOutcomeUnknown`]. When the write
-    /// of `Commit` fails with an I/O error, the session reads one message:
-    /// an `Error` is returned as that error, and a `CommitReply` is the
-    /// reply. A `Commit` that the codec refuses, for example a frame over the
-    /// limit, is returned as its error, and nothing is written. Each other
-    /// end of the session after the session wrote `Commit` is
-    /// [`Error::CommitOutcomeUnknown`]: the server may have written the refs.
+    /// Over ssh, the call then waits for the ssh client to exit, also after a
+    /// refusal. The ssh time limits of [`connect`](PushSession::connect) give
+    /// the rules of the wait.
     ///
-    /// Over HTTP, a `Commit` request that the client did not hand over to a
-    /// connection is [`Error::Fetch`], and the server changed no ref. After
-    /// the hand-over, a failure of the request, a response head that the
-    /// client refuses, as for a declared coding or a declared length over
-    /// the cap, a failed read of the response, a status the endpoint does
-    /// not give, and a body that is not one frame are
-    /// [`Error::CommitOutcomeUnknown`]. The client does not send the request
-    /// again.
+    /// # HTTP
     ///
-    /// A session that [`connect`](PushSession::connect) opened then waits a
-    /// bounded time for the ssh client to exit, also when the call refuses
-    /// `updates` and when the stream is broken. A session that committed
-    /// returns its outcome whatever the exit status.
+    /// The client sends the `Commit` request once, and never sends it again.
+    /// If the client did not hand the request over to a connection, the
+    /// server changed no ref. After the hand-over, these failures are
+    /// [`Error::CommitOutcomeUnknown`]:
+    ///
+    /// - a failure of the request
+    /// - a response head that the client refuses, for example for a declared
+    ///   coding or for a declared length over the cap
+    /// - a failed read of the response
+    /// - a status that the endpoint does not give
+    /// - a body that is not one frame
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if `updates` is empty, names a ref that
+    ///   `Hello` did not name, or names a ref twice.
+    /// - [`Error::InvalidInput`] if the session is broken.
+    /// - [`Error::LimitExceeded`] if the `Commit` frame is over the frame
+    ///   limit.
+    /// - An `Error` message from the server, as the [`Error`] variant of its
+    ///   code. An ostrya server sends it before it changes a ref, with two
+    ///   exceptions. A failed write of the refs can leave some refs written,
+    ///   and a failure of a hook after the update keeps all the refs.
+    /// - [`Error::Fetch`] over HTTP, if the client did not hand the request
+    ///   over to a connection.
+    /// - [`Error::CommitOutcomeUnknown`] for each other end of the session
+    ///   after the session wrote `Commit`. The server can have written the
+    ///   refs. A `CommitReply` whose refs are not the refs of `updates` in
+    ///   order is one of these cases.
+    ///
+    /// If the write of `Commit` fails with an I/O error, the session reads one
+    /// message. An `Error` message gives the [`Error`] variant of its code,
+    /// and a `CommitReply` gives the outcome. Any other result is
+    /// [`Error::CommitOutcomeUnknown`].
     pub async fn commit(self, updates: &[RefUpdate], force: bool) -> Result<PushOutcome> {
         let checked = check_updates(&self.inner.server.refs, updates);
         let (slot, transport, counters, checked) =
@@ -695,22 +845,31 @@ impl PushSession {
         finish(transport, result).await
     }
 
-    /// End the session. The server aborts its transaction.
+    /// Ends the session, so that the server aborts its transaction.
     ///
-    /// When the stream is still usable, the session writes `Abort` and
-    /// closes its output. A call that failed, or whose future was dropped,
-    /// left the stream broken and dropped it. The session then writes
-    /// nothing, and the call returns [`Error::InvalidInput`].
+    /// On a stream transport, if the stream is usable, the session writes
+    /// `Abort` and closes its output. A broken session has no stream, so the
+    /// call writes nothing. Over ssh, the call then waits for the ssh client to
+    /// exit, as the ssh time limits of [`connect`](PushSession::connect) state.
     ///
-    /// A session that [`connect`](PushSession::connect) opened then waits a
-    /// bounded time for the ssh client to exit, also when the stream is
-    /// broken. When the write of `Abort` fails with an I/O error and the
-    /// client exited with a failure status, the call returns
-    /// [`Error::Transport`] with the status.
+    /// Over HTTP, the call sends `DELETE`, also on a broken session. A 204 is
+    /// success, and so is a 404, which the server gives for a session that it
+    /// ended already.
     ///
-    /// Over HTTP the call sends `DELETE`, also on a broken session, which
-    /// then gives [`Error::InvalidInput`]. A 404, which the server gives for
-    /// a session that it ended already, is success.
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if the session is broken. Over HTTP, the
+    ///   call sends `DELETE` first.
+    /// - [`Error::Io`] if the write of `Abort` fails.
+    /// - [`Error::Transport`] over ssh, if the write of `Abort` fails with an
+    ///   I/O error and the ssh client exits with a failure status. The error
+    ///   names the status.
+    /// - An `Error` message from the server over HTTP, as the [`Error`]
+    ///   variant of its code.
+    /// - [`Error::Fetch`] over HTTP, for a failure of the HTTP client.
+    /// - [`Error::Transport`] over HTTP, for a status that the endpoint does
+    ///   not give, or for a body that is not one frame.
+    /// - [`Error::Io`] over HTTP, for a failed read of the response body.
     pub async fn abort(self) -> Result<()> {
         let (slot, transport) = match self.inner.link {
             Link::Stream { slot, transport } => (slot, transport),
@@ -745,7 +904,7 @@ enum Committing<'a> {
 }
 
 impl SessionInner {
-    /// Take the session apart to commit `updates`, which `checked` checked.
+    /// Takes the session apart to commit `updates`, which `checked` checked.
     fn into_commit<'a>(
         self,
         checked: Result<()>,
@@ -773,7 +932,7 @@ impl SessionInner {
     }
 }
 
-/// Refuse empty `updates`, a ref that is not in `refs`, and a ref named
+/// Refuses empty `updates`, a ref that is not in `refs`, and a ref named
 /// twice.
 fn check_updates(refs: &[RefState], updates: &[RefUpdate]) -> Result<()> {
     if updates.is_empty() {
@@ -794,7 +953,7 @@ fn check_updates(refs: &[RefState], updates: &[RefUpdate]) -> Result<()> {
     Ok(())
 }
 
-/// End a session with `result`. A session with a transport waits for it to
+/// Ends a session with `result`. A session with a transport waits for it to
 /// finish. The stream of the session must be closed or dropped first.
 async fn finish<T>(transport: Option<Transport>, result: Result<T>) -> Result<T> {
     match transport {
@@ -803,7 +962,7 @@ async fn finish<T>(transport: Option<Transport>, result: Result<T>) -> Result<T>
     }
 }
 
-/// Send `Commit` over `stream` and read the reply. The stream is closed or
+/// Sends `Commit` over `stream` and reads the reply. The stream is closed or
 /// dropped when the call returns.
 async fn commit_on(
     mut stream: Box<Stream>,

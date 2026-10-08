@@ -1,65 +1,45 @@
 #![forbid(unsafe_code)]
 
-//! The push protocol of ostrya, and the wire protocol of the pull over ssh.
+//! The wire codec and the client sessions of the ostrya push and ssh pull.
 //!
-//! A push client sends the objects of a set of commits to a server
-//! repository and then asks it to update refs in one transaction. The
-//! [`proto`] module holds the wire protocol: the messages, their GVariant
-//! encoding, the frame codec with its size limit, and the chunked object
-//! stream with its abandon marker. The module docs of [`proto`] state the
-//! wire format in full.
+//! A caller pushes a local directory as one commit with [`push_tree`](fn@push_tree), or the
+//! objects of its own source with a [`PushSession`]. A [`PullSession`] reads the
+//! files of a server repository over ssh. The crate has no repository knowledge,
+//! and it compiles on Linux, macOS, and Windows.
 //!
-//! The same codec carries the pull over ssh. A pull client asks for each
-//! file of the repository by its path with `Get`, and the server answers
-//! each `Get` with `GetReply` and a body of chunks. The pull has its own
-//! message kinds and its own version, [`proto::PULL_PROTOCOL_VERSION`].
-//! [`PullSession`] is the client side of the pull: it keeps several `Get`
-//! frames in flight on one stream, and gives the body of each found reply as
-//! a [`PullBody`]. [`PullSession::over_stream`] opens it over a pair of byte
-//! streams, and [`PullSession::connect`] over the ssh client, with
-//! [`PullConnectOptions`].
+//! # Entry points
 //!
-//! The [`session`] module holds the client side. [`PushSession`] runs one
-//! session over a pair of byte streams: it opens with `Hello`, asks which
-//! objects the server needs, sends them from an [`ObjectSource`], and asks
-//! the server to update its refs. [`PushProgress`] shows the counters of a
-//! session while it runs, and [`PushOutcome`] gives the ref outcomes and the
-//! [`PushStats`] of a session that committed. [`session::export_stream`]
-//! writes the messages of a session as one one-way stream, for a receiver
-//! that sends no reply.
+//! - [`push_tree`](fn@push_tree) pushes a local directory to a [`PushRemote`] as one commit.
+//! - [`push_tree_prepared`] and [`push_tree_over_stream`] run that push over other transports.
+//! - [`PushSession::connect`] opens a push session to an address that [`PushRemote::parse`] reads.
+//! - [`PushSession::prepare`] checks a transport, and [`PreparedSession::open`] opens its session.
+//! - [`PushSession::over_stream`] opens a push session over a pair of byte streams.
+//! - [`PullSession::connect`] opens a pull session over ssh, and [`PullSession::get`] reads a file.
+//! - [`Error`] is the error of each fallible operation, and [`ErrorCode`] names its wire codes.
 //!
-//! The [`transport`] module holds the transports. [`PushRemote`] parses a
-//! push address, and [`PushSession::connect`] opens a session to it.
-//! [`PushSession::prepare`] checks the options and makes the transport ready
-//! first, and [`PreparedSession::open`] opens the session later. Over
-//! ssh it runs the ssh client as a child process, and the remote side runs
-//! the receive command. Over HTTP each step of the session is one request to
-//! the receive endpoint of the server, and the object streams of a session
-//! run in parallel.
+//! # Modules
 //!
-//! The [`tree`] module walks a local directory into a
-//! [`TreeModel`](tree::TreeModel): the entry metadata, with an entry filter
-//! that can change it, and the checksum of each object of the tree.
+//! - [`proto`]: the wire format and its codec.
+//! - [`session`]: the push and pull sessions, their progress, and the one-way stream.
+//! - [`transport`]: the push addresses and the ssh and HTTP transports.
+//! - [`tree`]: the walk and the hash of a local directory.
 //!
-//! [`push_tree`] pushes a local directory as one commit: it walks and hashes
-//! the tree, opens a session over ssh or HTTP, builds and signs the commit
-//! over the tree, sends the objects the server lacks, and sets the target
-//! refs.
-//! [`push_tree_prepared`] runs the same push over a [`PreparedSession`], and
-//! [`push_tree_over_stream`] over a pair of byte streams.
-//! [`TreePushOptions`] holds their options.
+//! # Features
 //!
-//! [`Error`] is the error type of the crate. Each of its variants except
-//! [`Error::Aborted`], [`Error::CommitOutcomeUnknown`], [`Error::Source`],
-//! [`Error::InvalidInput`], [`Error::Transport`], [`Error::Fetch`],
-//! [`Error::Io`], [`Error::Walk`], and [`Error::Sign`] is one wire code, and
-//! [`ErrorCode`] names the codes.
+//! - `smol` (default): the `smol` backend of `ostrya-rt` for the ssh and HTTP transports.
+//! - `tokio`: the `tokio` backend of `ostrya-rt` for the ssh and HTTP transports.
 //!
-//! The codec and [`PushSession::over_stream`] are generic over the
-//! `futures-io` traits `AsyncRead` and `AsyncWrite`, so they need no async
-//! runtime. The ssh and the HTTP transports run on the runtime backend that
-//! the `smol` (default) or the `tokio` feature selects. The crate has no repository
-//! knowledge. It compiles on Linux, macOS, and Windows.
+//! # Examples
+//!
+//! ```no_run
+//! use ostrya_push::{TreePushOptions, push_tree, transport::{ConnectOptions, PushRemote}};
+//! # async fn run() -> ostrya_push::Result<()> {
+//! let remote = PushRemote::parse("ssh://builder@repo.example.com/srv/repo")?;
+//! let opts = TreePushOptions { refs: vec!["exampleos/stable".into()], ..Default::default() };
+//! let outcome = push_tree(&remote, "rootfs".as_ref(), ConnectOptions::default(), opts).await?;
+//! println!("{:?}", outcome.commit);
+//! # Ok(()) }
+//! ```
 
 mod commit;
 mod error;
@@ -84,7 +64,7 @@ pub use session::{
 #[doc(hidden)]
 pub use transport::{ConnectOptions, PreparedSession, PullConnectOptions, PushRemote};
 
-/// The public types of the protocol move freely across tasks and threads.
+// The public types of the protocol move freely across tasks and threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Error>();

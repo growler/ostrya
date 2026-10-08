@@ -106,7 +106,8 @@ fn error(code: ErrorCode, message: &str) -> ErrorMessage {
     }
 }
 
-/// A valid `Error` of `code`. A `ref-mismatch` carries its ref state.
+/// A valid `Error` message with the code `code`. An `Error` message with the
+/// code `ref-mismatch` carries its ref state.
 fn sample_error(code: ErrorCode, message: &str) -> ErrorMessage {
     let mut e = error(code, message);
     if code == ErrorCode::RefMismatch {
@@ -362,10 +363,10 @@ fn header_frame() -> Vec<u8> {
     v
 }
 
-/// The frame `write_message` gives an `ObjectHeader` equals the frame of the
-/// generic body encoder for each type and encoding the header allows, and
-/// reads back. A type or an encoding the header does not allow is refused,
-/// and nothing is written.
+/// For each type and encoding that an `ObjectHeader` allows, `write_message`
+/// writes the frame of the generic body encoder. The frame reads back.
+/// `write_message` refuses a type or an encoding that the header does not
+/// allow, and writes nothing.
 #[test]
 fn an_object_header_frame_equals_the_generic_encoding() {
     use ObjectType::*;
@@ -396,9 +397,10 @@ fn an_object_header_frame_equals_the_generic_encoding() {
     }
 }
 
-/// The frame `write_message` gives a `GetReply` equals the frame of the
-/// generic body encoder for each found value and length, and reads back. A
-/// reply with found false and a length is refused, and nothing is written.
+/// For each `found` value and length of a `GetReply`, `write_message` writes
+/// the frame of the generic body encoder. The frame reads back.
+/// `write_message` refuses a reply whose `found` is `false` and that has a
+/// length, and writes nothing.
 #[test]
 fn a_get_reply_frame_equals_the_generic_encoding() {
     for (found, len) in [
@@ -466,22 +468,26 @@ fn golden_bytes_pin_the_frame_layout() {
 
 /// The pull messages in GVariant normal form.
 ///
-/// `(ua{sv})`: the `u` is 4 bytes, and the `a{sv}` is aligned to 8, so 4
-/// zero bytes of padding follow the `u` also when the dict is empty. The
-/// dict is the last member, so the tuple has no framing offset. An empty
-/// dict is 0 bytes. The entry `{"agent": <"x">}` is the key `agent\0` (6
-/// bytes), 2 bytes of padding to align the variant to 8, the variant `x\0`,
-/// a zero separator, and the type `s` (4 bytes), and then the framing offset
-/// of the end of the key, 6. The array of one entry of 13 bytes adds the
-/// offset of the end of the entry, 13.
+/// `(ua{sv})`: the `u` is 4 bytes. The `a{sv}` is aligned to 8, so 4 zero
+/// bytes of padding follow the `u`, also when the dict is empty. The dict is
+/// the last member, so the tuple has no framing offset. An empty dict is 0
+/// bytes. The entry `{"agent": <"x">}` has these bytes:
+///
+/// - the key `agent\0` (6 bytes)
+/// - 2 bytes of padding that align the variant to 8
+/// - the variant `x\0`, a zero separator, and the type `s` (4 bytes)
+/// - the framing offset of the end of the key, 6
+///
+/// The array of one entry of 13 bytes adds the offset of the end of the
+/// entry, 13.
 ///
 /// `s`: the bytes of the string and a zero byte.
 ///
-/// `(bmt)`: the `b` is 1 byte, and the `mt` is aligned to 8, so 7 zero bytes
-/// of padding follow the `b` also when the maybe is nothing. A maybe of a
-/// fixed-size type is 0 bytes for nothing, and the 8 bytes of the `t` with no
-/// zero byte after them for a value. The maybe is the last member, so the
-/// tuple has no framing offset.
+/// `(bmt)`: the `b` is 1 byte. The `mt` is aligned to 8, so 7 zero bytes of
+/// padding follow the `b`, also when the maybe is nothing. A maybe of a
+/// fixed-size type is 0 bytes for nothing. For a value, the `mt` is the 8
+/// bytes of the `t`, with no zero byte after them. The maybe is the last
+/// member, so the tuple has no framing offset.
 #[test]
 fn golden_bytes_pin_the_pull_messages() {
     golden(
@@ -527,7 +533,8 @@ fn golden_bytes_pin_the_pull_messages() {
 #[test]
 fn malformed_pull_bodies_decode_to_protocol() {
     let cases = [
-        // found false with a length, which the encoder refuses too.
+        // A reply whose `found` is `false`, with a length. The encoder refuses
+        // it too.
         hex("00 00 00 11 0f 00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00"),
         // No padding before the maybe.
         hex("00 00 00 02 0f 01"),
@@ -786,7 +793,8 @@ fn malformed_bodies_decode_to_protocol() {
     assert_protocol(read_one(&hex(
         "00 00 00 1b 0a 72 65 6d 6f 74 65 2d 72 65 66 2d 64 65 6e 69 65 64 00 6d 00 00 00 00 00 14 12",
     )));
-    // The valid body that the HelloReply cases above alter decodes.
+    // The valid `HelloReply` body, which the `HelloReply` cases of `cases`
+    // alter, decodes.
     let valid = frame(2, &reply_body(MAX_FRAME, 1, bare(), "", vec![]));
     assert!(read_one(&valid).unwrap().is_some());
 
@@ -981,15 +989,18 @@ fn one_way_hello(agent: Option<&str>, refs: &[&str]) -> Message {
     Message::Hello(Hello { one_way: true, ..h })
 }
 
-/// `one-way` true is written after `agent` and reads back. The encoder writes
-/// no key for false, so `golden_bytes_pin_the_frame_layout` pins the bytes of
-/// a two-way `Hello`.
+/// The encoder writes `one-way` set to `true` after `agent`. The message
+/// reads back. The encoder writes no key for `false`, so
+/// `golden_bytes_pin_the_frame_layout` pins the bytes of a two-way `Hello`.
 ///
-/// The entry `{"one-way": <true>}` is the key `one-way\0` (8 bytes), the
-/// variant `01`, a zero separator, and the type `b`, and then the framing
-/// offset of the end of the key, 8. The array of one entry of 12 bytes adds
-/// the offset of the end of the entry, 12. The tuple ends with the offset of
-/// the end of the dict, 21.
+/// The entry `{"one-way": <true>}` has these bytes:
+///
+/// - the key `one-way\0` (8 bytes)
+/// - the variant `01`, a zero separator, and the type `b`
+/// - the framing offset of the end of the key, 8
+///
+/// The array of one entry of 12 bytes adds the offset of the end of the
+/// entry, 12. The tuple ends with the offset of the end of the dict, 21.
 #[test]
 fn a_one_way_hello_round_trips() {
     round_trip(one_way_hello(None, &[]));
@@ -1006,9 +1017,9 @@ fn a_one_way_hello_round_trips() {
     );
 }
 
-/// An absent `one-way` key and the value false both read as false. A value
-/// of another type is `protocol`. When the key occurs twice, the first one
-/// counts.
+/// An absent `one-way` key and the value `false` both read as `false`. A
+/// value of another type is `Error::Protocol`. If the key occurs two times,
+/// the first one counts.
 #[test]
 fn the_one_way_key_reads_strictly() {
     let read = |entries| read_one(&frame(1, &hello_body(entries)));
@@ -1147,7 +1158,7 @@ fn object_body_reads_split_chunks_to_the_end() {
 }
 
 /// One read takes as many ready chunks as fit, so tiny chunks do not make
-/// tiny reads. Bytes read before the marker or an error arrive first.
+/// tiny reads. The bytes before the marker or before an error arrive first.
 #[test]
 fn object_body_fills_the_buffer_across_chunks() {
     use futures_lite::io::AsyncReadExt;
@@ -1290,7 +1301,7 @@ fn reply_frame(found: bool, len: Option<u64>) -> Vec<u8> {
     encode(&get_reply(found, len))
 }
 
-/// Read a body to its end, or to the error that ends it.
+/// Reads a body to its end, or to the error that ends it.
 async fn read_body<R: futures_io::AsyncRead + Unpin>(
     r: &mut FrameReader<R>,
 ) -> Result<(Vec<u8>, ObjectRead), Error> {
@@ -1304,8 +1315,9 @@ async fn read_body<R: futures_io::AsyncRead + Unpin>(
     }
 }
 
-/// The reader enters the body state after a `GetReply` with found true, and
-/// stays between frames after a `GetReply` with found false.
+/// After a `GetReply` whose `found` is `true`, the reader enters the body
+/// state. After a `GetReply` whose `found` is `false`, the reader stays
+/// between frames.
 #[test]
 fn a_found_reply_enters_the_body_state() {
     let mut bytes = reply_frame(true, Some(3));
@@ -1340,9 +1352,10 @@ fn a_found_reply_enters_the_body_state() {
     });
 }
 
-/// After the abandon marker in a pull body, the `Error` frame gives the error
-/// of its code, and `Abort` or another frame is `protocol`. After the marker
-/// in an object of the push, an `Error` frame is `protocol`.
+/// After the abandon marker in a pull body, an `Error` message gives the
+/// `Error` variant of its code. In that position, `Abort` or another frame is
+/// `Error::Protocol`. After the marker in an object of the push, an `Error`
+/// message is `Error::Protocol`.
 #[test]
 fn the_abandon_marker_of_a_pull_body_takes_error() {
     use futures_lite::io::AsyncReadExt;
@@ -1395,8 +1408,8 @@ fn the_abandon_marker_of_a_pull_body_takes_error() {
         });
     }
 
-    // A found reply after the marker sets the body state, and the error
-    // leaves the reader between frames.
+    // A reply whose `found` is `true` after the marker sets the body state.
+    // The error leaves the reader between frames.
     let mut bytes = pull(&get_reply(true, None));
     bytes.extend(encode(&Message::Get("config".into())));
     let mut r = FrameReader::new(&bytes[..]);
@@ -1434,9 +1447,10 @@ fn the_abandon_marker_of_a_pull_body_takes_error() {
     });
 }
 
-/// The writer enters the body state after a `GetReply` with found true. The
-/// body takes the chunks of an object, and `abandon_body` writes the marker
-/// and the `Error` frame. Each abandon call refuses the other body kind.
+/// After a `GetReply` whose `found` is `true`, the writer enters the body
+/// state. The body takes the chunks of an object. `abandon_body` writes the
+/// marker and the frame of the `Error` message. Each abandon call refuses the
+/// other body kind.
 #[test]
 fn the_writer_writes_and_abandons_a_pull_body() {
     let mut w = FrameWriter::new(Vec::new());
@@ -1461,8 +1475,8 @@ fn the_writer_writes_and_abandons_a_pull_body() {
     block_on(async {
         w.write_message(&get_reply(true, None)).await.unwrap();
         w.write_object_data(b"a").await.unwrap();
-        // An `Error` that does not encode writes nothing, and the body stays
-        // open.
+        // If an `Error` message does not encode, `abandon_body` writes
+        // nothing. The body stays open.
         let no_detail = error(ErrorCode::RefMismatch, "moved");
         assert_protocol(w.abandon_body(&no_detail).await);
         w.abandon_body(&failure).await.unwrap();
@@ -1499,8 +1513,8 @@ fn the_writer_writes_and_abandons_a_pull_body() {
     assert_eq!(w.into_inner(), expected);
 }
 
-/// `get_ref` shows the bytes a buffered reader holds after a frame, with no
-/// read.
+/// `get_ref` shows the bytes that a buffered reader holds after a frame.
+/// `get_ref` does no read.
 #[test]
 fn get_ref_shows_the_buffered_bytes() {
     let first = encode(&Message::Get("a".into()));

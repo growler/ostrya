@@ -1,5 +1,5 @@
-//! One stream transport of a session: the frame codec over a pair of byte
-//! streams, and the object stream the session writes to it.
+//! The stream transport of a session: the frame codec over a pair of byte
+//! streams, and the object stream that the session writes to it.
 
 use std::io;
 use std::sync::Arc;
@@ -16,12 +16,13 @@ use crate::proto::{FrameReader, Message, protocol};
 /// The buffer size of the input of the stream.
 const STREAM_BUFFER: usize = 64 * 1024;
 
-/// The buffer size of the output of the stream: 64 KiB, the default capacity
-/// of a Linux pipe, so a full buffer goes into an empty pipe in one write. A
-/// full chunk of `CHUNK_PAYLOAD` bytes and its 4-byte length fill the buffer
-/// exactly. Each chunk is shorter than the buffer, so it goes through the
-/// buffer, and a chunk length is never the only content of a write to the
-/// transport.
+/// The buffer size of the output of the stream: 64 KiB.
+///
+/// 64 KiB is the default capacity of a Linux pipe, so a full buffer goes into
+/// an empty pipe in one write. A full chunk of `CHUNK_PAYLOAD` bytes and its
+/// 4-byte length fill the buffer exactly. Each chunk is shorter than the
+/// buffer, so the chunk goes through the buffer. Because of this, a write to
+/// the transport never holds a chunk length alone.
 pub(super) const WRITE_BUFFER: usize = 64 * 1024;
 
 pub(crate) type Input = Box<dyn AsyncRead + Unpin + Send>;
@@ -46,26 +47,31 @@ impl Stream {
         }
     }
 
-    /// Wait at most `limit` for a pending message after a failed write.
+    /// Sets the longest wait for a pending message after a failed write to
+    /// `limit`.
     pub(super) fn set_pending_limit(&mut self, limit: Duration) {
         self.pending_limit = Some(limit);
     }
 
-    /// Set the frame and chunk limit of the writer to the `max-frame` of the
-    /// server.
+    /// Sets the frame limit and the chunk limit of the writer to `limit`, the
+    /// `max-frame` value of the server.
     pub(super) fn set_write_limit(&mut self, limit: u32) {
         self.writer.frames().set_limit(limit);
     }
 
-    /// Write `msg` and flush, with no mapping of a failure.
+    /// Writes `msg` and flushes the writer. The call returns a failure
+    /// unchanged.
     pub(super) async fn write_raw(&mut self, msg: &Message) -> Result<()> {
         let frames = self.writer.frames();
         frames.write_message(msg).await?;
         frames.flush().await
     }
 
-    /// Write `msg` and flush. A failed write gives the `Error` the server
-    /// sent before it closed, where it sent one.
+    /// Writes `msg` and flushes the writer.
+    ///
+    /// If the write fails and the server sent an `Error` message before it
+    /// closed the stream, the call returns the [`Error`] variant of its code.
+    /// Otherwise the call returns the error of the write.
     pub(super) async fn request(&mut self, msg: &Message) -> Result<()> {
         match self.write_raw(msg).await {
             Ok(()) => Ok(()),
@@ -73,8 +79,12 @@ impl Stream {
         }
     }
 
-    /// The `Error` the server sent, when a write failed with an I/O error
-    /// because the server closed the stream after it. Otherwise `e`.
+    /// Returns the error that the server sent before it closed the stream, or
+    /// `e`.
+    ///
+    /// The call reads a pending message only if `e` is an [`Error::Io`]. If
+    /// that message is an `Error` message, the call returns the [`Error`]
+    /// variant of its code. Otherwise it returns `e`.
     pub(super) async fn after_write_error(&mut self, e: Error) -> Error {
         match self.pending_message(&e).await {
             Some(Message::Error(sent)) => sent.into(),
@@ -82,9 +92,14 @@ impl Stream {
         }
     }
 
-    /// Read one message after the write failure `e`, when `e` is an I/O
-    /// error. A read that fails gives `None`, and so does a read that takes
-    /// longer than the pending limit of the stream.
+    /// Reads one message after the write failure `e`.
+    ///
+    /// The call returns `None` in four cases:
+    ///
+    /// - `e` is not an [`Error::Io`], so the call reads nothing.
+    /// - The read fails.
+    /// - The stream ends.
+    /// - The read takes longer than the pending limit of the stream.
     pub(super) async fn pending_message(&mut self, e: &Error) -> Option<Message> {
         if !matches!(e, Error::Io(_)) {
             return None;
@@ -102,7 +117,7 @@ impl Stream {
         }
     }
 
-    /// Read the next message. An end of file is an [`Error::Io`] of kind
+    /// Reads the next message. An end of file is an [`Error::Io`] of the kind
     /// `UnexpectedEof`.
     pub(super) async fn next(&mut self) -> Result<Message> {
         self.reader
@@ -111,18 +126,23 @@ impl Stream {
             .ok_or_else(|| Error::Io(io::ErrorKind::UnexpectedEof.into()))
     }
 
-    /// Read the next message with no mapping.
+    /// Reads the next message. An end of file is `None`.
     pub(super) async fn read_raw(&mut self) -> Result<Option<Message>> {
         self.reader.read_message().await
     }
 
-    /// Close the writer.
+    /// Closes the writer.
     pub(super) async fn close(self) -> Result<()> {
         self.writer.close().await
     }
 
-    /// Send the objects of `up` in one object stream, and read the
-    /// `ObjectsReply`. A call with nothing to send writes nothing.
+    /// Sends the objects of `up` in one object stream and reads the
+    /// `ObjectsReply`.
+    ///
+    /// If there is nothing to send, the call writes nothing. If the writer
+    /// stops, the call abandons the stream and returns the error of the stop.
+    /// A reply other than `ObjectsReply` or an `Error` message is
+    /// [`Error::Protocol`].
     pub(super) async fn upload(&mut self, up: &Upload<'_>) -> Result<()> {
         let mut started = false;
         let mut pass = Pass::default();
@@ -132,8 +152,8 @@ impl Stream {
             Err(Stop::Abandon {
                 error, in_object, ..
             }) => {
-                // The stream ends with the error of the stop, so a failed
-                // write is ignored.
+                // The call returns the error of the stop, so it ignores a
+                // failure of these writes.
                 let _ = self.writer.abandon(in_object).await;
                 let _ = self.writer.frames().flush().await;
                 return Err(error);

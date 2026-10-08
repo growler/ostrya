@@ -29,57 +29,77 @@ static MAYBE_CHECKSUM: LazyLock<Type> = LazyLock::new(|| parse("may"));
 static PULL_HELLO: LazyLock<Type> = LazyLock::new(|| parse("(ua{sv})"));
 static GET_REPLY: LazyLock<Type> = LazyLock::new(|| parse("(bmt)"));
 
-/// `Hello`: the first message of the client.
+/// The first message of a push client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
-    /// The protocol version the client requests.
+    /// The protocol version that the client requests.
     pub version: u32,
-    /// The name and version of the client, key `agent`.
+    /// The name and version of the client, under the key `agent`.
     pub agent: Option<String>,
-    /// The refs the client intends to update: `NAME` or `REMOTE:NAME`.
+    /// The refs that the client intends to update, each `NAME` or
+    /// `REMOTE:NAME`.
     pub refs: Vec<String>,
-    /// Key `one-way`: the `Hello` opens a one-way stream, and the receiver
-    /// sends no message. The encoder writes the key when it is true alone,
-    /// and an absent key decodes as false.
+    /// The flag that is `true` if the `Hello` opens a
+    /// [one-way stream](super#one-way-stream).
+    ///
+    /// In a one-way stream, the receiver sends no message. The key is
+    /// `one-way`. The encoder writes the key only if the value is `true`, and
+    /// the decoder reads an absent key as `false`.
     pub one_way: bool,
 }
 
-/// `HelloReply`: the facts and limits of the server, and the refs of `Hello`.
+/// The reply to a `Hello`, with the facts and limits of the server.
+///
+/// It also gives the state of each ref that the `Hello` names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelloReply {
-    /// The protocol version the server speaks for the session.
+    /// The protocol version that the server speaks for the session.
     pub version: u32,
-    /// The repository mode, key `mode`.
+    /// The repository mode, under the key `mode`.
     pub mode: String,
-    /// The collection id of the repository, key `collection-id`.
+    /// The collection id of the repository, under the key `collection-id`.
     pub collection_id: Option<String>,
-    /// The frame limit, key `max-frame`. It is in
-    /// `MIN_FRAME_LIMIT..=MAX_FRAME_LIMIT`.
+    /// The frame limit that the server announces, under the key `max-frame`.
+    ///
+    /// Encode and decode return [`Error::Protocol`] for a value out of the
+    /// range that the [frame rules](crate::proto#frames) give.
     pub max_frame: u32,
-    /// The most entries in one `Have`, key `max-have`. It is at least 1.
+    /// The maximum number of entries in one `Have`, under the key `max-have`.
+    ///
+    /// The value is at least 1. For the value 0, encode and decode return
+    /// [`Error::Protocol`].
     pub max_have: u32,
-    /// The content encodings the server accepts, key `encodings`.
+    /// The content encodings that the server accepts, under the key
+    /// `encodings`.
+    ///
+    /// The decoder drops a name that is not an encoding.
     pub encodings: Vec<Encoding>,
-    /// The most object streams the server serves at the same time in one
-    /// session, key `parallel-uploads`. It is at least 1.
+    /// The most object streams at a time, under the key `parallel-uploads`.
+    ///
+    /// The server serves at most this number of object streams at the same
+    /// time in one session. The value is at least 1. For the value 0, encode and
+    /// decode return [`Error::Protocol`].
     pub parallel_uploads: u32,
-    /// One entry for each ref that `Hello` named.
+    /// The state of each ref that the `Hello` names, one entry for each ref.
     pub refs: Vec<RefState>,
 }
 
-/// `HaveReply`: one bit for each entry of `Have`.
+/// The reply to a `Have`, with one bit for each entry.
 ///
 /// Bit `i` is bit `i % 8` of byte `i / 8`, counted from the least significant
-/// bit. A set bit means the server does not hold the object, and the client
+/// bit. If a bit is set, the server does not hold the object, and the client
 /// must send it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HaveReply {
-    /// The bitmap.
+    /// The bitmap of the entries.
     pub bitmap: Vec<u8>,
 }
 
 impl HaveReply {
-    /// The reply whose bit `i` is entry `i` of `missing`.
+    /// Creates a reply from one `bool` for each entry of the `Have`.
+    ///
+    /// Bit `i` is set if entry `i` of `missing` is `true`. For `n` entries,
+    /// the bitmap has `n.div_ceil(8)` bytes.
     pub fn from_missing(missing: impl IntoIterator<Item = bool>) -> HaveReply {
         let mut bitmap = Vec::new();
         for (i, set) in missing.into_iter().enumerate() {
@@ -93,16 +113,24 @@ impl HaveReply {
         HaveReply { bitmap }
     }
 
-    /// Whether the server does not hold entry `index`.
+    /// Returns `true` if the server does not hold entry `index`.
+    ///
+    /// For an `index` after the end of the bitmap, it returns `false`.
     pub fn is_missing(&self, index: usize) -> bool {
         self.bitmap
             .get(index / 8)
             .is_some_and(|b| b & (1 << (index % 8)) != 0)
     }
 
-    /// Check the reply against a `Have` of `entries` entries: the bitmap is
-    /// `entries.div_ceil(8)` bytes long, and the bits after the last entry
-    /// are zero. Otherwise the error `protocol`.
+    /// Checks the reply against a `Have` of `entries` entries.
+    ///
+    /// The bitmap must be `entries.div_ceil(8)` bytes long, and the bits
+    /// after the last entry must be zero.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Protocol`] if the bitmap has a different length.
+    /// - [`Error::Protocol`] if the bitmap sets a bit after the last entry.
     pub fn check_len(&self, entries: usize) -> Result<()> {
         if self.bitmap.len() != entries.div_ceil(8) {
             return Err(protocol(format!(
@@ -118,125 +146,151 @@ impl HaveReply {
     }
 }
 
-/// `ObjectHeader`: the start of one object in the object stream.
+/// The message that starts one object in the
+/// [object stream](super#object-stream).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectHeader {
-    /// The object. For a `CommitMeta`, the checksum is that of its commit.
+    /// The type and the checksum of the object.
+    ///
+    /// For a `CommitMeta` object, the checksum is the checksum of its commit.
     pub name: ObjectName,
-    /// The encoding. `Deflate` is allowed for a file object alone.
+    /// The encoding of the object bytes.
+    ///
+    /// [`Encoding::Deflate`] is allowed for a file object alone.
     pub encoding: Encoding,
 }
 
-/// `ObjectsReply`: the result of an object stream.
+/// The reply of the server at the end of one object stream.
 ///
-/// The counts are those of one stream. Where two streams of one session send
-/// the same content, dirtree, dirmeta, or commit object at the same time,
-/// both can count it. A second detached metadata object for one commit is
-/// `protocol`, also from another stream, and ends the session.
+/// The counts are those of one stream. If two streams of one session send the
+/// same content, dirtree, dirmeta, or commit object at the same time, both
+/// can count it. A second detached metadata object for one commit is
+/// [`Error::Protocol`], also from another stream, and the session ends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectsReply {
-    /// The number of objects stored.
+    /// The number of objects that the server stored.
     pub objects: u32,
-    /// The number of payload bytes written.
+    /// The number of payload bytes that the server wrote.
     pub payload_bytes: u64,
 }
 
-/// `Commit`: the ref updates of the transaction.
+/// The `Commit` message, with the ref updates of the transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitRequest {
     /// The ref updates.
     pub updates: Vec<RefUpdate>,
-    /// Key `force`: allow an update that is not a fast-forward.
+    /// The flag that allows a ref update that is not a fast-forward.
+    ///
+    /// The key is `force`. The encoder writes the key only if the value is
+    /// `true`, and the decoder reads an absent key as `false`.
     pub force: bool,
 }
 
-/// `Error`: a failure the server reports. The session ends after it.
+/// The `Error` message, which the server sends to report a failure.
+///
+/// The session ends after this message. The `Error` message converts to the
+/// [`Error`] variant of its code, and [`Error::to_message`] converts back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorMessage {
-    /// The error code.
+    /// The code of the failure.
     pub code: ErrorCode,
-    /// The message for a human.
+    /// The text of the failure for a human reader.
     pub message: String,
-    /// Key `missing`: the objects of `missing-objects`. Types 1 to 4 alone.
+    /// The missing objects, for the code `missing-objects`.
+    ///
+    /// The key is `missing`. The encoder writes the key only if the list is
+    /// not empty. Each object is of type 1 to 4. For another type, encode and
+    /// decode return [`Error::Protocol`].
     pub missing: Vec<ObjectName>,
-    /// Keys `ref` and `current`: the current state of the ref of
-    /// `ref-mismatch`. The code `ref-mismatch` requires it, on encode and on
-    /// decode. Otherwise the error `protocol`.
+    /// The current state of the ref, for the code `ref-mismatch`.
+    ///
+    /// The keys are `ref` and `current`. If the code is `ref-mismatch` and
+    /// this field is `None`, encode and decode return [`Error::Protocol`]. The
+    /// decode of a body with one of the two keys alone also returns
+    /// [`Error::Protocol`].
     pub current: Option<RefState>,
 }
 
-/// `PullHello`: the first message of a pull client.
+/// The first message of a pull client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullHello {
-    /// The highest pull protocol version the client speaks.
+    /// The highest pull protocol version that the client speaks.
     pub version: u32,
-    /// The name and version of the client, key `agent`.
+    /// The name and version of the client, under the key `agent`.
     pub agent: Option<String>,
 }
 
-/// `PullHelloReply`: the pull version of the session.
+/// The reply to a `PullHello`, with the pull version of the session.
 ///
-/// The dict of the reply is empty in version 1. A decoder ignores a key it
-/// does not know.
+/// The dict of the reply is empty in version 1. A decoder ignores a key that
+/// it does not know.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullHelloReply {
-    /// The pull protocol version of the session: the lower of the version of
-    /// `PullHello` and the highest version of the server.
+    /// The pull protocol version of the session.
+    ///
+    /// It is the lower of the version of the `PullHello` and the highest
+    /// version of the server.
     pub version: u32,
 }
 
-/// `GetReply`: the answer to one `Get`.
+/// The reply to one `Get`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetReply {
-    /// Whether the server serves the path. A body follows a reply with found
-    /// true.
+    /// The flag that is `true` if the server serves the path.
+    ///
+    /// If `found` is `true`, a [body](super#pull) follows the reply.
     pub found: bool,
-    /// The length of the body, when the server knows it. A reply with found
-    /// false and a length is the error `protocol`, on encode and on decode.
+    /// The length of the body, if the server knows it.
+    ///
+    /// If `found` is `false` and the length is present, encode and decode
+    /// return [`Error::Protocol`].
     pub len: Option<u64>,
 }
 
-/// A message of the protocol.
+/// A message of the push or the pull protocol.
 ///
-/// The enum is `#[non_exhaustive]`, because a later protocol version adds
-/// messages.
+/// A later protocol version can add messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Message {
-    /// `Hello`.
+    /// The `Hello` message.
     Hello(Hello),
-    /// `HelloReply`.
+    /// The `HelloReply` message.
     HelloReply(HelloReply),
-    /// `Have`: the objects the client offers, types 1 to 4 alone.
+    /// The `Have` message, with the objects that the client offers.
+    ///
+    /// Each object is of type 1 to 4.
     Have(Vec<ObjectName>),
-    /// `HaveReply`.
+    /// The `HaveReply` message.
     HaveReply(HaveReply),
-    /// `ObjectHeader`.
+    /// The `ObjectHeader` message.
     ObjectHeader(ObjectHeader),
-    /// `ObjectsEnd`.
+    /// The `ObjectsEnd` message.
     ObjectsEnd,
-    /// `ObjectsReply`.
+    /// The `ObjectsReply` message.
     ObjectsReply(ObjectsReply),
-    /// `Commit`.
+    /// The `Commit` message.
     Commit(CommitRequest),
-    /// `CommitReply`: one outcome for each ref update.
+    /// The `CommitReply` message, with one outcome for each ref update.
     CommitReply(Vec<RefOutcome>),
-    /// `Error`.
+    /// The `Error` message.
     Error(ErrorMessage),
-    /// `Abort`.
+    /// The `Abort` message.
     Abort,
-    /// `PullHello`.
+    /// The `PullHello` message.
     PullHello(PullHello),
-    /// `PullHelloReply`.
+    /// The `PullHelloReply` message.
     PullHelloReply(PullHelloReply),
-    /// `Get`: the path of one file, relative to the repository root.
+    /// The `Get` message, with the path of one file.
+    ///
+    /// The path is relative to the repository root.
     Get(String),
-    /// `GetReply`.
+    /// The `GetReply` message.
     GetReply(GetReply),
 }
 
 impl Message {
-    /// The kind of the message.
+    /// Returns the kind of the message.
     pub fn kind(&self) -> Kind {
         match self {
             Message::Hello(_) => Kind::Hello,
@@ -257,9 +311,23 @@ impl Message {
         }
     }
 
-    /// The body of the message, without the frame header. A value that the
-    /// message cannot carry, for example a `Have` entry of type 6, is the
-    /// error `protocol`.
+    /// Encodes the body of the message, with no frame length and no kind byte.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Protocol`] if the message holds a value that it cannot carry:
+    ///
+    /// - a `HelloReply` whose `max_frame`, `max_have`, or `parallel_uploads`
+    ///   is out of range
+    /// - a `Have` entry or a `missing` object of a type other than 1 to 4, for
+    ///   example type 6
+    /// - an `ObjectHeader` of a type other than 1 to 4 or 6, or with
+    ///   [`Encoding::Deflate`] for an object that is not a file
+    /// - an `Error` message with the code `ref-mismatch` and no `current`
+    ///   state
+    /// - a `GetReply` whose `found` is `false` and that has a length
+    /// - a string with an interior NUL byte, which the GVariant serializer
+    ///   refuses
     pub fn encode_body(&self) -> Result<Vec<u8>> {
         let (ty, value): (&Type, Value) = match self {
             Message::ObjectsEnd => return Ok(Vec::new()),
@@ -410,14 +478,31 @@ impl Message {
         ostrya_gvariant::to_bytes(ty, &value).map_err(|e| protocol(format!("encode: {e}")))
     }
 
-    /// Decode the body of a message of `kind`. A malformed body is the error
-    /// `protocol`.
+    /// Decodes the body of a message of `kind`.
     ///
-    /// The decode borrows strings and byte arrays from `body` and reads each
-    /// array one entry at a time. It allocates the decoded message, and for a
-    /// dict value under a key it does not know, a value tree that it checks
-    /// for normal form and then drops. [`MAX_FRAME`](super::MAX_FRAME) states
-    /// the measured peaks.
+    /// The decoder borrows strings and byte arrays from `body` and reads each
+    /// array one entry at a time. It allocates the decoded message. For a
+    /// dict value under a key that it does not know, it allocates a value
+    /// tree, checks it for normal form, and then drops it.
+    /// [`MAX_FRAME`](super::MAX_FRAME) states the measured peaks.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Protocol`] if the body is malformed:
+    ///
+    /// - the body is not in normal form for the type of `kind`
+    /// - an `ObjectsEnd` body is not empty, or an `Abort` body is not the one
+    ///   byte `0x00`
+    /// - a known dict key holds a value of the wrong type
+    /// - a `HelloReply` has no `mode`, `max-frame`, `max-have`, `encodings`,
+    ///   or `parallel-uploads` key, or a limit is out of range
+    /// - a checksum is not 32 bytes long
+    /// - an object type or an encoding byte is not allowed in the message
+    /// - a ref update of a `Commit` has an unknown expected state, or a state
+    ///   that does not match its expected commit
+    /// - an `Error` message has an unknown code, has one of the keys `ref`
+    ///   and `current` alone, or has the code `ref-mismatch` with neither
+    /// - a `GetReply` whose `found` is `false` has a length
     pub fn decode(kind: Kind, body: &[u8]) -> Result<Message> {
         Ok(match kind {
             Kind::ObjectsEnd => {
@@ -512,9 +597,11 @@ impl Message {
     }
 }
 
-/// Check the limits of a `HelloReply`: `max-frame` is in
-/// `MIN_FRAME_LIMIT..=MAX_FRAME_LIMIT`, and `max-have` and `parallel-uploads`
-/// are at least 1. Otherwise the error `protocol`.
+/// Checks the limits of a `HelloReply`.
+///
+/// `max-frame` must be in `MIN_FRAME_LIMIT..=MAX_FRAME_LIMIT`, and `max-have`
+/// and `parallel-uploads` must be at least 1. Otherwise the function returns
+/// `Error::Protocol`.
 fn check_limits(max_frame: u32, max_have: u32, parallel_uploads: u32) -> Result<()> {
     if !(MIN_FRAME_LIMIT..=MAX_FRAME_LIMIT).contains(&max_frame) {
         return Err(protocol(format!("max-frame {max_frame} is out of range")));
@@ -525,7 +612,8 @@ fn check_limits(max_frame: u32, max_have: u32, parallel_uploads: u32) -> Result<
     Ok(())
 }
 
-/// `ref-mismatch` carries the ref and its current state.
+/// Checks that a `ref-mismatch` message carries the ref and its current
+/// state.
 fn check_error(e: &ErrorMessage) -> Result<()> {
     if e.code == ErrorCode::RefMismatch && e.current.is_none() {
         return Err(protocol("ref-mismatch lacks ref and current"));
@@ -582,7 +670,7 @@ fn decode_hello_reply(body: &[u8]) -> Result<HelloReply> {
     })
 }
 
-/// A `(symaymay)` ref update as it is in the body.
+/// A `(symaymay)` ref update, as the body holds it.
 type UpdateView<'a> = (&'a str, u8, MaybeBytes<'a>, MaybeBytes<'a>);
 
 fn decode_update((name, state, expected, new): UpdateView) -> Result<RefUpdate> {
@@ -632,7 +720,7 @@ fn decode_error(body: &[u8]) -> Result<ErrorMessage> {
     Ok(e)
 }
 
-/// A reply with found false carries no length.
+/// Checks that a reply whose `found` is `false` carries no length.
 fn check_get_reply(r: &GetReply) -> Result<()> {
     if !r.found && r.len.is_some() {
         return Err(protocol("GetReply with found false carries a length"));
@@ -640,7 +728,8 @@ fn check_get_reply(r: &GetReply) -> Result<()> {
     Ok(())
 }
 
-/// `deflate` is allowed for a file object alone.
+/// Checks the object type of an `ObjectHeader`, and that `deflate` occurs
+/// for a file object alone.
 fn check_header(name: &ObjectName, encoding: Encoding) -> Result<()> {
     if !header_type(name.ty) {
         return Err(protocol(format!(
@@ -658,10 +747,11 @@ fn check_header(name: &ObjectName, encoding: Encoding) -> Result<()> {
 /// the 35 bytes of the body.
 pub(super) const OBJECT_HEADER_FRAME: usize = 40;
 
-/// The frame of an `ObjectHeader`, with no allocation. The body `(yayy)` is
-/// the type, the 32 checksum bytes, the encoding, and one framing offset: the
-/// end of the checksum array, 33. The bytes equal the length, the kind, and
-/// the bytes of [`Message::encode_body`].
+/// Builds the frame of an `ObjectHeader` with no allocation.
+///
+/// The body `(yayy)` is the type, the 32 checksum bytes, the encoding, and
+/// one framing offset: the end of the checksum array, 33. The bytes equal the
+/// length, the kind, and the bytes of [`Message::encode_body`].
 pub(super) fn object_header_frame(h: &ObjectHeader) -> Result<[u8; OBJECT_HEADER_FRAME]> {
     check_header(&h.name, h.encoding)?;
     let mut frame = [0u8; OBJECT_HEADER_FRAME];
@@ -678,12 +768,16 @@ pub(super) fn object_header_frame(h: &ObjectHeader) -> Result<[u8; OBJECT_HEADER
 /// kind, and the 16 bytes of a body with a length.
 pub(super) const GET_REPLY_FRAME: usize = 21;
 
-/// The frame of a `GetReply`, with no allocation, and the number of its bytes
-/// in use: 13 with no length, 21 with one. The body `(bmt)` is the found
-/// byte, 7 bytes of padding to the alignment of the `mt`, and the 8 bytes of
-/// the length in little-endian order when there is one. A fixed-size first
-/// member and a last member take no framing offset. The bytes equal the
-/// length, the kind, and the bytes of [`Message::encode_body`].
+/// Builds the frame of a `GetReply` with no allocation.
+///
+/// The function also returns the number of bytes in use: 13 with no length,
+/// 21 with one.
+///
+/// The body `(bmt)` is the found byte, 7 bytes of padding to the alignment
+/// of the `mt`, and, if there is a length, its 8 bytes in little-endian
+/// order. A fixed-size first member and a last member take no framing
+/// offset. The bytes equal the length, the kind, and the bytes of
+/// [`Message::encode_body`].
 pub(super) fn get_reply_frame(r: &GetReply) -> Result<([u8; GET_REPLY_FRAME], usize)> {
     check_get_reply(r)?;
     let mut frame = [0u8; GET_REPLY_FRAME];
@@ -722,8 +816,10 @@ fn parse_body<'a, T: GvDecode<'a>>(body: &'a [u8]) -> Result<T> {
     T::decode(body).map_err(malformed)
 }
 
-/// Decode every entry of `items` and map it with `f`. A first pass counts
-/// the entries, so the result is allocated once at its final size.
+/// Decodes every entry of `items` and maps it with `f`.
+///
+/// A first pass counts the entries, so the function allocates the result
+/// once, at its final size.
 fn collect<'a, E: GvDecode<'a> + Copy, T>(
     items: ArrayIter<'a, E>,
     mut f: impl FnMut(E) -> Result<T>,
@@ -739,8 +835,8 @@ fn maybe_checksum(m: MaybeBytes) -> Result<Option<Checksum>> {
     m.0.map(checksum).transpose()
 }
 
-/// A `may` in the body: no bytes for nothing, or the bytes of the array and
-/// a zero byte.
+/// A `may` in the body: no bytes for `None`, or the bytes of the array and a
+/// zero byte.
 #[derive(Clone, Copy)]
 struct MaybeBytes<'a>(Option<&'a [u8]>);
 
@@ -761,8 +857,9 @@ impl<'a> GvDecode<'a> for MaybeBytes<'a> {
     }
 }
 
-/// An `mt` in the body: no bytes for nothing, or the 8 bytes of the `t`. A
-/// maybe of a fixed-size type has no terminating zero byte.
+/// An `mt` in the body: no bytes for `None`, or the 8 bytes of the `t`.
+///
+/// A maybe of a fixed-size type has no terminating zero byte.
 struct MaybeU64(Option<u64>);
 
 impl GvType for MaybeU64 {
@@ -815,9 +912,10 @@ impl<'a> GvDecode<'a> for RawVariant<'a> {
 /// An `a{sv}` in the body.
 type Dict<'a> = ArrayIter<'a, (&'a str, RawVariant<'a>)>;
 
-/// The first entry of each of `keys` in `entries`. The decoder checks every
-/// other entry for normal form and then drops it. The caller decodes each
-/// returned entry with [`field`].
+/// Returns the first entry of each of `keys` in `entries`.
+///
+/// The function checks every other entry for normal form and then drops it.
+/// The caller decodes each returned entry with [`field`].
 fn dict<'a, const N: usize>(
     entries: Dict<'a>,
     keys: [&str; N],
@@ -835,8 +933,10 @@ fn dict<'a, const N: usize>(
     Ok(found)
 }
 
-/// The value of the dict entry `key`. `Ok(None)` when the key is absent, and
-/// the error `protocol` when its variant does not hold `ty`.
+/// Returns the value of the dict entry `key`.
+///
+/// If the key is absent, the function returns `Ok(None)`. If the variant
+/// does not hold `ty`, it returns `Error::Protocol`.
 fn field<'a, T: GvDecode<'a>>(
     entry: Option<RawVariant<'a>>,
     key: &str,
@@ -851,7 +951,9 @@ fn field<'a, T: GvDecode<'a>>(
     T::decode(v.child).map(Some).map_err(malformed)
 }
 
-/// The value of the `HelloReply` key `key`, which must be present.
+/// Returns the value of the `HelloReply` key `key`, which must be present.
+///
+/// If the key is absent, the function returns `Error::Protocol`.
 fn required<'a, T: GvDecode<'a>>(entry: Option<RawVariant<'a>>, key: &str, ty: &Type) -> Result<T> {
     field(entry, key, ty)?.ok_or_else(|| protocol(format!("HelloReply lacks {key}")))
 }

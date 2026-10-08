@@ -1,25 +1,5 @@
-//! The client session of a pull over ssh.
-//!
-//! A [`PullSession`] opens with `PullHello` and asks for files by their path
-//! with [`get`](PullSession::get). The requests share one stream as a
-//! pipeline: a `get` takes its place in the pipeline and writes its `Get`
-//! frame under one lock, so the frames go on the wire in the order of the
-//! places, and the reply of a call is the next reply after the reply of the
-//! call before it. A reply carries no request id.
-//!
-//! At most [`max_outstanding`](PullSessionOptions::max_outstanding) calls
-//! hold a place at a time. A call holds its place from the write of its
-//! `Get` frame to the end of its reply: a reply with found false, or the
-//! chunk that ends the body of a found reply. The session moves to the next
-//! reply when it reads that chunk, also while the caller still holds the
-//! [`PullBody`].
-//!
-//! A failure ends the session: an `Error` from the server, a reply out of
-//! order, a stated length above the cap of the call or different from the
-//! sum of the chunks, a body past the cap, a failed read or write, a `get`
-//! future dropped after it took its place, and a [`PullBody`] dropped before
-//! its end. Each later call, and each later read of a body, fails with an
-//! error of the variant and the message of the first failure.
+//! The client session of a pull: the pipeline of `Get` frames and the bodies
+//! of the replies.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -46,7 +26,7 @@ use crate::transport::Transport;
 /// The buffer size of the input of the session.
 const STREAM_BUFFER: usize = 64 * 1024;
 
-/// The most calls that hold a place when the options name no number.
+/// The most calls that hold a place at a time if the options give no number.
 const DEFAULT_OUTSTANDING: usize = 8;
 
 type Reader = FrameReader<BufReader<Input>>;
@@ -55,24 +35,68 @@ type ReadFuture = Pin<Box<dyn Future<Output = Result<Option<Message>>> + Send>>;
 /// The options of a pull session.
 #[derive(Debug, Clone, Default)]
 pub struct PullSessionOptions {
-    /// The `agent` the session sends in `PullHello`. The default is
-    /// `ostrya/<version>`.
+    /// The `agent` value that the session sends in [`PullHello`].
+    ///
+    /// The default is `ostrya/<version>`, with the version of this crate.
     pub agent: Option<String>,
-    /// The most `get` calls that hold a place in the pipeline at a time. The
-    /// default is 8, and 0 is raised to 1.
+    /// The most [`get`](PullSession::get) calls that hold a place in the
+    /// [pipeline](PullSession#pipeline) at a time.
+    ///
+    /// The default is 8. The session raises a value of 0 to 1.
     pub max_outstanding: Option<usize>,
 }
 
-/// One client session of a pull over ssh.
+/// A client session of a pull, which reads the files of a server repository.
 ///
-/// The session is `Send + Sync`. Concurrent [`get`](PullSession::get) calls
-/// share the pipeline, and the replies come in the order of the `Get`
-/// frames. See the module docs for the rules of the pipeline.
+/// [`connect`](PullSession::connect) opens a session over ssh, and
+/// [`over_stream`](PullSession::over_stream) opens one over a pair of byte
+/// streams. The session is `Send + Sync`. Concurrent
+/// [`get`](PullSession::get) calls share the [pipeline](PullSession#pipeline),
+/// and the replies come in the order of the `Get` frames.
 ///
-/// A session dropped without [`finish`](PullSession::finish) sends nothing
-/// more and closes its output, so the server reads the end of its input. This
-/// is also true while the caller holds a [`PullBody`]. A session that [`connect`](PullSession::connect) opened then drops the ssh
-/// client without a wait.
+/// If the session is dropped without [`finish`](PullSession::finish), it
+/// sends nothing more and closes its output, so the server reads the end of
+/// its input. This is also true while the caller holds a [`PullBody`]. If
+/// [`connect`](PullSession::connect) opened the session, the drop then drops
+/// the ssh client without a wait.
+///
+/// # Pipeline
+///
+/// The session opens with [`PullHello`] and asks for files by their path
+/// with [`get`](PullSession::get). All requests share one stream as a
+/// pipeline. A `get` takes its place in the pipeline and writes its `Get`
+/// frame under one lock. Because of this lock, the frames go on the wire in
+/// the order of the places.
+///
+/// A reply carries no request id. The reply of a call is the next reply
+/// after the reply of the call before it.
+///
+/// At most [`max_outstanding`](PullSessionOptions::max_outstanding) calls
+/// hold a place at a time. A call holds its place from the write of its
+/// `Get` frame to the end of its reply.
+///
+/// The end of a reply is a [`GetReply`] whose `found` is `false`. For a reply
+/// whose `found` is `true`, the end is the chunk that ends the body. When the
+/// session reads that chunk, it moves to the next reply, also while the
+/// caller still holds the [`PullBody`].
+///
+/// # Failures
+///
+/// Each of these events is a failure, and a failure ends the session:
+///
+/// - an `Error` message from the server
+/// - a reply of a kind that the session does not expect
+/// - a stated length that is more than the cap of the call, or that is
+///   different from the sum of the chunks
+/// - a body that is longer than the cap of the call
+/// - a failed read or write
+/// - a drop of a `get` future after the call took its place
+/// - a drop of a [`PullBody`] before its end
+/// - a [`finish`](PullSession::finish) while the body of a reply is not read
+///   to its end
+///
+/// After a failure, each later call and each later read of a body fails. Its
+/// error has the variant and the message of the first failure.
 pub struct PullSession {
     inner: PullInner,
 }
@@ -87,8 +111,8 @@ struct PullInner {
 struct Shared {
     /// The places of the pipeline.
     places: Arc<Gate>,
-    /// The order of the writes: one call writes at a time, in the order the
-    /// calls arrived.
+    /// The order of the writes: one call writes at a time, in the order in
+    /// which the calls arrived.
     writing: Arc<Gate>,
     write: Mutex<WriteSide>,
     read: Mutex<ReadSide>,
@@ -98,8 +122,9 @@ struct Shared {
 }
 
 struct WriteSide {
-    /// The output, which a call takes while it writes its `Get` frame. `None`
-    /// once a write failed, the session failed, or the session ended.
+    /// The output, which a call takes while it writes its `Get` frame. It is
+    /// `None` after a write failed, after the session failed, or after the
+    /// session ended.
     writer: Option<Output>,
     /// The place of the next call.
     next: u64,
@@ -107,9 +132,9 @@ struct WriteSide {
 
 struct ReadSide {
     /// The reader. The call whose reply is next takes it while it reads the
-    /// head of its reply. The body of a found reply reads it here, under the
-    /// lock, so the end of the session drops it also while the caller holds
-    /// the body.
+    /// head of its reply. The body of a found file reads it here, under the
+    /// lock. The end of the session can then drop it also while the caller
+    /// holds the body.
     reader: Option<Box<Reader>>,
     /// The read of the frame that follows the abandon marker of a body. It
     /// holds the reader.
@@ -122,8 +147,10 @@ struct ReadSide {
     failure: Option<Error>,
 }
 
-/// An error of the variant and the message of `e`, for a later call of a
-/// session that failed with `e`. An I/O error keeps its kind.
+/// Returns a copy of `e` for a later call of a session that failed with `e`.
+///
+/// The copy has the variant and the message of `e`, and an I/O error keeps
+/// its kind. Each other variant with no wire code becomes `InvalidInput`.
 fn repeat(e: &Error) -> Error {
     match e {
         Error::Io(io) => Error::Io(io::Error::new(io.kind(), io.to_string())),
@@ -134,8 +161,10 @@ fn repeat(e: &Error) -> Error {
     }
 }
 
-/// The `io::Error` a body read gives for `e`. It carries `e`, and the kind of
-/// an I/O error.
+/// Returns the `io::Error` that a body read gives for `e`.
+///
+/// It carries `e`. Its kind is the kind of an I/O error, and `Other` for
+/// each other error.
 fn body_error(e: Error) -> io::Error {
     let kind = match &e {
         Error::Io(io) => io.kind(),
@@ -151,8 +180,8 @@ fn eof(what: &str) -> Error {
     ))
 }
 
-/// Read one message within `limit`. A failed read, an end of file, and a read
-/// that takes longer than `limit` give `None`.
+/// Reads one message within `limit`. A failed read, an end of file, and a
+/// read that takes longer than `limit` give `None`.
 async fn read_pending(reader: &mut Reader, limit: Option<Duration>) -> Option<Message> {
     let read = async { reader.read_message().await.ok().flatten() };
     match limit {
@@ -176,7 +205,7 @@ impl Shared {
         self.write.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The repeat of the first failure, when the session failed.
+    /// Returns the repeat of the first failure if the session failed.
     fn check(&self) -> Result<()> {
         match &self.lock_read().failure {
             Some(first) => Err(repeat(first)),
@@ -184,12 +213,14 @@ impl Shared {
         }
     }
 
-    /// End the session with `e`. The first failure stays the failure of the
-    /// session. Gives `e`, or the repeat of an earlier failure. The reader
-    /// and the writer are dropped, and every waiting call wakes.
+    /// Ends the session with `e`, and returns `e` or the repeat of an earlier
+    /// failure.
     ///
-    /// The failure is recorded before the writer is taken, so a call that
-    /// checks for a failure under the lock of the write side does not give
+    /// The first failure stays the failure of the session. The call drops the
+    /// reader and the writer, and wakes every waiting call.
+    ///
+    /// The call records the failure before it takes the writer. A call that
+    /// checks for a failure under the lock of the write side then cannot give
     /// the writer back to a failed session.
     fn fail(&self, e: Error) -> Error {
         let (out, reader, abandoned, waiting) = {
@@ -216,7 +247,7 @@ impl Shared {
         out
     }
 
-    /// Take the reader for the call at `place`, when its reply is next.
+    /// Takes the reader for the call at `place` when its reply is next.
     async fn wait_turn(&self, place: u64) -> Result<Box<Reader>> {
         poll_fn(|cx| {
             let mut read = self.lock_read();
@@ -243,7 +274,7 @@ impl Shared {
         .await
     }
 
-    /// Give back the reader after the reply of `place` ended, and wake the
+    /// Gives back the reader after the reply of `place` ended, and wakes the
     /// call whose reply is next.
     fn advance(&self, reader: Box<Reader>, place: u64) {
         let waker = {
@@ -258,9 +289,9 @@ impl Shared {
         }
     }
 
-    /// Give back the reader for the body of the reply at the turn, which
-    /// reads it in place. When the session failed, the reader is dropped,
-    /// and the call gives the repeat of the first failure.
+    /// Gives back the reader for the body of the reply at the turn, which
+    /// reads it in place. If the session failed, the call drops the reader
+    /// and returns the repeat of the first failure.
     fn lend(&self, reader: Box<Reader>) -> Result<()> {
         let mut read = self.lock_read();
         match &read.failure {
@@ -274,16 +305,18 @@ impl Shared {
 }
 
 impl ReadSide {
-    /// Move the turn past the reply of `place`. Gives the waker of the call
-    /// whose reply is next.
+    /// Moves the turn past the reply of `place`, and returns the waker of the
+    /// call whose reply is next.
     fn advance(&mut self, place: u64) -> Option<Waker> {
         self.turn = place + 1;
         self.waiting.remove(&(place + 1))
     }
 }
 
-/// A call that took its place. Dropped before its reply was handed over, it
-/// ends the session: its reply still arrives, and the codec is not
+/// A call that took its place in the pipeline.
+///
+/// If it is dropped before the call read the head of its reply, it ends the
+/// session. The reply of the call still arrives, and the codec is not
 /// cancel-safe.
 struct Placed<'a> {
     shared: &'a Shared,
@@ -306,18 +339,36 @@ impl Drop for Placed<'_> {
     }
 }
 
+/// The open of a session over a pair of byte streams, and its calls.
 impl PullSession {
-    /// Open a session over a pair of byte streams: `input` from the server and
-    /// `output` to it. The session sends `PullHello` with
-    /// [`PULL_PROTOCOL_VERSION`] and reads `PullHelloReply`.
+    /// Opens a session over a pair of byte streams.
     ///
-    /// An `Error` from the server is returned as its error. A reply with a
-    /// version the client does not speak is [`Error::VersionUnsupported`],
-    /// and the session closes `output` and sends no `Get`.
+    /// `input` carries the bytes from the server, and `output` the bytes to
+    /// it. The session sends [`PullHello`] with [`PULL_PROTOCOL_VERSION`] and
+    /// reads [`PullHelloReply`](crate::proto::PullHelloReply).
     ///
     /// The caller owns the liveness of the two streams. The session puts no
-    /// time limit on a read: a peer that stays silent keeps a call waiting
+    /// time limit on a read. A peer that stays silent keeps a call waiting
     /// until the caller drops its future or closes the streams.
+    ///
+    /// # Errors
+    ///
+    /// - An `Error` message from the server, as the [`Error`] variant of its
+    ///   code.
+    /// - [`Error::VersionUnsupported`] if the reply states a version out of
+    ///   `1..=PULL_PROTOCOL_VERSION`. The session then closes `output` and
+    ///   sends no `Get`.
+    /// - [`Error::Protocol`] if the reply is a message of another kind, or if
+    ///   the codec refuses a frame of the reply.
+    /// - [`Error::Protocol`] if `agent` holds a NUL byte.
+    /// - [`Error::LimitExceeded`] if the `PullHello` frame or a frame of the
+    ///   reply is longer than [`MIN_FRAME_LIMIT`].
+    /// - [`Error::Io`] if a read or a write of a stream fails. If `input`
+    ///   ends before the reply, the kind is `UnexpectedEof`.
+    ///
+    /// If the write of `PullHello` fails with [`Error::Io`], the call then
+    /// reads the message that the server can have sent before it closed. If
+    /// that message is an `Error` message, the call returns its variant.
     pub async fn over_stream<R, W>(input: R, output: W, opts: PullSessionOptions) -> Result<Self>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -326,8 +377,8 @@ impl PullSession {
         PullSession::open(Box::new(input), Box::new(output), opts, None).await
     }
 
-    /// Open a session over `input` and `output`. `pending_limit` bounds the
-    /// wait for a pending message after a failed write.
+    /// Opens a session over `input` and `output`. `pending_limit` is the
+    /// longest wait for a pending message after a failed write.
     pub(crate) async fn open(
         input: Input,
         output: Output,
@@ -397,36 +448,60 @@ impl PullSession {
         })
     }
 
-    /// Attach the child process the streams of the session belong to.
+    /// Attaches the child process whose standard streams the session uses.
     pub(crate) fn with_transport(mut self, child: Transport) -> PullSession {
         self.inner.transport = Some(child);
         self
     }
 
-    /// Ask for the file at `path`, relative to the repository root, and wait
-    /// for the head of its reply. `None` is a path that the server does not
-    /// serve.
+    /// Asks for the file at `path` and waits for the head of its reply.
     ///
-    /// The call waits while `max_outstanding` calls hold a place. It then
-    /// takes its place, and writes and flushes its `Get` frame under one
-    /// lock. A path whose `Get` frame is over the frame limit is
-    /// [`Error::LimitExceeded`], nothing is written, and the session stays
-    /// usable.
+    /// `path` is relative to the repository root. The call returns `None` if
+    /// the server does not serve the path. The [`PullBody`] holds the body to
+    /// `max_len` bytes and to its stated length.
     ///
-    /// A stated length above `max_len` ends the session with
-    /// [`Error::LimitExceeded`] before the body is read. The [`PullBody`]
-    /// holds the body to `max_len` and to its stated length.
+    /// If [`max_outstanding`](PullSessionOptions::max_outstanding) calls hold
+    /// a place, the call waits. It then takes its place, and writes and
+    /// flushes its `Get` frame under one lock.
     ///
-    /// The caller reads each body to its end, or drops it, before it awaits a
-    /// later `get`: a later call waits for the end of each body before its
-    /// own reply. A future of the call dropped after the call took its place
-    /// ends the session.
+    /// The caller must read each body to its end, or drop it, before it
+    /// awaits a later `get`. A later call waits for the end of each earlier
+    /// body before it reads its own reply. If the future of the call is
+    /// dropped after the call took its place, the session ends.
     ///
-    /// When the write of the `Get` frame fails, the call reads the message
-    /// the server can have sent before it closed, at the turn of its reply,
-    /// within the time limit of a session that
-    /// [`connect`](PullSession::connect) opened. An `Error` is returned as its
-    /// error, and otherwise the error of the write.
+    /// If the write of the `Get` frame fails, the call waits for the turn of
+    /// its reply. It then reads the message that the server can have sent
+    /// before it closed. If [`connect`](PullSession::connect) opened the
+    /// session, this read takes the ssh time limits of
+    /// [`PushSession::connect`](super::PushSession::connect). If
+    /// [`over_stream`](PullSession::over_stream) opened the session, this
+    /// read has no time limit.
+    ///
+    /// # Errors
+    ///
+    /// The first two errors leave the session usable, and the call writes
+    /// nothing. Each other error is a failure of the session, as
+    /// [Failures](PullSession#failures) states.
+    ///
+    /// - [`Error::LimitExceeded`] if the `Get` frame of `path` is longer than
+    ///   [`MIN_FRAME_LIMIT`].
+    /// - [`Error::Protocol`] if `path` holds a NUL byte.
+    /// - The repeat of the first failure, if the session failed before the
+    ///   call or while it waits.
+    /// - [`Error::LimitExceeded`] if the stated length of the body is more
+    ///   than `max_len`. The session ends before it reads the body.
+    /// - [`Error::LimitExceeded`] if a frame of the reply is longer than
+    ///   [`MIN_FRAME_LIMIT`].
+    /// - An `Error` message from the server, as the [`Error`] variant of its
+    ///   code.
+    /// - [`Error::Protocol`] if the reply is a message of another kind, or if
+    ///   the codec refuses a frame of the reply.
+    /// - [`Error::Io`] if a read or a write of the stream fails. If the stream
+    ///   ends before the reply, the kind is `UnexpectedEof`.
+    ///
+    /// If the write of the `Get` frame fails and the server sent an `Error`
+    /// message before it closed, the call returns the variant of that
+    /// message. Otherwise it returns the [`Error::Io`] of the write.
     pub async fn get(&self, path: &str, max_len: u64) -> Result<Option<PullBody>> {
         let shared = &self.inner.shared;
         shared.check()?;
@@ -522,21 +597,31 @@ impl PullSession {
         }
     }
 
-    /// End the session.
+    /// Ends the session.
     ///
-    /// After a clean end, when the session read the end of every reply and
-    /// the caller holds no body, the session closes its output at a frame
-    /// boundary, and the call returns `Ok` whatever the exit status of the
-    /// ssh client. At any other end the session closes its output and drops
-    /// its input before it waits for the ssh client, and the call returns the
-    /// error of the session: the first failure, or [`Error::InvalidInput`]
-    /// for a body that the caller still holds. The session then fails with
-    /// that error, and a later read of the held body repeats it.
+    /// An end is clean if the session read the end of every reply. After a
+    /// clean end, the session closes its output at a frame boundary. The call
+    /// then returns `Ok`, whatever the exit status of the ssh client.
     ///
-    /// A session that [`connect`](PullSession::connect) opened then waits a
-    /// bounded time for the ssh client to exit. When the error of the session
-    /// is [`Error::Io`] and the client exited with a failure status, the call
-    /// returns [`Error::Transport`] with the status.
+    /// At any other end, the session closes its output and drops its input
+    /// before it waits for the ssh client. Because the session drops the
+    /// input first, a server that is blocked in a write of a body does not
+    /// keep the client open. The session then fails with the error that the
+    /// call returns, and a later read of a held body repeats that error.
+    ///
+    /// If [`connect`](PullSession::connect) opened the session, the call then
+    /// waits for the ssh client to exit. The wait takes the ssh time limits
+    /// of [`PushSession::connect`](super::PushSession::connect).
+    ///
+    /// # Errors
+    ///
+    /// - The repeat of the first failure, if the session failed.
+    /// - [`Error::InvalidInput`] if the body of a reply is not read to its
+    ///   end, for example a body that the caller still holds.
+    /// - [`Error::Transport`] with the exit status, if the ssh client exited
+    ///   with a failure status and the error of the session is
+    ///   [`Error::Io`]. Only a session that [`connect`](PullSession::connect)
+    ///   opened returns it.
     pub async fn finish(mut self) -> Result<()> {
         let transport = self.inner.transport.take();
         let shared = &self.inner.shared;
@@ -574,27 +659,37 @@ impl PullSession {
 
 impl Drop for PullSession {
     fn drop(&mut self) {
-        // A body that the caller holds keeps the shared state, so the output
-        // is closed here.
+        // A body that the caller holds keeps the shared state, so this drop
+        // closes the output.
         let writer = self.inner.shared.lock_write().writer.take();
         drop(writer);
     }
 }
 
-/// The body of one found reply, as an `AsyncRead`.
+/// The body of a file that [`PullSession::get`] returns, as an `AsyncRead`.
 ///
 /// A read gives the bytes of the body until the chunk that ends it, and then
-/// end of file. The session moves to the next reply when a read meets that
-/// chunk. A body past the cap of its call, a body whose stated length
-/// differs from the sum of its chunks, an `Error` after the abandon marker,
-/// and a failed read each end the session. The read fails with an
-/// `io::Error` that carries the [`Error`] of the session, and each later read
-/// fails the same way. A read after the session failed for another reason,
-/// for example a dropped `get` future or [`PullSession::finish`], fails with
-/// the first failure and reads no more of the body. A body dropped before its
-/// end ends the session.
+/// end of file. When a read meets that chunk, the session moves to the next
+/// reply. The body is `Send + Sync`.
 ///
-/// The body is `Send + Sync`.
+/// # Failures
+///
+/// Each of these events in a read ends the session:
+///
+/// - a body that is longer than the `max_len` of its call
+/// - a body whose stated length is different from the sum of its chunks
+/// - an `Error` message after the abandon marker
+/// - a failed read
+///
+/// The read then fails with an `io::Error` that carries the [`Error`] of the
+/// session, and each later read fails the same way. If that error is an
+/// [`Error::Io`], the `io::Error` has its kind. Otherwise the kind is
+/// `Other`.
+///
+/// The session can also fail for another reason, for example a dropped
+/// `get` future or [`PullSession::finish`]. A later read of the body then
+/// fails with the first failure and reads no more of the body. A drop of the
+/// body before its end also ends the session.
 pub struct PullBody {
     len: Option<u64>,
     inner: Mutex<BodyInner>,
@@ -609,13 +704,14 @@ struct BodyInner {
     path: String,
     len: Option<u64>,
     max_len: u64,
-    /// The bytes of the body read so far.
+    /// The number of bytes of the body that the reads gave so far.
     read: u64,
 }
 
 enum BodyState {
-    /// The body is being read. The read side of the session holds the
-    /// reader, or the read of the frame that follows the abandon marker.
+    /// The read of the body is in progress. The read side of the session
+    /// holds the reader, or the read of the frame that follows the abandon
+    /// marker.
     Reading,
     /// The body ended.
     Ended,
@@ -624,7 +720,7 @@ enum BodyState {
 }
 
 impl PullBody {
-    /// The length the server stated for the body, when it knows it.
+    /// Returns the length that the server stated for the body, if any.
     // A body with no stated length has no answer to `is_empty`.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> Option<u64> {
@@ -641,7 +737,7 @@ impl std::fmt::Debug for PullBody {
 }
 
 impl BodyInner {
-    /// End the session with `e`, and give the error of the read.
+    /// Ends the session with `e`, and returns the error of the read.
     fn fail(&mut self, e: Error) -> io::Error {
         let e = self.shared.fail(e);
         self.state = BodyState::Failed(repeat(&e));
@@ -649,8 +745,8 @@ impl BodyInner {
         body_error(e)
     }
 
-    /// Count `n` bytes of the body, and check them against the cap and the
-    /// stated length.
+    /// Adds `n` bytes to the count of the body, and checks the count against
+    /// the cap and the stated length.
     fn count(&mut self, n: usize) -> Result<()> {
         self.read += n as u64;
         if self.read > self.max_len {

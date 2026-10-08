@@ -5,31 +5,33 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// The step a push is in.
-///
-/// The enum is `#[non_exhaustive]`, so a match outside the crate needs a
-/// wildcard arm.
+/// The step that a push is in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PushPhase {
-    /// The client reads its source and builds the object list. A tree push
-    /// shows it from the start of its scan until the walk has listed and
-    /// filtered each directory. Hash jobs can run during it.
+    /// The client reads its source and builds the object list.
+    ///
+    /// A tree push shows this phase from the start of its scan to the end of
+    /// the walk, which lists and filters each directory. Hash jobs can run in
+    /// this phase. A new [`PushProgress`] starts in this phase.
     #[default]
     Scanning,
-    /// The client hashes the files of a tree. A tree push shows it after the
-    /// walk, while the hash jobs still in flight end and the directories are
-    /// hashed bottom-up.
+    /// The client hashes the files and the directories of a tree.
+    ///
+    /// A tree push shows this phase after the walk. In this phase, the hash
+    /// jobs that still run come to an end, and the client hashes the
+    /// directories bottom-up.
     Hashing,
-    /// The session starts its transport and exchanges `Hello` with the
-    /// server. An ssh client can ask for a password or a passphrase on the
-    /// terminal in this phase.
+    /// The session starts its transport and exchanges `Hello` with the server.
+    ///
+    /// In this phase, an ssh client can ask for a password or a passphrase on
+    /// the terminal.
     Connecting,
     /// The session exchanges `Have` with the server.
     Negotiating,
     /// The session sends objects.
     Uploading,
-    /// The session sent `Commit` and waits for the reply.
+    /// The session sends `Commit` and waits for the reply.
     Committing,
 }
 
@@ -57,56 +59,64 @@ impl PushPhase {
     }
 }
 
-/// The hook of a [`PushProgress`]: a function that receives the counters of
-/// the handle when they change in a way a progress display shows.
+/// A hook that receives the counters of a [`PushProgress`] when they change.
+///
+/// The hook gets a call only at a change that a progress display shows.
+/// [Hook calls](PushProgress#hook-calls) lists these changes.
 ///
 /// The hook runs on the task that changed the counters: the task of the
-/// session, or the task of the scan of a tree push. Over HTTP each parallel
-/// object stream of a session calls it, so it can be called from more than
-/// one thread at the same time. The hook must return soon, because the
-/// session waits for it. A hook that keeps state between calls holds that
-/// state behind its own interior mutability, for example an atomic or a
-/// mutex.
+/// session, or the task of the scan of a tree push. Over HTTP, each parallel
+/// object stream of a session calls the hook, so more than one thread can call
+/// it at the same time. The session waits for the hook, so the hook must
+/// return soon.
+///
+/// A hook that keeps state between calls holds that state behind interior
+/// mutability of its own, for example an atomic or a mutex.
 pub type PushProgressFn = Arc<dyn Fn(&PushProgressSnapshot) + Send + Sync>;
 
-/// The number of content bytes between two calls of the hook that the
-/// content bytes make: 100 KiB.
+/// The step of the content count at which the hook gets a call: 100 KiB.
 const HOOK_BYTE_STEP: u64 = 102_400;
 
-/// The live counters of pushes, which a caller reads while they run.
+/// A handle on the live counters of pushes.
 ///
 /// A caller sets a clone of the handle in
-/// [`SessionOptions::progress`](super::SessionOptions::progress) and reads
-/// [`snapshot`](PushProgress::snapshot) from another task or thread. A
-/// session adds to the counters of the handle and never sets them to zero. A
-/// handle that several sessions share shows the sum of their counters, and the
-/// phase of the session that set it last.
+/// [`SessionOptions::progress`](super::SessionOptions::progress). Then it
+/// reads [`snapshot`](PushProgress::snapshot) from another task or thread
+/// while the push runs. A session adds to the counters of the handle and
+/// never sets them to zero.
 ///
-/// A handle made with [`with_hook`](PushProgress::with_hook) also calls its
-/// hook with a snapshot:
+/// If several sessions share a handle, the handle shows the sum of their
+/// counters and the phase of the session that set it last.
 ///
-/// - each time the phase changes to another phase;
+/// The [`PushStats`] of a session come from counters of its own, and the
+/// handle does not change them. Each count is one relaxed atomic add to those
+/// counters, and one more to the handle if the session has one.
+///
+/// # Hook calls
+///
+/// A handle made with [`with_hook`](PushProgress::with_hook) calls its hook
+/// with a snapshot at these changes:
+///
+/// - each time the phase changes to another phase
 /// - after each object of the object stream, when
-///   [`objects_sent`](PushProgressSnapshot::objects_sent) grows;
+///   [`objects_sent`](PushProgressSnapshot::objects_sent) grows
 /// - each time [`content_bytes`](PushProgressSnapshot::content_bytes)
-///   reaches the next multiple of 102,400 bytes.
-///
-/// The [`PushStats`] of a session come from counters of its own, whatever the
-/// handle holds. Each count is one relaxed atomic add to those counters, and
-/// one more to the handle when the session has one.
+///   reaches the next multiple of 102,400 bytes (100 KiB)
 #[derive(Debug, Clone, Default)]
 pub struct PushProgress {
     inner: Arc<ProgressCounters>,
 }
 
 impl PushProgress {
-    /// A handle whose counters are all zero.
+    /// Creates a handle whose counters are all zero.
     pub fn new() -> PushProgress {
         PushProgress::default()
     }
 
-    /// A handle whose counters are all zero, and which calls `hook` as the
-    /// type docs state. [`PushProgressFn`] gives the rules of the hook.
+    /// Creates a handle whose counters are all zero and that calls `hook`.
+    ///
+    /// [Hook calls](PushProgress#hook-calls) lists the calls.
+    /// [`PushProgressFn`] gives the rules of the hook.
     pub fn with_hook(hook: PushProgressFn) -> PushProgress {
         PushProgress {
             inner: Arc::new(ProgressCounters {
@@ -116,13 +126,15 @@ impl PushProgress {
         }
     }
 
-    /// The counters as they stand. Each counter is read on its own, so two
-    /// counters of one snapshot can differ by the work of one step.
+    /// Returns the counters as they stand now.
+    ///
+    /// The method reads each counter on its own, so two counters of one
+    /// snapshot can differ by the work of one step.
     pub fn snapshot(&self) -> PushProgressSnapshot {
         self.inner.snapshot()
     }
 
-    /// Set the phase of the handle. A tree push sets the phases of its scan
+    /// Sets the phase of the handle. A tree push sets the phases of its scan
     /// before a session opens.
     pub(crate) fn set_phase(&self, phase: PushPhase) {
         self.inner.set_phase(phase);
@@ -131,64 +143,78 @@ impl PushProgress {
 
 /// The counters of a [`PushProgress`] at one point in time.
 ///
-/// Code outside this crate gets one from [`PushProgress::snapshot`], from
-/// the hook, or from `Default`. A later version can add a field, so that
-/// code reads the fields by name and makes no struct literal.
+/// Code outside this crate gets a snapshot from [`PushProgress::snapshot`],
+/// from the hook, or from `Default`, and reads its fields by name.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PushProgressSnapshot {
-    /// The step the push is in.
+    /// The step that the push is in.
     pub phase: PushPhase,
-    /// As [`PushStats::objects_total`], so far.
+    /// The count of [`PushStats::objects_total`] so far.
     pub objects_total: u64,
-    /// As [`PushStats::objects_needed`], so far.
+    /// The count of [`PushStats::objects_needed`] so far.
     pub objects_needed: u64,
-    /// As [`PushStats::objects_sent`], so far.
+    /// The count of [`PushStats::objects_sent`] so far.
     pub objects_sent: u64,
-    /// As [`PushStats::bytes_sent`], so far.
+    /// The count of [`PushStats::bytes_sent`] so far.
     pub bytes_sent: u64,
-    /// As [`PushStats::payload_bytes`], so far.
+    /// The count of [`PushStats::payload_bytes`] so far.
     pub payload_bytes: u64,
-    /// The content bytes the session read so far: the bytes it read from
-    /// the reader that its source gave for each file object, before its own
-    /// compressor. A stored `.filez` that the session sends as it is counts
+    /// The content bytes that the session read so far.
+    ///
+    /// These are the bytes that the session read from the reader that its
+    /// source gave for each file object, before the compressor of the
+    /// session. A stored `.filez` that the session sends as it is counts
     /// with its stored bytes. A symlink, a metadata object, and detached
     /// metadata count no byte.
     pub content_bytes: u64,
-    /// The content bytes of the file objects that the session sends, as the
-    /// source told them before the first object, so that `content_bytes`
-    /// ends at this total. It stays 0 when the source does not tell it: see
+    /// The content bytes of the file objects that the session sends.
+    ///
+    /// The source tells this total before the first object, so
+    /// `content_bytes` ends at this total. If the source does not tell it,
+    /// or the query fails, the total stays 0. See
     /// [`ObjectSource::content_size`](super::ObjectSource::content_size).
     pub bytes_total: u64,
 }
 
-/// What one push session sent.
+/// The statistics of one push session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PushStats {
-    /// The objects the client offered in `Have`.
+    /// The number of objects that the client offered in `Have`.
     pub objects_total: u64,
-    /// The objects the server asked for in `HaveReply`.
+    /// The number of objects that the server asked for in `HaveReply`.
     pub objects_needed: u64,
-    /// The objects sent in the object stream. A detached metadata object
-    /// does not count.
-    pub objects_sent: u64,
-    /// The bytes the session handed to its transport: frames, chunk
-    /// lengths, and object bytes.
+    /// The number of objects that the session sent in the object stream.
     ///
-    /// On a stream transport, each byte counts when the session writes it
-    /// to the stream. Over HTTP, the bodies of the requests count, and the
-    /// HTTP heads do not. A body given whole, as for `Hello`, `Have`, and
-    /// `Commit`, counts when the client handed its request to a connection:
-    /// when the request gets a response, and when it fails after the
-    /// hand-over. An object stream counts each byte it writes into its
-    /// request body once the request is handed over, and the bytes it wrote
-    /// before the hand-over at that time. A request that is never handed
-    /// over counts no byte.
+    /// A detached metadata object does not count.
+    pub objects_sent: u64,
+    /// The number of bytes that the session gave to its transport.
+    ///
+    /// The count holds the frames, the chunk lengths, and the object bytes.
+    /// On a stream transport, a byte counts when the session writes it to
+    /// the stream.
+    ///
+    /// Over HTTP, the request bodies count and the HTTP heads do not:
+    ///
+    /// - A whole body, as for `Hello`, `Have`, and `Commit`, counts when the
+    ///   client gives its request to a connection. It counts if the request
+    ///   gets a response, and also if the request fails after the hand-over.
+    /// - An object stream counts each byte that it writes into its request
+    ///   body after the hand-over. At the hand-over, it counts the bytes that
+    ///   it wrote before.
+    /// - A request that the client never gives to a connection counts no
+    ///   byte.
     pub bytes_sent: u64,
-    /// The object bytes sent, in the encoding they were sent in, without the
-    /// chunk lengths. Detached metadata objects count.
+    /// The object bytes that the session sent, without the chunk lengths.
+    ///
+    /// The bytes are in the encoding that the session sent them in. Detached
+    /// metadata objects count.
     pub payload_bytes: u64,
-    /// How long the session ran.
+    /// The time that the session ran.
+    ///
+    /// The clock starts when the session opens: after the ssh client starts,
+    /// or before the first HTTP request. The scan and the hash pass of a tree
+    /// push do not count.
     pub elapsed: Duration,
 }
 
@@ -230,14 +256,14 @@ impl ProgressCounters {
         }
     }
 
-    /// Call the hook with the counters as they stand.
+    /// Calls the hook with the counters as they stand.
     fn call_hook(&self) {
         if let Some(hook) = &self.hook {
             hook(&self.snapshot());
         }
     }
 
-    /// Set the phase, and call the hook when the phase changed.
+    /// Sets the phase, and calls the hook if the phase changed.
     fn set_phase(&self, phase: PushPhase) {
         let before = self.phase.swap(phase.as_u8(), Ordering::Relaxed);
         if before != phase.as_u8() {
@@ -245,13 +271,13 @@ impl ProgressCounters {
         }
     }
 
-    /// Count one object sent, and call the hook.
+    /// Counts one object sent, and calls the hook.
     fn object_sent(&self) {
         self.objects_sent.fetch_add(1, Ordering::Relaxed);
         self.call_hook();
     }
 
-    /// Count `n` content bytes, and call the hook when the count reached the
+    /// Counts `n` content bytes, and calls the hook if the count reaches the
     /// next multiple of [`HOOK_BYTE_STEP`].
     fn content(&self, n: u64) {
         let before = self.content_bytes.fetch_add(n, Ordering::Relaxed);
@@ -261,8 +287,9 @@ impl ProgressCounters {
     }
 }
 
-/// The counters one session counts into: its own, which its [`PushStats`]
-/// read, and the caller's handle, which receives the same additions.
+/// The counters that one session counts into: its own, which its
+/// [`PushStats`] read, and the handle of the caller, which receives the same
+/// additions.
 #[derive(Debug)]
 pub(crate) struct Counters {
     own: ProgressCounters,
@@ -271,8 +298,8 @@ pub(crate) struct Counters {
 }
 
 impl Counters {
-    /// The counters of a session that starts now, which also counts into
-    /// `caller` where there is one.
+    /// Creates the counters of a session that starts now. The session also
+    /// counts into `caller` if there is one.
     pub(crate) fn new(caller: Option<&PushProgress>) -> Counters {
         Counters {
             own: ProgressCounters::default(),
@@ -281,7 +308,8 @@ impl Counters {
         }
     }
 
-    /// Run `f` on the session's own counters, then on the caller's.
+    /// Runs `f` on the own counters of the session, then on the counters of
+    /// the caller.
     fn each(&self, f: impl Fn(&ProgressCounters)) {
         f(&self.own);
         if let Some(caller) = &self.caller {
@@ -309,19 +337,19 @@ impl Counters {
         self.each(ProgressCounters::object_sent);
     }
 
-    /// Count `n` content bytes read from the source of a file object.
+    /// Counts `n` content bytes read from the source of a file object.
     pub(crate) fn content(&self, n: u64) {
         self.each(|c| c.content(n));
     }
 
-    /// Add `n` to the content bytes the session is to send.
+    /// Adds `n` to the content bytes that the session will send.
     pub(crate) fn content_total(&self, n: u64) {
         self.each(|c| {
             c.bytes_total.fetch_add(n, Ordering::Relaxed);
         });
     }
 
-    /// Whether a caller's handle receives the counts.
+    /// Returns `true` if a handle of the caller receives the counts.
     pub(crate) fn has_caller(&self) -> bool {
         self.caller.is_some()
     }
@@ -338,7 +366,7 @@ impl Counters {
         });
     }
 
-    /// The statistics of the session so far.
+    /// Returns the statistics of the session so far.
     pub(crate) fn stats(&self) -> PushStats {
         let s = self.own.snapshot();
         PushStats {

@@ -1,11 +1,8 @@
-//! The HTTP transport of a session: each step of the session is one request
-//! to the receive endpoint of the server.
+//! The HTTP transport of a session.
 //!
-//! `Hello`, `Have`, and `Commit` go as whole request bodies, and each object
-//! stream as the streamed body of one `objects` request. Each response body
-//! holds one frame: the reply of the step, or an `Error`. One `send` call
-//! runs up to `parallel-uploads` object streams at the same time, and the
-//! calls of one session share one gate of that many permits.
+//! Each step of a session is one request to the receive endpoint of the
+//! server, and each response body holds one frame. The calls of one session
+//! share one gate of `parallel-uploads` permits, at most [`MAX_PARALLEL`].
 
 use std::future::Future;
 use std::pin::Pin;
@@ -40,12 +37,13 @@ const SESSION_PATH: &str = "_ostrya/receive/v1/session";
 /// The response header that names a new session.
 const SESSION_HEADER: &str = "ostrya-session";
 
-/// The longest wait for the response to `Hello` after the request body was
-/// sent.
+/// The longest wait for the response to `Hello` after the client sent the
+/// request body.
 const HELLO_RESPONSE: Duration = Duration::from_secs(360);
 
-/// The longest wait for the response to `Commit` after the request body was
-/// sent. The response follows the commit checks and the ref writes.
+/// The longest wait for the response to `Commit` after the client sent the
+/// request body. The response comes after the commit checks and the ref
+/// writes.
 const COMMIT_RESPONSE: Duration = Duration::from_secs(3600);
 
 /// The most object streams of one session, whatever the server announces.
@@ -53,11 +51,11 @@ const COMMIT_RESPONSE: Duration = Duration::from_secs(3600);
 /// never wait for the object streams at the gate of the fetcher.
 pub(crate) const MAX_PARALLEL: u32 = 31;
 
-/// The start of the message of an error that the server gives a step of a
-/// session that it aborted for another cause.
+/// The start of the message of an error that the server gives to a step
+/// after it aborted the session for another cause.
 const SESSION_ABORTED: &str = "the session was aborted";
 
-/// The credential each request of a session carries.
+/// The credential that each request of a session carries.
 pub(crate) enum Credential {
     /// `Authorization: Bearer`.
     Bearer(BearerToken),
@@ -72,7 +70,7 @@ pub(crate) struct Endpoint {
     /// The push address, which the messages name.
     pub(crate) url: String,
     pub(crate) credential: Option<Credential>,
-    /// Send the credential to an `http://` address.
+    /// If `true`, the requests send the credential to an `http://` address.
     pub(crate) allow_cleartext: bool,
 }
 
@@ -80,12 +78,12 @@ pub(crate) struct Endpoint {
 type Sent = std::result::Result<Uploaded, ostrya_fetch::Error>;
 
 impl Endpoint {
-    /// Send one request to `path` under the push address. `timeout` bounds
-    /// the wait for the response after the body was sent. `None` takes the
-    /// progress timeout of the fetcher.
+    /// Sends one request to `path` under the push address.
     ///
-    /// The future of an upload is large, so it is boxed, and the future of
-    /// each step holds a pointer to it.
+    /// `timeout` bounds the wait for the response after the body is sent. If
+    /// `timeout` is `None`, the wait takes the progress timeout of the
+    /// fetcher. The future of an upload is large, so the call boxes it, and
+    /// the future of each step holds a pointer to it.
     fn request<'a>(
         &'a self,
         path: &'a str,
@@ -105,10 +103,12 @@ impl Endpoint {
         Box::pin(self.fetcher.upload(request))
     }
 
-    /// `POST` the whole body `body` to `path`, as [`request`](Self::request)
-    /// does. The bytes of the body count as sent when the fetcher handed the
-    /// request to a connection: when the upload gives a response, and when
-    /// it fails after the hand-over.
+    /// Sends the whole body `body` to `path` with `POST`, as
+    /// [`request`](Self::request) does.
+    ///
+    /// The bytes of the body count as sent when the fetcher hands the request
+    /// to a connection. This is true if the upload gives a response, and if
+    /// the upload fails after the hand-over.
     async fn post(
         &self,
         path: &str,
@@ -126,7 +126,7 @@ impl Endpoint {
         sent
     }
 
-    /// The URL of `path`, for a message.
+    /// Returns the URL of `path`, for the text of an error.
     fn url_of(&self, path: &str) -> String {
         format!("{}/{path}", self.url.trim_end_matches('/'))
     }
@@ -143,14 +143,15 @@ pub(crate) struct HttpLink {
     permits: usize,
     /// The frame and chunk limit of the server.
     max_frame: u32,
-    /// Set when a call failed or its future was dropped before it completed.
+    /// `true` after a call fails, or after the future of a call is dropped
+    /// before it completes.
     broken: AtomicBool,
-    /// Set while a `missing` call runs.
+    /// `true` while a `missing` call runs.
     have_busy: AtomicBool,
 }
 
-/// Marks a session broken when a call fails, or when its future is dropped
-/// before it completes.
+/// A guard that marks the session broken if a call fails, or if the future
+/// of the call is dropped before it completes.
 struct Call<'a> {
     broken: &'a AtomicBool,
     completed: bool,
@@ -177,7 +178,7 @@ impl Drop for Call<'_> {
     }
 }
 
-/// Clears the flag of a `missing` call when the call ends.
+/// A guard that clears the flag of a `missing` call when the call ends.
 struct Busy<'a> {
     flag: &'a AtomicBool,
 }
@@ -188,13 +189,17 @@ impl Drop for Busy<'_> {
     }
 }
 
-/// The message of the body of a response with `status` from `url`.
+/// Reads the message of the body of a response with `status` from `url`.
 ///
 /// The body of a 200 holds one frame. The body of a 401, a 403, a 409, a
-/// 422, a 500, and a 503 holds one `Error` frame. Each other status, a body
-/// that is not one frame, and a frame that is not `Error` with one of those
-/// statuses, is [`Error::Transport`], which names the URL and the status. A
-/// failed read of the body is [`Error::Io`]. The reader takes frames of at
+/// 422, a 500, and a 503 holds one frame of an `Error` message. These cases
+/// are [`Error::Transport`], which names the URL and the status:
+///
+/// - each other status,
+/// - a body that is not one frame,
+/// - a frame other than an `Error` message with one of the error statuses.
+///
+/// A failed read of the body is [`Error::Io`]. The reader takes frames of at
 /// most [`MAX_FRAME`] bytes, whatever the server announced.
 async fn decode_reply<R: AsyncRead + Unpin>(status: u16, url: &str, body: R) -> Result<Message> {
     if !matches!(status, 200 | 401 | 403 | 409 | 422 | 500 | 503) {
@@ -229,24 +234,28 @@ async fn decode_reply<R: AsyncRead + Unpin>(status: u16, url: &str, body: R) -> 
     }
 }
 
-/// The message of the response `uploaded` from `url`, as
-/// [`decode_reply`] reads it. The future holds the response body and a frame
-/// reader, so it is boxed, and the future of each step holds a pointer to it.
+/// Reads the message of the response `uploaded` from `url` with
+/// [`decode_reply`].
+///
+/// The future holds the response body and a frame reader, so the call boxes
+/// it. The future of each step holds a pointer to it.
 fn reply(uploaded: Uploaded, url: &str) -> BoxFuture<'_, Result<Message>> {
     let status = uploaded.status();
     Box::pin(decode_reply(status, url, uploaded.into_body()))
 }
 
-/// A session id: 64 lowercase hex digits.
+/// Returns the session id of the [`SESSION_HEADER`] header of `uploaded`, if
+/// the id is 64 lowercase hex digits.
 fn session_id(uploaded: &Uploaded) -> Option<String> {
     let id = uploaded.headers().get(SESSION_HEADER)?.to_str().ok()?;
     let valid = id.len() == 64 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     valid.then(|| id.to_owned())
 }
 
-/// Open a session: send `Hello` with `refs` and read `HelloReply`. A failed
-/// check of the reply after the server opened the session ends the session
-/// with `DELETE`.
+/// Opens a session: sends `Hello` with `refs` and reads `HelloReply`.
+///
+/// If a check of the reply fails after the server opened the session, the
+/// call ends the session with `DELETE`.
 pub(super) async fn open(
     endpoint: Endpoint,
     refs: &[String],
@@ -297,18 +306,26 @@ pub(super) async fn open(
     }
 }
 
-/// The number of object streams of a `send` call of `names` names with
-/// `permits` permits: one for each permit, and no more than the names, and
-/// at least one, which sends the detached metadata of a call with no name.
+/// Returns the number of object streams of a `send` call of `names` names
+/// with `permits` permits.
+///
+/// The number is one for each permit, no more than `names`, and at least
+/// one. The one stream of a call with no name sends the detached metadata.
 fn worker_count(permits: usize, names: usize) -> usize {
     permits.min(names.max(1))
 }
 
-/// The rank of an error of one object stream of a `send` call. The call
-/// returns the error of the lowest rank: an error of the client, then an
-/// error the server gave for its own cause, then any other error, such as
-/// the error a step gets when the server aborted the session for the cause
-/// of another stream.
+/// Returns the rank of an error of one object stream of a `send` call.
+///
+/// A `send` call returns the error of the lowest rank:
+///
+/// - 0: an error of the client, [`Error::Source`] or [`Error::InvalidInput`].
+/// - 1: each other error with a wire code. Examples are an error that the
+///   server gave for its own cause, and an [`Error::Protocol`] that the
+///   client makes for a frame that it refuses.
+/// - 2: each other error, and an [`Error::Protocol`] whose message starts
+///   with [`SESSION_ABORTED`]. That is the error that a step gets after the
+///   server aborted the session for the cause of another stream.
 fn rank(e: &Error) -> u8 {
     match e {
         Error::Source(_) | Error::InvalidInput(_) => 0,
@@ -318,11 +335,12 @@ fn rank(e: &Error) -> u8 {
     }
 }
 
-/// The error of a `Commit` request whose upload failed with `e`. A request
-/// that the fetcher did not hand over is a definite failure, which is
-/// [`Error::Fetch`]. A request that it handed over can have reached the
-/// server, so each failure after it is the error of `unknown`, and the
-/// request is not sent again.
+/// Returns the error of a `Commit` request whose upload failed with `e`.
+///
+/// If the fetcher did not hand the request over, the failure is definite,
+/// and the error is [`Error::Fetch`]. A request that the fetcher handed over
+/// can have reached the server. Each failure after the hand-over is then the
+/// error that `unknown` makes, and the client does not send the request again.
 fn commit_failure(e: ostrya_fetch::Error, unknown: impl FnOnce(String) -> Error) -> Error {
     if e.is_unsent() {
         Error::Fetch(e)
@@ -334,9 +352,10 @@ fn commit_failure(e: ostrya_fetch::Error, unknown: impl FnOnce(String) -> Error)
 /// The future of one object stream of a `send` call.
 type Worker<'f> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'f>>;
 
-/// The wake-ups of the workers of one [`join_workers`] call. Each worker has
-/// a waker of its own, which records the worker and wakes the task of the
-/// call, so the call polls the workers that woke alone.
+/// The wake-ups of the workers of one [`join_workers`] call.
+///
+/// Each worker has its own waker. The waker records the worker and wakes the
+/// task of the call. The call then polls only the workers that woke.
 struct Woken {
     /// One bit for each worker that woke since the call last polled it.
     due: AtomicU32,
@@ -370,14 +389,18 @@ impl Wake for WorkerWaker {
     }
 }
 
-/// Run `workers` to their end in the task of the caller, and give the error
-/// of each worker that failed, in the order the errors came. At the first
-/// error `stop` runs, and the call then waits for every worker to end.
+/// Runs `workers` to their end in the task of the caller and returns the
+/// errors of the failed workers.
 ///
-/// Each worker is polled first when the call is, and then only when its own
-/// waker woke. The waker of the task is kept before the due workers are
-/// read, so a worker that wakes during a poll of the call wakes the task
-/// again, and no wake-up is lost. One call runs at most 32 workers.
+/// The errors are in the order in which they came. At the first error, the
+/// call runs `stop` and then waits for every worker to end. The first poll of
+/// the call polls each worker. After that, the call polls a worker only when
+/// the waker of that worker wakes.
+///
+/// The call keeps the waker of the task before it reads the due workers. A
+/// worker that wakes during a poll of the call then wakes the task again, so
+/// no wake-up is lost. One call runs at most 32 workers, and more workers cause
+/// a panic.
 async fn join_workers(workers: Vec<Worker<'_>>, stop: impl Fn()) -> Vec<Error> {
     assert!(workers.len() <= 32, "a call runs at most 32 workers");
     // A worker that ends is dropped at once.
@@ -431,20 +454,23 @@ async fn join_workers(workers: Vec<Worker<'_>>, stop: impl Fn()) -> Vec<Error> {
     errors
 }
 
-/// How the write side of one object stream ended.
+/// The end of the write side of one object stream.
 enum Written {
     /// The stream ended with `ObjectsEnd`, and the body is closed.
     Done,
-    /// The source failed, or gave data the session cannot send. The stream
-    /// ended with `Abort`.
+    /// The source failed or gave data that the session cannot send. The
+    /// stream ended with `Abort`.
     Abandoned(Error),
-    /// A write failed. The body was dropped open, so the request fails.
+    /// A write failed. The body is dropped while it is open, so the request
+    /// fails.
     Failed(Error),
 }
 
-/// Write the object stream of one request: `first`, the items of `up` that
-/// `pass` takes after it, and `ObjectsEnd`. A failure stops `up`. The output
-/// is dropped when the call returns, so a body that is not closed fails.
+/// Writes the object stream of one request: `first`, the items of `up` that
+/// `pass` takes after it, and `ObjectsEnd`.
+///
+/// A failure stops `up`. The output is dropped when the call returns, so a
+/// body that is not closed fails.
 async fn write_stream<W: AsyncWrite + Unpin>(
     mut out: ObjectWriter<W>,
     first: std::result::Result<Item, Stop>,
@@ -491,12 +517,12 @@ async fn write_stream<W: AsyncWrite + Unpin>(
 }
 
 impl HttpLink {
-    /// The path of the step `step` of the session.
+    /// Returns the path of the step `step` of the session.
     fn step_path(&self, step: &str) -> String {
         format!("{}/{step}", self.session)
     }
 
-    /// Send `body` to the step `step` and read the message of the response.
+    /// Sends `body` to the step `step` and reads the message of the response.
     async fn step(&self, step: &str, body: Vec<u8>, counters: &Counters) -> Result<Message> {
         let path = self.step_path(step);
         let uploaded = self
@@ -507,8 +533,10 @@ impl HttpLink {
         reply(uploaded, &self.endpoint.url_of(&path)).await
     }
 
-    /// End the session on the server with `DELETE`. A 204 and a 404, which
-    /// the server gives for a session it ended already, are success.
+    /// Ends the session on the server with `DELETE`.
+    ///
+    /// The call returns `Ok` for a 204 and for a 404. The server gives a 404
+    /// for a session that it ended already.
     async fn delete(&self) -> Result<()> {
         let url = self.endpoint.url_of(&self.session);
         let uploaded = self
@@ -533,9 +561,11 @@ impl HttpLink {
         }
     }
 
-    /// The objects of `names` that the server does not hold, as
-    /// [`PushSession::missing`](super::PushSession::missing) states. Each
-    /// `Have` is one request, and the next waits for its response.
+    /// Returns the objects of `names` that the server does not hold, as
+    /// [`PushSession::missing`](super::PushSession::missing) states.
+    ///
+    /// Each `Have` is one request. The next `Have` waits for the response to
+    /// the `Have` before it.
     pub(super) async fn missing(
         &self,
         server: &ServerInfo,
@@ -581,15 +611,17 @@ impl HttpLink {
         Ok(missing)
     }
 
-    /// Send the objects of `up` over object streams of their own, as
+    /// Sends the objects of `up` over object streams of their own, as
     /// [`PushSession::send`](super::PushSession::send) states.
     ///
     /// The call runs one object stream for each permit of the session, up to
     /// one for each name, and polls them in its own task. Each stream waits
     /// for a permit of the session gate, so the streams of all the calls of
     /// the session stay within the permits. After the first error, no stream
-    /// takes a new name. Each stream reads its response, and the call then
-    /// returns the error of the lowest [`rank`].
+    /// takes a new name.
+    ///
+    /// Each stream reads its response. The call then returns the error of the
+    /// lowest [`rank`].
     pub(super) async fn send(&self, counters: &Arc<Counters>, up: &Upload<'_>) -> Result<()> {
         if self.broken.load(Ordering::Relaxed) {
             return Err(broken());
@@ -613,9 +645,10 @@ impl HttpLink {
         }
     }
 
-    /// One object stream of a `send` call: take a permit, take the first
-    /// item, and send the items of `up` in one `objects` request. A stream
-    /// that finds no item sends no request.
+    /// Sends one object stream of a `send` call in one `objects` request.
+    ///
+    /// The stream takes a permit and the first item, and then sends the items
+    /// of `up`. A stream that finds no item sends no request.
     async fn object_stream(&self, counters: &Arc<Counters>, up: &Upload<'_>) -> Result<()> {
         let _permit = self.gate.acquire(Priority::Normal).await;
         let (body, writer) = UploadBody::channel();
@@ -633,8 +666,9 @@ impl HttpLink {
         };
         let path = self.step_path("objects");
         let url = self.endpoint.url_of(&path);
-        // The response is read to its end, which ends a body that is still
-        // open, so the write side cannot wait for a request that is over.
+        // This future reads the response to its end, which also ends a body
+        // that is still open. The write side then cannot wait for a request
+        // that is over.
         let response = async {
             let uploaded = self
                 .endpoint
@@ -652,8 +686,8 @@ impl HttpLink {
                 other => Err(unexpected(&other, "ObjectsEnd")),
             },
             Written::Abandoned(error) => Err(error),
-            // A write fails when the request failed or the server answered
-            // before the end of the body. The response tells why.
+            // A write fails if the request failed, or if the server answered
+            // before the end of the body. The response gives the cause.
             Written::Failed(e) => Err(match reply {
                 Ok(Message::Error(sent)) => sent.into(),
                 Ok(_) => e,
@@ -662,10 +696,15 @@ impl HttpLink {
         }
     }
 
-    /// Send `Commit` with `updates`, as
-    /// [`PushSession::commit`](super::PushSession::commit) states. A refusal
-    /// of `checked`, a broken session, and a `Commit` the codec refuses end
-    /// the session with `DELETE` and send no `Commit`.
+    /// Sends `Commit` with `updates`, as
+    /// [`PushSession::commit`](super::PushSession::commit) states.
+    ///
+    /// The call ends the session with `DELETE` and sends no `Commit` in these
+    /// cases:
+    ///
+    /// - `checked` is an error.
+    /// - The session is broken.
+    /// - The codec refuses the `Commit`.
     pub(super) async fn commit(
         self,
         server: &ServerInfo,
@@ -724,8 +763,10 @@ impl HttpLink {
         })
     }
 
-    /// End the session with `DELETE`. On a broken session the call still
-    /// sends `DELETE`, and then returns [`Error::InvalidInput`].
+    /// Ends the session with `DELETE`.
+    ///
+    /// If the session is broken, the call also sends `DELETE` and then returns
+    /// [`Error::InvalidInput`].
     pub(super) async fn abort(self) -> Result<()> {
         let was_broken = self.broken.load(Ordering::Relaxed);
         let deleted = self.delete().await;
@@ -774,8 +815,8 @@ mod tests {
         }
     }
 
-    /// A 200 gives its one frame. An `Error` frame with each status that
-    /// carries one gives the frame.
+    /// A 200 gives its one frame. Each status that carries an `Error`
+    /// message gives the frame of that message.
     #[test]
     fn a_frame_status_gives_its_frame() {
         let reply = Message::ObjectsReply(ObjectsReply {
@@ -815,7 +856,7 @@ mod tests {
         }
     }
 
-    /// Each other status is a transport error that names the URL and the
+    /// Each other status is `Error::Transport`, which names the URL and the
     /// status, whatever the body holds.
     #[test]
     fn another_status_is_a_transport_error() {
@@ -828,9 +869,9 @@ mod tests {
         }
     }
 
-    /// A body that is not one frame is a transport error: an empty body,
-    /// text, a cut frame, bytes after the frame, a frame over the limit of
-    /// the client, and a reply frame with an error status.
+    /// A body that is not one frame is `Error::Transport`: an empty body,
+    /// text, bytes after the frame, a frame over the limit of the client, and
+    /// a reply frame with an error status. A cut frame is `Error::Io`.
     #[test]
     fn a_body_that_is_not_one_frame_is_a_transport_error() {
         transport(decode(200, b""), "the body is empty");
@@ -907,9 +948,9 @@ mod tests {
     }
 
     /// The futures of `missing`, `commit`, `connect`, its two steps, and the
-    /// tree pushes hold the state of both transports. The upload request, the read of its
-    /// reply, and the construction of the fetcher are boxed, so none of them
-    /// sits inline in these futures.
+    /// tree pushes hold the state of both transports. The upload request, the
+    /// read of its reply, and the construction of the fetcher are boxed, so
+    /// none of them sits inline in these futures.
     #[test]
     fn the_session_futures_are_small() {
         use crate::proto::{Encoding, HelloReply};
@@ -987,8 +1028,8 @@ mod tests {
     }
 
     /// A `Commit` request that the fetcher did not hand over is a definite
-    /// failure. Each failure after the hand-over leaves the outcome unknown,
-    /// a response that the fetcher refuses for its coding included.
+    /// failure. Each failure after the hand-over leaves the outcome unknown.
+    /// This includes a response that the fetcher refuses for its coding.
     #[test]
     fn a_commit_failure_after_the_hand_over_is_unknown() {
         let unknown = |message: String| Error::CommitOutcomeUnknown {
@@ -1097,8 +1138,8 @@ mod tests {
         assert_eq!([polls(0), polls(1), polls(2)], [2, 3, 3]);
     }
 
-    /// At the first error the call stops the upload and waits for the other
-    /// workers, and it gives each error.
+    /// At the first error, the call stops the upload, waits for the other
+    /// workers, and returns each error.
     #[test]
     fn join_stops_at_the_first_error_and_waits_for_every_worker() {
         let stopped = AtomicBool::new(false);
@@ -1132,8 +1173,9 @@ mod tests {
         assert_eq!(worker_count(4, 4), 4);
     }
 
-    /// An error of the client wins over an error of the server, which wins
-    /// over the error of a step that the abort of the session failed.
+    /// An error of the client wins over an error of the server. An error of
+    /// the server wins over the error of a step that failed because of the
+    /// abort of the session.
     #[test]
     fn the_error_of_a_call_is_chosen_by_rank() {
         let source = Error::Source("read failed".into());

@@ -69,34 +69,43 @@ struct Node {
 
 /// The model of a local tree that [`TreeModel::scan`] walked and hashed.
 ///
-/// The model keeps, for each entry, its name, its metadata, and the index of
-/// its parent directory. For each regular file it keeps the number of payload
-/// bytes the hash pass read. It serializes a dirtree or a dirmeta object
-/// again from these fields when a caller asks for it, and it holds no file
-/// content.
+/// For each entry, the model keeps the name, the metadata, and the index of
+/// the parent directory. For each regular file, it also keeps the number of
+/// payload bytes that the hash pass read. The model holds no file content, and
+/// it serializes a dirtree or a dirmeta object again from its fields on each
+/// request. Its memory grows with the number of entries and the length of
+/// their names.
 ///
-/// The model is the [`ObjectSource`] of a push of the tree, once
-/// [`set_commit`](TreeModel::set_commit) gave it the commit over the tree:
+/// # Object source
+///
+/// After [`set_commit`](TreeModel::set_commit) gives the model the commit over
+/// the tree, the model is the [`ObjectSource`] of a push of the tree:
 ///
 /// - [`objects`](ObjectSource::objects) of that commit gives each object of
 ///   the tree once, and then the commit.
-/// - [`open`](ObjectSource::open) of a regular file opens the file again,
-///   with the open and the checks of the hash pass, and gives it as
-///   [`ObjectData::Content`]. Its `size` is the number of payload bytes the
-///   hash pass read. The model does not read the length of the file again,
-///   and it does not hash the file again, so a file that changed after the
-///   hash pass reaches the server, which refuses it. A symlink opens
-///   nothing. A dirtree or a dirmeta object is serialized again from the
-///   model, and the commit object is the bytes that `set_commit` gave. Each
-///   of them is [`ObjectData::Encoded`] in `raw`.
+/// - [`open`](ObjectSource::open) of a regular file opens the file again on
+///   the blocking pool, with the open and the checks of the hash pass. These
+///   are the type check, and on Unix the identity check. It gives the file as
+///   [`ObjectData::Content`], whose `size` is the payload size that the hash
+///   pass read.
+/// - `open` of a symlink opens no file. `open` of a dirtree or a dirmeta
+///   object serializes the object again from the model. `open` of the commit
+///   gives the bytes that `set_commit` gave. Each of the three is
+///   [`ObjectData::Encoded`] in the `raw` encoding.
 /// - [`detached_metadata`](ObjectSource::detached_metadata) of the commit
 ///   gives the dict that `set_commit` gave.
 /// - [`content_size`](ObjectSource::content_size) gives the sum of the
-///   payload sizes of the hash pass, in each encoding, and reads no file.
+///   payload sizes of the hash pass, in each encoding. It reads no file.
 ///
-/// Another commit, and an object that the model does not hold, are
-/// [`Error::InvalidInput`]. A failed open of a file is [`Error::Walk`] that
-/// names the file.
+/// When the model sends a file, it gives the payload size of the hash pass and
+/// does not hash the file again. If a file changes after the hash pass, the
+/// server verifies the object and refuses it.
+///
+/// If a call names another commit, or an object that the model does not hold,
+/// it returns [`Error::InvalidInput`]. If the open of a file fails, the call
+/// returns [`Error::Walk`] with the path of the file and one of the kinds that
+/// [`scan`](TreeModel::scan) lists. The session returns that error inside
+/// [`Error::Source`].
 pub struct TreeModel {
     /// The walk root.
     root: PathBuf,
@@ -128,16 +137,96 @@ struct Sources {
 }
 
 impl TreeModel {
-    /// Walk the directory `root` and hash each object of its tree.
+    /// Walks the directory `root` and hashes each object of its tree.
     ///
-    /// The module docs give the rules of the walk and of the hash pass.
-    /// A failure of either is [`Error::Walk`]. `hash_jobs` of `Some(0)` is
-    /// [`Error::InvalidInput`].
+    /// The scan gives the checksum of each object of the tree: a content
+    /// object for each regular file and symlink, and a dirtree and a dirmeta
+    /// object for each directory.
+    ///
+    /// # Walk
+    ///
+    /// - The walk does not follow symlinks. The walk root must be a directory.
+    /// - The walk holds one directory open at a time. It reads a listing to its
+    ///   end and closes the directory before it enters a subdirectory.
+    /// - While it reads a listing, the walk reads the metadata of each entry
+    ///   with `DirEntry::metadata` and the target of each symlink. It reads
+    ///   only the walk root with `symlink_metadata`.
+    /// - Each name must be valid UTF-8 and must pass the dirtree name rule of
+    ///   `ostrya-core`. Each symlink target must be valid UTF-8.
+    /// - The walk takes regular files, directories, and symlinks. Any other
+    ///   entry stops the walk before the entry filter runs, so the filter never
+    ///   sees it. Other entries are device nodes, fifos, sockets, and Windows
+    ///   reparse points that are not symlinks.
+    /// - After the walk closes a directory, it runs the
+    ///   [`EntryFilter`](super::EntryFilter) on each entry in the order of the
+    ///   listing. Then it enters each kept subdirectory in turn, depth first.
+    /// - The filter sees the root first, with the empty path.
+    /// - [`EntryAction::Skip`](super::EntryAction::Skip) leaves out an entry,
+    ///   and for a directory its whole subtree. The walk does not open a
+    ///   skipped entry. `Skip` on the root stops the walk.
+    /// - If a file has more than one hard link in the tree, the walk reads and
+    ///   hashes the file once for each of its paths.
+    ///
+    /// # Hash pass
+    ///
+    /// - The pass reads each kept regular file once, on the blocking pool of
+    ///   the runtime. It hashes the file over its file header and its payload.
+    /// - The pass starts each file as soon as the filter keeps it, in the order
+    ///   of the walk, with at most [`ScanOptions::hash_jobs`] files in flight.
+    /// - A job reads its file in chunks of at most 64 KiB. Before each chunk,
+    ///   it checks the stop flag of the pass.
+    /// - At the first error of the walk or of a job, the pass sets the stop flag
+    ///   and starts no new job. It returns the error after each job in flight
+    ///   stops, so no file of the pass is open when the scan returns.
+    /// - If the future of the scan is dropped, the pass sets the stop flag.
+    ///   Each job in flight then stops at its next chunk.
+    /// - On Unix, a job opens its file with `O_NOFOLLOW | O_NONBLOCK`. On
+    ///   Windows, it opens the file with
+    ///   `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS`.
+    /// - One metadata read of the open file must show a regular file. On Unix,
+    ///   the device and inode numbers must also equal those that the walk
+    ///   read. If a parent directory of the file becomes a symlink after the
+    ///   walk, the open can reach another file, and this check refuses it.
+    ///   Windows has no identity check.
+    /// - The model records the number of payload bytes that each job read.
+    /// - After the walk and the jobs end, the scan hashes each directory bottom
+    ///   up: its dirtree object, with the entries sorted by name, and its
+    ///   dirmeta object.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if [`ScanOptions::hash_jobs`] is `Some(0)`.
+    ///   The walk does not start.
+    /// - [`Error::Walk`] for each failure of the walk and of the hash pass. The
+    ///   error names the entry on the local filesystem, the walk root
+    ///   included. It keeps one of these `io::ErrorKind` values:
+    ///   - the kind of the call that failed, for example `PermissionDenied` or
+    ///     `NotFound`
+    ///   - `InvalidInput` if the walk root is not a directory, or if the filter
+    ///     returns `Skip` for the root
+    ///   - `Unsupported` for an entry that is not a regular file, a directory,
+    ///     or a symlink, and on Windows for a symlink whose target `std` cannot
+    ///     read
+    ///   - `InvalidData` for a name that is not valid UTF-8 or that fails the
+    ///     name rule, and for a symlink target that is not valid UTF-8
+    ///   - `InvalidData` for a change by the filter that [`EntryMeta`] does not
+    ///     allow, and for a file header that `ostrya-core` refuses, for example
+    ///     a symlink target with a NUL byte
+    ///   - `InvalidData` on Windows for a symlink target that holds `\` or
+    ///     starts with a drive prefix, also if no filter runs
+    ///   - `InvalidData` for a file whose type or identity changed after the
+    ///     walk read it
+    ///   - `InvalidData` for a dirtree or a dirmeta object of more than
+    ///     [`MAX_METADATA_SIZE`] bytes, and for a tree of more than `u32::MAX`
+    ///     kept entries
+    ///
+    /// If more than one entry fails, the error names one of the failing paths.
+    /// If more than one hash job runs, the order of the failures is not fixed.
     pub async fn scan(root: &Path, options: ScanOptions) -> Result<TreeModel> {
         walk::scan(root, options, None).await
     }
 
-    /// [`scan`](TreeModel::scan), which also sets the phases of the scan in
+    /// Runs [`scan`](TreeModel::scan) and sets the phases of the scan in
     /// `progress`: [`Scanning`](crate::PushPhase::Scanning) during the walk,
     /// and [`Hashing`](crate::PushPhase::Hashing) after it.
     pub(crate) async fn scan_with(
@@ -148,19 +237,22 @@ impl TreeModel {
         walk::scan(root, options, progress).await
     }
 
-    /// The dirtree checksum of the walk root.
+    /// Returns the dirtree checksum of the walk root.
     pub fn root_dirtree(&self) -> Checksum {
         self.dir_sums(0).0
     }
 
-    /// The dirmeta checksum of the walk root.
+    /// Returns the dirmeta checksum of the walk root.
     pub fn root_dirmeta(&self) -> Checksum {
         self.dir_sums(0).1
     }
 
-    /// Each object of the tree once: the content object of each regular file
-    /// and symlink, and the dirtree and dirmeta objects of each directory, in
-    /// the order the walk reached their first source.
+    /// Returns the name of each object of the tree, once each.
+    ///
+    /// The list holds the content object of each regular file and symlink,
+    /// and the dirtree and dirmeta objects of each directory. It holds no
+    /// commit object. The order is the order in which the walk reached the
+    /// first source of each object.
     pub fn object_names(&self) -> Vec<ObjectName> {
         let Sources {
             files,
@@ -178,13 +270,14 @@ impl TreeModel {
         names
     }
 
-    /// Give the model the commit object over the tree: its checksum
-    /// `checksum`, its serialized bytes `bytes`, and the `a{sv}` dict
-    /// `detached` that the push sends as its detached metadata. A later call
-    /// replaces the commit.
+    /// Sets the commit object over the tree, which a push of the tree sends.
+    ///
+    /// `checksum` is the checksum of the commit, and `bytes` is its serialized
+    /// form. `detached` is the `a{sv}` dict that the push sends as the detached
+    /// metadata of the commit. A later call replaces the commit.
     ///
     /// The model does not check the bytes. The server verifies the commit
-    /// object as it does each other object.
+    /// object as it verifies each other object.
     pub fn set_commit(&mut self, checksum: Checksum, bytes: Vec<u8>, detached: Option<Value>) {
         self.commit = Some(CommitObject {
             checksum,
@@ -214,12 +307,12 @@ impl TreeModel {
             .map_err(|_| invalid_data("the tree holds more entries than the model can index"))
     }
 
-    /// Add the walk root, with the metadata the filter left.
+    /// Adds the walk root, with the metadata the filter left.
     pub(super) fn push_root(&mut self, meta: EntryMeta, id: FileId) {
         self.push(0, String::new(), meta, id);
     }
 
-    /// Add an entry under the directory `parent`, with the metadata the filter
+    /// Adds an entry under the directory `parent`, with the metadata the filter
     /// left and the identity the walk read. The caller checked the index with
     /// [`next_index`](TreeModel::next_index).
     pub(super) fn push(&mut self, parent: u32, name: String, meta: EntryMeta, id: FileId) {
@@ -257,7 +350,7 @@ impl TreeModel {
         });
     }
 
-    /// Record the hash of the symlink `index`, whose content object has no
+    /// Records the hash of the symlink `index`, whose content object has no
     /// payload.
     pub(super) fn hash_symlink(&mut self, index: u32) -> io::Result<()> {
         let checksum = ostrya_core::ContentHasher::new(&self.header(index))
@@ -267,7 +360,7 @@ impl TreeModel {
         Ok(())
     }
 
-    /// Record the kept entries of the directory `dir`.
+    /// Records the kept entries of the directory `dir`.
     pub(super) fn set_children(&mut self, dir: u32, range: Range<u32>) {
         if let NodeData::Dir { children, .. } = &mut self.node_mut(dir).data {
             *children = range;
@@ -282,7 +375,7 @@ impl TreeModel {
         }
     }
 
-    /// Whether the entry `index` is a directory.
+    /// Returns `true` if the entry `index` is a directory.
     pub(super) fn is_dir(&self, index: u32) -> bool {
         matches!(self.node(index).data, NodeData::Dir { .. })
     }
@@ -330,8 +423,8 @@ impl TreeModel {
         }
     }
 
-    /// Hash each directory bottom-up, once each regular file is hashed, and
-    /// record the source of each object.
+    /// Hashes each directory bottom-up, once each regular file is hashed, and
+    /// records the source of each object.
     pub(super) fn finish(&mut self) -> Result<()> {
         // The entries of a directory come after it, so the reverse order
         // hashes each directory after all of its subdirectories.
@@ -566,14 +659,15 @@ impl TreeModel {
         }
     }
 
-    /// Record the hash of the regular file or symlink `index`.
+    /// Records the hash of the regular file or symlink `index`.
     pub(super) fn set_hashed(&mut self, index: u32, result: Hashed) {
         if let NodeData::Content { hashed, .. } = &mut self.node_mut(index).data {
             *hashed = Some(result);
         }
     }
 
-    /// The number of entries. [`push`](TreeModel::push) keeps it within `u32`.
+    /// Returns the number of entries. The walk checks each index with
+    /// [`next_index`](TreeModel::next_index), so the number fits in a `u32`.
     fn next_index_unchecked(&self) -> u32 {
         self.nodes.len() as u32
     }
@@ -659,7 +753,7 @@ fn encoded(bytes: Vec<u8>) -> ObjectData {
     }
 }
 
-/// Refuse a metadata object of more than `limit` bytes.
+/// Refuses a metadata object of more than `limit` bytes.
 fn check_metadata_size(bytes: &[u8], what: &str, limit: u64) -> io::Result<()> {
     if bytes.len() as u64 > limit {
         return Err(invalid_data(format!(

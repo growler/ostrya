@@ -1,5 +1,5 @@
-//! The HTTP transport: the checks of the connect options, the token file and
-//! the TLS files, and the fetcher of a session.
+//! The HTTP transport. It checks the connect options, reads the token file
+//! and the TLS files, and builds the fetcher of a session.
 
 use std::io::Read;
 use std::path::Path;
@@ -12,19 +12,19 @@ use super::ConnectOptions;
 use crate::error::{Error, Result};
 use crate::session::http::{Credential, Endpoint, MAX_PARALLEL};
 
-/// The most bytes the client reads of a token file or of a TLS file: 1 MiB.
+/// The largest first line of a token file, and the largest TLS file: 1 MiB.
 const FILE_CAP: u64 = 1 << 20;
 
-/// The most requests of one session in flight: an object stream for each
-/// permit, and one `Have` or `Commit`.
+/// The maximum number of requests of one session in flight: one object
+/// stream for each permit, and one `Have` or `Commit` request.
 const MAX_OUTSTANDING: usize = MAX_PARALLEL as usize + 1;
 
 fn invalid(msg: impl Into<String>) -> Error {
     Error::InvalidInput(msg.into())
 }
 
-/// Check `connect` for the HTTP address `url`, read the files it names, and
-/// build the fetcher of the session. Nothing is sent.
+/// Checks `connect` for the HTTP address `url`, reads the files that it
+/// names, and builds the fetcher of the session. The call sends no request.
 pub(super) async fn prepare(url: &str, connect: &ConnectOptions) -> Result<Endpoint> {
     check(url, connect)?;
     let credential = match &connect.push_token_file {
@@ -56,8 +56,8 @@ pub(super) async fn prepare(url: &str, connect: &ConnectOptions) -> Result<Endpo
     http.mirrors = vec![url.to_owned()];
     http.max_outstanding = MAX_OUTSTANDING;
     http.max_redirects = 0;
-    // The future of the construction is large, and the connect futures of
-    // the session would hold it inline, so it is boxed.
+    // The future of the construction is large. The box keeps it out of the
+    // connect futures of the session.
     let fetcher = Box::pin(Fetcher::new(http)).await.map_err(Error::Fetch)?;
     Ok(Endpoint {
         fetcher,
@@ -67,10 +67,19 @@ pub(super) async fn prepare(url: &str, connect: &ConnectOptions) -> Result<Endpo
     })
 }
 
-/// Refuse the options that do not apply to an HTTP address, the options
-/// that give two answers to one question, the TLS settings that verify no
-/// server certificate, and a credential to an `http://` address without
-/// [`ConnectOptions::allow_cleartext_credentials`].
+/// Refuses each value of `connect` that an HTTP push cannot use.
+///
+/// The refused values are:
+///
+/// - an ssh field
+/// - mirrors or a Basic credential in [`ConnectOptions::http`]
+/// - a TLS setting that verifies no server certificate
+/// - two fields that set one thing, for example `tls_ca_path` and the trust
+///   roots of `http`
+/// - a client certificate without its key, or a key without its certificate
+/// - a `push_user` without a token file, or one that is empty or holds `:`
+/// - a token to an `http://` address without
+///   [`ConnectOptions::allow_cleartext_credentials`].
 fn check(url: &str, connect: &ConnectOptions) -> Result<()> {
     let not_http = |name: &str| {
         invalid(format!(
@@ -147,7 +156,7 @@ fn check(url: &str, connect: &ConnectOptions) -> Result<()> {
     Ok(())
 }
 
-/// Whether `http` holds the default value of each field.
+/// Returns `true` if each field of `http` holds its default value.
 pub(super) fn is_default(http: &FetcherOptions) -> bool {
     let FetcherOptions {
         mirrors,
@@ -186,9 +195,11 @@ pub(super) fn is_default(http: &FetcherOptions) -> bool {
         && *fetch_timeout == d.fetch_timeout
 }
 
-/// Read at most [`FILE_CAP`] bytes and one byte more of the file at `path`,
-/// which the option `key` names, on the blocking pool. A failure names the
-/// option and the path, and holds no byte of the file.
+/// Reads at most [`FILE_CAP`] + 1 bytes of the file at `path`, on the
+/// blocking pool.
+///
+/// The option `key` names the file. A failure is an [`Error::Io`] that names
+/// the option and the path, and holds no byte of the file.
 async fn read_capped(path: &Path, key: &str) -> Result<Vec<u8>> {
     let owned = path.to_owned();
     let read = ostrya_rt::unblock(move || {
@@ -207,8 +218,8 @@ async fn read_capped(path: &Path, key: &str) -> Result<Vec<u8>> {
     })
 }
 
-/// The bytes of the TLS file at `path`, which the option `key` names. A file
-/// over [`FILE_CAP`] is refused.
+/// Returns the bytes of the TLS file at `path`, which the option `key` names.
+/// A file larger than [`FILE_CAP`] is refused.
 async fn read_tls(path: &Path, key: &str) -> Result<Vec<u8>> {
     let bytes = read_capped(path, key).await?;
     if bytes.len() as u64 > FILE_CAP {
@@ -217,8 +228,11 @@ async fn read_tls(path: &Path, key: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// The token of the token file at `path`: its first line. A refusal holds
-/// no part of the token.
+/// Returns the token of the token file at `path`, which is the first line of
+/// the file.
+///
+/// A first line longer than [`FILE_CAP`] is refused. A refusal holds no part
+/// of the token.
 async fn read_token(path: &Path) -> Result<String> {
     let bytes = read_capped(path, "push-token-file").await?;
     let line = match bytes.iter().position(|b| *b == b'\n') {
@@ -234,7 +248,8 @@ async fn read_token(path: &Path) -> Result<String> {
     token_of(line).map_err(|why| invalid(format!("push-token-file '{}': {why}", path.display())))
 }
 
-/// The token of the first line `line` of a token file.
+/// Returns the token of `line`, the first line of a token file, or the
+/// reason of its refusal.
 fn token_of(line: &[u8]) -> std::result::Result<String, &'static str> {
     if line.contains(&b'\r') {
         return Err("the first line holds a carriage return");
@@ -252,9 +267,9 @@ fn token_of(line: &[u8]) -> std::result::Result<String, &'static str> {
     Ok(token.to_owned())
 }
 
-/// Whether `token` has the token68 syntax of HTTP authentication: one or
-/// more ASCII letters, digits, `-`, `.`, `_`, `~`, `+`, or `/`, then any
-/// number of `=`.
+/// Returns `true` if `token` has the token68 syntax of HTTP authentication.
+/// The syntax is one or more ASCII letters, digits, `-`, `.`, `_`, `~`, `+`,
+/// or `/`, then any number of `=`.
 fn is_token68(token: &str) -> bool {
     let body = token.trim_end_matches('=');
     !body.is_empty()
@@ -310,7 +325,7 @@ mod tests {
         }
     }
 
-    /// The options with the token file `path`. They allow a cleartext
+    /// Returns the options with the token file `path`. They allow a cleartext
     /// credential, so a test needs no trust store of the host for a fetcher
     /// it builds over `http://`.
     fn with_token(path: PathBuf) -> ConnectOptions {
@@ -452,7 +467,7 @@ mod tests {
         }
     }
 
-    /// `push_user` needs a token file, and holds no `:`.
+    /// `push_user` needs a token file. It cannot be empty or hold `:`.
     #[test]
     fn push_user_needs_a_token_file() {
         let m = refused(
@@ -476,8 +491,8 @@ mod tests {
         }
     }
 
-    /// A token to an `http://` address is refused before any request,
-    /// unless the options allow cleartext credentials.
+    /// If the options do not allow cleartext credentials, a token to an
+    /// `http://` address is refused before any request.
     #[test]
     fn a_token_to_a_cleartext_address_needs_the_switch() {
         let dir = Dir::new();
@@ -580,8 +595,7 @@ mod tests {
             },
         );
         assert!(m.starts_with("receive-command applies"), "{m}");
-        // The ssh command of a remote section does not apply, and is not
-        // read.
+        // An HTTP address does not read the ssh command of a remote section.
         prepared(
             "http://h/",
             ConnectOptions {

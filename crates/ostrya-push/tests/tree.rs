@@ -1,7 +1,11 @@
-//! The tree walk and the hash pass over trees built on disk: the refusals of
-//! structure, the unreadable entries, the entry filter, and the files of the
-//! pass after an error. The send pass of the model as an object source, and
-//! the bytes a session sends from it to a scripted server.
+//! Tests of the tree walk, the hash pass, and the send pass of `TreeModel`.
+//!
+//! The tests build trees on disk and check these items:
+//!
+//! - the refusals of structure, the unreadable entries, and the entry filter
+//! - the files of the hash pass that are open after an error
+//! - the model as an object source in the send pass
+//! - the bytes that a session sends from the model to a scripted server
 
 #![cfg(unix)]
 
@@ -31,7 +35,7 @@ use ostrya_push::{
     Compression, Encoding, Error, ObjectData, ObjectSource, PushSession, SessionOptions,
 };
 
-/// A scratch directory under the temporary directory, removed when dropped.
+/// A scratch directory under the temporary directory. A drop removes it.
 struct Scratch {
     path: PathBuf,
 }
@@ -55,7 +59,8 @@ impl Drop for Scratch {
     }
 }
 
-/// Give each directory under `path` the mode 0755, so the tree can be removed.
+/// Gives each directory under `path` the mode 0755, so that a drop can remove
+/// the tree.
 fn open_up(path: &Path) {
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o755));
     if let Ok(listing) = fs::read_dir(path) {
@@ -71,8 +76,8 @@ fn set_mode(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
-/// Make a fifo at `path` with the `mkfifo` command. False when the command
-/// does not make one.
+/// Makes a fifo at `path` with the `mkfifo` command. Returns `false` if the
+/// command does not make one.
 fn mkfifo(path: &Path) -> bool {
     match std::process::Command::new("mkfifo").arg(path).status() {
         Ok(status) if status.success() => true,
@@ -94,7 +99,7 @@ fn with_filter(filter: EntryFilter) -> ScanOptions {
     }
 }
 
-/// The path and the kind of an `Error::Walk`.
+/// Returns the path and the kind of an `Error::Walk`.
 fn walk_error(result: ostrya_push::Result<TreeModel>) -> (PathBuf, io::ErrorKind) {
     match result {
         Err(Error::Walk { path, source }) => (path, source.kind()),
@@ -284,8 +289,8 @@ fn a_filter_must_keep_the_target_with_the_symlink() {
 /// The unreadable entries of the permission tests.
 const UNREADABLE: [&str; 3] = ["file0000", "dir0000", "dir0311"];
 
-/// Make the unreadable entry `name` under `root`, beside a readable file.
-/// False when the process can open the entry, as root can.
+/// Makes the unreadable entry `name` under `root`, beside a readable file.
+/// Returns `false` if the process can open the entry, as root can.
 fn unreadable_entry(root: &Path, name: &str) -> bool {
     fs::write(root.join("kept"), b"kept").unwrap();
     let path = root.join(name);
@@ -364,7 +369,7 @@ fn a_directory_without_search_permission_names_its_entry() {
         walk_error(scan(root, with_filter(skipping(&["dir0644/child"])))),
         (root.join("dir0644/child"), io::ErrorKind::PermissionDenied)
     );
-    // A skip of the directory does.
+    // A skip of the directory prevents the error.
     scan(root, with_filter(skipping(&["dir0644"]))).unwrap();
 }
 
@@ -429,7 +434,7 @@ fn a_root_that_is_not_a_directory_is_invalid_input() {
 
 #[test]
 fn zero_hash_jobs_is_invalid_input() {
-    // The root does not exist, so a walk that started would fail with
+    // The root does not exist. If a walk starts, it fails with
     // `Error::Walk`.
     let dir = Scratch::new("jobs0");
     let options = ScanOptions {
@@ -496,7 +501,8 @@ fn a_file_replaced_by_a_fifo_fails_without_blocking() {
     let dir = Scratch::new("fifo-swap");
     let root = dir.path.clone();
     fs::write(root.join("victim"), b"x").unwrap();
-    // The probe fifo shows that the command works, before the filter runs it.
+    // Before the filter runs the command, the probe fifo shows that the
+    // command works.
     if !mkfifo(&root.join("probe")) {
         return;
     }
@@ -520,8 +526,8 @@ fn a_file_replaced_by_a_fifo_fails_without_blocking() {
     assert_eq!(walk_error(result), (victim, io::ErrorKind::InvalidData));
 }
 
-/// Scan `root` with a filter that runs `swap` on the entry `victim` and keeps
-/// it, and give the error of the scan.
+/// Scans `root` with a filter that runs `swap` on the entry `victim` and keeps
+/// the entry. Returns the path and the kind of the error of the scan.
 fn scan_with_swap(
     root: &Path,
     victim: &'static str,
@@ -743,7 +749,7 @@ fn objects_of_the_commit_are_the_tree_objects_and_the_commit() {
     let mut model = small_tree(&dir.path);
     let (commit, bytes) = stand_in_commit();
 
-    // With no commit, each call about a commit is refused.
+    // If the model has no commit, it refuses each call about a commit.
     assert_invalid_input(run(model.objects(&commit)));
     assert_invalid_input(run(model.detached_metadata(&commit)));
     assert_invalid_input(open(&model, &ObjectName::new(commit, ObjectType::Commit)));
@@ -763,13 +769,14 @@ fn objects_of_the_commit_are_the_tree_objects_and_the_commit() {
         Some(detached())
     );
 
-    // Another commit is refused by each call.
+    // Each call refuses a commit other than the commit of the model.
     let other = Checksum::from_bytes([0xc1; 32]);
     assert_invalid_input(run(model.objects(&other)));
     assert_invalid_input(run(model.detached_metadata(&other)));
     assert_invalid_input(open(&model, &ObjectName::new(other, ObjectType::Commit)));
 
-    // A later call replaces the commit, and no detached dict gives none.
+    // A later `set_commit` call replaces the commit. If the call gives no
+    // detached dict, `detached_metadata` gives `None`.
     model.set_commit(other, b"other".to_vec(), None);
     assert_invalid_input(run(model.objects(&commit)));
     assert_eq!(run(model.detached_metadata(&other)).unwrap(), None);
@@ -827,15 +834,16 @@ fn a_regular_file_is_opened_again_with_the_size_of_the_hash_pass() {
     assert_eq!(size, 13);
     assert_eq!(payload.as_deref(), Some(&b"file content\n"[..]));
 
-    // The size is the count of the hash pass. A file that grew after it is
-    // given with the old size and its first size + 1 bytes.
+    // The size is the byte count of the hash pass. If a file grows after the
+    // pass, the open gives the old size and the first size + 1 bytes.
     fs::write(dir.path.join("file"), b"file content\nand more\n").unwrap();
     let (_, size, payload) = content(open(&model, &name).unwrap());
     assert_eq!(size, 13);
     assert_eq!(payload.as_deref(), Some(&b"file content\na"[..]));
 }
 
-/// The bytes of a file that grows by 1 MiB after the scan.
+/// Scans a tree of one file, then makes the file 1 MiB larger. Returns the
+/// model, the name of the file object, and the new bytes of the file.
 fn grown_file(root: &Path) -> (TreeModel, ObjectName, Vec<u8>) {
     fs::write(root.join("file"), b"file content\n").unwrap();
     set_mode(&root.join("file"), 0o644);
@@ -871,8 +879,8 @@ fn a_symlink_opens_nothing_and_has_the_mode_0o120777() {
     let dir = Scratch::new("send-symlink");
     let model = small_tree(&dir.path);
     let name = file_name(&model, &header(0o120777, "file"), b"");
-    // The link is gone, and the open still gives its content object: the
-    // model opens nothing for a symlink.
+    // The test removes the link, and the open still gives its content object.
+    // The model opens nothing for a symlink.
     fs::remove_file(dir.path.join("link")).unwrap();
     let (got, size, payload) = content(open(&model, &name).unwrap());
     assert_eq!(got.mode, 0o120777);
@@ -881,7 +889,7 @@ fn a_symlink_opens_nothing_and_has_the_mode_0o120777() {
     assert_eq!(payload, None);
 }
 
-/// The kind and the path of the `Error::Walk` of a failed open.
+/// Returns the path and the kind of the `Error::Walk` of a failed open.
 fn open_walk_error(result: ostrya_push::Result<ObjectData>) -> (PathBuf, io::ErrorKind) {
     match result {
         Err(Error::Walk { path, source }) => (path, source.kind()),
@@ -897,8 +905,8 @@ fn the_send_pass_refuses_a_file_that_is_not_the_one_the_walk_read() {
     let name = file_name(&model, &header(0o100644, ""), b"file content\n");
     let file = root.join("file");
 
-    // Another file at the same path, with the same bytes. The new file is
-    // made before the rename, so it has an inode of its own.
+    // Another file at the same path, with the same bytes. The test makes the
+    // new file before the rename, so the new file has an inode of its own.
     fs::write(root.join("new"), b"file content\n").unwrap();
     fs::rename(root.join("new"), &file).unwrap();
     assert_eq!(
@@ -1024,8 +1032,8 @@ fn written_objects(bytes: &[u8]) -> Vec<(ObjectName, Encoding, Vec<u8>)> {
     })
 }
 
-/// Send `names` of `model` to the scripted server with `compression`, and
-/// give the objects the session wrote.
+/// Sends `names` of `model` to the scripted server with `compression`.
+/// Returns the objects that the session wrote.
 fn send_scripted(
     model: &TreeModel,
     names: &[ObjectName],
@@ -1073,9 +1081,11 @@ fn xorshift(state: &mut u32) -> u32 {
     *state
 }
 
-/// The golden payload of crates/ostrya-core/src/deflate.rs: one and a half
-/// `DEFLATE_CHUNK` in three half-chunk blocks, one over a four-symbol
-/// alphabet and two of an xorshift32 stream.
+/// The golden payload of crates/ostrya-core/src/deflate.rs.
+///
+/// The payload is one and a half `DEFLATE_CHUNK` in three half-chunk blocks.
+/// The first block uses a four-symbol alphabet. The other two blocks are an
+/// xorshift32 stream.
 fn golden_payload() -> Vec<u8> {
     const BLOCK: usize = DEFLATE_CHUNK / 2;
     let mut out = Vec::with_capacity(3 * BLOCK);

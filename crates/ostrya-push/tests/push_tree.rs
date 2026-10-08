@@ -1,7 +1,8 @@
-//! The refusals of a tree push before a session: a walk error, a hash error,
-//! and the options the push refuses before the scan start no ssh client and
-//! send no request, and the push over a pair of streams writes no byte for
-//! them.
+//! Tests of the refusals of a tree push before a session.
+//!
+//! A walk error, a hash error, and an option that the push refuses before the
+//! scan start no ssh client. These refusals send no request. For these
+//! refusals, the push over a pair of streams writes no byte.
 
 #![cfg(unix)]
 
@@ -20,7 +21,7 @@ use ostrya_push::{
     push_tree_over_stream,
 };
 
-/// A scratch directory under the temporary directory, removed when dropped.
+/// A scratch directory under the temporary directory. A drop removes it.
 struct Scratch {
     path: PathBuf,
 }
@@ -81,7 +82,7 @@ fn options(refs: &[&str]) -> TreePushOptions {
     }
 }
 
-/// An output stream that counts the bytes written to it.
+/// An output stream that counts the bytes that it receives.
 struct Counted(Arc<AtomicU64>);
 
 impl AsyncWrite for Counted {
@@ -103,9 +104,12 @@ impl AsyncWrite for Counted {
     }
 }
 
-/// Run `push_tree` of `root` over the stand-in, and give its error after it
-/// checks that the stand-in did not start. `opts` builds the options each
-/// time, because the options are not `Clone`.
+/// Runs `push_tree` of `root` over the stand-in and returns its error.
+///
+/// The function checks that the stand-in did not start. It also runs
+/// `push_tree_over_stream` with the same options. That push must write no byte
+/// and must fail with the same `Error` variant. `opts` builds the options for
+/// each push, because the options are not `Clone`.
 fn refused_with_no_start(
     tag: &str,
     address: &str,
@@ -141,7 +145,7 @@ fn refused_with_no_start(
     e
 }
 
-/// The path and the kind of an `Error::Walk`.
+/// Returns the path and the I/O error kind of an `Error::Walk`.
 fn walk_error(tag: &str, e: Error) -> (PathBuf, io::ErrorKind) {
     match e {
         Error::Walk { path, source } => (path, source.kind()),
@@ -228,7 +232,8 @@ fn options_refused_before_the_scan_start_no_ssh_client() {
     let root = tree(&scratch.path);
     let variant =
         || ostrya_core::Value::variant(ostrya_core::Type::Str, ostrya_core::Value::Str("v".into()));
-    // One `ay` value of the size limit, so the dict that holds it is over it.
+    // One `ay` value at the size limit. The dict that holds this value is
+    // larger than the limit.
     let oversized = || {
         let bytes = vec![0; ostrya_core::MAX_METADATA_SIZE as usize];
         let ty = ostrya_core::Type::parse("ay").unwrap();
@@ -309,8 +314,9 @@ fn options_refused_before_the_scan_start_no_ssh_client() {
         invalid_input(tag, e, part);
     }
 
-    // An ssh option with an HTTP address, and a token to an `http://`
-    // address without the cleartext switch, are refused before any request.
+    // Before it sends a request, the push refuses an ssh option with an HTTP
+    // address. It also refuses a token to an `http://` address without the
+    // cleartext switch.
     let marker = scratch.path.join("started");
     let remote = PushRemote::parse("http://host/repo").unwrap();
     let result = ostrya_rt::block_on(push_tree(

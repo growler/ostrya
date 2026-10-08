@@ -29,14 +29,16 @@ struct RawEntry {
 struct Walker {
     model: TreeModel,
     filter: Option<EntryFilter>,
-    /// The path the filter sees. One buffer serves each entry.
+    /// The path that the filter sees. The walk uses this one buffer for each
+    /// entry.
     path: EntryPath,
 }
 
-/// Walk and hash the tree at `root`. `progress`, when given, shows
-/// [`PushPhase::Scanning`] until the walk has listed and filtered each
-/// directory, and then [`PushPhase::Hashing`] through the hash jobs still in
-/// flight and the bottom-up pass.
+/// Walks and hashes the tree at `root`.
+///
+/// If `progress` is `Some`, it shows [`PushPhase::Scanning`] until the walk
+/// lists and filters each directory. Then it shows [`PushPhase::Hashing`]
+/// while the hash jobs in flight end and the bottom-up pass runs.
 pub(super) async fn scan(
     root: &Path,
     options: ScanOptions,
@@ -62,8 +64,8 @@ pub(super) async fn scan(
             path: String::new(),
         },
     };
-    // A walk that stops records its error in `jobs`, and `finish` gives it
-    // once each job in flight has stopped.
+    // A walk that stops records its error in `jobs`. `finish` returns the
+    // error after each job in flight stops.
     let _ = walker.walk(&mut jobs, hash_jobs).await;
     if let Some(progress) = progress {
         progress.set_phase(PushPhase::Hashing);
@@ -77,11 +79,11 @@ pub(super) async fn scan(
 }
 
 impl Walker {
-    /// Read the walk root, run the filter on it, and walk the tree
-    /// depth-first with an explicit stack of (directory, next entry).
+    /// Reads the walk root, runs the filter on it, and walks the tree
+    /// depth-first. An explicit stack holds the pairs (directory, next entry).
     ///
-    /// The call that reads the root also counts the CPUs for a `hash_jobs`
-    /// of `None`, because the count can read files of the system.
+    /// If `hash_jobs` is `None`, the blocking call that reads the root also
+    /// counts the CPUs, because the count can read files of the system.
     async fn walk(
         &mut self,
         jobs: &mut Jobs,
@@ -152,9 +154,11 @@ impl Walker {
         Ok(())
     }
 
-    /// List the directory `dir`, run the filter on each of its entries in the
-    /// order of the listing, and add the kept ones to the model. A kept
-    /// regular file is queued for the hash pass at once.
+    /// Lists the directory `dir`, runs the filter on each entry in the order
+    /// of the listing, and adds the kept entries to the model.
+    ///
+    /// The call queues a kept regular file for the hash pass at once, and
+    /// hashes a kept symlink at once.
     async fn enter(&mut self, dir: u32, jobs: &mut Jobs) -> std::result::Result<(), Stopped> {
         let os_dir = self.model.os_path(dir);
         let listing = jobs
@@ -213,11 +217,12 @@ impl Walker {
     }
 }
 
-/// Read the directory `dir` to its end, with the metadata of each entry and
-/// the target of each symlink, in one blocking call. The first failure ends
-/// the listing and names its path, so the filter never sees a listing that
-/// holds an entry the walk refuses. The directory is closed when the call
-/// returns.
+/// Reads the directory `dir` to its end in one blocking call, with the
+/// metadata of each entry and the target of each symlink.
+///
+/// The first failure ends the listing and names its path, so the filter never
+/// sees a listing that holds an entry that the walk refuses. The call closes
+/// the directory before it returns.
 fn list_dir(dir: PathBuf) -> std::result::Result<Vec<RawEntry>, (PathBuf, io::Error)> {
     let listing = fs::read_dir(&dir).map_err(|e| (dir.clone(), e))?;
     let mut entries = Vec::new();
@@ -243,7 +248,8 @@ fn list_dir(dir: PathBuf) -> std::result::Result<Vec<RawEntry>, (PathBuf, io::Er
     Ok(entries)
 }
 
-/// The target of the symlink at `path`, which must be valid UTF-8.
+/// Returns the target of the symlink at `path`. A target that is not valid
+/// UTF-8 is an error of the kind `InvalidData`.
 fn read_target(path: &Path) -> io::Result<String> {
     fs::read_link(path)
         .map_err(unsupported_link)?
@@ -252,13 +258,17 @@ fn read_target(path: &Path) -> io::Result<String> {
         .map_err(|_| invalid_data("the symlink target is not valid UTF-8"))
 }
 
-/// A failed read of a symlink target on Windows. `std` fails with the kind
-/// `Uncategorized` for a reparse point that it reads as a symlink but whose
-/// target it cannot read, and the walk refuses that entry as `Unsupported`.
+/// Returns the error of a failed read of a symlink target on Windows.
 ///
-/// `io::ErrorKind` names `Uncategorized` only as an unstable variant, so the
-/// kind comes from an OS error that `std` cannot categorize: a Win32 code
-/// with the customer bit set, which no system error has.
+/// `std` reads some reparse points as symlinks, but it cannot read their
+/// target. The read then fails with the kind `Uncategorized`. The walk
+/// refuses such an entry with the kind `Unsupported`. The call returns each
+/// other error unchanged.
+///
+/// Because `io::ErrorKind` names `Uncategorized` only as an unstable variant,
+/// the call gets the kind from an OS error that `std` cannot categorize. That
+/// error is a Win32 code with the customer bit set, which no system error
+/// has.
 #[cfg(windows)]
 fn unsupported_link(e: io::Error) -> io::Error {
     let uncategorized = io::Error::from_raw_os_error(0x2000_0000).kind();
@@ -271,7 +281,7 @@ fn unsupported_link(e: io::Error) -> io::Error {
     e
 }
 
-/// A failed read of a symlink target keeps its kind.
+/// Returns the error of a failed read of a symlink target unchanged.
 #[cfg(not(windows))]
 fn unsupported_link(e: io::Error) -> io::Error {
     e

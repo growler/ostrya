@@ -1,16 +1,19 @@
-//! Time the send pass of a tree push over a scripted server.
+//! Times the send pass of a tree push over a scripted server.
 //!
 //! Usage: `send_pass COUNT SIZE raw|deflate [DIR]`
 //!
 //! The program writes COUNT files of SIZE bytes each under DIR (a new
-//! directory in the temporary directory by default). SIZE must be at least 8
-//! when COUNT is more than 1. The program scans the files into a tree
-//! model, and sends every content object to a server that needs each object.
-//! The bytes of the session go to a sink, so the program holds no object.
+//! directory in the temporary directory by default). If COUNT is more than 1,
+//! SIZE must be at least 8. The program scans the files into a tree model.
+//! Then it sends each content object to a server that needs each object.
 //!
-//! The program writes `send pass: start` to stderr just before the send, so a
-//! trace of the process can be cut at that write. After the send it prints the
-//! time for each file, and on Linux the peak resident set size (`VmHWM`).
+//! The bytes of the session go to a sink, so the program holds no object.
+//! The program writes `send pass: start` to standard error immediately before
+//! the send, so that a trace of the process can be cut at that write.
+//!
+//! After the send, the program prints the mean time for each file and the
+//! total time. On Linux, it also prints the peak resident set size
+//! (`VmHWM`).
 
 use std::fs;
 use std::io::{self, Write};
@@ -26,11 +29,11 @@ use ostrya_push::proto::{
 use ostrya_push::tree::{ScanOptions, TreeModel};
 use ostrya_push::{Compression, Encoding, PushSession, SessionOptions};
 
-/// The size of the buffer the files are written with.
+/// The largest write of file data: 1 MiB.
 const WRITE_CHUNK: usize = 1024 * 1024;
 
-/// The replies of a server that lists `raw` and `deflate`, needs each
-/// object, and takes one object stream.
+/// Returns the replies of a server that lists `raw` and `deflate`, needs
+/// each object, and takes one object stream.
 async fn scripted_replies() -> io::Result<Vec<u8>> {
     let msgs = [
         Message::HelloReply(HelloReply {
@@ -58,7 +61,7 @@ async fn scripted_replies() -> io::Result<Vec<u8>> {
     Ok(w.into_inner())
 }
 
-/// Write `count` files of `size` bytes under `dir`. The first 8 bytes of each
+/// Writes `count` files of `size` bytes under `dir`. The first 8 bytes of each
 /// file hold its index, so no two files share a content object.
 fn write_files(dir: &Path, count: u64, size: u64) -> io::Result<()> {
     let mut chunk = vec![0u8; WRITE_CHUNK];
@@ -82,7 +85,8 @@ fn write_files(dir: &Path, count: u64, size: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// The peak resident set size of the process, as `/proc/self/status` gives it.
+/// Returns the peak resident set size of the process, as `/proc/self/status`
+/// gives it.
 fn peak_rss() -> Option<String> {
     let status = fs::read_to_string("/proc/self/status").ok()?;
     let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;

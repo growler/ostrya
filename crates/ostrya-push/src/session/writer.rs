@@ -1,11 +1,11 @@
-//! The object stream a session writes: the plan of each object, the frames
-//! and chunks of the objects of one `send` call, and the detached metadata of
-//! their commits.
+//! The object stream that a session writes: the plan of each object, the
+//! frames and chunks of the objects of one `send` call, and the detached
+//! metadata of their commits.
 //!
-//! [`ObjectWriter`] is generic over its output. A stream transport writes it
-//! into a buffered pipe, and the HTTP transport into the body of one upload
-//! request. One `send` call can run several writers over one [`Upload`]: they
-//! take the names from one shared cursor.
+//! `ObjectWriter` is generic over its output. A stream transport gives it a
+//! buffered pipe, and the HTTP transport gives it the body of one upload
+//! request. One `send` call can run several writers over one `Upload`, and
+//! these writers take the names from one shared cursor.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -25,16 +25,19 @@ use super::{ObjectData, ObjectReader, ObjectSource, invalid};
 use crate::error::{Error, Result};
 use crate::proto::{Encoding, FrameWriter, Message, ObjectHeader};
 
-/// The longest chunk the session writes: 64 KiB less the 4 bytes of its
-/// length. A full chunk and its length fill the output buffer of a stream
-/// exactly, and one frame of an upload body.
+/// The largest chunk payload that the session writes: 64 KiB less 4 bytes.
+///
+/// The 4 bytes hold the length of the chunk. A full chunk and its length
+/// fill the output buffer of a stream exactly. They also fill one frame of
+/// an upload body exactly.
 pub(super) const CHUNK_PAYLOAD: usize = 64 * 1024 - 4;
 
-/// An output that tells whether the bytes written to it reach the transport.
+/// An output that tells if the bytes written to it reach the transport.
 pub(super) trait HandOver {
-    /// Whether the transport holds what the output takes: always for a
-    /// stream, and from the hand-over of its request on for the body of an
-    /// upload.
+    /// Returns `true` if the transport holds the bytes that the output takes.
+    ///
+    /// A stream always returns `true`. The body of an upload returns `true`
+    /// from the hand-over of its request.
     fn is_handed_over(&self) -> bool;
 }
 
@@ -50,14 +53,16 @@ impl HandOver for ostrya_fetch::UploadWriter {
     }
 }
 
-/// A writer that counts each byte it takes as a byte sent once its output
-/// is handed over. The bytes it takes before that are held, and counted at
-/// the first write, flush, or close after the hand-over. Bytes of an output
-/// that is never handed over are never counted.
+/// A writer that counts the bytes that it takes as bytes sent, after the
+/// hand-over of its output.
+///
+/// Before the hand-over, the writer holds the bytes that it takes. It counts
+/// them at the first write, flush, or close after the hand-over. If the
+/// output is never handed over, the writer counts none of its bytes.
 pub(super) struct Counting<W> {
     inner: W,
     counters: Arc<Counters>,
-    /// The bytes taken before the hand-over and not counted yet.
+    /// The number of bytes taken before the hand-over and not counted yet.
     held: u64,
 }
 
@@ -70,8 +75,8 @@ impl<W: AsyncWrite + HandOver + Unpin> Counting<W> {
         }
     }
 
-    /// Count the held bytes and `n` more, or hold them all until the
-    /// hand-over.
+    /// Adds `n` to the held bytes, and counts all held bytes as sent if the
+    /// output is handed over.
     fn count(&mut self, n: u64) {
         self.held += n;
         if self.held > 0 && self.inner.is_handed_over() {
@@ -107,8 +112,9 @@ impl<W: AsyncWrite + HandOver + Unpin> AsyncWrite for Counting<W> {
     }
 }
 
-/// A reader that counts each byte it gives as a content byte: the input of
-/// the session compressor.
+/// A reader that counts each byte that it gives as a content byte.
+///
+/// The session compressor reads the content bytes through it.
 struct ContentCount {
     inner: Box<dyn ObjectReader>,
     counters: Arc<Counters>,
@@ -129,14 +135,22 @@ impl futures_io::AsyncRead for ContentCount {
 
 /// The claims of the detached metadata of the commits of one session.
 ///
-/// A commit is free, pending, or sent. A call that finds a commit free claims
-/// it and asks its source, and the claim is pending until the source
-/// answers. A dict makes the commit sent, and no call sends a dict for it
-/// again. No dict, a failure, and a call that is dropped make the commit free
-/// again. A call that finds the claim of a commit pending waits until it
-/// ends, and then claims the commit itself when it is free again, so no call
-/// passes over a commit whose claim another call gives back. A call holds
-/// one pending claim at a time, and no lock is held while it waits.
+/// A commit has one of three states:
+///
+/// - free: a call that finds the commit free claims it and asks its source.
+/// - pending: a call asks its source. The claim is pending until the source
+///   answers.
+/// - sent: a call has a dict of the commit that passed the checks, and it
+///   writes the dict. No call sends a dict for the commit again.
+///
+/// If the call gets a dict that it can send, the commit becomes sent. If the
+/// source gives no dict, or a failure occurs, or the call is dropped, the
+/// commit becomes free again.
+///
+/// A call that finds the claim of a commit pending waits until the claim
+/// ends. If the commit is then free, the call claims it, so no call passes
+/// over a commit whose claim another call gives back. A call holds one
+/// pending claim at a time, and a waiting call holds no lock.
 #[derive(Default)]
 pub(super) struct MetaClaims {
     claims: Mutex<HashMap<Checksum, Claim>>,
@@ -144,7 +158,8 @@ pub(super) struct MetaClaims {
 
 /// The state of a commit that a call claimed. A commit with no entry is free.
 enum Claim {
-    /// A call asks its source, and these calls wait for the answer.
+    /// A call asks its source. The wakers are of the calls that wait for the
+    /// answer.
     Pending(Vec<Waker>),
     /// A call sent the dict of the commit.
     Sent,
@@ -155,8 +170,10 @@ impl MetaClaims {
         self.claims.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Claim `commit`: the pending claim, or `None` when a call sent the
-    /// dict of the commit. A claim that another call holds is waited for.
+    /// Claims `commit`, and returns the pending claim.
+    ///
+    /// Returns `None` if a call sent the dict of the commit. If another call
+    /// holds the claim, this call waits until that claim ends.
     pub(super) async fn claim(&self, commit: &Checksum) -> Option<PendingClaim<'_>> {
         std::future::poll_fn(|cx| match self.lock().entry(*commit) {
             Entry::Vacant(free) => {
@@ -181,9 +198,11 @@ impl MetaClaims {
     }
 }
 
-/// The pending claim of one commit. [`sent`](PendingClaim::sent) makes the
-/// commit sent. Dropped without it, the claim makes the commit free again.
-/// Either way the calls that wait for the claim wake.
+/// The pending claim of one commit.
+///
+/// `PendingClaim::sent` makes the commit sent. If the claim is dropped with
+/// no call to `sent`, the commit becomes free again. In both cases, the calls
+/// that wait for the claim wake.
 pub(super) struct PendingClaim<'a> {
     claims: &'a MetaClaims,
     commit: Checksum,
@@ -191,7 +210,7 @@ pub(super) struct PendingClaim<'a> {
 }
 
 impl PendingClaim<'_> {
-    /// The session sends the dict of the commit, and no call sends it again.
+    /// Marks the commit as sent, so no call sends its dict again.
     pub(super) fn sent(mut self) {
         self.sent = true;
     }
@@ -212,27 +231,29 @@ impl Drop for PendingClaim<'_> {
     }
 }
 
-/// The objects of one `send` call, and what the session knows to send them.
+/// The objects of one `send` call, and the data that the session needs to
+/// send them.
 ///
 /// The writers of the call take the names from one cursor. The first writer
-/// that finds no name left claims the detached metadata of `commits`, and
-/// writes it alone. After [`stop`](Upload::stop), the cursor gives no name
-/// and no writer can claim the detached metadata.
+/// that finds no name left claims the detached metadata of `commits`. Only
+/// that writer writes the detached metadata. After `Upload::stop`, the
+/// cursor gives no name, and no writer can claim the detached metadata.
 pub(super) struct Upload<'a> {
     pub source: &'a dyn ObjectSource,
     pub names: &'a [ObjectName],
     pub commits: &'a [Checksum],
-    /// The level a content object is deflated at, or `None` to send it raw.
+    /// The deflate level of a content object, or `None` to send content
+    /// objects raw.
     pub level: Option<u8>,
-    /// Whether the server lists the encoding `deflate`.
+    /// `true` if the server lists the encoding `deflate`.
     pub deflate_ok: bool,
     /// The claims of the detached metadata of the session.
     pub claims: &'a MetaClaims,
     /// The index of the next name to send.
     cursor: AtomicUsize,
-    /// Whether a writer claimed the detached metadata.
+    /// `true` if a writer claimed the detached metadata.
     metas_claimed: AtomicBool,
-    /// Whether a writer failed. No writer then takes more work.
+    /// `true` if a writer failed. After that, no writer takes more work.
     stopped: AtomicBool,
 }
 
@@ -258,7 +279,8 @@ impl<'a> Upload<'a> {
         }
     }
 
-    /// The next name to send, or `None` when none is left or a writer failed.
+    /// Returns the next name to send, or `None` if no name is left or a
+    /// writer failed.
     fn next_name(&self) -> Option<&'a ObjectName> {
         if self.stopped.load(Ordering::Relaxed) {
             return None;
@@ -266,13 +288,16 @@ impl<'a> Upload<'a> {
         self.names.get(self.cursor.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Claim the detached metadata of the commits. Only the first call gets
-    /// `true`, and no call after [`stop`](Upload::stop) does.
+    /// Returns `true` if this call claims the detached metadata of the
+    /// commits.
+    ///
+    /// Only the first call returns `true`. After `Upload::stop`, no call
+    /// returns `true`.
     fn claim_metas(&self) -> bool {
         !self.stopped.load(Ordering::Relaxed) && !self.metas_claimed.swap(true, Ordering::Relaxed)
     }
 
-    /// Give no more work to the writers of the call.
+    /// Stops the upload, so the writers of the call get no more work.
     pub(super) fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
     }
@@ -282,22 +307,24 @@ impl<'a> Upload<'a> {
     }
 }
 
-/// Where one writer is in an [`Upload`].
+/// The position of one writer in an `Upload`.
 #[derive(Default)]
 pub(super) struct Pass {
-    /// `None` while the writer takes names. After it claimed the detached
-    /// metadata, the index of the next commit.
+    /// The index of the next commit, after the writer claimed the detached
+    /// metadata. `None` while the writer takes names.
     metas: Option<usize>,
 }
 
-/// Why an object stream stopped.
+/// The cause of the stop of an object stream.
 pub(super) enum Stop {
     /// A write to the stream failed.
     Wire(Error),
-    /// The source failed, or gave data the session cannot send. The session
-    /// ends the stream with `Abort`, after the abandon marker when an object
-    /// is open. `next` is the header of the object the writer was to start,
-    /// when the failure came before that header was written.
+    /// The source failed, or gave data that the session cannot send.
+    ///
+    /// The session ends the stream with `Abort`. If an object is open, the
+    /// session writes the abandon marker before `Abort`. If the failure came
+    /// before the writer wrote the header of the next object, `next` is that
+    /// header.
     Abandon {
         error: Error,
         in_object: bool,
@@ -311,7 +338,8 @@ impl From<Error> for Stop {
     }
 }
 
-/// Stop before the object of `next`, whose header is not written.
+/// Returns the stop before the object of `next`, whose header the writer
+/// did not write.
 fn refuse(error: Error, next: ObjectHeader) -> Stop {
     Stop::Abandon {
         error,
@@ -320,8 +348,9 @@ fn refuse(error: Error, next: ObjectHeader) -> Stop {
     }
 }
 
-/// The error of a source call. An error that is already a source error is
-/// kept as it is.
+/// Returns `e` as the error of a source call.
+///
+/// If `e` is already [`Error::Source`], the function returns it unchanged.
 fn source_error(e: Error) -> Error {
     match e {
         Error::Source(_) => e,
@@ -337,13 +366,13 @@ fn read_failed(e: io::Error) -> Stop {
     }
 }
 
-/// The object bytes after the prefix the session builds.
+/// The object bytes after the prefix that the session builds.
 enum Body {
-    /// No bytes: a symlink.
+    /// No bytes, for a symlink.
     None,
     /// Bytes copied as the reader gives them.
     Copy(Box<dyn ObjectReader>),
-    /// Bytes the session deflates at `level`.
+    /// Bytes that the session deflates at the given level.
     Deflate(Box<dyn ObjectReader>, u8),
 }
 
@@ -353,28 +382,31 @@ enum Prefix {
     None,
     /// The framed file header in the header buffer of the writer.
     Header,
-    /// These bytes.
+    /// The given bytes.
     Bytes(Vec<u8>),
 }
 
-/// What the session sends for one object.
+/// The data that the session sends for one object.
 pub(super) struct Plan {
     encoding: Encoding,
     prefix: Prefix,
     body: Body,
 }
 
-/// One object an object stream carries next.
+/// The next object of an object stream.
 pub(super) enum Item {
-    /// An object of the names, and what the session sends for it.
+    /// An object of the names, and the plan of what the session sends for it.
     Object(ObjectName, Plan),
     /// The serialized detached metadata of a commit.
     Meta(Checksum, Vec<u8>),
 }
 
-/// Check the data a source gave for `name`, and build what the session sends
-/// for it. `level` is the level of the session compressor, when it deflates.
-/// The framed file header of a content object goes into `header_buf`.
+/// Checks the data that a source gave for `name`, and returns the plan of
+/// what the session sends for it.
+///
+/// `level` is the level of the session compressor, or `None` if the session
+/// does not deflate. The function writes the framed file header of a content
+/// object into `header_buf`.
 fn plan(
     name: &ObjectName,
     data: ObjectData,
@@ -450,13 +482,15 @@ fn plan(
     }
 }
 
-/// Writes object streams over one output `W`.
+/// A writer of object streams over one output `W`.
 pub(super) struct ObjectWriter<W> {
     writer: FrameWriter<W>,
-    /// The compressor of the objects this writer deflates. It is made at the
-    /// first such object and reset for each one after it.
+    /// The compressor of the objects that this writer deflates.
+    ///
+    /// The writer creates it at the first such object, and resets it for each
+    /// object after that.
     deflate: Option<DeflateReader<Box<dyn ObjectReader>>>,
-    /// The buffer object bytes are copied through.
+    /// The buffer that the writer copies object bytes through.
     buf: Vec<u8>,
     /// The buffer of the framed file header of each content object.
     header_buf: Vec<u8>,
@@ -474,13 +508,14 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
         }
     }
 
-    /// The frame writer under the object writer.
+    /// Returns the frame writer under the object writer.
     pub(super) fn frames(&mut self) -> &mut FrameWriter<W> {
         &mut self.writer
     }
 
-    /// Write the items of `up` that `pass` takes, until none is left. Sets
-    /// `started` before the first write.
+    /// Writes the items of `up` that `pass` takes, until none is left.
+    ///
+    /// Sets `started` to `true` before the first write.
     pub(super) async fn write_items(
         &mut self,
         up: &Upload<'_>,
@@ -494,10 +529,13 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
         Ok(())
     }
 
-    /// The next item of `up` for `pass`: the next name of the cursor, then,
-    /// for the writer that claims them, the detached metadata of each commit
-    /// that has some and that no call of the session claimed. `None` when
-    /// the writer has nothing more to write.
+    /// Returns the next item of `up` for `pass`, or `None` if the writer has
+    /// nothing more to write.
+    ///
+    /// The objects of the names of the cursor come first. Then the writer that
+    /// claims the detached metadata gets the detached metadata of the commits.
+    /// It skips a commit with no dict, and a commit that a call of the session
+    /// made sent. It waits while another call holds a pending claim.
     pub(super) async fn next_item(
         &mut self,
         up: &Upload<'_>,
@@ -536,8 +574,9 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
             if up.is_stopped() {
                 return Ok(None);
             }
-            // A failure, and a commit with no dict, drop the claim, which
-            // makes the commit free again for the calls that wait for it.
+            // If the source fails or has no dict for the commit, the claim
+            // drops. The commit is then free again for the calls that wait
+            // for it.
             let Some(claim) = up.claims.claim(commit).await else {
                 continue;
             };
@@ -576,7 +615,7 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
         Ok(None)
     }
 
-    /// Write one item.
+    /// Writes one item.
     pub(super) async fn write_item(&mut self, item: Item) -> std::result::Result<(), Stop> {
         match item {
             Item::Object(name, plan) => {
@@ -596,9 +635,11 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
         Ok(())
     }
 
-    /// End the stream after `stop`: the abandon marker and `Abort` when an
-    /// object is open, `Abort` alone otherwise. A failed write stops the call
-    /// and returns its error.
+    /// Ends the stream after a `Stop::Abandon`.
+    ///
+    /// If an object is open, the call writes the abandon marker and `Abort`.
+    /// If no object is open, it writes `Abort` alone. If a write fails, the
+    /// call stops and returns its error.
     pub(super) async fn abandon(&mut self, in_object: bool) -> Result<()> {
         if in_object {
             self.writer.abandon_object().await
@@ -607,7 +648,7 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
         }
     }
 
-    /// Write one object: its header, its bytes as chunks, and the end chunk.
+    /// Writes one object: its header, its bytes as chunks, and the end chunk.
     async fn write_object(
         &mut self,
         name: ObjectName,
@@ -624,8 +665,8 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
         match &plan.prefix {
             Prefix::None => {}
             Prefix::Header => {
-                // The buffer goes back to the writer for the next header. A
-                // failed write drops it, and the stream ends.
+                // The buffer goes back to the writer for the next header. If
+                // the write fails, the buffer is dropped, and the stream ends.
                 let header = std::mem::take(&mut self.header_buf);
                 self.write_data(&header).await?;
                 self.header_buf = header;
@@ -639,8 +680,8 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
                     self.buf = vec![0u8; CHUNK_PAYLOAD];
                 }
                 loop {
-                    // Each chunk but the last is full, whatever size each
-                    // read gives.
+                    // Each chunk except the last is full, for all sizes of
+                    // the reads.
                     let mut n = 0;
                     let mut end = false;
                     while n < self.buf.len() {
@@ -670,7 +711,8 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
                 }
             }
             Body::Deflate(reader, level) => {
-                // The compressor reads the content bytes through the count.
+                // The compressor reads the content bytes through a
+                // `ContentCount`.
                 let reader: Box<dyn ObjectReader> = Box::new(ContentCount {
                     inner: reader,
                     counters: Arc::clone(&self.counters),
@@ -687,14 +729,14 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
                     if chunk.is_empty() {
                         break;
                     }
-                    // The compressor gives up to 64 KiB, 4 bytes more than a
-                    // chunk.
+                    // The compressor gives up to 64 KiB, which is 4 bytes
+                    // more than a chunk.
                     let n = chunk.len().min(CHUNK_PAYLOAD);
                     self.writer.write_object_data(&chunk[..n]).await?;
                     self.counters.payload(n as u64);
                     deflate.consume(n);
                 }
-                // Release the source of the object.
+                // The empty reader releases the source of the object.
                 *deflate.get_mut() = Box::new(futures_lite::io::empty());
             }
         }
@@ -710,7 +752,7 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
         Ok(())
     }
 
-    /// Close the output.
+    /// Closes the output.
     pub(super) async fn close(self) -> Result<()> {
         self.writer.into_inner().close().await?;
         Ok(())
@@ -721,9 +763,9 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
 mod tests {
     use super::*;
 
-    /// The bytes written before the hand-over are held, and counted with the
-    /// first write or close after it. An output that is never handed over
-    /// counts no byte.
+    /// The writer holds the bytes written before the hand-over, and counts
+    /// them at the first write or close after it. If the output is never
+    /// handed over, the writer counts no byte.
     #[test]
     fn bytes_count_once_the_output_is_handed_over() {
         struct Output {
@@ -778,9 +820,9 @@ mod tests {
         assert_eq!(never.stats().bytes_sent, 0);
     }
 
-    /// Of many threads that claim one commit at the same time, one gets the
-    /// claim. The others wait until it ends. A sent commit is not claimed
-    /// again, and another commit is free.
+    /// If many threads claim one commit at the same time, one thread gets
+    /// the claim. The others wait until the claim ends. A claim of a sent
+    /// commit returns `None`, and another commit is free.
     #[test]
     fn one_claim_of_a_commit_wins() {
         let claims = MetaClaims::default();
@@ -801,10 +843,10 @@ mod tests {
         assert!(ostrya_rt::block_on(claims.claim(&Checksum::from_bytes([4; 32]))).is_some());
     }
 
-    /// A call that finds the claim of a commit pending waits. When the claim
-    /// is given back, as for a source with no dict, the waiting call gets
-    /// the claim and asks its own source. When the commit is sent, the
-    /// waiting call passes over it.
+    /// A call that finds the claim of a commit pending waits. If the claim is
+    /// given back, as for a source with no dict, the waiting call gets the
+    /// claim and asks its own source. If the commit is sent, the waiting call
+    /// passes over it.
     #[test]
     fn a_waiting_claim_follows_the_pending_one() {
         use futures_lite::future::poll_once;
@@ -815,7 +857,8 @@ mod tests {
             let first = claims.claim(&commit).await.expect("the commit is free");
             let mut second = std::pin::pin!(claims.claim(&commit));
             assert!(poll_once(second.as_mut()).await.is_none());
-            // No dict: the claim is given back, and the waiting call gets it.
+            // With no dict, the claim is given back, and the waiting call
+            // gets it.
             drop(first);
             let second = second.await.expect("a given-back claim is free");
 
@@ -874,7 +917,8 @@ mod tests {
     /// and the last chunk holds the rest.
     #[test]
     fn short_reads_make_full_chunks() {
-        /// A reader of `left` bytes that gives at most 1000 bytes a read.
+        /// A reader of `left` bytes that gives at most 1000 bytes for each
+        /// read.
         struct Trickle {
             left: usize,
         }

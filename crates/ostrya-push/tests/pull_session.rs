@@ -1,7 +1,7 @@
 //! The client session of the pull against scripted servers over a bounded
-//! in-process pipe: the hello and the version, the pipeline, the reply
-//! bodies, the length checks, the end of the session, and the errors that
-//! later calls repeat.
+//! in-process pipe. The tests cover the hello and the version, the pipeline,
+//! the reply bodies, the length checks, the end of the session, and the errors
+//! that later calls repeat.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -20,8 +20,8 @@ use ostrya_push::proto::{
 };
 use ostrya_push::{Error, ErrorCode, PullBody, PullSession, PullSessionOptions};
 
-/// The capacity of each pipe: smaller than a large body, so the server waits
-/// for the client to read.
+/// The capacity of each pipe. It is smaller than a large body, so the server
+/// waits for the client to read.
 const PIPE_CAP: usize = 16 * 1024;
 
 /// The time bound of each test.
@@ -39,12 +39,12 @@ struct PipeState {
     write_waker: Option<Waker>,
 }
 
-/// The write half of a bounded pipe. Dropping it gives the reader end of
-/// file.
+/// The write half of a bounded pipe. After a drop of this half, the reader
+/// reads end of file.
 struct PipeWriter(Arc<Mutex<PipeState>>);
 
-/// The read half of a bounded pipe. Dropping it fails each later write with
-/// `BrokenPipe`.
+/// The read half of a bounded pipe. After a drop of this half, each later
+/// write fails with `BrokenPipe`.
 struct PipeReader(Arc<Mutex<PipeState>>);
 
 fn pipe() -> (PipeWriter, PipeReader) {
@@ -155,7 +155,7 @@ impl Server {
         self.writer.flush().await.unwrap();
     }
 
-    /// Read `PullHello` and reply with `version`.
+    /// Reads `PullHello` and replies with `version`.
     async fn hello(&mut self, version: u32) {
         match self.recv().await {
             Some(Message::PullHello(hello)) => assert_eq!(hello.version, PULL_PROTOCOL_VERSION),
@@ -165,7 +165,7 @@ impl Server {
             .await;
     }
 
-    /// Read one `Get` and give its path.
+    /// Reads one `Get` and returns its path.
     async fn path(&mut self) -> String {
         match self.recv().await {
             Some(Message::Get(path)) => path,
@@ -173,8 +173,8 @@ impl Server {
         }
     }
 
-    /// Reply with found and `len`, then `body` in chunks of `chunk` bytes and
-    /// the end of the body.
+    /// Replies with `found` set to `true` and with `len`. Then sends `body` in
+    /// chunks of `chunk` bytes, and then the end of the body.
     async fn body(&mut self, len: Option<u64>, body: &[u8], chunk: usize) {
         self.send(&Message::GetReply(GetReply { found: true, len }))
             .await;
@@ -228,7 +228,7 @@ fn options(max_outstanding: Option<usize>) -> PullSessionOptions {
     }
 }
 
-/// Run the client and the server together, within the time bound.
+/// Runs the client and the server together within the time bound.
 fn run<C, S, T>(client: C, server: S) -> T
 where
     C: Future<Output = T>,
@@ -249,8 +249,8 @@ where
 /// One call of a test client, as a boxed future.
 type Call<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
-/// Poll every future of `futures` until each is done, and give their outputs
-/// in order.
+/// Polls every future of `futures` until each is done, and returns their
+/// outputs in order.
 async fn join_all<T>(futures: Vec<Call<'_, T>>) -> Vec<T> {
     let mut futures: Vec<_> = futures.into_iter().map(Some).collect();
     let mut outputs: Vec<Option<T>> = futures.iter().map(|_| None).collect();
@@ -299,9 +299,9 @@ fn body_of(path: &str) -> Vec<u8> {
 // Tests.
 // ---------------------------------------------------------------------------
 
-/// Eight concurrent calls keep eight `Get` frames in flight: the server reads
-/// all eight before it answers one, and each reply goes to the call of its
-/// place, a not-found reply included.
+/// Eight concurrent calls keep eight `Get` frames in flight. The server reads
+/// all eight before it answers one. Each reply goes to the call of its place,
+/// also a not-found reply.
 #[test]
 fn concurrent_calls_share_the_pipeline_in_order() {
     let paths: Vec<String> = (0..8).map(|i| format!("objects/{i:02}/file")).collect();
@@ -334,8 +334,8 @@ fn concurrent_calls_share_the_pipeline_in_order() {
             for _ in 0..8 {
                 seen.push(server.path().await);
             }
-            // The frames went on the wire in some order of the places;
-            // each reply answers the frame of its turn.
+            // The frames went on the wire in some order of the places. Each
+            // reply answers the frame of its turn.
             let mut sorted = seen.clone();
             sorted.sort();
             assert_eq!(sorted, expected);
@@ -359,8 +359,8 @@ fn concurrent_calls_share_the_pipeline_in_order() {
     }
 }
 
-/// The session moves to the next reply when it reads the chunk that ends a
-/// body, while the caller still holds that body.
+/// When the session reads the chunk that ends a body, it moves to the next
+/// reply, also while the caller still holds that body.
 #[test]
 fn a_later_reply_arrives_while_the_caller_holds_a_body_read_to_its_end() {
     let ((input, output), mut server) = ends();
@@ -391,8 +391,8 @@ fn a_later_reply_arrives_while_the_caller_holds_a_body_read_to_its_end() {
     );
 }
 
-/// A stated length that differs from the sum of the chunks is `protocol`, in
-/// both directions, and ends the session.
+/// A stated length that differs from the sum of the chunks is
+/// `Error::Protocol` in both directions. It also ends the session.
 #[test]
 fn a_stated_length_that_differs_from_the_body_is_protocol() {
     for (stated, body) in [(10u64, &b"short"[..]), (3, &b"longer"[..])] {
@@ -419,9 +419,9 @@ fn a_stated_length_that_differs_from_the_body_is_protocol() {
     }
 }
 
-/// A stated length above the cap of the call ends the session before the
-/// body is read, and a body with no stated length ends it at the chunk that
-/// passes the cap.
+/// A stated length that is more than the cap of the call ends the session
+/// before the client reads the body. A body with no stated length ends the
+/// session at the chunk that passes the cap.
 #[test]
 fn a_body_over_the_cap_ends_the_session() {
     let ((input, output), mut server) = ends();
@@ -480,14 +480,16 @@ fn a_body_over_the_cap_ends_the_session() {
 }
 
 impl Server {
-    /// Wait for the end of the input of the server, and tell whether it came.
+    /// Waits for the end of the input of the server, and returns `true` if it
+    /// came. A read error also counts as the end.
     async fn recv_or_eof(&mut self) -> bool {
         matches!(self.reader.read_message().await, Ok(None) | Err(_))
     }
 }
 
-/// A `get` future dropped after it took its place ends the session, and so
-/// does a body dropped before its end. Later calls fail with the same error.
+/// A `get` future that is dropped after it takes its place ends the session.
+/// A body dropped before its end also ends the session. Later calls fail with
+/// the same error.
 #[test]
 fn a_dropped_call_or_body_ends_the_session() {
     let ((input, output), mut server) = ends();
@@ -542,9 +544,9 @@ fn a_dropped_call_or_body_ends_the_session() {
     );
 }
 
-/// An `Error` from the server is the error of the call, and each later call
-/// repeats its code and its message. An I/O error repeats its kind and its
-/// message.
+/// An `Error` message from the server is the error of the call. Each later
+/// call repeats its code and its message. An I/O error repeats its kind and
+/// its message.
 #[test]
 fn later_calls_repeat_the_first_error() {
     let ((input, output), mut server) = ends();
@@ -597,8 +599,8 @@ fn later_calls_repeat_the_first_error() {
     );
 }
 
-/// After the abandon marker the session reads the `Error` frame, and the read
-/// of the body fails with its code.
+/// After the abandon marker, the session reads the `Error` message. The read
+/// of the body fails with the code of that message.
 #[test]
 fn an_abandoned_body_gives_the_code_of_its_error() {
     let ((input, output), mut server) = ends();
@@ -636,8 +638,9 @@ fn an_abandoned_body_gives_the_code_of_its_error() {
     );
 }
 
-/// The client goes on at a reply of version 1, and refuses a reply of a
-/// version it does not speak, and an `Error` at the hello is that error.
+/// The client continues after a reply of version 1. It refuses a reply of a
+/// version that it does not speak. An `Error` message at the hello is
+/// returned as the `Error` variant of its code.
 #[test]
 fn the_hello_reply_gives_the_version_of_the_session() {
     let ((input, output), mut server) = ends();
@@ -693,7 +696,8 @@ fn the_hello_reply_gives_the_version_of_the_session() {
     );
 }
 
-/// A pipeline depth of 0 is raised to 1: the server sees one `Get` at a time.
+/// The session raises a pipeline depth of 0 to 1, so the server sees one
+/// `Get` at a time.
 #[test]
 fn a_depth_of_zero_keeps_one_get_in_flight() {
     let ((input, output), mut server) = ends();
@@ -731,8 +735,8 @@ fn a_depth_of_zero_keeps_one_get_in_flight() {
     );
 }
 
-/// `finish` while the caller holds a body that is not read to its end ends
-/// the session uncleanly, and returns `InvalidInput`. The session drops its
+/// If the caller holds a body that it did not read to its end, `finish` ends
+/// the session uncleanly and returns `InvalidInput`. The session drops its
 /// input, and a later read of the held body repeats the error.
 #[test]
 fn finish_with_an_unread_body_is_an_unclean_end() {
@@ -770,8 +774,8 @@ fn finish_with_an_unread_body_is_an_unclean_end() {
     drop(held);
 }
 
-/// A body read after the session failed fails with a repeat of the first
-/// failure, and reads no more of the body.
+/// After the session fails, a read of a body fails with a repeat of the first
+/// error and reads no more of the body.
 #[test]
 fn a_body_read_after_a_failure_repeats_the_failure() {
     let ((input, output), mut server) = ends();

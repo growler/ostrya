@@ -1,6 +1,6 @@
 //! The push of a local directory: the walk and the hash pass, the commit
-//! over the tree, and one session that sends the objects the server lacks
-//! and sets the target refs.
+//! over the tree, and one session that sends the objects that the server
+//! lacks and sets the target refs.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -25,42 +25,53 @@ use crate::tree::{EntryFilter, ScanOptions, TreeModel};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ParentPolicy {
     /// The commit of the first target ref on the server, as `HelloReply`
-    /// reports it. No parent when that ref is absent.
+    /// reports it.
+    ///
+    /// If that ref is absent, the commit has no parent.
     #[default]
     CurrentTip,
     /// No parent.
     None,
-    /// The given commit. The client cannot resolve a ref name or an
-    /// abbreviated checksum on the server, so it takes a full checksum.
+    /// The commit of the given full checksum.
+    ///
+    /// The client cannot resolve a ref name or an abbreviated checksum on the
+    /// server.
     Commit(Checksum),
 }
 
-/// What [`push_tree`] and [`push_tree_over_stream`] push, and how.
+/// The options of a tree push.
 ///
-/// The struct carries no `#[non_exhaustive]`: build it with
+/// [`push_tree`], [`push_tree_prepared`], and [`push_tree_over_stream`] take
+/// them. The struct carries no `#[non_exhaustive]`. A caller builds it with
 /// `..Default::default()`.
 #[derive(Default)]
 pub struct TreePushOptions {
-    /// The target refs, one or more, each a ref name below `refs/heads`. The
-    /// commit sets each of them.
+    /// The target refs, one or more, each a ref name below `refs/heads`.
+    ///
+    /// The push sets each of them to the commit.
     pub refs: Vec<String>,
     /// The parent of the commit.
     pub parent: ParentPolicy,
-    /// The subject of the commit. Empty when not set.
+    /// The subject of the commit, empty if not set.
     pub subject: Option<String>,
-    /// The body of the commit. Empty when not set.
+    /// The body of the commit, empty if not set.
     pub body: Option<String>,
-    /// The entries of the `a{sv}` metadata dict of the commit, in order, each
-    /// value a variant. The bindings follow them.
+    /// The entries of the `a{sv}` metadata dict of the commit, in order.
+    ///
+    /// Each value is a variant. The bindings follow the entries.
     pub metadata: Vec<(String, Value)>,
-    /// The entries of the detached metadata dict of the commit, in order,
-    /// each value a variant. The signatures follow them.
+    /// The entries of the detached metadata dict of the commit, in order.
+    ///
+    /// Each value is a variant. The signatures follow the entries.
     pub detached_metadata: Vec<(String, Value)>,
     /// The timestamp of the commit, in seconds since the Unix epoch, UTC.
-    /// When not set, `SOURCE_DATE_EPOCH` is used if set, otherwise the
-    /// current time.
+    ///
+    /// If this field is not set, the push takes the `SOURCE_DATE_EPOCH`
+    /// environment variable. If that variable is also not set, the push takes
+    /// the current time.
     pub timestamp: Option<u64>,
-    /// Leave out `ostree.ref-binding` and `ostree.collection-binding`.
+    /// The switch that leaves out `ostree.ref-binding` and
+    /// `ostree.collection-binding`.
     pub no_bindings: bool,
     /// The signers of the commit, in order.
     pub signers: Vec<Box<dyn ostrya_sign::Signer>>,
@@ -68,49 +79,66 @@ pub struct TreePushOptions {
     pub compression: Compression,
     /// The filter that sees each entry of the walk.
     pub entry_filter: Option<EntryFilter>,
-    /// The most regular files the hash pass reads at the same time, as
-    /// [`ScanOptions::hash_jobs`].
+    /// The maximum number of regular files that the hash pass reads at one
+    /// time.
+    ///
+    /// [`ScanOptions::hash_jobs`] gives the default and the limits.
     pub hash_jobs: Option<usize>,
-    /// Set each target ref whatever its state on the server, and ask the
-    /// server to allow an update that is not a fast-forward.
+    /// The switch that sets each target ref whatever its state on the server.
+    ///
+    /// If it is `true`, `Commit` also asks the server to allow an update that
+    /// is not a fast-forward.
     pub force: bool,
-    /// A handle that shows the phase of the scan, and that the session also
-    /// counts its progress into.
+    /// The progress handle of the scan and of the session.
+    ///
+    /// The scan sets its phases in the handle, and the session counts its
+    /// progress into it.
     pub progress: Option<PushProgress>,
 }
 
-/// Push the directory `root` to `remote` as one commit, and set the target
-/// refs of the server to it in one transaction.
+/// Pushes the directory `root` to `remote` as one commit.
 ///
-/// The push runs in this order:
+/// The server sets the target refs to the commit in one transaction. The push
+/// runs in this order:
 ///
-/// 1. It checks the options, and it refuses with
-///    [`Error::InvalidInput`](crate::Error::InvalidInput) the options that
-///    [`push_tree_over_stream`] refuses. It then makes the transport ready
-///    with [`PushSession::prepare`]: for ssh it builds the command line, and
-///    for HTTP it reads the files that `connect` names and builds the HTTP
-///    client. It refuses what [`PushSession::connect`] refuses before it
-///    starts the transport.
+/// 1. It checks `opts` and refuses each value that [`push_tree_over_stream`]
+///    refuses. Then it makes the transport ready with
+///    [`PushSession::prepare`]. For ssh, it builds the command line. For
+///    HTTP, it reads the files that `connect` names and builds the HTTP
+///    client. It refuses each value that [`PushSession::connect`] refuses
+///    before it starts the transport.
 /// 2. It walks and hashes the tree with [`TreeModel::scan`], with
-///    `entry_filter` and `hash_jobs`. A walk error and a hash error are
-///    [`Error::Walk`](crate::Error::Walk).
-/// 3. It starts the ssh client, or sends the first HTTP request, and opens
-///    the session, with the target refs in one `Hello`.
-/// 4. It builds the commit, signs it, offers each object of the tree and the
-///    commit in one round of `Have`, sends the objects the server lacks with
-///    the detached metadata of the commit, and sends `Commit`.
+///    `entry_filter` and `hash_jobs`.
+/// 3. It starts the ssh client, or sends the first HTTP request. It opens the
+///    session with the target refs in one `Hello`.
+/// 4. It builds the commit and signs it. It offers each object of the tree
+///    and the commit in one round of `Have`. It sends the objects that the
+///    server lacks, with the detached metadata of the commit, and then it
+///    sends `Commit`.
 ///
-/// So a refusal of the options, a walk error, and a hash error start no ssh
+/// A refusal of the options, a walk error, and a hash error start no ssh
 /// client, send no request, and open no session. [`push_tree_over_stream`]
-/// states the rules of the commit and of the session. `PushStats::elapsed`
-/// of the outcome covers the session alone, from the start of the
-/// transport, and not the scan.
+/// gives the rules of the commit and of the session.
+///
+/// [`PushStats::elapsed`](crate::session::PushStats::elapsed) of the outcome
+/// covers the session alone, from the open of the session. It excludes the
+/// time of the scan.
 ///
 /// Under the tokio backend, the call must run within a runtime that has the
-/// IO driver and the time driver enabled. These are `enable_io` and
-/// `enable_time` of the runtime builder, or `enable_all`. The ssh child
-/// process and its pipes, and the connections of an HTTP session, need the
-/// IO driver, and the time limits of the session need the time driver.
+/// IO driver and the time driver enabled, as [`PushSession::connect`] states.
+///
+/// # Errors
+///
+/// - Each error of [`push_tree_prepared`](push_tree_prepared#errors).
+/// - [`Error::InvalidInput`] if `connect` holds a value that
+///   [`PushSession::prepare`] refuses.
+/// - [`Error::Io`] if the token file or a TLS file of `connect` cannot be
+///   read.
+/// - [`Error::Fetch`] if the HTTP client cannot be built.
+///
+/// [`Error::InvalidInput`]: crate::Error::InvalidInput
+/// [`Error::Io`]: crate::Error::Io
+/// [`Error::Fetch`]: crate::Error::Fetch
 pub async fn push_tree(
     remote: &PushRemote,
     root: &Path,
@@ -122,17 +150,33 @@ pub async fn push_tree(
     push.scan_and_run(transport, root, scan).await
 }
 
-/// Push the directory `root` as one commit over `session`, a transport that
-/// [`PushSession::prepare`] made ready, and set the target refs of the
-/// server to it in one transaction.
+/// Pushes the directory `root` as one commit over a prepared transport.
 ///
-/// The push is the push of [`push_tree`] with the transport checks done
-/// first, so a caller can make them before the work that builds `opts`, for
-/// example before it starts a signer. The push checks `opts` as
-/// [`push_tree`] does, then scans the tree, and then opens `session`. A
-/// refusal of the options, a walk error, and a hash error start no ssh
-/// client, send no request, and open no session. The other rules are those
-/// of [`push_tree`].
+/// `session` is a transport that [`PushSession::prepare`] made ready. The
+/// server sets the target refs to the commit in one transaction. The push is
+/// that of [`push_tree`] with the transport checks done first, so a caller
+/// can do them before the work that builds `opts`. For example, the caller
+/// can start a signer after the checks.
+///
+/// The push checks `opts` as [`push_tree`] does, then scans the tree, and then
+/// opens `session`. A refusal of the options, a walk error, and a hash error
+/// start no ssh client, send no request, and open no session. The other rules
+/// are those of [`push_tree`].
+///
+/// # Errors
+///
+/// - Each error of [`push_tree_over_stream`](push_tree_over_stream#errors).
+/// - [`Error::Transport`] if the ssh client cannot be started, or if it exits
+///   with a failure status after the session fails with an I/O error.
+/// - [`Error::Transport`] if an HTTP server answers with a status that the
+///   receive endpoint does not give, or with a body that is not one frame.
+/// - [`Error::Unauthorized`] if an HTTP server refuses the credential of the
+///   session with an `Error` message of the code `unauthorized`.
+/// - [`Error::Fetch`] for a failure of the HTTP client.
+///
+/// [`Error::Transport`]: crate::Error::Transport
+/// [`Error::Unauthorized`]: crate::Error::Unauthorized
+/// [`Error::Fetch`]: crate::Error::Fetch
 pub async fn push_tree_prepared(
     session: PreparedSession,
     root: &Path,
@@ -142,85 +186,134 @@ pub async fn push_tree_prepared(
     push.scan_and_run(session, root, scan).await
 }
 
-/// Push the directory `root` as one commit over a pair of byte streams, and
-/// set the target refs of the server to it in one transaction.
+/// Pushes the directory `root` as one commit over a pair of byte streams.
 ///
-/// `input` comes from the server, and `output` goes to it. The scan of the
-/// tree runs before the first byte is written to `output`.
+/// `input` comes from the server, and `output` goes to it. The server sets the
+/// target refs to the commit in one transaction. The push scans the tree
+/// before it writes the first byte to `output`.
 ///
-/// Before the scan, the push refuses with
-/// [`Error::InvalidInput`](crate::Error::InvalidInput):
+/// # Refusals
 ///
-/// - empty `refs`, a ref named twice, a ref that holds `:`, a ref that holds
-///   `^`, and a ref that fails the ref-name rule of
-///   [`ostrya_core::is_ref_name`], and a ref of 64 lowercase hex
-///   characters. A revision reads `^` as the parent of a commit, and a name
-///   of 64 lowercase hex characters as a commit checksum, so a ref of either
-///   form cannot be read back by its name;
-/// - a DEFLATE level outside 1 through 9;
-/// - a malformed `SOURCE_DATE_EPOCH` when `timestamp` is not set, and a
-///   system clock before the Unix epoch when neither is set;
-/// - an empty key in `metadata` or in `detached_metadata`, entries that do
-///   not serialize as an `a{sv}` dict, and entries whose serialized dict is
-///   over [`MAX_METADATA_SIZE`](ostrya_core::MAX_METADATA_SIZE);
-/// - a `subject`, a `body`, and `metadata` whose commit object is over
+/// Before the scan, the push refuses these values of `opts`:
+///
+/// - empty `refs`, and a ref named twice
+/// - a ref that holds `:` or `^`, a ref of 64 lowercase hex characters, and a
+///   ref that fails the ref-name rule of [`ostrya_core::is_ref_name`]
+/// - a DEFLATE level outside 1 through 9
+/// - a malformed `SOURCE_DATE_EPOCH` if `timestamp` is not set, and a system
+///   clock before the Unix epoch if neither is set
+/// - an empty key in `metadata` or in `detached_metadata`, entries that do not
+///   serialize as an `a{sv}` dict, and entries whose serialized dict is more
+///   than [`MAX_METADATA_SIZE`]
+/// - a `subject`, a `body`, and `metadata` whose commit object is more than
 ///   `MAX_METADATA_SIZE` without the bindings and without a parent of
-///   [`ParentPolicy::CurrentTip`]. These only add bytes, so the check never
-///   refuses a commit object that the check after `HelloReply` accepts.
+///   [`ParentPolicy::CurrentTip`]
 ///
-/// The timestamp is read before the scan. The scan refuses `hash_jobs` of
-/// `Some(0)` with [`Error::InvalidInput`](crate::Error::InvalidInput) before
-/// the walk starts. A walk error and a hash error are
-/// [`Error::Walk`](crate::Error::Walk). In each of these cases the push
-/// writes nothing.
+/// A revision cannot name a ref that holds `^`, because it reads `^` as the
+/// parent of a commit. It also cannot name a ref of 64 lowercase hex
+/// characters, because it reads that name as a commit checksum.
+///
+/// The bindings and a parent from the server only add bytes to the commit
+/// object. As a result, the size check before the scan never refuses a commit
+/// object that the check after `HelloReply` accepts.
+///
+/// The push reads the timestamp before the scan. The scan refuses `hash_jobs`
+/// of `Some(0)` before the walk starts. If the push refuses a value, or if
+/// the walk or the hash pass fails, the push writes nothing.
+///
+/// # Commit
 ///
 /// After `HelloReply`, the push builds the commit object:
 ///
 /// - The parent comes from [`ParentPolicy`].
-/// - The metadata dict holds the entries of `metadata`, in order, then
-///   `ostree.ref-binding` with the target refs sorted, then
-///   `ostree.collection-binding` with the collection id of the server when
-///   the server has one. With `no_bindings` the dict holds the entries of
-///   `metadata` alone. This is the rule of [`ostrya_core::commit_metadata`],
-///   so the commit checksum equals the checksum of a commit that
-///   `Transaction::write_commit` of `ostrya` writes over the same tree with
-///   the same inputs.
-/// - A commit object over [`MAX_METADATA_SIZE`](ostrya_core::MAX_METADATA_SIZE)
-///   is [`Error::InvalidInput`](crate::Error::InvalidInput).
+/// - The metadata dict holds the entries of `metadata`, in order. Then it
+///   holds `ostree.ref-binding` with the target refs sorted. Then it holds
+///   `ostree.collection-binding` with the collection id of the server, if the
+///   server has one.
+/// - With `no_bindings`, the dict holds the entries of `metadata` alone.
+///
+/// The dict follows the rule of [`ostrya_core::commit_metadata`]. As a result,
+/// the commit checksum equals the checksum of the commit that
+/// `Transaction::write_commit` of `ostrya` writes over the same tree with the
+/// same inputs.
+///
+/// # Ref states
 ///
 /// Without `force`, each target ref must have the state of the first target
-/// ref on the server: all absent, or all at one commit. Target refs in mixed
-/// states are [`Error::InvalidInput`](crate::Error::InvalidInput), with a
-/// message that names each ref and its commit, and the push offers no
-/// object.
+/// ref on the server: all absent, or all at one commit. If the target refs
+/// are in mixed states, the push offers no object. The message of the error
+/// names each ref and its commit.
+///
+/// # Signatures
 ///
 /// The push signs the serialized commit with each signer of `signers`, in
-/// order, while the session is open. The detached metadata dict holds the
-/// entries of `detached_metadata`, in order, and then each signature under
-/// the `metadata_key` of its signer. A signature goes into the `aay` array
-/// of its key, after the blobs that the array already holds, also when the
-/// array is an entry of `detached_metadata`. A value of
-/// `detached_metadata` under the key of a signer that is not an `aay`, and a
-/// signer that fails, are [`Error::Sign`](crate::Error::Sign). The push
-/// checks the key of each signer before the first signer signs. A dict over
-/// `MAX_METADATA_SIZE` is [`Error::InvalidInput`](crate::Error::InvalidInput).
-/// An empty dict sends no detached metadata.
+/// order, while the session is open. It checks the key of each signer before
+/// the first signer signs.
 ///
-/// The push then offers each object of the tree and the commit in one round
-/// of `Have`. It sends the objects the server lacks, and the detached
-/// metadata of the commit also when the server holds the commit. Each ref
-/// update expects the commit that `HelloReply` reported for the ref, or no
-/// ref. With `force`, each update expects any state, and `Commit` carries
-/// `force`. The outcome carries the commit in
-/// [`PushOutcome::commit`].
+/// The detached metadata dict holds the entries of `detached_metadata`, in
+/// order. Then it holds each signature under the
+/// [`metadata_key`](ostrya_sign::Signer::metadata_key) of its signer. If the
+/// dict is empty, the push sends no detached metadata.
 ///
-/// The server verifies each object. A file whose bytes changed after the
-/// hash pass fails the push with the error of the server, and no ref
-/// changes.
+/// A signature goes into the `aay` array of its key, after the blobs that the
+/// array already holds. This is also the rule if the array is an entry of
+/// `detached_metadata`.
 ///
-/// A failure after the session opened and before `Commit` ends the session
-/// and returns that failure. The push writes `Abort` when the stream is
-/// still usable. `PushStats::elapsed` covers the session alone.
+/// # Objects and refs
+///
+/// The push offers each object of the tree and the commit in one round of
+/// `Have`. It sends the objects that the server lacks. It sends the detached
+/// metadata of the commit also if the server holds the commit.
+///
+/// Each ref update expects the state that `HelloReply` reported for its ref:
+/// the commit of the ref, or an absent ref. With `force`, each update expects
+/// any state, and `Commit` carries `force`. [`PushOutcome::commit`] holds the
+/// commit.
+///
+/// The server verifies each object. If the bytes of a file change after the
+/// hash pass, the server sends an `Error` message and no ref changes.
+///
+/// # Failures
+///
+/// A failure after the session opens and before `Commit` ends the session, and
+/// the push returns that failure. If the stream is still usable, the push
+/// writes `Abort`. Over HTTP, the push ends the session with `DELETE`.
+/// [`PushStats::elapsed`](crate::session::PushStats::elapsed)
+/// covers the session alone.
+///
+/// # Errors
+///
+/// - [`Error::InvalidInput`] for each value of [Refusals](#refusals), and if
+///   `hash_jobs` is `Some(0)`.
+/// - [`Error::InvalidInput`] if the target refs are in mixed states on the
+///   server without `force`.
+/// - [`Error::InvalidInput`] if the commit object or the detached metadata
+///   dict is more than [`MAX_METADATA_SIZE`].
+/// - [`Error::Walk`] if the walk or the hash pass fails. [`TreeModel::scan`]
+///   gives the `io::ErrorKind` of each case.
+/// - [`Error::Source`] if the send pass cannot open or read a file of the
+///   tree. The error of a failed open is the [`Error::Walk`] of that file.
+/// - [`Error::Sign`] if a signer fails, or if `detached_metadata` holds a
+///   value that is not an `aay` under the key of a signer.
+/// - [`Error::Protocol`] or [`Error::LimitExceeded`] if the codec refuses a
+///   frame of the session.
+/// - [`Error::Io`] for an I/O error of `input` or `output`.
+/// - [`Error::CommitOutcomeUnknown`] if the session ends after `Commit` with
+///   no reply that the client can read.
+/// - An `Error` message from the server, as the [`Error`] variant of its code.
+///   An example is [`Error::RefMismatch`] if a target ref is not in the state
+///   that `HelloReply` reported.
+///
+/// [`Error`]: crate::Error
+/// [`Error::InvalidInput`]: crate::Error::InvalidInput
+/// [`Error::Walk`]: crate::Error::Walk
+/// [`Error::Source`]: crate::Error::Source
+/// [`Error::Sign`]: crate::Error::Sign
+/// [`Error::Protocol`]: crate::Error::Protocol
+/// [`Error::LimitExceeded`]: crate::Error::LimitExceeded
+/// [`Error::Io`]: crate::Error::Io
+/// [`Error::CommitOutcomeUnknown`]: crate::Error::CommitOutcomeUnknown
+/// [`Error::RefMismatch`]: crate::Error::RefMismatch
 pub async fn push_tree_over_stream<R, W>(
     input: R,
     output: W,
@@ -257,8 +350,8 @@ struct Prepared {
 }
 
 impl Prepared {
-    /// Check `opts` and resolve the timestamp. Gives the options of the scan
-    /// apart, because the entry filter is not `Sync`.
+    /// Checks `opts` and resolves the timestamp. Returns the options of the
+    /// scan as a separate value, because the entry filter is not `Sync`.
     fn new(opts: TreePushOptions) -> Result<(ScanOptions, Prepared)> {
         let TreePushOptions {
             refs,
@@ -307,13 +400,13 @@ impl Prepared {
         Ok((scan, push))
     }
 
-    /// Walk and hash the tree at `root`, with the phases of the scan in the
-    /// progress handle.
+    /// Walks and hashes the tree at `root`, and sets the phases of the scan
+    /// in the progress handle.
     async fn scan(&self, root: &Path, scan: ScanOptions) -> Result<TreeModel> {
         TreeModel::scan_with(root, scan, self.progress.as_ref()).await
     }
 
-    /// Scan the tree at `root`, open `transport`, and run the push.
+    /// Scans the tree at `root`, opens `transport`, and runs the push.
     async fn scan_and_run(
         self,
         transport: PreparedSession,
@@ -332,8 +425,8 @@ impl Prepared {
         }
     }
 
-    /// Run the push over `session`. A failure before `Commit` ends the
-    /// session, with `Abort` when the stream is still usable.
+    /// Runs the push over `session`. A failure before `Commit` ends the
+    /// session, with `Abort` if the stream is still usable.
     async fn run(self, session: PushSession, model: TreeModel) -> Result<PushOutcome> {
         let force = self.force;
         match self.upload(&session, model).await {
@@ -349,8 +442,9 @@ impl Prepared {
         }
     }
 
-    /// The check of the ref states, the commit, the one `Have` round, and
-    /// the upload. Gives the commit and the ref updates of `Commit`.
+    /// Checks the ref states, builds the commit, runs the one `Have` round,
+    /// and sends the objects. Returns the commit and the ref updates of
+    /// `Commit`.
     async fn upload(
         self,
         session: &PushSession,
@@ -384,7 +478,7 @@ impl Prepared {
     }
 }
 
-/// Refuse empty `refs`, a ref that holds `:`, a ref that holds `^`, a ref
+/// Refuses empty `refs`, a ref that holds `:`, a ref that holds `^`, a ref
 /// that fails the ref-name rule, a ref of 64 lowercase hex characters, and a
 /// ref named twice.
 fn check_refs(refs: &[String]) -> Result<()> {

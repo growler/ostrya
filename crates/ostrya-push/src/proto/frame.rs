@@ -26,19 +26,21 @@ fn limit_exceeded(what: &str, len: u32, limit: u32) -> Error {
     Error::LimitExceeded(format!("{what} of {len} bytes is over the limit {limit}"))
 }
 
-/// The kind of a body: the frame that follows the abandon marker.
+/// The kind of a body. It sets the message that must follow the abandon
+/// marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BodyKind {
-    /// An object of the push, after `ObjectHeader`. `Abort` follows the
-    /// marker.
+    /// An object of the push, after an `ObjectHeader`. An `Abort` message
+    /// follows the marker.
     Object,
-    /// A body of the pull, after `GetReply` with found true. `Error` follows
-    /// the marker.
+    /// A body of the pull, after a `GetReply` whose `found` is `true`. An
+    /// `Error` message follows the marker.
     Pull,
 }
 
 impl BodyKind {
-    /// The kind of body that follows `msg`, or `None` when no body follows.
+    /// Returns the kind of body that follows `msg`, or `None` if no body
+    /// follows.
     fn after(msg: &Message) -> Option<BodyKind> {
         match msg {
             Message::ObjectHeader(_) => Some(BodyKind::Object),
@@ -51,9 +53,10 @@ impl BodyKind {
 #[derive(Debug)]
 enum ReadState {
     Frames,
-    /// Inside a body of `kind`. `remaining` is what is left of the current
-    /// chunk. At 0 the next chunk length is read, and `prefix` holds the
-    /// `got` bytes of it already read.
+    /// Inside a body of `kind`. `remaining` is the number of bytes of the
+    /// current chunk that are not read. If it is 0, the next read starts
+    /// with the chunk length, and `prefix` holds the `got` bytes of it that
+    /// are read.
     Body {
         kind: BodyKind,
         remaining: u32,
@@ -77,34 +80,36 @@ impl ReadState {
 pub(crate) enum Step {
     Data(usize),
     End,
-    /// The abandon marker in a body of this kind. The frame that must follow
-    /// is not read.
+    /// The abandon marker in a body of this kind. The message that must
+    /// follow the marker is not read.
     Marker(BodyKind),
 }
 
 /// The result of one [`FrameReader::read_object_data`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectRead {
-    /// This number of body bytes is at the start of the buffer.
+    /// The number of body bytes at the start of the buffer.
     Data(usize),
-    /// The body ended. Frames follow.
+    /// The end of the body, after which frames follow.
     End,
-    /// The sender abandoned an object of the push, and the `Abort` frame that
-    /// must follow the marker was read. An abandoned body of the pull gives
-    /// the error of its `Error` frame in place of this value.
+    /// An object of the push that the sender abandoned.
+    ///
+    /// The call read the `Abort` message that must follow the marker. If the
+    /// sender abandons a body of the pull, the call returns the [`Error`]
+    /// variant of the code in the `Error` message.
     Abandoned,
 }
 
-/// Reads frames and object chunks from a stream.
+/// A reader of frames, object chunks, and pull bodies on a stream.
 ///
-/// Wrap a raw socket or pipe in a buffered reader: a frame takes three reads
-/// and a chunk two. A buffered reader that passes a large read through to
-/// the stream does not copy the object bytes a second time.
+/// A frame takes three reads and a chunk takes two, so a caller wraps a raw
+/// socket or pipe in a buffered reader. A buffered reader that passes a large
+/// read through to the stream does not copy the object bytes a second time.
 ///
 /// The futures of the reader are not cancel-safe. A call that is dropped
-/// before it completes can leave part of a frame or a chunk prefix read, and
-/// the next call then reads from the middle of it. After a cancelled call,
-/// drop the reader.
+/// before it completes can leave part of a frame or of a chunk length read.
+/// The next call then reads from the middle of it. After a canceled call,
+/// the caller must drop the reader.
 #[derive(Debug)]
 pub struct FrameReader<R> {
     inner: R,
@@ -113,7 +118,7 @@ pub struct FrameReader<R> {
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
-    /// A reader with the limit [`MIN_FRAME_LIMIT`].
+    /// Creates a reader with the limit [`MIN_FRAME_LIMIT`].
     pub fn new(inner: R) -> Self {
         FrameReader {
             inner,
@@ -122,30 +127,42 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         }
     }
 
-    /// Set the frame and chunk limit. The value is clamped to
-    /// `MIN_FRAME_LIMIT..=MAX_FRAME_LIMIT`.
+    /// Sets the frame and chunk limit of the reader.
     ///
-    /// The reader allocates the body of a frame in full, up to the limit. A
-    /// client keeps its own read limit, for example [`MAX_FRAME`], and does
-    /// not take the `max-frame` of the server here. The client gives that
-    /// value to its [`FrameWriter`] alone.
+    /// The value is clamped to [`MIN_FRAME_LIMIT`]`..=`[`MAX_FRAME_LIMIT`].
+    /// A client sets a read limit of its own here, for example
+    /// [`MAX_FRAME`], and gives the `max-frame` of the server to its
+    /// [`FrameWriter`] alone. The [frame rules](crate::proto#frames) give
+    /// the reason.
     ///
     /// [`MAX_FRAME`]: super::MAX_FRAME
     pub fn set_limit(&mut self, limit: u32) {
         self.limit = clamp_limit(limit);
     }
 
-    /// The frame and chunk limit.
+    /// Returns the frame and chunk limit.
     pub fn limit(&self) -> u32 {
         self.limit
     }
 
-    /// Read the next message. `Ok(None)` is an end of file at a frame
-    /// boundary. An end of file inside a frame is an [`Error::Io`] of kind
-    /// `UnexpectedEof`. After an `ObjectHeader`, and after a `GetReply` with
-    /// found true, the body bytes must be read to their end with
-    /// [`read_object_data`](Self::read_object_data) or
-    /// [`object_body`](Self::object_body) before the next message.
+    /// Reads the next message.
+    ///
+    /// `Ok(None)` is an end of file at a frame boundary. After an
+    /// `ObjectHeader`, and after a `GetReply` whose `found` is `true`, the
+    /// caller must read the body to its end before the next message. It reads
+    /// the body with [`read_object_data`](Self::read_object_data) or
+    /// [`object_body`](Self::object_body).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Protocol`] if the body of the previous message is not read to
+    ///   its end.
+    /// - [`Error::Protocol`] if the frame length is 0, if the kind byte is not
+    ///   a known kind, or if the body does not decode.
+    /// - [`Error::LimitExceeded`] if the frame length is more than the limit.
+    /// - [`Error::Io`] of kind `UnexpectedEof` if the stream ends inside a
+    ///   frame.
+    /// - [`Error::Io`] if a read of the stream fails.
     pub async fn read_message(&mut self) -> Result<Option<Message>> {
         if let ReadState::Body { .. } = self.state {
             return Err(protocol("object data not read to its end"));
@@ -178,8 +195,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         Ok(Some(msg))
     }
 
-    /// The bytes of the current object or pull body as an `AsyncRead`. See
-    /// [`ObjectBody`].
+    /// Returns an [`ObjectBody`] that reads the current object or pull body.
     pub fn object_body(&mut self) -> ObjectBody<'_, R> {
         ObjectBody {
             reader: self,
@@ -188,16 +204,29 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         }
     }
 
-    /// Read the bytes of an object or of a pull body into `buf`. A chunk
-    /// longer than `buf` arrives over several calls, so `buf` bounds the
-    /// memory. An empty `buf` reads nothing and returns `Data(0)`. Outside a
-    /// body the call is the error `protocol`.
+    /// Reads bytes of the current object or pull body into `buf`.
     ///
-    /// After the abandon marker the call reads the frame that must follow
-    /// it. In an object of the push, `Abort` gives
-    /// [`ObjectRead::Abandoned`]. In a body of the pull, `Error` gives the
-    /// error of its code, for example [`Error::Internal`]. Any other frame is
-    /// the error `protocol`.
+    /// A chunk longer than `buf` arrives over several calls, so `buf` bounds
+    /// the memory. Inside a body, an empty `buf` reads nothing and gives
+    /// `ObjectRead::Data(0)`.
+    ///
+    /// If the call meets the abandon marker, it reads the message that must
+    /// follow the marker. In an object of the push, an `Abort` message gives
+    /// [`ObjectRead::Abandoned`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Protocol`] if the reader is not inside a body.
+    /// - [`Error::LimitExceeded`] if a chunk length is more than the limit.
+    /// - In a body of the pull, the [`Error`] variant of the code in the
+    ///   `Error` message after the marker, for example [`Error::Internal`].
+    /// - [`Error::Protocol`] if a message of another kind follows the
+    ///   marker.
+    /// - [`Error::Io`] of kind `UnexpectedEof` if the stream ends inside a
+    ///   chunk, or after the marker and before the next message.
+    /// - [`Error::Io`] if a read of the stream fails.
+    /// - The errors of [`read_message`](Self::read_message) for the message
+    ///   after the marker.
     pub async fn read_object_data(&mut self, buf: &mut [u8]) -> Result<ObjectRead> {
         match poll_fn(|cx| self.poll_step(cx, buf)).await? {
             Step::Data(n) => Ok(ObjectRead::Data(n)),
@@ -209,17 +238,17 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         }
     }
 
-    /// Read the frame that must follow the abandon marker in a body of
-    /// `kind`: `Abort` after an object, which gives `Ok`, and `Error` after a
-    /// pull body, which gives the error of its code. Another frame is the
-    /// error `protocol`.
+    /// Reads the message that must follow the abandon marker in a body of
+    /// `kind`. After an object, an `Abort` message gives `Ok`. After a pull
+    /// body, an `Error` message gives the [`Error`] variant of its code.
+    /// Another message gives [`Error::Protocol`].
     async fn read_after_marker(&mut self, kind: BodyKind) -> Result<()> {
         match (kind, self.read_message().await?) {
             (BodyKind::Object, Some(Message::Abort)) => Ok(()),
             (BodyKind::Pull, Some(Message::Error(e))) => Err(e.into()),
             (_, Some(other)) => {
-                // An ObjectHeader or a GetReply with found true sets the body
-                // state. The error leaves the reader between frames.
+                // An ObjectHeader or a GetReply whose `found` is `true` sets
+                // the body state. This reset leaves the reader between frames.
                 self.state = ReadState::Frames;
                 Err(protocol(format!(
                     "{:?} after the abandon marker",
@@ -230,8 +259,8 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         }
     }
 
-    /// Read the next step of the object stream into `buf`. A partial chunk
-    /// length is kept in the state, so a pending read loses no byte.
+    /// Reads the next step of the object stream into `buf`. The state keeps
+    /// a partial chunk length, so a pending read loses no byte.
     pub(crate) fn poll_step(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<Step>> {
         let FrameReader {
             inner,
@@ -285,14 +314,16 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         Poll::Ready(Ok(Step::Data(n)))
     }
 
-    /// A reference to the underlying stream. A caller that wraps the stream
-    /// in a buffered reader can look at the bytes the buffer holds, for
-    /// example to learn whether a whole frame waits there, with no read.
+    /// Returns a reference to the underlying stream.
+    ///
+    /// If the stream is a buffered reader, a caller can look at the bytes in
+    /// the buffer with no read. An example is a check for a whole frame in
+    /// the buffer.
     pub fn get_ref(&self) -> &R {
         &self.inner
     }
 
-    /// The underlying stream.
+    /// Returns the underlying stream.
     pub fn into_inner(self) -> R {
         self.inner
     }
@@ -303,21 +334,23 @@ enum BodyState {
     Reading,
     Finished,
     Abandoned(BodyKind),
-    /// A read failed with an error of this kind, which every later read
-    /// repeats.
+    /// A read failed with an error of this kind. Every later read fails with
+    /// the same kind.
     Failed(io::ErrorKind),
 }
 
-/// The bytes of one object of the push, or of one body of the pull, read
-/// from a [`FrameReader`] as an `AsyncRead`.
+/// One object or pull body of a [`FrameReader`], read as an `AsyncRead`.
 ///
 /// A read returns body bytes until the chunk of length 0, and then end of
 /// file. A read that meets the abandon marker, a codec error, or an error of
 /// the stream fails with an `io::Error`, and every later read fails too.
-/// After the abandon marker, [`is_abandoned`](Self::is_abandoned) is true, and
-/// [`finish_abandon`](Self::finish_abandon) reads the frame that must
-/// follow. After another failure, [`take_error`](Self::take_error) gives the
-/// error of the reader, with its wire code.
+///
+/// - After the abandon marker, [`is_abandoned`](Self::is_abandoned) returns
+///   `true`, and [`finish_abandon`](Self::finish_abandon) reads the message
+///   that must follow the marker.
+/// - After another failure, [`take_error`](Self::take_error) returns the
+///   [`Error`] of the reader. The `io::Error` of the read does not keep the
+///   variant or its wire code.
 ///
 /// The body keeps a partial chunk length in the reader, so a read that returns
 /// `Pending` loses no byte. A read that is dropped before it completes leaves
@@ -330,28 +363,42 @@ pub struct ObjectBody<'a, R> {
 }
 
 impl<R: AsyncRead + Unpin> ObjectBody<'_, R> {
-    /// Whether the object ended with the chunk of length 0.
+    /// Returns `true` if the body ended with the chunk of length 0.
     pub fn is_finished(&self) -> bool {
         self.state == BodyState::Finished
     }
 
-    /// Whether the sender abandoned the body with the abandon marker.
+    /// Returns `true` if the sender abandoned the body with the abandon
+    /// marker.
     pub fn is_abandoned(&self) -> bool {
         matches!(self.state, BodyState::Abandoned(_))
     }
 
-    /// The error of the reader that failed a read: a codec error, such as
-    /// `limit-exceeded` for a chunk over the limit, or [`Error::Io`] for an
-    /// error of the stream. `None` when no read failed that way.
+    /// Takes the [`Error`] of the read that failed.
+    ///
+    /// The error is a codec error, for example [`Error::LimitExceeded`] for a
+    /// chunk over the limit, or an [`Error::Io`] from the stream. The call
+    /// returns `None` if no read failed, if the abandon marker is the only
+    /// failure, or if an earlier call took the error.
     pub fn take_error(&mut self) -> Option<Error> {
         self.error.take()
     }
 
-    /// After the abandon marker, read the frame that must follow it. In an
-    /// object of the push, `Abort` gives `Ok`. In a body of the pull, `Error`
-    /// gives the error of its code, for example [`Error::Internal`]. Any
-    /// other frame is the error `protocol`. Before the marker the call is the
-    /// error `protocol`.
+    /// Reads the message that must follow the abandon marker.
+    ///
+    /// In an object of the push, an `Abort` message gives `Ok`. In a body of
+    /// the pull, an `Error` message gives the [`Error`] variant of its code.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Protocol`] if no read met the abandon marker.
+    /// - In a body of the pull, the [`Error`] variant of the code in the
+    ///   `Error` message, for example [`Error::Internal`].
+    /// - [`Error::Protocol`] if a message of another kind follows the
+    ///   marker.
+    /// - [`Error::Io`] of kind `UnexpectedEof` if the stream ends before the
+    ///   message.
+    /// - The errors of [`FrameReader::read_message`] for the message.
     pub async fn finish_abandon(self) -> Result<()> {
         let BodyState::Abandoned(kind) = self.state else {
             return Err(protocol("the object was not abandoned"));
@@ -380,10 +427,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for ObjectBody<'_, R> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        // Fill `buf` across chunk boundaries while the stream has bytes ready,
-        // so small chunks do not make small reads. Bytes already in `buf` are
-        // returned before a pending read, the end, the marker, or an error,
-        // which the next read then reports.
+        // The loop fills `buf` across chunk boundaries while the stream has
+        // bytes ready, so small chunks do not make small reads. If `buf` holds
+        // bytes at a pending read, the end, the marker, or an error, the read
+        // returns those bytes. The next read reports the end, the marker, or
+        // the error.
         let mut filled = 0;
         loop {
             let step = match me.reader.poll_step(cx, &mut buf[filled..]) {
@@ -426,8 +474,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for ObjectBody<'_, R> {
     }
 }
 
-/// The frame of `msg`: the length, the kind, and the body. A frame over
-/// `limit` is the error `limit-exceeded`. A caller that sends the frame as
+/// Returns the frame of `msg`: the length, the kind, and the body. A frame
+/// over `limit` is [`Error::LimitExceeded`]. A caller that sends the frame as
 /// one buffer takes it from here with no copy of its own.
 pub(crate) fn encode_frame(msg: &Message, limit: u32) -> Result<Vec<u8>> {
     let body = msg.encode_body()?;
@@ -447,22 +495,25 @@ pub(crate) fn encode_frame(msg: &Message, limit: u32) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
-/// Writes frames, object chunks, and the chunks of pull bodies to a stream.
+/// A writer of frames, object chunks, and pull bodies on a stream.
 ///
-/// The writer enters the body state when it writes an `ObjectHeader` or a
-/// `GetReply` with found true. [`write_object_data`](Self::write_object_data)
-/// and [`end_object`](Self::end_object) serve both body kinds.
-/// [`abandon_object`](Self::abandon_object) abandons an object of the push,
-/// and [`abandon_body`](Self::abandon_body) a body of the pull.
+/// The writer enters the body state when it writes an `ObjectHeader`, or a
+/// `GetReply` whose `found` is `true`.
 ///
-/// The writer does not flush and holds no object bytes. The caller flushes
+/// - [`write_object_data`](Self::write_object_data) and
+///   [`end_object`](Self::end_object) serve both body kinds.
+/// - [`abandon_object`](Self::abandon_object) abandons an object of the
+///   push.
+/// - [`abandon_body`](Self::abandon_body) abandons a body of the pull.
+///
+/// The writer holds no object bytes and does not flush. The caller flushes
 /// with [`flush`](Self::flush), or wraps the stream in a buffered writer.
-/// A frame is one write, and a chunk is two: the length and the data. Wrap
-/// a raw socket or pipe in a buffered writer.
+/// A frame is one write, and a chunk is two: the length and the data. A
+/// caller wraps a raw socket or pipe in a buffered writer.
 ///
 /// The futures of the writer are not cancel-safe. A call that is dropped
 /// before it completes can leave part of a frame or a chunk written. After a
-/// cancelled call, drop the writer.
+/// canceled call, the caller must drop the writer.
 #[derive(Debug)]
 pub struct FrameWriter<W> {
     inner: W,
@@ -471,7 +522,7 @@ pub struct FrameWriter<W> {
 }
 
 impl<W: AsyncWrite + Unpin> FrameWriter<W> {
-    /// A writer with the limit [`MIN_FRAME_LIMIT`].
+    /// Creates a writer with the limit [`MIN_FRAME_LIMIT`].
     pub fn new(inner: W) -> Self {
         FrameWriter {
             inner,
@@ -480,23 +531,42 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         }
     }
 
-    /// Set the limit of the peer: the `max-frame` it announced. The value is
-    /// clamped to `MIN_FRAME_LIMIT..=MAX_FRAME_LIMIT`.
+    /// Sets the frame and chunk limit to the `max-frame` that the peer
+    /// announced.
+    ///
+    /// The value is clamped to [`MIN_FRAME_LIMIT`]`..=`[`MAX_FRAME_LIMIT`].
+    /// [`HelloReply::max_frame`](super::HelloReply::max_frame) holds the
+    /// announced value, and the [frame rules](crate::proto#frames) apply
+    /// the limit.
     pub fn set_limit(&mut self, limit: u32) {
         self.limit = clamp_limit(limit);
     }
 
-    /// Write one message as a frame. A frame over the limit is the error
-    /// `limit-exceeded`, and nothing is written. Inside an object or a pull
-    /// body the call is the error `protocol`. After an `ObjectHeader`, and
-    /// after a `GetReply` with found true, the writer is in the body state.
+    /// Writes one message as a frame.
+    ///
+    /// After an `ObjectHeader`, and after a `GetReply` whose `found` is
+    /// `true`, the writer is in the body state.
+    ///
+    /// # Errors
+    ///
+    /// If the call returns [`Error::Protocol`] or [`Error::LimitExceeded`],
+    /// it writes nothing.
+    ///
+    /// - [`Error::Protocol`] if the writer is inside an object or a pull
+    ///   body.
+    /// - [`Error::Protocol`] if `msg` holds a value that its kind cannot
+    ///   carry, for example a `GetReply` whose `found` is `false` with a
+    ///   length.
+    /// - [`Error::LimitExceeded`] if the frame is over the limit.
+    /// - [`Error::Io`] if a write to the stream fails.
     pub async fn write_message(&mut self, msg: &Message) -> Result<()> {
         if self.body.is_some() {
             return Err(protocol("message inside an object"));
         }
         // An object stream writes one `ObjectHeader` for each object, and a
-        // pull session one `GetReply` for each path, so their frames are
-        // built on the stack. Each frame is below every limit.
+        // pull session one `GetReply` for each path, so the writer builds
+        // their frames on the stack. Each of these frames is shorter than
+        // `MIN_FRAME_LIMIT`.
         if let Message::ObjectHeader(header) = msg {
             let frame = object_header_frame(header)?;
             self.inner.write_all(&frame).await?;
@@ -511,9 +581,9 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         Ok(())
     }
 
-    /// Write `frame`, which [`encode_frame`] built for a message that opens
-    /// no body. Inside an object or a pull body the call is the error
-    /// `protocol`.
+    /// Writes `frame`, which [`encode_frame`] built for a message that opens
+    /// no body. If the writer is inside an object or a pull body, the call
+    /// returns [`Error::Protocol`].
     pub(crate) async fn write_frame(&mut self, frame: &[u8]) -> Result<()> {
         if self.body.is_some() {
             return Err(protocol("message inside an object"));
@@ -522,13 +592,17 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         Ok(())
     }
 
-    /// Write the bytes of an object or of a pull body as chunks of at most
-    /// the limit. An empty `data` writes nothing. Outside a body the call is
-    /// the error `protocol`.
+    /// Writes bytes of the current object or pull body as chunks.
     ///
-    /// Each call with data writes one chunk or more, and each chunk costs 4
-    /// bytes of framing and one read call on the peer. Give the object bytes in large
-    /// pieces, 64 KiB or more.
+    /// Each chunk holds at most the limit. Inside a body, an empty `data`
+    /// writes nothing. Each call with data writes one chunk or more, and each
+    /// chunk costs 4 bytes of framing and one read call on the peer. A caller
+    /// gives the object bytes in pieces of 64 KiB or more.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Protocol`] if the writer is not inside a body.
+    /// - [`Error::Io`] if a write to the stream fails.
     pub async fn write_object_data(&mut self, data: &[u8]) -> Result<()> {
         if self.body.is_none() {
             return Err(protocol("object data outside an object"));
@@ -542,7 +616,12 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         Ok(())
     }
 
-    /// End the object or the pull body with a chunk of length 0.
+    /// Ends the current object or pull body with a chunk of length 0.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Protocol`] if the writer is not inside a body.
+    /// - [`Error::Io`] if a write to the stream fails.
     pub async fn end_object(&mut self) -> Result<()> {
         if self.body.is_none() {
             return Err(protocol("no object to end"));
@@ -552,9 +631,15 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         Ok(())
     }
 
-    /// Abandon an object of the push: write the marker [`ABANDON`] and then
-    /// the `Abort` frame. Outside an object, a pull body included, the call
-    /// is the error `protocol`.
+    /// Abandons the current object of the push.
+    ///
+    /// The call writes the marker [`ABANDON`] and then an `Abort` message.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Protocol`] if the writer is not inside an object of the
+    ///   push, for example if it is inside a body of the pull.
+    /// - [`Error::Io`] if a write to the stream fails.
     pub async fn abandon_object(&mut self) -> Result<()> {
         if self.body != Some(BodyKind::Object) {
             return Err(protocol("no object to abandon"));
@@ -564,12 +649,21 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         self.write_message(&Message::Abort).await
     }
 
-    /// Abandon a body of the pull: write the marker [`ABANDON`] and then the
-    /// `Error` frame of `error`. The caller gives the code, `internal` for a
-    /// read of the file that failed. Outside a pull body, an object of the
-    /// push included, the call is the error `protocol`. An `error` that does
-    /// not encode, or whose frame is over the limit, is an error, and nothing
-    /// is written.
+    /// Abandons the current body of the pull.
+    ///
+    /// The call writes the marker [`ABANDON`] and then `error` as an `Error`
+    /// message. The caller gives the code, for example `internal` for a
+    /// failed read of the file.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Protocol`] if the writer is not inside a body of the pull,
+    ///   for example if it is inside an object of the push.
+    /// - [`Error::Protocol`] if `error` does not encode. The call writes
+    ///   nothing.
+    /// - [`Error::LimitExceeded`] if the frame of `error` is over the limit.
+    ///   The call writes nothing.
+    /// - [`Error::Io`] if a write to the stream fails.
     pub async fn abandon_body(&mut self, error: &ErrorMessage) -> Result<()> {
         if self.body != Some(BodyKind::Pull) {
             return Err(protocol("no pull body to abandon"));
@@ -581,13 +675,17 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         Ok(())
     }
 
-    /// Flush the underlying stream.
+    /// Flushes the underlying stream.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the flush of the stream fails.
     pub async fn flush(&mut self) -> Result<()> {
         self.inner.flush().await?;
         Ok(())
     }
 
-    /// The underlying stream.
+    /// Returns the underlying stream.
     pub fn into_inner(self) -> W {
         self.inner
     }

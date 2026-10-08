@@ -24,8 +24,8 @@ use crate::proto::{
     encode_frame,
 };
 
-/// The output of a one-way stream. Each byte it takes reaches the caller's
-/// writer, so it is handed over at once.
+/// The output of a one-way stream. Each byte that it takes reaches the writer
+/// of the caller, so the output is handed over at once.
 struct Direct<W> {
     inner: W,
 }
@@ -54,48 +54,97 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Direct<W> {
     }
 }
 
-/// Write one one-way stream to `output`: one `Hello` with `one-way` true for
-/// the refs of `updates`, one object stream with `names` from `source` and
-/// the detached metadata of each commit in `commits` that has some, closed
-/// by `ObjectsEnd`, and one `Commit` with `updates` and `force` false. The
-/// stream has no object stream when it has no object to carry.
+/// Writes a push as one one-way stream to `output`.
 ///
-/// The receiver sends no reply, so the stream reads nothing, does no
-/// negotiation, and sends each name of `names`. The frame limit and the
-/// chunk limit are [`MIN_FRAME_LIMIT`]. The `deflate` encoding is used for
-/// the content objects when `compression` asks for it: a one-way receiver
-/// accepts it in every repository mode.
+/// The receiver of a [one-way stream](crate::proto#one-way-stream) sends no
+/// reply, so the call reads nothing, does no negotiation, and sends each name
+/// of `names`. The call returns the statistics of the stream as [`PushStats`].
 ///
-/// Before it writes a byte, the call refuses with [`Error::InvalidInput`]:
+/// # Stream
 ///
-/// - empty `updates`, a ref named twice, a ref name that fails the rule of
-///   [`ostrya_core::is_refspec`], and a ref name of 64 lowercase hex
-///   characters with no `REMOTE:` part that an update writes, which a
-///   revision reads as a commit checksum;
-/// - an update whose expected state is [`Expected::Commit`], and an update
-///   with no new commit, because the sender cannot learn the current tips;
-/// - a level outside 1 through 9;
-/// - a name whose type is not a file, a dirtree, a dirmeta, or a commit;
-/// - a `Hello` or a `Commit` frame over [`MIN_FRAME_LIMIT`].
+/// The stream holds these parts, in this order:
 ///
-/// A source that fails while the call writes the stream, for example on a
-/// missing file object or a failed read, and data of the source that the
-/// stream cannot carry, end the stream inside an object: the call writes the
-/// header of the object when it did not write it yet, then the abandon
-/// marker and `Abort`, flushes `output`, and returns the error of the source
-/// as [`Error::Source`], or [`Error::InvalidInput`] for the data. A failed
-/// write returns its error, and the call writes nothing more.
+/// 1. One `Hello` with `one-way` set to `true` and the refs of `updates`.
+/// 2. One object stream, closed by `ObjectsEnd`. It carries the objects of
+///    `names` from `source`, then the detached metadata of each commit of
+///    `commits` that has some. If the stream has no object to carry, it has
+///    no object stream.
+/// 3. One `Commit` with `updates` and `force` set to `false`.
 ///
-/// The call writes `output` in blocks of 64 KiB, so the caller need not give
-/// a buffered writer. It flushes `output` after `Commit` and does not close
-/// it. The caller closes it, and the close gives the end of file that ends
-/// the stream. A caller that keeps its writer gives `&mut W`. `opts.agent` is
-/// the `agent` of `Hello`, and `opts.progress` receives the counters. The
-/// statistics count each name as offered and as needed, and the phases are
-/// [`PushPhase::Uploading`] and then [`PushPhase::Committing`]. With
-/// `opts.progress`, and when `names` holds at least one file object, the
-/// call asks the source for the content bytes of `names` with
-/// [`ObjectSource::content_size`] before it writes the first byte.
+/// The frame limit and the chunk limit are [`MIN_FRAME_LIMIT`]. If
+/// `compression` asks for `deflate`, the call sends the content objects with
+/// the `deflate` encoding. A one-way receiver accepts this encoding in every
+/// repository mode.
+///
+/// # Output
+///
+/// The call writes `output` in blocks of 64 KiB, so the caller does not need
+/// to give a buffered writer. After `Commit`, the call flushes `output` and
+/// does not close it. The caller closes `output`, and this close gives the end
+/// of file that ends the stream. A caller that keeps its writer gives `&mut W`.
+///
+/// # Progress
+///
+/// - `opts.agent` is the `agent` of `Hello`.
+/// - `opts.progress` receives the counters.
+/// - The statistics count each name of `names` as offered and as needed.
+/// - The phases are [`PushPhase::Uploading`] and then
+///   [`PushPhase::Committing`].
+///
+/// If `opts.progress` is set and `names` holds at least one file object, the
+/// call asks [`ObjectSource::content_size`] for the content bytes of `names`.
+/// It asks before it writes the first byte.
+///
+/// # Failures
+///
+/// The source can fail while the call writes the stream, for example on a
+/// missing file object or a failed read. The source can also give data that
+/// the stream cannot carry. In both cases, the call ends the stream inside an
+/// object:
+///
+/// 1. It writes the header of the object, if it did not write it yet.
+/// 2. It writes the abandon marker and `Abort`.
+/// 3. It flushes `output`.
+///
+/// A one-way receiver refuses an `Abort` between two objects with the code
+/// `protocol`, so the call writes the header first. If a write fails, the
+/// call returns the error of the write and writes nothing more.
+///
+/// # Errors
+///
+/// Before it writes the first byte, the call returns:
+///
+/// - [`Error::InvalidInput`] if `updates` is empty, or names a ref twice.
+/// - [`Error::InvalidInput`] if a ref name fails the rule of
+///   [`ostrya_core::is_refspec`].
+/// - [`Error::InvalidInput`] if an update writes a ref name of 64 lowercase
+///   hex characters with no `REMOTE:` part. A revision reads such a name as a
+///   commit checksum.
+/// - [`Error::InvalidInput`] if an update expects [`Expected::Commit`], or
+///   has no new commit, because the sender cannot learn the current tips.
+/// - [`Error::InvalidInput`] if `compression` is [`Compression::Deflate`]
+///   with a level outside 1 through 9.
+/// - [`Error::InvalidInput`] if the type of a name of `names` is not a file,
+///   a dirtree, a dirmeta, or a commit.
+/// - [`Error::InvalidInput`] if the `Hello` frame or the `Commit` frame is
+///   more than [`MIN_FRAME_LIMIT`].
+/// - [`Error::Protocol`] if `opts.agent` holds a NUL byte, because the
+///   `Hello` frame does not encode.
+///
+/// After the first byte, the call returns:
+///
+/// - [`Error::Source`] if a call of the source fails. It holds the error of
+///   the source.
+/// - [`Error::Source`] if a read of an object reader fails. It holds the
+///   I/O error of the read.
+/// - [`Error::InvalidInput`] if the source gives data that the stream cannot
+///   carry:
+///   - an object with a type that its data does not permit
+///   - a symlink with a payload, or a regular file with no payload
+///   - a file header that does not encode
+///   - detached metadata that does not serialize as `a{sv}`, or that is more
+///     than [`MAX_METADATA_SIZE`](ostrya_core::MAX_METADATA_SIZE) bytes
+/// - [`Error::Io`] if a write to `output` or a flush of `output` fails.
 pub async fn export_stream<W>(
     output: W,
     source: &dyn ObjectSource,
@@ -114,8 +163,8 @@ where
     let agent = opts
         .agent
         .unwrap_or_else(|| format!("ostrya/{}", env!("CARGO_PKG_VERSION")));
-    // Each frame is encoded once, before the first byte. The stream keeps
-    // the bytes of `Commit` and no message.
+    // The call encodes each frame once, before the first byte. The stream
+    // keeps the bytes of `Commit` and no message.
     let hello = frame(
         &Message::Hello(Hello {
             version: PROTOCOL_VERSION,
@@ -158,9 +207,10 @@ where
             in_object,
             next,
         }) => {
-            // A one-way receiver reads `Abort` between two objects as
-            // `protocol`, so the stream opens the object it was to send and
-            // abandons it. A failed write ends the call with its error.
+            // A one-way receiver refuses `Abort` between two objects with
+            // the code `protocol`, so the stream opens the object that it
+            // was to send and abandons it. A failed write ends the call with
+            // its error.
             let mut in_object = in_object;
             if let (false, Some(header)) = (in_object, next) {
                 writer
@@ -184,7 +234,7 @@ where
     Ok(counters.stats())
 }
 
-/// Refuse empty `updates`, a ref named twice, a ref name that is not a
+/// Refuses empty `updates`, a ref named twice, a ref name that is not a
 /// refspec, a write to a ref name of 64 lowercase hex characters, an expected
 /// commit, and a delete.
 fn check_updates(updates: &[RefUpdate]) -> Result<()> {
@@ -217,8 +267,8 @@ fn check_updates(updates: &[RefUpdate]) -> Result<()> {
     Ok(())
 }
 
-/// The frame of `msg`. A frame over [`MIN_FRAME_LIMIT`], the limit of a
-/// one-way stream, is refused.
+/// Returns the frame of `msg`. If the frame is more than [`MIN_FRAME_LIMIT`],
+/// the limit of a one-way stream, the call returns `Error::InvalidInput`.
 fn frame(msg: &Message, what: &str) -> Result<Vec<u8>> {
     match encode_frame(msg, MIN_FRAME_LIMIT) {
         Ok(frame) => Ok(frame),
@@ -337,9 +387,9 @@ mod tests {
         ostrya_rt::block_on(reader.read_message()).unwrap()
     }
 
-    /// The stream is `Hello` with `one-way` true and the refs of the
+    /// The stream is `Hello` with `one-way` set to `true` and the refs of the
     /// updates, each object, the detached metadata of the commit, then
-    /// `ObjectsEnd`, `Commit` with `force` false, and the end. The
+    /// `ObjectsEnd`, `Commit` with `force` set to `false`, and the end. The
     /// statistics count each name as offered, needed, and sent.
     #[test]
     fn the_stream_is_hello_objects_metadata_objects_end_and_commit() {

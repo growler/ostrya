@@ -102,8 +102,8 @@ fn the_home_prefix_is_removed() {
 
 #[test]
 fn the_scp_form_ends_the_host_at_the_first_colon() {
-    // As git reads it: the scp form cannot give a user with `:`, and an IPv6
-    // host needs brackets.
+    // The scp form is read as git reads it. It cannot give a user with `:`,
+    // and an IPv6 host needs brackets.
     assert_eq!(
         argv("u:p@host:path"),
         strings(&["ssh", "u", "ostrya receive --repo='p@host:path'"])
@@ -180,7 +180,8 @@ fn a_backslash_before_the_first_colon_is_a_local_path_on_windows() {
     for address in ["..\\dir:x", "\\\\?\\C:\\repo", "dir\\sub:x"] {
         let msg = refused(address, true);
         assert!(msg.contains("local path"), "{address}: {msg}");
-        // Elsewhere the backslash is a character a host cannot hold.
+        // On other systems, the backslash is a character that a host cannot
+        // hold.
         let msg = refused(address, false);
         assert!(msg.contains("character"), "{address}: {msg}");
     }
@@ -226,8 +227,8 @@ fn malformed_addresses_are_refused() {
     }
 }
 
-/// A refusal names the address it refuses, and serves the push and the pull
-/// alike.
+/// A refusal names the address that it refuses. The push and the pull get
+/// the same refusal.
 #[test]
 fn a_refusal_names_the_address() {
     assert_eq!(
@@ -276,8 +277,8 @@ fn http_addresses_parse_and_their_malformed_forms_are_refused() {
         ("https://h/r#frag", "fragment"),
         ("https://h:65536/r", "not a number"),
         ("http://h:port/r", "not a number"),
-        // A password that holds a `/` or a `?` ends the authority before the
-        // `@`, and no message names it.
+        // A `/` or a `?` in a password ends the authority before the `@`. No
+        // message names the password.
         ("https://user:443/pw-QXZ@h/repo", "userinfo"),
         ("https://user:1234?pw-QXZ@h/", "userinfo"),
         ("http://h:+80/", "not a number"),
@@ -288,8 +289,8 @@ fn http_addresses_parse_and_their_malformed_forms_are_refused() {
     }
 }
 
-/// An HTTP option with an ssh address is refused before the ssh client
-/// starts, and so is a non-default `http` field.
+/// With an ssh address, an HTTP option and a non-default `http` field are
+/// refused before the ssh client starts.
 #[test]
 fn an_http_option_is_refused_with_an_ssh_address() {
     let remote = PushRemote::parse("ssh://host/srv/repo").unwrap();
@@ -447,8 +448,8 @@ fn an_empty_ssh_command_is_refused() {
     );
 }
 
-/// The command line of a pull runs the send command, which the options can
-/// name, and an HTTP address is refused.
+/// The command line of a pull runs the send command. The options can name
+/// the send command. A pull refuses an HTTP address.
 #[test]
 fn a_pull_runs_the_send_command_over_ssh() {
     let remote = PushRemote::parse("ssh://me@host:2222/srv/repo").unwrap();
@@ -522,7 +523,7 @@ fn an_env_value_that_is_not_utf8_is_refused() {
 }
 
 /// The sessions over a stand-in ssh client: a shell script that ignores the
-/// ssh arguments and plays one server.
+/// ssh arguments and acts as one server.
 #[cfg(unix)]
 mod standin {
     use std::path::{Path, PathBuf};
@@ -546,8 +547,9 @@ mod standin {
     const LIMIT: Duration = Duration::from_millis(300);
     /// The time limit of a session in a test that checks that a call waits
     /// for the exit of the stand-in. A call that waits returns when the
-    /// stand-in exits, so the limit costs no time, and a loaded host cannot
-    /// end the wait before the stand-in exits.
+    /// stand-in exits, so the limit costs no time. The stand-in exits 0.1 s
+    /// after the end of its input. A limit of 5 s, 50 times that delay, keeps
+    /// a loaded host from ending the wait before the stand-in exits.
     const EXIT_LIMIT: Duration = Duration::from_secs(5);
     const AGENT: &str = "transport-test";
 
@@ -649,14 +651,15 @@ mod standin {
         }
     }
 
-    /// Open a session over the stand-in `script`. The streams of the child
+    /// Opens a session over the stand-in `script`. The streams of the child
     /// belong to the runtime that opens them, so each test opens and drives
     /// its session in one `block_on`.
     async fn open(script: &str) -> Result<PushSession> {
         open_with_limit(script, LIMIT).await
     }
 
-    /// As [`open`], with `limit` as the time limit of the session.
+    /// Opens a session as [`open`] does, with `limit` as the time limit of the
+    /// session.
     async fn open_with_limit(script: &str, limit: Duration) -> Result<PushSession> {
         let remote = PushRemote::parse("ssh://me@host:2222/srv/it's repo").unwrap();
         connect_with(
@@ -814,8 +817,8 @@ mod standin {
             }
             other => panic!("{other:?}"),
         }
-        // One limit for the pending read, and one for the wait for the exit,
-        // which the silent server outlasts.
+        // The call spends one limit on the pending read and one limit on the
+        // wait for the exit. The silent server outlasts the wait for the exit.
         assert!(elapsed >= LIMIT * 2, "{elapsed:?}");
         assert!(elapsed < LIMIT * 2 + Duration::from_secs(3), "{elapsed:?}");
     }
@@ -834,8 +837,8 @@ mod standin {
             "committed",
             &encode(&[Message::CommitReply(vec![outcome.clone()])]),
         );
-        // The stand-in reads to end of file, so it exits only once the
-        // session closed its standard input.
+        // The stand-in reads to end of file, so it exits only after the
+        // session closes its standard input.
         let script = format!(
             "{}; {}; {}; {}; cat > /dev/null; {}; exit 7",
             skip(hello_len()),
@@ -861,8 +864,8 @@ mod standin {
         let reply = dir.file("reply", &hello_reply());
         let seen = dir.0.join("seen");
         let eof_seen = dir.0.join("eof_seen");
-        // The stand-in reads to end of file, so it exits only once the
-        // session closed its standard input.
+        // The stand-in reads to end of file, so it exits only after the
+        // session closes its standard input.
         let script = format!(
             "{}; {}; cat > {}; {}; exit 1",
             skip(hello_len()),
@@ -888,7 +891,7 @@ mod standin {
         let dir = Dir::new();
         let reply = dir.file("reply", &hello_reply());
         // The stand-in closes its input before it replies, so the write of
-        // `Abort` fails, and it exits with a failure status.
+        // `Abort` fails. Then the stand-in exits with a failure status.
         let script = format!("{}; exec 0<&-; {}; exit 5", skip(hello_len()), cat(&reply));
         let r = ostrya_rt::block_on(async { open(&script).await.unwrap().abort().await });
         match r {
@@ -907,8 +910,8 @@ mod standin {
         let seen = dir.0.join("seen");
         let exited = dir.0.join("exited");
         // The stand-in closes its output after the reply, so `missing` reads
-        // end of file and leaves the session broken. The stand-in then reads
-        // its input to end of file, and exits a moment later.
+        // end of file and leaves the session broken. Then the stand-in reads
+        // its input to end of file and exits 0.1 s later.
         let script = format!(
             "{}; {}; exec 1>&-; cat > {}; sleep 0.1; {}; exit 3",
             skip(hello_len()),
@@ -930,12 +933,12 @@ mod standin {
             other => panic!("{other:?}"),
         }
         assert!(exited.exists(), "abort returned before the stand-in exited");
-        // The stand-in read the `Have` of `missing` alone: no `Abort`.
+        // The stand-in read only the `Have` of `missing`, and no `Abort`.
         let have = encode(&[Message::Have(names(1))]);
         assert_eq!(std::fs::read(&seen).unwrap(), have);
     }
 
-    /// A source whose each open fails.
+    /// A source for which each open fails.
     struct FailingSource;
 
     impl ObjectSource for FailingSource {
@@ -959,9 +962,9 @@ mod standin {
         }
     }
 
-    /// A server that replies with `HelloReply` from `reply`, copies its
-    /// input to `seen` until end of file, and creates `exited` a moment
-    /// later, just before it exits with a failure status.
+    /// A server that replies with `HelloReply` from `reply` and copies its
+    /// input to `seen` until end of file. 0.1 s later, the server creates
+    /// `exited`, and then it exits with a failure status.
     fn reads_to_eof(reply: &Path, seen: &Path, exited: &Path) -> String {
         format!(
             "{}; {}; cat > {}; sleep 0.1; {}; exit 3",
@@ -999,7 +1002,7 @@ mod standin {
         }
         assert_broken(committed);
         assert!(exited.exists(), "commit did not wait for the stand-in");
-        // The stand-in read the `Abort` of the failed `send` alone: no
+        // The stand-in read only the `Abort` of the failed `send`, and no
         // `Commit`.
         assert_eq!(std::fs::read(&seen).unwrap(), encode(&[Message::Abort]));
     }
@@ -1151,8 +1154,8 @@ mod standin {
         }
 
         /// A stand-in that runs the send command gets the command line of a
-        /// pull, and an ssh client that exits with a failure status after a
-        /// clean end does not fail the session.
+        /// pull. If the ssh client exits with a failure status after a clean
+        /// end, the session does not fail.
         #[test]
         fn a_failure_status_after_a_clean_end_is_no_failure() {
             let dir = Dir::new();
@@ -1188,12 +1191,13 @@ mod standin {
             );
         }
 
-        /// At an unclean end the session closes the input of the stand-in and
-        /// drops its output before it waits. A stand-in blocked in the write
-        /// of a body on a full pipe then fails the write and exits, so the
-        /// wait ends with the exit and not with the time limit. This holds
-        /// for a body that the caller dropped, and for a body that the caller
-        /// still holds, whose later read then repeats the error.
+        /// At an unclean end, the session closes the input of the stand-in and
+        /// drops its output before it waits. Then a stand-in that is blocked
+        /// in the write of a body on a full pipe fails the write and exits.
+        /// The wait ends at the exit of the stand-in, before the time limit.
+        /// This holds for a body that the caller dropped and for a body that
+        /// the caller still holds. A later read of a held body repeats the
+        /// error.
         #[test]
         fn an_unclean_end_closes_both_sides_before_the_wait() {
             for hold in [false, true] {
@@ -1210,8 +1214,8 @@ mod standin {
                 chunk.extend_from_slice(&[b'x'; 4096]);
                 let chunk = dir.file("chunk", &chunk);
                 let exited = dir.0.join("exited");
-                // The stand-in writes chunks of the body until a write fails,
-                // which happens when the client drops its side of the output.
+                // The stand-in writes chunks of the body until a write fails.
+                // A write fails when the client drops its side of the output.
                 let script = format!(
                     "{}; {}; {}; {}; while {} 2>/dev/null; do :; done; {}; exit 6",
                     skip(pull_hello_len()),
@@ -1260,9 +1264,9 @@ mod standin {
             }
         }
 
-        /// A session that failed with an I/O error, over a stand-in that exits
-        /// with a failure status, ends with a transport error that names the
-        /// program and the status.
+        /// If a session fails with an I/O error and the stand-in exits with a
+        /// failure status, the session ends with `Error::Transport`. The error
+        /// names the program and the status.
         #[test]
         fn an_io_error_with_a_failure_status_is_a_transport_error() {
             let dir = Dir::new();

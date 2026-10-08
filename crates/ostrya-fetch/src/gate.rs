@@ -1,19 +1,19 @@
-//! Priority admission control for in-flight fetches.
+//! A priority admission gate that bounds concurrent work.
 //!
-//! A [`Gate`] holds a fixed number of permits. A waiter that finds none free
-//! joins a queue ordered by priority first and arrival second, so a metadata
-//! fetch a scan is blocked on overtakes queued bulk content. The guarantee a
-//! waiter has is within its own priority: no later arrival of the same priority
-//! is served before it. Across priorities the order is strict, so a steady
-//! arrival of higher-priority waiters keeps a lower-priority one queued; what
-//! bounds that is the caller's mix of priorities, not the gate.
+//! A [`Gate`] holds a fixed number of permits. [`Gate::acquire`] returns an
+//! [`Acquire`] future, which resolves to a [`Permit`].
+//! [`Fetcher`](crate::Fetcher) uses a gate to bound the requests in flight.
+//! Other code can use a gate to bound other work, for example the content
+//! writes that run at once.
 //!
-//! A released permit is handed to the best waiter directly rather than returned
-//! to a counter, so the woken waiter cannot lose it to a newcomer.
+//! If no permit is free, the waiter joins a queue. The queue serves the highest
+//! [`Priority`] first, and the waiters of one priority in arrival order. A
+//! released permit goes directly to the first waiter and does not raise the
+//! free count, so a new waiter cannot take it.
 //!
-//! Two callers hold one: the fetcher, whose gate bounds requests in flight, and
-//! the HTTP pull, whose gate bounds the fetched content objects being written at
-//! once.
+//! The order across priorities is strict. If higher-priority waiters arrive
+//! without a pause, a lower-priority waiter stays in the queue. The mix of
+//! priorities that the callers use sets the limit of that wait.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,26 +24,27 @@ use std::task::{Context, Poll, Waker};
 
 use super::Priority;
 
-/// A waiter's place in the queue: highest priority first, then arrival order.
+/// The place of a waiter in the queue: highest priority first, then arrival.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct WaitKey {
     rank: Reverse<Priority>,
     seq: u64,
 }
 
-/// The queue and the free-permit count.
+/// The queue and the count of free permits.
 struct State {
     free: usize,
     next_seq: u64,
-    /// Waiters that have not been handed a permit, with the waker to notify.
+    /// The waiters that have no permit, each with the waker to wake.
     waiting: BTreeMap<WaitKey, Option<Waker>>,
-    /// Waiters a permit has been handed to, which have yet to observe it.
+    /// The waiters that got a permit, which the next poll of each takes.
     granted: BTreeSet<WaitKey>,
 }
 
 impl State {
-    /// Give up a permit: to the best waiter if there is one, otherwise back to
-    /// the count. Returns the waker to notify once the lock is released.
+    /// Releases one permit. If a waiter is in the queue, the first waiter gets
+    /// the permit. If not, the free count increases. Returns the waker that the
+    /// caller must wake after it releases the lock.
     fn hand_off(&mut self) -> Option<Waker> {
         match self.waiting.keys().next().copied() {
             Some(key) => {
@@ -59,13 +60,15 @@ impl State {
     }
 }
 
-/// A bounded, priority-ordered admission gate.
+/// A priority admission gate with a fixed number of permits.
 pub struct Gate {
     state: Mutex<State>,
 }
 
 impl Gate {
-    /// A gate admitting `limit` holders at a time.
+    /// Creates a gate with `limit` permits.
+    ///
+    /// If `limit` is 0, no [`Acquire`] future resolves.
     pub fn new(limit: usize) -> Gate {
         Gate {
             state: Mutex::new(State {
@@ -77,7 +80,10 @@ impl Gate {
         }
     }
 
-    /// Wait for a permit at `priority`.
+    /// Returns a future that waits for a permit at `priority`.
+    ///
+    /// The future resolves to a [`Permit`]. The [`gate`](crate::gate) module
+    /// states the queue order.
     pub fn acquire(self: &Arc<Gate>, priority: Priority) -> Acquire {
         Acquire {
             gate: self.clone(),
@@ -86,22 +92,26 @@ impl Gate {
         }
     }
 
-    /// Hand a permit on and notify whoever receives it.
+    /// Releases one permit and wakes the waiter that gets it.
     fn release(&self) {
         let waker = self.state.lock().expect("fetch gate mutex").hand_off();
-        // Waking outside the lock keeps an executor that polls inline from
-        // re-entering it.
+        // The wake runs outside the lock, so an executor that polls the woken
+        // future inline does not lock the mutex a second time.
         if let Some(waker) = waker {
             waker.wake();
         }
     }
 }
 
-/// The future returned by [`Gate::acquire`].
+/// The future that [`Gate::acquire`] returns.
+///
+/// If a caller drops the future before it resolves, the future leaves the
+/// queue. If the gate gave it a permit already, the permit goes to the next
+/// waiter.
 pub struct Acquire {
     gate: Arc<Gate>,
     priority: Priority,
-    /// This waiter's queue position, once it has queued.
+    /// The place of this waiter in the queue, after it joins the queue.
     key: Option<WaitKey>,
 }
 
@@ -110,6 +120,8 @@ impl Future for Acquire {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Permit> {
         let me = self.get_mut();
+        // The mutex is poisoned only if a holder panics under the lock. No
+        // caller input can cause that.
         let mut state = me.gate.state.lock().expect("fetch gate mutex");
         match me.key {
             None => {
@@ -153,7 +165,8 @@ impl Drop for Acquire {
         let waker = {
             let mut state = self.gate.state.lock().expect("fetch gate mutex");
             state.waiting.remove(&key);
-            // A permit handed to a waiter that goes away has to move on.
+            // If the gate gave this waiter a permit, the permit goes to
+            // the next waiter.
             if state.granted.remove(&key) {
                 state.hand_off()
             } else {
@@ -166,7 +179,7 @@ impl Drop for Acquire {
     }
 }
 
-/// Admission to run one fetch, released on drop.
+/// A permit of a [`Gate`], which returns to the gate on drop.
 pub struct Permit {
     gate: Arc<Gate>,
 }
@@ -205,14 +218,16 @@ mod tests {
             let held = gate.acquire(Priority::Normal).await;
             let mut low = Box::pin(gate.acquire(Priority::Low));
             let mut high = Box::pin(gate.acquire(Priority::High));
-            // Queue low first, then high, so priority and not arrival decides.
+            // Queue low first, then high. The later arrival gets the permit,
+            // because priority comes first.
             assert!(poll_once(&mut low).await.is_none());
             assert!(poll_once(&mut high).await.is_none());
             drop(held);
             assert!(poll_once(&mut low).await.is_none());
             let permit = poll_once(&mut high).await;
             assert!(permit.is_some());
-            // With the high-priority holder done, the low waiter proceeds.
+            // After the high-priority holder releases its permit, the low
+            // waiter gets it.
             drop(permit);
             assert!(poll_once(&mut low).await.is_some());
         });
@@ -242,8 +257,8 @@ mod tests {
             let mut staying = Box::pin(gate.acquire(Priority::Normal));
             assert!(poll_once(&mut leaving).await.is_none());
             assert!(poll_once(&mut staying).await.is_none());
-            // The permit is handed to the high-priority waiter, which is then
-            // dropped without ever observing it.
+            // The gate gives the permit to the high-priority waiter. The test
+            // then drops that waiter before it polls again.
             drop(held);
             drop(leaving);
             assert!(poll_once(&mut staying).await.is_some());

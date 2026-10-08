@@ -1,85 +1,20 @@
-//! The fetcher's TLS configuration.
+//! The TLS configuration of the fetcher.
 //!
-//! Two rustls [`ClientConfig`]s are built per [`Fetcher`](crate::Fetcher) and
-//! shared by the connections it opens: one presents the configured client
-//! certificate and one presents none, so the certificate reaches the origin a
-//! route named and no redirect hop elsewhere. Everything else -- the crypto
-//! provider, the protocol versions, the trust anchors, and the ALPN offer --
-//! is one configuration both hold. With no client certificate configured the
-//! two are one `Arc`, so nothing is built twice. The crypto provider is
-//! `graviola`: Rust plus formally-verified assembly, so the provider adds no C
-//! to the build and carries no `cc` build dependency.
+//! Each [`Fetcher`](crate::Fetcher) builds two rustls [`ClientConfig`]s. One
+//! presents the configured client certificate, and one presents none. Both
+//! hold the same crypto provider, protocol versions, trust anchors, and ALPN
+//! offer. With no client certificate, the two are one `Arc`.
 //!
-//! ALPN advertises `h2` before `http/1.1` unless HTTP/2 is switched off, which
-//! is what selects the protocol version -- the server picks from the offer
-//! during the handshake, and the fetcher speaks whichever came back.
+//! ALPN offers `h2` before `http/1.1` unless HTTP/2 is off. The server picks
+//! the protocol from the offer during the handshake.
 //!
-//! A client private key comes in as PEM. The blob holds one section or more.
-//! The fetcher takes the first section whose armor label names a private key,
-//! and that section decides the path. The labels it reads are
-//! `ENCRYPTED PRIVATE KEY`, `PRIVATE KEY`, `RSA PRIVATE KEY`, and
-//! `EC PRIVATE KEY`.
-//!
-//! A section under one of the last three labels is read as it is. An
-//! `ENCRYPTED PRIVATE KEY` section is PKCS#8 under PBES2, and
-//! [`ClientIdentity::key_passphrase`] decrypts it. The supported ciphers are
-//! AES-128-CBC, AES-192-CBC, and AES-256-CBC. The supported key derivation
-//! functions are PBKDF2 with an HMAC-SHA-2 pseudorandom function, and scrypt.
-//!
-//! Each of these cases is refused with a message of its own:
-//!
-//! - a key that is encrypted, where no passphrase is set;
-//! - a passphrase set for a key section that carries no encryption;
-//! - a passphrase that does not decrypt the key;
-//! - a PBES2 cipher or key derivation function this build carries no
-//!   implementation for. The message names the OID. DES, 3DES, and PBKDF2
-//!   with an HMAC-SHA-1 pseudorandom function all reach it;
-//! - a key under PKCS#5 PBES1, which `pkcs5` parses and does not decrypt. The
-//!   message names PBES1. `pkcs5` recognizes six PBES1 OIDs, and an OID
-//!   outside that set gives a DER decoding failure. A corrupted document
-//!   gives the same failure, so the two cases are not told apart;
-//! - the legacy OpenSSL traditional PEM, which carries a
-//!   `Proc-Type: 4,ENCRYPTED` header line in the section. The message names
-//!   the `openssl pkcs8 -topk8` conversion that gives a PKCS#8 key.
-//!
-//! The key file sets the cost of the key derivation. The iteration count of
-//! PBKDF2 and the cost parameter of scrypt both come out of the document. A
-//! file that names an extreme parameter spends that much processor time or
-//! that much memory. The key file is operator-supplied, so no bound is applied
-//! to either parameter.
-//!
-//! Building the configuration is async for two reasons.
-//! [`TrustRoots::System`] reads the host trust store off the filesystem, and
-//! an encrypted client key runs a key derivation function. Both belong on the
-//! blocking pool. Everything else here is decoding already-loaded bytes.
-//!
-//! Two trust settings bypass verification, for an origin whose certificate the
-//! operator has decided not to check.
-//! [`DangerousAcceptAnyChain`](TrustRoots::DangerousAcceptAnyChain) takes the
-//! server certificate chain as presented: no trust anchor, no expiry check,
-//! and no key-usage check, so a client certificate or a CA certificate is
-//! taken as a server leaf. It keeps the host name check.
-//! [`DangerousAcceptAny`](TrustRoots::DangerousAcceptAny) drops the name check
-//! as well. Revocation is checked on neither path, since the anchored path
-//! configures no CRL.
-//!
-//! Both keep the handshake signature check, so the peer proves it holds the
-//! private key of the certificate it presented. Nobody vouches for that
-//! certificate, so the peer is not authenticated: an active attacker on the
-//! path presents a certificate of its own and the handshake completes, and a
-//! credential sent to such an origin reaches whoever answered the connection.
-//! The fetcher's cleartext credential guards read the scheme alone, so a
-//! credential does reach a bypass origin, which is what the reference tool and
-//! `curl -k` both do. The operator who asks for the bypass carries that risk.
-//!
-//! Under either one no trust store is read: the constructor touches no file
-//! and reaches no blocking pool, and a handshake proceeds, so
-//! [`ClientConfigs::has_trust_anchors`] is true.
+//! The read of the host trust store and the key derivation of an encrypted
+//! key run on the blocking pool, so the build is async. All other work
+//! decodes bytes that are already in memory. Under a bypass variant, no store
+//! is read, and [`ClientConfigs::has_trust_anchors`] is `true`.
 //!
 //! [`server_config`] builds the configuration of an HTTP server with the same
-//! provider and the same key loaders. It offers `h2` and `http/1.1` in ALPN,
-//! and with a client CA it verifies a client certificate that a client
-//! presents, and accepts a client that presents none.
+//! provider and the same key loaders.
 
 use std::io::BufReader;
 use std::sync::Arc;
@@ -92,55 +27,143 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 
 use super::{Error, Result};
 
-/// Which certificate authorities the fetcher trusts.
+/// The trust setting that a fetcher verifies a server certificate with.
+///
+/// The default is [`System`](TrustRoots::System). No variant checks
+/// revocation, because the anchored path configures no CRL.
+///
+/// All TLS connections use the `graviola` crypto provider of rustls. The
+/// provider is Rust and assembly, with formally verified assembly where it is
+/// available. It adds no C code and no `cc` build dependency.
+///
+/// # Bypass variants
+///
+/// [`DangerousAcceptAnyChain`](TrustRoots::DangerousAcceptAnyChain) and
+/// [`DangerousAcceptAny`](TrustRoots::DangerousAcceptAny) bypass the
+/// verification of the server certificate. They are for an origin whose
+/// certificate the operator does not want to check. Under a bypass variant,
+/// the fetcher reads no trust store.
+///
+/// Both variants verify the handshake signature, so the peer proves that it
+/// holds the private key of the certificate that it presents. Nobody vouches
+/// for that certificate, so the peer is not authenticated.
+///
+/// An active attacker on the path can present a certificate of its own, and
+/// the handshake completes. A credential sent to such an origin goes to the
+/// party that answers the connection.
+///
+/// The cleartext credential checks of the fetcher read the scheme alone, so a
+/// credential goes to a bypass origin. The `ostree` command and `curl -k` also
+/// send it. The operator who selects a bypass accepts this risk.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TrustRoots {
-    /// The certificates the host system trusts.
+    /// The certificates that the host system trusts.
     #[default]
     System,
-    /// Exactly the PEM-encoded certificates in this blob.
+    /// The PEM-encoded certificates in this blob, and no other certificates.
+    ///
+    /// If the blob does not decode as PEM, holds no certificate, or holds a
+    /// certificate that the root store refuses, [`Fetcher::new`] returns
+    /// [`Error::Fetch`].
+    ///
+    /// [`Fetcher::new`]: crate::Fetcher::new
     Pem(Vec<u8>),
-    /// Take the server certificate chain as presented: no trust anchor, no
-    /// expiry check, and no key-usage check, so a client certificate or a CA
-    /// certificate is taken as a server leaf. No trust store is read.
-    /// Revocation is checked on neither this path nor the anchored path, which
-    /// configures no CRL. The host name check is kept, so the certificate
-    /// still has to carry the name the request asked for, and the handshake
-    /// signature check is kept, so the peer still proves it holds the matching
-    /// private key. Nobody vouches for that certificate, so the peer is not
-    /// authenticated: an active attacker on the path presents a certificate of
-    /// its own, and a credential sent to such an origin reaches whoever
-    /// answered the connection.
+    /// A bypass that accepts any server chain and keeps the host name check.
+    ///
+    /// The chain needs no trust anchor. The fetcher checks no expiry and no
+    /// key usage, so a client certificate or a CA certificate passes as a
+    /// server leaf. The certificate must carry the host name that the request
+    /// names. [`TrustRoots`](TrustRoots#bypass-variants) states the risk.
     DangerousAcceptAnyChain,
-    /// The above, and the host name check dropped as well: any certificate the
-    /// server presents is taken, whatever name it carries. The handshake
-    /// signature check is kept, and the peer is as unauthenticated as it is
-    /// above.
+    /// A bypass that accepts any server certificate, with no host name check.
+    ///
+    /// This variant is
+    /// [`DangerousAcceptAnyChain`](TrustRoots::DangerousAcceptAnyChain) with
+    /// the host name check removed. The certificate can carry any name.
+    /// [`TrustRoots`](TrustRoots#bypass-variants) states the risk.
     DangerousAcceptAny,
 }
 
-/// A client certificate and its private key, both PEM-encoded, for a remote
-/// that authenticates its clients with TLS.
+/// A client certificate and its private key, for TLS client authentication.
+///
+/// Both are PEM-encoded. A remote that authenticates its clients with TLS
+/// needs an identity.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ClientIdentity {
-    /// The client certificate, followed by any intermediates.
+    /// The client certificate, followed by any intermediate certificates.
+    ///
+    /// If the blob holds no certificate, [`Fetcher::new`] returns
+    /// [`Error::Fetch`].
+    ///
+    /// [`Fetcher::new`]: crate::Fetcher::new
     pub cert_chain_pem: Vec<u8>,
-    /// The matching private key. The first section whose armor label names a
-    /// private key is the one read. A `PRIVATE KEY`, `RSA PRIVATE KEY`, or
-    /// `EC PRIVATE KEY` section is read as it is, and an
-    /// `ENCRYPTED PRIVATE KEY` section is decrypted with `key_passphrase`.
+    /// The private key of the client certificate.
+    ///
+    /// The blob holds one section or more. The fetcher reads the first
+    /// section whose armor label names a private key, and that section
+    /// selects the path:
+    ///
+    /// - A `PRIVATE KEY`, `RSA PRIVATE KEY`, or `EC PRIVATE KEY` section is
+    ///   read as it is.
+    /// - An `ENCRYPTED PRIVATE KEY` section is PKCS#8 under PBES2.
+    ///   [`key_passphrase`](ClientIdentity::key_passphrase) decrypts it.
+    ///
+    /// If the blob holds no private key section, [`Fetcher::new`] returns
+    /// [`Error::Fetch`].
+    ///
+    /// [`Fetcher::new`]: crate::Fetcher::new
     pub key_pem: Vec<u8>,
-    /// Decrypts an encrypted PKCS#8 key. A key section that carries no
-    /// encryption is refused where this is set, because a passphrase that
-    /// decrypts nothing hides a configuration mistake.
+    /// The passphrase of an encrypted PKCS#8 private key.
+    ///
+    /// If this is set and the key section carries no encryption, the fetcher
+    /// refuses the key. A passphrase that decrypts nothing hides a
+    /// configuration mistake.
+    ///
+    /// # Algorithms
+    ///
+    /// - Ciphers: AES-128-CBC, AES-192-CBC, and AES-256-CBC.
+    /// - Key derivation functions: PBKDF2 with an HMAC-SHA-2 pseudorandom
+    ///   function, and scrypt.
+    ///
+    /// # Key derivation cost
+    ///
+    /// The key file sets the cost of the key derivation. The iteration count
+    /// of PBKDF2 and the cost parameter of scrypt come from the file. A file
+    /// with an extreme parameter uses that much processor time or memory. The
+    /// operator supplies the key file, so ostrya applies no bound to either
+    /// parameter.
+    ///
+    /// # Refusals
+    ///
+    /// [`Fetcher::new`] returns [`Error::Fetch`], with a message of its own,
+    /// in each of these cases:
+    ///
+    /// - The key is encrypted, and no passphrase is set.
+    /// - A passphrase is set, and the key section carries no encryption.
+    /// - The passphrase does not decrypt the key.
+    /// - This build has no implementation of the PBES2 cipher or key
+    ///   derivation function. The message names the OID. DES, 3DES, and
+    ///   PBKDF2 with an HMAC-SHA-1 pseudorandom function get this refusal.
+    /// - The key is under PKCS#5 PBES1, which the `pkcs5` crate parses and
+    ///   does not decrypt. The message names PBES1. `pkcs5` recognizes six
+    ///   PBES1 OIDs, and an OID outside that set gives a DER decoding failure.
+    ///   A corrupted document gives the same failure, so the two cases look
+    ///   the same.
+    /// - The key is in the legacy OpenSSL traditional PEM format, with a
+    ///   `Proc-Type: 4,ENCRYPTED` header line in the section. The message
+    ///   names the `openssl pkcs8 -topk8` conversion, which gives a PKCS#8
+    ///   key. This refusal applies with or without a passphrase.
+    ///
+    /// [`Fetcher::new`]: crate::Fetcher::new
     pub key_passphrase: Option<String>,
 }
 
-/// The private key and the passphrase are both held out of the formatted
-/// text, so a logged fetcher configuration carries neither. The key is stated
-/// by its length, and the passphrase by whether it is set. The certificate
-/// chain is public material and is formatted in full.
+/// Redacts the private key and the passphrase.
+///
+/// A logged configuration holds neither. The key shows as its length in
+/// bytes, and the passphrase shows as `"<redacted>"` if it is set. The
+/// certificate chain is public material and shows in full.
 impl std::fmt::Debug for ClientIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientIdentity")
@@ -157,13 +180,22 @@ impl std::fmt::Debug for ClientIdentity {
     }
 }
 
-/// How the fetcher negotiates TLS.
+/// The TLS options of a fetcher.
+///
+/// The default trusts the host system store, [`TrustRoots::System`], and
+/// presents no client certificate.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TlsOptions {
-    /// Which certificate authorities the server certificate is verified
-    /// against, or the bypass that verifies it against none.
+    /// The trust setting for the server certificate.
     pub roots: TrustRoots,
     /// The client certificate to present, for a remote that requires one.
+    ///
+    /// The fetcher presents the certificate to the origin that a request
+    /// names, the origin of a mirror or of a URL target. A redirect hop at
+    /// another origin gets no certificate. [`Fetcher::fetch`] states the
+    /// redirect rules.
+    ///
+    /// [`Fetcher::fetch`]: crate::Fetcher::fetch
     pub client_identity: Option<ClientIdentity>,
 }
 
@@ -177,21 +209,22 @@ pub(crate) struct ClientConfigs {
     /// It presents no client certificate. With none configured this is the
     /// other field's own `Arc`.
     pub(crate) without_identity: Arc<ClientConfig>,
-    /// Whether a handshake has what it needs to verify the peer. A store with
-    /// no anchor reaches here for a fetcher whose mirrors are all cleartext,
-    /// which opens no handshake to consult them; the caller refuses a fetch
-    /// that would, whether the route named the TLS origin or a redirect hop
-    /// did. A bypass variant of [`TrustRoots`] reads no store and reports
-    /// true, because its handshake consults no anchor and completes.
+    /// `true` if a handshake has what it needs to verify the peer. A store
+    /// with no anchor reaches here for a fetcher whose mirrors are all
+    /// cleartext, which opens no handshake to reach them. The caller refuses
+    /// a fetch that opens one, from the origin of the route or from a redirect
+    /// hop. A bypass variant of [`TrustRoots`] reads no store and reports
+    /// `true`, because its handshake consults no anchor and completes.
     pub(crate) has_trust_anchors: bool,
 }
 
-/// Build the shared client configurations. `http2` decides whether `h2` is
-/// offered in ALPN. `https` says whether any mirror is reached over TLS, which
-/// decides whether an empty system trust store is fatal. `reaches_tls` says
-/// whether any fetch can open a handshake, through a mirror, a URL target, or
-/// a redirect. Without it, [`TrustRoots::System`] reads no store and gives
-/// the empty one. `https` implies `reaches_tls`.
+/// Builds the shared client configurations.
+///
+/// `http2` selects whether ALPN offers `h2`. `https` tells whether any mirror
+/// is reached over TLS, which makes an empty system trust store fatal.
+/// `reaches_tls` tells whether any fetch can open a handshake, through a
+/// mirror, a URL target, or a redirect. Without it, [`TrustRoots::System`]
+/// reads no store and gives the empty one. `https` implies `reaches_tls`.
 pub(crate) async fn client_config(
     options: &TlsOptions,
     http2: bool,
@@ -238,13 +271,31 @@ pub(crate) async fn client_config(
     })
 }
 
-/// Build the TLS configuration of an HTTP server from PEM bytes: the
-/// certificate chain, the private key, the passphrase of an encrypted key,
-/// and, with `client_ca_pem`, the CA that client certificates are verified
-/// against. A client certificate is optional: a client that presents one must
-/// present one the CA signed, and a client that presents none completes the
-/// handshake. The key is read as the key of a [`ClientIdentity`] is, with the
-/// same refusals. ALPN offers `h2`, then `http/1.1`.
+/// Builds the TLS configuration of an HTTP server from PEM bytes.
+///
+/// The inputs are the certificate chain, the private key, and the passphrase
+/// of an encrypted key. With `client_ca_pem`, the server verifies a client
+/// certificate against that CA. A client that presents a certificate must
+/// present one that the CA signed. A client that presents none completes the
+/// handshake.
+///
+/// The key is read as the key of a [`ClientIdentity`] is read, with the same
+/// refusals. ALPN offers `h2`, then `http/1.1`.
+///
+/// # Errors
+///
+/// - [`Error::Fetch`] if `cert_chain_pem` does not decode as PEM, or holds no
+///   certificate.
+/// - [`Error::Fetch`] if `key_pem` holds no private key that decodes, or if a
+///   refusal of [`ClientIdentity::key_passphrase`] applies.
+/// - [`Error::Fetch`] if the crypto provider supports no default protocol
+///   version.
+/// - [`Error::Fetch`] if `client_ca_pem` does not decode as PEM, holds no
+///   certificate, or holds a certificate that the root store refuses.
+/// - [`Error::Fetch`] if rustls refuses the client certificate verifier that
+///   it builds from `client_ca_pem`.
+/// - [`Error::Fetch`] if rustls refuses the certificate chain with the key,
+///   for example a key of another certificate.
 pub async fn server_config(
     cert_chain_pem: &[u8],
     key_pem: &[u8],
@@ -282,10 +333,11 @@ pub async fn server_config(
     Ok(Arc::new(config))
 }
 
-/// What both client configurations hold: the crypto provider, the protocol
-/// versions, and how the server certificate is verified. Both are shared by
-/// `Arc`, so the store is parsed once and held once, and the bypass verifier
-/// is one object under both configurations.
+/// Returns the builder state that both client configurations hold.
+///
+/// The state is the crypto provider, the protocol versions, and the
+/// verification of the server certificate. Both share the store and the
+/// bypass verifier by `Arc`, so the store is parsed once and held once.
 fn shared(
     provider: &Arc<rustls::crypto::CryptoProvider>,
     verification: &Verification,
@@ -309,11 +361,12 @@ enum Verification {
     Bypass(Arc<dyn ServerCertVerifier>),
 }
 
-/// Resolve the trust setting into what the configurations verify with. `https`
-/// says whether a handshake will consult the anchors, and `reaches_tls`
-/// whether any handshake can open at all. A bypass variant reads nothing, and
-/// neither does [`TrustRoots::System`] without `reaches_tls`, so these return
-/// without reaching the filesystem or the blocking pool.
+/// Resolves the trust setting into what the configurations verify with.
+///
+/// `https` tells whether a handshake will consult the anchors, and
+/// `reaches_tls` tells whether any handshake can open. A bypass variant and
+/// [`TrustRoots::System`] without `reaches_tls` read nothing, so they touch no
+/// file system and no blocking pool.
 async fn verification(
     roots: &TrustRoots,
     https: bool,
@@ -337,20 +390,22 @@ async fn verification(
     })
 }
 
-/// The verifier the bypass variants of [`TrustRoots`] install. It accepts the
-/// chain the server presented with no trust anchor, no expiry check, and no
-/// key-usage check: the anchored path holds the leaf to webpki's
-/// `KeyUsage::server_auth`, and this one holds it to nothing, so a client
-/// certificate or a CA certificate is taken as a server leaf. Revocation is
-/// checked on neither path. `check_name` decides whether the end-entity
-/// certificate is still held to the name the request asked for, which is the
-/// one difference between [`TrustRoots::DangerousAcceptAnyChain`] and
-/// [`TrustRoots::DangerousAcceptAny`].
+/// The verifier that the bypass variants of [`TrustRoots`] install.
+///
+/// It accepts the chain that the server presents with no trust anchor, no
+/// expiry check, and no key-usage check. The anchored path holds the leaf to
+/// webpki's `KeyUsage::server_auth`, and this verifier holds it to nothing. So
+/// a client certificate or a CA certificate passes as a server leaf. Neither
+/// path checks revocation.
+///
+/// `check_name` selects whether the end-entity certificate must carry the name
+/// that the request names. That is the one difference between
+/// [`TrustRoots::DangerousAcceptAnyChain`] and [`TrustRoots::DangerousAcceptAny`].
 ///
 /// The three signature members delegate to the crypto provider, so the
-/// handshake signature is verified as it is under the full check. That proves
-/// possession of the private key of a certificate nobody vouched for, so it
-/// authenticates no peer.
+/// handshake signature is verified as under the full check. That proves
+/// possession of the private key of a certificate that nobody vouches for, so
+/// it authenticates no peer.
 #[derive(Debug)]
 struct AcceptAnyChain {
     provider: Arc<rustls::crypto::CryptoProvider>,
@@ -415,15 +470,15 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
-/// Assemble the trust anchors the host system holds. `https` says whether a
-/// handshake will consult them.
+/// Assembles the trust anchors that the host system holds. `https` tells
+/// whether a handshake will consult them.
 async fn system_store(https: bool) -> Result<rustls::RootCertStore> {
     #[cfg(test)]
     SYSTEM_STORE_READS.with(|reads| reads.set(reads.get() + 1));
     let mut store = rustls::RootCertStore::empty();
-    // Reading and parsing the host store is filesystem work, so it runs on the
-    // blocking pool rather than on the caller's executor thread. The
-    // certificates come back as bytes; adding them is not I/O.
+    // The read and the parse of the host store are file system work, so they
+    // run on the blocking pool, away from the executor thread of the caller.
+    // The certificates come back as bytes. The add to the store does no I/O.
     let (certs, detail) = rt::unblock(|| {
         let loaded = rustls_native_certs::load_native_certs();
         let detail = loaded.errors.first().map(|e| e.to_string());
@@ -431,13 +486,13 @@ async fn system_store(https: bool) -> Result<rustls::RootCertStore> {
     })
     .await;
     for cert in certs {
-        // A malformed certificate in the system store is skipped, the same as
-        // any other consumer of that store does.
+        // The loop skips a malformed certificate in the system store, as other
+        // consumers of that store do.
         let _ = store.add(cert);
     }
-    // A host without a CA bundle carries no anchors. That fails a fetcher with
-    // an `https` mirror, whose handshake needs them, and is left to the empty
-    // store for a cleartext-only fetcher, which never opens one.
+    // A host without a CA bundle holds no anchors. That fails a fetcher with
+    // an `https` mirror, because its handshake needs them. A cleartext-only
+    // fetcher opens no handshake, so it keeps the empty store.
     if store.is_empty() && https {
         let detail = detail.unwrap_or_else(|| "the system trust store is empty".to_string());
         return Err(Error::Fetch(format!("no trusted certificates: {detail}")));
@@ -445,7 +500,7 @@ async fn system_store(https: bool) -> Result<rustls::RootCertStore> {
     Ok(store)
 }
 
-/// Assemble the trust anchors a PEM blob holds.
+/// Assembles the trust anchors that a PEM blob holds.
 fn pem_store(pem: &[u8]) -> Result<rustls::RootCertStore> {
     let mut store = rustls::RootCertStore::empty();
     for cert in parse_certs(pem)? {
@@ -459,47 +514,51 @@ fn pem_store(pem: &[u8]) -> Result<rustls::RootCertStore> {
     Ok(store)
 }
 
-/// Decode every certificate in a PEM blob.
+/// Decodes each certificate in a PEM blob.
 fn parse_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
     rustls_pemfile::certs(&mut BufReader::new(pem))
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::Fetch(format!("certificate pem: {e}")))
 }
 
-/// The armor label of an encrypted PKCS#8 section, which this module decrypts
-/// itself.
+/// The armor label of an encrypted PKCS#8 section, which this module
+/// decrypts.
 const ENCRYPTED_KEY_LABEL: &[u8] = b"ENCRYPTED PRIVATE KEY";
 
 /// The armor labels `rustls_pemfile` reads a private key out of.
 const PLAIN_KEY_LABELS: [&[u8]; 3] = [b"PRIVATE KEY", b"RSA PRIVATE KEY", b"EC PRIVATE KEY"];
 
-/// The header a legacy OpenSSL traditional encrypted PEM carries on a line of
-/// its own inside the section. RFC 7468 allows no header, so the PEM readers
-/// here stop on such a section; the fetcher finds the line first and names the
-/// conversion. RFC 1421 leaves the space after the colon optional.
+/// The header that a legacy OpenSSL traditional encrypted PEM carries on a
+/// line of its own inside the section.
+///
+/// RFC 7468 allows no header, so the PEM readers here stop on such a section.
+/// The fetcher finds the line first and names the conversion. RFC 1421 makes
+/// the space after the colon optional.
 const LEGACY_ENCRYPTED_HEADER: &[u8] = b"Proc-Type:";
 
-/// The value that header carries where the section is encrypted.
+/// The value of that header in an encrypted section.
 const LEGACY_ENCRYPTED_VALUE: &[u8] = b"4,ENCRYPTED";
 
 /// The first section of a PEM blob whose armor label names a private key.
 enum KeySection<'a> {
-    /// An `ENCRYPTED PRIVATE KEY` section, sliced out of the blob so the
+    /// An `ENCRYPTED PRIVATE KEY` section, cut out of the blob, so the
     /// decoder sees that section and nothing around it.
     Encrypted(&'a [u8]),
-    /// A section under a label `rustls_pemfile` reads a key out of.
+    /// A section under a label that `rustls_pemfile` reads a key from.
     Plain(&'a [u8]),
 }
 
-/// Decode the private key a PEM blob holds. The first section whose armor
-/// label names a private key decides the path. A blob that carries a
-/// certificate and a key, or two plain keys, therefore reads the way
-/// `rustls_pemfile` reads one. An `ENCRYPTED PRIVATE KEY` section in front of
-/// a plain key parts from that reader, which holds the label unknown and steps
-/// over the section to the plain key behind it. `passphrase` decrypts an
-/// `ENCRYPTED PRIVATE KEY` section. It is refused on a section that carries no
-/// encryption, because a passphrase that decrypts nothing hides a
-/// configuration mistake.
+/// Decodes the private key that a PEM blob holds.
+///
+/// The first section whose armor label names a private key selects the path.
+/// So a blob with a certificate and a key, or with two plain keys, reads as
+/// `rustls_pemfile` reads it. An `ENCRYPTED PRIVATE KEY` section in front of a
+/// plain key is a difference: that reader does not know the label and skips
+/// to the plain key.
+///
+/// `passphrase` decrypts an `ENCRYPTED PRIVATE KEY` section. A passphrase on a
+/// section that carries no encryption is refused, because a passphrase that
+/// decrypts nothing hides a configuration mistake.
 async fn parse_key(pem: &[u8], passphrase: Option<&str>) -> Result<PrivateKeyDer<'static>> {
     match first_key_section(pem) {
         Some(KeySection::Encrypted(section)) => decrypt_key(section, passphrase).await,
@@ -518,23 +577,24 @@ async fn parse_key(pem: &[u8], passphrase: Option<&str>) -> Result<PrivateKeyDer
             }
             read_plain_key(pem)
         }
-        // A blob that carries no private-key section holds no key, whatever
-        // else it carries. `rustls_pemfile` states that.
+        // A blob with no private-key section holds no key, whatever else it
+        // carries. `rustls_pemfile` reports that.
         None => read_plain_key(pem),
     }
 }
 
-/// Read the key `rustls_pemfile` finds first. The section scan has already
-/// settled which section that is.
+/// Reads the key that `rustls_pemfile` finds first. The section scan selects
+/// that section before this call.
 fn read_plain_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut BufReader::new(pem))
         .map_err(|e| Error::Fetch(format!("private key pem: {e}")))?
         .ok_or_else(|| Error::Fetch("private key pem holds no key".into()))
 }
 
-/// Find the first section whose armor label names a private key. A key blob is
-/// a configuration-sized buffer, so this walks its lines; a certificate
-/// section, or a section under any other label, is stepped over.
+/// Finds the first section whose armor label names a private key.
+///
+/// A key blob is a small configuration buffer, so this walks its lines. The
+/// walk skips a certificate section and a section under any other label.
 fn first_key_section(pem: &[u8]) -> Option<KeySection<'_>> {
     for (start, end) in line_ranges(pem, 0) {
         let Some(label) = armor_label(pem[start..end].trim_ascii(), b"BEGIN") else {
@@ -550,9 +610,11 @@ fn first_key_section(pem: &[u8]) -> Option<KeySection<'_>> {
     None
 }
 
-/// The bytes of the section that opens at `begin`, from that line through the
-/// end of the matching end line. A section with no end line runs to the end of
-/// the blob, and the decoder that reads it reports it as no key.
+/// Returns the bytes of the section that opens at `begin`.
+///
+/// The bytes run from that line through the end of the matching end line. A
+/// section with no end line runs to the end of the blob, and the decoder
+/// reports it as no key.
 fn section_at<'a>(pem: &'a [u8], begin: usize, label: &[u8]) -> &'a [u8] {
     for (start, end) in line_ranges(pem, begin) {
         if armor_label(pem[start..end].trim_ascii(), b"END") == Some(label) {
@@ -562,9 +624,10 @@ fn section_at<'a>(pem: &'a [u8], begin: usize, label: &[u8]) -> &'a [u8] {
     &pem[begin..]
 }
 
-/// The label of a PEM armor line, `-----BEGIN <label>-----` for the keyword
-/// `BEGIN` and `-----END <label>-----` for `END`. A line that is neither gives
-/// `None`.
+/// Returns the label of a PEM armor line.
+///
+/// The line is `-----BEGIN <label>-----` for the keyword `BEGIN` and
+/// `-----END <label>-----` for `END`. A line that is neither gives `None`.
 fn armor_label<'a>(line: &'a [u8], keyword: &[u8]) -> Option<&'a [u8]> {
     line.strip_prefix(b"-----".as_slice())?
         .strip_prefix(keyword)?
@@ -572,9 +635,11 @@ fn armor_label<'a>(line: &'a [u8], keyword: &[u8]) -> Option<&'a [u8]> {
         .strip_suffix(b"-----".as_slice())
 }
 
-/// Whether a section carries the header of the legacy OpenSSL traditional
-/// encrypted PEM. The header opens a line of its own, so the same text in the
-/// free space around a section reads as free text.
+/// Returns `true` if a section carries the header of the legacy OpenSSL
+/// traditional encrypted PEM.
+///
+/// The header opens a line of its own, so the same text in the free space
+/// around a section reads as free text.
 fn is_legacy_encrypted(section: &[u8]) -> bool {
     line_ranges(section, 0).any(|(start, end)| {
         section[start..end]
@@ -584,8 +649,8 @@ fn is_legacy_encrypted(section: &[u8]) -> bool {
     })
 }
 
-/// The byte range of each line of `pem` from `from`, the terminating newline
-/// counted in the range it ends.
+/// Returns the byte range of each line of `pem` from `from`. Each range holds
+/// the newline that ends its line.
 fn line_ranges(pem: &[u8], from: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
     let mut offset = from;
     std::iter::from_fn(move || {
@@ -601,12 +666,12 @@ fn line_ranges(pem: &[u8], from: usize) -> impl Iterator<Item = (usize, usize)> 
     })
 }
 
-/// Decrypt an encrypted PKCS#8 section with `passphrase`.
+/// Decrypts an encrypted PKCS#8 section with `passphrase`.
 ///
-/// PBKDF2 and scrypt are deliberately slow, and the key file sets how slow.
-/// The work therefore runs on the blocking pool, away from the caller's
-/// executor thread. The closure owns its inputs. That costs one copy of the
-/// section and one of the passphrase, once per fetcher.
+/// PBKDF2 and scrypt are slow by design, and the key file sets how slow, so
+/// the work runs on the blocking pool, away from the executor thread of the
+/// caller. The closure owns its inputs, which costs one copy of the section
+/// and one of the passphrase for each fetcher.
 async fn decrypt_key(section: &[u8], passphrase: Option<&str>) -> Result<PrivateKeyDer<'static>> {
     let Some(passphrase) = passphrase else {
         return Err(Error::Fetch(
@@ -618,17 +683,17 @@ async fn decrypt_key(section: &[u8], passphrase: Option<&str>) -> Result<Private
     rt::unblock(move || decrypt_pkcs8(&section, &passphrase)).await
 }
 
-/// Decode an encrypted PKCS#8 section and decrypt it. A section the decoder
-/// reads no document out of reports the failure an empty blob reports, because
-/// it holds no key either way.
+/// Decodes an encrypted PKCS#8 section and decrypts it.
+///
+/// If the decoder reads no document from the section, the error is the error
+/// of an empty blob, because neither holds a key.
 fn decrypt_pkcs8(section: &[u8], passphrase: &str) -> Result<PrivateKeyDer<'static>> {
     let no_key = || Error::Fetch("private key pem holds no key".into());
     let text = std::str::from_utf8(section).map_err(|_| no_key())?;
     let (_, document) = pkcs8::SecretDocument::from_pem(text).map_err(|_| no_key())?;
-    // The cipher and the key derivation function are named by OID in the
-    // document, and the decoder rejects an OID it carries no implementation
-    // for. DES and 3DES are compiled out, so a PBES2 key under either stops
-    // here.
+    // The document names the cipher and the key derivation function by OID.
+    // The decoder refuses an OID that it has no implementation for. DES and
+    // 3DES are compiled out, so a PBES2 key under either stops here.
     let info = document
         .decode_msg::<pkcs8::EncryptedPrivateKeyInfo<'_>>()
         .map_err(|e| match e.kind() {
@@ -636,15 +701,15 @@ fn decrypt_pkcs8(section: &[u8], passphrase: &str) -> Result<PrivateKeyDer<'stat
             _ => Error::Fetch(format!("encrypted private key pem: {e}")),
         })?;
     let key = info.decrypt(passphrase).map_err(|e| match e {
-        // A wrong passphrase derives a wrong key, and the plaintext that key
-        // gives carries invalid padding. `pkcs5` reports a padding failure as
-        // `EncryptFailed` on the decryption path as well as the encryption
-        // path, and constructs `DecryptFailed` nowhere.
+        // A wrong passphrase derives a wrong key, and the plaintext of that
+        // key carries invalid padding. `pkcs5` reports a padding failure as
+        // `EncryptFailed` on the decryption path and on the encryption path.
+        // It constructs `DecryptFailed` nowhere.
         pkcs8::Error::EncryptedPrivateKey(pkcs8::pkcs5::Error::EncryptFailed) => {
             Error::Fetch("the passphrase does not decrypt the private key".into())
         }
-        // A PBES2 pseudorandom function that is compiled out lands here, where
-        // an unknown cipher OID lands in the decoder above.
+        // A PBES2 pseudorandom function that is compiled out gives this
+        // error. An unknown cipher OID gives the decoder error.
         pkcs8::Error::EncryptedPrivateKey(pkcs8::pkcs5::Error::UnsupportedAlgorithm { oid }) => {
             unsupported_algorithm(&oid)
         }
@@ -661,8 +726,8 @@ fn decrypt_pkcs8(section: &[u8], passphrase: &str) -> Result<PrivateKeyDer<'stat
     Ok(PrivateKeyDer::Pkcs8(key.as_bytes().to_vec().into()))
 }
 
-/// The refusal an algorithm this build carries no implementation for gets. The
-/// document names the algorithm by OID, and so does the message.
+/// Returns the refusal for an algorithm that this build has no implementation
+/// of. The document names the algorithm by OID, and the message does too.
 fn unsupported_algorithm(oid: &pkcs8::ObjectIdentifier) -> Error {
     Error::Fetch(format!(
         "private key pem is encrypted with algorithm {oid}, \
@@ -687,12 +752,12 @@ mod tests {
     /// The same key, in PKCS#8 under PBES1 with pbeWithMD5AndDES-CBC.
     const CLIENT_KEY_PBES1_PEM: &[u8] =
         include_bytes!("../../../tests/fixtures/tls/client.key.pbes1.pem");
-    /// The passphrase `tests/fixtures/tls/generate.sh` encrypted all three
-    /// with.
+    /// The passphrase that `tests/fixtures/tls/generate.sh` encrypts all
+    /// three with.
     const KEY_PASSPHRASE: &str = "ostrya test passphrase";
 
-    /// Build the configurations from a client key and whatever passphrase goes
-    /// with it, so a test states the one pair it is about.
+    /// Builds the configurations from a client key and its passphrase, so a
+    /// test states the one pair that it checks.
     fn configs_for_key(key_pem: &[u8], passphrase: Option<&str>) -> Result<ClientConfigs> {
         block_on(client_config(
             &TlsOptions {
@@ -727,8 +792,8 @@ mod tests {
         );
     }
 
-    /// A configuration built from anchors of its own reports that it holds
-    /// them, whichever scheme the mirrors carry.
+    /// A configuration built from its own anchors reports that it holds them,
+    /// for each scheme of the mirrors.
     #[test]
     fn pem_anchors_are_reported_as_held() {
         let options = TlsOptions {
@@ -741,9 +806,8 @@ mod tests {
         }
     }
 
-    /// A configured client certificate makes the two configurations two, and
-    /// the ALPN offer of both is the one offer. With none configured the two
-    /// are one `Arc`.
+    /// A configured client certificate makes two separate configurations
+    /// with the same ALPN offer. With no certificate, the two are one `Arc`.
     #[test]
     fn a_client_identity_is_accepted() {
         let options = TlsOptions {
@@ -775,11 +839,11 @@ mod tests {
         ));
     }
 
-    /// A bypass variant builds with no anchors configured and still reports
-    /// that a handshake can proceed, and with no client identity the two
-    /// configurations stay one `Arc`. That the host store is not read as well
-    /// is held by `tests/fetch_no_trust_store.rs`, which runs the constructor
-    /// in a child process whose store holds nothing.
+    /// A bypass variant builds with no anchors and reports that a handshake
+    /// can proceed. With no client identity, the two configurations are one
+    /// `Arc`. `tests/fetch_no_trust_store.rs` checks that the host store is
+    /// not read. It runs the constructor in a child process with an empty
+    /// store.
     #[test]
     fn a_bypass_needs_no_trust_store() {
         for roots in [
@@ -801,8 +865,8 @@ mod tests {
         }
     }
 
-    /// A client identity alongside a bypass builds two configurations, both
-    /// verifying with the one bypass verifier.
+    /// A client identity with a bypass builds two configurations. Both verify
+    /// with the one bypass verifier.
     #[test]
     fn a_bypass_carries_a_client_identity() {
         for roots in [
@@ -835,7 +899,7 @@ mod tests {
         let err = block_on(client_config(&no_roots, true, true, true)).unwrap_err();
         assert!(err.to_string().contains("no certificate"), "{err}");
 
-        // A well-formed PEM blob that holds a certificate rather than a key.
+        // A well-formed PEM blob that holds a certificate and no key.
         let no_key = TlsOptions {
             roots: TrustRoots::Pem(CA_PEM.to_vec()),
             client_identity: Some(ClientIdentity {
@@ -870,9 +934,12 @@ mod tests {
         ));
     }
 
-    /// Each refusal the encrypted-key path carries names its own case: a wrong
-    /// passphrase, an encrypted key with no passphrase, a passphrase on a key
-    /// that carries no encryption, and the legacy OpenSSL format.
+    /// Each refusal of the encrypted-key path names its own case:
+    ///
+    /// - a wrong passphrase
+    /// - an encrypted key with no passphrase
+    /// - a passphrase on a key that carries no encryption
+    /// - the legacy OpenSSL format
     #[test]
     fn the_encrypted_key_refusals_name_their_case() {
         let err = configs_for_key(CLIENT_KEY_ENC_PEM, Some("not the passphrase")).unwrap_err();
@@ -894,8 +961,8 @@ mod tests {
              encryption"
         );
 
-        // The legacy form is refused whether a passphrase is set or not, and
-        // the message names the conversion that gives a readable key.
+        // The legacy form is refused with or without a passphrase. The message
+        // names the conversion that gives a readable key.
         for passphrase in [Some(KEY_PASSPHRASE), None] {
             let err = configs_for_key(CLIENT_KEY_LEGACY_PEM, passphrase).unwrap_err();
             assert_eq!(
@@ -912,8 +979,8 @@ mod tests {
     /// is formatted in full.
     #[test]
     fn debug_redacts_the_key_and_the_passphrase() {
-        // A key that carries no encryption is the case a `Debug` leak costs
-        // most, and it is the case a pull configures.
+        // A `Debug` leak costs most for a key that carries no encryption. A
+        // pull configures that case.
         let identity = ClientIdentity {
             cert_chain_pem: CLIENT_CERT_PEM.to_vec(),
             key_pem: CLIENT_KEY_PEM.to_vec(),
@@ -947,9 +1014,9 @@ mod tests {
         assert!(!text.contains(KEY_PASSPHRASE), "{text}");
     }
 
-    /// The encrypted section is read whatever follows it: a trailing blank
-    /// line, or the certificate the usual bundle carries in front of the key.
-    /// The decoder sees that one section, sliced out of the blob.
+    /// The encrypted section is read whatever is around it: a trailing blank
+    /// line, or the certificate that the usual bundle carries in front of the
+    /// key. The decoder sees that one section, cut out of the blob.
     #[test]
     fn an_encrypted_key_is_read_out_of_a_longer_blob() {
         let blobs = [
@@ -966,14 +1033,12 @@ mod tests {
         }
     }
 
-    /// The first section whose label names a private key decides the path, so
-    /// a blob that holds an encrypted key and a plain one is read as whichever
-    /// comes first.
+    /// The first section whose label names a private key selects the path. So
+    /// a blob with an encrypted key and a plain key is read as the first one.
     #[test]
     fn the_first_key_section_decides_the_path() {
-        // Encrypted first: the passphrase is spent on it, and leaving the
-        // passphrase out refuses rather than falling through to the plain key
-        // behind it.
+        // Encrypted first: the passphrase decrypts it. With no passphrase, the
+        // key is refused, and the plain key behind it is not read.
         let encrypted_first = [CLIENT_KEY_ENC_PEM, CLIENT_KEY_PEM].concat();
         configs_for_key(&encrypted_first, Some(KEY_PASSPHRASE)).unwrap();
         let err = configs_for_key(&encrypted_first, None).unwrap_err();
@@ -982,8 +1047,8 @@ mod tests {
             "fetch: private key pem is encrypted, and no passphrase is set"
         );
 
-        // Plain first: it is read as it is, and a passphrase is refused
-        // although an encrypted section stands behind it.
+        // Plain first: it is read as it is. A passphrase is refused, although
+        // an encrypted section is behind it.
         let plain_first = [CLIENT_KEY_PEM, CLIENT_KEY_ENC_PEM].concat();
         configs_for_key(&plain_first, None).unwrap();
         let err = configs_for_key(&plain_first, Some(KEY_PASSPHRASE)).unwrap_err();
@@ -995,8 +1060,8 @@ mod tests {
     }
 
     /// The legacy header is read inside the section that carries it. A plain
-    /// key in front of a legacy one is served, and the same text in the free
-    /// space around a plain key reads as free text.
+    /// key in front of a legacy key is read. The same text in the free space
+    /// around a plain key reads as free text.
     #[test]
     fn the_legacy_header_is_read_inside_its_own_section() {
         let plain_first = [CLIENT_KEY_PEM, CLIENT_KEY_LEGACY_PEM].concat();
@@ -1011,8 +1076,8 @@ mod tests {
         configs_for_key(&with_note, None).unwrap();
     }
 
-    /// RFC 1421 leaves the space after the colon optional, and the header is
-    /// named under either spelling.
+    /// RFC 1421 makes the space after the colon optional. The header is
+    /// found with or without the space.
     #[test]
     fn the_legacy_header_is_named_without_the_space() {
         let text = std::str::from_utf8(CLIENT_KEY_LEGACY_PEM)
@@ -1054,7 +1119,7 @@ mod tests {
         }
     }
 
-    /// The key loaders of the client identity read the server key, so an
+    /// The key loaders of the client identity read the server key. So an
     /// encrypted key is decrypted with its passphrase and refused without
     /// one.
     #[test]

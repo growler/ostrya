@@ -38,8 +38,8 @@ hyper = { version = "1.11.1", default-features = false, features = [
 # drops neither it nor the Unicode tables it carries.
 url = "2.5.8"
 # TLS for the fetcher. `rustls-graviola` supplies the crypto provider: Rust
-# plus formally-verified assembly, so the provider adds no C to the build and
-# carries no `cc` build dependency.
+# plus assembly, which is formally verified where it is available. The
+# provider adds no C to the build and carries no `cc` build dependency.
 rustls = { version = "0.23", default-features = false, features = [
     "logging",
     "std",

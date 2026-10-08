@@ -1,16 +1,19 @@
-//! Glue between hyper and the runtime-neutral stream surface.
+//! Adapters between hyper and the runtime-neutral stream surface.
 //!
-//! hyper drives its connections over its own I/O traits, spawns its background
-//! work through its own executor trait, and schedules its HTTP/2 keep-alive
-//! pings through its own timer trait. [`FuturesIo`] presents a `futures-io`
-//! stream -- a plain TCP stream or a TLS session over one -- as a hyper stream,
-//! [`RtExecutor`] hands hyper's tasks to `rt::spawn`, and [`RtTimer`] hands its
-//! delays to `rt::Deadline`. All three are thin: the fetcher, the TLS layer, and
-//! every stream below them stay written against `futures-io` and `ostrya-rt`.
+//! hyper uses its own traits for I/O, for background tasks, and for the
+//! keep-alive pings of HTTP/2. The adapters implement these traits over the
+//! runtime:
 //!
-//! The adapters are public, so an HTTP server over `ostrya-rt` drives hyper's
-//! server connections with them. [`WriteVectored`] is implemented for the
-//! plain TCP stream and for both TLS stream types of `futures-rustls`.
+//! - `FuturesIo` presents a `futures-io` stream as a hyper stream. The stream
+//!   is a plain TCP stream or a TLS session over one.
+//! - `RtExecutor` gives the tasks of hyper to `rt::spawn`.
+//! - `RtTimer` gives the delays of hyper to `rt::Deadline`.
+//!
+//! The fetcher, the TLS layer, and all streams under them use only
+//! `futures-io` and `ostrya-rt`. The adapters are public, so an HTTP server
+//! over `ostrya-rt` drives the server connections of hyper with them.
+//! `WriteVectored` has implementations for the plain TCP stream and for the two
+//! TLS stream types of `futures-rustls`.
 
 use std::future::Future;
 use std::io::{self, IoSlice};
@@ -20,19 +23,21 @@ use std::time::{Duration, Instant};
 
 use futures_io::{AsyncRead, AsyncWrite};
 
-/// The largest read hyper's buffer request is honored with in one go. hyper
-/// asks for as much as its read strategy currently wants; the copy below is
-/// bounded so a large request cannot size the scratch buffer without limit.
+/// The largest read that `FuturesIo` asks of the inner stream in one call.
+///
+/// hyper asks for as many bytes as its read strategy wants at that time. This
+/// limit bounds the copy through the scratch buffer, so a large request cannot
+/// grow the buffer without limit.
 const MAX_READ: usize = 64 * 1024;
 
-/// Whether a stream's vectored write takes more than the first slice.
+/// A stream that states if its vectored write takes more than the first slice.
 ///
-/// hyper asks this before it hands over a slice list, and coalesces the pieces
-/// itself when the answer is no. The `futures-io` write trait carries no such
-/// query -- unlike the tokio and std ones -- so the answer is stated per stream
-/// type here and travels with the stream into [`FuturesIo`].
+/// hyper asks this before it gives a list of slices. If the answer is `false`,
+/// hyper joins the slices itself. The `futures-io` write trait has no such
+/// query, and the tokio and std write traits have one. Each stream type states
+/// its answer with this trait, and `FuturesIo` gives the answer to hyper.
 pub trait WriteVectored {
-    /// Whether a vectored write takes more than the first slice.
+    /// Returns `true` if a vectored write takes more than the first slice.
     fn is_write_vectored(&self) -> bool;
 }
 
@@ -44,35 +49,35 @@ impl WriteVectored for ostrya_rt::TcpStream {
 
 impl<S> WriteVectored for futures_rustls::client::TlsStream<S> {
     fn is_write_vectored(&self) -> bool {
-        // The slices go to the rustls session writer, which copies them into
-        // the record it is building whatever the socket below does with them.
+        // The rustls session writer copies all slices into the record that it
+        // builds. The socket under the session has no effect on this answer.
         true
     }
 }
 
 impl<S> WriteVectored for futures_rustls::server::TlsStream<S> {
     fn is_write_vectored(&self) -> bool {
-        // The server session writer copies the slices into its record as the
-        // client one does.
+        // The server session writer copies the slices into its record, as the
+        // client session writer does.
         true
     }
 }
 
-/// A `futures-io` stream presented as a hyper stream.
+/// An adapter that presents a `futures-io` stream as a hyper stream.
 pub struct FuturesIo<S> {
     inner: S,
-    /// Reads land here first and are copied into hyper's cursor.
+    /// The buffer that receives each read before the copy into the cursor.
     ///
-    /// hyper hands out a cursor over possibly-uninitialized memory, and the
-    /// only safe way to fill it is [`put_slice`](hyper::rt::ReadBufCursor). The
-    /// alternative -- exposing the uninitialized bytes to
-    /// [`AsyncRead::poll_read`] -- needs `unsafe`, which this crate forbids, so
-    /// a read costs one extra copy of the bytes already in memory.
+    /// hyper gives a cursor over memory that can be uninitialized. The only
+    /// safe way to fill this cursor is `ReadBufCursor::put_slice`. A read of
+    /// `AsyncRead::poll_read` into the uninitialized bytes needs `unsafe`,
+    /// which this crate forbids. As a result, each read makes one more copy of
+    /// the bytes that are already in memory.
     scratch: Vec<u8>,
 }
 
 impl<S> FuturesIo<S> {
-    /// The adapter over `inner`.
+    /// Creates an adapter over `inner`.
     pub fn new(inner: S) -> FuturesIo<S> {
         FuturesIo {
             inner,
@@ -80,9 +85,10 @@ impl<S> FuturesIo<S> {
         }
     }
 
-    /// The stream the adapter holds, taken back once hyper is done with it.
-    /// A `CONNECT` tunnel recovers its socket this way: hyper hands the
-    /// upgraded I/O back as the type the handshake was opened over.
+    /// Returns the inner stream, for use after hyper releases the adapter.
+    ///
+    /// A `CONNECT` tunnel gets its socket back this way. hyper gives the
+    /// upgraded I/O back as the type that the handshake used.
     pub fn into_inner(self) -> S {
         self.inner
     }
@@ -95,12 +101,13 @@ impl<S: AsyncRead + Unpin> hyper::rt::Read for FuturesIo<S> {
         mut buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<io::Result<()>> {
         let want = buf.remaining().min(MAX_READ);
-        // hyper reserves capacity before every read, so it never asks for zero;
-        // the branch exists so the read below is never handed a zero-length
-        // slice, which a stream may answer with `Ok(0)` -- end of stream. Filling
-        // nothing is what hyper reads as end of stream too, so the two agree on
-        // an input hyper does not produce. `Poll::Pending` would be worse: there
-        // is no waker to register, so the connection task would never be woken.
+        // hyper reserves capacity before each read, so it never asks for zero
+        // bytes. With this branch, the inner stream never gets a zero-length
+        // slice. A stream can answer a zero-length slice with `Ok(0)`, the end
+        // of stream. hyper also reads an empty fill as the end of stream, so
+        // the two results agree on an input that hyper does not produce. The
+        // branch returns `Poll::Ready`, because it has no waker to register.
+        // A pending result with no registered waker stops the connection task.
         if want == 0 {
             return Poll::Ready(Ok(()));
         }
@@ -144,7 +151,7 @@ impl<S: AsyncWrite + WriteVectored + Unpin> hyper::rt::Write for FuturesIo<S> {
     }
 }
 
-/// Hands hyper's connection tasks to the runtime backend.
+/// An executor that gives the connection tasks of hyper to the runtime backend.
 #[derive(Clone, Copy, Debug)]
 pub struct RtExecutor;
 
@@ -154,14 +161,17 @@ where
     F::Output: Send + 'static,
 {
     fn execute(&self, future: F) {
-        // Dropping the handle leaves the task running, which is what a
-        // connection driver needs: it outlives the request that opened it.
+        // The task continues to run after the drop of its handle. A connection
+        // driver needs this, because it lives longer than the request that
+        // opened it.
         drop(ostrya_rt::spawn(future));
     }
 }
 
-/// Hands hyper's delays to the runtime backend. An HTTP/2 connection needs one
-/// to schedule its keep-alive ping and the wait for the reply.
+/// A timer that gives the delays of hyper to the runtime backend.
+///
+/// An HTTP/2 connection uses it to schedule its keep-alive ping and the wait
+/// for the reply.
 #[derive(Clone, Copy, Debug)]
 pub struct RtTimer;
 
@@ -173,13 +183,13 @@ impl hyper::rt::Timer for RtTimer {
     }
 
     fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn hyper::rt::Sleep>> {
-        // A deadline already past is a zero-length window, which expires on its
-        // first poll.
+        // If the deadline is in the past, the delay has zero length and
+        // expires on its first poll.
         self.sleep(deadline.saturating_duration_since(Instant::now()))
     }
 }
 
-/// One delay, as a future hyper can hold.
+/// One delay, as a future that hyper can hold.
 struct RtSleep {
     deadline: ostrya_rt::Deadline,
 }
@@ -202,15 +212,15 @@ mod tests {
     use ostrya_rt::block_on;
 
     /// `std::io::Cursor<Vec<u8>>` implements `write_vectored`, and futures-lite
-    /// forwards the vectored write to it, so every slice lands.
+    /// forwards the vectored write to it, so each slice arrives.
     impl WriteVectored for Cursor<Vec<u8>> {
         fn is_write_vectored(&self) -> bool {
             true
         }
     }
 
-    /// A sink that leaves `poll_write_vectored` at the `futures-io` default,
-    /// which writes the first non-empty slice and no more.
+    /// A sink that keeps the `futures-io` default of `poll_write_vectored`,
+    /// which writes only the first non-empty slice.
     struct PlainSink(Vec<u8>);
 
     impl AsyncWrite for PlainSink {
@@ -238,9 +248,8 @@ mod tests {
         }
     }
 
-    /// What hyper is told about vectored writes is what the stream underneath
-    /// says, so hyper coalesces the slices itself when they would not all be
-    /// taken.
+    /// hyper gets the vectored-write answer of the inner stream. If the stream
+    /// does not take all slices, hyper joins the slices itself.
     #[test]
     fn the_vectored_write_answer_comes_from_the_stream() {
         let vectored = FuturesIo::new(Cursor::new(Vec::new()));
@@ -249,7 +258,7 @@ mod tests {
         assert!(!Write::is_write_vectored(&plain));
     }
 
-    /// Drive `poll_read` once through hyper's cursor and report what landed.
+    /// Calls `poll_read` once through the hyper cursor and returns the bytes.
     fn read_once<S: AsyncRead + Unpin>(io: &mut FuturesIo<S>, cap: usize) -> Vec<u8> {
         block_on(async {
             let mut buf = Vec::with_capacity(cap);
@@ -266,18 +275,18 @@ mod tests {
         let mut io = FuturesIo::new(Cursor::new(b"abcdefgh".to_vec()));
         assert_eq!(read_once(&mut io, 3), b"abc");
         assert_eq!(read_once(&mut io, 5), b"defgh");
-        // At EOF the cursor stays empty, which is how hyper sees end of stream.
+        // At EOF, the cursor stays empty. hyper reads this as end of stream.
         assert!(read_once(&mut io, 4).is_empty());
     }
 
-    /// A cursor with no room is an input hyper does not produce, since it
-    /// reserves capacity before every read. What the branch is there for is the
-    /// stream below it, which is never handed a zero-length slice.
+    /// hyper never gives a cursor with no room, because it reserves capacity
+    /// before each read. The branch protects the inner stream, which never gets
+    /// a zero-length slice.
     #[test]
     fn a_zero_capacity_cursor_reads_nothing() {
         let mut io = FuturesIo::new(Cursor::new(b"data".to_vec()));
         assert!(read_once(&mut io, 0).is_empty());
-        // The stream is untouched, so the bytes are still there.
+        // The read did not touch the stream, so the bytes are still there.
         assert_eq!(read_once(&mut io, 4), b"data");
     }
 

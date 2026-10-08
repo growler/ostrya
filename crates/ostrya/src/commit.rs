@@ -1,32 +1,10 @@
-//! Commit assembly and detached commit metadata.
+//! Commit objects and the detached metadata of a commit.
 //!
-//! [`Transaction::write_commit`] serializes a commit object over a written root
-//! tree and stages it like any other metadata object. The caller supplies the
-//! commit's metadata dict, parent, subject, body, and timestamp through
-//! [`CommitOptions`]; the well-known binding keys (`ostree.ref-binding`,
-//! `ostree.collection-binding`) are ordinary metadata entries the caller
-//! provides, so `write_commit` adds nothing of its own beyond `ostree.sizes`.
-//!
-//! `ostree.sizes` is emitted only when a filesystem ingest requested
-//! [`GENERATE_SIZES`](crate::CommitModifierFlags::GENERATE_SIZES) and the
-//! repository is archive mode; it is appended as the last metadata entry,
-//! matching the tool. Its records cover exactly the objects reachable from the
-//! committed root -- the root dirmeta, each dirtree, each subdirectory dirmeta,
-//! and each file entry -- and no others, so a transaction that stages more than
-//! one commit gives each commit its own reachable-scoped key. The set is
-//! recovered by walking the committed tree at commit time. A freshly staged
-//! object uses the size record the transaction kept; an object that already
-//! existed in `objects/` and deduplicated has its sizes recovered from its loose
-//! object, so an incremental commit that reaches pre-existing objects lists them
-//! too, matching the tool. The commit object itself is never among them, since
-//! the walk starts below it. In every other mode the request is a silent no-op,
-//! so a commit's bytes are identical with and without it.
-//!
-//! Detached metadata ([`read_commit_detached_metadata`](Repo::read_commit_detached_metadata),
-//! [`write_commit_detached_metadata`](Repo::write_commit_detached_metadata))
-//! is a bare `a{sv}` at the commit's `.commitmeta` loose path, replaced
-//! atomically and outside the commit checksum. Writing `None` produces the
-//! documented zero-length file.
+//! - [`Transaction::write_commit`] stages a commit object over a root tree,
+//!   with the options in [`CommitOptions`].
+//! - [`Repo::read_commit_detached_metadata`] and
+//!   [`Repo::write_commit_detached_metadata`] read and write the detached
+//!   metadata of a commit.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -48,47 +26,116 @@ use crate::tree::RepoTree;
 
 pub use ostrya_core::commit_metadata;
 
-/// The metadata dict type string for detached commit metadata and, wrapped in
-/// the commit tuple, the commit metadata dict.
+/// The type string of a metadata dict: the detached metadata, and the commit
+/// metadata inside the commit tuple.
 const METADATA_SIGNATURE: &str = "a{sv}";
-/// The `ostree.sizes` value type: an array of packed byte buffers.
+/// The type of the `ostree.sizes` value: an array of packed byte buffers.
 const SIZES_SIGNATURE: &str = "aay";
-/// The metadata key `ostree.sizes` is written under.
+/// The metadata key of the size records.
 const SIZES_KEY: &str = "ostree.sizes";
-/// The permission bits forced on the `.commitmeta` file, matching the `0644`
-/// every metadata object carries.
+/// The permission bits of a `.commitmeta` file: the `0644` of each metadata
+/// object.
 const COMMITMETA_MODE: u32 = 0o644;
 
-/// Options for [`Transaction::write_commit`].
+/// The options of [`Transaction::write_commit`].
 ///
-/// Every field is optional. `metadata`, when set, must be an `a{sv}` dict
-/// value; its entries appear in the commit in insertion order, which byte
-/// identity with a tool commit relies on, so a caller reproducing a tool commit
-/// supplies the binding keys in the tool's observed order.
+/// Each field is optional. If `metadata` is set, it must be an `a{sv}` dict
+/// value. Its entries appear in the commit in insertion order. A caller that
+/// reproduces a commit of the `ostree` command byte for byte supplies the
+/// binding keys in the observed order of that command.
 #[derive(Debug, Default, Clone)]
 pub struct CommitOptions {
     /// The parent commit, or `None` for a root commit.
     pub parent: Option<Checksum>,
-    /// The commit subject; an empty string when `None`.
+    /// The subject of the commit, or an empty string if `None`.
     pub subject: Option<String>,
-    /// The commit body; an empty string when `None`.
+    /// The body of the commit, or an empty string if `None`.
     pub body: Option<String>,
-    /// The commit timestamp in seconds since the Unix epoch, UTC. When `None`,
-    /// `SOURCE_DATE_EPOCH` is used if set, otherwise the current time.
+    /// The commit time in seconds since the Unix epoch, UTC.
+    ///
+    /// If the value is `None` and `SOURCE_DATE_EPOCH` is set, the commit uses
+    /// that variable. If both are absent, the commit uses the current time.
     pub timestamp: Option<u64>,
     /// The `a{sv}` metadata dict, or `None` for an empty dict.
     pub metadata: Option<Value>,
 }
 
+/// Methods that write a commit object.
 impl Transaction {
-    /// Assemble a commit object over `root` and stage it, returning its
-    /// checksum.
+    /// Stages a commit object over the tree `root` and returns its checksum.
     ///
-    /// The commit's metadata dict comes from `opts.metadata` (empty when
-    /// unset); `ostree.sizes` is appended when the transaction was marked for
-    /// size generation and the repository is archive mode. The timestamp
-    /// resolves from `opts.timestamp`, else `SOURCE_DATE_EPOCH`, else the
-    /// current time. The root dirtree and dirmeta come from `root`.
+    /// The call stages the commit in the same way as other metadata objects.
+    /// The root dirtree and the root dirmeta come from `root`. The other
+    /// fields come from `opts`.
+    ///
+    /// The metadata dict is `opts.metadata`, or an empty dict if it is `None`.
+    /// The call adds no key of its own except `ostree.sizes`. The binding keys
+    /// `ostree.ref-binding` and `ostree.collection-binding` are normal
+    /// metadata entries that the caller supplies.
+    ///
+    /// # `ostree.sizes`
+    ///
+    /// The commit gets the `ostree.sizes` key if the transaction generates
+    /// sizes and the repository is in archive mode. A file system ingest under
+    /// [`GENERATE_SIZES`](crate::CommitModifierFlags::GENERATE_SIZES) turns
+    /// size generation on. [`set_generate_sizes`](Transaction::set_generate_sizes)
+    /// sets it for the whole transaction.
+    ///
+    /// The key is the last metadata entry, as in a commit of the `ostree`
+    /// command. Its records cover the objects that the committed root reaches,
+    /// and no other objects:
+    ///
+    /// - the root dirmeta
+    /// - each dirtree
+    /// - each subdirectory dirmeta
+    /// - each file entry
+    ///
+    /// The commit object is not in the list, because the walk starts below it.
+    /// If a transaction stages more than one commit, the key of each commit
+    /// holds the objects that this commit reaches. If the caller uses
+    /// [`begin_tree_source`](Transaction::begin_tree_source), the key holds the
+    /// objects of the last tree source and the directory objects.
+    ///
+    /// The call walks the committed tree at commit time. An object that the
+    /// transaction staged uses the size record that the transaction kept. An
+    /// object that deduplicated against `objects/` gets its sizes from its
+    /// loose object. As in a commit of the `ostree` command, an incremental
+    /// commit also lists the objects that existed before.
+    ///
+    /// In each other mode the call writes no key. The bytes of the commit are
+    /// the same with and without the request.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
+    /// - [`Error::Unsupported`] if `[ex-integrity] fsverity` is `yes` and the
+    ///   fs-verity seal fails.
+    /// - [`Error::InvalidFormat`] if `opts.timestamp` is `None` and
+    ///   `SOURCE_DATE_EPOCH` is not a count of seconds.
+    /// - [`Error::InvalidFormat`] if the call reads the system clock and the
+    ///   clock is before the Unix epoch.
+    /// - [`Error::InvalidFormat`] if the call adds `ostree.sizes` and
+    ///   `opts.metadata` is not an array value.
+    /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
+    ///   `[ex-integrity] composefs` in the repository config is malformed.
+    /// - [`Error::Core`] if the commit does not serialize: `opts.metadata` is
+    ///   not an `a{sv}` dict, a string holds an interior NUL byte, or the
+    ///   metadata nests too deep.
+    /// - [`Error::Core`] if `[core] fsync` or `[core] per-object-fsync` in the
+    ///   repository config is malformed.
+    /// - [`Error::Core`] if the call adds `ostree.sizes` and a dirtree that
+    ///   the commit reaches does not parse.
+    /// - [`Error::ObjectNotFound`] if the call adds `ostree.sizes` and an
+    ///   object that the commit reaches is in neither the staging directory
+    ///   nor `objects/`.
+    /// - The errors of [`load_file`](Repo::load_file) if the call adds
+    ///   `ostree.sizes` and a file object from `objects/` does not load.
+    /// - [`Error::InsufficientFreeSpace`] if the commit object needs more
+    ///   space than the free-space budget of the transaction holds.
+    /// - [`Error::Io`] if the call adds `ostree.sizes` and a dirtree that the
+    ///   commit reaches is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_commit(&self, opts: CommitOptions, root: &RepoTree) -> Result<Checksum> {
         if self.repo().mode() == RepoMode::BareSplitXattrs {
             return Err(Error::Unsupported(
@@ -123,13 +170,14 @@ impl Transaction {
         self.write_metadata(ObjectType::Commit, None, &bytes).await
     }
 
-    /// Build the `ostree.sizes` entries for `root`: one record per object
-    /// reachable from the committed root, covering both the objects this
-    /// transaction freshly staged and the objects that already existed in
-    /// `objects/` and deduplicated. A freshly staged object uses the size record
-    /// the transaction kept; a deduplicated object has its sizes recovered from
-    /// its loose object. The commit object itself is never among them, since the
-    /// walk starts below it.
+    /// Builds the `ostree.sizes` entries for `root`.
+    ///
+    /// The list has one record for each object that the committed root
+    /// reaches. It holds the objects that this transaction staged and the
+    /// objects that deduplicated against `objects/`. A staged object uses the
+    /// size record that the transaction kept. A deduplicated object gets its
+    /// sizes from its loose object. The commit object is not in the list,
+    /// because the walk starts below it.
     async fn reachable_size_entries(&self, root: &RepoTree) -> Result<Vec<SizeEntry>> {
         let reachable = self.reachable_objects(root).await?;
         let staged: HashMap<Checksum, SizeEntry> = self
@@ -139,10 +187,9 @@ impl Transaction {
             .collect();
         let mut entries = Vec::with_capacity(reachable.len());
         for (checksum, ty) in reachable {
-            // A commit composed from several tree sources scopes the key to the
-            // objects the last source contributed plus the directory objects the
-            // serialization wrote; see
-            // [`begin_tree_source`](Transaction::begin_tree_source).
+            // If a commit comes from several tree sources, the key holds the
+            // objects of the last source and the directory objects that the
+            // serialization wrote. See `Transaction::begin_tree_source`.
             if !self.in_size_scope(&checksum) {
                 continue;
             }
@@ -154,11 +201,16 @@ impl Transaction {
         Ok(entries)
     }
 
-    /// Recover the `ostree.sizes` entry for a reachable object that deduplicated
-    /// against `objects/`, so has no freshly staged size record. Archive mode
-    /// only. The compressed size is the loose object's on-disk size; the
-    /// unpacked size is a metadata object's serialized byte length, a regular
-    /// file's uncompressed payload length, or a symlink's target length.
+    /// Returns the `ostree.sizes` entry of an object that deduplicated against
+    /// `objects/`.
+    ///
+    /// The object has no size record from this transaction. The call serves
+    /// archive mode only. The compressed size is the size of the loose object
+    /// on disk. The unpacked size is:
+    ///
+    /// - the serialized length of a metadata object
+    /// - the uncompressed payload length of a regular file
+    /// - the target length of a symlink
     async fn recover_size_entry(&self, checksum: Checksum, ty: ObjectType) -> Result<SizeEntry> {
         let compressed = self.repo().loose_object_size(ty, &checksum).await?;
         let unpacked = if ty == ObjectType::File {
@@ -168,7 +220,7 @@ impl Transaction {
             }
         } else {
             // A metadata object is stored uncompressed, so its unpacked size
-            // equals its on-disk size.
+            // is its size on disk.
             compressed
         };
         Ok(SizeEntry {
@@ -179,16 +231,18 @@ impl Transaction {
         })
     }
 
-    /// Collect the objects reachable from `root`, each mapped to its type: the
-    /// root dirmeta, every dirtree in the committed tree, each subdirectory
-    /// dirmeta, and each file entry. Used to scope `ostree.sizes` to one commit's
-    /// objects even when the transaction stages more than one commit.
+    /// Returns the objects that `root` reaches, each with its type.
     ///
-    /// The walk descends into every subtree, whether freshly staged or
-    /// pre-existing: [`load_reachable_dirtree`](Self::load_reachable_dirtree)
-    /// reads a dirtree from the transaction's staging directory when present, and
-    /// falls back to the published `objects/` loose object when it deduplicated,
-    /// so an unchanged subtree's objects are visited instead of being skipped.
+    /// The map holds the root dirmeta, each dirtree of the committed tree, each
+    /// subdirectory dirmeta, and each file entry. It limits `ostree.sizes` to
+    /// the objects of one commit, also if the transaction stages more than one
+    /// commit.
+    ///
+    /// The walk goes into each subtree, staged or not.
+    /// [`load_reachable_dirtree`](Self::load_reachable_dirtree) reads a dirtree
+    /// from the staging directory of the transaction if it is there. If the
+    /// dirtree deduplicated, it reads the loose object in `objects/`. This
+    /// read order lets the walk visit the objects of an unchanged subtree.
     async fn reachable_objects(&self, root: &RepoTree) -> Result<HashMap<Checksum, ObjectType>> {
         let mut reachable: HashMap<Checksum, ObjectType> = HashMap::new();
         reachable.insert(*root.dirmeta_checksum(), ObjectType::DirMeta);
@@ -212,9 +266,10 @@ impl Transaction {
         Ok(reachable)
     }
 
-    /// Load a dirtree reachable from the committed root: from the transaction's
-    /// staging directory when freshly staged, else from the published `objects/`
-    /// loose object when it deduplicated.
+    /// Loads a dirtree that the committed root reaches.
+    ///
+    /// The call reads the staging directory of the transaction first. If the
+    /// dirtree deduplicated, the call reads the loose object in `objects/`.
     async fn load_reachable_dirtree(&self, checksum: &Checksum) -> Result<DirTree> {
         if let Some(dirtree) = self.load_staged_dirtree(checksum).await? {
             return Ok(dirtree);
@@ -222,8 +277,10 @@ impl Transaction {
         self.repo().load_dirtree(checksum).await
     }
 
-    /// Load a dirtree staged in this transaction, or `None` when it is not in
-    /// the staging directory because it deduplicated against `objects/`.
+    /// Loads a dirtree from the staging directory of this transaction.
+    ///
+    /// Returns `None` if the dirtree is not there, because it deduplicated
+    /// against `objects/`.
     async fn load_staged_dirtree(&self, checksum: &Checksum) -> Result<Option<DirTree>> {
         let name = crate::write::flat_name(checksum, ObjectType::DirTree, self.repo().mode());
         let staging = self.staging_fd().try_clone_to_owned()?;
@@ -243,9 +300,21 @@ impl Transaction {
     }
 }
 
+/// Methods that read and write the detached metadata of a commit.
 impl Repo {
-    /// Read a commit's detached metadata, or `None` when absent or stored as
-    /// the zero-length "no metadata" file.
+    /// Returns the detached metadata of a commit, or `None` if it has none.
+    ///
+    /// The detached metadata is an `a{sv}` dict at the `.commitmeta` loose
+    /// path of the commit. It is outside the commit checksum. The call returns
+    /// `None` if the file is absent, or if it is the zero-length file that
+    /// marks no metadata.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Core`] if the file does not parse as an `a{sv}` dict.
+    /// - [`Error::Io`] if the file is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if a file system
+    ///   operation fails.
     pub async fn read_commit_detached_metadata(
         &self,
         checksum: &Checksum,
@@ -258,8 +327,7 @@ impl Repo {
             Err(Error::ObjectNotFound { .. }) => return Ok(None),
             Err(e) => return Err(e),
         };
-        // A zero-length file is the documented deletion marker, not an empty
-        // dict.
+        // A zero-length file marks deleted metadata. It is not an empty dict.
         if bytes.is_empty() {
             return Ok(None);
         }
@@ -269,16 +337,38 @@ impl Repo {
         ))
     }
 
-    /// Write (or clear) a commit's detached metadata at its `.commitmeta` loose
-    /// path, replaced atomically. `Some(meta)` serializes the `a{sv}` dict;
-    /// `None` writes the documented zero-length file.
+    /// Writes or clears the detached metadata of a commit.
     ///
-    /// The call takes the repository lock shared and then the update lock, as
-    /// [`Repo::begin_update`] does, and writes under both. Each of the two
-    /// waits fails with [`Error::LockTimeout`] after `lock-timeout-secs`. A
-    /// caller that holds an [`UpdateGuard`](crate::UpdateGuard) of this
-    /// repository waits for its own guard until the timeout, and with
-    /// `lock-timeout-secs=-1` it waits forever.
+    /// If `meta` is `Some`, the call writes the `a{sv}` dict at the
+    /// `.commitmeta` loose path of the commit. If `meta` is `None`, the call
+    /// writes a zero-length file, which marks no metadata. The new file
+    /// replaces the old file atomically and gets mode `0644`. The detached
+    /// metadata is outside the commit checksum.
+    ///
+    /// The call writes a temp file in `tmp/` and renames it over the loose
+    /// path. If `[core] fsync` is on, the call syncs the file before the
+    /// rename and syncs its directory after the rename.
+    ///
+    /// # Locks
+    ///
+    /// The call takes a shared hold of the repository lock
+    /// ([`LockKind`](crate::LockKind)), then the update lock, as
+    /// [`begin_update`](Repo::begin_update) does. It writes under both locks.
+    /// If the caller holds an [`UpdateGuard`](crate::UpdateGuard) of this
+    /// repository, the call waits for that guard.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
+    ///   lock-timeout-secs`. Each of the two waits gets the full timeout.
+    /// - [`Error::Core`] if `meta` is not an `a{sv}` dict value.
+    /// - [`Error::Core`] if `[core] fsync` or `[core] locking` is not a
+    ///   boolean, or if `[core] lock-timeout-secs` is not an integer.
+    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is less than
+    ///   `-1`.
+    /// - [`Error::Io`] with `EXDEV` if `tmp/` and `objects/` are on different
+    ///   file systems.
+    /// - [`Error::Io`] if another file system operation fails.
     pub async fn write_commit_detached_metadata(
         &self,
         checksum: &Checksum,
@@ -309,7 +399,7 @@ impl Repo {
     }
 }
 
-/// Append one entry to an `a{sv}` dict value, preserving insertion order.
+/// Appends one entry to an `a{sv}` dict value, after its existing entries.
 pub(crate) fn append_dict_entry(metadata: &mut Value, key: &str, value: Value) -> Result<()> {
     match metadata {
         Value::Array(entries) => {
@@ -322,21 +412,25 @@ pub(crate) fn append_dict_entry(metadata: &mut Value, key: &str, value: Value) -
     }
 }
 
-/// Apply one detached-metadata edit at a commit's `.commitmeta` loose path,
-/// on the blocking pool.
+/// Applies one edit of the detached metadata at the `.commitmeta` loose path
+/// of a commit.
 ///
-/// `replace` is the dict that stands in for whatever the file holds; with
-/// `None` the edit starts from the file's own dict, or from an empty dict
-/// where the file is absent or is the zero-length marker. `merge`, where
-/// given, is the serialized `a{sv}` dict merged into that dict with a union
-/// of each signature list, and the keys whose value stays where that dict
-/// holds them. Each entry of `appends` then appends one signature
-/// to its engine's `aay` array, in order, and the result replaces the file
-/// atomically.
+/// The call runs on the blocking pool. The edit starts from a base dict:
 ///
-/// The read, the merge and the replacing write run as one step under
-/// [`DETACHED_MERGE`], for this edit alone, so a caller can apply several
-/// edits in one trip to the blocking pool. The caller holds the update lock.
+/// - `replace`, if it is `Some`, in place of the dict of the file
+/// - else the dict that the file holds
+/// - else an empty dict, if the file is absent or is the zero-length marker
+///
+/// If `merge` is given, it holds a serialized `a{sv}` dict and a list of
+/// keys. The call merges that dict into the base dict with a union of each
+/// signature list. The listed keys keep the value that the base dict holds.
+/// Then each entry of `appends` appends one signature to the `aay` array of
+/// its engine, in order. The result replaces the file atomically.
+///
+/// The read, the merge, and the write run as one step under
+/// [`DETACHED_MERGE`], for this edit only. Because the guard covers one edit,
+/// a caller can apply several edits in one call on the blocking pool. The
+/// caller holds the update lock.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn merge_detached_blocking(
     tmp_fd: BorrowedFd<'_>,
@@ -370,16 +464,17 @@ pub(crate) fn merge_detached_blocking(
     })
 }
 
-/// Remove signatures at a commit's `.commitmeta` loose path, on the blocking
-/// pool.
+/// Removes signatures at the `.commitmeta` loose path of a commit.
 ///
-/// `remove(payload, blob)` decides each blob stored under `metadata_key`,
-/// where `payload` is the commit's canonical bytes. The read, the removal and
-/// the replacing write run as one step under [`DETACHED_MERGE`], as the edit
-/// of [`merge_detached_blocking`] does. Returns the number of blobs removed:
-/// zero leaves the file as it stands, and a dict the removal empties is
-/// written as the zero-length "no metadata" marker. The caller holds the
+/// The call runs on the blocking pool. `remove(payload, blob)` decides for
+/// each blob under `metadata_key`. `payload` is the canonical bytes of the
+/// commit. The read, the removal, and the write run as one step under
+/// [`DETACHED_MERGE`], as in [`merge_detached_blocking`]. The caller holds the
 /// update lock.
+///
+/// Returns the number of blobs removed. If the count is zero, the file stays
+/// as it is. If the removal empties the dict, the call writes the zero-length
+/// "no metadata" marker.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prune_detached_signatures_blocking(
     tmp_fd: BorrowedFd<'_>,
@@ -410,12 +505,12 @@ pub(crate) fn prune_detached_signatures_blocking(
     })
 }
 
-/// Write the bytes of a commit's detached metadata to the file `name` in a
-/// transaction's staging directory, for
-/// [`install_detached_blocking`] to move into `objects/` at the commit. The
-/// file takes the `0644` of every metadata object. A file already at `name`
-/// is replaced. The call syncs nothing: the commit makes the file durable
-/// before the install.
+/// Writes detached metadata to the file `name` in a staging directory.
+///
+/// [`install_detached_blocking`] moves the file into `objects/` at the
+/// transaction commit. The file gets the `0644` of each metadata object. If a
+/// file exists at `name`, the call replaces it. The call syncs nothing,
+/// because the transaction commit makes the file durable before the install.
 pub(crate) fn stage_detached_blocking(
     staging_fd: BorrowedFd<'_>,
     name: &str,
@@ -436,13 +531,17 @@ pub(crate) fn stage_detached_blocking(
     Ok(())
 }
 
-/// Rename each file of a transaction's staging directory in `staged` over
-/// the `.commitmeta` loose path of its commit, under [`DETACHED_MERGE`]. Each
-/// fanout directory is created on demand as [`write_detached_blocking`]
-/// creates it. With fsync on, after the last rename each fanout directory
-/// that gained a file is `fsync`-ed once, and `objects/` is `fsync`-ed once
-/// when a fanout directory was newly created. The caller holds the update
-/// lock, and with fsync on the staged files are durable before the call.
+/// Renames each staged file in `staged` over the `.commitmeta` loose path of
+/// its commit.
+///
+/// The call runs under [`DETACHED_MERGE`]. It creates each fanout directory
+/// on demand, as [`write_detached_blocking`] does. If fsync is on, the call
+/// runs `fsync` once on each fanout directory that got a file, after the last
+/// rename. It also runs `fsync` once on `objects/` if it created a fanout
+/// directory.
+///
+/// The caller holds the update lock. If fsync is on, the staged files are
+/// durable before the call.
 pub(crate) fn install_detached_blocking(
     staging_fd: BorrowedFd<'_>,
     staged: &[(&Checksum, &str)],
@@ -451,8 +550,8 @@ pub(crate) fn install_detached_blocking(
     repo_mode: RepoMode,
 ) -> Result<()> {
     let _guard = DETACHED_MERGE.lock().unwrap_or_else(|err| err.into_inner());
-    // Each fanout directory that gained a file, and whether this call
-    // created it.
+    // Each fanout directory that got a file, and `true` if this call created
+    // it.
     let mut fanouts = std::collections::BTreeMap::<String, bool>::new();
     for (checksum, name) in staged {
         let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
@@ -472,34 +571,38 @@ pub(crate) fn install_detached_blocking(
     Ok(())
 }
 
-/// Serializes the read-modify-write cycle behind
-/// [`edit_detached_blocking`], and the install of a staged file, across the
-/// whole process. The section holds one small read, one serialize and one
-/// atomic rename, and it holds no await, so it cannot block a task. Every
-/// edit of a `.commitmeta` also runs under the update lock, which excludes
-/// other processes and the other writers of this process, so two processes
-/// that sign one commit at the same time keep both signatures. The mutex
-/// guards only a caller of this process that edits without the update lock.
+/// The process-wide mutex of each edit of a `.commitmeta` file.
+///
+/// It serializes the read-modify-write cycle of [`edit_detached_blocking`]
+/// and the install of a staged file. The section holds one small read, one
+/// serialization, and one atomic rename. It holds no await, so it cannot
+/// block a task.
+///
+/// Each edit of a `.commitmeta` also runs under the update lock. That lock
+/// excludes other processes and the other writers of this process. If two
+/// processes sign one commit at the same time, both signatures stay. The
+/// mutex guards only a caller of this process that edits without the update
+/// lock.
 static DETACHED_MERGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// What one guarded edit leaves at a `.commitmeta` loose path.
+/// The result of one guarded edit at a `.commitmeta` loose path.
 enum DetachedWrite {
-    /// Replace the file with this `a{sv}` dict's bytes.
+    /// The bytes of this `a{sv}` dict replace the file.
     Dict(Value),
-    /// Replace the file with the zero-length "no metadata" marker.
+    /// The zero-length "no metadata" marker replaces the file.
     Marker,
-    /// Leave the file as it stands.
+    /// The file stays as it is.
     Keep,
 }
 
-/// Run one read-modify-write of a `.commitmeta` loose path under
+/// Runs one read-modify-write of a `.commitmeta` loose path under
 /// [`DETACHED_MERGE`].
 ///
-/// `edit` receives a reader for the stored dict -- the `a{sv}` the file holds,
-/// or `None` where the file is absent or is the zero-length marker -- and
-/// returns what to leave at the path together with the value the caller wants
-/// back. The reader, `edit` and the write all run inside the guard, so no other
-/// edit of this process lands between them.
+/// `edit` receives a reader of the stored dict. The reader returns the
+/// `a{sv}` dict of the file, or `None` if the file is absent or is the
+/// zero-length marker. `edit` returns what to leave at the path and the value
+/// for the caller. The reader, `edit`, and the write all run inside the guard,
+/// so no other edit of this process occurs between them.
 fn edit_detached_blocking<T>(
     tmp_fd: BorrowedFd<'_>,
     objects_fd: BorrowedFd<'_>,
@@ -524,8 +627,10 @@ fn edit_detached_blocking<T>(
     Ok(value)
 }
 
-/// Read the `a{sv}` dict at a `.commitmeta` loose path, or `None` where the
-/// file is absent or is the zero-length "no metadata" marker.
+/// Reads the `a{sv}` dict at a `.commitmeta` loose path.
+///
+/// Returns `None` if the file is absent or is the zero-length "no metadata"
+/// marker.
 fn read_detached_blocking(
     objects_fd: BorrowedFd<'_>,
     dest: &str,
@@ -545,19 +650,25 @@ fn read_detached_blocking(
     ))
 }
 
-/// Write metadata bytes to a loose path atomically. The detached-metadata
-/// writers reach it for a `.commitmeta`, and the prune sweep reaches it for a
-/// `.tombstone-commit`; both objects carry the `0644` every metadata object
-/// carries. `tmp_fd` is the open `tmp/` of the repository. The fanout
-/// directory is created on demand (`0777` reduced by the umask, and forced to
-/// [`perm::SHARED_DIR_MODE`] where this call creates it in a
-/// `bare-user-shared` repository), the bytes go to a temp file in `tmp/`
-/// (`fchmod` 0644, `fdatasync` when fsync is on), and the temp is renamed over
-/// the target. A `tmp/` on another filesystem makes the rename fail with
-/// `EXDEV`, and the temp is removed. When fsync is on, the fanout directory is
-/// fsynced after the rename so the new name survives a crash, and `objects/` is
-/// fsynced too when the fanout directory was newly created, matching the
-/// durability the object publication path honors.
+/// Writes metadata bytes to a loose path atomically.
+///
+/// The detached metadata writers use it for a `.commitmeta` file. The prune
+/// sweep uses it for a `.tombstone-commit` file. Both objects get the `0644`
+/// of each metadata object. `tmp_fd` is the open `tmp/` directory of the
+/// repository. The steps are:
+///
+/// 1. The call creates the fanout directory if it is absent, with `0777`
+///    reduced by the umask. If the call creates it in a `bare-user-shared`
+///    repository, the mode is [`perm::SHARED_DIR_MODE`].
+/// 2. The call writes the bytes to a temp file in `tmp/` and runs `fchmod`
+///    0644. If fsync is on, it runs `fdatasync` on the file.
+/// 3. The call renames the temp file over the target. If `tmp/` is on another
+///    file system, the rename fails with `EXDEV` and the temp file is removed.
+/// 4. If fsync is on, the call runs `fsync` on the fanout directory, so the
+///    new name survives a crash. If the call created the fanout directory, it
+///    also runs `fsync` on `objects/`.
+///
+/// The object publication path gives the same durability.
 pub(crate) fn write_detached_blocking(
     tmp_fd: BorrowedFd<'_>,
     objects_fd: BorrowedFd<'_>,
@@ -587,9 +698,11 @@ pub(crate) fn write_detached_blocking(
     Ok(())
 }
 
-/// Create the fanout directory `fanout` under `objects/` where it is absent
-/// (`0777` reduced by the umask, and forced to [`perm::SHARED_DIR_MODE`] in a
-/// `bare-user-shared` repository), and return whether this call created it.
+/// Creates the fanout directory `fanout` under `objects/` if it is absent.
+///
+/// The directory gets `0777` reduced by the umask. In a `bare-user-shared`
+/// repository, its mode is [`perm::SHARED_DIR_MODE`]. Returns `true` if this
+/// call created the directory.
 fn create_fanout(objects_fd: BorrowedFd<'_>, fanout: &str, repo_mode: RepoMode) -> Result<bool> {
     match rustix::fs::mkdirat(objects_fd, fanout, Mode::from_raw_mode(0o777)) {
         Ok(()) => {
@@ -601,9 +714,10 @@ fn create_fanout(objects_fd: BorrowedFd<'_>, fanout: &str, repo_mode: RepoMode) 
     }
 }
 
-/// Make a directory entry renamed into `fanout` durable: `fsync` the fanout
-/// directory, and `objects/` too when `created` says the fanout was newly
-/// created.
+/// Makes a directory entry renamed into `fanout` durable.
+///
+/// The call runs `fsync` on the fanout directory. If `created` is `true`, the
+/// fanout directory is new, and the call also runs `fsync` on `objects/`.
 fn sync_fanout(objects_fd: BorrowedFd<'_>, fanout: &str, created: bool) -> Result<()> {
     let dir = rustix::fs::openat(
         objects_fd,

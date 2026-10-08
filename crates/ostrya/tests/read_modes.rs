@@ -1,8 +1,8 @@
-//! Reading-path tests for repository modes without checked-in fixtures.
+//! Tests of the read path for the repository modes with no checked-in fixtures.
 //!
-//! bare and bare-user-only need root or a tool to produce faithful ownership,
-//! so there are no golden fixtures. These tests instead build real inodes for
-//! the bare family directly, then read them back through the port.
+//! The modes bare and bare-user-only need root or an external tool to write
+//! the correct ownership, so they have no golden fixtures. These tests make
+//! real inodes for the bare modes and read them back through ostrya.
 
 mod common;
 
@@ -27,7 +27,9 @@ async fn read_payload(file: &ostrya::FileObject) -> Vec<u8> {
     buf
 }
 
-/// Absolute path of a loose object within a repository.
+/// Returns the absolute path of a loose object in a repository.
+///
+/// It also creates the parent directory of the object.
 fn object_path(
     repo_root: &Path,
     checksum: &Checksum,
@@ -50,12 +52,14 @@ fn reads_bare_regular_symlink_and_xattrs() {
             .await
             .expect("create bare repo");
 
-        // A regular file object is a real inode; its metadata is the inode's.
+        // A regular file object is a real inode. Its metadata is the metadata
+        // of the inode.
         let reg = csum(&"aa".repeat(32));
         let reg_path = object_path(&root, &reg, ObjectType::File, RepoMode::Bare);
         fs::write(&reg_path, b"bare content\n").unwrap();
         fs::set_permissions(&reg_path, fs::Permissions::from_mode(0o644)).unwrap();
-        // A user xattr, where the filesystem supports it, must round-trip.
+        // If the file system supports user xattrs, a user xattr must
+        // round-trip.
         let xattr_ok = rustix::fs::setxattr(
             &reg_path,
             "user.demo",
@@ -106,7 +110,7 @@ fn reads_bare_user_only_discarding_ownership() {
         fs::set_permissions(&reg_path, fs::Permissions::from_mode(0o644)).unwrap();
 
         let file = repo.load_file(&reg).await.unwrap();
-        // uid/gid are discarded in this mode and read back as 0.
+        // This mode discards the uid and the gid, so they read back as 0.
         assert_eq!((file.uid, file.gid), (0, 0));
         assert_eq!(file.mode, 0o100644);
         assert_eq!(file.kind, FileKind::Regular { size: 4 });
@@ -136,17 +140,19 @@ fn reads_bare_user_shared_like_bare_user() {
             .await
             .expect("create bare-user-shared repo");
 
-        // Storage is bare-user: raw payload on the inode, logical metadata in
-        // `user.ostreemeta`. A restrictive logical mode (0600) is carried in
-        // the xattr while the inode is a plain 0644 object.
+        // The storage is the same as bare-user. The raw payload is on the
+        // inode, and the logical metadata is in `user.ostreemeta`. The xattr
+        // holds a restrictive logical mode (0600). The inode has the plain
+        // mode 0644.
         let reg = csum(&"11".repeat(32));
         let reg_path = object_path(&root, &reg, ObjectType::File, RepoMode::BareUserShared);
         fs::write(&reg_path, b"shared\n").unwrap();
         fs::set_permissions(&reg_path, fs::Permissions::from_mode(0o644)).unwrap();
-        // The logical uid/gid/mode live in `user.ostreemeta` as the
-        // `(uuua(ayay))` stat-metadata form: three big-endian u32s, then an
-        // empty xattr array that adds no trailing bytes. The reader must report
-        // this logical 0600, never the fixed 0644 the inode carries.
+        // `user.ostreemeta` holds the logical uid, gid, and mode in the
+        // `(uuua(ayay))` stat-metadata form. The form is three big-endian u32
+        // values, then an xattr array. An empty array adds no trailing bytes.
+        // The reader must report the logical 0600, never the fixed 0644 of the
+        // inode.
         let mut meta = Vec::new();
         meta.extend_from_slice(&0u32.to_be_bytes()); // uid
         meta.extend_from_slice(&0u32.to_be_bytes()); // gid

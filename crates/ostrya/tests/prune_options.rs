@@ -1,11 +1,16 @@
-//! The prune options that bound a walk: the per-branch depths, the timestamp
-//! cut, the commit-only sweep, the static-delta sweep, and the tombstone
-//! markers.
+//! Tests of the prune options that bound a walk:
 //!
-//! Each test builds its repository with the port and states the objects the run
-//! left and the statistics it reported. The `ostree` tool's own behavior for
-//! these options is compared in `crates/ostrya-cli/tests/cli.rs`; these tests
-//! pin the library rules those comparisons rest on.
+//! - the depth of each branch
+//! - the timestamp cut
+//! - the commit-only sweep
+//! - the static-delta sweep
+//! - the tombstone markers
+//!
+//! Each test builds its repository with ostrya. Then it checks the objects
+//! that the run left and the statistics that the run reported. The tests in
+//! `crates/ostrya-cli/tests/cli.rs` compare these options with the `ostree`
+//! command. The tests in this file hold the library rules that those
+//! comparisons use.
 
 mod common;
 
@@ -19,21 +24,22 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// The timestamp of the first commit every fixture writes. Later commits step
-/// one day at a time from it, so a cut between two of them is spellable.
+/// The number of seconds in one day. The fixtures write their commits one day
+/// apart, so a timestamp cut can fall between two commits.
 const DAY: u64 = 86_400;
-/// The base timestamp, so every commit is reproducible.
+/// The base timestamp. Commit `step` of a chain has the timestamp
+/// `BASE_TS + DAY * step`, so each commit is reproducible.
 const BASE_TS: u64 = 1_700_000_000;
 
-/// Write a one-file tree at `base/<name>`, its content naming it.
+/// Writes a tree of one file at `base/<name>`. The file holds the name.
 fn write_tree(base: &Path, name: &str) {
     let dir = base.join(name);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("payload.txt"), format!("{name}\n")).unwrap();
 }
 
-/// Commit the tree `base/<name>` into `repo` at `timestamp`, with the given
-/// parent and, where `branch` names one, a ref pointing at the result.
+/// Commits the tree `base/<name>` into `repo` at `timestamp`, with `parent`.
+/// If `branch` is `Some`, it also sets that ref to the new commit.
 async fn commit(
     repo: &Repo,
     base: &Path,
@@ -76,15 +82,15 @@ async fn commit(
     commit
 }
 
-/// A fresh `bare` repository under `base/repo`.
+/// Creates a new `bare` repository at `base/repo`.
 async fn repo_at(base: &Path) -> Repo {
     Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Bare))
         .await
         .unwrap()
 }
 
-/// A branch of three commits, one day apart, named `<branch>1` to `<branch>3`.
-/// Returns them oldest first.
+/// Writes three commits, one day apart, named `<branch>1` to `<branch>3`, and
+/// sets the ref `<branch>` to the last one. Returns the commits oldest first.
 async fn chain(repo: &Repo, base: &Path, branch: &str) -> [Checksum; 3] {
     let mut parent = None;
     let mut out = Vec::new();
@@ -98,10 +104,10 @@ async fn chain(repo: &Repo, base: &Path, branch: &str) -> [Checksum; 3] {
     [out[0], out[1], out[2]]
 }
 
-/// A branch of five commits, one day apart, named `<branch>1` to `<branch>5`,
-/// with a second ref `mid` pointing at the third. The two branches share their
-/// history, so a bound one of them carries reaches the other's walk. Returns
-/// the five commits oldest first.
+/// Writes five commits, one day apart, named `<branch>1` to `<branch>5`. Sets
+/// the ref `<branch>` to the fifth commit and the ref `mid` to the third. The
+/// two refs share their history, so the bound of one ref applies inside the
+/// walk of the other. Returns the five commits oldest first.
 async fn shared_chain(repo: &Repo, base: &Path, branch: &str, mid: &str) -> [Checksum; 5] {
     let mut parent = None;
     let mut out = Vec::new();
@@ -118,12 +124,13 @@ async fn shared_chain(repo: &Repo, base: &Path, branch: &str, mid: &str) -> [Che
     [out[0], out[1], out[2], out[3], out[4]]
 }
 
-/// Whether the repository still holds `commit` as an object.
+/// Returns `true` if the repository still holds `commit` as a commit object.
 async fn holds(repo: &Repo, commit: &Checksum) -> bool {
     repo.has_object(ObjectType::Commit, commit).await.unwrap()
 }
 
-/// Prune with the options the caller shaped from the refs-only default.
+/// Prunes `repo` with options that start from the refs-only default. The
+/// `shape` closure changes the options before the run.
 async fn prune(repo: &Repo, shape: impl FnOnce(&mut PruneOptions)) -> PruneStats {
     let mut opts = PruneOptions {
         refs_only: true,
@@ -139,7 +146,7 @@ fn keep_younger_than_roots_on_refs_alone() {
     block_on(async {
         let repo = repo_at(tmp.path()).await;
         let main = chain(&repo, tmp.path(), "main").await;
-        // An orphan younger than the cut, named by no ref.
+        // An orphan commit that no ref names. It is younger than the cut.
         let orphan = commit(&repo, tmp.path(), "orphan", BASE_TS + DAY * 10, None, None).await;
 
         prune(&repo, |o| {
@@ -163,7 +170,7 @@ fn keep_younger_than_keeps_every_ref_head() {
         let repo = repo_at(tmp.path()).await;
         let main = chain(&repo, tmp.path(), "main").await;
 
-        // A cut past every commit in the repository.
+        // A cut that is later than every commit in the repository.
         prune(&repo, |o| o.keep_younger_than = Some(BASE_TS + DAY * 100)).await;
         assert!(
             holds(&repo, &main[2]).await,
@@ -181,8 +188,9 @@ fn keep_younger_than_replaces_depth() {
         let repo = repo_at(tmp.path()).await;
         let main = chain(&repo, tmp.path(), "main").await;
 
-        // Depth 0 alone keeps the head alone. With a cut older than every
-        // commit the depth is read nowhere and the whole chain stays.
+        // Depth 0 without a cut keeps only the head. With a cut older than
+        // every commit, the run does not read the depth, and the whole chain
+        // stays.
         let stats = prune(&repo, |o| {
             o.depth = 0;
             o.keep_younger_than = Some(BASE_TS);
@@ -261,8 +269,8 @@ fn only_branch_naming_no_ref_is_refused() {
             "the refusal stands ahead of every removal"
         );
 
-        // A value that resolves and names no ref assigns the depth to no
-        // branch, so every branch is retained in full.
+        // A value that resolves to a commit and names no ref gives the depth
+        // to no branch, so the run keeps every branch in full.
         opts.only_branch = vec![main[2].to_hex()];
         let stats = repo.prune(&opts).await.unwrap();
         assert_eq!(stats.pruned_objects, 0);
@@ -357,7 +365,7 @@ fn retain_branch_depth_roots_on_refs_alone() {
     block_on(async {
         let repo = repo_at(tmp.path()).await;
         let main = chain(&repo, tmp.path(), "main").await;
-        // An orphan named by no ref.
+        // An orphan commit that no ref names.
         let orphan = commit(&repo, tmp.path(), "orphan", BASE_TS + DAY * 10, None, None).await;
 
         prune(&repo, |o| {
@@ -381,9 +389,9 @@ fn a_ref_target_takes_its_own_bound_over_an_inherited_one() {
         let repo = repo_at(tmp.path()).await;
         let c = shared_chain(&repo, tmp.path(), "main", "mid").await;
 
-        // `main` keeps its whole ancestry and reaches `mid`'s target on the
-        // way. The bound `mid` carries stands there, so one parent of it is
-        // kept and the rest of the history goes.
+        // `main` keeps its whole ancestry, and its walk reaches the target of
+        // `mid`. The bound of `mid` applies at that commit. As a result, the
+        // run keeps one parent of the target and removes the older history.
         prune(&repo, |o| {
             o.retain_branch_depth = vec![("mid".to_owned(), 1)]
         })
@@ -406,9 +414,10 @@ fn a_ref_target_bound_replaces_and_does_not_narrow() {
         let repo = repo_at(tmp.path()).await;
         let c = shared_chain(&repo, tmp.path(), "main", "mid").await;
 
-        // The walk arrives at `mid`'s target with one parent hop left of the
-        // global depth 3. `mid` takes the global depth itself, so the arrival
-        // continues under depth 3 and the whole chain is kept.
+        // The walk from `main` reaches the target of `mid` with one parent
+        // step left of the global depth 3. The entry of depth 0 gives `mid`
+        // the global depth, so the walk continues from that commit under
+        // depth 3. As a result, the run keeps the whole chain.
         prune(&repo, |o| {
             o.depth = 3;
             o.retain_branch_depth = vec![("mid".to_owned(), 0)];
@@ -431,8 +440,8 @@ fn only_branch_bounds_the_history_running_through_the_branch_it_names() {
         let repo = repo_at(tmp.path()).await;
         let c = shared_chain(&repo, tmp.path(), "main", "mid").await;
 
-        // `main` is retained in full and `mid` is cut to its head. The cut
-        // holds where `main`'s walk reaches `mid`'s target.
+        // The run keeps all of `main` and cuts `mid` to its head. The cut
+        // applies where the walk from `main` reaches the target of `mid`.
         prune(&repo, |o| {
             o.depth = 0;
             o.only_branch = vec!["mid".to_owned()];
@@ -453,8 +462,8 @@ fn a_time_bound_at_a_ref_target_replaces_an_inherited_depth() {
         let repo = repo_at(tmp.path()).await;
         let c = shared_chain(&repo, tmp.path(), "main", "mid").await;
 
-        // `main` keeps its whole ancestry; `mid` takes the timestamp cut. The
-        // cut holds from `mid`'s target back.
+        // `main` keeps its whole ancestry. `mid` takes the timestamp cut. The
+        // cut applies from the target of `mid` to the older commits.
         prune(&repo, |o| {
             o.keep_younger_than = Some(BASE_TS + DAY * 3);
             o.retain_branch_depth = vec![("main".to_owned(), -1)];
@@ -476,9 +485,10 @@ fn two_refs_at_one_commit_keep_what_either_bound_reaches() {
         txn.set_ref("beta", Some(&c[2]));
         txn.commit().await.unwrap();
 
-        // `alpha` and `beta` name one commit. `alpha` is cut to its head and
-        // `beta`, which no value names, is retained in full. The commit is
-        // walked under each of the two bounds and keeps what either reaches.
+        // `alpha` and `beta` name the same commit. The run cuts `alpha` to
+        // its head. No `only_branch` value names `beta`, so the run keeps all
+        // of `beta`. The run walks the commit under each of the two bounds
+        // and keeps what either bound reaches.
         prune(&repo, |o| {
             o.depth = 0;
             o.only_branch = vec!["alpha".to_owned()];
@@ -649,9 +659,9 @@ fn static_deltas_only_deletes_the_delta_and_nothing_else() {
             .unwrap();
         let before = repo.list_objects().await.unwrap();
 
-        // The commit the option names is the branch head, which a plain
-        // `delete_commit` refuses; this run keys the deltas on it and touches
-        // no loose object.
+        // The option names the branch head. A `delete_commit` run without
+        // `static_deltas_only` refuses the head. This run removes the deltas
+        // that target that commit and changes no loose object.
         let stats = repo
             .prune(&PruneOptions {
                 delete_commit: Some(main[2]),
@@ -922,12 +932,13 @@ fn a_tombstone_is_written_when_the_config_key_is_set() {
             .set_string("core", "tombstone-commits", "true")
             .unwrap();
         repo.write_config(&keyfile).await.unwrap();
-        // The handle keeps the configuration it was opened with, so the key is
-        // read by a fresh one.
+        // A handle keeps the configuration that it read at open, so a new
+        // handle reads the key.
         let repo = Repo::open(&tmp.path().join("repo")).await.unwrap();
 
-        // The two commits below the head, and the dirtree and the file object
-        // each of them alone reached.
+        // The run removes six objects. They are the two commits below the
+        // head, and the dirtree and the file object that only each of them
+        // reaches.
         let stats = prune(&repo, |o| o.depth = 0).await;
         assert_eq!(stats.pruned_objects, 6);
         for c in [&main[0], &main[1]] {
@@ -937,8 +948,8 @@ fn a_tombstone_is_written_when_the_config_key_is_set() {
                     .unwrap()
             );
         }
-        // A second run reads the markers and counts neither them nor itself
-        // into the deletion.
+        // A second run reads the markers. It counts them in neither the total
+        // nor the deletion count.
         let again = prune(&repo, |o| o.depth = 0).await;
         assert_eq!(again.pruned_objects, 0);
         assert_eq!(

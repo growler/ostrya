@@ -1,19 +1,26 @@
-//! Static-delta offline application and signature verification.
+//! Tests of offline static-delta application and signature verification.
 //!
-//! These drive the `ostree` tool as a black box: it builds an archive
-//! repository, commits two trees, and generates static deltas; the port then
-//! applies them offline and the produced objects are checked. Both directions
-//! are exercised -- the port applies the tool's delta, and the tool's `fsck`
-//! validates the objects the port wrote. The from-scratch delta carries a
-//! 512 KiB object, so it exercises the temp-file + mmap part-payload path; one
-//! from->to delta exercises the bspatch path over a 20 KiB file with a small
-//! edit; another exercises the rollsum copy-from-source `write` op over a 2 MiB
-//! file edited in place; and a signed delta is verified with the ed25519 engine.
+//! These tests run the `ostree` command as a black box. The command creates an
+//! archive repository, commits two trees, and generates static deltas. ostrya
+//! then applies the deltas offline, and the tests check the objects that it
+//! writes. The tests cover both directions: ostrya applies a delta of the
+//! `ostree` command, and `ostree fsck` verifies the objects that ostrya writes.
 //!
-//! Every test that drives the tool is skipped when the tool is absent,
-//! matching the other interop tests. The signed-delta test also needs the
-//! tool's ed25519 engine and is skipped where the build carries none. The
-//! removal tests build their delta entries by hand and need no tool.
+//! The deltas cover these paths:
+//!
+//! - The from-scratch delta carries a 512 KiB object. It covers the path that
+//!   writes a part payload to a temp file and maps it with mmap.
+//! - One from-to delta covers the bspatch path over a 20 000-byte file with a
+//!   small edit.
+//! - Another from-to delta covers the rollsum `write` op, which copies from the
+//!   source object, over a 2 MiB file edited in place.
+//! - A signed delta, which the ed25519 engine verifies.
+//!
+//! If the `ostree` command is absent, each test that runs it skips itself, as
+//! the other interop tests do. The signed-delta test also needs the ed25519
+//! engine of the `ostree` command. If the build has no such engine, the test
+//! skips itself. The removal tests build their delta entries by hand and do
+//! not need the `ostree` command.
 
 mod common;
 
@@ -28,16 +35,17 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// The fixed ed25519 keypair shared with the other signing tests.
+/// The fixed ed25519 key pair that the other signing tests also use.
 const SECRET_B64: &str =
     "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
 const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
 
-/// The v1 and v2 contents of the small file rewritten between commits.
+/// The v1 and v2 contents of the small file that changes between the commits.
 const APP_V1: &[u8] = b"hello world version one\n";
 const APP_V2: &[u8] = b"hello world version two changed\n";
 
-/// Run the `ostree` tool and assert it succeeded.
+/// Runs the `ostree` command, asserts that it succeeds, and returns its
+/// standard output.
 fn ostree(args: &[&str]) -> Vec<u8> {
     let out = Command::new("ostree")
         .args(args)
@@ -51,19 +59,23 @@ fn ostree(args: &[&str]) -> Vec<u8> {
     out.stdout
 }
 
-/// A 512 KiB data file, identical in both commits. It exceeds the reader's
-/// 128 KiB heap/mmap threshold, so its object in the from-scratch delta is
-/// spliced from an mmapped part payload rather than a heap buffer. It is
-/// unchanged between commits, so the from->to delta does not redeliver it.
+/// Returns a 512 KiB data file that is the same in both commits.
+///
+/// The delta reader keeps a part payload of 128 KiB or less on the heap, and
+/// maps a larger one with mmap. The file is larger than 128 KiB, so the
+/// from-scratch delta splices its object from a mapped part payload. The file
+/// does not change between the commits, so the from-to delta does not deliver
+/// it again.
 fn data_bin() -> Vec<u8> {
     (0..512u32 * 1024)
         .map(|i| ((i * 7 + 3) % 256) as u8)
         .collect()
 }
 
-/// A 20 000-byte file that changes between commits, sized so the tool expresses
-/// the from->to delta as a compact bspatch. `edit` flips three bytes near the
-/// middle.
+/// Returns a 20 000-byte file that changes between the commits.
+///
+/// The size makes the `ostree` command write the from-to delta as a compact
+/// bspatch. If `edit` is `true`, three bytes near the middle change.
 fn patch_bin(edit: bool) -> Vec<u8> {
     let mut v: Vec<u8> = (0..20_000u32).map(|i| ((i * 7 + 3) % 256) as u8).collect();
     if edit {
@@ -74,7 +86,7 @@ fn patch_bin(edit: bool) -> Vec<u8> {
     v
 }
 
-/// Build the v1 and v2 source trees under `base`, returning their paths.
+/// Builds the v1 and v2 source trees under `base` and returns their paths.
 fn build_trees(base: &Path) -> (PathBuf, PathBuf) {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -106,8 +118,8 @@ fn build_trees(base: &Path) -> (PathBuf, PathBuf) {
     (v1, v2)
 }
 
-/// Initialize an archive repo, commit both trees, and generate both deltas.
-/// Returns the repo path and the two commit checksums (hex).
+/// Creates an archive repository, commits both trees, and generates both
+/// deltas. Returns the repository path and the two commit checksums in hex.
 fn build_source_repo(base: &Path) -> (PathBuf, String, String) {
     let (v1, v2) = build_trees(base);
     let repo = base.join("srcrepo");
@@ -161,8 +173,9 @@ fn build_source_repo(base: &Path) -> (PathBuf, String, String) {
     (repo, c1, c2)
 }
 
-/// Find the delta directories under `repo/deltas`, classifying by whether the
-/// leaf name carries a `-` (a from->to delta) or not (a from-scratch delta).
+/// Returns the from-scratch and the from-to delta directories under
+/// `repo/deltas`. A leaf name with a `-` is a from-to delta, and a leaf name
+/// with no `-` is a from-scratch delta.
 fn find_delta_dirs(repo: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
     let mut scratch = None;
     let mut fromto = None;
@@ -185,7 +198,7 @@ fn find_delta_dirs(repo: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
     (scratch, fromto)
 }
 
-/// Read a file's payload from a commit's tree.
+/// Returns the content of the file at `path` in the tree of `rev`.
 async fn read_file(repo: &Repo, rev: &str, path: &str) -> Vec<u8> {
     let (tree, _) = repo.read_commit(rev).await.unwrap();
     let entry = tree
@@ -204,7 +217,7 @@ async fn read_file(repo: &Repo, rev: &str, path: &str) -> Vec<u8> {
     buf
 }
 
-/// Read a symlink's target from a commit's tree.
+/// Returns the target of the symlink at `path` in the tree of `rev`.
 async fn read_symlink(repo: &Repo, rev: &str, path: &str) -> String {
     let (tree, _) = repo.read_commit(rev).await.unwrap();
     let entry = tree.lookup(Path::new(path)).await.unwrap().unwrap();
@@ -245,13 +258,13 @@ fn applies_from_scratch_delta() {
         let (_commit, state) = repo.load_commit(&to).await.unwrap();
         assert_eq!(state, CommitState::Normal);
         assert_eq!(read_file(&repo, &c1, "usr/bin/app").await, APP_V1);
-        // The 512 KiB object is spliced from an mmapped part payload.
+        // The delta splices the 512 KiB object from a mapped part payload.
         assert_eq!(
             read_file(&repo, &c1, "usr/share/data.bin").await,
             data_bin()
         );
 
-        // The tool validates the objects the port wrote.
+        // `ostree fsck` verifies the objects that ostrya wrote.
         repo.set_ref_immediate("test", Some(&to)).await.unwrap();
     });
     ostree(&[&format!("--repo={}", dst.display()), "fsck"]);
@@ -269,7 +282,8 @@ fn applies_from_to_delta_with_bspatch() {
     let (_, fromto) = find_delta_dirs(&src_repo);
     let fromto = fromto.expect("from->to delta dir");
 
-    // A destination repo holding only the source commit's objects.
+    // A destination repository that holds only the objects of the source
+    // commit.
     let dst = base.join("dst");
     let dst_arg = format!("--repo={}", dst.display());
     ostree(&[&dst_arg, "init", "--mode=archive"]);
@@ -286,18 +300,19 @@ fn applies_from_to_delta_with_bspatch() {
 
         let (_commit, state) = repo.load_commit(&to).await.unwrap();
         assert_eq!(state, CommitState::Normal);
-        // The bspatch'd object reproduces its exact v2 content.
+        // The object that bspatch writes has the exact v2 content.
         assert_eq!(
             read_file(&repo, &c2, "usr/share/patch.bin").await,
             patch_bin(true)
         );
         assert_eq!(read_file(&repo, &c2, "usr/bin/app").await, APP_V2);
-        // The unchanged 512 KiB object is shared from the source, still readable.
+        // The unchanged 512 KiB object comes from the source commit and is
+        // readable.
         assert_eq!(
             read_file(&repo, &c2, "usr/share/data.bin").await,
             data_bin()
         );
-        // An unchanged symlink is still resolvable (shared with the source).
+        // The unchanged symlink comes from the source commit and resolves.
         assert_eq!(read_symlink(&repo, &c2, "usr/bin/applink").await, "app");
 
         repo.set_ref_immediate("test", Some(&to)).await.unwrap();
@@ -315,7 +330,8 @@ fn verifies_signed_delta() {
     let base = tmp.path();
     let (src_repo, c1, c2) = build_source_repo(base);
 
-    // A separate repo holding both commits, with a signed from->to delta.
+    // A separate repository that holds both commits and a signed from-to
+    // delta.
     let srepo = base.join("srepo");
     let srepo_arg = format!("--repo={}", srepo.display());
     ostree(&[&srepo_arg, "init", "--mode=archive"]);
@@ -347,17 +363,20 @@ fn verifies_signed_delta() {
         assert!(outcome.valid, "trusted key verifies the signed delta");
         assert!(outcome.signatures.iter().any(|s| s.valid));
 
-        // A verifier trusting a different key rejects it.
+        // A verifier that trusts a different key rejects the delta.
         let other = Ed25519Verifier::new([vec![0u8; 32]], Vec::<Vec<u8>>::new()).unwrap();
         let rejected = repo.verify_static_delta(&signed, &[&other]).await.unwrap();
         assert!(!rejected.valid, "untrusted key does not verify the delta");
     });
 }
 
-/// A 2 MiB pseudo-random file (xorshift64), sized so the tool expresses an
-/// in-place edit as a rollsum copy-from-source delta rather than a bsdiff.
-/// `edit` inverts a 512-byte window near the middle, leaving well over half the
-/// content-defined chunks unchanged so the compiler prefers rollsum `write` ops.
+/// Returns a 2 MiB pseudo-random file (xorshift64).
+///
+/// The size makes the `ostree` command write an in-place edit as a rollsum
+/// delta, which copies from the source object. If `edit` is `true`, a 512-byte
+/// window near the middle is inverted. Much more than half of the
+/// content-defined chunks stay the same, so the delta generator of the
+/// `ostree` command uses rollsum `write` ops.
 fn rollsum_bin(edit: bool) -> Vec<u8> {
     let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut v: Vec<u8> = (0..2 * 1024 * 1024)
@@ -376,17 +395,17 @@ fn rollsum_bin(edit: bool) -> Vec<u8> {
     v
 }
 
-/// Read the count reported for `key` (for example `"write="`) on a
-/// `static-delta show` line, or zero if absent.
+/// Returns the count for `key` (for example `"write="`) in the output of
+/// `static-delta show`, or zero if the key is absent.
 fn op_count(show: &str, key: &str) -> u64 {
     show.split_whitespace()
         .find_map(|tok| tok.strip_prefix(key).and_then(|n| n.parse().ok()))
         .unwrap_or(0)
 }
 
-/// The part lines of the tool's `static-delta show` for the delta in `dir`,
-/// against the superblock accessors and `DeltaSuperblock::part_stats` over the
-/// same files.
+/// Asserts that the output of `ostree static-delta show` for the delta in
+/// `dir` agrees with the superblock accessors and with
+/// `DeltaSuperblock::part_stats` over the same files.
 fn assert_part_stats_match_the_tool(repo_arg: &str, name: &str, dir: &Path) {
     let show = String::from_utf8(ostree(&[repo_arg, "static-delta", "show", name])).unwrap();
     let lines: Vec<&str> = show.lines().collect();
@@ -431,8 +450,9 @@ fn assert_part_stats_match_the_tool(repo_arg: &str, name: &str, dir: &Path) {
     });
 }
 
-/// The part statistics the library reads agree with the tool's report over a
-/// from-scratch delta and a from->to delta carrying a bspatch object.
+/// The part statistics that ostrya reads agree with the output of
+/// `ostree static-delta show`, for a from-scratch delta and for a from-to delta
+/// with a bspatch object.
 #[test]
 fn part_stats_match_the_tool_show() {
     if !ostree_available() {
@@ -456,10 +476,12 @@ fn part_stats_match_the_tool_show() {
     assert_part_stats_match_the_tool(&repo_arg, &format!("{c1}-{c2}"), &fromto.unwrap());
 }
 
-/// Replace the deltas of `src_repo` with the one the tool generates with
-/// `args` and `--inline`, and return its directory. The tool leaves the part
-/// files of an earlier delta in place, so the tree is removed first: a part
-/// file left there would let a reader that ignores the inline parts pass.
+/// Replaces the deltas of `src_repo` with the delta that the `ostree` command
+/// generates with `args` and `--inline`, and returns its directory.
+///
+/// The `ostree` command keeps the part files of an earlier delta in place, so
+/// the function first removes the `deltas/` tree. If a part file stays there,
+/// a reader that ignores the inline parts can pass the test.
 fn tool_inline_delta(src_repo: &Path, args: &[&str]) -> PathBuf {
     let _ = std::fs::remove_dir_all(src_repo.join("deltas"));
     let repo_arg = format!("--repo={}", src_repo.display());
@@ -479,9 +501,10 @@ fn tool_inline_delta(src_repo: &Path, args: &[&str]) -> PathBuf {
     dir
 }
 
-/// The port applies the tool's inline delta, one object to each part, into
-/// `archive` and `bare-user` repositories the tool created. The commit and the
-/// file contents agree, and the tool's `fsck` passes over what the port wrote.
+/// ostrya applies an inline delta of the `ostree` command, with one object in
+/// each part, to `archive` and `bare-user` repositories that the command
+/// created. The commit and the file contents agree, and `ostree fsck` passes
+/// over the objects that ostrya wrote.
 #[test]
 fn the_port_applies_the_tools_inline_delta() {
     if !ostree_available() {
@@ -491,7 +514,7 @@ fn the_port_applies_the_tools_inline_delta() {
     let tmp = TmpDir::new("delta-inline");
     let base = tmp.path();
     let (src_repo, c1, _c2) = build_source_repo(base);
-    // The tool reads a chunk size of 0 as one object for each part.
+    // The `ostree` command reads a chunk size of 0 as one object for each part.
     let to = format!("--to={c1}");
     let dir = tool_inline_delta(
         &src_repo,
@@ -530,8 +553,9 @@ fn the_port_applies_the_tools_inline_delta() {
     }
 }
 
-/// The port applies the tool's inline from-to delta written under
-/// `--set-endianness=B`, whose meta-entry sizes are big-endian.
+/// ostrya applies an inline from-to delta that the `ostree` command writes with
+/// `--set-endianness=B`. The sizes in the meta entries of this delta are
+/// big-endian.
 #[test]
 fn the_port_applies_the_tools_big_endian_inline_delta() {
     if !ostree_available() {
@@ -564,8 +588,9 @@ fn the_port_applies_the_tools_big_endian_inline_delta() {
     ostree(&[&dst_arg, "fsck"]);
 }
 
-/// A part file beside an inline superblock is not read: the inline part is
-/// applied, as the tool applies it, so a garbage `0` changes nothing.
+/// ostrya does not read a part file next to an inline superblock. It applies
+/// the inline part, as the `ostree` command does, so a garbage part file `0`
+/// changes nothing.
 #[test]
 fn an_inline_part_wins_over_a_part_file() {
     if !ostree_available() {
@@ -592,9 +617,9 @@ fn an_inline_part_wins_over_a_part_file() {
     });
 }
 
-/// The `delta-indexes/` listing takes a regular file `<2 chars>/<41
-/// chars>.index` that decodes as a checksum, sorted, and skips every other
-/// entry.
+/// The listing of `delta-indexes/` returns, sorted, each regular file
+/// `<2 chars>/<41 chars>.index` whose name decodes as a checksum. It skips
+/// every other entry.
 #[test]
 fn static_delta_indexes_skip_what_is_not_an_index() {
     let tmp = TmpDir::new("delta-indexes");
@@ -668,8 +693,8 @@ fn applies_from_to_delta_with_rollsum() {
     let tmp = TmpDir::new("delta-rollsum");
     let base = tmp.path();
 
-    // Build a tree with a large regular file and commit it, then overwrite the
-    // file in place and commit again.
+    // The test commits a tree with a large regular file. Then it overwrites the
+    // file in place and commits again.
     let tree = base.join("tree");
     std::fs::create_dir_all(&tree).unwrap();
     let write_tree = |edit: bool, notes: &[u8]| {
@@ -716,8 +741,8 @@ fn applies_from_to_delta_with_rollsum() {
         &c2,
     ]);
 
-    // The delta must actually use rollsum `write` ops, or it would not exercise
-    // the path under test.
+    // The delta must use rollsum `write` ops. If it uses none, the test does
+    // not cover the rollsum path.
     let show = String::from_utf8(ostree(&[
         &src_arg,
         "static-delta",
@@ -734,7 +759,8 @@ fn applies_from_to_delta_with_rollsum() {
     let fromto = fromto.expect("from->to delta dir");
     assert_part_stats_match_the_tool(&src_arg, &format!("{c1}-{c2}"), &fromto);
 
-    // A destination repo holding only the source commit's objects.
+    // A destination repository that holds only the objects of the source
+    // commit.
     let dst = base.join("dst");
     let dst_arg = format!("--repo={}", dst.display());
     ostree(&[&dst_arg, "init", "--mode=archive"]);
@@ -751,9 +777,9 @@ fn applies_from_to_delta_with_rollsum() {
 
         let (_commit, state) = repo.load_commit(&to).await.unwrap();
         assert_eq!(state, CommitState::Normal);
-        // The rollsum-reconstructed 2 MiB object reproduces its exact v2 content:
-        // unchanged runs copied from the source object, the edited window from
-        // the delta payload.
+        // The 2 MiB object that rollsum rebuilds has the exact v2 content. The
+        // unchanged runs come from the source object, and the edited window
+        // comes from the delta payload.
         assert_eq!(
             read_file(&repo, &c2, "bigfile.dat").await,
             rollsum_bin(true)
@@ -763,10 +789,12 @@ fn applies_from_to_delta_with_rollsum() {
     ostree(&[&dst_arg, "fsck"]);
 }
 
-/// A 4 MiB pseudo-random file (xorshift64) with `edits` scattered 512-byte
-/// windows inverted. Each edited window splits the rollsum match into another
-/// contiguous run, and the tool emits one `r`/`R` pair per run, so the op stream
-/// names the same source object once per edit plus one.
+/// Returns a 4 MiB pseudo-random file (xorshift64) in which `edits` scattered
+/// 512-byte windows are inverted.
+///
+/// Each edited window splits the rollsum match into one more contiguous run.
+/// The `ostree` command writes one `r`/`R` pair for each run, so the op stream
+/// names the same source object `edits` + 1 times.
 fn scattered_bin(edits: usize) -> Vec<u8> {
     let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut v: Vec<u8> = (0..4 * 1024 * 1024)
@@ -786,13 +814,18 @@ fn scattered_bin(edits: usize) -> Vec<u8> {
     v
 }
 
-/// A delta that names its read source many times over reconstructs the target
-/// object correctly. The reader holds the loaded source across the `R`/`r`
-/// boundary and reuses it on a checksum match, so this covers the reuse being
-/// valid: a stale or misindexed held source would corrupt the copied runs and
-/// fail the `close` checksum assertion. Forty scattered edits make the tool emit
-/// forty-one `r` ops against one 4 MiB source object, where loading per op would
-/// cost a full read and spill of the object forty-one times.
+/// A delta that names its read source many times rebuilds the target object
+/// with the correct content.
+///
+/// The delta reader keeps the loaded source across the `R`/`r` boundary. If
+/// the checksum of the next source matches, the reader uses the kept source
+/// again. This test shows that the reuse is correct. A stale or wrongly
+/// indexed kept source corrupts the copied runs, and the `close` checksum
+/// assertion fails.
+///
+/// Forty scattered edits make the `ostree` command write forty-one `r` ops for
+/// one 4 MiB source object. Without the reuse, a load for each op reads and
+/// spills the full object forty-one times.
 #[test]
 fn applies_delta_naming_one_read_source_many_times() {
     use std::os::unix::fs::PermissionsExt;
@@ -836,7 +869,8 @@ fn applies_delta_naming_one_read_source_many_times() {
     let c1 = commit("@1700000000");
     write_tree(40);
     let c2 = commit("@1700000100");
-    // Keep the object packed rather than delivered as a 4 MiB fallback.
+    // `--min-fallback-size=999` keeps the 4 MiB object in a part, so the delta
+    // does not deliver it as a fallback object.
     ostree(&[
         &src_arg,
         "static-delta",
@@ -888,9 +922,10 @@ fn applies_delta_naming_one_read_source_many_times() {
     ostree(&[&dst_arg, "fsck"]);
 }
 
-/// Write `size` bytes of a repeating block to `path` in bounded chunks, so a
-/// large fixture costs little memory to produce and compresses small on disk
-/// while still decompressing to its full size inside a delta part.
+/// Writes `size` bytes of a repeating 1 MiB block to `path` in bounded chunks.
+///
+/// A large fixture made this way uses little memory and compresses to a small
+/// size on disk. Inside a delta part, it decompresses to its full size.
 fn write_pattern(path: &Path, size: usize) {
     use std::io::Write;
 
@@ -909,13 +944,17 @@ fn write_pattern(path: &Path, size: usize) {
     writer.flush().unwrap();
 }
 
-/// A regular-file object larger than 512 MiB, carried inside a delta part
-/// (fallback disabled), applies and validates. The reader spills the whole
-/// decompressed part payload to a temp file and mmaps it, so a large packed
-/// object costs staging-filesystem space rather than resident heap and no fixed
-/// size ceiling rejects a delta the tool wrote. Ignored by default: it commits
-/// and applies over half a gigabyte, too slow and disk-heavy for the normal
-/// suite; run with `cargo test -p ostrya --test delta -- --ignored`.
+/// A regular-file object larger than 512 MiB, in a delta part with no
+/// fallback, applies and passes `ostree fsck`.
+///
+/// The delta reader writes the full decompressed part payload to a temp file
+/// and maps it with mmap. As a result, a large object in a part uses space on
+/// the file system of the staging directory, and no resident heap memory. No
+/// fixed size limit refuses a delta that the `ostree` command wrote.
+///
+/// The test is ignored by default. It commits and applies more than half a
+/// gigabyte, which takes too much time and disk space for the normal test run.
+/// To run it, use `cargo test -p ostrya --test delta -- --ignored`.
 #[test]
 #[ignore = "creates a >512 MiB object; run with --ignored"]
 fn applies_delta_with_object_over_half_gib_packed() {
@@ -926,7 +965,7 @@ fn applies_delta_with_object_over_half_gib_packed() {
     let tmp = TmpDir::new("delta-huge");
     let base = tmp.path();
 
-    // One object of 520 MiB, past the reader's former 512 MiB ceiling.
+    // One object of 520 MiB, which is more than 512 MiB.
     let size = 520 * 1024 * 1024;
     let tree = base.join("tree");
     std::fs::create_dir_all(&tree).unwrap();
@@ -949,8 +988,8 @@ fn applies_delta_with_object_over_half_gib_packed() {
     .unwrap()
     .trim()
     .to_owned();
-    // Disable fallback so the object is packed into a part rather than delivered
-    // as a loose fallback object, which is the path the size ceiling blocked.
+    // A large `--min-fallback-size` turns the fallback off, so the object goes
+    // into a part. This test covers that part path.
     ostree(&[
         &src_arg,
         "static-delta",
@@ -968,8 +1007,8 @@ fn applies_delta_with_object_over_half_gib_packed() {
 
     let (scratch, _) = find_delta_dirs(&src);
     let scratch = scratch.expect("from-scratch delta dir");
-    // The statistics walk streams the part three times with no temp file, and
-    // its payload framing takes 4-byte offsets.
+    // The statistics walk reads the part as a stream three times and uses no
+    // temp file. Its payload framing uses 4-byte offsets.
     assert_part_stats_match_the_tool(&src_arg, &c, &scratch);
 
     let dst = base.join("dst");
@@ -982,12 +1021,14 @@ fn applies_delta_with_object_over_half_gib_packed() {
         assert_eq!(to.to_hex(), c, "applied delta reproduces the target commit");
         repo.set_ref_immediate("test", Some(&to)).await.unwrap();
     });
-    // The tool validates the checksums of the objects the port wrote.
+    // `ostree fsck` verifies the checksums of the objects that ostrya wrote.
     ostree(&[&dst_arg, "fsck"]);
 }
 
-/// Two distinct commit checksums for the removal tests. No commit object backs
-/// them: the removal reads only the `deltas/` tree.
+/// Returns two different commit checksums for the removal tests.
+///
+/// No commit object exists for them. The removal reads only the `deltas/`
+/// tree, so it does not need one.
 fn removal_checksums() -> (Checksum, Checksum) {
     (
         Checksum::from_hex(&"1a".repeat(32)).unwrap(),
@@ -995,20 +1036,20 @@ fn removal_checksums() -> (Checksum, Checksum) {
     )
 }
 
-/// A fresh `archive` repository under `base/repo`.
+/// Creates an `archive` repository at `base/repo`.
 async fn removal_repo(base: &Path) -> Repo {
     Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Archive))
         .await
         .unwrap()
 }
 
-/// The absolute path of one delta's `deltas/<fanout>/<rest>` entry.
+/// Returns the absolute path of the `deltas/<fanout>/<rest>` entry of a delta.
 fn delta_entry(base: &Path, from: Option<&Checksum>, to: &Checksum) -> PathBuf {
     base.join("repo").join(static_delta_relative_dir(from, to))
 }
 
-/// A delta directory holding a superblock and one part, as a generator leaves
-/// it.
+/// Writes a delta directory that holds a superblock and one part, as a delta
+/// generator leaves it.
 fn write_flat_delta(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("superblock"), b"superblock").unwrap();
@@ -1025,8 +1066,9 @@ fn list_static_deltas_lists_only_a_directory_holding_a_superblock() {
         let repo = removal_repo(base).await;
         write_flat_delta(&delta_entry(base, None, &c2));
 
-        // An empty directory, a directory holding a part and no superblock, a
-        // regular file, and a directory whose superblock is a dangling symlink.
+        // An empty directory, a directory that holds a part and no superblock,
+        // a regular file, and a directory whose superblock is a dangling
+        // symlink.
         std::fs::create_dir_all(delta_entry(base, Some(&c1), &c2)).unwrap();
         let part_only = delta_entry(base, None, &c1);
         std::fs::create_dir_all(&part_only).unwrap();
@@ -1323,23 +1365,26 @@ fn delete_static_delta_reports_an_absent_delta() {
     });
 }
 
-/// Marks the re-executed child of
-/// [`delete_static_delta_removes_a_tree_deeper_than_the_descriptor_limit`], and
-/// names the file the child writes to record that the removal ran.
+/// The environment variable that marks the re-executed child of
+/// [`delete_static_delta_removes_a_tree_deeper_than_the_descriptor_limit`].
+/// Its value is the path of the file that the child writes to record that the
+/// removal ran.
 const DEEP_DELETE_CHILD: &str = "OSTRYA_DEEP_DELTA_DELETE_CHILD";
-/// The soft descriptor limit the child runs under. It stands well above what
-/// the repository, the runtime, and the blocking pool open for themselves.
+/// The soft file descriptor limit of the child. It is much more than the
+/// number of descriptors that the repository, the runtime, and the blocking
+/// pool open for themselves.
 const DEEP_DELETE_NOFILE: usize = 256;
-/// The depth of the tree the child removes. It stands well above
-/// [`DEEP_DELETE_NOFILE`], so a removal holding one descriptor per level runs
-/// out.
+/// The depth of the tree that the child removes. It is much more than
+/// [`DEEP_DELETE_NOFILE`], so a removal that holds one descriptor for each
+/// level runs out of descriptors.
 const DEEP_DELETE_DEPTH: usize = 1024;
 
 #[test]
 fn delete_static_delta_removes_a_tree_deeper_than_the_descriptor_limit() {
-    // The limit is a property of the process and the tests of this binary run
-    // in parallel threads, so the lowered limit goes to a child: this test
-    // binary re-executed for this test alone, through `sh` with `ulimit -n`.
+    // The limit applies to the whole process, and the tests of this binary run
+    // in parallel threads. For this reason, only a child process gets the
+    // lowered limit. The child is this test binary, run again for this test
+    // alone through `sh` with `ulimit -n`.
     if let Some(marker) = std::env::var_os(DEEP_DELETE_CHILD) {
         delete_a_deep_delta();
         std::fs::write(marker, b"removed").expect("record that the deep removal ran");
@@ -1364,16 +1409,16 @@ fn delete_static_delta_removes_a_tree_deeper_than_the_descriptor_limit() {
         status.success(),
         "the deep removal failed under a soft limit of {DEEP_DELETE_NOFILE} descriptors: {status}"
     );
-    // A name the child's filter does not match runs nothing and still exits 0,
-    // so the marker is what proves the removal ran.
+    // If the test filter of the child matches no test, the child runs nothing
+    // and exits 0. The marker file proves that the removal ran.
     assert!(
         marker.exists(),
         "the child ran no deep removal: the test name the filter names is stale"
     );
 }
 
-/// Remove a delta directory [`DEEP_DELETE_DEPTH`] levels deep. Runs in the
-/// child process, under the lowered descriptor limit.
+/// Removes a delta directory that is [`DEEP_DELETE_DEPTH`] levels deep. The
+/// function runs in the child process, under the lowered descriptor limit.
 fn delete_a_deep_delta() {
     use std::os::fd::AsFd;
 
@@ -1384,8 +1429,9 @@ fn delete_a_deep_delta() {
         let repo = removal_repo(base).await;
         let entry = delta_entry(base, None, &c2);
         write_flat_delta(&entry);
-        // The tree is built through a descending descriptor, so no path of its
-        // own grows past the kernel's limit.
+        // The test builds the tree through a descriptor that moves down one
+        // level at each step. As a result, no path that the test uses grows
+        // past the path limit of the kernel.
         let mut dir: std::os::fd::OwnedFd = std::fs::File::open(&entry).unwrap().into();
         for _ in 0..DEEP_DELETE_DEPTH {
             rustix::fs::mkdirat(dir.as_fd(), "d", rustix::fs::Mode::from_raw_mode(0o755)).unwrap();
@@ -1431,7 +1477,7 @@ fn delete_static_delta_removes_an_empty_directory_with_no_search_permission() {
     block_on(async {
         let repo = removal_repo(base).await;
 
-        // An empty subdirectory that can be read but not searched.
+        // An empty subdirectory with read permission and no search permission.
         let entry = delta_entry(base, None, &c2);
         write_flat_delta(&entry);
         std::fs::create_dir(entry.join("sub")).unwrap();
@@ -1452,8 +1498,8 @@ fn delete_static_delta_removes_an_empty_directory_with_no_search_permission() {
             "the empty mode-0400 delta directory goes"
         );
 
-        // A subdirectory with no search permission and an entry in it cannot
-        // be emptied, and the removal fails.
+        // The removal cannot empty a subdirectory that has no search
+        // permission and holds an entry, so the removal fails.
         let entry = delta_entry(base, None, &c2);
         std::fs::create_dir_all(entry.join("sub")).unwrap();
         std::fs::write(entry.join("sub/f"), b"f").unwrap();

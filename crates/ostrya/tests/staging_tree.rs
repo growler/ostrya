@@ -1,13 +1,19 @@
-//! Staging-tree integration tests.
+//! Integration tests of the staging tree.
 //!
-//! These drive the path-addressed [`StagingTree`] surface: the equivalence
-//! between a tree built through staging operations and the same tree ingested
-//! from disk through `write_dfd_to_mtree`, hardlink object sharing, staged-first
-//! reads that see unpublished content and follow symlink chains (failing on
-//! loops and dangling targets), and the tree merge with symlink resolution
-//! (a package over `/opt -> usr/opt`, a file over a `localtime` symlink, a
-//! left-side symlink staged in the same transaction, and a conflict that names
-//! the path). A concurrency test streams many files through one `&StagingTree`.
+//! The tests drive the path-addressed [`StagingTree`] API:
+//!
+//! - A tree built through staging operations equals the same tree ingested
+//!   from disk through `write_dfd_to_mtree`.
+//! - Hardlinks share one object.
+//! - Reads look in the staged objects first, so they find content that is not
+//!   published.
+//! - Reads follow symlink chains. A loop or a dangling target fails.
+//! - The tree merge resolves symlinks in these cases:
+//!   - a package over `/opt -> usr/opt`
+//!   - a file over a `localtime` symlink
+//!   - a left-side symlink staged in the same transaction
+//!   - a conflict that names the path
+//! - A concurrency test streams many files through one `&StagingTree`.
 
 mod common;
 
@@ -39,9 +45,9 @@ fn dir_meta() -> DirMeta {
     }
 }
 
-/// A symlink's mode is fixed by the object model, so only owner and xattrs
-/// matter; canonical ingest zeroes the owner, so this matches a disk symlink
-/// committed with canonical permissions.
+/// The object model fixes the mode of a symlink, so only the owner and the
+/// xattrs matter. Canonical ingest zeroes the owner, so this value matches a
+/// symlink on disk committed with canonical permissions.
 fn symlink_meta() -> FileMeta {
     FileMeta {
         uid: 0,
@@ -72,7 +78,7 @@ fn write_file(path: &Path, content: &[u8], mode: u32) {
     set_mode(path, mode);
 }
 
-/// Stage the shared 0755 root dirmeta and return its checksum.
+/// Stages the shared 0755 root dirmeta and returns its checksum.
 async fn stage_dir_meta(txn: &Transaction) -> Checksum {
     let bytes = dir_meta().serialize().unwrap();
     txn.write_metadata(ObjectType::DirMeta, None, &bytes)
@@ -80,7 +86,7 @@ async fn stage_dir_meta(txn: &Transaction) -> Checksum {
         .unwrap()
 }
 
-/// Read a file object's whole payload.
+/// Reads the whole payload of a file object.
 async fn read_all(obj: &FileObject) -> Vec<u8> {
     let mut buf = Vec::new();
     obj.reader()
@@ -92,8 +98,8 @@ async fn read_all(obj: &FileObject) -> Vec<u8> {
     buf
 }
 
-/// Commit the on-disk tree at `path` (relative to `dfd`) onto `refname` with
-/// canonical permissions, so it can be hydrated with `MutableTree::from_commit`.
+/// Commits the tree on disk at `path` (relative to `dfd`) to `refname` with
+/// canonical permissions. `MutableTree::from_commit` can then hydrate it.
 async fn commit_dir(repo: &Repo, dfd: std::os::fd::BorrowedFd<'_>, path: &Path, refname: &str) {
     let txn = repo.transaction().await.unwrap();
     let mut modifier = CommitModifier::new(canon_flags());
@@ -110,8 +116,8 @@ async fn commit_dir(repo: &Repo, dfd: std::os::fd::BorrowedFd<'_>, path: &Path, 
     txn.commit().await.unwrap();
 }
 
-/// Count loose objects under `<repo_root>/objects` whose filename ends in
-/// `ext`, scanning only the two-character fanout directories.
+/// Counts the loose objects under `<repo_root>/objects` whose file name ends
+/// in `ext`. The count reads only the two-character fanout directories.
 fn count_objects_with_ext(repo_root: &Path, ext: &str) -> usize {
     let objects = repo_root.join("objects");
     let mut count = 0;
@@ -129,7 +135,7 @@ fn count_objects_with_ext(repo_root: &Path, ext: &str) -> usize {
     count
 }
 
-/// The content checksum of the file `name` under directory `dir` in `tree`.
+/// Returns the content checksum of the file at `path` in `tree`.
 async fn lookup_file(tree: &ostrya::RepoTree, path: &str) -> Checksum {
     match tree.lookup(Path::new(path)).await.unwrap() {
         Some(TreeEntry::File { checksum, .. }) => checksum,
@@ -139,8 +145,8 @@ async fn lookup_file(tree: &ostrya::RepoTree, path: &str) -> Checksum {
 
 #[test]
 fn builds_same_tree_as_write_dfd_to_mtree() {
-    // A tree assembled through staging-tree operations reaches the same root
-    // dirtree and dirmeta as ingesting the equivalent on-disk tree.
+    // A tree built through staging-tree operations reaches the same root
+    // dirtree and dirmeta as an ingest of the equivalent tree on disk.
     let tmp = TmpDir::new("staging-equiv");
     let base = tmp.path();
 
@@ -337,8 +343,8 @@ fn reads_staged_content_and_follows_symlinks() {
 
 #[test]
 fn package_merges_through_opt_symlink() {
-    // A package tree merged over a base holding `/opt -> usr/opt` lands its
-    // files under `usr/opt` when symlinks are followed.
+    // If the merge follows symlinks, a package tree merged over a base with
+    // `/opt -> usr/opt` puts its files under `usr/opt`.
     let tmp = TmpDir::new("staging-merge-opt");
     let base = tmp.path();
 
@@ -395,7 +401,7 @@ fn package_merges_through_opt_symlink() {
 
         let repo = Repo::open(&base.join("repo")).await.unwrap();
         let (tree, _) = repo.read_commit("test/merged").await.unwrap();
-        // `opt` is still a symlink, not a directory.
+        // `opt` stays a symlink.
         assert!(
             matches!(
                 tree.lookup(Path::new("opt")).await.unwrap(),
@@ -495,8 +501,9 @@ fn file_over_localtime_symlink_replaces_without_writing_through() {
 #[test]
 fn merge_resolves_a_symlink_staged_in_this_transaction() {
     // The left-side symlink `/opt -> usr/opt` is staged in the current
-    // transaction, not committed. Resolving it during the merge exercises the
-    // staged-first object lookup: a plain objects/ lookup would not find it.
+    // transaction and is not committed. The merge resolves it, so the test
+    // covers the object lookup that reads the staged objects first. A lookup
+    // in `objects/` alone does not find the symlink.
     let tmp = TmpDir::new("staging-merge-staged-symlink");
     let root = tmp.path().join("repo");
     block_on(async {
@@ -566,13 +573,16 @@ fn merge_resolves_a_symlink_staged_in_this_transaction() {
 #[test]
 fn merge_reads_committed_right_side_subtrees() {
     // The right side of a merge is a tree hydrated from a commit, so its
-    // subdirectories arrive as lazy children resolved through the right-side
-    // committed dirtree load. Existing merge tests pass a freshly built (all
-    // loaded) right side, so this is the only coverage of that path. The
-    // dirtrees here are published, so it does not distinguish staged-first from
-    // objects-only: a staged-but-unpublished right-side dirtree is unreachable
-    // through the current public API (a lazy child comes only from a
-    // hydrated-from-commit tree, whose dirtrees are already published).
+    // subdirectories arrive as lazy children. The merge resolves them through
+    // a load of the committed right-side dirtree. The other merge tests pass a
+    // right side built in memory with all children loaded, so only this test
+    // covers that path.
+    //
+    // The dirtrees here are published, so the test does not tell a lookup in
+    // the staged objects first from a lookup in `objects/` alone. The public
+    // API cannot reach a right-side dirtree that is staged and not published.
+    // A lazy child comes only from a tree hydrated from a commit, and the
+    // dirtrees of that tree are already published.
     let tmp = TmpDir::new("staging-merge-committed-right");
     let base = tmp.path();
 
@@ -730,8 +740,8 @@ fn close_fails_with_an_outstanding_writer() {
         let txn = repo.transaction().await.unwrap();
         let st = txn.staging_tree(None).await.unwrap();
         let writer = st.write_file(Path::new("f.txt"), &reg()).await.unwrap();
-        // A different handle cannot be closed while a writer is live; keep the
-        // writer alive across the check.
+        // The tree cannot close while a writer is live. The writer stays alive
+        // across the check.
         match st.close() {
             Err(Error::Staging(msg)) => {
                 assert_eq!(
@@ -746,9 +756,9 @@ fn close_fails_with_an_outstanding_writer() {
     });
 }
 
-/// A `make_dir_all` whose path components all already exist creates nothing, so
-/// a novel dirmeta it carries must not be staged: were it staged, commit would
-/// publish it as an orphan object.
+/// A `make_dir_all` whose path components all exist creates nothing, so it
+/// must not stage the novel dirmeta that it carries. The commit publishes each
+/// staged dirmeta, and a dirmeta that no directory uses is an orphan object.
 #[test]
 fn no_op_make_dir_all_stages_no_orphan_dirmeta() {
     let tmp = TmpDir::new("staging-make-dir-all-noop");
@@ -766,8 +776,8 @@ fn no_op_make_dir_all_stages_no_orphan_dirmeta() {
             .await
             .unwrap();
 
-        // A no-op call over the same, existing path carrying a novel dirmeta (a
-        // distinct mode used nowhere in the tree). Nothing is created.
+        // A no-op call over the same existing path, with a novel dirmeta (a
+        // mode that no entry in the tree uses). The call creates nothing.
         let novel = DirMeta {
             uid: 0,
             gid: 0,
@@ -781,8 +791,8 @@ fn no_op_make_dir_all_stages_no_orphan_dirmeta() {
         txn.write_mtree(&mut built).await.unwrap();
         txn.commit().await.unwrap();
 
-        // root, a, and b all carry the 0755 dirmeta, so exactly one dirmeta
-        // object is published; the novel one was never staged.
+        // root, a, and b all carry the 0755 dirmeta, so the commit publishes
+        // exactly one dirmeta object. The novel dirmeta is not staged.
         assert_eq!(
             count_objects_with_ext(&root, ".dirmeta"),
             1,
@@ -791,10 +801,10 @@ fn no_op_make_dir_all_stages_no_orphan_dirmeta() {
     });
 }
 
-/// A non-UTF-8 path component is rejected rather than silently converted with
-/// replacement characters. The tree is `String`-keyed, so a lossy name would
-/// address the wrong entry; `symlink` already rejects a non-UTF-8 target, and
-/// the path entry points agree.
+/// A non-UTF-8 path component is refused. The staging tree does not replace
+/// the bytes with replacement characters. The tree is keyed by `String`, so a
+/// lossy name addresses the wrong entry. `symlink` refuses a non-UTF-8 target
+/// in the same way.
 #[test]
 fn non_utf8_path_component_is_rejected() {
     use std::ffi::OsStr;
@@ -821,10 +831,11 @@ fn non_utf8_path_component_is_rejected() {
     });
 }
 
-/// Each staging refusal carries its own variant and names the path the walk
-/// stopped at, so a consumer branches on the condition instead of matching a
-/// message. The path a walk reports is the literal path resolution reached,
-/// which is the symlink-resolved form rather than the path as given.
+/// Each staging refusal carries its own variant and names the path where the
+/// walk stopped. A consumer can branch on the condition with no match on a
+/// message. The path that a walk reports is the literal path that resolution
+/// reached. This is the path after symlink resolution, which can differ from
+/// the path as given.
 #[test]
 fn staging_refusals_are_typed_by_condition() {
     let tmp = TmpDir::new("staging-typed-errors");
@@ -877,7 +888,7 @@ fn staging_refusals_are_typed_by_condition() {
             Err(Error::NotADirectory { path }) => assert_eq!(path, "f.txt"),
             other => panic!("expected NotADirectory, got {other:?}"),
         }
-        // And through make_dir_all, which resolves its own components.
+        // The same through make_dir_all, which resolves its own components.
         match st.make_dir_all(Path::new("f.txt/inner"), &dir_meta()).await {
             Err(Error::NotADirectory { path }) => assert_eq!(path, "f.txt"),
             other => panic!("expected NotADirectory, got {other:?}"),
@@ -892,12 +903,12 @@ fn staging_refusals_are_typed_by_condition() {
             other => panic!("expected DanglingSymlink, got {other:?}"),
         }
 
-        // A symlink chain past the depth cap. The name the refusal carries is
-        // fixed: the walk starts at `loop1` and the two links alternate, so
-        // visit n resolves `loop1` for odd n and `loop2` for even n. Visit n
-        // raises the depth to n, and the cap refuses the first visit with a
-        // depth above MAX_SYMLINK_DEPTH (40), which is visit 41. 41 is odd, so
-        // the refusal names `loop1`.
+        // A symlink chain past the depth cap. The refusal names a fixed entry.
+        // The walk starts at `loop1` and the two links alternate, so visit n
+        // resolves `loop1` for odd n and `loop2` for even n. Visit n raises
+        // the depth to n. The cap refuses the first visit with a depth of more
+        // than MAX_SYMLINK_DEPTH (40), which is visit 41. 41 is odd, so the
+        // refusal names `loop1`.
         match st.read_file(Path::new("loop1"), true).await {
             Err(Error::SymlinkLoop { path }) => assert_eq!(path, "loop1"),
             other => panic!("expected SymlinkLoop, got {other:?}"),
@@ -941,11 +952,11 @@ fn staging_refusals_are_typed_by_condition() {
     });
 }
 
-/// A symlink whose target resolves does not shadow an absent component reached
-/// under it: once the target is spent, the walk is back on the caller's own
-/// components, so an absent entry is the path-not-found condition. `opt ->
-/// usr/opt` is the alias the merge tests build, and both the read path and the
-/// write path (through `resolve_parent`) reach the same walk.
+/// A symlink whose target resolves does not hide an absent component under
+/// it. After the walk uses up the target, it continues on the components of
+/// the caller, so an absent entry is the path-not-found condition. The merge
+/// tests build the same alias `opt -> usr/opt`. The read path and the write
+/// path (through `resolve_parent`) reach the same walk.
 #[test]
 fn absent_under_a_resolved_symlink_is_path_not_found() {
     let tmp = TmpDir::new("staging-absent-under-symlink");
@@ -985,9 +996,9 @@ fn absent_under_a_resolved_symlink_is_path_not_found() {
     });
 }
 
-/// With one symlink reached through another, the refusal names the innermost
-/// symlink whose target is still being consumed. `a -> b` resolves; `b`'s own
-/// target is the one that does not, so `b` is what the walk reports.
+/// If the walk reaches one symlink through another, the refusal names the
+/// innermost symlink whose target the walk still consumes. `a -> b` resolves.
+/// The target of `b` does not resolve, so the walk reports `b`.
 #[test]
 fn nested_symlinks_name_the_innermost_open_symlink() {
     let tmp = TmpDir::new("staging-nested-symlinks");
@@ -1020,12 +1031,14 @@ fn nested_symlinks_name_the_innermost_open_symlink() {
     });
 }
 
-/// Every refusal names the resolved literal component path, so an operation
-/// reached through the alias `opt -> usr/opt` reports the `usr/opt` form for the
-/// conditions raised outside the walker as well: the existing entry `make_dir`
-/// refuses and the file `read_dir` refuses. The write over a directory is the
-/// carve-out: `ReplaceDirWithFile` names the entry, because the mutable-tree
-/// layer raises it and that layer is addressed by name.
+/// Every refusal names the resolved literal component path. An operation
+/// reached through the alias `opt -> usr/opt` reports the `usr/opt` form. This
+/// is also true for two conditions raised outside the walker: the existing
+/// entry that `make_dir` refuses, and the file that `read_dir` refuses.
+///
+/// The write over a directory is the exception. `ReplaceDirWithFile` names the
+/// entry, because the mutable-tree layer raises it and that layer addresses
+/// entries by name.
 #[test]
 fn refusals_through_a_symlinked_parent_name_the_resolved_path() {
     let tmp = TmpDir::new("staging-resolved-refusal-paths");
@@ -1073,13 +1086,15 @@ fn refusals_through_a_symlinked_parent_name_the_resolved_path() {
     });
 }
 
-/// A directory in the way of a write is one condition, whichever moment the
-/// directory appeared at. The check in `write_file`/`write_file_content` and
-/// the record step a raced directory reaches both refuse with
-/// [`Error::ReplaceDirWithFile`] naming the entry, because the mutable-tree
-/// layer raises it and that layer is addressed by name, and both convert to
-/// `io::ErrorKind::AlreadyExists`. A `StagedFileWriter` is a handle held
-/// across calls, so the interleave needs no threads.
+/// A directory in the way of a write is one condition, at whatever moment the
+/// directory appeared. Two places refuse it: the check in
+/// `write_file`/`write_file_content`, and the record step that a raced
+/// directory reaches.
+///
+/// Both refuse with [`Error::ReplaceDirWithFile`] and name the entry, because
+/// the mutable-tree layer raises it and that layer addresses entries by name.
+/// Both convert to `io::ErrorKind::AlreadyExists`. A `StagedFileWriter` is a
+/// handle held across calls, so the interleave needs no threads.
 #[test]
 fn checked_and_raced_directory_clash_report_one_variant() {
     use std::io;
@@ -1130,9 +1145,9 @@ fn checked_and_raced_directory_clash_report_one_variant() {
     });
 }
 
-/// A merge that follows a left-side symlink resolving to a regular file reports
-/// the not-a-directory condition. The refusal comes from the merge's symlink
-/// resolution, which is the third re-typed site outside the walker.
+/// A merge that follows a left-side symlink to a regular file reports the
+/// not-a-directory condition. The refusal comes from the symlink resolution of
+/// the merge, the third site outside the walker that gives a typed refusal.
 #[test]
 fn merge_through_a_symlink_to_a_file_is_not_a_directory() {
     let tmp = TmpDir::new("staging-merge-symlink-to-file");
@@ -1189,8 +1204,8 @@ fn merge_through_a_symlink_to_a_file_is_not_a_directory() {
 }
 
 /// The tree root has no components, so a refusal that names the whole path
-/// spells it `.`. Both the walker's directory end and the merge's root dirmeta
-/// conflict reach that spelling.
+/// spells it `.`. The directory end of the walker and the root dirmeta
+/// conflict of the merge both reach that spelling.
 #[test]
 fn a_refusal_at_the_tree_root_spells_it_as_a_dot() {
     let tmp = TmpDir::new("staging-root-path-form");
@@ -1241,8 +1256,9 @@ fn a_refusal_at_the_tree_root_spells_it_as_a_dot() {
     });
 }
 
-/// The new value types are `Send + Sync` (the lifetime-bearing types are pinned
-/// by compile-time assertions inside the crate).
+/// The value types `MergeOptions`, `StagingEntry`, and `StagingLookup` are
+/// `Send + Sync`. Compile-time assertions inside the crate pin the types that
+/// carry a lifetime.
 #[test]
 fn value_types_are_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
@@ -1262,9 +1278,9 @@ fn dir_meta_mode(mode: u32) -> DirMeta {
     }
 }
 
-/// Remove one loose object file, so a later read of it fails. Used to prove an
-/// operation does not read the object: with the file gone, a read errors, so an
-/// operation that succeeds provably never issued one.
+/// Removes one loose object file, so a later read of it fails. A test uses it
+/// to prove that an operation does not read the object. If the operation
+/// succeeds with the file gone, it did not read the object.
 fn delete_loose_object(repo_root: &Path, checksum: &Checksum, ext: &str) {
     let hex = checksum.to_hex();
     let path = repo_root
@@ -1275,7 +1291,7 @@ fn delete_loose_object(repo_root: &Path, checksum: &Checksum, ext: &str) {
 }
 
 /// The dirtree and dirmeta checksums of the committed subdirectory `name`
-/// directly under `rev`'s root, plus the root's own dirtree checksum.
+/// directly under the root of `rev`, and the dirtree checksum of the root.
 async fn committed_subdir(repo: &Repo, rev: &str, name: &str) -> (Checksum, Checksum, Checksum) {
     let (tree, _) = repo.read_commit(rev).await.unwrap();
     let root_dirtree = *tree.dirtree_checksum();
@@ -1289,9 +1305,9 @@ async fn committed_subdir(repo: &Repo, rev: &str, name: &str) -> (Checksum, Chec
     }
 }
 
-/// `lookup` answers `Absent` for a missing component anywhere along the path,
-/// and reports files, symlinks, and directories by kind. A symlink's final
-/// component follows only with `follow_symlinks`.
+/// `lookup` returns `Absent` for a missing component anywhere in the path. It
+/// reports files, symlinks, and directories by kind. If the final component is
+/// a symlink, `lookup` follows it only with `follow_symlinks`.
 #[test]
 fn lookup_reports_kind_and_absent_without_error() {
     let tmp = TmpDir::new("staging-lookup");
@@ -1315,7 +1331,7 @@ fn lookup_reports_kind_and_absent_without_error() {
             .unwrap();
 
         // An absent final component, and an absent path whose parent is also
-        // absent: both are `Absent`, not an error.
+        // absent: both give `Absent` and no error.
         assert_eq!(
             st.lookup(Path::new("missing"), false).await.unwrap(),
             StagingLookup::Absent
@@ -1361,8 +1377,8 @@ fn lookup_reports_kind_and_absent_without_error() {
     });
 }
 
-/// `symlink` and `hardlink` replace an existing file or symlink, the same rule
-/// `write_file` and `write_file_content` follow.
+/// `symlink` and `hardlink` replace an existing file or symlink.
+/// `write_file` and `write_file_content` obey the same rule.
 #[test]
 fn symlink_and_hardlink_replace_files_and_symlinks() {
     let tmp = TmpDir::new("staging-replace-writes");
@@ -1454,11 +1470,12 @@ fn symlink_and_hardlink_replace_files_and_symlinks() {
     });
 }
 
-/// A `symlink` or `hardlink` whose destination holds a directory reports
-/// `ReplaceDirWithFile` converting to `AlreadyExists`, the answer every write
-/// over a destination directory gives. A `hardlink` whose source resolves to a
-/// directory is a distinct condition and stays in `Staging`, converting to
-/// `Other`.
+/// If the destination of a `symlink` or `hardlink` holds a directory, the call
+/// reports `ReplaceDirWithFile`, which converts to `AlreadyExists`. Every write
+/// over a destination directory gives this answer.
+///
+/// A `hardlink` whose source resolves to a directory is a different
+/// condition. It stays in `Staging` and converts to `Other`.
 #[test]
 fn symlink_and_hardlink_over_a_directory_report_replace_dir_with_file() {
     use std::io;
@@ -1515,8 +1532,8 @@ fn symlink_and_hardlink_over_a_directory_report_replace_dir_with_file() {
 }
 
 /// `ensure_dir` creates an absent directory with its `meta` and restamps an
-/// existing one, reaching the same dirtree bytes as `make_dir` given the same
-/// input. A file at the path is the not-a-directory condition.
+/// existing one. For the same input, it reaches the same dirtree bytes as
+/// `make_dir`. A file at the path is the not-a-directory condition.
 #[test]
 fn ensure_dir_creates_and_restamps_like_make_dir() {
     use std::io;
@@ -1578,9 +1595,9 @@ fn ensure_dir_creates_and_restamps_like_make_dir() {
     });
 }
 
-/// An `ensure_dir` whose `meta` matches the directory's recorded dirmeta
-/// offers nothing for staging. `metadata_total` counts every offer before
-/// dedup, so the exact count is the assertion.
+/// If the `meta` of an `ensure_dir` matches the recorded dirmeta of the
+/// directory, the call offers nothing for staging. `metadata_total` counts
+/// every offer before dedup, so the test asserts the exact count.
 #[test]
 fn unchanged_ensure_dir_stages_no_dirmeta() {
     let tmp = TmpDir::new("staging-ensure-dir-noop");
@@ -1611,10 +1628,10 @@ fn unchanged_ensure_dir_stages_no_dirmeta() {
     });
 }
 
-/// An `ensure_dir` whose `meta` matches a lazy committed directory's dirmeta
-/// hydrates nothing and stages nothing. The subdirectory's dirtree object is
-/// deleted first, so any hydration would fail; the unchanged root dirtree and
-/// the zero offer count carry the rest.
+/// If the `meta` of an `ensure_dir` matches the dirmeta of a lazy committed
+/// directory, the call hydrates nothing and stages nothing. The test first
+/// deletes the dirtree object of the subdirectory, so a hydration fails. The
+/// unchanged root dirtree and the zero offer count prove the rest.
 #[test]
 fn matching_ensure_dir_on_a_lazy_child_hydrates_nothing() {
     let tmp = TmpDir::new("staging-ensure-dir-lazy-match");
@@ -1654,9 +1671,9 @@ fn matching_ensure_dir_on_a_lazy_child_hydrates_nothing() {
     });
 }
 
-/// An `ensure_dir` with a differing `meta` restamps a lazy committed directory
-/// in place: the entry keeps its dirtree checksum and takes the new dirmeta,
-/// and no dirtree is read (the object is deleted, so a read would fail).
+/// An `ensure_dir` with a different `meta` restamps a lazy committed directory
+/// in place. The entry keeps its dirtree checksum and takes the new dirmeta.
+/// The call reads no dirtree: the test deletes the object, so a read fails.
 #[test]
 fn differing_ensure_dir_restamps_a_lazy_child_without_hydrating() {
     let tmp = TmpDir::new("staging-ensure-dir-lazy-differ");
@@ -1710,12 +1727,13 @@ fn differing_ensure_dir_restamps_a_lazy_child_without_hydrating() {
     });
 }
 
-/// `ensure_dir` at a path with no components stamps the tree root, so the
-/// tree `close` hands back carries its root dirmeta and `write_mtree` and the
-/// commit take it as it stands. A second call with a differing `meta`
-/// replaces the recorded one, and the committed root dirmeta reads back as
-/// the second stamp. The file written between the two stamps stays in the
-/// tree, because a stamp drops no entry.
+/// `ensure_dir` at a path with no components stamps the tree root. The tree
+/// that `close` returns carries its root dirmeta, and `write_mtree` and the
+/// commit take it as it is.
+///
+/// A second call with a different `meta` replaces the recorded one, and the
+/// committed root dirmeta reads back as the second stamp. A stamp drops no
+/// entry, so the file written between the two stamps stays in the tree.
 #[test]
 fn ensure_dir_stamps_and_restamps_the_tree_root() {
     let tmp = TmpDir::new("staging-ensure-dir-root");
@@ -1736,7 +1754,7 @@ fn ensure_dir_stamps_and_restamps_the_tree_root() {
         st.ensure_dir(Path::new("."), &meta2).await.unwrap();
 
         // The tree goes to write_mtree with the stamp as its only root
-        // dirmeta: no set_metadata_checksum call stands between them.
+        // dirmeta. No set_metadata_checksum call occurs between them.
         let mut built = st.close().unwrap();
         let tree = txn.write_mtree(&mut built).await.unwrap();
         let root_dirmeta = *tree.dirmeta_checksum();
@@ -1768,9 +1786,9 @@ fn ensure_dir_stamps_and_restamps_the_tree_root() {
     });
 }
 
-/// A root `ensure_dir` whose `meta` matches the root's recorded dirmeta
-/// offers nothing for staging. `metadata_total` counts every offer before
-/// dedup, so the exact count is the assertion.
+/// If the `meta` of a root `ensure_dir` matches the recorded dirmeta of the
+/// root, the call offers nothing for staging. `metadata_total` counts every
+/// offer before dedup, so the test asserts the exact count.
 #[test]
 fn unchanged_root_ensure_dir_stages_no_dirmeta() {
     let tmp = TmpDir::new("staging-ensure-dir-root-noop");
@@ -1800,8 +1818,8 @@ fn unchanged_root_ensure_dir_stages_no_dirmeta() {
 }
 
 /// The three spellings of a path with no components -- `.`, `/`, and the
-/// empty path -- each stamp the tree root. A path ending in `..` carries a
-/// final component the split refuses before resolution begins.
+/// empty path -- each stamp the tree root. A path that ends in `..` has a
+/// final component that the split refuses before resolution starts.
 #[test]
 fn every_root_spelling_stamps_the_tree_root() {
     let tmp = TmpDir::new("staging-ensure-dir-root-spellings");
@@ -1838,10 +1856,10 @@ fn every_root_spelling_stamps_the_tree_root() {
     });
 }
 
-/// A root `ensure_dir` on a tree hydrated from a commit replaces the commit's
-/// root dirmeta and leaves the tree body as it was: the root keeps its
-/// committed dirtree checksum and is never reassembled, and the new commit
-/// carries the stamp.
+/// A root `ensure_dir` on a tree hydrated from a commit replaces the root
+/// dirmeta of the commit and keeps the tree body. The root keeps its committed
+/// dirtree checksum and is not assembled again. The new commit carries the
+/// stamp.
 #[test]
 fn root_ensure_dir_restamps_a_committed_root() {
     let tmp = TmpDir::new("staging-ensure-dir-root-commit");
@@ -1889,8 +1907,8 @@ fn root_ensure_dir_restamps_a_committed_root() {
         txn.set_ref("test/restamped", Some(&recommit));
         let stats = txn.commit().await.unwrap();
 
-        // The offers: the stamped dirmeta and the commit object. A reassembled
-        // root dirtree would be a third, whatever checksum it landed on.
+        // The offers: the stamped dirmeta and the commit object. A root
+        // dirtree assembled again adds a third offer, whatever its checksum.
         assert_eq!(stats.metadata_total, 2, "the stamp reassembled no dirtree");
 
         let repo = Repo::open(&repo_root).await.unwrap();
@@ -1908,9 +1926,9 @@ fn root_ensure_dir_restamps_a_committed_root() {
     });
 }
 
-/// A root `ensure_dir` stamps a dirmeta and drops no entry, so no
-/// outstanding-writer guard holds it off: the stamp lands while a `write_file`
-/// writer is live, and that writer's entry lands after it.
+/// A root `ensure_dir` stamps a dirmeta and drops no entry, so the guard for
+/// outstanding writers does not block it. The stamp lands while a
+/// `write_file` writer is live, and the entry of that writer lands after it.
 #[test]
 fn root_ensure_dir_runs_with_an_outstanding_writer() {
     let tmp = TmpDir::new("staging-ensure-dir-root-writer");
@@ -1950,8 +1968,8 @@ fn root_ensure_dir_runs_with_an_outstanding_writer() {
     });
 }
 
-/// `place_object` records a checksum at a path, is silent for an identical
-/// placement, and answers a differing entry or a directory with
+/// `place_object` records a checksum at a path. An identical placement is
+/// silent. A different entry or a directory at the path gives
 /// `MergeConflict`.
 #[test]
 fn place_object_records_dedups_and_conflicts() {
@@ -2019,10 +2037,10 @@ fn place_object_records_dedups_and_conflicts() {
     });
 }
 
-/// Concurrent `place_object` calls with two differing checksums at one path
-/// resolve to one recorded winner; every call carrying the winner succeeds and
-/// every other call conflicts. The rule is decided under the mutating lock
-/// acquisition, so no interleaving produces a silent overwrite.
+/// Concurrent `place_object` calls with two different checksums at one path
+/// resolve to one recorded winner. Every call with the winner succeeds, and
+/// every other call conflicts. The decision occurs under the lock that the
+/// mutating call takes, so no interleave gives a silent overwrite.
 #[test]
 fn concurrent_place_object_never_silently_overwrites() {
     let tmp = TmpDir::new("staging-place-concurrent");
@@ -2145,8 +2163,8 @@ async fn dirtree_subdir(repo: &Repo, dirtree: &Checksum, name: &str) -> (Checksu
 }
 
 /// Ancestors created by each of the six write operations under an implied
-/// dirmeta carry the policy dirmeta, and the `ensure_dir` leaf takes the meta
-/// the call itself supplies.
+/// dirmeta carry the policy dirmeta. The `ensure_dir` leaf takes the meta that
+/// the call supplies.
 #[test]
 fn implied_ancestors_carry_the_policy_dirmeta() {
     let tmp = TmpDir::new("staging-implied-ancestors");
@@ -2211,10 +2229,10 @@ fn implied_ancestors_carry_the_policy_dirmeta() {
     });
 }
 
-/// A write whose parent already exists stages no policy dirmeta, and a
-/// `make_dir_all` over a path whose every component exists still stages
-/// nothing. `metadata_total` counts every offer before dedup, so the exact
-/// count is the assertion.
+/// A write whose parent exists stages no policy dirmeta. A `make_dir_all`
+/// over a path whose components all exist also stages nothing.
+/// `metadata_total` counts every offer before dedup, so the test asserts the
+/// exact count.
 #[test]
 fn writes_with_an_existing_parent_stage_no_policy_dirmeta() {
     let tmp = TmpDir::new("staging-implied-existing-parent");
@@ -2246,9 +2264,9 @@ fn writes_with_an_existing_parent_stage_no_policy_dirmeta() {
         txn.write_mtree(&mut built).await.unwrap();
         let stats = txn.commit().await.unwrap();
 
-        // The offers: the root dirmeta, make_dir's novel dirmeta, and the two
-        // dirtrees write_mtree assembles. The writes into the existing parent
-        // and the all-existing make_dir_all add none.
+        // The offers: the root dirmeta, the novel dirmeta of make_dir, and the
+        // two dirtrees that write_mtree assembles. The writes into the existing
+        // parent and the make_dir_all over existing components add none.
         assert_eq!(
             stats.metadata_total, 4,
             "no policy dirmeta was offered for staging"
@@ -2256,9 +2274,9 @@ fn writes_with_an_existing_parent_stage_no_policy_dirmeta() {
     });
 }
 
-/// With a policy set, `lookup`, the reads, `remove`, `clear_dir`, and the
-/// `from` side of a `rename` resolve a path whose ancestors are absent
-/// without creating a directory and without staging an object.
+/// If a policy is set, `lookup`, the reads, `remove`, `clear_dir`, and the
+/// `from` side of a `rename` resolve a path whose ancestors are absent. They
+/// create no directory and stage no object.
 #[test]
 fn resolution_for_a_read_creates_nothing_under_a_policy() {
     let tmp = TmpDir::new("staging-implied-reads");
@@ -2371,9 +2389,9 @@ fn implied_and_explicit_ancestors_agree_on_the_checksum() {
     });
 }
 
-/// A policy creates an absent ancestor, and does not create the target of a
-/// symlink that has one, so the creating walk names the symlink with
-/// `DanglingSymlink` the way the non-creating walk does. The refusal creates
+/// A policy creates an absent ancestor. It does not create the absent target
+/// of a symlink, so the creating walk names the symlink with
+/// `DanglingSymlink`, the same as the non-creating walk. The refusal creates
 /// nothing.
 #[test]
 fn a_dangling_symlink_ancestor_under_a_policy_is_dangling_not_absent() {
@@ -2511,8 +2529,8 @@ fn concurrent_implied_writes_create_each_ancestor_once() {
     block_on(txn.write_mtree(&mut built)).unwrap();
     block_on(txn.commit()).unwrap();
 
-    // The 0755 root dirmeta and the policy one: two objects, however many
-    // concurrent walks staged the same bytes.
+    // Two objects: the 0755 root dirmeta and the policy dirmeta. The count
+    // stays two for any number of concurrent walks that staged the same bytes.
     assert_eq!(
         count_objects_with_ext(&root, ".dirmeta"),
         2,
@@ -2520,9 +2538,10 @@ fn concurrent_implied_writes_create_each_ancestor_once() {
     );
 }
 
-/// A write racing a `write_file_content` at an ancestor's own name reaches an
-/// error: exactly one call wins, and the tree holds the winner's entry rather
-/// than a directory silently replacing a file or the reverse.
+/// A write that races a `write_file_content` at the name of an ancestor gets
+/// an error. Exactly one call wins, and the tree holds the entry of the
+/// winner. A directory does not silently replace a file, and a file does not
+/// silently replace a directory.
 #[test]
 fn a_write_racing_a_file_at_an_ancestor_name_errors() {
     let tmp = TmpDir::new("staging-implied-race");
@@ -2573,10 +2592,10 @@ fn a_write_racing_a_file_at_an_ancestor_name_errors() {
     block_on(txn.abort()).unwrap();
 }
 
-/// A merge overwrite that would drop a directory is refused while a file
-/// writer is outstanding, names the directory it refused to drop, and leaves
-/// the directory and its subtree in place. Once the writer finishes, the same
-/// merge succeeds.
+/// While a file writer is outstanding, a merge overwrite that drops a
+/// directory is refused. The refusal names the directory, and the directory
+/// and its subtree stay in place. After the writer finishes, the same merge
+/// succeeds.
 #[test]
 fn merge_overwrite_of_a_directory_is_refused_while_a_writer_is_live() {
     let tmp = TmpDir::new("staging-merge-writer-guard");
@@ -2648,9 +2667,9 @@ fn merge_overwrite_of_a_directory_is_refused_while_a_writer_is_live() {
     });
 }
 
-/// The guard counts writers over the whole tree: a live writer in a branch
-/// disjoint from the dropped directory blocks the overwrite too, and an
-/// abandoned writer releases the guard.
+/// The guard counts the writers of the whole tree. A live writer in a branch
+/// disjoint from the dropped directory also blocks the overwrite. An abandoned
+/// writer releases the guard.
 #[test]
 fn merge_overwrite_is_refused_by_a_writer_in_a_disjoint_branch() {
     let tmp = TmpDir::new("staging-merge-writer-guard-disjoint");
@@ -2700,7 +2719,7 @@ fn merge_overwrite_is_refused_by_a_writer_in_a_disjoint_branch() {
             "the blocked overwrite leaves the directory in place"
         );
 
-        // Abandoning the writer (drop without finish) releases the guard.
+        // An abandoned writer (a drop with no finish) releases the guard.
         drop(writer);
         base_st.merge(&package, opts).await.unwrap();
         assert!(
@@ -2716,12 +2735,14 @@ fn merge_overwrite_is_refused_by_a_writer_in_a_disjoint_branch() {
     });
 }
 
-/// `remove` takes out a file, a symlink (the symlink object, not its target),
-/// and a populated directory with its subtree, under either `allow_noent`
-/// value. An absent entry, an absent ancestor, and a path through a dangling
-/// symlink are `Ok` with `allow_noent`; without it, the absent entry is
-/// `PathNotFound` (converting to `NotFound`) and the walk conditions keep
-/// their own variants.
+/// `remove` removes a file, a symlink, and a populated directory with its
+/// subtree, under each `allow_noent` value. For a symlink, it removes the
+/// symlink object, and the target stays.
+///
+/// With `allow_noent`, an absent entry, an absent ancestor, and a path through
+/// a dangling symlink give `Ok`. Without `allow_noent`, the absent entry is
+/// `PathNotFound`, which converts to `NotFound`. The walk conditions keep their
+/// own variants.
 #[test]
 fn remove_covers_each_kind_and_absent_paths() {
     use std::io;
@@ -2783,7 +2804,7 @@ fn remove_covers_each_kind_and_absent_paths() {
             StagingLookup::Absent
         );
 
-        // A populated directory, subtree and all.
+        // A populated directory, with its subtree.
         st.remove(Path::new("d1"), false).await.unwrap();
         assert_eq!(
             st.lookup(Path::new("d1"), false).await.unwrap(),
@@ -2822,7 +2843,7 @@ fn remove_covers_each_kind_and_absent_paths() {
             other => panic!("expected DanglingSymlink, got {other:?}"),
         }
         st.remove(Path::new("dangling/f"), true).await.unwrap();
-        // The dangling symlink itself removes as the symlink.
+        // A `remove` of the dangling symlink itself removes the symlink.
         st.remove(Path::new("dangling"), false).await.unwrap();
 
         drop(st);
@@ -2830,10 +2851,10 @@ fn remove_covers_each_kind_and_absent_paths() {
     });
 }
 
-/// `clear_dir` empties the directory and the entry keeps its dirmeta
-/// checksum; a file at the path, and a symlink there even where it points at
-/// a directory, are the not-a-directory condition, and an absent directory
-/// follows `allow_noent`.
+/// `clear_dir` empties the directory, and the entry keeps its dirmeta
+/// checksum. A file at the path is the not-a-directory condition. A symlink at
+/// the path is the same condition, also if it points at a directory. An absent
+/// directory obeys `allow_noent`.
 #[test]
 fn clear_dir_empties_and_keeps_the_dirmeta() {
     use std::io;
@@ -2876,8 +2897,8 @@ fn clear_dir_empties_and_keeps_the_dirmeta() {
             "every entry under the directory is gone"
         );
 
-        // A file at the path, and a symlink pointing at a directory: the
-        // final component never follows, so neither is cleared.
+        // A file at the path, and a symlink that points at a directory. The
+        // walk never follows the final component, so clear_dir clears neither.
         match st.clear_dir(Path::new("plain"), false).await {
             Err(Error::NotADirectory { path }) => assert_eq!(path, "plain"),
             other => panic!("expected NotADirectory, got {other:?}"),
@@ -2924,9 +2945,9 @@ fn clear_dir_empties_and_keeps_the_dirmeta() {
     });
 }
 
-/// `clear_dir` over a lazily-loaded committed directory hydrates nothing: the
-/// subdirectory's dirtree object is deleted first, so any read would fail,
-/// and the emptied directory keeps the lazy child's dirmeta checksum.
+/// `clear_dir` over a lazily loaded committed directory hydrates nothing. The
+/// test first deletes the dirtree object of the subdirectory, so a read fails.
+/// The emptied directory keeps the dirmeta checksum of the lazy child.
 #[test]
 fn clear_dir_on_a_lazy_child_hydrates_nothing() {
     let tmp = TmpDir::new("staging-clear-dir-lazy");
@@ -2980,9 +3001,10 @@ fn clear_dir_on_a_lazy_child_hydrates_nothing() {
     });
 }
 
-/// `remove` and `clear_dir` are refused while any file writer is live -- a
-/// writer in a branch disjoint from the affected path included -- leave the
-/// tree in place, and succeed once every writer has finished or been dropped.
+/// While any file writer is live, `remove` and `clear_dir` are refused. This
+/// includes a writer in a branch disjoint from the affected path. The refused
+/// calls leave the tree in place. After every writer finishes or is dropped,
+/// the calls succeed.
 #[test]
 fn remove_and_clear_dir_are_refused_while_a_writer_is_live() {
     let tmp = TmpDir::new("staging-remove-writer-guard");
@@ -3056,10 +3078,10 @@ fn remove_and_clear_dir_are_refused_while_a_writer_is_live() {
     });
 }
 
-/// `rename` moves a file, a symlink (the symlink object, not its target),
-/// and a populated directory with its subtree and dirmeta, and the renamed
-/// tree reaches the same root dirtree checksum as the same tree assembled by
-/// explicit writes at the final locations.
+/// `rename` moves a file, a symlink, and a populated directory with its
+/// subtree and dirmeta. For a symlink, it moves the symlink object, and the
+/// target stays. The renamed tree reaches the same root dirtree checksum as
+/// the same tree assembled by explicit writes at the final locations.
 #[test]
 fn rename_moves_each_kind_and_matches_explicit_writes() {
     let tmp = TmpDir::new("staging-rename");
@@ -3160,11 +3182,13 @@ fn rename_moves_each_kind_and_matches_explicit_writes() {
     });
 }
 
-/// `rename` of a lazily-loaded committed subtree hydrates nothing: the
-/// subdirectory's dirtree object is deleted first, so any read would fail,
-/// and the moved entry keeps the child's dirtree and dirmeta checksums, which
-/// tells a moved lazy child from a rebuilt one -- a rebuild would have had to
-/// read the deleted dirtree. The one metadata offer is the new root dirtree.
+/// `rename` of a lazily loaded committed subtree hydrates nothing. The test
+/// first deletes the dirtree object of the subdirectory, so a read fails. The
+/// one metadata offer is the new root dirtree.
+///
+/// The moved entry keeps the dirtree and dirmeta checksums of the child. These
+/// checksums tell a moved lazy child from a rebuilt one, because a rebuild
+/// must read the deleted dirtree.
 #[test]
 fn rename_of_a_lazy_subtree_hydrates_nothing() {
     let tmp = TmpDir::new("staging-rename-lazy");
@@ -3216,11 +3240,14 @@ fn rename_of_a_lazy_subtree_hydrates_nothing() {
     });
 }
 
-/// `rename` onto an existing entry -- the source's own path included -- is
-/// `EntryExists`, converting to `AlreadyExists`; an absent source is
-/// `PathNotFound`; a destination under the moved entry is refused; and a
-/// missing destination parent follows the implied-dirmeta policy: an error
-/// without one, created under it.
+/// `rename` gives these answers:
+///
+/// - A rename onto an existing entry, also onto the path of the source itself,
+///   is `EntryExists`, which converts to `AlreadyExists`.
+/// - An absent source is `PathNotFound`.
+/// - A destination under the moved entry is refused.
+/// - A missing destination parent obeys the implied-dirmeta policy. Without a
+///   policy, it is an error. Under a policy, the rename creates it.
 #[test]
 fn rename_refusals_and_destination_parents() {
     use std::io;
@@ -3275,8 +3302,8 @@ fn rename_refusals_and_destination_parents() {
             "the refused rename leaves the directory in place"
         );
 
-        // A missing destination parent without a policy is the walk's error,
-        // and the source stays where it was.
+        // Without a policy, a missing destination parent gives the error of
+        // the walk, and the source stays where it was.
         let err = st
             .rename(Path::new("a"), Path::new("no/where"))
             .await
@@ -3287,7 +3314,7 @@ fn rename_refusals_and_destination_parents() {
         }
         staged_file(&st, "a").await;
 
-        // Under a policy the destination parent chain is created.
+        // Under a policy, the rename creates the destination parent chain.
         let stp = txn
             .staging_tree(None)
             .await
@@ -3312,9 +3339,9 @@ fn rename_refusals_and_destination_parents() {
     });
 }
 
-/// `rename` is refused while any file writer is live -- a writer in a branch
-/// disjoint from both paths included -- leaves both sides as they were, and
-/// succeeds once the writer has finished or been dropped.
+/// While any file writer is live, `rename` is refused. This includes a writer
+/// in a branch disjoint from both paths. The refused call leaves both sides as
+/// they were. After the writer finishes or is dropped, the call succeeds.
 #[test]
 fn rename_is_refused_while_a_writer_is_live() {
     let tmp = TmpDir::new("staging-rename-writer-guard");
@@ -3385,9 +3412,9 @@ fn rename_is_refused_while_a_writer_is_live() {
     });
 }
 
-/// `merge_at` lands the right side under an existing base, and the tree it
-/// produces reaches the same root dirtree checksum as the same union assembled
-/// by explicit writes.
+/// `merge_at` lands the right side under an existing base. The resulting tree
+/// reaches the same root dirtree checksum as the same union assembled by
+/// explicit writes.
 #[test]
 fn merge_at_matches_explicit_writes() {
     let tmp = TmpDir::new("staging-merge-at");
@@ -3447,9 +3474,9 @@ fn merge_at_matches_explicit_writes() {
             "nothing landed at the tree root"
         );
 
-        // `/` and the empty path name the tree root, like `.`. Each takes a
-        // fresh tree, since a base that reached nothing would pass on a tree
-        // the merge already filled.
+        // `/` and the empty path name the tree root, the same as `.`. Each
+        // spelling takes a new tree, because on a tree that the merge already
+        // filled, a base that reaches nothing also passes the check.
         for spelling in ["/", ""] {
             let at_root = txn.staging_tree(None).await.unwrap();
             at_root
@@ -3500,11 +3527,15 @@ fn merge_at_matches_explicit_writes() {
     });
 }
 
-/// `root_dirmeta` governs the merge root alone. A base whose dirmeta equals the
-/// right root's is silent under either value; a differing one is a conflict
-/// under `Reconcile` and is taken with `allow_overwrite`; `KeepLeft` keeps the
-/// base's own dirmeta and merges the entries all the same. A directory below
-/// the root reconciles whatever the value is.
+/// `root_dirmeta` governs the merge root alone:
+///
+/// - If the dirmeta of the base equals the dirmeta of the right root, the
+///   merge is silent under each value.
+/// - Under `Reconcile`, a different base dirmeta is a conflict. With
+///   `allow_overwrite`, the base takes the right dirmeta.
+/// - `KeepLeft` keeps the dirmeta of the base and merges the entries all the
+///   same.
+/// - A directory below the root reconciles under each value.
 #[test]
 fn merge_at_root_dirmeta_governs_the_base_alone() {
     let tmp = TmpDir::new("staging-merge-at-root-dirmeta");
@@ -3515,8 +3546,8 @@ fn merge_at_root_dirmeta_governs_the_base_alone() {
             .unwrap();
         let txn = repo.transaction().await.unwrap();
         let root_dm = stage_dir_meta(&txn).await;
-        // `dir_meta()` is the 0755 meta the bases below take, so they carry
-        // the same checksum the tree root does.
+        // `dir_meta()` is the 0755 meta that the bases of this test take, so
+        // they carry the same checksum as the tree root.
         let base_dm = root_dm;
         let novel = dir_meta_mode(0o040700);
         let novel_csum = txn
@@ -3539,7 +3570,8 @@ fn merge_at_root_dirmeta_governs_the_base_alone() {
             root_dirmeta: RootDirmeta::KeepLeft,
             ..MergeOptions::default()
         };
-        // A base whose dirmeta equals the right root's: silent either way.
+        // A base whose dirmeta equals that of the right root: silent under
+        // each value.
         st.make_dir(Path::new("equal"), &novel).await.unwrap();
         st.merge_at(Path::new("equal"), &package, MergeOptions::default())
             .await
@@ -3549,8 +3581,8 @@ fn merge_at_root_dirmeta_governs_the_base_alone() {
             .await
             .unwrap();
 
-        // A differing base under `Reconcile`: a conflict naming the base, and
-        // the right dirmeta with `allow_overwrite`.
+        // A different base under `Reconcile`: a conflict that names the base.
+        // With `allow_overwrite`, the base takes the right dirmeta.
         st.make_dir(Path::new("differ"), &dir_meta()).await.unwrap();
         match st
             .merge_at(Path::new("differ"), &package, MergeOptions::default())
@@ -3578,7 +3610,7 @@ fn merge_at_root_dirmeta_governs_the_base_alone() {
         .await
         .unwrap();
 
-        // The same differing base under `KeepLeft`: no conflict, and the base
+        // The same different base under `KeepLeft`: no conflict, and the base
         // keeps its own dirmeta.
         st.make_dir(Path::new("keep"), &dir_meta()).await.unwrap();
         st.merge_at(Path::new("keep"), &package, keep_left)
@@ -3608,10 +3640,11 @@ fn merge_at_root_dirmeta_governs_the_base_alone() {
     });
 }
 
-/// Stage the `/var/lock -> ../run/lock` alias under `prefix`: a 0755
-/// `<prefix>/run/lock` directory and a `<prefix>/var/lock` symlink that reaches
-/// it, one level below the `<prefix>/var` merge base. Each arm of the test
-/// below takes its own prefix, so one tree carries them all.
+/// Stages the `/var/lock -> ../run/lock` alias under `prefix`. The alias is a
+/// 0755 `<prefix>/run/lock` directory and a `<prefix>/var/lock` symlink that
+/// reaches it, one level below the `<prefix>/var` merge base. Each arm of
+/// `merge_can_keep_the_dirmeta_of_a_followed_symlink_target` takes its own
+/// prefix, so one tree carries all the arms.
 async fn stage_lock_alias(st: &ostrya::StagingTree<'_>, prefix: &str) {
     for dir in ["", "/run", "/run/lock", "/var"] {
         st.make_dir(Path::new(&format!("{prefix}{dir}")), &dir_meta())
@@ -3627,14 +3660,17 @@ async fn stage_lock_alias(st: &ostrya::StagingTree<'_>, prefix: &str) {
     .unwrap();
 }
 
-/// `symlink_target_dirmeta` governs the dirmeta of the directory a followed
-/// left-side symlink lands in. Every arm merges the same 0700 `lock` directory
-/// over the `/var/lock -> /run/lock` alias, whose 0755 target disagrees with
-/// it. Under the default `Reconcile` the landing reconciles, so the merge
-/// conflicts, and takes the right side's dirmeta with `allow_overwrite`; under
-/// `KeepLeft` the landing keeps its own dirmeta whatever `allow_overwrite`
-/// says, and the merge lands the entries. A directory below the landing
-/// reconciles under either value.
+/// `symlink_target_dirmeta` governs the dirmeta of the directory where a
+/// followed left-side symlink lands. Every arm merges the same 0700 `lock`
+/// directory over the `/var/lock -> ../run/lock` alias. The 0755 target of the
+/// alias disagrees with the `lock` directory.
+///
+/// - Under the default `Reconcile`, the landing reconciles, so the merge
+///   conflicts. With `allow_overwrite`, the landing takes the dirmeta of the
+///   right side.
+/// - Under `KeepLeft`, the landing keeps its own dirmeta for each
+///   `allow_overwrite` value, and the merge lands the entries.
+/// - A directory below the landing reconciles under each value.
 #[test]
 fn merge_can_keep_the_dirmeta_of_a_followed_symlink_target() {
     let tmp = TmpDir::new("staging-merge-symlink-target-dirmeta");
@@ -3644,8 +3680,8 @@ fn merge_can_keep_the_dirmeta_of_a_followed_symlink_target() {
             .await
             .unwrap();
         let txn = repo.transaction().await.unwrap();
-        // `dir_meta()` is the 0755 meta the alias directories take, so
-        // `run/lock` carries the same checksum the tree root does.
+        // `dir_meta()` is the 0755 meta that the alias directories take, so
+        // `run/lock` carries the same checksum as the tree root.
         let root_dm = stage_dir_meta(&txn).await;
         let novel = dir_meta_mode(0o040700);
         let novel_csum = txn
@@ -3653,10 +3689,10 @@ fn merge_can_keep_the_dirmeta_of_a_followed_symlink_target() {
             .await
             .unwrap();
 
-        // The right side: a 0700 `lock` directory holding a file and a 0700
+        // The right side: a 0700 `lock` directory that holds a file and a 0700
         // subdirectory. Its root carries no dirmeta, so the merge root itself
-        // reconciles nothing and the symlink's landing is the first dirmeta
-        // question the merge asks.
+        // reconciles nothing. The landing of the symlink is then the first
+        // dirmeta question that the merge asks.
         let pkg_st = txn.staging_tree(None).await.unwrap();
         pkg_st.make_dir(Path::new("lock"), &novel).await.unwrap();
         pkg_st
@@ -3691,8 +3727,8 @@ fn merge_can_keep_the_dirmeta_of_a_followed_symlink_target() {
             stage_lock_alias(&st, prefix).await;
         }
 
-        // The default reconciles the landing directory, and the two modes
-        // differ, so the merge conflicts and names the landing directory.
+        // The default reconciles the landing directory. The two modes differ,
+        // so the merge conflicts and names the landing directory.
         match st
             .merge_at(Path::new("reconcile/var"), &package, follow)
             .await
@@ -3711,15 +3747,15 @@ fn merge_can_keep_the_dirmeta_of_a_followed_symlink_target() {
             "the conflict was raised before the entries were applied"
         );
 
-        // `Reconcile` with `allow_overwrite` takes the right side's dirmeta for
-        // the landing, the answer a differing dirmeta gets anywhere else in the
-        // merge.
+        // With `allow_overwrite`, `Reconcile` takes the dirmeta of the right
+        // side for the landing. A different dirmeta gets the same answer at
+        // each other place in the merge.
         st.merge_at(Path::new("overwrite/var"), &package, follow_overwrite)
             .await
             .unwrap();
 
-        // `KeepLeft` suppresses that reconciliation alone, and suppresses it
-        // whatever `allow_overwrite` says.
+        // `KeepLeft` suppresses that reconciliation alone, for each
+        // `allow_overwrite` value.
         st.merge_at(Path::new("keep/var"), &package, keep)
             .await
             .unwrap();
@@ -3737,9 +3773,10 @@ fn merge_can_keep_the_dirmeta_of_a_followed_symlink_target() {
             "the right side landed in the symlink's target"
         );
 
-        // A directory below the landing reconciles under `KeepLeft` too. This
-        // arm's left side already holds a 0755 `run/lock/sub`, so the right
-        // side's 0700 `lock/sub` conflicts with it one level below the landing.
+        // A directory below the landing also reconciles under `KeepLeft`. The
+        // left side of this arm already holds a 0755 `run/lock/sub`. The 0700
+        // `lock/sub` of the right side conflicts with it, one level below the
+        // landing.
         st.make_dir(Path::new("below/run/lock/sub"), &dir_meta())
             .await
             .unwrap();
@@ -3777,12 +3814,15 @@ fn merge_can_keep_the_dirmeta_of_a_followed_symlink_target() {
     });
 }
 
-/// `KeepLeft` can leave a landing directory with no dirmeta, and a tree that
-/// holds such a directory cannot be written. An `l -> ..` symlink at the top
-/// level lands the merge on the tree root, which a staging tree opened without
-/// a commit carries no dirmeta for: under `Reconcile` the landing takes the
-/// right side's dirmeta and the tree writes, and under `KeepLeft` the landing
-/// keeps none and `write_mtree` refuses the tree.
+/// `KeepLeft` can leave a landing directory with no dirmeta, and `write_mtree`
+/// refuses a tree that holds such a directory. An `l -> ..` symlink at the top
+/// level lands the merge on the tree root. A staging tree opened without a
+/// commit carries no dirmeta for the tree root.
+///
+/// - Under `Reconcile`, the landing takes the dirmeta of the right side, and
+///   the tree writes.
+/// - Under `KeepLeft`, the landing keeps no dirmeta, and `write_mtree` refuses
+///   the tree.
 #[test]
 fn keep_left_can_leave_a_symlink_landing_without_a_dirmeta() {
     let tmp = TmpDir::new("staging-merge-symlink-target-no-dirmeta");
@@ -3798,7 +3838,7 @@ fn keep_left_can_leave_a_symlink_landing_without_a_dirmeta() {
             .await
             .unwrap();
 
-        // The right side: a 0700 `l` directory holding a file.
+        // The right side: a 0700 `l` directory that holds a file.
         let pkg_st = txn.staging_tree(None).await.unwrap();
         pkg_st.make_dir(Path::new("l"), &novel).await.unwrap();
         pkg_st
@@ -3853,8 +3893,10 @@ fn keep_left_can_leave_a_symlink_landing_without_a_dirmeta() {
     });
 }
 
-/// Stage the nested alias the test below merges over: a 0755 `c` directory and
-/// an `a/b` symlink that reaches it, two levels below the tree root.
+/// Stages the nested alias that
+/// `symlink_target_dirmeta_holds_below_the_merge_root` merges over: a 0755 `c`
+/// directory and an `a/b` symlink that reaches it. The symlink is two levels
+/// below the tree root.
 async fn stage_nested_alias(st: &ostrya::StagingTree<'_>) {
     st.make_dir(Path::new("c"), &dir_meta()).await.unwrap();
     st.make_dir(Path::new("a"), &dir_meta()).await.unwrap();
@@ -3863,10 +3905,10 @@ async fn stage_nested_alias(st: &ostrya::StagingTree<'_>) {
         .unwrap();
 }
 
-/// The suppression is not scoped to the merge root: it holds at every symlink
-/// landing the recursion reaches. The symlink sits two levels below the merge
-/// root here -- `a/b -> ../c`, with the right side carrying `a/b/d` -- and the
-/// default still conflicts on `c` while `KeepLeft` still lands the entries.
+/// The suppression holds at every symlink landing that the recursion reaches,
+/// also below the merge root. In this test the symlink `a/b -> ../c` sits two
+/// levels below the merge root, and the right side carries `a/b/d`. The
+/// default still conflicts on `c`, and `KeepLeft` still lands the entries.
 #[test]
 fn symlink_target_dirmeta_holds_below_the_merge_root() {
     let tmp = TmpDir::new("staging-merge-symlink-target-nested");
@@ -3883,8 +3925,8 @@ fn symlink_target_dirmeta_holds_below_the_merge_root() {
             .await
             .unwrap();
 
-        // The right side: `a` at 0755, so the ordinary recursion through it is
-        // silent, and a 0700 `a/b` holding `d` and a file.
+        // The right side: `a` at 0755, so the ordinary recursion through `a` is
+        // silent, and a 0700 `a/b` that holds `d` and a file.
         let pkg_st = txn.staging_tree(None).await.unwrap();
         pkg_st.make_dir(Path::new("a"), &dir_meta()).await.unwrap();
         pkg_st.make_dir(Path::new("a/b"), &novel).await.unwrap();
@@ -3943,11 +3985,15 @@ fn symlink_target_dirmeta_holds_below_the_merge_root() {
     });
 }
 
-/// A missing `merge_at` base is created under the implied dirmeta and stays in
-/// the tree when the merge then conflicts on it. `KeepLeft` keeps the policy
-/// dirmeta and lands the right side under it. Without a policy, an absent base
-/// is `PathNotFound`, a file at the base and a symlink to one are
-/// `NotADirectory`, and a symlink to a directory is a valid base.
+/// Under the implied dirmeta, `merge_at` creates a missing base. If the merge
+/// then conflicts on the base, the base stays in the tree. `KeepLeft` keeps
+/// the policy dirmeta and lands the right side under it.
+///
+/// Without a policy:
+///
+/// - An absent base is `PathNotFound`.
+/// - A file at the base, and a symlink to a file, are `NotADirectory`.
+/// - A symlink to a directory is a valid base.
 #[test]
 fn merge_at_creates_its_base_under_the_implied_policy() {
     let tmp = TmpDir::new("staging-merge-at-implied-base");
@@ -3983,8 +4029,8 @@ fn merge_at_creates_its_base_under_the_implied_policy() {
             .unwrap()
             .with_implied_dirmeta(policy);
 
-        // The base's every component is created under the policy, its own
-        // final component included. The right root's dirmeta is not the policy
+        // The policy creates each component of the base, the final component
+        // included. The dirmeta of the right root differs from the policy
         // dirmeta, so `Reconcile` conflicts on it.
         match st
             .merge_at(Path::new("pool/x"), &package, MergeOptions::default())
@@ -4002,7 +4048,7 @@ fn merge_at_creates_its_base_under_the_implied_policy() {
             "the refused merge keeps the base the policy created"
         );
 
-        // `KeepLeft` is the case that needs the policy dirmeta kept.
+        // `KeepLeft` is the case that keeps the policy dirmeta.
         st.merge_at(
             Path::new("pool/y"),
             &package,
@@ -4051,9 +4097,10 @@ fn merge_at_creates_its_base_under_the_implied_policy() {
             other => panic!("a symlink to a file is NotADirectory: {other:?}"),
         }
 
-        // A base that is a dangling symlink names the symlink either way: the
-        // creating walk and the plain walk agree on the variant, so a policy
-        // does not change the condition a caller branches on.
+        // With or without a policy, a base that is a dangling symlink gives an
+        // error that names the symlink. The creating walk and the plain walk
+        // give the same variant, so a policy does not change the condition that
+        // a caller branches on.
         for (tree, label) in [(&plain, "without a policy"), (&st, "under a policy")] {
             tree.symlink(Path::new("gone"), Path::new("nowhere"), &symlink_meta())
                 .await
@@ -4070,9 +4117,10 @@ fn merge_at_creates_its_base_under_the_implied_policy() {
             }
         }
 
-        // A symlink to a directory is a valid base, and the base's final
-        // component follows without `follow_symlinks`. The right root's
-        // dirmeta is the one `real` carries, so the base reconciles silently.
+        // A symlink to a directory is a valid base. The walk follows the final
+        // component of the base with no `follow_symlinks`. The dirmeta of the
+        // right root is the dirmeta that `real` carries, so the base reconciles
+        // silently.
         plain.make_dir(Path::new("real"), &novel).await.unwrap();
         plain
             .symlink(Path::new("to_dir"), Path::new("real"), &symlink_meta())
@@ -4118,12 +4166,14 @@ fn merge_at_creates_its_base_under_the_implied_policy() {
     });
 }
 
-/// The writer guard covers the merge arms that drop a directory and no others.
-/// A right-side directory arriving over an absent name or over a file drops no
-/// directory, so both land with a writer live; a right-side file over a
-/// directory is refused. The branch where the name holds a directory the merge
-/// did not read has no cell: one task reaches the re-read with no await between
-/// it and the read, so only another task can put a directory there.
+/// The writer guard covers only the merge arms that drop a directory. A
+/// right-side directory over an absent name or over a file drops no
+/// directory, so both land while a writer is live. A right-side file over a
+/// directory is refused.
+///
+/// The branch where the name holds a directory that the merge did not read
+/// has no cell. One task reaches the re-read with no await between the read
+/// and the re-read, so only another task can put a directory there.
 #[test]
 fn merge_at_guards_only_the_arms_that_drop_a_directory() {
     let tmp = TmpDir::new("staging-merge-at-guard-scope");
@@ -4134,9 +4184,10 @@ fn merge_at_guards_only_the_arms_that_drop_a_directory() {
             .unwrap();
         let txn = repo.transaction().await.unwrap();
 
-        // One right side holds directories at `f` and `e`, the other a file at
-        // `d`. They merge separately, since the merge applies a directory's
-        // file entries before it descends into its subdirectories.
+        // One right side holds directories at `f` and `e`. The other holds a
+        // file at `d`. They merge separately, because the merge applies the
+        // file entries of a directory before it descends into its
+        // subdirectories.
         let dirs_st = txn.staging_tree(None).await.unwrap();
         dirs_st.make_dir(Path::new("f"), &dir_meta()).await.unwrap();
         dirs_st
@@ -4212,10 +4263,10 @@ fn merge_at_guards_only_the_arms_that_drop_a_directory() {
     });
 }
 
-/// Stage the `/var/lock -> ../run/lock` alias at the tree root: a 0755
+/// Stages the `/var/lock -> ../run/lock` alias at the tree root: a 0755
 /// `run/lock` directory, a 0755 `var` directory, and a `var/lock` symlink that
-/// reaches the directory. This is the shape a base rootfs ships when it aliases
-/// `/var/lock` onto `/run/lock`.
+/// reaches the directory. A base root filesystem that aliases `/var/lock` onto
+/// `/run/lock` ships this shape.
 async fn stage_root_lock_alias(st: &ostrya::StagingTree<'_>) {
     for dir in ["run", "run/lock", "var"] {
         st.make_dir(Path::new(dir), &dir_meta()).await.unwrap();
@@ -4230,13 +4281,15 @@ async fn stage_root_lock_alias(st: &ostrya::StagingTree<'_>) {
 }
 
 /// `make_dir_all` refuses a symlink at the last path component and writes
-/// nothing, so a caller that asks for `/var/lock` on a base root filesystem
-/// that ships the name as an alias hears about the alias and places no content
-/// under the symlink's target. The refusal holds whatever the symlink points
-/// at, and comes before the target resolves, so a symlink onto a regular file
-/// and a dangling symlink take it too. An absent last component still creates
-/// the directory, and a regular file there keeps the condition the walk types
-/// for a file in the way.
+/// nothing. A caller can ask for `/var/lock` on a base root filesystem that
+/// ships the name as an alias. The caller then gets the refusal and places no
+/// content under the target of the symlink.
+///
+/// The refusal holds for each symlink target. It comes before the target
+/// resolves, so a symlink to a regular file and a dangling symlink also get
+/// it. An absent last component still creates the directory. A regular file
+/// at the last component keeps the condition that the walk types for a file
+/// in the way.
 #[test]
 fn make_dir_all_refuses_a_symlink_at_the_final_component() {
     let tmp = TmpDir::new("staging-make-dir-all-final-symlink");
@@ -4257,8 +4310,9 @@ fn make_dir_all_refuses_a_symlink_at_the_final_component() {
             other => panic!("a final symlink is refused: {other:?}"),
         }
 
-        // The refusal wrote nothing: the entry is still the symlink, it still
-        // holds its target, and the target directory is still empty.
+        // The refusal wrote nothing. The entry is still the symlink, the
+        // symlink still holds its target, and the target directory is still
+        // empty.
         assert!(
             matches!(
                 st.lookup(Path::new("var/lock"), false).await.unwrap(),
@@ -4294,8 +4348,8 @@ fn make_dir_all_refuses_a_symlink_at_the_final_component() {
             "an absent final component is created"
         );
 
-        // A regular file at the same component keeps the condition the walk
-        // types for a file in the way of a directory.
+        // A regular file at the same component keeps the condition that the
+        // walk types for a file in the way of a directory.
         st.write_file_content(Path::new("var/f"), &reg(), b"f")
             .await
             .unwrap();
@@ -4307,10 +4361,10 @@ fn make_dir_all_refuses_a_symlink_at_the_final_component() {
             other => panic!("a final regular file is NotADirectory: {other:?}"),
         }
 
-        // What the symlink points at leaves the refusal the same: one onto the
-        // regular file just written, and one that resolves to nothing, are
-        // both refused, and the dangling one is refused before its target is
-        // walked, so it is not reported as dangling.
+        // The target of the symlink does not change the refusal. A symlink to
+        // the regular file written before and a symlink that resolves to
+        // nothing are both refused. The dangling one is refused before the
+        // walk reads its target, so the refusal does not report it as dangling.
         st.symlink(Path::new("var/tofile"), Path::new("f"), &symlink_meta())
             .await
             .unwrap();
@@ -4336,12 +4390,13 @@ fn make_dir_all_refuses_a_symlink_at_the_final_component() {
     });
 }
 
-/// The refusal belongs to the last component of the walked list. A `..` hop
-/// after a symlink makes the symlink an earlier component, which the walk
-/// follows, and the hop then pops the target's own components: the walk of
-/// `var/lock/..` ends at `run`, so a name after the hop is created there.
-/// `..` pops and clamps at the root everywhere in the staging tree, and this
-/// test holds that rule in place for `make_dir_all`.
+/// The refusal belongs to the last component of the walked list. If a `..`
+/// hop comes after a symlink, the symlink is an earlier component, and the
+/// walk follows it. The hop then pops the components of the target. The walk
+/// of `var/lock/..` ends at `run`, so a name after the hop is created there.
+///
+/// `..` pops and clamps at the root everywhere in the staging tree. This test
+/// holds that rule in place for `make_dir_all`.
 #[test]
 fn make_dir_all_follows_a_symlink_before_a_parent_hop() {
     let tmp = TmpDir::new("staging-make-dir-all-parent-hop");
@@ -4354,7 +4409,7 @@ fn make_dir_all_follows_a_symlink_before_a_parent_hop() {
         let st = txn.staging_tree(None).await.unwrap();
         stage_root_lock_alias(&st).await;
 
-        // A path ending in the hop. The walk follows `var/lock`, pops to
+        // A path that ends in the hop. The walk follows `var/lock`, pops to
         // `run`, and creates nothing.
         st.make_dir_all(Path::new("var/lock/.."), &dir_meta())
             .await
@@ -4379,8 +4434,8 @@ fn make_dir_all_follows_a_symlink_before_a_parent_hop() {
             "neither call created anything under the symlink target"
         );
 
-        // A fresh name after the hop lands in the target's parent, `run`,
-        // because the hop pops the path the symlink resolved to.
+        // A new name after the hop lands in the parent of the target, `run`,
+        // because the hop pops the path that the symlink resolved to.
         st.make_dir_all(Path::new("var/lock/../new"), &dir_meta())
             .await
             .unwrap();
@@ -4413,11 +4468,11 @@ fn make_dir_all_follows_a_symlink_before_a_parent_hop() {
     });
 }
 
-/// The refusal keeps the directories the same walk created before it. The walk
-/// of `new1/new2/../../var/lock` creates `new1` and `new1/new2`, pops back to
-/// the root, and then refuses the alias, and the two directories stay in the
-/// tree. This matches every other staging operation that creates implied
-/// ancestors and then refuses the entry it walked to.
+/// The refusal keeps the directories that the same walk created before it.
+/// The walk of `new1/new2/../../var/lock` creates `new1` and `new1/new2`, pops
+/// back to the root, and then refuses the alias. The two directories stay in
+/// the tree. Every other staging operation that creates implied ancestors and
+/// then refuses the entry it walked to does the same.
 #[test]
 fn a_refused_make_dir_all_keeps_the_directories_it_created() {
     let tmp = TmpDir::new("staging-make-dir-all-kept-ancestors");
@@ -4448,12 +4503,13 @@ fn a_refused_make_dir_all_keeps_the_directories_it_created() {
     });
 }
 
-/// The refusal names the resolved literal component path, the path form every
-/// typed staging refusal reports. The alias sits at `x/y/var/lock` and the
-/// walk reaches its parent through the `a/b -> ../x/y` symlink, so the refusal
-/// names `x/y/var/lock` and not the `a/b/var/lock` the caller gave. The name
-/// of the refused component itself is never resolved through, so the path
-/// names the symlink where it sits.
+/// The refusal names the resolved literal component path. Every typed staging
+/// refusal reports this path form.
+///
+/// The alias sits at `x/y/var/lock`, and the caller gives `a/b/var/lock`. The
+/// walk reaches the parent of the alias through the `a/b -> ../x/y` symlink,
+/// so the refusal names `x/y/var/lock`. The walk never resolves through the
+/// name of the refused component, so the path names the symlink where it sits.
 #[test]
 fn a_refused_make_dir_all_names_the_resolved_path() {
     let tmp = TmpDir::new("staging-make-dir-all-resolved-path");
@@ -4535,10 +4591,10 @@ fn make_dir_all_follows_a_symlink_at_an_intermediate_component() {
     });
 }
 
-/// The two other walks that create implied ancestors keep following a symlink
-/// at the last component they walk, because that component is a parent
-/// directory: a write under an implied dirmeta lands its file under the
-/// symlink's target, and a merge base that is a symlink merges into the target.
+/// The two other walks that create implied ancestors follow a symlink at the
+/// last component that they walk, because that component is a parent
+/// directory. A write under an implied dirmeta lands its file under the target
+/// of the symlink. A merge base that is a symlink merges into the target.
 #[test]
 fn implied_writes_and_a_merge_base_follow_a_final_symlink() {
     let tmp = TmpDir::new("staging-implied-final-symlink");

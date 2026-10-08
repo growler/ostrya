@@ -1,42 +1,46 @@
-//! bspatch for static-delta `B` (bspatch) operations, streaming its output.
+//! A bspatch decoder for the `B` (bspatch) operation of a static delta.
 //!
-//! The `B` opcode carries a bsdiff patch produced by the `ostree` tool. The
-//! stream is the classic bsdiff patch with its three streams interleaved and
-//! stored uncompressed (the enclosing delta part is xz-compressed as a whole,
-//! so the patch bytes are not separately compressed). The layout, recovered by
-//! observing the tool (see `format-reference.md`, "Static delta wire format"),
-//! is a sequence of blocks, each:
+//! The `B` opcode carries a bsdiff patch that the `ostree` command writes. The
+//! patch is the classic bsdiff patch with its three streams interleaved. The
+//! patch bytes have no compression of their own, because the whole enclosing
+//! delta part is xz-compressed.
 //!
-//! - a 24-byte control block of three signed 64-bit integers in bsdiff's
-//!   `offtin` encoding -- `diff_len`, `extra_len`, and a source `seek`;
-//! - `diff_len` bytes, each added (wrapping) to the corresponding source byte
-//!   at the current source position;
-//! - `extra_len` bytes copied verbatim;
+//! The layout comes from observation of the `ostree` command. The patch is a
+//! sequence of blocks, and each block holds these parts:
 //!
-//! after which the source position advances by `diff_len` and then by `seek`.
-//! Blocks are consumed until the output reaches `new_size`, which the delta's
-//! `open` operation supplies. There is no header and no block count: `new_size`
-//! is the sole terminator.
+//! - A 24-byte control block of three signed 64-bit integers in the bsdiff
+//!   `offtin` encoding: `diff_len`, `extra_len`, and a source `seek`.
+//! - `diff_len` bytes. The decoder adds each byte (wrapping) to the source
+//!   byte at the current source position.
+//! - `extra_len` bytes, copied verbatim.
 //!
-//! The output is produced strictly forward, so it is streamed to the caller's
-//! writer in bounded pieces rather than materializing the whole target object.
-//! The random-access `source` is the read-source object; a large one is a
-//! memory map, so indexing it reads demand-paged file cache rather than heap.
+//! After each block, the source position advances by `diff_len` and then by
+//! `seek`. The decoder reads blocks until the output reaches `new_size`. The
+//! `open` operation of the delta supplies `new_size`. The patch has no header
+//! and no block count, so `new_size` is the only terminator.
 //!
-//! The `offtin` encoding is little-endian sign-magnitude: the eight bytes hold
-//! the magnitude little-endian, and the top bit of the last byte is a sign flag
-//! (set means negative), so it is not two's complement.
+//! Because the decoder makes the output strictly forward, it streams the
+//! output to the writer of the caller in bounded pieces. It never holds the
+//! whole target object in memory.
+//!
+//! The random-access `source` is the read-source object. A large read-source
+//! object is a memory map, so an index into it reads the demand-paged file
+//! cache and uses no heap memory.
+//!
+//! The `offtin` encoding is little-endian sign-magnitude. The eight bytes hold
+//! the magnitude in little-endian order, and the top bit of the last byte is
+//! the sign flag. A set flag means a negative value. This encoding is not
+//! two's complement.
 
 use futures_io::AsyncWrite;
 use futures_lite::AsyncWriteExt;
 
 use crate::error::{Error, Result};
 
-/// The bounded staging buffer for a diff run's overlaid bytes.
+/// The size of the staging buffer for the overlaid bytes of a diff run.
 const OUT_CHUNK: usize = 128 * 1024;
 
-/// Decode one bsdiff `offtin` 64-bit integer (little-endian magnitude, top bit
-/// of the final byte a sign flag).
+/// Decodes one 64-bit integer in the bsdiff `offtin` encoding.
 fn offtin(buf: &[u8; 8]) -> i64 {
     let mut y = i64::from(buf[7] & 0x7f);
     for i in (0..7).rev() {
@@ -45,15 +49,25 @@ fn offtin(buf: &[u8; 8]) -> i64 {
     if buf[7] & 0x80 != 0 { -y } else { y }
 }
 
-/// Apply a bspatch `stream` against `source`, writing exactly `new_size` bytes
-/// to `out`. `source` is the whole content of the read-source object; `stream`
-/// is the `B` operation's slice of the delta part's data source.
+/// Applies the bspatch `stream` to `source` and writes the output to `out`.
 ///
-/// Every offset is bounds-checked, so a malformed patch fails with
-/// [`Error::InvalidFormat`] rather than panicking or reading out of range. The
-/// produced object's checksum is asserted separately by the delta's `close`
-/// operation, so a patch that applies cleanly but yields the wrong bytes is
-/// still caught downstream.
+/// `source` is the whole content of the read-source object. `stream` is the
+/// slice of the data source of the delta part that the `B` operation uses.
+/// `out` receives exactly `new_size` bytes.
+///
+/// The function checks the bounds of every offset, so a malformed patch does
+/// not cause a panic or a read out of range. The `close` operation of the
+/// delta verifies the checksum of the produced object. That verification
+/// catches a patch that applies without error but gives wrong bytes.
+///
+/// # Errors
+///
+/// - [`Error::InvalidFormat`] if the patch is malformed:
+///   - a truncated control block or data run
+///   - a negative length or an offset overflow
+///   - output past `new_size`
+///   - a source read or seek out of range
+/// - [`Error::Io`] if a write to `out` fails.
 pub(crate) async fn bspatch<W: AsyncWrite + Unpin>(
     source: &[u8],
     stream: &[u8],
@@ -79,8 +93,8 @@ pub(crate) async fn bspatch<W: AsyncWrite + Unpin>(
         let diff_len = to_len(diff_len, "diff")?;
         let extra_len = to_len(extra_len, "extra")?;
 
-        // The two data runs must fit in the stream, and the whole output in
-        // new_size.
+        // The two data runs must fit in the stream. The whole output must fit
+        // in `new_size`.
         let diff_end = cur
             .checked_add(diff_len)
             .ok_or_else(|| bad("bspatch diff run overflow"))?;
@@ -94,9 +108,9 @@ pub(crate) async fn bspatch<W: AsyncWrite + Unpin>(
             return Err(bad("bspatch output exceeds declared size"));
         }
 
-        // Diff run: source bytes plus the diff overlay, produced and written in
-        // bounded chunks so neither the target object nor the overlay is fully
-        // buffered.
+        // Diff run: the source bytes plus the diff overlay. The loop writes
+        // them in bounded chunks, so it never buffers the whole target object
+        // or the whole overlay.
         let src_end = spos
             .checked_add(diff_len)
             .ok_or_else(|| bad("bspatch source run overflow"))?;
@@ -122,7 +136,7 @@ pub(crate) async fn bspatch<W: AsyncWrite + Unpin>(
         cur = extra_end;
         produced += diff_len + extra_len;
 
-        // Seek the source, staying within bounds.
+        // Seek the source. The position must stay within the source.
         spos = apply_seek(spos, seek)?;
         if spos > source.len() {
             return Err(bad("bspatch source seek past end"));
@@ -131,7 +145,7 @@ pub(crate) async fn bspatch<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Convert an `offtin` length to a `usize`, rejecting negatives.
+/// Converts an `offtin` length to a `usize` and refuses a negative length.
 fn to_len(v: i64, which: &str) -> Result<usize> {
     if v < 0 {
         return Err(Error::InvalidFormat(format!(
@@ -141,7 +155,7 @@ fn to_len(v: i64, which: &str) -> Result<usize> {
     Ok(v as usize)
 }
 
-/// Apply a signed source seek to a position, rejecting an out-of-range result.
+/// Applies a signed source seek to a position and refuses a negative result.
 fn apply_seek(pos: usize, seek: i64) -> Result<usize> {
     let next = i128::from(pos as u64) + i128::from(seek);
     if next < 0 {
@@ -161,7 +175,7 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    /// A minimal in-memory `futures-io` writer collecting the bspatch output.
+    /// An in-memory `futures-io` writer that collects the bspatch output.
     struct VecSink(Vec<u8>);
 
     impl AsyncWrite for VecSink {
@@ -183,7 +197,7 @@ mod tests {
         }
     }
 
-    /// Run bspatch to completion and return the produced bytes.
+    /// Runs bspatch to completion and returns the produced bytes.
     fn apply(source: &[u8], stream: &[u8], new_size: usize) -> Result<Vec<u8>> {
         block_on(async {
             let mut sink = VecSink(Vec::new());
@@ -192,11 +206,12 @@ mod tests {
         })
     }
 
-    /// A real bspatch stream the `ostree` tool wrote for the `/usr/bin/app`
-    /// object of a from->to delta: one control block `(20, 12, 3)`, a 20-byte
-    /// zero diff, and the 12 extra bytes "two changed\n". The source is the old
-    /// content "hello world version one\n"; the patch reproduces the new content
-    /// "hello world version two changed\n".
+    /// A bspatch stream that the `ostree` command wrote for the `/usr/bin/app`
+    /// object of a from->to delta. The stream holds one control block
+    /// `(20, 12, 3)`, a 20-byte zero diff, and the 12 extra bytes
+    /// "two changed\n". The source is the old content "hello world version
+    /// one\n". The patch gives the new content "hello world version two
+    /// changed\n".
     #[test]
     fn tool_vector_app() {
         let source = b"hello world version one\n";
@@ -210,18 +225,19 @@ mod tests {
         assert_eq!(out, b"hello world version two changed\n");
     }
 
-    /// offtin is sign-magnitude, not two's complement.
+    /// The `offtin` encoding is sign-magnitude. It is not two's complement.
     #[test]
     fn offtin_sign_magnitude() {
         assert_eq!(offtin(&[0, 0, 0, 0, 0, 0, 0, 0]), 0);
         assert_eq!(offtin(&[1, 0, 0, 0, 0, 0, 0, 0]), 1);
-        // Negative one is magnitude 1 with the sign bit set, not 0xFFFF...FF.
+        // Negative one is magnitude 1 with the sign bit set. It is not
+        // 0xFFFF...FF.
         assert_eq!(offtin(&[1, 0, 0, 0, 0, 0, 0, 0x80]), -1);
         assert_eq!(offtin(&[0x2c, 1, 0, 0, 0, 0, 0, 0]), 300);
     }
 
-    /// A negative seek walks the source backwards; a pure-diff block with a
-    /// zero overlay copies the source verbatim.
+    /// A negative seek moves the source position back. A pure-diff block with
+    /// a zero overlay copies the source verbatim.
     #[test]
     fn negative_seek_rewinds_source() {
         let source = b"ABCDEF";
@@ -245,7 +261,8 @@ mod tests {
     #[test]
     fn truncated_stream_errors() {
         let source = b"AAAA";
-        // Control claims a 10-byte diff run but the stream has none.
+        // The control block declares a 10-byte diff run. The stream holds no
+        // data run.
         let mut stream = Vec::new();
         stream.extend_from_slice(&10i64.to_le_bytes());
         stream.extend_from_slice(&0i64.to_le_bytes());

@@ -1,8 +1,9 @@
-//! The process-wide staging reap.
+//! The reap of the staging directories of the process.
 //!
-//! [`ostrya::reap_process_staging`] removes the staging directory of every live
-//! transaction in the process, so it holds this test binary to itself: a test
-//! sharing the process would lose the staging directory of its own transaction.
+//! [`ostrya::reap_process_staging`] removes the staging directory of each live
+//! transaction in the process. For this reason, this test has a test binary
+//! of its own. If another test runs in the same process, the reap also removes
+//! the staging directory of the transaction of that test.
 
 mod common;
 
@@ -12,7 +13,7 @@ use common::TmpDir;
 use ostrya::{CreateOptions, Repo, RepoMode};
 use ostrya_rt::block_on;
 
-/// The staging directory names present under `<repo>/tmp`.
+/// Returns the names of the staging directories in `<repo>/tmp`.
 fn staging_dirs(repo: &Path) -> Vec<String> {
     let tmp = repo.join("tmp");
     let mut dirs = Vec::new();
@@ -35,10 +36,11 @@ fn new_repo(tag: &str) -> (TmpDir, PathBuf) {
     (dir, repo_path)
 }
 
-/// The reap removes the staging directory of a transaction that is still live,
-/// which is what a process ending without running destructors needs. Two live
-/// transactions lose both directories and both sibling lock files, and the
-/// transactions still abort cleanly afterward.
+/// The reap removes the staging directory of a live transaction.
+///
+/// A process that ends and runs no destructors needs this reap. With two live
+/// transactions, the reap removes both directories and both sibling lock
+/// files. After the reap, each transaction aborts with no error.
 #[test]
 fn reap_process_staging_removes_the_directories_of_live_transactions() {
     let (_dir, repo_path) = new_repo("txn-reap-process");

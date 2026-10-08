@@ -1,12 +1,18 @@
-//! Commit-signing integration tests.
+//! Integration tests for commit signing.
 //!
-//! These exercise the [`Signer`]/[`Verifier`] framework through the dummy
-//! engine: a dummy signature the port appends is accepted by `ostree sign
-//! --verify --sign-type=dummy`, the port verifies a dummy signature the tool
-//! wrote, appending a second engine's signatures leaves the first engine's
-//! array intact, and an unsigned commit verifies as not-valid. The dummy engine
-//! is gated in the tool behind `OSTREE_DUMMY_SIGN_ENABLED`, so every tool
-//! invocation here sets it.
+//! These tests use the dummy engine of the `Signer` and `Verifier` framework.
+//! The tests cover:
+//!
+//! - a dummy signature that ostrya appends, which
+//!   `ostree sign --verify --sign-type=dummy` accepts
+//! - a dummy signature that the `ostree` command writes, which ostrya verifies
+//! - the signatures of a second engine, which keep the array of the first
+//!   engine unchanged
+//! - an unsigned commit, which does not verify as valid
+//!
+//! The `ostree` command enables the dummy engine only if
+//! `OSTREE_DUMMY_SIGN_ENABLED` is set. Each run of the command in these tests
+//! sets this variable.
 
 mod common;
 
@@ -21,7 +27,7 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// Build a tiny source tree under `base/src`.
+/// Builds a small source tree under `base/src`.
 fn build_source(base: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let src = base.join("src");
@@ -35,9 +41,9 @@ fn build_source(base: &Path) {
     std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// Create an archive repo under `base/repo`, ingest `base/src` with canonical
-/// permissions and owner 0:0, and commit it on `test/main`. Returns the repo
-/// handle and the commit checksum.
+/// Creates an archive repository under `base/repo` and commits `base/src` on
+/// `test/main`. The ingest uses canonical permissions and owner 0:0. Returns
+/// the repository handle and the commit checksum.
 async fn build_committed_repo(base: &Path) -> (Repo, Checksum) {
     build_source(base);
     let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Archive))
@@ -69,7 +75,7 @@ async fn build_committed_repo(base: &Path) -> (Repo, Checksum) {
     (repo, commit)
 }
 
-/// Run `ostree` with the dummy engine enabled, returning its captured output.
+/// Runs `ostree` with the dummy engine enabled and returns its captured output.
 fn run_ostree_dummy(args: &[&str]) -> std::process::Output {
     Command::new("ostree")
         .env("OSTREE_DUMMY_SIGN_ENABLED", "1")
@@ -95,7 +101,8 @@ fn port_dummy_signature_is_verified_by_the_tool() {
         commit
     });
 
-    // The tool verifies the port-written signature with the matching key.
+    // With the matching key, the `ostree` command verifies the signature that
+    // ostrya wrote.
     let commit_hex = commit.to_hex();
     let ok = run_ostree_dummy(&[
         &repo_arg,
@@ -139,7 +146,8 @@ fn port_verifies_a_dummy_signature_the_tool_wrote() {
         let (repo, commit) = build_committed_repo(base).await;
         let commit_hex = commit.to_hex();
 
-        // The tool signs the port-built commit with the dummy engine.
+        // The `ostree` command signs the commit that ostrya built, with the
+        // dummy engine.
         let signed = run_ostree_dummy(&[
             &repo_arg,
             "sign",
@@ -153,8 +161,8 @@ fn port_verifies_a_dummy_signature_the_tool_wrote() {
             String::from_utf8_lossy(&signed.stderr)
         );
 
-        // The port verifies it with the matching trusted key, and rejects a
-        // verifier that does not trust the key.
+        // A verifier that trusts the key verifies the signature. With a
+        // verifier that does not trust the key, the signature is not valid.
         let outcome = repo
             .verify_commit(&commit, &[&DummyVerifier::new(["toolkey"])])
             .await
@@ -180,8 +188,9 @@ fn dummy_commitmeta_is_byte_identical_to_the_tool() {
         eprintln!("skipping: ostree tool not available");
         return;
     }
-    // Two repositories hold the identical commit; one is signed by the port and
-    // one by the tool with the same key, so the `.commitmeta` files must match.
+    // Two repositories hold the same commit. In one, ostrya signs it. In the
+    // other, the `ostree` command signs it with the same key. The two
+    // `.commitmeta` files must be identical.
     let commitmeta_bytes = |base: &Path, commit: &Checksum| -> Vec<u8> {
         let hex = commit.to_hex();
         let (a, b) = hex.split_at(2);
@@ -232,8 +241,8 @@ fn appending_dummy_signature_leaves_a_foreign_engine_array_intact() {
     block_on(async {
         let (repo, commit) = build_committed_repo(base).await;
 
-        // Seed a foreign engine's signature array directly into the detached
-        // metadata, standing in for a different signing engine.
+        // Write the signature array of a foreign engine directly into the
+        // detached metadata. This array stands for a different signing engine.
         let ed_key = "ostree.sign.ed25519";
         let ed_sig = vec![0x11u8; 64];
         let seeded = Value::Array(vec![Value::Tuple(vec![
@@ -247,8 +256,8 @@ fn appending_dummy_signature_leaves_a_foreign_engine_array_intact() {
             .await
             .unwrap();
 
-        // Sign with the dummy engine, then again, so the dummy array grows to
-        // two blobs.
+        // Sign two times with the dummy engine, so the dummy array holds two
+        // blobs.
         repo.sign_commit(&commit, &DummySigner::new("keyone"))
             .await
             .unwrap();
@@ -262,13 +271,13 @@ fn appending_dummy_signature_leaves_a_foreign_engine_array_intact() {
             .unwrap()
             .expect("detached metadata present");
 
-        // The foreign engine's array is untouched.
+        // The array of the foreign engine does not change.
         let ed = dict.dict_get(ed_key).and_then(Value::as_variant).unwrap().1;
         let ed_blobs = ed.as_array().unwrap();
         assert_eq!(ed_blobs.len(), 1, "foreign engine array is intact");
         assert_eq!(ed_blobs[0].as_bytes(), Some(ed_sig.as_slice()));
 
-        // The dummy engine accumulated both signatures in order.
+        // The dummy array holds both signatures in the order of signing.
         let dummy = dict
             .dict_get("ostree.sign.dummy")
             .and_then(Value::as_variant)
@@ -279,7 +288,8 @@ fn appending_dummy_signature_leaves_a_foreign_engine_array_intact() {
         assert_eq!(dummy_blobs[0].as_bytes(), Some(b"keyone".as_slice()));
         assert_eq!(dummy_blobs[1].as_bytes(), Some(b"keytwo".as_slice()));
 
-        // Verification sees both dummy blobs; trusting one key validates.
+        // The verification sees both dummy blobs. A verifier that trusts one
+        // of the keys gives a valid result.
         let outcome = repo
             .verify_commit(&commit, &[&DummyVerifier::new(["keytwo"])])
             .await
@@ -302,7 +312,7 @@ fn delete_signatures_removes_matching_and_empties() {
             .await
             .unwrap();
 
-        // Remove only the blob matching key-a.
+        // Remove only the blob that matches key-a.
         let removed = repo
             .delete_signatures(&commit, "ostree.sign.dummy", |_payload, blob| {
                 blob == b"key-a"
@@ -311,7 +321,7 @@ fn delete_signatures_removes_matching_and_empties() {
             .unwrap();
         assert_eq!(removed, 1);
 
-        // key-b's signature survives; key-a's is gone.
+        // The signature of key-b stays. The signature of key-a is gone.
         let dict = repo
             .read_commit_detached_metadata(&commit)
             .await
@@ -340,7 +350,8 @@ fn delete_signatures_removes_matching_and_empties() {
                 .valid
         );
 
-        // Removing the survivor empties the dict, leaving no detached metadata.
+        // The removal of the last signature empties the dict. Then no detached
+        // metadata remains.
         let removed = repo
             .delete_signatures(&commit, "ostree.sign.dummy", |_payload, _blob| true)
             .await
@@ -362,7 +373,8 @@ fn delete_signatures_preserves_other_engines() {
     block_on(async {
         let (repo, commit) = build_committed_repo(base).await;
 
-        // Seed a foreign engine's array, then add dummy signatures alongside it.
+        // Write the array of a foreign engine. Then add a dummy signature next
+        // to it.
         let ed_key = "ostree.sign.ed25519";
         let ed_sig = vec![0x11u8; 64];
         let seeded = Value::Array(vec![Value::Tuple(vec![
@@ -379,8 +391,8 @@ fn delete_signatures_preserves_other_engines() {
             .await
             .unwrap();
 
-        // Deleting every dummy signature drops the dummy entry but keeps the
-        // foreign engine's array, so the metadata is not cleared.
+        // The delete of all dummy signatures removes the dummy entry. The array
+        // of the foreign engine stays, so the detached metadata remains.
         let removed = repo
             .delete_signatures(&commit, "ostree.sign.dummy", |_payload, _blob| true)
             .await
@@ -410,7 +422,8 @@ fn delete_signatures_without_a_match_is_a_noop() {
             .await
             .unwrap();
 
-        // A non-matching key, and an engine key with no entry, remove nothing.
+        // A key that does not match removes nothing. An engine key with no
+        // entry also removes nothing.
         assert_eq!(
             repo.delete_signatures(&commit, "ostree.sign.dummy", |_p, b| b == b"nope")
                 .await
@@ -492,7 +505,8 @@ fn dummy_round_trip_within_the_port() {
     });
 }
 
-/// The dummy engine's stored signature blobs for `commit`, sorted, as text.
+/// Returns the stored signature blobs of the dummy engine for `commit`, sorted,
+/// as text.
 async fn dummy_signatures(repo: &Repo, commit: &Checksum) -> Vec<String> {
     let Some(dict) = repo.read_commit_detached_metadata(commit).await.unwrap() else {
         return Vec::new();
@@ -514,14 +528,18 @@ async fn dummy_signatures(repo: &Repo, commit: &Checksum) -> Vec<String> {
     blobs
 }
 
-/// Signatures two signers produce at the same time both reach the
-/// `.commitmeta`, whether they share one transaction, run in two, or pair a
-/// transaction with a [`Repo::sign_commit`] caller.
+/// Two signatures that two signers make at the same time both reach the
+/// `.commitmeta`. The test covers these cases:
 ///
-/// The append is queued under one lock with no await inside it, and the write
-/// reads, merges and replaces the file under a guard the process shares, so
-/// neither signer overwrites the other. The order the two take is whichever
-/// signer finishes first, so the claim is the set.
+/// - two signers in one transaction
+/// - two signers in two transactions
+/// - a transaction signer and a `Repo::sign_commit` caller
+///
+/// The append goes into a queue under one lock, with no `.await` inside the
+/// lock. The write reads, merges, and replaces the file under a guard that the
+/// process shares, so neither signer overwrites the other. The order of the
+/// signatures depends on which signer finishes first, so the test checks the
+/// set.
 #[test]
 fn concurrent_signatures_are_not_lost() {
     let tmp = TmpDir::new("sign-concurrent");
@@ -529,7 +547,7 @@ fn concurrent_signatures_are_not_lost() {
     block_on(async {
         let (repo, commit) = build_committed_repo(base).await;
 
-        // Two signers sharing one transaction.
+        // Two signers in one transaction.
         let txn = repo.transaction().await.unwrap();
         let (one, two) = futures_lite::future::zip(
             txn.sign_commit(&commit, &DummySigner::new("one")),
@@ -545,8 +563,9 @@ fn concurrent_signatures_are_not_lost() {
             "a signature was lost inside one transaction"
         );
 
-        // Two transactions in one process signing the one commit. Each appends
-        // to what the other left, the way two sequential runs do.
+        // Two transactions in one process sign the same commit. Each
+        // transaction appends to the signatures that the other left, as two
+        // runs in sequence do.
         async fn sign_in_own_transaction(repo: &Repo, commit: &Checksum, key: &str) {
             let txn = repo.transaction().await.unwrap();
             txn.sign_commit(commit, &DummySigner::new(key))
@@ -565,8 +584,8 @@ fn concurrent_signatures_are_not_lost() {
             "a signature was lost across two transactions"
         );
 
-        // A queued replace still drops what stands, and the signatures queued
-        // after it survive.
+        // A queued replace removes the stored signatures. The signatures that
+        // are queued after the replace stay.
         let txn = repo.transaction().await.unwrap();
         txn.set_commit_detached_metadata(&commit, Value::Array(Vec::new()));
         let (five, six) = futures_lite::future::zip(
@@ -583,10 +602,10 @@ fn concurrent_signatures_are_not_lost() {
             "the replace did not clear the stored signatures"
         );
 
-        // A `Repo::sign_commit` caller racing a transaction signer on the one
-        // commit. The two hold no queue in common, so the guard the
-        // read-modify-write takes is what keeps both signatures. Each pass adds
-        // two, and the count states that no earlier signature went with them.
+        // A `Repo::sign_commit` caller races a transaction signer on the same
+        // commit. The two share no queue, so the guard of the read-modify-write
+        // is the one thing that keeps both signatures. Each pass adds two
+        // signatures. The count shows that all earlier signatures stay.
         for pass in 0usize..8 {
             let direct = format!("direct-{pass}");
             let queued = format!("queued-{pass}");
@@ -616,9 +635,9 @@ fn concurrent_signatures_are_not_lost() {
     });
 }
 
-/// The signing items resolve at their public paths in `ostrya`: the module
-/// paths under `ostrya::sign` and the root paths name the same items, and the
-/// error of an engine converts into the repository error.
+/// The signing items resolve at their public paths in `ostrya`. The module
+/// paths under `ostrya::sign` and the root paths name the same items. The error
+/// of an engine converts into the repository error.
 #[test]
 fn signing_items_resolve_at_their_public_paths() {
     use ostrya::sign::{

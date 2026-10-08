@@ -1,18 +1,13 @@
-//! Owned transaction handles.
+//! Transactions: the write path of a repository.
 //!
-//! A [`Transaction`] is created from a [`Repo`] and owns the
-//! repository lock hold and a staging directory for its duration. Multiple
-//! transactions may exist at once in one process, each with its own staging
-//! directory; the shared repository lock coordinates them and excludes other
-//! processes, and the `ostree` tool, per the configured lock kind.
+//! [`Repo::transaction`] begins a [`Transaction`]. The transaction stages
+//! objects in its own staging directory. [`commit`](Transaction::commit)
+//! publishes them into `objects/` and writes the queued refs.
+//! [`TransactionStats`] counts the work of a transaction.
 //!
-//! A transaction ingests objects into its staging directory through the write
-//! methods (in `crate::write`) and publishes them into `objects/` at
-//! [`commit`](Transaction::commit). Object identity, dedup, free-space
-//! accounting, and the archive size map live in the shared staged state behind
-//! a mutex, so concurrent writers may share a `&Transaction`. Dropping a
-//! transaction without committing reaps the staging directory (discarding every
-//! staged object) and releases the lock.
+//! [`ContentWriter`] streams the payload of one regular file into a
+//! transaction. [`FileMeta`] holds the uid, the gid, the mode, and the
+//! extended attributes of a file object.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -34,185 +29,298 @@ use crate::write::{
 
 pub use crate::write::{ContentWriter, FileMeta};
 
-/// Statistics accumulated over a transaction, returned by
-/// [`commit`](Transaction::commit).
+/// The counts and sizes of the work of a transaction.
+///
+/// [`commit`](Transaction::commit) returns them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TransactionStats {
-    /// Metadata objects the transaction offered for staging (dirtree, dirmeta,
-    /// commit, and the like), counted before dedup. One directory's dirmeta is
-    /// counted once per directory, so a tree whose directories share one dirmeta
-    /// counts it once for each of them.
+    /// The number of metadata objects offered for staging, dedup hits included.
+    ///
+    /// A metadata object is a dirtree, a dirmeta, a commit, or another object
+    /// that is not a content object. Each directory counts its dirmeta once, so
+    /// a tree whose directories share one dirmeta counts it once for each
+    /// directory.
     pub metadata_total: u32,
-    /// Metadata objects freshly staged (dirtree, dirmeta, commit, and the
-    /// like). A dedup hit does not count.
+    /// The number of metadata objects freshly staged.
+    ///
+    /// A dedup hit does not count.
     pub metadata_written: u32,
-    /// Content objects the transaction offered for staging, counted before
-    /// dedup. A content object a [`DevInoCache`](crate::DevInoCache) hit
-    /// resolved is never offered, so it does not count here.
+    /// The number of content objects offered for staging, dedup hits included.
+    ///
+    /// A content object that a [`DevInoCache`](crate::DevInoCache) hit
+    /// resolves is never offered, so it does not count.
     pub content_total: u32,
-    /// Content objects freshly staged. A dedup hit does not count.
+    /// The number of content objects freshly staged.
+    ///
+    /// A dedup hit does not count.
     pub content_written: u32,
-    /// The total on-disk size of the freshly staged content objects. An object
-    /// imported from another repository counts its size whether its bytes were
-    /// written, shared by reflink, or shared by hardlink, so this is the storage
-    /// the objects occupy and not the space the transaction consumed.
+    /// The total on-disk size of the freshly staged content objects.
+    ///
+    /// An object imported from another repository counts its full size. This
+    /// is true if its bytes were written, shared by reflink, or shared by
+    /// hardlink. So the value is the storage that the objects occupy. A shared
+    /// object uses no new space on the file system.
     pub content_bytes_written: u64,
-    /// The total payload size of the freshly staged regular-file content
-    /// objects, before any compression the repository mode applies. A symlink
-    /// contributes nothing, and an object hardlinked from another repository
-    /// contributes nothing, its payload never being read; an object whose
-    /// payload was cloned contributes that payload's length. An object a
-    /// static delta produced contributes nothing, which is what the tool
-    /// reports for a pull.
+    /// The total payload size of the freshly staged regular-file content objects.
+    ///
+    /// The size is the size before the compression of the repository mode. An
+    /// object whose payload is cloned adds the length of its payload. These
+    /// objects add nothing:
+    ///
+    /// - A symlink.
+    /// - An object hardlinked from another repository, because its payload is
+    ///   never read.
+    /// - An object that a static delta produced. The `ostree` command also
+    ///   counts nothing for such an object in a pull.
     pub content_bytes_unpacked: u64,
-    /// Content objects skipped because their (device, inode) was already known
-    /// through a [`DevInoCache`](crate::DevInoCache) hit during a filesystem
-    /// ingest.
+    /// The number of content objects that a [`DevInoCache`](crate::DevInoCache)
+    /// hit skipped in a file system ingest.
+    ///
+    /// A hit is a file whose device and inode pair the cache knows already.
     pub devino_cache_hits: u32,
-    /// Entries a commit-modifier filter excluded during a filesystem ingest.
+    /// The number of entries that a commit-modifier filter excluded in a file
+    /// system ingest.
     pub filtered: u32,
 }
 
-/// One object staged in a transaction, awaiting publication.
+/// One object staged in a transaction that waits for publication.
 struct StagedObject {
-    /// The flat name the object holds in the staging directory.
+    /// The flat name of the object in the staging directory.
     staging_name: String,
-    /// The loose path under `objects/` the object publishes to.
+    /// The loose path under `objects/` that the object publishes to.
     dest: String,
 }
 
-/// The archive size record for one staged object, the input for `ostree.sizes`
-/// emission in [`write_commit`](crate::Transaction::write_commit). The tool's
-/// `ostree.sizes` covers every object in the commit -- content and metadata
-/// alike -- so a record is kept per object type, not only for content.
+/// The archive size record of one staged object.
+///
+/// [`write_commit`](crate::Transaction::write_commit) reads the records to
+/// write `ostree.sizes`. The `ostree.sizes` key of the `ostree` command covers
+/// each object of the commit, content and metadata. So the transaction keeps a
+/// record for each object type.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SizeRecord {
-    /// The on-disk size: the `.filez` storage size for archive content, the
+    /// The on-disk size: the `.filez` storage size for archive content, or the
     /// serialized byte length for a metadata object.
     pub(crate) compressed: u64,
-    /// The logical (unpacked) size: a file's payload length, a symlink's
-    /// target length, or a metadata object's byte length.
+    /// The logical (unpacked) size: the payload length of a file, the target
+    /// length of a symlink, or the byte length of a metadata object.
     pub(crate) unpacked: u64,
-    /// The object type, written as the trailing `ostree.sizes` entry byte.
+    /// The object type, written as the last byte of the `ostree.sizes` entry.
     pub(crate) objtype: ObjectType,
 }
 
-/// The mutable state shared by concurrent writers on one transaction.
+/// The mutable state that concurrent writers of one transaction share.
 struct Staged {
-    /// Objects staged so far, keyed by identity and type for in-transaction
-    /// dedup and for publication at commit.
+    /// The objects staged so far, by identity and type, for the dedup in the
+    /// transaction and for publication at commit.
     objects: HashMap<(Checksum, ObjectType), StagedObject>,
-    /// Per-object size records (archive mode), keyed by checksum. Covers
-    /// content and metadata objects, the input for `ostree.sizes`.
+    /// The size record of each object in archive mode, by checksum. The
+    /// records cover content and metadata objects, the input of `ostree.sizes`.
     sizes: HashMap<Checksum, SizeRecord>,
-    /// Which objects `ostree.sizes` covers, where a caller scopes the key by
-    /// tree source (see [`begin_tree_source`](Transaction::begin_tree_source)).
-    /// `None` leaves the key covering every object the commit reaches.
+    /// The objects that `ostree.sizes` covers, if a caller limits the key by
+    /// tree source with [`begin_tree_source`](Transaction::begin_tree_source).
+    /// `None` makes the key cover each object that the commit reaches.
     size_scope: Option<HashMap<Checksum, ObjectType>>,
-    /// Remaining write budget in bytes before the configured free-space reserve
-    /// is breached.
+    /// The bytes that the transaction can write before the free space is less
+    /// than the configured reserve.
     free_budget: u64,
-    /// Accumulated statistics.
+    /// The statistics so far.
     stats: TransactionStats,
-    /// The number of staged objects that are durable before publication: the
-    /// objects the last [`sync_staged`](Transaction::sync_staged) made durable,
-    /// and each metadata object synced on its own after it. The publication
-    /// step skips its `syncfs` while this equals the number of staged objects,
-    /// so another object staged after the sync gets the `syncfs` it needs.
+    /// The number of staged objects that are durable before publication.
+    ///
+    /// The count is the objects that the last `sync_staged` made durable, plus
+    /// each metadata object synced on its own after it. The publication step
+    /// skips its `syncfs` while this count equals the number of staged objects.
+    /// So an object staged after the sync gets the `syncfs` that it needs.
     presynced: Option<usize>,
 }
 
-/// One commit's queued detached-metadata edit.
+/// The queued detached-metadata edit of one commit.
 ///
-/// The edit is held as a plan rather than as a finished dict, so the read of
-/// what the repository already stores happens once, at the write, under the
-/// guard that serializes it. `staged` names the file a pull staged in place of
-/// the stored one; `replace` is the dict
-/// [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
-/// put in place of the stored one; `merge` is the dict a receiving session
-/// merges into it, with the keys whose stored value stays; `appends` are the
-/// signatures
-/// [`sign_commit`](Transaction::sign_commit) produced after it, in call order.
+/// The edit is a plan, so the read of the stored dict happens once, at the
+/// write, under the guard that serializes the write. The parts are:
+///
+/// - `staged`: the file that a pull staged to replace the stored one.
+/// - `replace`: the dict that
+///   [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
+///   queued to replace the stored one.
+/// - `merge`: the dict that a receiving session merges in, with the keys whose
+///   stored value stays.
+/// - `appends`: the signatures that [`sign_commit`](Transaction::sign_commit)
+///   made after it, in call order.
 #[derive(Default)]
 struct DetachedEdit {
-    /// The file in the staging directory whose bytes replace whatever the
-    /// repository stores, when a pull staged one. The write installs it
-    /// first, and the other parts of the edit then apply to it.
+    /// The file in the staging directory whose bytes replace the stored
+    /// detached metadata, if a pull staged one. The write installs it first,
+    /// and the other parts of the edit apply to it next.
     staged: Option<String>,
-    /// The dict that replaces whatever the repository stores, when a caller
-    /// queued one. `None` starts the edit from the stored dict.
+    /// The dict that replaces the stored detached metadata, if a caller queued
+    /// one. `None` starts the edit from the stored dict.
     replace: Option<Value>,
-    /// The serialized `a{sv}` dict merged into the dict the edit starts
-    /// from, before the appends, and the keys whose stored value stays: each
-    /// signature list gets the union of the two lists, a key of the list
-    /// that the dict the edit starts from holds keeps its value, and each
-    /// other key takes the value of this dict.
+    /// The serialized `a{sv}` dict that the edit merges in before the appends,
+    /// and the keys whose stored value stays.
+    ///
+    /// Each signature list gets the union of the two lists. A listed key that
+    /// the starting dict holds keeps its value. Each other key takes the value
+    /// of this dict.
     merge: Option<(Vec<u8>, Vec<String>)>,
-    /// Signatures to append, each an engine metadata key and one signature.
+    /// The signatures to append, each an engine metadata key and one signature.
     appends: Vec<(String, Vec<u8>)>,
 }
 
-/// The queued detached-metadata edits of a transaction, one per commit in the
-/// order of the first edit of each, with an index from each commit to the
-/// position of its edit.
+/// The queued detached-metadata edits of a transaction.
+///
+/// The queue holds one edit for each commit, in the order of the first edit of
+/// each commit. An index maps each commit to the position of its edit.
 #[derive(Default)]
 struct DetachedQueue {
     edits: Vec<(Checksum, DetachedEdit)>,
     index: HashMap<Checksum, usize>,
 }
 
-/// An owned transaction over a repository.
+/// A set of staged objects and queued writes to one repository.
 ///
-/// The handle carries its repository lock hold, staging directory, and the
-/// shared staged state. `&Transaction` is `Send + Sync`: concurrent writers may
-/// stage objects through one shared reference. Dropping it without
-/// [`commit`](Transaction::commit) or [`abort`](Transaction::abort) reaps the
-/// staging directory and releases the lock, so an abandoned transaction leaves
-/// nothing behind.
+/// [`Repo::transaction`] and [`Repo::transaction_with_lock`] begin a
+/// transaction. The transaction holds the repository lock and its own staging
+/// directory until it ends. [`commit`](Transaction::commit) publishes the
+/// staged objects and writes the queued refs and detached metadata.
+/// [`abort`](Transaction::abort) discards them.
+///
+/// If a transaction drops without `commit` or `abort`, it removes its staging
+/// directory with each staged object and releases the lock. So an abandoned
+/// transaction leaves nothing behind.
+///
+/// # Concurrency
+///
+/// One process can hold many transactions at once, each with its own staging
+/// directory. The repository lock coordinates them. It also excludes other
+/// processes and the `ostree` command, as [`LockKind`](crate::LockKind)
+/// states.
+///
+/// `&Transaction` is `Send + Sync`, so concurrent writers can stage objects
+/// through one shared reference. A mutex guards the state that the writers
+/// share: the set of staged objects for the dedup, the free-space budget, and
+/// the archive size records.
+///
+/// # Staging directory
+///
+/// A transaction stages its objects in `tmp/staging-<boot-id>-XXXXXX`. It
+/// creates the directory when it begins and removes it when it ends. While the
+/// transaction lives, it holds an exclusive record lock on the sibling file
+/// `staging-<boot-id>-XXXXXX-lock`.
+///
+/// The boot id separates the directories of the current boot from the
+/// directories of earlier boots. The owner of a directory of the current boot
+/// can still be alive. The owner of a directory of an earlier boot is gone.
+///
+/// When a transaction begins, it removes these stale entries at the top level
+/// of `tmp/`:
+///
+/// - A staging directory whose lock it can take, because no live holder has
+///   the lock.
+/// - A staging directory with no lock file, if the directory is older than
+///   `tmp-expiry-secs`. The age test is necessary because another process can
+///   be in the middle of the creation of the directory.
+/// - Each other entry whose mtime is older than `tmp-expiry-secs`, as the
+///   `ostree` command does. A directory goes as a whole tree, by its own
+///   mtime. A symlink goes as the link itself.
+///
+/// It never touches `tmp/cache`, and it never removes a staging directory that
+/// this process owns. A staging lock file has no age test, because a
+/// transaction can live longer than `tmp-expiry-secs` and still hold the lock.
+///
+/// A ref write, a detached-metadata write, and a tombstone write create a temp
+/// entry at the top level of `tmp/` and rename it over the target. The entry
+/// of a ref write is named `.ostrya-ref-<pid>-<n>-XXXXXX`. The entry of the
+/// other two writes is named `.ostrya-meta-<pid>-<n>-XXXXXX`. The age test
+/// applies to such an entry.
+///
+/// If `tmp-expiry-secs` is very small or negative, a transaction that begins
+/// can remove the entry before its rename. The write then fails with `ENOENT`,
+/// and the ref or the object stays unchanged.
+///
+/// # Examples
+///
+/// Commit the directory `/srv/rootfs` and point a ref at the new commit:
+///
+/// ```no_run
+/// # async fn run() -> ostrya::Result<()> {
+/// use std::os::fd::AsFd;
+/// use std::path::Path;
+///
+/// use ostrya::{CommitOptions, MutableTree, Repo};
+///
+/// let repo = Repo::open(Path::new("/srv/repo")).await?;
+/// let txn = repo.transaction().await?;
+///
+/// let parent = std::fs::File::open("/srv")?;
+/// let mut mtree = MutableTree::new();
+/// txn.write_dfd_to_mtree(parent.as_fd(), Path::new("rootfs"), &mut mtree, None)
+///     .await?;
+/// let root = txn.write_mtree(&mut mtree).await?;
+///
+/// let opts = CommitOptions {
+///     subject: Some("Build 1".into()),
+///     ..CommitOptions::default()
+/// };
+/// let commit = txn.write_commit(opts, &root).await?;
+/// txn.set_ref("exampleos/stable", Some(&commit));
+/// let stats = txn.commit().await?;
+/// println!("{} content objects written", stats.content_written);
+/// # Ok(()) }
+/// ```
 pub struct Transaction {
     repo: Repo,
-    /// A per-transaction replacement for the repository config's `[core] fsync`
-    /// setting, from [`set_fsync`](Transaction::set_fsync). `None` leaves the
-    /// config in charge.
+    /// The `[core] fsync` value of this transaction alone, from
+    /// [`set_fsync`](Transaction::set_fsync). `None` leaves the config value in
+    /// force.
     fsync_override: Option<bool>,
-    /// A per-transaction replacement for the repository config's
-    /// `[core] per-object-fsync` setting, from
+    /// The `[core] per-object-fsync` value of this transaction alone, from
     /// [`set_per_object_fsync`](Transaction::set_per_object_fsync). `None`
-    /// leaves the config in charge.
+    /// leaves the config value in force.
     per_object_fsync_override: Option<bool>,
-    /// Set by a filesystem ingest under
-    /// [`GENERATE_SIZES`](crate::CommitModifierFlags::GENERATE_SIZES). Read by
-    /// commit assembly to decide whether to emit `ostree.sizes`.
+    /// The `ostree.sizes` request of a file system ingest under
+    /// [`GENERATE_SIZES`](crate::CommitModifierFlags::GENERATE_SIZES). The
+    /// commit assembly reads it to decide if it writes `ostree.sizes`.
     generate_sizes: AtomicBool,
-    /// A caller's answer for the whole transaction, from
-    /// [`set_generate_sizes`](Transaction::set_generate_sizes). It wins over
-    /// `generate_sizes` in both directions; `None` leaves the ingest in charge.
+    /// The answer of a caller for the whole transaction, from
+    /// [`set_generate_sizes`](Transaction::set_generate_sizes).
+    ///
+    /// It overrides `generate_sizes` in both directions. `None` leaves the
+    /// ingest flag in force.
     generate_sizes_override: Option<bool>,
-    // Dropped in declaration order: the staged state and staging directory are
-    // released, then the lock.
+    // Fields drop in declaration order: the staged state and the staging
+    // directory go first, then the lock.
     staged: Mutex<Staged>,
-    /// Refspec-to-checksum writes queued by [`set_ref`](Transaction::set_ref)
-    /// and applied at [`commit`](Transaction::commit), after object
-    /// publication, per the durability contract.
+    /// The refspec-to-checksum writes that [`set_ref`](Transaction::set_ref)
+    /// queues. [`commit`](Transaction::commit) applies them after object
+    /// publication, for durability.
     pub(crate) refs: Mutex<Vec<crate::refs::RefWrite>>,
-    /// Detached-metadata edits queued by
+    /// The detached-metadata edits that
     /// [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
-    /// and by [`sign_commit`](Transaction::sign_commit), applied at
-    /// [`commit`](Transaction::commit) after object publication and before the
-    /// queued ref writes, so a commit a ref names carries its signatures.
+    /// and [`sign_commit`](Transaction::sign_commit) queue.
+    ///
+    /// [`commit`](Transaction::commit) applies them after object publication
+    /// and before the queued ref writes. So a commit that a ref names carries
+    /// its signatures.
     detached: Mutex<DetachedQueue>,
-    /// The uid and gid an object freshly staged in this transaction takes,
-    /// measured once on first use by [`fresh_owner`](Transaction::fresh_owner).
+    /// The uid and gid of an object freshly staged in this transaction.
+    /// [`fresh_owner`](Transaction::fresh_owner) measures them once, on first
+    /// use.
     fresh_owner: OnceLock<(u32, u32)>,
     staging: Option<StagingDir>,
-    /// The repository lock hold, kept for the transaction's lifetime and
-    /// released when this field drops. A commit that writes a ref or detached
-    /// metadata moves it into the blocking closure of that write.
+    /// The repository lock hold, kept for the life of the transaction.
+    ///
+    /// The drop of this field releases the lock. A commit that writes a ref
+    /// or detached metadata moves the hold into the blocking closure of that
+    /// write.
     lock: LockGuard,
 }
 
+/// Methods that set the options of a transaction, read its staged trees, queue
+/// detached metadata, and end it.
 impl Transaction {
-    /// Assemble a transaction from a repository handle, an acquired lock, a
+    /// Assembles a transaction from a repository handle, an acquired lock, a
     /// staging directory, and the initial free-space budget.
     pub(crate) fn new(
         repo: Repo,
@@ -242,43 +350,52 @@ impl Transaction {
         }
     }
 
-    /// Replace the repository config's `[core] fsync` setting for this
-    /// transaction alone, for the whole of it: the per-object writes, the
-    /// publication step, and the ref writes all read it. The setting changes the
-    /// durability of the writes and no byte the repository stores.
+    /// Overrides the `[core] fsync` value for this transaction alone.
+    ///
+    /// The value applies to the whole transaction: the per-object writes, the
+    /// publication step, the detached-metadata writes, and the ref writes. It
+    /// changes the durability of the writes and no byte that the repository
+    /// stores.
+    /// [`commit`](Transaction::commit) states the sync sequence.
     pub fn set_fsync(&mut self, enabled: bool) {
         self.fsync_override = Some(enabled);
     }
 
-    /// Replace the repository config's `[core] per-object-fsync` setting for
-    /// this transaction alone. With the setting on, the file of each content
-    /// object is synced as it is staged, before publication. A metadata object
-    /// is never synced on its own, and an object imported by hardlink is not
-    /// synced. The setting has no effect while fsync is off, from the config or
-    /// from [`set_fsync`](Transaction::set_fsync). It changes the durability of
-    /// the writes and no byte the repository stores.
+    /// Overrides the `[core] per-object-fsync` value for this transaction alone.
+    ///
+    /// If the value is `true`, the transaction syncs the file of each content
+    /// object when it stages the object, before publication. It never syncs a
+    /// metadata object on its own. It does not sync an object imported by
+    /// hardlink.
+    ///
+    /// The value has no effect while fsync is off, from the config or from
+    /// [`set_fsync`](Transaction::set_fsync). It changes the durability of the
+    /// writes and no byte that the repository stores.
+    /// [`commit`](Transaction::commit) states the sync sequence.
     pub fn set_per_object_fsync(&mut self, enabled: bool) {
         self.per_object_fsync_override = Some(enabled);
     }
 
-    /// Settle whether this transaction emits `ostree.sizes` in every commit it
-    /// writes, the way a filesystem ingest under
-    /// [`GENERATE_SIZES`](crate::CommitModifierFlags::GENERATE_SIZES) does. The
-    /// request serves an ingest that runs no commit modifier, the tar import
-    /// among them. The answer given here holds for the whole transaction and
-    /// wins over the flag any ingest sets, so `false` turns the key off again.
-    /// Outside archive mode the request is a silent no-op, since no other mode
+    /// Sets if each commit of this transaction carries the `ostree.sizes` key.
+    ///
+    /// A file system ingest under
+    /// [`GENERATE_SIZES`](crate::CommitModifierFlags::GENERATE_SIZES) turns the
+    /// key on. This call serves an ingest that runs no commit modifier, for
+    /// example the tar import. The value holds for the whole transaction and
+    /// overrides the flag of each ingest, so `false` turns the key off again.
+    ///
+    /// Outside archive mode the call has no effect, because no other mode
     /// writes the key.
     pub fn set_generate_sizes(&mut self, enabled: bool) {
         self.generate_sizes_override = Some(enabled);
     }
 
-    /// The repository this transaction writes to.
+    /// Returns the repository that this transaction writes to.
     pub(crate) fn repo(&self) -> &Repo {
         &self.repo
     }
 
-    /// The staging directory descriptor objects are ingested into.
+    /// Returns the descriptor of the staging directory, where the objects go.
     pub(crate) fn staging_fd(&self) -> BorrowedFd<'_> {
         self.staging
             .as_ref()
@@ -286,11 +403,12 @@ impl Transaction {
             .dir_fd()
     }
 
-    /// The uid and gid an object freshly staged in this transaction takes,
-    /// measured on first use and held for the transaction's lifetime. Read by the
-    /// import path, which admits a hardlink only where the source inode's
-    /// ownership is already this pair. Two callers racing the first read measure
-    /// the same directory and one of the two results is kept.
+    /// Returns the uid and gid of an object freshly staged in this transaction.
+    ///
+    /// The call measures the pair on first use and keeps it for the life of the
+    /// transaction. The import path reads it. It accepts a hardlink only if the
+    /// source inode has this ownership already. If two callers race for the
+    /// first read, both measure the same directory, and one result stays.
     pub(crate) async fn fresh_owner(&self) -> Result<(u32, u32)> {
         if let Some(owner) = self.fresh_owner.get() {
             return Ok(*owner);
@@ -300,43 +418,48 @@ impl Transaction {
         Ok(*self.fresh_owner.get_or_init(|| owner))
     }
 
-    /// Mark that this transaction should emit `ostree.sizes` at commit. Set by
-    /// a filesystem ingest under
-    /// [`GENERATE_SIZES`](crate::CommitModifierFlags::GENERATE_SIZES).
+    /// Records that this transaction writes `ostree.sizes` at commit.
+    ///
+    /// A file system ingest under
+    /// [`GENERATE_SIZES`](crate::CommitModifierFlags::GENERATE_SIZES) calls it.
     pub(crate) fn mark_generate_sizes(&self) {
         self.generate_sizes.store(true, Ordering::Relaxed);
     }
 
-    /// Whether size generation was requested: the caller's answer where
-    /// [`set_generate_sizes`](Transaction::set_generate_sizes) gave one, and
-    /// the ingest flag otherwise. Read by
-    /// [`write_commit`](Transaction::write_commit) to decide whether to emit
-    /// `ostree.sizes`.
+    /// Returns `true` if the transaction writes `ostree.sizes`.
+    ///
+    /// The answer of the caller from
+    /// [`set_generate_sizes`](Transaction::set_generate_sizes) applies if it
+    /// exists, else the ingest flag. [`write_commit`](Transaction::write_commit)
+    /// reads it.
     pub(crate) fn generate_sizes(&self) -> bool {
         self.generate_sizes_override
             .unwrap_or_else(|| self.generate_sizes.load(Ordering::Relaxed))
     }
 
-    /// Open a new tree source for `ostree.sizes` accounting.
+    /// Starts a new tree source for the `ostree.sizes` key.
     ///
-    /// The tool scopes the key to the objects the last tree source contributed,
-    /// together with the directory objects the tree serialization writes: a
-    /// content object an earlier source contributed leaves the key, while a
-    /// directory object stays. A caller that composes a commit from several
-    /// sources calls this before each of them, so the key it writes is the one
-    /// the tool writes; a caller that never calls it leaves the key covering
-    /// every object the commit reaches.
+    /// The `ostree` command limits the key to the objects that the last tree
+    /// source added, plus the directory objects that the tree serialization
+    /// writes. So a content object from an earlier source leaves the key, and a
+    /// directory object stays.
     ///
-    /// A `--base` layer is applied before the first call, so it contributes
-    /// nothing to the key, which is what the tool records.
+    /// A caller that builds a commit from several sources calls this method
+    /// before each source. Then the key that ostrya writes is the key that the
+    /// `ostree` command writes. If a caller never calls this method, the key
+    /// covers each object that the commit reaches.
+    ///
+    /// The `--base` layer of a commit goes in before the first call, so it adds
+    /// nothing to the key. The `ostree` command records the same key.
     pub fn begin_tree_source(&self) {
         let mut staged = self.staged.lock().unwrap();
         let scope = staged.size_scope.get_or_insert_with(HashMap::new);
         scope.retain(|_, ty| *ty != ObjectType::File);
     }
 
-    /// Record one object in the `ostree.sizes` scope, when a scope is in force.
-    /// `true` where the object was not already in it.
+    /// Records one object in the `ostree.sizes` scope, if a scope is in force.
+    ///
+    /// Returns `true` if the object was not in the scope before.
     pub(crate) fn note_size_scope(&self, checksum: Checksum, ty: ObjectType) -> bool {
         let mut staged = self.staged.lock().unwrap();
         match &mut staged.size_scope {
@@ -345,13 +468,14 @@ impl Transaction {
         }
     }
 
-    /// Whether a size scope is in force.
+    /// Returns `true` if a size scope is in force.
     pub(crate) fn size_scoped(&self) -> bool {
         self.staged.lock().unwrap().size_scope.is_some()
     }
 
-    /// Whether `checksum` is inside the `ostree.sizes` scope. Every object is,
-    /// where no scope is in force.
+    /// Returns `true` if `checksum` is inside the `ostree.sizes` scope.
+    ///
+    /// If no scope is in force, each object is inside it.
     pub(crate) fn in_size_scope(&self, checksum: &Checksum) -> bool {
         match &self.staged.lock().unwrap().size_scope {
             Some(scope) => scope.contains_key(checksum),
@@ -359,14 +483,15 @@ impl Transaction {
         }
     }
 
-    /// Snapshot the archive size records for the objects freshly staged so far,
-    /// as `ostree.sizes` entries. Read by
-    /// [`write_commit`](Transaction::write_commit) before it stages the commit
-    /// object, so the commit's own size is never among them; `write_commit`
-    /// looks each reachable object up in this snapshot and recovers the sizes of
-    /// any it does not find (an object that deduplicated against `objects/`)
-    /// from disk, so a multi-commit transaction gives each commit its own
-    /// reachable-scoped key.
+    /// Returns a copy of the archive size records of the objects freshly staged
+    /// so far, as `ostree.sizes` entries.
+    ///
+    /// [`write_commit`](Transaction::write_commit) reads the copy before it
+    /// stages the commit object, so the size of the commit itself is never in
+    /// it. `write_commit` looks up each reachable object in the copy. It reads
+    /// the sizes of an object that it does not find from disk: an object that
+    /// was a dedup hit against `objects/`. So in a transaction with many
+    /// commits, each commit gets its own key, limited to its reachable objects.
     pub(crate) fn size_entries(&self) -> Vec<ostrya_core::sizes::SizeEntry> {
         let staged = self.staged.lock().unwrap();
         staged
@@ -381,19 +506,21 @@ impl Transaction {
             .collect()
     }
 
-    /// Count one content object skipped through a devino-cache hit.
+    /// Counts one content object that a devino-cache hit skipped.
     pub(crate) fn note_devino_hit(&self) {
         self.staged.lock().unwrap().stats.devino_cache_hits += 1;
     }
 
-    /// Count one entry excluded by a commit-modifier filter.
+    /// Counts one entry that a commit-modifier filter excluded.
     pub(crate) fn note_filtered(&self) {
         self.staged.lock().unwrap().stats.filtered += 1;
     }
 
-    /// Whether an object of the given identity and type is staged in this
-    /// transaction (present in the staging directory, not yet published into
-    /// `objects/`).
+    /// Returns `true` if an object of this identity and type is staged in this
+    /// transaction.
+    ///
+    /// A staged object is in the staging directory and is not yet published
+    /// into `objects/`.
     pub(crate) fn is_staged(&self, checksum: &Checksum, ty: ObjectType) -> bool {
         self.staged
             .lock()
@@ -402,7 +529,8 @@ impl Transaction {
             .contains_key(&(*checksum, ty))
     }
 
-    /// The checksums of the objects of type `ty` staged in this transaction.
+    /// Returns the checksums of the objects of type `ty` staged in this
+    /// transaction.
     #[cfg(feature = "receive")]
     pub(crate) fn staged_of_type(&self, ty: ObjectType) -> Vec<Checksum> {
         self.staged
@@ -415,9 +543,11 @@ impl Transaction {
             .collect()
     }
 
-    /// Load a file object, checking this transaction's staged set before the
-    /// repository's `objects/`. Used by the staging-tree read and merge paths so
-    /// content staged in the current transaction is visible before it publishes.
+    /// Loads a file object from the staged set of this transaction, or else
+    /// from `objects/`.
+    ///
+    /// The read and merge paths of a staging tree use it, so they see the
+    /// content staged in this transaction before it publishes.
     pub(crate) async fn load_file_staged_first(
         &self,
         checksum: &Checksum,
@@ -425,8 +555,8 @@ impl Transaction {
         self.load_file_staged_first_with(checksum, false).await
     }
 
-    /// [`load_file_staged_first`], with the `measure` flag of
-    /// [`Repo::load_file_with`].
+    /// Loads a file object as [`load_file_staged_first`] does, with the
+    /// `measure` flag of [`Repo::load_file_with`].
     ///
     /// [`load_file_staged_first`]: Transaction::load_file_staged_first
     pub(crate) async fn load_file_staged_first_with(
@@ -441,10 +571,12 @@ impl Transaction {
         }
     }
 
-    /// Load a dirtree object, checking this transaction's staged set before the
-    /// repository's `objects/`. Mirrors [`load_file_staged_first`] for the
-    /// merge path's right side, so a dirtree staged in the current transaction
-    /// is visible before it publishes.
+    /// Loads a dirtree object from the staged set of this transaction, or else
+    /// from `objects/`.
+    ///
+    /// It does for the right side of the merge path what
+    /// [`load_file_staged_first`] does for files. So the merge sees a dirtree
+    /// staged in this transaction before it publishes.
     ///
     /// [`load_file_staged_first`]: Transaction::load_file_staged_first
     pub(crate) async fn load_dirtree_staged_first(
@@ -469,10 +601,12 @@ impl Transaction {
         }
     }
 
-    /// Load a dirmeta object, checking this transaction's staged set before the
-    /// repository's `objects/`. Mirrors
-    /// [`load_dirtree_staged_first`](Self::load_dirtree_staged_first) for the
-    /// directory metadata a staged tree carries.
+    /// Loads a dirmeta object from the staged set of this transaction, or else
+    /// from `objects/`.
+    ///
+    /// It does for the directory metadata of a staged tree what
+    /// [`load_dirtree_staged_first`](Self::load_dirtree_staged_first) does for
+    /// dirtrees.
     pub(crate) async fn load_dirmeta_staged_first(
         &self,
         checksum: &Checksum,
@@ -495,18 +629,28 @@ impl Transaction {
         }
     }
 
-    /// List one directory of a tree this transaction assembled, reading the
-    /// objects it staged before the repository's `objects/`.
+    /// Lists one directory of a tree that this transaction staged.
+    ///
+    /// The call reads the objects that this transaction staged first, and then
+    /// `objects/`. A caller can use it to derive commit metadata from a tree
+    /// before the transaction commit.
     ///
     /// [`RepoTree::read_dir`](crate::RepoTree::read_dir) reads `objects/`
-    /// alone, so it sees a tree only once the transaction has committed. This
-    /// reads the same listing -- files first, then subdirectories, each group
-    /// name-sorted -- over a tree that is still staged, which is what a caller
-    /// deriving commit metadata from the tree it is about to commit needs. Each
-    /// [`TreeEntry::Dir`](crate::TreeEntry::Dir) it returns is read back the
-    /// same way: passing one to `RepoTree::read_dir` before the transaction
-    /// commits reaches [`Error::ObjectNotFound`]
-    /// for the subtree's dirtree.
+    /// alone, so it sees a tree only after the transaction commit. The order of
+    /// the entries is the same in both calls: files first, then subdirectories,
+    /// each group sorted by name.
+    ///
+    /// Before the transaction commit, `RepoTree::read_dir` on a
+    /// [`TreeEntry::Dir`](crate::TreeEntry::Dir) of a staged tree fails with
+    /// [`Error::ObjectNotFound`]. This method reads such an entry.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if the dirtree of `tree` is not staged and
+    ///   not in `objects/`.
+    /// - [`Error::Io`] if the read of the dirtree fails, or if the dirtree is
+    ///   larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::Core`] if the dirtree does not parse.
     pub async fn read_dir(&self, tree: &crate::RepoTree) -> Result<Vec<crate::TreeEntry>> {
         let dirtree = self
             .load_dirtree_staged_first(tree.dirtree_checksum())
@@ -524,15 +668,17 @@ impl Transaction {
         Ok(entries)
     }
 
-    /// Queue the detached metadata of a commit this transaction writes.
+    /// Queues the detached metadata of a commit that this transaction writes.
     ///
-    /// `meta` is an `a{sv}` dict, and it replaces whatever the repository
-    /// already stores for `checksum`. The write happens at
+    /// `meta` is an `a{sv}` dict. It replaces the detached metadata that the
+    /// repository stores for `checksum`. The write happens at
     /// [`commit`](Transaction::commit), after the staged objects publish and
-    /// before the queued refs are written, so a commit is durable together with
-    /// its detached metadata and both are durable before a ref names them.
-    /// Queueing twice for one checksum keeps the last dict, and it drops the
-    /// signatures [`sign_commit`](Transaction::sign_commit) queued before it.
+    /// before the queued ref writes. So the commit and its detached metadata are
+    /// durable before a ref names them.
+    ///
+    /// If the call runs twice for one checksum, the last dict stays. The call
+    /// also drops the signatures that [`sign_commit`](Transaction::sign_commit)
+    /// queued before it.
     pub fn set_commit_detached_metadata(&self, checksum: &Checksum, meta: Value) {
         let mut queue = self.detached.lock().unwrap();
         let edit = Self::edit_for(&mut queue, checksum);
@@ -542,21 +688,23 @@ impl Transaction {
         edit.appends.clear();
     }
 
-    /// Stage `bytes`, the serialized detached metadata of `checksum`, in
-    /// place of whatever the repository stores. A pull copies a source's
-    /// `.commitmeta` verbatim through this call.
+    /// Stages `bytes`, the serialized detached metadata of `checksum`, to
+    /// replace the stored detached metadata.
     ///
-    /// The bytes go to a file in the staging directory at once, so the queue
-    /// holds no copy of them. At [`commit`](Transaction::commit) the write
-    /// renames the file over the `.commitmeta` of `checksum`, after the staged
-    /// objects publish and before the queued refs are written. With fsync on,
-    /// the file is durable before the rename: the `syncfs` of the publication
-    /// step covers it, and where that step runs no `syncfs` the write runs
-    /// one of its own. A transaction that does not
-    /// commit leaves the stored file as it stands. Staging again for one
-    /// checksum replaces the file, and like
+    /// A pull copies the `.commitmeta` of a source byte for byte through this
+    /// call. The bytes go to a file in the staging directory at once, so the
+    /// queue holds no copy of them.
+    ///
+    /// At [`commit`](Transaction::commit) the write renames the file over the
+    /// `.commitmeta` of `checksum`. The rename comes after the staged objects
+    /// publish and before the queued ref writes. With fsync on, the file is
+    /// durable before the rename. The `syncfs` of the publication step covers
+    /// it, and if that step runs no `syncfs`, the write runs one of its own.
+    ///
+    /// A transaction that does not commit leaves the stored file unchanged. A
+    /// second stage for one checksum replaces the file. As
     /// [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
-    /// the call drops the edits queued for `checksum` before it.
+    /// does, the call drops the edits queued for `checksum` before it.
     pub(crate) async fn stage_commit_detached_bytes(
         &self,
         checksum: &Checksum,
@@ -578,19 +726,20 @@ impl Transaction {
         Ok(())
     }
 
-    /// Queue a merge of `incoming`, the bytes of an `a{sv}` dict, into the
+    /// Queues a merge of `incoming`, the bytes of an `a{sv}` dict, into the
     /// detached metadata of `checksum`.
     ///
-    /// At [`commit`](Transaction::commit) the write reads the stored dict,
-    /// parses `incoming`, and merges it into the stored dict under the guard
-    /// the whole process shares for
-    /// detached-metadata edits: each signature list gets the union of the
-    /// stored and the incoming list, a key of `keep` that the stored dict
-    /// holds keeps the stored value, and each other key takes the incoming
-    /// value. The signatures
-    /// [`append_signature`](Transaction::append_signature) queues follow the
-    /// merge. Queueing twice for one checksum keeps the last dict and its
-    /// `keep`.
+    /// At [`commit`](Transaction::commit) the write reads the stored dict and
+    /// parses `incoming`. It merges `incoming` into the stored dict under the
+    /// process-wide guard of detached-metadata edits:
+    ///
+    /// - Each signature list gets the union of the stored and the incoming list.
+    /// - A key of `keep` that the stored dict holds keeps the stored value.
+    /// - Each other key takes the incoming value.
+    ///
+    /// The signatures that [`append_signature`](Transaction::append_signature)
+    /// queues come after the merge. If the call runs twice for one checksum, the
+    /// last dict and its `keep` stay.
     #[cfg(feature = "receive")]
     pub(crate) fn merge_commit_detached(
         &self,
@@ -602,11 +751,11 @@ impl Transaction {
         Self::edit_for(&mut queue, checksum).merge = Some((incoming, keep));
     }
 
-    /// Queue `signature`, a signature made before this call, for the engine
-    /// metadata key `key` of the detached metadata of `checksum`. The write at
-    /// [`commit`](Transaction::commit) appends it as
-    /// [`sign_commit`](Transaction::sign_commit) appends the signature it
-    /// makes.
+    /// Queues `signature`, made before this call, for the engine metadata key
+    /// `key` of the detached metadata of `checksum`.
+    ///
+    /// The write at [`commit`](Transaction::commit) appends it as it appends a
+    /// signature from [`sign_commit`](Transaction::sign_commit).
     #[cfg(feature = "receive")]
     pub(crate) fn append_signature(&self, checksum: &Checksum, key: &str, signature: Vec<u8>) {
         let mut queue = self.detached.lock().unwrap();
@@ -615,29 +764,46 @@ impl Transaction {
             .push((key.to_owned(), signature));
     }
 
-    /// Sign a commit this transaction wrote, appending the signature to the
-    /// commit's queued detached metadata.
+    /// Signs a commit that this transaction wrote and queues the signature.
     ///
-    /// The payload is the commit object's canonical bytes, read from the
-    /// staging directory when the object is staged and from `objects/` when it
-    /// deduplicated. The signature appends to the engine's `aay` array in the
-    /// dict
-    /// [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
-    /// queued, else in the dict the repository stores at the moment of the
-    /// write, else in an empty one.
+    /// The signature goes into the detached metadata of the commit. The
+    /// payload is the canonical bytes of the commit object. The call reads them
+    /// from the staging directory if the object is staged, and from `objects/`
+    /// if the repository holds the object already.
     ///
-    /// The queueing takes one lock and holds no await. The signature is made
-    /// here, before any lock of the commit. The write at `commit` reads,
-    /// merges and replaces the file under the update lock, so signatures that
-    /// several tasks or processes produce for one commit all reach it -- from
-    /// one transaction, from concurrent transactions, and from
-    /// [`Repo::sign_commit`](crate::Repo::sign_commit) alike. The `ostree`
-    /// tool can lose a signature in that case.
+    /// The signature appends to the `aay` array of the engine, in the first of
+    /// these dicts that exists:
     ///
-    /// Nothing reaches the filesystem here: the whole signing step precedes
-    /// object publication and the ref writes, so a signature that cannot be
-    /// produced fails the transaction with no object published and no ref
-    /// moved.
+    /// 1. The dict that
+    ///    [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
+    ///    queued.
+    /// 2. The dict that the repository stores at the time of the write.
+    /// 3. An empty dict.
+    ///
+    /// The call writes nothing to the file system. The signing step comes
+    /// before the object publication and the ref writes. So a signer failure
+    /// fails the transaction before it publishes an object or moves a ref.
+    ///
+    /// # Concurrent signers
+    ///
+    /// The queue step takes one lock and holds no await. The call makes the
+    /// signature here, before it takes a lock of the commit.
+    ///
+    /// The write at [`commit`](Transaction::commit) reads, merges, and replaces
+    /// the file under the update lock. So each signature that tasks or
+    /// processes make for one commit reaches the file: from one transaction,
+    /// from concurrent transactions, and from [`Repo::sign_commit`]. The
+    /// `ostree` command can lose a signature in that case.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if the commit is not staged and not in
+    ///   `objects/`.
+    /// - [`Error::Io`] if the read of the commit object fails, or if the object
+    ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::Signature`] if `signer` cannot make a signature. An error of
+    ///   a signer can also convert to [`Error::InvalidFormat`] or
+    ///   [`Error::Core`].
     pub async fn sign_commit(&self, checksum: &Checksum, signer: &dyn crate::Signer) -> Result<()> {
         let payload = self.load_commit_bytes_staged_first(checksum).await?;
         let signature = signer.sign(&payload).await?;
@@ -648,7 +814,8 @@ impl Transaction {
         Ok(())
     }
 
-    /// The queued edit for `checksum`, added empty when the queue holds none.
+    /// Returns the queued edit of `checksum`, and adds an empty edit if the
+    /// queue holds none.
     fn edit_for<'a>(queue: &'a mut DetachedQueue, checksum: &Checksum) -> &'a mut DetachedEdit {
         let edits = &mut queue.edits;
         let index = *queue.index.entry(*checksum).or_insert_with(|| {
@@ -658,9 +825,9 @@ impl Transaction {
         &mut edits[index].1
     }
 
-    /// Load a commit object's canonical bytes, checking this transaction's
-    /// staged set before the repository's `objects/`, the way the other
-    /// staged-first readers do.
+    /// Loads the canonical bytes of a commit object from the staged set of
+    /// this transaction, or else from `objects/`, as the other staged-first
+    /// readers do.
     pub(crate) async fn load_commit_bytes_staged_first(
         &self,
         checksum: &Checksum,
@@ -684,12 +851,11 @@ impl Transaction {
         .map_err(Error::Io)
     }
 
-    /// Take the queued detached-metadata edits, for
-    /// [`DetachedJob::run`] to apply between publication and the ref writes,
-    /// under the transaction's own fsync policy.
+    /// Takes the queued detached-metadata edits for [`DetachedJob::run`].
     ///
-    /// `synced` tells whether the publication step ran its `syncfs`, which
-    /// makes the staged files durable too.
+    /// The job applies them between publication and the ref writes, under the
+    /// fsync policy of the transaction. `synced` is `true` if the publication
+    /// step ran its `syncfs`, which also makes the staged files durable.
     fn detached_job(&self, synced: bool) -> Result<DetachedJob> {
         let queued = std::mem::take(&mut self.detached.lock().unwrap().edits);
         let (fsync, _) = self.fsync_flags()?;
@@ -703,9 +869,11 @@ impl Transaction {
         })
     }
 
-    /// Stage a regular-file content object whose payload is already written to
-    /// `file`. Called by [`ContentWriter::finish`](crate::ContentWriter::finish).
-    /// `counted` chooses whether the payload adds to
+    /// Stages a regular-file content object whose payload is in `file`
+    /// already.
+    ///
+    /// [`ContentWriter::finish`](crate::ContentWriter::finish) calls it. If
+    /// `counted` is `true`, the payload adds to
     /// [`content_bytes_unpacked`](TransactionStats::content_bytes_unpacked).
     pub(crate) async fn stage_regular(
         &self,
@@ -738,8 +906,9 @@ impl Transaction {
         self.record(checksum, ObjectType::File, mode, outcome, counted)
     }
 
-    /// Stage a symlink content object. Called by
-    /// [`write_symlink`](Transaction::write_symlink).
+    /// Stages a symlink content object.
+    ///
+    /// [`write_symlink`](Transaction::write_symlink) calls it.
     pub(crate) async fn stage_symlink(
         &self,
         checksum: Checksum,
@@ -767,8 +936,9 @@ impl Transaction {
         self.record(checksum, ObjectType::File, mode, outcome, false)
     }
 
-    /// Stage a metadata object from its serialized bytes. Called by
-    /// [`write_metadata`](Transaction::write_metadata).
+    /// Stages a metadata object from its serialized bytes.
+    ///
+    /// [`write_metadata`](Transaction::write_metadata) calls it.
     pub(crate) async fn stage_metadata(
         &self,
         checksum: Checksum,
@@ -780,9 +950,11 @@ impl Transaction {
             .map(|_| checksum)
     }
 
-    /// Stage a metadata object as [`stage_metadata`](Transaction::stage_metadata)
-    /// does, and return whether it was written: `false` where the repository
-    /// already holds it.
+    /// Stages a metadata object as
+    /// [`stage_metadata`](Transaction::stage_metadata) does.
+    ///
+    /// Returns `true` if the call wrote the object, and `false` if the
+    /// repository holds it already.
     pub(crate) async fn stage_metadata_outcome(
         &self,
         checksum: Checksum,
@@ -816,15 +988,18 @@ impl Transaction {
         Ok(written)
     }
 
-    /// Import one object from another local repository's `objects/` directory by
-    /// hardlinking it, which shares the source inode. The two repositories must
-    /// store the object identically, and the source inode must already carry the
-    /// ownership a write here produces; see [`stage_import_blocking`]. Called by
-    /// the local pull path.
+    /// Imports one object from the `objects/` directory of another local
+    /// repository with a hardlink, which shares the source inode.
     ///
-    /// Returns whether the object is staged. `false` is a content object whose
-    /// link was refused, which the caller imports through the object's logical
-    /// header instead; a metadata object is always staged, by link or by copy.
+    /// The two repositories must store the object in the same form. The source
+    /// inode must have the ownership that a write here gives already.
+    /// [`stage_import_blocking`] states the rules. The local pull path calls
+    /// this method.
+    ///
+    /// Returns `true` if the object is staged. `false` is a content object
+    /// whose link the call refused. The caller then imports it through the
+    /// logical header of the object. A metadata object is always staged, by
+    /// link or by copy.
     pub(crate) async fn stage_import(
         &self,
         src_objects_fd: BorrowedFd<'_>,
@@ -839,9 +1014,9 @@ impl Transaction {
         let objects = self.repo.objects_fd().try_clone_to_owned()?;
         let staging = self.staging_fd().try_clone_to_owned()?;
         let source = src_objects_fd.try_clone_to_owned()?;
-        // The ownership a link must match, withheld where no link is attempted:
-        // measuring it creates and removes a staging temporary, which a forced
-        // copy and a sealing repository would never read.
+        // The ownership that a link must match. The call measures it only if it
+        // tries a link. The measure creates and removes a staging temporary,
+        // and a forced copy or a sealing repository never reads the result.
         let link_owner = if force_copy || verity != Tristate::No {
             None
         } else {
@@ -863,17 +1038,20 @@ impl Transaction {
         let Some(outcome) = outcome else {
             return Ok(false);
         };
-        // An imported object carries no size record: a pull writes no commit, so
-        // `ostree.sizes` is never emitted from this transaction, and the payload
-        // is never read, so its unpacked length is unknown anyway.
+        // An imported object has no size record. A pull writes no commit, so
+        // this transaction never writes `ostree.sizes`. The call also never
+        // reads the payload, so the unpacked length is not known.
         self.record_object(checksum, ty, mode, outcome, false, false, false)?;
         Ok(true)
     }
 
-    /// Import one regular-file content object from another local repository by
-    /// cloning its payload and applying this repository's inode policy from the
-    /// object's logical header. The two modes must store the payload the same
-    /// way; see [`stage_clone_content_blocking`]. Called by the local pull path.
+    /// Imports one regular-file content object from another local repository
+    /// with a clone of its payload.
+    ///
+    /// The call applies the inode policy of this repository from the logical
+    /// header of the object. The two modes must store the payload in the same
+    /// form. [`stage_clone_content_blocking`] states the rules. The local pull
+    /// path calls this method.
     pub(crate) async fn stage_clone_content(
         &self,
         src_objects_fd: BorrowedFd<'_>,
@@ -908,8 +1086,8 @@ impl Transaction {
             )
         })
         .await?;
-        // An imported object carries no size record: a pull writes no commit, so
-        // `ostree.sizes` is never emitted from this transaction.
+        // An imported object has no size record. A pull writes no commit, so
+        // this transaction never writes `ostree.sizes`.
         self.record_object(
             checksum,
             ObjectType::File,
@@ -922,10 +1100,12 @@ impl Transaction {
         Ok(())
     }
 
-    /// Record a staged object's outcome: debit the free-space budget by the
-    /// blocks the object allocated, insert it into the staged set, and update the
-    /// statistics. Idempotent by identity, so restaging an object already staged
-    /// in this transaction is a no-op.
+    /// Records the outcome of a staged object.
+    ///
+    /// The call takes the blocks that the object allocated from the free-space
+    /// budget, adds the object to the staged set, and updates the statistics.
+    /// The call is idempotent by identity, so a second stage of an object that
+    /// is staged in this transaction does nothing.
     fn record(
         &self,
         checksum: Checksum,
@@ -937,15 +1117,17 @@ impl Transaction {
         self.record_object(checksum, ty, mode, outcome, true, payload, false)
     }
 
-    /// The body of [`record`](Transaction::record). `with_size` chooses whether
-    /// the object contributes an archive size record; an import contributes none,
-    /// since the pull that imports it writes no commit to carry one. `payload`
-    /// marks a regular-file content object, whose unpacked length is what
-    /// [`content_bytes_unpacked`](TransactionStats::content_bytes_unpacked)
-    /// sums; a symlink and a metadata object carry none. `synced` marks an
-    /// object whose file was synced on its own after
-    /// [`sync_staged`](Transaction::sync_staged), which the count of durable
-    /// objects then includes.
+    /// Records the outcome of a staged object, as [`record`](Transaction::record)
+    /// does, with all flags.
+    ///
+    /// - `with_size`: the object adds an archive size record. An import adds
+    ///   none, because the pull that imports it writes no commit to carry one.
+    /// - `payload`: the object is a regular-file content object. Its unpacked
+    ///   length adds to
+    ///   [`content_bytes_unpacked`](TransactionStats::content_bytes_unpacked).
+    ///   A symlink and a metadata object add none.
+    /// - `synced`: the file of the object was synced on its own after
+    ///   `sync_staged`. The count of durable objects then includes it.
     #[allow(clippy::too_many_arguments)]
     fn record_object(
         &self,
@@ -958,15 +1140,16 @@ impl Transaction {
         synced: bool,
     ) -> Result<Checksum> {
         let mut staged = self.staged.lock().unwrap();
-        // The totals count every object offered, dedup hits included, which is
-        // the work the transaction was asked for rather than the work it did.
+        // The totals count each object offered, dedup hits included. They are
+        // the work that the caller asked for.
         if ty == ObjectType::File {
             staged.stats.content_total += 1;
         } else {
             staged.stats.metadata_total += 1;
         }
-        // An object the store already held is inside the `ostree.sizes` scope
-        // just as a freshly staged one is; its sizes are recovered from disk.
+        // An object that the object store holds already is inside the
+        // `ostree.sizes` scope, as a freshly staged one is. `write_commit` reads
+        // its sizes from disk.
         if with_size
             && mode.is_archive()
             && let Some(scope) = &mut staged.size_scope
@@ -981,9 +1164,9 @@ impl Transaction {
             return Ok(checksum);
         }
         // Only freshly written blocks come off the budget. An imported object
-        // that shares the source inode by hardlink allocates nothing, and one
-        // whose payload came from a `FICLONE` reflink shares the source extents,
-        // so neither reduces the bytes free on the filesystem.
+        // that shares the source inode by hardlink allocates nothing. An object
+        // whose payload came from a `FICLONE` reflink shares the source extents.
+        // So neither reduces the bytes free on the file system.
         let allocated = match outcome.blocks {
             Blocks::Written => outcome.on_disk_size,
             Blocks::Linked | Blocks::Reflinked => 0,
@@ -1034,18 +1217,18 @@ impl Transaction {
         Ok(checksum)
     }
 
-    /// The `fsync` and `per-object-fsync` settings, the first from
-    /// [`set_fsync`](Transaction::set_fsync) and the second from
-    /// [`set_per_object_fsync`](Transaction::set_per_object_fsync) where the
-    /// transaction carries an override, and each from the repository config
-    /// otherwise. Every write path of the transaction reads this pair: the
-    /// per-object writes, the publication step, the detached-metadata writes,
-    /// and the ref writes.
+    /// Returns the `fsync` and `per-object-fsync` values of the transaction.
     ///
-    /// The configured `[core] fsync` and `[core] per-object-fsync` are both
-    /// read whether or not an override stands, so a value the reader refuses is
-    /// reported from every transaction and an override never conceals it
-    /// (`docs/format-reference.md`, "The fsync vocabulary").
+    /// Each value comes from its override, from
+    /// [`set_fsync`](Transaction::set_fsync) or
+    /// [`set_per_object_fsync`](Transaction::set_per_object_fsync), if the
+    /// transaction has one. Else it comes from the repository config. Each write
+    /// path of the transaction reads this pair: the per-object writes, the
+    /// publication step, the detached-metadata writes, and the ref writes.
+    ///
+    /// The call reads `[core] fsync` and `[core] per-object-fsync` in all
+    /// cases, also when an override is set. So each transaction reports a value
+    /// that the reader refuses, and an override never hides it.
     pub(crate) fn fsync_flags(&self) -> Result<(bool, bool)> {
         let config = self.repo.config();
         let configured = config.fsync()?;
@@ -1057,51 +1240,81 @@ impl Transaction {
         Ok((fsync, per_object))
     }
 
-    /// The effective `[ex-integrity] fsverity` setting from the repository
-    /// config, applied when staging each regular-file object.
+    /// Returns the `[ex-integrity] fsverity` value of the repository config.
+    ///
+    /// The stage of each regular-file object applies it.
     fn verity(&self) -> Result<Tristate> {
         self.repo.config().fsverity()
     }
 
-    /// Finish the transaction, publishing its staged objects into `objects/`
-    /// and then applying the queued ref writes.
+    /// Publishes the staged objects into `objects/` and writes the queued refs.
     ///
-    /// Publication follows the durability contract, under the one fsync policy
-    /// the transaction resolves from [`set_fsync`](Transaction::set_fsync) and
-    /// the repository config: with fsync on, the repository is `syncfs`-ed
-    /// before the staged objects are renamed into `objects/<xx>/`, and each
-    /// touched fanout directory and `objects/` is `fsync`-ed afterward. The
-    /// queued detached-metadata edits are written next, and then the queued
-    /// refs, in one trip to the blocking pool, so a commit and its
-    /// `.commitmeta` are both durable before a ref names them. Each ref is
-    /// written atomically (tmpfile, rename, with the tmpfile `fdatasync`-ed
-    /// under the same policy). After the last rename each directory that
-    /// gained or lost a ref name is `fsync`-ed once, deepest first, so every
-    /// ref is durable when the call returns and every object a ref names is
-    /// durable before the ref points at it; the set of ref writes is not atomic
-    /// as a whole. With fsync off no step of the sequence syncs. Queued
-    /// refspecs are validated up front, before any object is published, so a
-    /// malformed refspec fails the commit with nothing written. The staging
-    /// directory is then reaped and the lock released.
+    /// # Sequence
     ///
-    /// The objects publish with no update lock held. When the transaction
-    /// writes a ref, a ref removal included, or detached metadata, the call
-    /// then takes the update lock, which excludes the other writers of refs
-    /// and detached metadata, and writes the detached metadata and the refs
-    /// under it. A transaction that writes neither takes no update lock. The
-    /// transaction holds the repository lock already, so the wait is for the
-    /// update lock alone. It fails with [`Error::LockTimeout`] after
-    /// `lock-timeout-secs`, and the commit then leaves its published objects
-    /// with no detached metadata and no ref written. A caller that holds an
-    /// [`UpdateGuard`](crate::UpdateGuard) of this repository and commits a
-    /// transaction that writes a ref waits for its own guard until the
-    /// timeout, and with `lock-timeout-secs=-1` it waits forever.
+    /// 1. The call checks each queued refspec. If a refspec is malformed, the
+    ///    call fails before it publishes an object, and it writes nothing.
+    /// 2. The call renames each staged object into `objects/<xx>/`.
+    /// 3. The call writes the queued detached-metadata edits.
+    /// 4. The call writes the queued refs. Each ref write is atomic: a temp
+    ///    file, then a rename. The set of ref writes is not atomic as a whole.
+    /// 5. The call removes the staging directory and releases the repository
+    ///    lock.
+    ///
+    /// Steps 3 and 4 run in one trip to the blocking pool.
+    ///
+    /// # Durability
+    ///
+    /// One fsync policy applies to all steps: the value from
+    /// [`set_fsync`](Transaction::set_fsync), or else `[core] fsync` of the
+    /// repository config. With fsync on, the call syncs as follows:
+    ///
+    /// - Before the renames of step 2, it runs `syncfs` on the repository.
+    /// - After the renames, it runs `fsync` on each fanout directory that got
+    ///   an object, and on `objects/`.
+    /// - Before the rename of each ref, it runs `fdatasync` on the temp file.
+    /// - After the last ref rename, it runs `fsync` once on each directory that
+    ///   gained or lost a ref name, deepest first.
+    ///
+    /// With this sequence, a commit and its `.commitmeta` are durable before a
+    /// ref names them. Each ref is durable when the call returns. With fsync
+    /// off, no step syncs.
+    ///
+    /// # Locks
+    ///
+    /// The transaction holds the repository lock from its begin to the end of
+    /// this call, in the [`LockKind`](crate::LockKind) of its begin. Step 2
+    /// runs with no update lock.
+    ///
+    /// If the transaction writes a ref, a ref removal included, or detached
+    /// metadata, the call takes the update lock for steps 3 and 4. The update
+    /// lock excludes the other writers of refs and detached metadata, as
+    /// [`UpdateGuard`](crate::UpdateGuard) states. The wait is for the update
+    /// lock alone, because the transaction holds the repository lock already. A
+    /// transaction that writes neither does not take the update lock.
+    ///
+    /// # Cancellation
     ///
     /// The update lock, the repository lock, and the staging directory move
-    /// into the blocking closure that writes the detached metadata and the
-    /// refs, and the closure releases them when those writes end. So a caller
-    /// that drops the returned future cannot release a lock or lose a staged
-    /// file while those writes still run, and the writes complete.
+    /// into the blocking closure of steps 3 and 4. The closure releases them
+    /// when its writes end. If a caller drops the returned future, the writes
+    /// complete, and the locks and the staged files stay until the writes end.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRefspec`] if a queued refspec is malformed. The call
+    ///   publishes no object.
+    /// - [`Error::LockTimeout`] if the wait for the update lock passes
+    ///   `[core] lock-timeout-secs`. The published objects stay, and the call
+    ///   writes no detached metadata and no ref.
+    /// - [`Error::Core`] if `[core] fsync`, `[core] per-object-fsync`, or
+    ///   `[core] lock-timeout-secs` has a value that does not parse.
+    /// - [`Error::Core`] if the stored detached metadata of a commit does not
+    ///   parse.
+    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is less than
+    ///   `-1`, or if a signature entry of the stored detached metadata is not
+    ///   an array.
+    /// - [`Error::Io`] if a rename, a sync, or a write of a ref or of the
+    ///   detached metadata fails.
     pub async fn commit(mut self) -> Result<TransactionStats> {
         let refs = self.resolve_ref_queue()?;
         let synced = self.publish().await?;
@@ -1114,10 +1327,11 @@ impl Transaction {
         self.write_tail(refs, synced, Some(held)).await
     }
 
-    /// Commit the transaction as [`commit`](Transaction::commit) does, under
-    /// the update lock the caller holds. The reference to the hold makes a
-    /// call without the lock a type error, and the call does not take the
-    /// lock again.
+    /// Commits the transaction as [`commit`](Transaction::commit) does, under
+    /// the update lock that the caller holds.
+    ///
+    /// The reference to the hold makes a call without the lock a type error.
+    /// The call does not take the lock again.
     pub(crate) async fn commit_under(self, held: &UpdateLockHeld) -> Result<TransactionStats> {
         debug_assert!(
             self.repo.holds_update_lock(held),
@@ -1128,16 +1342,18 @@ impl Transaction {
         self.write_tail(refs, synced, None).await
     }
 
-    /// Write the queued detached metadata and then `refs`, reap the staging
-    /// directory, and release the locks, in one trip to the blocking pool.
-    /// `synced` tells whether the publication step ran its `syncfs`.
+    /// Writes the queued detached metadata and then `refs`, removes the
+    /// staging directory, and releases the locks, in one trip to the blocking
+    /// pool.
     ///
-    /// The staging directory, the repository lock, and `held`, where given,
-    /// move into the blocking closure. The closure releases the update lock
-    /// after the last ref write, then reaps the staging directory, then
-    /// releases the repository lock. So a caller that drops the returned
-    /// future cannot release a lock or remove a staged file while the writes
-    /// still run.
+    /// `synced` is `true` if the publication step ran its `syncfs`. The staging
+    /// directory, the repository lock, and `held`, if given, move into the
+    /// blocking closure. The closure releases the update lock after the last
+    /// ref write, then removes the staging directory, then releases the
+    /// repository lock.
+    ///
+    /// The move makes sure that a caller that drops the returned future cannot
+    /// release a lock or remove a staged file while the writes run.
     async fn write_tail(
         mut self,
         refs: Vec<(String, Option<Checksum>)>,
@@ -1176,11 +1392,13 @@ impl Transaction {
         Ok(stats)
     }
 
-    /// Make the objects staged so far durable ahead of
-    /// [`commit`](Transaction::commit): with fsync on, run one `syncfs` of the
-    /// repository. The publication step of `commit` then runs no `syncfs` of
-    /// its own, unless an object was staged after this call. With fsync off the
-    /// call does nothing.
+    /// Makes the objects staged so far durable before
+    /// [`commit`](Transaction::commit).
+    ///
+    /// With fsync on, the call runs one `syncfs` of the repository. The
+    /// publication step of `commit` then runs no `syncfs` of its own, unless an
+    /// object was staged after this call. With fsync off, the call does
+    /// nothing.
     #[cfg(feature = "receive")]
     pub(crate) async fn sync_staged(&self) -> Result<()> {
         let (fsync, _) = self.fsync_flags()?;
@@ -1196,22 +1414,28 @@ impl Transaction {
         Ok(())
     }
 
-    /// Whether the publication step runs its `syncfs`: with fsync on, unless
-    /// [`sync_staged`](Transaction::sync_staged) made every staged object
-    /// durable already.
+    /// Returns `true` if the publication step runs its `syncfs`.
+    ///
+    /// The step runs it with fsync on, unless `sync_staged` made each staged
+    /// object durable already.
     fn syncfs_at_publish(&self, fsync: bool) -> bool {
         let staged = self.staged.lock().unwrap();
         fsync && staged.presynced != Some(staged.objects.len())
     }
 
-    /// Discard the transaction and its staged objects, releasing the lock.
+    /// Discards the transaction and its staged objects, and releases the lock.
+    ///
+    /// # Errors
+    ///
+    /// The call does not fail. It always returns `Ok(())`.
     pub async fn abort(mut self) -> Result<()> {
         self.reap_staging().await;
         Ok(())
     }
 
-    /// Rename every staged object into `objects/` on the blocking pool, and
-    /// return whether the step ran its `syncfs`.
+    /// Renames each staged object into `objects/` on the blocking pool.
+    ///
+    /// Returns `true` if the step ran its `syncfs`.
     async fn publish(&self) -> Result<bool> {
         let objects: Vec<(String, String)> = {
             let staged = self.staged.lock().unwrap();
@@ -1245,7 +1469,8 @@ impl Transaction {
         Ok(syncfs)
     }
 
-    /// Remove the staging directory on the blocking pool, if still present.
+    /// Removes the staging directory on the blocking pool, if it is still
+    /// present.
     async fn reap_staging(&mut self) {
         if let Some(staging) = self.staging.take() {
             ostrya_rt::unblock(move || drop(staging)).await;
@@ -1258,7 +1483,7 @@ impl Transaction {
 struct DetachedJob {
     queued: Vec<(Checksum, DetachedEdit)>,
     fsync: bool,
-    /// Whether the staged files are durable already, from the `syncfs` of
+    /// `true` if the staged files are durable already, from the `syncfs` of
     /// the publication step.
     staged_durable: bool,
     repo_mode: RepoMode,
@@ -1267,14 +1492,19 @@ struct DetachedJob {
 }
 
 impl DetachedJob {
-    /// Apply the edits. The staged files are installed first, in one step,
-    /// and the rest of the edit of each commit then applies to its installed
-    /// file. With fsync on, a `syncfs` makes the staged files durable before
-    /// the install where the publication step ran none. Each other edit is
-    /// written and, with fsync on, made durable before the next one starts,
-    /// and each takes the process-wide guard of detached-metadata edits for
-    /// itself alone. `tmp_fd` is the open `tmp/` of the repository, where
-    /// each edit creates its temp file. The caller holds the update lock.
+    /// Applies the edits.
+    ///
+    /// The call installs the staged files first, in one step. The rest of the
+    /// edit of each commit then applies to its installed file. With fsync on,
+    /// if the publication step ran no `syncfs`, a `syncfs` makes the staged
+    /// files durable before the install.
+    ///
+    /// The call writes each other edit before the next one starts, and with
+    /// fsync on it makes the edit durable first. Each edit takes the
+    /// process-wide guard of detached-metadata edits for itself alone.
+    ///
+    /// `tmp_fd` is the open `tmp/` of the repository, where each edit creates
+    /// its temp file. The caller holds the update lock.
     fn run(self, tmp_fd: BorrowedFd<'_>) -> Result<()> {
         let staged: Vec<(&Checksum, &str)> = self
             .queued
@@ -1322,10 +1552,12 @@ const _: fn() = || {
     is_send_sync::<Transaction>();
 };
 
-/// A gate that the step of a commit that writes detached metadata and refs
-/// passes, for the unit tests. A test arms it for one repository root. The
-/// next such step of a commit of that repository then reports that it started
-/// and waits until the test opens the gate.
+/// A gate for the unit tests, at the commit step that writes detached metadata
+/// and refs.
+///
+/// A test arms the gate for one repository root. The next such step of a
+/// commit of that repository then reports that it started, and waits until the
+/// test opens the gate.
 #[cfg(test)]
 mod test_tail {
     use std::os::fd::BorrowedFd;
@@ -1336,7 +1568,7 @@ mod test_tail {
 
     static GATES: Mutex<Vec<Gate>> = Mutex::new(Vec::new());
 
-    /// Arm the gate for the repository root `root`, and return the receiver
+    /// Arms the gate for the repository root `root`, and returns the receiver
     /// of the start report and the sender that opens the gate.
     pub(super) fn arm(root: &std::path::Path) -> (Receiver<()>, Sender<()>) {
         use std::os::unix::fs::MetadataExt;
@@ -1350,7 +1582,7 @@ mod test_tail {
         (started_rx, go_tx)
     }
 
-    /// Report the start and wait for the gate, when a gate is armed for the
+    /// Reports the start and waits for the gate, if a gate is armed for the
     /// repository root `repo_fd`.
     pub(super) fn pass(repo_fd: BorrowedFd<'_>) {
         let Ok(stat) = rustix::fs::fstat(repo_fd) else {
@@ -1486,7 +1718,7 @@ mod tests {
     }
 
     /// Metadata objects staged after `sync_staged` are synced one by one and
-    /// counted as durable, so the anchor commit a receiving session stages
+    /// counted as durable. So the anchor commit that a receiving session stages
     /// under its lock brings no `syncfs` back at publication.
     #[cfg(feature = "receive")]
     #[test]
@@ -1528,9 +1760,9 @@ mod tests {
         });
     }
 
-    /// A queued merge runs on the stored dict before the queued signatures:
-    /// the signature lists get the union, another key takes the incoming
-    /// value, and a stored key the incoming dict does not hold stays.
+    /// A queued merge runs on the stored dict before the queued signatures.
+    /// The signature lists get the union, another key takes the incoming
+    /// value, and a stored key that the incoming dict does not hold stays.
     #[cfg(feature = "receive")]
     #[test]
     fn a_queued_merge_applies_before_the_appended_signatures() {
@@ -1618,9 +1850,9 @@ mod tests {
         });
     }
 
-    /// A source object the clone path cannot open because it is gone is reported
-    /// as the missing object it is, the answer the link path gives for the same
-    /// condition.
+    /// If the clone path cannot open a source object because it is gone, the
+    /// error reports the object as missing. The link path gives the same
+    /// answer for the same condition.
     #[test]
     fn a_clone_of_an_absent_source_object_reports_it_missing() {
         let scratch = Scratch::new("clone-missing");
@@ -1911,8 +2143,8 @@ mod tests {
     }
 
     /// A commit future dropped while its ref step runs on the blocking pool
-    /// keeps the repository lock until that step ends, so an exclusive holder
-    /// such as a prune cannot start before the ref is written.
+    /// keeps the repository lock until that step ends. So an exclusive holder,
+    /// for example a prune, cannot start before the ref is written.
     #[test]
     fn a_dropped_commit_holds_the_repository_lock_until_its_ref_step_ends() {
         use crate::LockKind;

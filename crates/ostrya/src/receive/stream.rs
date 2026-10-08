@@ -1,5 +1,5 @@
-//! One one-way stream: the messages of a push session in one direction, with
-//! no reply.
+//! The one-way stream of a push: the messages of a session in one direction,
+//! with no reply. [`Repo::receive_stream`] reads it.
 
 use futures_io::AsyncRead;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
@@ -12,42 +12,98 @@ use crate::push::proto::{CommitRequest, FrameReader, Message};
 use crate::push::{self, Expected};
 use crate::repo::Repo;
 
+/// Methods that receive a one-way stream.
 impl Repo {
-    /// Read one one-way stream from `input` into one transaction: one `Hello`
-    /// with `one-way` true, zero or more object streams, each closed by
-    /// `ObjectsEnd`, one `Commit`, and the end of `input`. The call sends no
-    /// message, and returns the result in place of a reply.
+    /// Reads one one-way stream from `input` into one transaction.
     ///
-    /// The frame limit and the chunk limit are 1 MiB. The objects are staged
-    /// as in [`Repo::receive`], after the checksum and the content checks of
-    /// the repository mode and of `policy`. A `bare-split-xattrs` repository
-    /// is `mode-refused`, and so is a `bare` repository unless the process
-    /// runs as root. A repository with `[core] locking=false` is accepted.
+    /// A one-way stream holds the messages of a push session in one direction.
+    /// The call sends no message, and returns the result in place of a reply.
+    /// The stream holds these messages, in this order:
+    ///
+    /// 1. One `Hello` with `one-way` true.
+    /// 2. Zero or more object streams, each one closed by `ObjectsEnd`.
+    /// 3. One `Commit`.
+    /// 4. The end of `input`.
+    ///
+    /// # Hello
+    ///
+    /// The frame limit and the chunk limit are 1 MiB
+    /// ([`MAX_FRAME`](crate::push::proto::MAX_FRAME)). A `bare-split-xattrs`
+    /// repository is `mode-refused`. A `bare` repository is `mode-refused`
+    /// unless the process runs as root. The call accepts a repository with
+    /// `[core] locking=false`.
+    ///
     /// The size of a `HelloReply` does not bound the ref names of `Hello`,
     /// because the stream gets no reply.
     ///
+    /// # Objects
+    ///
+    /// The call stages the objects as [`Repo::receive`] does. Before the
+    /// stage, it verifies the checksum of each object and checks the content
+    /// rules of the repository mode and of `policy`.
+    ///
+    /// # Locks
+    ///
     /// The session transaction holds the repository lock shared from `Hello`
-    /// to the end, with no lock under `[core] locking=false`. The commit
+    /// to the end. Under `[core] locking=false`, it holds no lock. The commit
     /// takes the update lock, which ignores `[core] locking`.
     ///
-    /// `Commit` runs the checks and the steps of [`Repo::receive`], with three
-    /// differences. The `signers` of each rule, `summary_signers`, and
-    /// `update_summary` of `policy` are ignored, so the commit adds no server
-    /// signature, writes no anchor commit, and does not regenerate the
-    /// summary. A ref update whose expected state is
-    /// [`Expected::Commit`], and a ref update with no new commit, are
-    /// `protocol`. The commit checks run only after `input` reaches its end,
-    /// and a byte after `Commit` is `protocol`. The reply limit of the two-way
-    /// session applies to the ref updates of `Commit` as well.
+    /// # Commit
     ///
-    /// Each failure aborts the transaction, and the repository does not
-    /// change. A failure with a wire code returns as [`Error::Push`]. `Have`,
-    /// a `Hello` without `one-way` true, and an `Abort` frame between two
-    /// objects are `protocol`. An abandoned object, the abandon marker and
-    /// `Abort` inside an object, returns [`push::Error::Aborted`]. An end of
-    /// `input` before `Commit` is complete returns an [`Error::Io`] of kind
-    /// `UnexpectedEof`, and an error of `input` returns as [`Error::Io`]. A
-    /// failure on the receiving side returns as the error it is.
+    /// `Commit` runs the checks and the steps of [`Repo::receive`], with three
+    /// differences:
+    ///
+    /// - The call ignores the `signers` of each rule, `summary_signers`, and
+    ///   `update_summary` of `policy`. As a result, the commit adds no server
+    ///   signature, writes no anchor commit, and does not regenerate the
+    ///   summary.
+    /// - A ref update whose expected state is [`Expected::Commit`] is
+    ///   `protocol`. A ref update with no new commit is also `protocol`.
+    /// - The commit checks run only after `input` reaches its end. A byte
+    ///   after `Commit` is `protocol`.
+    ///
+    /// The reply limit of the two-way session also applies to the ref updates
+    /// of `Commit`.
+    ///
+    /// # Errors
+    ///
+    /// A failure before the transaction commit aborts the transaction, and the
+    /// repository does not change. A failure of the transaction commit can
+    /// leave the detached metadata and some refs written. The call returns a
+    /// wire code inside [`Error::Push`]. It returns each other error as it is.
+    ///
+    /// - [`push::Error::Protocol`] if the first message is not `Hello`, or if
+    ///   `Hello` does not have `one-way` true.
+    /// - [`push::Error::Protocol`] if a message comes out of order. `Have` and
+    ///   an `Abort` frame between two objects are out of order.
+    /// - [`push::Error::VersionUnsupported`] if `Hello` states another
+    ///   protocol version.
+    /// - [`push::Error::ModeRefused`] if the repository mode is
+    ///   `bare-split-xattrs`, or if it is `bare` and the process does not run
+    ///   as root.
+    /// - [`push::Error::InvalidRef`] if `Hello` names a ref that is not valid.
+    /// - The errors of [`Repo::transaction`] if the session transaction cannot
+    ///   open. These include [`Error::LockTimeout`] for the repository lock.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if `[core] fsync`,
+    ///   `[core] per-object-fsync`, `[ex-integrity] fsverity`, or
+    ///   `[archive] zlib-level` is malformed.
+    /// - The errors of an object stream that [`Repo::receive`] lists:
+    ///   `checksum-mismatch`, `mode-refused`, `limit-exceeded`, `protocol`,
+    ///   and the wire code of the frame decoder.
+    /// - [`push::Error::Protocol`] if an update of `Commit` expects a commit
+    ///   or has no new commit, or if a byte follows `Commit`.
+    /// - At `Commit`, the errors of
+    ///   [`ReceiveService::commit`](super::ReceiveService::commit), other than
+    ///   the errors of steps in flight and of hooks. These include
+    ///   [`Error::LockTimeout`] for the update lock.
+    /// - [`push::Error::Aborted`] inside [`Error::Push`] if the sender
+    ///   abandons an object: the abandon marker and then `Abort` inside the
+    ///   object.
+    /// - [`Error::Io`] of kind `UnexpectedEof` if `input` ends before
+    ///   `Commit` is complete.
+    /// - [`Error::Io`] if a read of `input` fails.
+    /// - An I/O error from the file system, if a step of the transaction
+    ///   fails.
     pub async fn receive_stream<R>(&self, input: R, policy: &ReceivePolicy) -> Result<ReceiveReport>
     where
         R: AsyncRead + Unpin + Send,
@@ -65,8 +121,10 @@ impl Repo {
     }
 }
 
-/// `policy` with no server key and no summary step: the `signers` of each
-/// rule and `summary_signers` are empty, and `update_summary` is false.
+/// Returns a copy of `policy` with no server key and no summary step.
+///
+/// The `signers` of each rule and `summary_signers` are empty, and
+/// `update_summary` is `false`.
 fn one_way_policy(policy: &ReceivePolicy) -> ReceivePolicy {
     let rule = |rule: &ReceiveRule| ReceiveRule {
         signers: Vec::new(),
@@ -112,8 +170,8 @@ where
         }
     };
     check_updates(&request)?;
-    // The bytes after `Commit` are not frames: each one is `protocol`, also
-    // one that does not make a whole frame.
+    // Any byte after `Commit` is `protocol`, also bytes that do not make a
+    // whole frame.
     let mut rest = reader.into_inner();
     match rest.fill_buf().await {
         Ok([]) => {}
@@ -129,8 +187,10 @@ where
     core.finish(request).await
 }
 
-/// A one-way sender cannot learn the current tips, so each update expects
-/// its ref absent or takes any state, and sets a new commit.
+/// Checks that each update of `request` expects its ref absent or takes any
+/// state, and sets a new commit.
+///
+/// A one-way sender cannot learn the current tips of the refs.
 fn check_updates(request: &CommitRequest) -> std::result::Result<(), Failure> {
     for update in &request.updates {
         if let Expected::Commit(_) = update.expected {
@@ -149,7 +209,8 @@ fn check_updates(request: &CommitRequest) -> std::result::Result<(), Failure> {
     Ok(())
 }
 
-/// The future of a one-way stream can run on a thread pool.
+// A compile-time check that the future of a one-way stream is `Send`, so
+// that it can run on a thread pool.
 const _: fn() = || {
     fn assert_send<T: Send>(_: T) {}
     let _ = |repo: &Repo, policy: &ReceivePolicy| {

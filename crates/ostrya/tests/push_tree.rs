@@ -1,11 +1,15 @@
-//! The tree walk of `ostrya::push::tree` against the ingest of
-//! `write_dfd_to_mtree`: the root checksums of the two agree over the same
-//! tree, with extended attributes skipped, with and without canonical
-//! permissions, and with a skipped directory. The tree model as the object
-//! source of a push to `Repo::receive` over two in-process pipes. The tree
-//! push of `push_tree_over_stream` to `Repo::receive`: its commit against
-//! `Transaction::write_commit`, the refs it sets, the objects it sends, the
-//! refusal of mixed ref states, its signatures, and its progress phases.
+//! Tests of the tree push of `ostrya::push`. The file has three parts:
+//!
+//! - The tree walk of `ostrya::push::tree` against the ingest of
+//!   `write_dfd_to_mtree`. The two give the same root checksums over the same
+//!   tree. The tests skip extended attributes, run with and without canonical
+//!   permissions, and skip a directory.
+//! - The tree model as the object source of a push to `Repo::receive` over
+//!   two in-process pipes.
+//! - The tree push of `push_tree_over_stream` to `Repo::receive`. The tests
+//!   compare its commit with the commit of `Transaction::write_commit`. They
+//!   check the refs that it sets, the objects that it sends, the refusal of
+//!   mixed ref states, its signatures, and its progress phases.
 
 #![cfg(all(feature = "push", feature = "receive"))]
 
@@ -57,10 +61,13 @@ fn build_fixture_source(base: &Path) -> PathBuf {
     src
 }
 
-/// A tree with nested and empty directories, a setgid directory, files at
-/// several modes, an empty file, a file over three hash chunks, duplicate
-/// content, a hard link, a symlink to a directory, and names whose listing
-/// order differs from their byte order, under `base/src`.
+/// Builds a source tree under `base/src` and returns its path. The tree holds:
+///
+/// - nested and empty directories, and a setgid directory
+/// - files at several modes, an empty file, and a file over three hash chunks
+/// - duplicate content and a hard link
+/// - a symlink to a directory
+/// - names whose listing order differs from their byte order
 fn build_rich_source(base: &Path) -> PathBuf {
     let src = base.join("src");
     std::fs::create_dir_all(src.join("nested/deeper/deepest")).unwrap();
@@ -91,8 +98,10 @@ fn build_rich_source(base: &Path) -> PathBuf {
     src
 }
 
-/// A filter that gives each entry the canonical permissions: owner 0:0, and
-/// the permission bits masked with 0755 for a regular file and a directory.
+/// Returns a filter that gives each entry the canonical permissions.
+///
+/// The filter sets the owner to 0:0. For each entry that is not a symlink, it
+/// masks the permission bits with 0755.
 fn canonical() -> EntryFilter {
     Box::new(|_path, meta| {
         meta.uid = 0;
@@ -156,9 +165,10 @@ async fn scan(src: &Path, entry_filter: Option<EntryFilter>) -> (Checksum, Check
     (model.root_dirtree(), model.root_dirmeta())
 }
 
-/// The walk and the ingest agree over the tree `build` makes, with no filter
-/// against `SKIP_XATTRS`, and with the canonical filter against
-/// `SKIP_XATTRS | CANONICAL_PERMISSIONS`. Gives the canonical checksums.
+/// Checks that the walk and the ingest give the same root checksums over the
+/// tree that `build` makes. The walk with no filter runs against
+/// `SKIP_XATTRS`. The walk with the canonical filter runs against
+/// `SKIP_XATTRS | CANONICAL_PERMISSIONS`. Returns the canonical checksums.
 fn agree_over(tag: &str, build: fn(&Path) -> PathBuf) -> (Checksum, Checksum) {
     let tmp = TmpDir::new(tag);
     let base = tmp.path();
@@ -228,11 +238,12 @@ fn a_skipped_directory_leaves_out_its_subtree_as_the_ingest_does() {
 // The tree model as the source of a push.
 // ---------------------------------------------------------------------------
 
-/// The ref each push sets.
+/// The ref that each push sets.
 const REF: &str = "tree/main";
 
-/// Scan `src` with the canonical filter, and give the model a commit over its
-/// roots with a detached dict. Gives the model and the commit checksum.
+/// Scans `src` with the canonical filter and gives the model a commit over
+/// its roots, with a detached metadata dict. Returns the model and the commit
+/// checksum.
 fn scan_and_commit(src: &Path) -> (TreeModel, Checksum) {
     let options = ScanOptions {
         entry_filter: Some(canonical()),
@@ -258,8 +269,8 @@ fn scan_and_commit(src: &Path) -> (TreeModel, Checksum) {
     (model, commit)
 }
 
-/// One push of `commit` from `model` into `repo`, which sets `REF` from
-/// absent.
+/// Pushes `commit` from `model` into `repo`. The push sets `REF` and expects
+/// it to be absent.
 fn push(
     repo: &Repo,
     model: &TreeModel,
@@ -336,9 +347,9 @@ fn a_push_of_the_tree_model_commits_and_sets_its_ref() {
     }
 }
 
-/// Scan the fixture tree, run `change` on its file `hello.txt`, and push.
-/// Gives the server error and the client error, after it checks that the
-/// ref stayed absent.
+/// Scans the fixture tree, runs `change` on its file `hello.txt`, and pushes.
+/// Checks that the ref is still absent. Returns the server error and the
+/// client error.
 fn push_after_change(
     tag: &str,
     mode: RepoMode,
@@ -461,7 +472,7 @@ fn tree_options(refs: &[&str]) -> TreePushOptions {
 type Hook = Box<dyn FnOnce() + Send>;
 
 /// The input stream of the client, which runs a hook at its first read. The
-/// push reads first after the scan and `Hello`.
+/// first read of the push comes after the scan and `Hello`.
 struct FirstRead {
     inner: PipeReader,
     hook: Option<Hook>,
@@ -504,8 +515,8 @@ fn tree_push(
     ))
 }
 
-/// A tree push that succeeds. Gives the commit, after it checks the outcome
-/// against the report of the server.
+/// Runs a tree push that must succeed. Checks the outcome against the report
+/// of the server. Returns the commit and the outcome.
 fn pushed(repo: &Repo, src: &Path, opts: TreePushOptions, what: &str) -> (Checksum, PushOutcome) {
     let (report, client) = tree_push(repo, src, opts, None);
     let report = report.unwrap_or_else(|e| panic!("{what}: {e}"));
@@ -522,10 +533,11 @@ fn named_ref(repo: &Repo, name: &str) -> Option<String> {
     std::fs::read_to_string(repo.path().join("refs/heads").join(name)).ok()
 }
 
-/// The commit `Transaction::write_commit` writes over `base/src`, ingested
-/// with canonical permissions and no extended attributes into the new
-/// archive repository `base/<repo>`, with `parent`, `metadata`, and the
-/// subject, the body, and the timestamp of these tests.
+/// Writes a commit with `Transaction::write_commit` and returns its checksum.
+/// The commit holds `base/src`, ingested with canonical permissions and no
+/// extended attributes into the new archive repository `base/<repo>`. The
+/// commit has `parent`, `metadata`, and the subject, the body, and the
+/// timestamp of these tests.
 async fn local_commit(
     base: &Path,
     repo: &str,
@@ -716,9 +728,9 @@ fn a_second_tree_push_sends_only_the_commit() {
     assert_eq!(named_ref(&repo, REF), Some(format!("{second}\n")));
 }
 
-/// A target ref of 64 lowercase hex characters, which a revision reads as a
-/// commit checksum, is refused before the scan. The server writes no ref and
-/// no object.
+/// The push refuses a target ref of 64 lowercase hex characters before the
+/// scan, because a revision reads it as a commit checksum. The server writes
+/// no ref and no object.
 #[test]
 fn a_target_ref_of_64_lowercase_hex_characters_is_refused() {
     let tmp = TmpDir::new("push-tree-hex-ref");
@@ -887,8 +899,8 @@ fn the_signatures_follow_the_detached_entries_of_the_caller_in_signer_order() {
     assert!(outcome.valid, "{outcome:?}");
 }
 
-/// The content bytes a tree push reads end at the byte total of its model,
-/// raw and deflated.
+/// At the end of a tree push, the count of content bytes equals the byte
+/// total of its model, with raw and with deflated objects.
 #[test]
 fn the_content_bytes_of_a_tree_push_end_at_the_byte_total() {
     for (tag, compression) in [

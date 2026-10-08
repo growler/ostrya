@@ -1,5 +1,8 @@
-//! The union merge of an incoming detached-metadata dict into the dict the
-//! receiving repository holds for the same commit.
+//! The union merge of an incoming detached-metadata dict into the dict that
+//! the receiving repository holds for the same commit.
+//!
+//! The public text of the merge rules is on `Repo::receive`, under
+//! `# Detached metadata merge`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -7,11 +10,10 @@ use ostrya_core::{ArrayIter, GvDecode, GvEncode, GvType, Type, Value, VariantByt
 
 use crate::error::{Error, Result};
 
-/// The detached-metadata keys whose value is a list of signatures, each an
-/// `aay`. The merge takes the union of the stored list and the incoming list
-/// under these keys.
+/// The detached-metadata keys whose value is a list of signatures, an `aay`.
 ///
-/// The list does not depend on the engines this build has, so a build without
+/// Under these keys, the merge takes the union of the stored list and the
+/// incoming list. The list is the same in each build. A build without
 /// `sign-spki` keeps the stored `ostree.sign.spki` signatures and adds the
 /// incoming ones.
 pub(crate) const SIGNATURE_KEYS: [&str; 4] = [
@@ -23,45 +25,59 @@ pub(crate) const SIGNATURE_KEYS: [&str; 4] = [
 
 /// The GVariant type of a signature list.
 const SIGNATURE_ARRAY: &str = "aay";
-/// How a refusal names each input.
+/// The name of the incoming dict in an error message.
 const INCOMING: &str = "the incoming detached metadata";
+/// The name of the stored dict in an error message.
 const STORED: &str = "the stored detached metadata";
+/// The name of a host entry in an error message.
 const HOST: &str = "a detached-metadata entry of the host";
 
-/// Merge the `a{sv}` dict `incoming` into `stored`, the dict the repository
-/// holds for the same commit, and give the merged dict.
+/// Merges the `a{sv}` dict `incoming` into `stored` and returns the merged dict.
 ///
-/// `stored` is `None` where the repository holds no detached metadata for the
-/// commit, or holds the zero-length "no metadata" marker. The merged dict has
-/// the stored keys first, in the stored order, and then each key only the
-/// incoming dict holds, in the incoming order.
+/// `stored` is the dict that the repository holds for the same commit. It is
+/// `None` if the repository holds no detached metadata for the commit, or
+/// holds the zero-length "no metadata" marker.
+///
+/// # Merge rules
+///
+/// The merged dict has the stored keys first, in the stored order. Then it
+/// has each key that only the incoming dict holds, in the incoming order.
 ///
 /// - Under a key of [`SIGNATURE_KEYS`], the value is the union of the two
-///   lists: the stored blobs in the stored order, then each incoming blob that
-///   is not byte-equal to a blob already in the list. A duplicate the stored
-///   list already holds stays as it is.
-/// - Under a key of `keep` that the stored dict holds, the stored value stays,
-///   and the incoming value is dropped. A key of `keep` that the stored dict
-///   does not hold is added as each other incoming key is.
-/// - Under any other key, the incoming value replaces the stored value, at the
-///   position of the stored key.
-/// - A key only the stored dict holds stays.
+///   lists. The union holds the stored blobs in the stored order. Then it
+///   holds each incoming blob that is not byte-equal to a blob already in the
+///   list. A duplicate in the stored list stays.
+/// - Under a key of `keep` that the stored dict holds, the stored value stays
+///   and the merge drops the incoming value. If the stored dict does not hold
+///   a key of `keep`, the merge adds the incoming entry as for each other new
+///   key.
+/// - Under each other key, the incoming value replaces the stored value, at
+///   the position of the stored key.
+/// - A key that only the stored dict holds stays.
 ///
-/// Refused as [`Error::InvalidFormat`]: an input that is not an array of
-/// `{sv}` entries, an incoming dict that holds one key twice, and a value under
-/// a signature key that is not an `aay`, on either side. The type of a
-/// signature value is checked, so a stored list the merge cannot extend is
-/// refused and not replaced.
+/// # Size and filter
 ///
-/// The merged dict can be larger than either input. The caller refuses a
-/// merged dict whose serialized form is over
-/// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) before it writes it. This
-/// function applies no `detached-metadata-exclude` filter: the caller filters
-/// the incoming dict first.
+/// The merged dict can be larger than either input. If its serialized form is
+/// over [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), the caller refuses it
+/// before the write. This function applies no filter. The caller applies the
+/// `detached-metadata-exclude` filter to the incoming dict before the merge.
+///
+/// # Cost
 ///
 /// The merge moves the entries and the blobs of both inputs into the merged
-/// dict and copies no blob. Its time is linear in the number of keys and
-/// blobs of the two inputs.
+/// dict. It copies no blob. Its time is linear in the number of keys and blobs
+/// of the two inputs.
+///
+/// # Errors
+///
+/// The function returns [`Error::InvalidFormat`] for each of these inputs:
+///
+/// - an input that is not an array of `{sv}` entries
+/// - an incoming dict that holds one key twice
+/// - a value under a signature key that is not an `aay`, in either dict
+///
+/// The merge checks the type of a stored signature value too. It refuses a
+/// stored list that it cannot extend, and does not replace it.
 pub(crate) fn merge_detached(
     stored: Option<Value>,
     incoming: Value,
@@ -81,9 +97,9 @@ pub(crate) fn merge_detached(
         Some(stored) => dict_entries(stored, STORED)?,
         None => Vec::new(),
     };
-    // The position of each stored key in `merged`. A key the stored dict holds
-    // twice maps to its first entry. The incoming keys are distinct, so the
-    // loop never looks up a key that it appends.
+    // The position of each stored key in `merged`. A key that the stored dict
+    // holds twice maps to its first entry. The incoming keys are distinct, so
+    // the loop never looks up a key that it appends.
     let mut positions: HashMap<String, usize> = HashMap::with_capacity(merged.len());
     for (position, (key, _)) in merged.iter().enumerate() {
         positions.entry(key.clone()).or_insert(position);
@@ -114,17 +130,21 @@ pub(crate) fn merge_detached(
     ))
 }
 
-/// The serialized dict `incoming` with the entries of `host` in place of each
-/// entry of the same key, building no value. `incoming` is `None` where there
-/// is no incoming dict, and each dict of `host` holds one entry.
+/// Returns the serialized dict `incoming` with the `host` entries in place of
+/// the entries of the same keys.
 ///
-/// The dict holds each entry of `incoming` whose key no dict of `host` holds,
-/// in the incoming order, and then the entries of `host`, in order. Each
-/// entry is copied as its bytes, in one pass over the inputs, and the bytes
-/// are those that the serialization of the same dict gives. The caller has
-/// checked each dict of `host` as an `a{sv}` in normal form, and it is read
-/// with no second check. Refused as [`Error::InvalidFormat`]: an `incoming`
-/// that is not an `a{sv}` in normal form.
+/// `incoming` is `None` if there is no incoming dict. Each dict of `host`
+/// holds one entry. The function builds no value.
+///
+/// The output holds each entry of `incoming` whose key no dict of `host`
+/// holds, in the incoming order. Then it holds the entries of `host`, in
+/// order. The function copies each entry as its bytes, in one pass over the
+/// inputs. The output bytes are the bytes of the serialization of the same
+/// dict.
+///
+/// The caller checked each dict of `host` as an `a{sv}` in normal form, so
+/// the function reads it with no second check. If `incoming` is not an
+/// `a{sv}` in normal form, the function returns [`Error::InvalidFormat`].
 pub(crate) fn replace_entries(incoming: Option<&[u8]>, host: &[Vec<u8>]) -> Result<Vec<u8>> {
     let mut replacing = Vec::with_capacity(host.len());
     for dict in host {
@@ -163,9 +183,11 @@ pub(crate) fn replace_entries(incoming: Option<&[u8]>, host: &[Vec<u8>]) -> Resu
     Ok(out)
 }
 
-/// The number of entries of `bytes`, a serialized `a{sv}` checked in normal
-/// form, from its framing offsets: the last offset is the end of the last
-/// entry, and the offsets take the bytes after it, one for each entry.
+/// Returns the number of entries of `bytes`, from its framing offsets.
+///
+/// `bytes` is a serialized `a{sv}` that the caller checked in normal form. The
+/// last offset is the end of the last entry. The offsets take the bytes after
+/// that end, one offset for each entry.
 fn entry_count(bytes: &[u8]) -> usize {
     let z = ostrya_core::offset_size_for(bytes.len());
     let Some(last) = bytes.len().checked_sub(z) else {
@@ -177,12 +199,15 @@ fn entry_count(bytes: &[u8]) -> usize {
     bytes.len().saturating_sub(end) / z
 }
 
-/// Check, building no value, that [`merge_detached`] takes the serialized
-/// dict `bytes` as its incoming dict: an `a{sv}` in normal form that holds
-/// each key once, with an `aay` under each key of [`SIGNATURE_KEYS`].
+/// Checks that [`merge_detached`] accepts the serialized dict `bytes` as its
+/// incoming dict.
 ///
-/// The check applies the limits of the parser, and its memory grows with the
-/// number of keys alone. Refused as [`Error::InvalidFormat`].
+/// The dict must be an `a{sv}` in normal form that holds each key once, with
+/// an `aay` under each key of [`SIGNATURE_KEYS`]. If a check fails, the
+/// function returns [`Error::InvalidFormat`].
+///
+/// The check builds no value. It applies the limits of the parser. Its memory
+/// grows with the number of keys only.
 pub(crate) fn check_incoming(bytes: &[u8]) -> Result<()> {
     let mut seen = HashSet::new();
     for entry in entries_in_place(bytes, INCOMING)? {
@@ -199,9 +224,12 @@ pub(crate) fn check_incoming(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// The keys of [`SIGNATURE_KEYS`] that `bytes`, a serialized incoming dict,
-/// holds, as one flag for each key, in the order of the list. A dict that is
-/// not an `a{sv}` in normal form is refused as [`Error::InvalidFormat`].
+/// Returns the keys of [`SIGNATURE_KEYS`] that the serialized incoming dict
+/// `bytes` holds.
+///
+/// The result has one flag for each key, in the order of the list. If the dict
+/// is not an `a{sv}` in normal form, the function returns
+/// [`Error::InvalidFormat`].
 pub(crate) fn signature_keys_in(bytes: &[u8]) -> Result<[bool; SIGNATURE_KEYS.len()]> {
     let mut held = [false; SIGNATURE_KEYS.len()];
     for entry in entries_in_place(bytes, INCOMING)? {
@@ -213,15 +241,19 @@ pub(crate) fn signature_keys_in(bytes: &[u8]) -> Result<[bool; SIGNATURE_KEYS.le
     Ok(held)
 }
 
-/// Check, building no value, that an edit accepts `stored`, the serialized
-/// dict the repository holds: an `a{sv}` in normal form whose first entry
-/// under each key of [`SIGNATURE_KEYS`] that `touched` flags holds an `aay`.
-/// A key is touched when the incoming dict holds it or a signature is
-/// appended under it, which are the two steps that extend the stored list.
+/// Checks that an edit accepts `stored`, the serialized dict that the
+/// repository holds.
 ///
-/// This is the refusal of [`merge_detached`] and of the signature append for
-/// the stored dict, so an edit that passes the check does not fail on the
-/// stored dict at the write. Refused as [`Error::InvalidFormat`].
+/// The dict must be an `a{sv}` in normal form. For each key of
+/// [`SIGNATURE_KEYS`] that `touched` flags, the first entry under the key must
+/// hold an `aay`. A key is touched if the incoming dict holds it, or if the
+/// edit appends a signature under it. These are the two steps that extend the
+/// stored list.
+///
+/// The check builds no value. It applies the stored-dict refusals of
+/// [`merge_detached`] and of the signature append. An edit that passes the
+/// check does not fail on the stored dict at the write. If a check fails, the
+/// function returns [`Error::InvalidFormat`].
 pub(crate) fn check_stored(stored: &[u8], touched: [bool; SIGNATURE_KEYS.len()]) -> Result<()> {
     let mut checked = [false; SIGNATURE_KEYS.len()];
     for entry in entries_in_place(stored, STORED)? {
@@ -237,8 +269,10 @@ pub(crate) fn check_stored(stored: &[u8], touched: [bool; SIGNATURE_KEYS.len()])
     Ok(())
 }
 
-/// The `{sv}` entries of the serialized dict `bytes`, read in place after a
-/// check of the whole dict. `subject` names the dict in a refusal.
+/// Returns the `{sv}` entries of the serialized dict `bytes`, read in place.
+///
+/// The function checks the whole dict before it reads the entries. `subject`
+/// names the dict in an error message.
 fn entries_in_place<'a>(
     bytes: &'a [u8],
     subject: &str,
@@ -248,13 +282,15 @@ fn entries_in_place<'a>(
     ArrayIter::decode(bytes).map_err(|e| not_a_dict(subject, e))
 }
 
-/// The refusal of a dict that is not an `a{sv}` in normal form.
+/// Returns the error for a dict that is not an `a{sv}` in normal form.
 fn not_a_dict(subject: &str, e: impl std::fmt::Display) -> Error {
     Error::InvalidFormat(format!("{subject} is not a dict `a{{sv}}`: {e}"))
 }
 
-/// The `{sv}` entries of an `a{sv}` dict, each as its key and its variant,
-/// moved out of the dict. `subject` names the dict in a refusal.
+/// Moves the `{sv}` entries out of an `a{sv}` dict, each as its key and its
+/// variant.
+///
+/// `subject` names the dict in an error message.
 fn dict_entries(dict: Value, subject: &str) -> Result<Vec<(String, Value)>> {
     let Value::Array(entries) = dict else {
         return Err(Error::InvalidFormat(format!("{subject} is not a dict")));
@@ -275,16 +311,18 @@ fn dict_entries(dict: Value, subject: &str) -> Result<Vec<(String, Value)>> {
         .collect()
 }
 
-/// The refusal of a signature value that is not an `aay`. `subject` names the
-/// dict the value comes from.
+/// Returns the error for a signature value that is not an `aay`.
+///
+/// `subject` names the dict that holds the value.
 fn not_aay(key: &str, subject: &str) -> Error {
     Error::InvalidFormat(format!(
         "{subject} holds '{key}' as a value that is not `aay`"
     ))
 }
 
-/// The blobs of one signature list, a variant holding an `aay`, for the merge
-/// to extend in place.
+/// Returns the blobs of one signature list, for the merge to extend in place.
+///
+/// The list is a variant that holds an `aay`.
 fn signature_list<'a>(
     value: &'a mut Value,
     key: &str,
@@ -300,8 +338,7 @@ fn signature_list<'a>(
     Err(not_aay(key, subject))
 }
 
-/// The blobs of one signature list, a variant holding an `aay`, moved out of
-/// the value.
+/// Moves the blobs out of one signature list, a variant that holds an `aay`.
 fn signature_blobs(value: Value, key: &str, subject: &str) -> Result<Vec<Vec<u8>>> {
     if let Value::Variant(inner) = value
         && let (ty, Value::Array(blobs)) = *inner
@@ -318,9 +355,12 @@ fn signature_blobs(value: Value, key: &str, subject: &str) -> Result<Vec<Vec<u8>
     Err(not_aay(key, subject))
 }
 
-/// Append to `list` each blob of `incoming` that no blob of `list` equals
-/// byte for byte, in the incoming order. A duplicate `list` already holds
-/// stays as it is.
+/// Appends to `list` each blob of `incoming` that is not byte-equal to a blob
+/// of `list`.
+///
+/// The function appends the blobs in the incoming order. If two incoming
+/// blobs are byte-equal, it appends the first one only. A duplicate that
+/// `list` already holds stays.
 fn union(list: &mut Vec<Value>, incoming: Vec<Vec<u8>>) {
     let fresh: Vec<bool> = {
         let mut seen: HashSet<&[u8]> = list
@@ -340,7 +380,7 @@ fn union(list: &mut Vec<Value>, incoming: Vec<Vec<u8>>) {
     );
 }
 
-/// A signature list as the variant a dict entry holds.
+/// Returns a signature list as the variant that a dict entry holds.
 fn signature_value(list: Vec<Value>) -> Result<Value> {
     let ty = Type::parse(SIGNATURE_ARRAY).map_err(ostrya_core::Error::from)?;
     Ok(Value::variant(ty, Value::Array(list)))
@@ -404,7 +444,8 @@ mod tests {
         assert_eq!(blobs(&merged, ED), [b"A".to_vec(), b"B".to_vec()]);
     }
 
-    /// An incoming signature byte-equal to a stored one is not added twice.
+    /// The union holds one copy of a signature that is byte-equal to a stored
+    /// one or to another incoming one.
     #[test]
     fn a_byte_equal_signature_is_added_once() {
         let merged = merge_detached(
@@ -423,7 +464,7 @@ mod tests {
         .unwrap();
         assert_eq!(blobs(&merged, ED), [b"A".to_vec(), b"B".to_vec()]);
 
-        // A duplicate the stored list holds stays as it is.
+        // A duplicate that the stored list holds stays.
         let merged = merge_detached(
             Some(dict(vec![(ED, sigs(&[b"A", b"A"]))])),
             dict(vec![(ED, sigs(&[b"A"]))]),
@@ -433,8 +474,8 @@ mod tests {
         assert_eq!(blobs(&merged, ED), [b"A".to_vec(), b"A".to_vec()]);
     }
 
-    /// Every signature key takes the union, also one this build has no engine
-    /// for.
+    /// Every signature key takes the union, also a key that this build has no
+    /// engine for.
     #[test]
     fn every_signature_key_takes_the_union() {
         for key in SIGNATURE_KEYS {
@@ -448,9 +489,9 @@ mod tests {
         }
     }
 
-    /// Another key takes the incoming value at the stored position, a key only
-    /// the stored dict holds stays, and a key only the incoming dict holds
-    /// comes after the stored keys, in the incoming order.
+    /// Another key takes the incoming value at the stored position. A key that
+    /// only the stored dict holds stays. A key that only the incoming dict
+    /// holds comes after the stored keys, in the incoming order.
     #[test]
     fn other_keys_take_the_incoming_value() {
         let stored = dict(vec![
@@ -500,8 +541,8 @@ mod tests {
     }
 
     /// Under a key of `keep` that the stored dict holds, the stored value
-    /// stays. A key of `keep` that the stored dict does not hold is added,
-    /// and each other key takes the incoming value.
+    /// stays. The merge adds a key of `keep` that the stored dict does not
+    /// hold. Each other key takes the incoming value.
     #[test]
     fn a_kept_key_keeps_the_stored_value() {
         let stored = dict(vec![("u", number(1)), ("o", number(2))]);
@@ -525,10 +566,10 @@ mod tests {
     }
 
     /// The dict that [`replace_entries`] writes is the serialization of the
-    /// same dict: with no incoming dict, with each incoming key replaced, and
-    /// with the kept incoming entries first, for dicts whose framing offsets
-    /// take 1, 2, and 4 bytes. The count of entries read from the framing
-    /// offsets is exact for each of them.
+    /// same dict. The test covers three cases: no incoming dict, each incoming
+    /// key replaced, and the kept incoming entries first. Each case runs for
+    /// dicts whose framing offsets take 1, 2, and 4 bytes. The count of
+    /// entries read from the framing offsets is exact for each dict.
     #[test]
     fn replaced_entries_give_the_serialized_dict() {
         for len in [0, 1, 7, 100, 200, 300, 70_000] {
@@ -567,14 +608,15 @@ mod tests {
             replace_entries(None, &[]).unwrap(),
             bytes(&dict(Vec::new()))
         );
-        // An input that is not an `a{sv}` is refused.
+        // The function refuses an input that is not an `a{sv}`.
         assert!(matches!(
             replace_entries(Some(b"\x01"), &[]),
             Err(Error::InvalidFormat(_))
         ));
     }
 
-    /// Each malformed input is refused by what is wrong with it.
+    /// The merge refuses each malformed input with a message that names the
+    /// fault.
     #[test]
     fn malformed_inputs_are_refused() {
         let refused = |stored: Option<Value>, incoming: Value, part: &str| {
@@ -606,7 +648,7 @@ mod tests {
             ])]),
             "not `{sv}`",
         );
-        // A key the incoming dict holds twice.
+        // A key that the incoming dict holds twice.
         refused(
             None,
             dict(vec![("x", number(1)), ("x", number(2))]),

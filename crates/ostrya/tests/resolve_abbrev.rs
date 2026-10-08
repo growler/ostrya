@@ -1,12 +1,15 @@
-//! Abbreviated-checksum resolution.
+//! Tests of the resolution of an abbreviated checksum.
 //!
 //! A revision shorter than a full checksum names the one commit object whose
 //! checksum starts with it. These tests pin the rule at the library boundary:
-//! which objects the match set holds, what a prefix more than one commit carries
-//! reports, and where the scan stands against the ref store. The behavior was
-//! recovered from the `ostree` tool as a black box and is stated in
-//! `docs/format-reference.md`, "Revision syntax"; the invocation-level comparison
-//! against the tool is in `crates/ostrya-cli/tests/cli.rs`.
+//!
+//! - which objects the match set holds
+//! - what a prefix reports if more than one commit carries it
+//! - where the scan stands against the ref store
+//!
+//! The rule is observed behavior of the `ostree` command. The comparison with
+//! the `ostree` command at the command line is in
+//! `crates/ostrya-cli/tests/cli.rs`.
 
 mod common;
 
@@ -20,10 +23,12 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// Commit a one-file tree whose content is `body`, on `branch`, parented on
-/// `parent`. The timestamp varies with the body so each commit is a distinct
-/// object, and the walk uses canonical permissions so the objects do not depend
-/// on the test environment.
+/// Commits a one-file tree with the content `body` on `branch`, with the
+/// parent `parent`.
+///
+/// The timestamp changes with the body, so each commit is a distinct object.
+/// The walk uses canonical permissions, so the objects do not depend on the
+/// test environment.
 async fn commit_body(
     repo: &Repo,
     base: &Path,
@@ -61,9 +66,11 @@ async fn commit_body(
     commit
 }
 
-/// Commit bodies until two commits share their first hex character, returning
-/// that character. The checksums are content-addressed, so the collision is
-/// found by committing rather than chosen.
+/// Commits bodies until two commits share their first hex character, and
+/// returns that character.
+///
+/// The checksums are content-addressed, so the test cannot choose a collision.
+/// It commits until a collision occurs.
 async fn ambiguous_prefix(repo: &Repo, base: &Path) -> String {
     let mut seen: Vec<Checksum> = Vec::new();
     for n in 0..400 {
@@ -100,8 +107,8 @@ fn an_abbreviated_checksum_resolves_at_every_length() {
                 "prefix of {len} characters"
             );
         }
-        // The full checksum keeps resolving to itself, and one character more
-        // is a ref name that names nothing.
+        // The full checksum resolves to itself. With one more character, the
+        // revision is a ref name that names nothing.
         assert_eq!(repo.resolve_rev(&hex, false).await.unwrap(), Some(commit));
         assert!(matches!(
             repo.resolve_rev(&format!("{hex}a"), false).await,
@@ -133,8 +140,8 @@ fn the_match_set_holds_commit_objects_alone() {
         .unwrap();
         let commit = commit_body(&repo, tmp.path(), "only", "one\n", None).await;
 
-        // Every other object in the store is unreachable by prefix, whatever
-        // its type, and a prefix no object carries is a ref name.
+        // No other object in the store resolves by prefix, whatever its type.
+        // A prefix that no commit carries is a ref name.
         let objects = repo.list_objects().await.unwrap();
         let mut others = 0;
         for name in &objects {
@@ -174,8 +181,8 @@ fn a_prefix_more_than_one_commit_carries_is_ambiguous() {
         .unwrap();
         let prefix = ambiguous_prefix(&repo, tmp.path()).await;
 
-        // Ambiguity is an error whatever `allow_noent` says: the name is not an
-        // absent one.
+        // Ambiguity is an error for each value of `allow_noent`, because the
+        // name matches more than one commit.
         for allow_noent in [false, true] {
             let err = repo.resolve_rev(&prefix, allow_noent).await.unwrap_err();
             assert!(
@@ -183,8 +190,8 @@ fn a_prefix_more_than_one_commit_carries_is_ambiguous() {
                 "allow_noent = {allow_noent}: {err}"
             );
         }
-        // The ancestry suffix reports the same failure: nothing was resolved to
-        // walk back from.
+        // The ancestry suffix reports the same failure, because the prefix
+        // resolves to no commit to walk back from.
         assert!(matches!(
             repo.resolve_rev(&format!("{prefix}^"), true).await,
             Err(Error::AmbiguousRefspec(_))
@@ -205,8 +212,8 @@ fn a_prefix_stands_ahead_of_a_ref_of_the_same_name() {
         let first = commit_body(&repo, tmp.path(), "base", "one\n", None).await;
         let prefix = first.to_hex()[..4].to_owned();
 
-        // A hex name no commit begins with is a ref name, so the store carries
-        // one under that name.
+        // A hex name that no commit begins with is a ref name, so the store can
+        // hold a ref with that name.
         let free = "dddd";
         assert!(matches!(
             repo.resolve_rev(free, false).await,
@@ -215,9 +222,9 @@ fn a_prefix_stands_ahead_of_a_ref_of_the_same_name() {
         repo.set_ref_immediate(free, Some(&first)).await.unwrap();
         assert_eq!(repo.resolve_rev(free, false).await.unwrap(), Some(first));
 
-        // A ref whose name is a prefix of a commit resolves to that commit and
-        // not to the ref's own target, so the branch's tip is reached through
-        // the ref listing and not through its name.
+        // If the name of a ref is a prefix of a commit, the name resolves to
+        // that commit. The target of the ref is reachable only through the ref
+        // listing.
         let second = commit_body(&repo, tmp.path(), &prefix, "two\n", Some(first)).await;
         assert_ne!(first, second);
         assert_eq!(repo.resolve_rev(&prefix, false).await.unwrap(), Some(first));
@@ -240,8 +247,8 @@ fn a_ref_read_takes_no_prefix() {
         .unwrap();
         let commit = commit_body(&repo, tmp.path(), "base", "one\n", None).await;
 
-        // `list_refs` reports the ref store, so the branch keeps its own tip
-        // whatever a name would resolve to as a revision.
+        // `list_refs` reads the ref store, so it gives the tip of the branch,
+        // whatever the name resolves to as a revision.
         assert_eq!(
             repo.list_refs(None).await.unwrap(),
             vec![("base".to_owned(), commit)]

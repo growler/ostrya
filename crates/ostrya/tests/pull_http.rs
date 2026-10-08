@@ -1,16 +1,20 @@
 //! HTTP pull from a remote repository.
 //!
-//! Every test serves a repository directory from an in-process static file
-//! server, over cleartext HTTP/1.1 and, where the transport matters, over TLS
-//! with ALPN selecting HTTP/2. The source repositories are built with the port
-//! itself; the interop tests that need the `ostree` tool are skipped when it is
-//! absent.
+//! Each test serves a repository directory from an in-process static file
+//! server. The server uses cleartext HTTP/1.1. If the transport matters, it
+//! uses TLS, and ALPN selects HTTP/2.
 //!
-//! The server records the request paths it saw, which is what the request-set
-//! assertions read, the status it answered each with, which is what the status
-//! assertions read, how many requests were in flight at once, which is what the
-//! concurrency assertion reads, and how many connections it accepted, which is
-//! what the connection-reuse assertion reads.
+//! ostrya builds the source repositories. If the `ostree` command is absent,
+//! each interop test that needs it returns early.
+//!
+//! The server records these values for the assertions:
+//!
+//! - the request paths that it receives, for the request-set assertions
+//! - the status of each answer, for the status assertions
+//! - the peak number of requests in flight at one time, for the concurrency
+//!   assertion
+//! - the number of connections that it accepts, for the connection-reuse
+//!   assertion.
 
 mod common;
 #[path = "common/proxy.rs"]
@@ -38,9 +42,8 @@ use pull::*;
 
 // --- tests -----------------------------------------------------------------
 
-/// The base case: one ref, its commit, and its whole tree arrive, the ref lands
-/// under `refs/remotes/`, and a second pull of the unchanged ref fetches no
-/// object at all.
+/// A pull of one ref fetches its commit and its whole tree. The ref goes under
+/// `refs/remotes/`. A second pull of the unchanged ref fetches no object.
 #[test]
 fn pulls_a_ref_and_its_tree_then_fetches_nothing_the_second_time() {
     block_on(async {
@@ -74,8 +77,9 @@ fn pulls_a_ref_and_its_tree_then_fetches_nothing_the_second_time() {
         assert_eq!(stats.content_imported, 4);
         assert!(stats.metadata_imported >= 4);
 
-        // The order the tool's own pull asks in: the signature, the summary,
-        // the config, then the commit's detached metadata before the commit.
+        // The request order of a pull by the `ostree` command: the signature,
+        // the summary, the config, the detached metadata of the commit, and
+        // the commit.
         let seen = server.seen();
         assert_eq!(&seen[..3], ["summary.sig", "summary", "config"]);
         assert!(seen.contains(&meta_path(&commit, "commitmeta")));
@@ -87,10 +91,11 @@ fn pulls_a_ref_and_its_tree_then_fetches_nothing_the_second_time() {
             );
         }
 
-        // The statistics: every object came loose off the remote, the delta
-        // index was asked for, and the transferred count is the served bytes
-        // after the summary and the config. The payloads of the three regular
-        // files are 6, 18, and 7 bytes; the symlink counts nothing.
+        // The statistics: each object arrives as a loose object from the
+        // remote, and the pull requests the delta index. The transferred count
+        // is the sum of the served bytes after the summary and the config. The
+        // payloads of the three regular files are 6, 18, and 7 bytes. The
+        // symlink adds nothing.
         let served: u64 = seen[3..]
             .iter()
             .filter_map(|path| std::fs::metadata(dir.path().join("remote").join(path)).ok())
@@ -98,7 +103,8 @@ fn pulls_a_ref_and_its_tree_then_fetches_nothing_the_second_time() {
             .sum();
         assert_eq!(stats.bytes_transferred, served);
         assert_eq!(stats.content_fetched, 4);
-        // The delta index request counts whatever the answer, which is a 404.
+        // The delta index request counts as a fetch for each answer. Here it is
+        // a 404.
         assert!(seen.iter().any(|path| path.starts_with("delta-indexes/")));
         assert_eq!(stats.metadata_fetched, stats.metadata_imported + 1);
         assert_eq!(stats.delta_parts, 0);
@@ -110,8 +116,8 @@ fn pulls_a_ref_and_its_tree_then_fetches_nothing_the_second_time() {
         assert_eq!(snapshot.objects_done, snapshot.objects_total);
         assert!(!snapshot.scanning);
 
-        // A repeat pull re-reads what may have changed and stops at the commit
-        // it already holds: no object is fetched.
+        // A repeat pull reads again the files that can change, and stops at the
+        // commit that it holds. It fetches no object.
         server.forget();
         let repeated = dest
             .pull(
@@ -145,9 +151,9 @@ fn pulls_a_ref_and_its_tree_then_fetches_nothing_the_second_time() {
     });
 }
 
-/// The detached-metadata filter shapes what an HTTP pull stores, the same as it
-/// does for a local pull: the remote serves the whole `.commitmeta` and the
-/// destination keeps the properties the filter allows.
+/// The detached-metadata filter controls what an HTTP pull stores, as it does
+/// for a local pull. The remote serves the whole `.commitmeta`, and the
+/// destination keeps the properties that the filter allows.
 #[test]
 fn a_filter_shapes_the_detached_metadata_an_http_pull_stores() {
     block_on(async {
@@ -209,10 +215,10 @@ fn a_filter_shapes_the_detached_metadata_an_http_pull_stores() {
     });
 }
 
-/// An HTTP pull whose commit fails at the step that writes detached metadata
-/// and refs, because a guard holds the update lock, keeps the marker of the
-/// commit it published and writes no `.commitmeta` and no ref. The next pull
-/// completes the commit, its detached metadata included.
+/// A guard holds the update lock, so an HTTP pull fails at the step that writes
+/// detached metadata and refs. The pull keeps the marker of the commit that it
+/// published. It writes no `.commitmeta` and no ref. The next pull completes
+/// the commit, with its detached metadata.
 #[test]
 fn a_pull_that_times_out_at_the_ref_step_keeps_its_markers() {
     block_on(async {
@@ -273,10 +279,10 @@ fn a_pull_that_times_out_at_the_ref_step_keeps_its_markers() {
     });
 }
 
-/// An HTTP pull into one handle of a repository whose other handle holds a
-/// guard publishes its objects and waits at the step that writes detached
-/// metadata and refs. With `lock-timeout-secs=-1` it completes that step once
-/// the guard is finished.
+/// Two handles open one repository, and one handle holds a guard. An HTTP pull
+/// into the other handle publishes its objects. Then it waits at the step that
+/// writes detached metadata and refs. With `lock-timeout-secs=-1`, it completes
+/// that step after the guard is finished.
 #[test]
 fn a_pull_under_a_guard_publishes_its_objects_and_waits_at_the_ref_step() {
     block_on(async {
@@ -333,8 +339,8 @@ fn a_pull_under_a_guard_publishes_its_objects_and_waits_at_the_ref_step() {
     });
 }
 
-/// The same pull over TLS, where ALPN selects HTTP/2 and every object travels
-/// over one multiplexed connection.
+/// The same pull over TLS. ALPN selects HTTP/2, and all objects use one
+/// multiplexed connection.
 #[test]
 fn pulls_over_tls_with_http2() {
     block_on(async {
@@ -368,9 +374,10 @@ fn pulls_over_tls_with_http2() {
     });
 }
 
-/// An archive remote into each destination mode. Every destination lands the
-/// same commit and passes its own fsck, which for the bare family means the
-/// re-ingested objects hash to the names they arrived under.
+/// A pull from an archive remote into each destination mode. Each destination
+/// gets the same commit and passes its own fsck. For the bare family, this
+/// means that the objects ingested again hash to the names that they arrived
+/// under.
 #[test]
 fn pulls_an_archive_remote_into_every_destination_mode() {
     block_on(async {
@@ -380,8 +387,8 @@ fn pulls_an_archive_remote_into_every_destination_mode() {
             RepoMode::BareUserOnly,
             RepoMode::Bare,
         ] {
-            // A bare destination writes each object's own uid and gid, which
-            // for a canonically committed remote is root.
+            // A bare destination writes the uid and gid of each object. For a
+            // remote with canonical commits, both are root.
             if mode == RepoMode::Bare && !rustix::process::geteuid().is_root() {
                 eprintln!("skipping the bare destination: not running as root");
                 continue;
@@ -409,8 +416,8 @@ fn pulls_an_archive_remote_into_every_destination_mode() {
             let report = dest.fsck(&FsckOptions::default()).await.unwrap();
             assert!(report.is_ok(), "{mode:?}: {:?}", report.errors);
 
-            // The symlink object and the two regular files of differing modes
-            // all crossed, so the tree reads back whole.
+            // The symlink object and the two regular files with different modes
+            // all arrive, so the whole tree reads back.
             let (tree, _) = dest.read_commit(&commit.to_hex()).await.unwrap();
             let mut names: Vec<String> = tree
                 .read_dir()
@@ -431,8 +438,8 @@ fn pulls_an_archive_remote_into_every_destination_mode() {
     });
 }
 
-/// The tool reads what an HTTP pull wrote: it resolves the ref, passes its own
-/// fsck, and reads the tree back.
+/// The `ostree` command reads what an HTTP pull wrote. It resolves the ref,
+/// passes its own fsck, and reads the tree back.
 #[test]
 fn the_tool_reads_what_an_http_pull_wrote() {
     if !ostree_available() {
@@ -467,12 +474,14 @@ fn the_tool_reads_what_an_http_pull_wrote() {
     });
 }
 
-/// A pull reads a payload of several reads from a remote the `ostree` tool built.
+/// A pull reads a payload that takes several reads, from a remote that the
+/// `ostree` command built.
 ///
 /// The object is 256 KiB of incompressible content, so the streaming loop runs
-/// several iterations, the decoder's input buffer refills several times, and the
-/// end-of-stream check meets the framing the tool wrote. The tool judges what
-/// landed: it recomputes each object's checksum and reads the payload back.
+/// several iterations. The input buffer of the decoder refills several times.
+/// The end-of-stream check meets the framing that the `ostree` command wrote.
+/// The `ostree` command verifies the checksum of each object and reads the
+/// payload.
 #[test]
 fn pulls_a_multi_read_payload_from_a_tool_built_remote() {
     if !ostree_available() {
@@ -501,8 +510,8 @@ fn pulls_a_multi_read_payload_from_a_tool_built_remote() {
         .trim()
         .to_owned();
         ostree(&[&remote_arg, "summary", "-u"]);
-        // The premise of the test: one body is longer than one read of the
-        // receive path's 128 KiB payload buffer.
+        // The premise of the test: one body is longer than one read of the 128
+        // KiB payload buffer of the receive path.
         let largest = largest_filez(&remote);
         assert!(largest > 128 * 1024, "largest object is {largest} byte(s)");
 
@@ -535,13 +544,14 @@ fn pulls_a_multi_read_payload_from_a_tool_built_remote() {
     });
 }
 
-/// An archive-to-archive pull stores every `.filez` object exactly as the
-/// remote holds it, rather than inflating and recompressing it at the
-/// destination's own `zlib-level`. The destination is configured with a level
-/// far from the remote's default, over a payload long and repetitive enough
-/// that recompressing it at a different level would leave a visibly different
-/// byte sequence: a match here can only mean the fetched bytes were stored
-/// verbatim.
+/// An archive-to-archive pull stores each `.filez` object as the remote holds
+/// it. It does not inflate the object and compress it again at the `zlib-level`
+/// of the destination.
+///
+/// The destination sets a level far from the default level of the remote. The
+/// payload is long and repetitive, so a different level gives a visibly
+/// different byte sequence. A match shows that the destination stored the
+/// fetched bytes without change.
 #[test]
 fn an_archive_pull_reproduces_filez_bytes_at_a_different_zlib_level() {
     block_on(async {
@@ -603,11 +613,12 @@ fn an_archive_pull_reproduces_filez_bytes_at_a_different_zlib_level() {
     });
 }
 
-/// An archive-to-archive pull from a remote the `ostree` tool built stores
-/// every `.filez` object exactly as the tool wrote it. The tool's zlib encoder
-/// and the port's own raw-DEFLATE encoder are different implementations, so
-/// bytes that match can only mean the destination stored the fetched bytes
-/// verbatim rather than inflating and recompressing them.
+/// An archive-to-archive pull from a remote that the `ostree` command built
+/// stores each `.filez` object as the `ostree` command wrote it. The zlib
+/// encoder of the `ostree` command and the raw-DEFLATE encoder of ostrya are
+/// different implementations. If the bytes match, the destination stored the
+/// fetched bytes without change. It did not inflate them and compress them
+/// again.
 #[test]
 fn an_archive_pull_reproduces_filez_bytes_from_a_tool_built_remote() {
     if !ostree_available() {
@@ -674,10 +685,10 @@ fn an_archive_pull_reproduces_filez_bytes_from_a_tool_built_remote() {
     });
 }
 
-/// A bare-family destination still stores the inflated payload: the
-/// pass-through path applies only to an archive destination, so a bare-user
-/// destination's content object holds the plain, uncompressed bytes rather
-/// than the remote's raw-DEFLATE ones.
+/// A bare-family destination stores the inflated payload, because the
+/// pass-through path applies only to an archive destination. The content object
+/// of a bare-user destination holds the plain, uncompressed bytes. It does not
+/// hold the raw-DEFLATE bytes of the remote.
 #[test]
 fn a_bare_family_destination_still_stores_the_inflated_payload() {
     block_on(async {
@@ -718,9 +729,9 @@ fn a_bare_family_destination_still_stores_the_inflated_payload() {
     });
 }
 
-/// The declared size the pass-through path stores is held to equality, not
-/// treated as a ceiling: a payload that inflates to fewer bytes than its
-/// header declares is refused just as one that inflates to more is.
+/// The pass-through path holds the declared size to equality. The declared size
+/// is not a ceiling. If a payload inflates to fewer bytes than its header
+/// declares, the path refuses it, the same as a payload that inflates to more.
 #[test]
 fn a_payload_underrunning_its_declared_size_fails_the_pull() {
     block_on(async {
@@ -729,9 +740,9 @@ fn a_payload_underrunning_its_declared_size_fails_the_pull() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        // Replace a payload-bearing object's compressed bytes with a final
-        // stored DEFLATE block of one byte, leaving the header -- and the
-        // size it declares -- as they were.
+        // Replace the compressed bytes of an object with a payload by a final
+        // stored DEFLATE block of one byte. Keep the header and the size that
+        // it declares.
         let mut victim = None;
         for checksum in content_checksums(&remote, &commit).await {
             let path = filez_path(&checksum.to_hex());
@@ -745,8 +756,8 @@ fn a_payload_underrunning_its_declared_size_fails_the_pull() {
         let (path, stored) = victim.expect("the fixture tree holds a payload-bearing file");
         let header_len = u32::from_be_bytes(stored[..4].try_into().unwrap()) as usize;
         let mut tampered = stored[..8 + header_len].to_vec();
-        // A final stored block: BFINAL=1, BTYPE=00, then LEN=1, NLEN=!LEN, one
-        // byte of content.
+        // A final stored block: BFINAL=1, BTYPE=00, then LEN=1, NLEN=!LEN, and
+        // one byte of content.
         tampered.extend_from_slice(&[0x01, 0x01, 0x00, 0xfe, 0xff, b'x']);
         server.tamper(&path, tampered);
 
@@ -763,16 +774,16 @@ fn a_payload_underrunning_its_declared_size_fails_the_pull() {
         assert!(matches!(err, Error::InvalidFormat(_)), "{err}");
         assert!(err.to_string().contains("inflates to 1 byte"), "{err}");
         assert_nothing_published(&dest).await;
-        // The body arrived whole, so the refusal is the object's own and a
-        // second fetch would be refused the same way: it is not asked again,
-        // whatever the retry count.
+        // The body arrived whole, so the refusal is about the object itself. A
+        // second fetch gets the same refusal, so the pull does not request the
+        // object again, for any retry count.
         assert_eq!(server.requests_for(&path), 1);
     });
 }
 
-/// A bare-family destination holds the declared size to equality too: a
-/// payload that inflates to fewer bytes than its header declares is refused,
-/// even when the bytes it holds hash to the object's name.
+/// A bare-family destination also holds the declared size to equality. If a
+/// payload inflates to fewer bytes than its header declares, the pull refuses
+/// it. This occurs also when the bytes hash to the name of the object.
 #[test]
 fn a_bare_family_destination_refuses_a_payload_under_its_declared_size() {
     block_on(async {
@@ -781,8 +792,9 @@ fn a_bare_family_destination_refuses_a_payload_under_its_declared_size() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
 
-        // Raise a payload-bearing object's declared size by 100 and keep its
-        // compressed bytes, so the content still hashes to the object's name.
+        // Increase the declared size of an object with a payload by 100 and
+        // keep its compressed bytes. The content then still hashes to the name
+        // of the object.
         let mut victim = None;
         for checksum in content_checksums(&remote, &commit).await {
             let path = filez_path(&checksum.to_hex());
@@ -815,12 +827,14 @@ fn a_bare_family_destination_refuses_a_payload_under_its_declared_size() {
     });
 }
 
-/// The overrun check reports its own message even when the compressed payload
-/// is long enough to arrive over more than one read: the pass-through path
-/// decodes into a decoder that buffers decoded bytes and only forwards them on
-/// a later call, so a small fixture object -- one read, one decode, one
-/// forward -- cannot tell an overrun's own message apart from one folded into
-/// a generic "trailing bytes" report the way a multi-read object can.
+/// The overrun check reports its own message also when the compressed payload
+/// arrives over more than one read. The pass-through path decodes into a
+/// decoder that buffers decoded bytes and forwards them on a later call.
+///
+/// A small fixture object takes one read, one decode, and one forward. With
+/// such an object, the test cannot tell the overrun message from a generic
+/// "trailing bytes" report that wraps it. A multi-read object shows the
+/// difference.
 #[test]
 fn an_overrunning_payload_over_multiple_reads_reports_the_overrun() {
     block_on(async {
@@ -844,9 +858,10 @@ fn an_overrunning_payload_over_multiple_reads_reports_the_overrun() {
         let server = RepoServer::start(&remote_path, false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        // Declare a size well past what one read off the connection covers
-        // (`COPY_CHUNK` is 64 KiB) but short of the object's real, larger
-        // uncompressed size, so decoding it spans more than one read.
+        // Declare a size much larger than one read from the connection
+        // (`COPY_CHUNK` is 64 KiB). Keep it smaller than the real uncompressed
+        // size of the object, so the decode of the object spans more than one
+        // read.
         let mut victim = None;
         for checksum in content_checksums(&remote, &commit).await {
             let path = filez_path(&checksum.to_hex());
@@ -877,8 +892,8 @@ fn an_overrunning_payload_over_multiple_reads_reports_the_overrun() {
     });
 }
 
-/// A remote serving no summary answers 404 for it, and each requested ref
-/// resolves through `refs/heads/<ref>` instead.
+/// A remote with no summary answers 404 for it. Each requested ref then
+/// resolves through `refs/heads/<ref>`.
 #[test]
 fn a_remote_with_no_summary_resolves_through_refs_heads() {
     block_on(async {
@@ -906,9 +921,9 @@ fn a_remote_with_no_summary_resolves_through_refs_heads() {
     });
 }
 
-/// A pull from a remote with no summary reads each ref from `refs/heads`
-/// before it counts the bytes it transfers, as it reads the summary and the
-/// config before: the transferred figure starts after the ref files.
+/// A pull from a remote with no summary reads each ref from `refs/heads` before
+/// it counts the transferred bytes. It does the same with the summary and the
+/// config. The transferred figure starts after the ref files.
 #[test]
 fn the_transferred_count_leaves_out_the_ref_files() {
     block_on(async {
@@ -934,7 +949,7 @@ fn the_transferred_count_leaves_out_the_ref_files() {
             &seen[..4],
             ["summary.sig", "summary", "config", "refs/heads/test/main"]
         );
-        // The 404 answers carry empty bodies, so only the files served count.
+        // The 404 answers have empty bodies, so only the served files count.
         let served: u64 = seen[4..]
             .iter()
             .filter_map(|path| std::fs::metadata(dir.path().join("remote").join(path)).ok())
@@ -945,8 +960,8 @@ fn the_transferred_count_leaves_out_the_ref_files() {
     });
 }
 
-/// Two pulls that run at once and share one progress handle each report the
-/// statistics of their own work, and the handle shows the sum of both.
+/// Two concurrent pulls share one progress handle. Each pull reports the
+/// statistics of its own work, and the handle shows the sum of both.
 #[test]
 fn concurrent_pulls_sharing_a_progress_handle_keep_their_own_statistics() {
     block_on(async {
@@ -964,7 +979,7 @@ fn concurrent_pulls_sharing_a_progress_handle_keep_their_own_statistics() {
             progress,
             ..PullOptions::default()
         };
-        // The statistics of one pull alone, the elapsed time aside.
+        // The statistics of one pull alone, without the elapsed time.
         let solo = dests[0].pull("origin", opts(None)).await.unwrap();
         let solo = PullStats {
             elapsed: std::time::Duration::ZERO,
@@ -996,8 +1011,8 @@ fn concurrent_pulls_sharing_a_progress_handle_keep_their_own_statistics() {
     });
 }
 
-/// A ref name reaches the wire percent-encoded, so a name carrying `%` asks the
-/// server for that name and not for what it would decode the escape into.
+/// Because a ref name goes on the wire percent-encoded, a name with `%` asks
+/// the server for that exact name. The server does not decode the escape.
 #[test]
 fn a_ref_name_reaches_the_wire_percent_encoded() {
     block_on(async {
@@ -1007,9 +1022,9 @@ fn a_ref_name_reaches_the_wire_percent_encoded() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        // Unencoded, `test%2fmain` asks a server that decodes its request target
-        // for `refs/heads/test/main` -- the ref that exists, under a name that
-        // was not requested.
+        // Without encoding, `test%2fmain` asks a server that decodes its
+        // request target for `refs/heads/test/main`. That ref exists under a
+        // name that the test did not request.
         let err = dest
             .pull(
                 "origin",
@@ -1029,8 +1044,8 @@ fn a_ref_name_reaches_the_wire_percent_encoded() {
     });
 }
 
-/// A ref neither the summary nor `refs/heads` yields fails before anything is
-/// fetched.
+/// If a ref is in neither the summary nor `refs/heads`, the pull fails before
+/// it fetches anything.
 #[test]
 fn an_absent_ref_fails_the_pull() {
     block_on(async {
@@ -1054,8 +1069,8 @@ fn an_absent_ref_fails_the_pull() {
     });
 }
 
-/// An empty ref list takes the remote's configured `branches`, and fails when
-/// the remote configures none.
+/// An empty ref list takes the `branches` that the remote configures. If the
+/// remote configures none, the pull fails.
 #[test]
 fn an_empty_ref_list_takes_the_configured_branches() {
     block_on(async {
@@ -1095,10 +1110,10 @@ fn an_empty_ref_list_with_no_branches_fails() {
     });
 }
 
-/// A mirror pull of every ref takes them from the summary, writes them under
-/// `refs/heads`, and copies the summary and its signature verbatim. The
-/// signature bytes are arbitrary here: the remote turns no summary
-/// verification on, so the pull copies them without reading them.
+/// A mirror pull of all refs takes them from the summary and writes them under
+/// `refs/heads`. It copies the summary and its signature without change. Here
+/// the signature bytes are arbitrary. The remote turns on no summary
+/// verification, so the pull copies the bytes and does not read them.
 #[test]
 fn a_mirror_pull_writes_local_refs_and_copies_the_summary() {
     block_on(async {
@@ -1118,7 +1133,7 @@ fn a_mirror_pull_writes_local_refs_and_copies_the_summary() {
         .await
         .unwrap();
 
-        // The ref is local, not under refs/remotes.
+        // The ref is local. It is not under refs/remotes.
         assert_eq!(
             dest.resolve_rev("test/main", true).await.unwrap(),
             Some(commit)
@@ -1132,15 +1147,17 @@ fn a_mirror_pull_writes_local_refs_and_copies_the_summary() {
         let published = std::fs::read(dir.path().join("remote/summary")).unwrap();
         let copied = std::fs::read(dir.path().join("dest/summary")).unwrap();
         assert_eq!(copied, published);
-        // A client pulling from this repository with `gpg-verify-summary=true`
-        // needs the signature that covers those bytes.
+        // A client that pulls from this repository with
+        // `gpg-verify-summary=true` needs the signature that covers those
+        // bytes.
         let signature = std::fs::read(dir.path().join("dest/summary.sig")).unwrap();
         assert_eq!(signature, SUMMARY_SIG);
     });
 }
 
-/// A remote holding no `summary.sig` leaves the destination's own file as it
-/// stands, which is what the tool was observed to do.
+/// If the remote has no `summary.sig`, the pull keeps the file of the
+/// destination unchanged. This is the observed behavior of the `ostree`
+/// command.
 #[test]
 fn a_mirror_pull_from_an_unsigned_summary_keeps_the_signature_here() {
     block_on(async {
@@ -1168,15 +1185,17 @@ fn a_mirror_pull_from_an_unsigned_summary_keeps_the_signature_here() {
     });
 }
 
-/// A mirror pull takes its ref names from the summary, so a malformed name
-/// there is refused where a requested one is: before the first object request,
-/// rather than when the transaction resolves the refspec at publication.
+/// A mirror pull takes its ref names from the summary. The pull refuses a
+/// malformed name there at the same point as a malformed requested name, before
+/// the first object request. It does not wait until the transaction resolves
+/// the refspec at publication.
 #[test]
 fn a_mirror_pull_rejects_a_malformed_summary_ref_name_before_fetching() {
     block_on(async {
         const NAME: &[u8] = b"test/main";
-        // Same length, so the summary's frame offsets stay valid; the name gains
-        // a traversal component, which the ref store refuses.
+        // The length stays the same, so the frame offsets of the summary stay
+        // valid. The name gets a traversal component, which the ref store
+        // refuses.
         const TRAVERSAL: &[u8] = b"test/../m";
 
         let dir = TmpDir::new("pull-http-mirror-bad-ref");
@@ -1216,8 +1235,8 @@ fn a_mirror_pull_rejects_a_malformed_summary_ref_name_before_fetching() {
     });
 }
 
-/// A mirror pull of named refs holds part of what the remote publishes, so it
-/// writes neither the summary nor its signature.
+/// A mirror pull of named refs holds only part of what the remote publishes, so
+/// it writes neither the summary nor its signature.
 #[test]
 fn a_mirror_pull_of_named_refs_writes_no_summary() {
     block_on(async {
@@ -1242,7 +1261,7 @@ fn a_mirror_pull_of_named_refs_writes_no_summary() {
     });
 }
 
-/// A mirror pull of every ref needs the summary to know what every ref is.
+/// A mirror pull of all refs needs the summary to know all the refs.
 #[test]
 fn a_mirror_pull_of_every_ref_needs_a_summary() {
     block_on(async {
@@ -1267,8 +1286,8 @@ fn a_mirror_pull_of_every_ref_needs_a_summary() {
     });
 }
 
-/// `depth` follows the commit chain, and a parent the remote does not hold ends
-/// that chain without failing the pull.
+/// `depth` follows the commit chain. If the remote does not hold a parent, that
+/// parent ends the chain, and the pull does not fail.
 #[test]
 fn depth_follows_parents_and_an_absent_parent_ends_the_chain() {
     block_on(async {
@@ -1313,7 +1332,7 @@ fn depth_follows_parents_and_an_absent_parent_ends_the_chain() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        // Two parents deep reaches all three commits.
+        // A depth of two parents reaches all three commits.
         dest.pull(
             "origin",
             PullOptions {
@@ -1338,8 +1357,9 @@ fn depth_follows_parents_and_an_absent_parent_ends_the_chain() {
         }
         assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
 
-        // A remote that has pruned the root ends the chain there rather than
-        // failing: the same shape as a local source with truncated history.
+        // If the remote pruned the root, the chain ends there, and the pull
+        // does not fail. A local source with truncated history gives the same
+        // result.
         let dir2 = TmpDir::new("pull-http-depth-truncated");
         let dest2 = build_dest(dir2.path(), RepoMode::Archive, &server.url(), "").await;
         server.hide(&meta_path(&first, "commit"));
@@ -1373,8 +1393,9 @@ fn depth_follows_parents_and_an_absent_parent_ends_the_chain() {
     });
 }
 
-/// A pull at a greater depth extends the history a shallower pull left: the tip
-/// this repository already holds complete is walked past, and its parent arrives.
+/// A pull at a greater depth extends the history that a shallower pull left.
+/// The pull walks past the complete tip that this repository holds, and the
+/// parent arrives.
 #[test]
 fn a_deep_pull_extends_a_shallow_history() {
     block_on(async {
@@ -1409,7 +1430,7 @@ fn a_deep_pull_extends_a_shallow_history() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        // The tip alone, which leaves the parent absent.
+        // The tip alone, so the parent stays absent.
         dest.pull(
             "origin",
             PullOptions {
@@ -1431,7 +1452,8 @@ fn a_deep_pull_extends_a_shallow_history() {
                 .unwrap()
         );
 
-        // The whole history, which has to walk past the tip already here.
+        // The whole history. The pull must walk past the tip that is already
+        // here.
         dest.pull(
             "origin",
             PullOptions {
@@ -1456,9 +1478,10 @@ fn a_deep_pull_extends_a_shallow_history() {
     });
 }
 
-/// A parent the remote answers 404 for ends the chain, and its detached metadata
-/// is dropped rather than written: the `.commitmeta` is fetched ahead of the
-/// commit and written once the commit object is here.
+/// If the remote answers 404 for a parent, that parent ends the chain. The pull
+/// drops the detached metadata of that parent and does not write it. The pull
+/// fetches the `.commitmeta` before the commit, and writes it when the commit
+/// object is here.
 #[test]
 fn a_chain_ending_parent_leaves_no_detached_metadata() {
     block_on(async {
@@ -1482,8 +1505,8 @@ fn a_chain_ending_parent_leaves_no_detached_metadata() {
             FIXED_TS + 1,
         )
         .await;
-        // Both commits carry detached metadata, so the pull has bytes in hand
-        // for the parent whose commit object it cannot fetch.
+        // Both commits have detached metadata, so the pull holds bytes for the
+        // parent whose commit object it cannot fetch.
         for commit in [first, second] {
             remote
                 .write_commit_detached_metadata(&commit, Some(&detached_dict()))
@@ -1512,8 +1535,9 @@ fn a_chain_ending_parent_leaves_no_detached_metadata() {
         .await
         .unwrap();
 
-        // The parent's detached metadata was fetched and dropped; the tip's was
-        // written with the commit it belongs to.
+        // The pull fetched and dropped the detached metadata of the parent. It
+        // wrote the detached metadata of the tip with the commit that it
+        // belongs to.
         assert!(
             server.seen_set().contains(&meta_path(&first, "commitmeta")),
             "the parent's detached metadata was not requested"
@@ -1532,8 +1556,8 @@ fn a_chain_ending_parent_leaves_no_detached_metadata() {
     });
 }
 
-/// A remote that is not archive is refused on its config mode, before any
-/// object is requested.
+/// The pull refuses a remote that is not archive by the mode in its config,
+/// before it requests an object.
 #[test]
 fn a_non_archive_remote_is_refused_on_its_config_mode() {
     block_on(async {
@@ -1569,14 +1593,15 @@ fn a_non_archive_remote_is_refused_on_its_config_mode() {
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "{err}");
         assert!(err.to_string().contains("bare-user"), "{err}");
-        // Nothing beyond the three root files was asked for.
+        // The pull requested nothing more than the three root files.
         assert_eq!(server.seen(), ["summary.sig", "summary", "config"]);
         assert_nothing_published(&dest).await;
     });
 }
 
-/// A corrupt object on the remote is caught where it is stored: the write path
-/// names what it stores, so the pull fails and publishes nothing.
+/// The pull finds a corrupt object on the remote when it stores the object. The
+/// write path computes the name of each object that it stores, so the pull
+/// fails and publishes nothing.
 #[test]
 fn a_corrupt_object_fails_the_pull_with_a_checksum_mismatch() {
     block_on(async {
@@ -1585,8 +1610,8 @@ fn a_corrupt_object_fails_the_pull_with_a_checksum_mismatch() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        // Replace one content object's stored bytes with another's, which is a
-        // well-formed object under the wrong name.
+        // Replace the stored bytes of one content object with the bytes of
+        // another. The result is a well-formed object under the wrong name.
         let contents = content_checksums(&remote, &commit).await;
         let victim = filez_path(&contents[0].to_hex());
         let donor = filez_path(&contents[1].to_hex());
@@ -1608,10 +1633,11 @@ fn a_corrupt_object_fails_the_pull_with_a_checksum_mismatch() {
     });
 }
 
-/// A payload that decompresses past the size its own header declares is refused
-/// there, which bounds what is written before the checksum comparison at the end
-/// of the payload is reached. The declared size is not part of the object's
-/// identity, so nothing else in the pull looks at it.
+/// If a payload decompresses past the size that its header declares, the pull
+/// refuses it at that point. This limits the bytes written before the pull
+/// reaches the checksum comparison at the end of the payload. The declared size
+/// is not part of the identity of the object, so no other part of the pull
+/// checks it.
 #[test]
 fn a_payload_outgrowing_its_declared_size_fails_the_pull() {
     block_on(async {
@@ -1620,9 +1646,10 @@ fn a_payload_outgrowing_its_declared_size_fails_the_pull() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        // The stored form is a four-byte header length, four zero bytes, then the
-        // header, whose first field is the payload's uncompressed size. Declaring
-        // one byte leaves the object's bytes otherwise as they were.
+        // The stored form is a four-byte header length, four zero bytes, and
+        // the header. The first field of the header is the uncompressed size of
+        // the payload. A declared size of one byte keeps all other bytes of the
+        // object unchanged.
         let mut victim = None;
         for checksum in content_checksums(&remote, &commit).await {
             let path = filez_path(&checksum.to_hex());
@@ -1653,11 +1680,11 @@ fn a_payload_outgrowing_its_declared_size_fails_the_pull() {
     });
 }
 
-/// A payload that decompresses to nothing however long it runs -- empty non-final
-/// DEFLATE blocks, five bytes each -- is refused against the bound its declared
-/// size sets for the compressed side. The decompressed bound never trips against
-/// such a stream, and the progress deadline measures silence, which a stream that
-/// keeps delivering never falls into.
+/// A payload can decompress to nothing for any length: non-final empty DEFLATE
+/// blocks of five bytes each. The pull refuses it against the bound that its
+/// declared size sets for the compressed side. The decompressed bound never
+/// trips for such a stream. The progress deadline measures silence, and a
+/// stream that continues to deliver bytes is never silent.
 #[test]
 fn a_compressed_payload_passing_its_bound_fails_the_pull() {
     block_on(async {
@@ -1666,8 +1693,8 @@ fn a_compressed_payload_passing_its_bound_fails_the_pull() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        // The header is left as it was, so the object declares the size it always
-        // did; what replaces the payload behind it decompresses to nothing.
+        // The header stays unchanged, so the object declares its usual size.
+        // The replacement payload behind it decompresses to nothing.
         let mut victim = None;
         for checksum in content_checksums(&remote, &commit).await {
             let path = filez_path(&checksum.to_hex());
@@ -1708,9 +1735,9 @@ fn a_compressed_payload_passing_its_bound_fails_the_pull() {
     });
 }
 
-/// A commit object substituted on the remote -- another commit's bytes, on the
-/// same ref, under the wrong name -- fails where the commit object is stored,
-/// which is before its tree is asked for.
+/// The remote serves a substituted commit object: the bytes of another commit,
+/// on the same ref, under the wrong name. The pull fails when it stores the
+/// commit object, before it requests the tree.
 #[test]
 fn a_substituted_commit_object_fails_before_its_tree_is_fetched() {
     block_on(async {
@@ -1744,8 +1771,9 @@ fn a_substituted_commit_object_fails_before_its_tree_is_fetched() {
 
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
-        // The tip serves its parent's bytes: a commit that parses, carries the
-        // same ref binding, and is not the commit that was asked for.
+        // The tip serves the bytes of its parent. That commit parses and has
+        // the same ref binding. It is a different commit from the requested
+        // one.
         let donor =
             std::fs::read(dir.path().join("remote").join(meta_path(&first, "commit"))).unwrap();
         server.tamper(&meta_path(&second, "commit"), donor);
@@ -1770,8 +1798,8 @@ fn a_substituted_commit_object_fails_before_its_tree_is_fetched() {
     });
 }
 
-/// An object the remote does not hold fails the pull, which publishes nothing
-/// and takes back the marker it wrote for the commit it did not publish.
+/// If the remote does not hold an object, the pull fails and publishes nothing.
+/// It removes the marker that it wrote for the unpublished commit.
 #[test]
 fn a_missing_object_fails_the_pull_and_clears_the_marker() {
     block_on(async {
@@ -1803,9 +1831,9 @@ fn a_missing_object_fails_the_pull_and_clears_the_marker() {
     });
 }
 
-/// The marker of a commit this repository holds survives a failed pull: that
-/// commit was partial before the pull ran, so the marker is one the pull found
-/// in place rather than one it wrote.
+/// A failed pull keeps the marker of a commit that this repository holds. That
+/// commit was partial before the pull ran, so the pull found the marker in
+/// place and did not write it.
 #[test]
 fn a_failed_pull_keeps_the_marker_of_a_commit_it_holds() {
     block_on(async {
@@ -1814,7 +1842,7 @@ fn a_failed_pull_keeps_the_marker_of_a_commit_it_holds() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        // A commit-only pull publishes the commit object and leaves its marker.
+        // A commit-only pull publishes the commit object and keeps its marker.
         dest.pull(
             "origin",
             PullOptions {
@@ -1831,8 +1859,8 @@ fn a_failed_pull_keeps_the_marker_of_a_commit_it_holds() {
             .join(format!("{}.commitpartial", commit.to_hex()));
         assert!(marker.exists());
 
-        // The pull that would complete it fails on an object the remote stopped
-        // serving.
+        // The next pull of the commit fails on an object that the remote no
+        // longer serves.
         let contents = content_checksums(&remote, &commit).await;
         server.hide(&filez_path(&contents[0].to_hex()));
         let err = dest
@@ -1854,8 +1882,8 @@ fn a_failed_pull_keeps_the_marker_of_a_commit_it_holds() {
     });
 }
 
-/// A commit-only pull fetches the commit object alone, leaves a zero-length
-/// marker, and reports the commit partial.
+/// A commit-only pull fetches only the commit object. It leaves a zero-length
+/// marker and reports the commit as partial.
 #[test]
 fn a_commit_only_pull_leaves_the_commit_partial() {
     block_on(async {
@@ -1887,7 +1915,7 @@ fn a_commit_only_pull_leaves_the_commit_partial() {
             .join(format!("{}.commitpartial", commit.to_hex()));
         assert_eq!(std::fs::metadata(&marker).unwrap().len(), 0);
 
-        // Completing the pull clears it.
+        // A complete pull clears the marker.
         dest.pull(
             "origin",
             PullOptions {
@@ -1906,8 +1934,8 @@ fn a_commit_only_pull_leaves_the_commit_partial() {
     });
 }
 
-/// The timestamp check refuses a fetched tip strictly older than what it is
-/// checked against, and accepts an equal one.
+/// The timestamp check refuses a fetched tip that is strictly older than the
+/// commit that it compares with. It accepts a tip with an equal timestamp.
 #[test]
 fn the_timestamp_check_refuses_only_a_strictly_older_tip() {
     block_on(async {
@@ -1952,13 +1980,13 @@ fn the_timestamp_check_refuses_only_a_strictly_older_tip() {
         assert!(message.contains(&newer.to_hex()), "{message}");
         assert!(message.contains(&FIXED_TS.to_string()), "{message}");
         assert!(message.contains(&(FIXED_TS + 100).to_string()), "{message}");
-        // The ref still names what it did.
+        // The ref still points to the same commit.
         assert_eq!(
             dest.resolve_rev("origin:test/main", true).await.unwrap(),
             Some(newer)
         );
 
-        // An equal timestamp passes: the check is strict.
+        // An equal timestamp passes, because the check is strict.
         let equal = commit_tree(&dest, dir.path(), "src", "origin:test/main", None, FIXED_TS).await;
         assert_ne!(equal, older);
         dest.pull(
@@ -1978,8 +2006,8 @@ fn the_timestamp_check_refuses_only_a_strictly_older_tip() {
     });
 }
 
-/// `TimestampCheck::Rev` compares against a named commit rather than the ref's
-/// current tip.
+/// `TimestampCheck::Rev` compares against a named commit. It does not use the
+/// current tip of the ref.
 #[test]
 fn the_timestamp_check_can_name_the_commit_to_compare_against() {
     block_on(async {
@@ -1996,8 +2024,8 @@ fn the_timestamp_check_can_name_the_commit_to_compare_against() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        // A commit in the destination under an unrelated ref, newer than the
-        // remote's tip.
+        // A commit in the destination, under an unrelated ref, that is newer
+        // than the tip of the remote.
         std::fs::write(src.join("hello.txt"), b"newer\n").unwrap();
         let reference = commit_tree(
             &dest,
@@ -2028,9 +2056,10 @@ fn the_timestamp_check_can_name_the_commit_to_compare_against() {
     });
 }
 
-/// Two requested refs naming one commit are each checked against its ref
-/// binding. The commit is fetched once, so the second ref has no step of its own,
-/// and the flag remains the only way out.
+/// If two requested refs point to one commit, the pull checks each ref against
+/// the ref binding of the commit. The pull fetches the commit once, so the
+/// second ref has no step of its own. Only `PullFlags::DISABLE_VERIFY_BINDINGS`
+/// lets the pull pass.
 #[test]
 fn a_second_ref_at_one_commit_is_checked_against_the_binding() {
     block_on(async {
@@ -2071,8 +2100,9 @@ fn a_second_ref_at_one_commit_is_checked_against_the_binding() {
     });
 }
 
-/// The timestamp check runs for each of two requested refs naming one commit, so
-/// a second ref whose current tip here is newer refuses the pull.
+/// The timestamp check runs for each of two requested refs that point to one
+/// commit. If the current tip of the second ref here is newer, the check
+/// refuses the pull.
 #[test]
 fn a_second_ref_at_one_commit_is_checked_against_its_timestamp() {
     block_on(async {
@@ -2081,7 +2111,7 @@ fn a_second_ref_at_one_commit_is_checked_against_its_timestamp() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        // Only the second ref names a newer commit here, so only its check
+        // Only the second ref points to a newer commit here, so only its check
         // refuses the fetched tip.
         std::fs::write(dir.path().join("src/hello.txt"), b"newer\n").unwrap();
         let newer = commit_tree(
@@ -2120,8 +2150,8 @@ fn a_second_ref_at_one_commit_is_checked_against_its_timestamp() {
     });
 }
 
-/// A localcache repository supplies an object the remote answers 404 for, and
-/// without it the same pull fails.
+/// A localcache repository supplies an object for which the remote answers 404.
+/// Without the cache, the same pull fails.
 #[test]
 fn a_localcache_repository_supplies_an_object_the_remote_lost() {
     block_on(async {
@@ -2129,7 +2159,7 @@ fn a_localcache_repository_supplies_an_object_the_remote_lost() {
         let (remote, commit) = build_remote(dir.path()).await;
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
 
-        // A cache holding the whole commit, built by pulling it before the
+        // A cache that holds the whole commit. A pull fills it before the
         // remote loses the object.
         let cache = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
         cache
@@ -2148,7 +2178,7 @@ fn a_localcache_repository_supplies_an_object_the_remote_lost() {
         let contents = content_checksums(&remote, &commit).await;
         server.hide(&filez_path(&contents[0].to_hex()));
 
-        // Without the cache the object is gone and the pull fails.
+        // Without the cache, the object is gone and the pull fails.
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
         let err = dest
             .pull(
@@ -2162,7 +2192,7 @@ fn a_localcache_repository_supplies_an_object_the_remote_lost() {
             .unwrap_err();
         assert!(matches!(err, Error::ObjectNotFound { .. }), "{err}");
 
-        // With it, the pull completes and the object is never requested.
+        // With the cache, the pull completes and never requests the object.
         std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
         server.forget();
@@ -2181,8 +2211,8 @@ fn a_localcache_repository_supplies_an_object_the_remote_lost() {
     });
 }
 
-/// One slot pins the request order to the plan's drain order: the commit, then
-/// the scan, then the content.
+/// With one slot, the request order is the drain order of the plan: the commit,
+/// then the scan, then the content.
 #[test]
 fn a_single_slot_pins_the_request_order() {
     block_on(async {
@@ -2208,8 +2238,8 @@ fn a_single_slot_pins_the_request_order() {
             .iter()
             .filter(|path| path.starts_with("objects/"))
             .collect();
-        // The commit's detached metadata and the commit itself come first, then
-        // the metadata the scan is blocked on, and the content last.
+        // First the detached metadata of the commit and the commit. Then the
+        // metadata that the scan waits for, and last the content.
         assert_eq!(*objects[0], meta_path(&commit, "commitmeta"));
         assert_eq!(*objects[1], meta_path(&commit, "commit"));
         let first_content = objects
@@ -2228,10 +2258,11 @@ fn a_single_slot_pins_the_request_order() {
     });
 }
 
-/// A pull reuses one connection per slot: each step reads its response to the
-/// end, which returns the connection to the pool for the next step. One slot
-/// makes every request share one connection, so a step that left its response
-/// unfinished would cost a connection setup and show up here.
+/// A pull reuses one connection for each slot. Each step reads its response to
+/// the end, which returns the connection to the pool for the next step. With
+/// one slot, all requests share one connection. If a step left its response
+/// unfinished, the next step needs a new connection setup, and this test sees
+/// it.
 #[test]
 fn one_slot_pulls_every_object_over_one_connection() {
     block_on(async {
@@ -2251,8 +2282,8 @@ fn one_slot_pulls_every_object_over_one_connection() {
         .await
         .unwrap();
 
-        // The fixture tree carries regular files and a symlink, so both content
-        // paths are covered.
+        // The fixture tree has regular files and a symlink, so the test covers
+        // both content paths.
         let contents = content_checksums(&remote, &commit).await;
         assert!(contents.len() > 1);
         assert_eq!(server.connections(), 1, "requests: {:?}", server.seen());
@@ -2260,8 +2291,8 @@ fn one_slot_pulls_every_object_over_one_connection() {
     });
 }
 
-/// A content object declaring a header past the header cap is refused, so the
-/// receive path allocates no buffer for it.
+/// The pull refuses a content object that declares a header larger than the
+/// header cap, so the receive path allocates no buffer for it.
 #[test]
 fn an_oversized_content_header_fails_the_pull() {
     block_on(async {
@@ -2270,8 +2301,8 @@ fn an_oversized_content_header_fails_the_pull() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        // One byte past the 1 MiB header cap, with the rest of the object left as
-        // it was: the length is refused before its bytes are read.
+        // One byte past the 1 MiB header cap. The rest of the object stays
+        // unchanged. The pull refuses the length before it reads the bytes.
         let checksum = content_checksums(&remote, &commit)
             .await
             .pop()
@@ -2297,8 +2328,8 @@ fn an_oversized_content_header_fails_the_pull() {
     });
 }
 
-/// A content object followed by bytes its payload does not account for is
-/// refused, since the stream a correct object ends is the connection's own.
+/// The pull refuses a content object that has extra bytes after its payload,
+/// because a correct object ends at the end of the response stream.
 #[test]
 fn trailing_bytes_after_a_payload_fail_the_pull() {
     block_on(async {
@@ -2307,8 +2338,8 @@ fn trailing_bytes_after_a_payload_fail_the_pull() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        // A regular file, so the bytes land after a deflated payload rather than
-        // after a symlink's header.
+        // A regular file, so the extra bytes come after a deflated payload.
+        // They do not come after the header of a symlink.
         let (tree, _) = remote.read_commit(&commit.to_hex()).await.unwrap();
         let mut content = None;
         for entry in tree.read_dir().await.unwrap() {
@@ -2338,8 +2369,8 @@ fn trailing_bytes_after_a_payload_fail_the_pull() {
     });
 }
 
-/// The default limit fetches concurrently: the request set is the same and the
-/// server sees more than one request in flight at once.
+/// The default limit fetches concurrently. The request set is the same, and the
+/// server sees more than one request in flight at one time.
 #[test]
 fn the_default_limit_fetches_concurrently() {
     block_on(async {
@@ -2371,8 +2402,8 @@ fn the_default_limit_fetches_concurrently() {
     });
 }
 
-/// A connection cut mid-object fails the pull rather than storing a truncated
-/// object, and publishes nothing.
+/// If the connection is cut in the middle of an object, the pull fails and
+/// stores no truncated object. It publishes nothing.
 #[test]
 fn a_connection_cut_mid_pull_fails_and_publishes_nothing() {
     block_on(async {
@@ -2389,7 +2420,8 @@ fn a_connection_cut_mid_pull_fails_and_publishes_nothing() {
                 "origin",
                 PullOptions {
                     refs: vec!["test/main".to_owned()],
-                    // One slot keeps the failure on the object the test cut.
+                    // With one slot, the failure stays on the object that the
+                    // test cut.
                     max_outstanding_fetches: Some(1),
                     n_network_retries: Some(0),
                     ..PullOptions::default()
@@ -2397,8 +2429,8 @@ fn a_connection_cut_mid_pull_fails_and_publishes_nothing() {
             )
             .await
             .unwrap_err();
-        // The pull fails on the object whose delivery was cut, and nothing of
-        // what it did receive is published under a name it does not hash to.
+        // The pull fails on the object with the cut delivery. It publishes
+        // nothing that it received under a name that the bytes do not hash to.
         assert!(err.to_string().contains(".filez"), "{err}");
         assert_nothing_published(&dest).await;
         assert!(
@@ -2410,9 +2442,9 @@ fn a_connection_cut_mid_pull_fails_and_publishes_nothing() {
     });
 }
 
-/// A body cut in transit is fetched again from the start, which spends one
-/// repeat of the retry count, and the pull completes with every object intact
-/// and no staging file left behind.
+/// If a body is cut in transit, the pull fetches it again from the start, and
+/// this uses one repeat of the retry count. The pull completes with all objects
+/// intact and leaves no staging file.
 #[test]
 fn a_body_cut_once_is_fetched_again_and_the_pull_completes() {
     block_on(async {
@@ -2425,8 +2457,8 @@ fn a_body_cut_once_is_fetched_again_and_the_pull_completes() {
             let contents = content_checksums(&remote, &commit).await;
             let cut = filez_path(&contents[0].to_hex());
             server.truncate_times(&cut, 1);
-            // A metadata object is read whole, and is fetched again the same
-            // way.
+            // The pull reads a metadata object whole, and fetches it again in
+            // the same way.
             let root = meta_path(&commit, "commit");
             server.truncate_times(&root, 1);
 
@@ -2461,8 +2493,8 @@ fn a_body_cut_once_is_fetched_again_and_the_pull_completes() {
     });
 }
 
-/// A body cut on every request spends the whole retry count, one request more
-/// than the count, and then fails the pull.
+/// If each request cuts the body, the pull uses the whole retry count, one
+/// request more than the count. Then the pull fails.
 #[test]
 fn a_body_cut_every_time_spends_the_retry_count() {
     block_on(async {
@@ -2493,10 +2525,9 @@ fn a_body_cut_every_time_spends_the_retry_count() {
     });
 }
 
-/// A remote setting `tls-permissive` pulls from a server whose chain no
-/// authority the destination holds signed. That the key also leaves
-/// `tls-ca-path` unread is held by `remote_tls`'s own unit test, which needs
-/// no server.
+/// If a remote sets `tls-permissive`, the pull accepts a server whose chain no
+/// authority of the destination signed. The unit test of `remote_tls` checks
+/// that the key also leaves `tls-ca-path` unread. That test needs no server.
 #[test]
 fn a_tls_permissive_remote_accepts_an_untrusted_chain() {
     block_on(async {
@@ -2528,8 +2559,8 @@ fn a_tls_permissive_remote_accepts_an_untrusted_chain() {
     });
 }
 
-/// `tls-permissive` keeps the host name check, so a leaf covering neither name
-/// the harness reaches is refused. The pull writes no ref.
+/// `tls-permissive` keeps the host name check, so the pull refuses a leaf that
+/// covers neither name of the harness. The pull writes no ref.
 #[test]
 fn a_tls_permissive_remote_keeps_the_name_check() {
     block_on(async {
@@ -2550,8 +2581,9 @@ fn a_tls_permissive_remote_keeps_the_name_check() {
                 "origin",
                 PullOptions {
                     refs: vec!["test/main".to_owned()],
-                    // A failed handshake is retryable, so the rounds are
-                    // turned off and the refusal is reported at once.
+                    // A failed handshake is retryable, so the test turns off
+                    // the retry rounds. Then the pull reports the refusal at
+                    // once.
                     n_network_retries: Some(0),
                     ..PullOptions::default()
                 },
@@ -2570,8 +2602,8 @@ fn a_tls_permissive_remote_keeps_the_name_check() {
     });
 }
 
-/// `remote_fetch_summary` reports the remote's summary and its signature, an
-/// absent one as `None`.
+/// `remote_fetch_summary` returns the summary of the remote and its signature.
+/// It returns an absent signature as `None`.
 #[test]
 fn remote_fetch_summary_reports_both_files() {
     block_on(async {
@@ -2591,15 +2623,16 @@ fn remote_fetch_summary_reports_both_files() {
         );
         assert_eq!(signature, None);
 
-        // A signature the remote publishes comes back with it.
+        // If the remote publishes a signature, the call returns it with the
+        // summary.
         std::fs::write(dir.path().join("remote/summary.sig"), b"signature bytes").unwrap();
         let (_, signature) = dest.remote_fetch_summary("origin").await.unwrap();
         assert_eq!(signature.as_deref(), Some(b"signature bytes".as_slice()));
     });
 }
 
-/// `remote_fetch_summary` reads an HTTP `pull-url`, with no `url` and in
-/// place of a `url` that answers no request.
+/// `remote_fetch_summary` reads from an HTTP `pull-url` when no `url` is set.
+/// It also uses `pull-url` when the `url` answers no request.
 #[test]
 fn remote_fetch_summary_reads_an_http_pull_url() {
     block_on(async {
@@ -2629,8 +2662,8 @@ fn remote_fetch_summary_reads_an_http_pull_url() {
     });
 }
 
-/// A pull needs a URL: a remote the config does not describe fails unless the
-/// caller supplies one.
+/// A pull needs a URL. If the config does not describe the remote, the pull
+/// fails unless the caller supplies a URL.
 #[test]
 fn an_unconfigured_remote_needs_a_url() {
     block_on(async {
@@ -2639,9 +2672,9 @@ fn an_unconfigured_remote_needs_a_url() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        // A remote the config does not describe takes the configuration
-        // defaults, `gpg-verify` among them, so both pulls of this unsigned
-        // commit state their own policy.
+        // A remote that the config does not describe takes the default
+        // configuration values. Because `gpg-verify` is one of these defaults,
+        // both pulls of this unsigned commit state their own policy.
         let err = dest
             .pull(
                 "elsewhere",
@@ -2658,8 +2691,8 @@ fn an_unconfigured_remote_needs_a_url() {
             .unwrap_err();
         assert!(err.to_string().contains("no remote 'elsewhere'"), "{err}");
 
-        // With a URL the same pull runs, and the refs land under the remote
-        // name it was asked for.
+        // With a URL, the same pull runs, and the refs go under the requested
+        // remote name.
         dest.pull(
             "elsewhere",
             PullOptions {
@@ -2681,10 +2714,10 @@ fn an_unconfigured_remote_needs_a_url() {
     });
 }
 
-/// A remote with an HTTP `pull-url` and no `url` pulls from `pull-url`, and
-/// `pull-url` wins over a `url` that answers no request. An HTTP pull reads
-/// neither `ssh-command` nor `send-command`, so a value of each that does
-/// not parse fails no pull.
+/// If a remote has an HTTP `pull-url` and no `url`, the pull uses `pull-url`.
+/// `pull-url` also has priority over a `url` that answers no request. An HTTP
+/// pull reads neither `ssh-command` nor `send-command`. If either key holds a
+/// value that does not parse, no pull fails.
 #[test]
 fn an_http_pull_url_wins_over_url() {
     block_on(async {
@@ -2725,16 +2758,17 @@ fn an_http_pull_url_wins_over_url() {
     });
 }
 
-/// A symlink object and an xattr-bearing object both cross: the symlink's
-/// identity is its header alone, and the xattrs are part of the header the
-/// destination stores.
+/// A symlink object and an object with xattrs both cross the pull. The identity
+/// of a symlink object is its header alone. The xattrs are part of the header
+/// that the destination stores.
 #[test]
 fn symlink_and_xattr_bearing_objects_cross() {
     block_on(async {
         let dir = TmpDir::new("pull-http-xattrs");
         let src = dir.path().join("src");
         build_tree(&src, b"hello\n");
-        // A user xattr the commit records, so the object's header carries it.
+        // The commit records a user xattr, so the header of the object holds
+        // it.
         if rustix::fs::setxattr(
             src.join("hello.txt"),
             "user.marked",
@@ -2759,9 +2793,9 @@ fn symlink_and_xattr_bearing_objects_cross() {
             "test/main",
             None,
             FIXED_TS,
-            // Neither SKIP_XATTRS nor CANONICAL_PERMISSIONS: both drop the
-            // xattr set, and a bare-user destination stores whatever header an
-            // object arrives with.
+            // No SKIP_XATTRS and no CANONICAL_PERMISSIONS, because each one
+            // drops the xattr set. A bare-user destination stores the header
+            // that an object arrives with.
             CommitModifierFlags::empty(),
         )
         .await;
@@ -2810,9 +2844,9 @@ fn symlink_and_xattr_bearing_objects_cross() {
     });
 }
 
-/// A bare-user-only destination stores neither ownership nor xattrs, so an
-/// object whose header is not the canonical form cannot be held under its own
-/// name and the pull is refused.
+/// A bare-user-only destination stores no ownership and no xattrs. If the
+/// header of an object is not in the canonical form, the destination cannot
+/// hold the object under its own name. The pull is refused.
 #[test]
 fn a_bare_user_only_destination_refuses_a_non_canonical_object() {
     block_on(async {
@@ -2825,8 +2859,8 @@ fn a_bare_user_only_destination_refuses_a_non_canonical_object() {
         )
         .await
         .unwrap();
-        // Committed under the process's own ownership, which for a bare-user-only
-        // destination is not the header it stores.
+        // The commit records the ownership of the process. A bare-user-only
+        // destination does not store that header.
         commit_tree_with(
             &remote,
             dir.path(),
@@ -2860,8 +2894,8 @@ fn a_bare_user_only_destination_refuses_a_non_canonical_object() {
     });
 }
 
-/// `BAREUSERONLY_FILES` rejects a regular-file mode with bits outside `0775`,
-/// over the header the object arrives with.
+/// `BAREUSERONLY_FILES` rejects a regular-file mode with bits outside `0775`.
+/// The check reads the mode in the header that the object arrives with.
 #[test]
 fn bareuseronly_files_rejects_a_mode_outside_0775() {
     block_on(async {
@@ -2905,7 +2939,7 @@ fn bareuseronly_files_rejects_a_mode_outside_0775() {
         assert!(err.to_string().contains("invalid mode"), "{err}");
         assert_nothing_published(&dest).await;
 
-        // Without the flag an archive destination stores it.
+        // Without the flag, an archive destination stores the object.
         std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
         dest.pull(
@@ -2921,8 +2955,10 @@ fn bareuseronly_files_rejects_a_mode_outside_0775() {
     });
 }
 
-/// The request path of one part of the single delta a served repository holds,
-/// found by walking `deltas/<fanout>/<leaf>/` rather than rebuilding the name.
+/// Returns the request path of one part of the single delta in a served
+/// repository.
+/// The function walks `deltas/<fanout>/<leaf>/` to find the path. It does not
+/// build the name again.
 fn served_part_path(root: &Path, index: usize) -> String {
     let deltas = root.join("deltas");
     let fanout = std::fs::read_dir(&deltas)
@@ -2936,9 +2972,9 @@ fn served_part_path(root: &Path, index: usize) -> String {
     format!("{}/{index}", dir.display())
 }
 
-/// A remote answering a part request with more than the part is gets no further
-/// than the size the superblock declares for that part: the fetcher refuses the
-/// oversized body and the pull publishes nothing.
+/// A remote answers a part request with more bytes than the part holds. The
+/// fetcher reads no more than the size that the superblock declares for that
+/// part. It refuses the oversized body, and the pull publishes nothing.
 #[test]
 fn a_part_larger_than_the_superblock_declares_is_refused() {
     block_on(async {
@@ -2971,7 +3007,8 @@ fn a_part_larger_than_the_superblock_declares_is_refused() {
             .await
             .unwrap();
 
-        // The part the superblock declares, served four times over.
+        // The server answers the part request with a body of four times the
+        // size that the superblock declares for the part.
         let part = served_part_path(&remote_path, 0);
         let declared = std::fs::metadata(remote_path.join(&part)).unwrap().len();
         let server = RepoServer::start(&remote_path, false).await;
@@ -3001,10 +3038,9 @@ fn a_part_larger_than_the_superblock_declares_is_refused() {
     });
 }
 
-/// `BAREUSERONLY_FILES` reaches an object a static delta delivers: the mode a
-/// part's table names is checked before the object is written, so a remote
-/// publishing a delta cannot hand over what a loose fetch of the same object
-/// would be refused.
+/// `BAREUSERONLY_FILES` applies to an object that a static delta delivers. The
+/// pull checks the mode in the table of a part before it writes the object. If
+/// the pull refuses a loose fetch of an object, a delta cannot deliver it.
 #[test]
 fn bareuseronly_files_rejects_a_delta_delivered_mode_outside_0775() {
     block_on(async {
@@ -3031,9 +3067,9 @@ fn bareuseronly_files_rejects_a_delta_delivered_mode_outside_0775() {
             CommitModifierFlags::SKIP_XATTRS,
         )
         .await;
-        // A from-scratch delta of the commit, which a fresh destination is what
-        // the remote publishes for. The remote serves no summary, so the delta is
-        // asked for by name.
+        // The remote publishes a from-scratch delta of the commit, for a fresh
+        // destination. The remote serves no summary, so the pull requests the
+        // delta by name.
         remote
             .generate_static_delta(
                 None,
@@ -3070,8 +3106,8 @@ fn bareuseronly_files_rejects_a_delta_delivered_mode_outside_0775() {
             server.seen()
         );
 
-        // Without the flag the same delta delivers the object, so the refusal is
-        // the flag's and not the delta path failing to apply.
+        // Without the flag, the same delta delivers the object. This shows
+        // that the delta path works and that the flag causes the refusal.
         std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
         server.forget();
         let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
@@ -3101,11 +3137,13 @@ fn bareuseronly_files_rejects_a_delta_delivered_mode_outside_0775() {
     });
 }
 
-/// A delta into each destination mode. The destination is one commit behind, so
-/// the delta patches against objects it already stores: the applier reads a
-/// source object in the destination's own storage form -- a deflated `.filez`
-/// for an archive destination -- and writes what the part produces back in that
-/// same form. Every mode lands the target commit whole and passes its own fsck.
+/// A delta pull into each destination mode. Each mode gets the whole target
+/// commit and passes its own fsck.
+///
+/// The destination is one commit behind, so the delta patches objects that the
+/// destination already stores. The applier reads a source object in the storage
+/// form of the destination. For an archive destination, this form is a deflated
+/// `.filez`. The applier writes the output of the part in the same form.
 #[test]
 fn a_delta_delivers_a_commit_into_every_destination_mode() {
     block_on(async {
@@ -3117,8 +3155,9 @@ fn a_delta_delivers_a_commit_into_every_destination_mode() {
             let dir = TmpDir::new(&format!("pull-http-delta-dest-{}", mode.as_mode_str()));
             let src = dir.path().join("src");
             build_tree(&src, b"hello\n");
-            // A file spanning several chunks, so the edit below leaves most of
-            // it to be copied out of the object the destination already holds.
+            // A file of several chunks. After the edit of 4 bytes, the applier
+            // copies most of the file from the object that the destination
+            // holds.
             let mut bulk = incompressible(256 * 1024);
             std::fs::write(src.join("bulk.bin"), &bulk).unwrap();
 
@@ -3128,8 +3167,8 @@ fn a_delta_delivers_a_commit_into_every_destination_mode() {
                 .unwrap();
             let first = commit_tree(&remote, dir.path(), "src", "test/main", None, FIXED_TS).await;
 
-            // The destination takes the first commit loose: the remote holds no
-            // delta yet, so its superblock request is a 404.
+            // The destination gets the first commit as loose objects. The
+            // remote holds no delta yet, so the superblock request gets a 404.
             let server = RepoServer::start(&remote_path, false).await;
             let dest = build_dest(dir.path(), mode, &server.url(), "").await;
             dest.pull(
@@ -3147,9 +3186,9 @@ fn a_delta_delivers_a_commit_into_every_destination_mode() {
                 "{mode:?}"
             );
 
-            // The remote moves on by one commit -- one file edited, one added --
-            // and publishes the delta that produces it from the commit the
-            // destination holds.
+            // The remote adds one commit, with one file edited and one file
+            // added. It publishes the delta from the commit that the
+            // destination holds to the new commit.
             bulk[128 * 1024..128 * 1024 + 4].copy_from_slice(b"edit");
             std::fs::write(src.join("bulk.bin"), &bulk).unwrap();
             std::fs::write(src.join("added.txt"), b"added\n").unwrap();
@@ -3186,8 +3225,8 @@ fn a_delta_delivers_a_commit_into_every_destination_mode() {
                 .await
                 .unwrap();
 
-            // The delta carried the content: the superblock was requested and no
-            // content object was.
+            // The delta carries the content. The pull requests the superblock
+            // and requests no content object.
             let seen = server.seen();
             assert!(
                 seen.iter().any(|path| path.ends_with("/superblock")),
@@ -3197,8 +3236,9 @@ fn a_delta_delivers_a_commit_into_every_destination_mode() {
                 !seen.iter().any(|path| path.ends_with(".filez")),
                 "{mode:?}: a content object was fetched loose: {seen:?}"
             );
-            // Each part file requested counts once, and what the delta wrote
-            // counts as no content written, which is the tool's figure.
+            // Each requested part file counts once. The content that the delta
+            // writes counts as zero content written, as the `ostree` command
+            // counts it.
             let part_files = seen
                 .iter()
                 .filter(|path| {
@@ -3228,7 +3268,7 @@ fn a_delta_delivers_a_commit_into_every_destination_mode() {
             let report = dest.fsck(&FsckOptions::default()).await.unwrap();
             assert!(report.is_ok(), "{mode:?}: {:?}", report.errors);
 
-            // The tree reads back with both the edited and the added file.
+            // The tree holds the edited file and the added file.
             let (tree, _) = dest.read_commit(&second.to_hex()).await.unwrap();
             let mut names: Vec<String> = tree
                 .read_dir()
@@ -3256,12 +3296,17 @@ fn a_delta_delivers_a_commit_into_every_destination_mode() {
     });
 }
 
-/// A remote with no summary advertises no delta, so the pull asks for the
-/// superblock by name: after the ref resolves through `refs/heads/<ref>`, the
-/// delta from the commit the destination holds under the ref, or the
-/// from-scratch delta where it holds none, is requested by its path. A 404
-/// there leaves the commit to be fetched loose; a superblock that is there
-/// delivers the commit through its parts, with no loose object.
+/// A remote with no summary advertises no delta, so the pull requests the
+/// superblock by name.
+///
+/// First the ref resolves through `refs/heads/<ref>`. Then the pull requests,
+/// by its path, the delta from the commit that the destination holds under the
+/// ref. If the destination holds no commit under the ref, the pull requests the
+/// from-scratch delta.
+///
+/// If the superblock request gets a 404, the pull fetches the commit as loose
+/// objects. If the superblock is present, the commit arrives through its parts,
+/// with no loose object.
 #[test]
 fn a_pull_with_no_summary_takes_a_delta_by_name() {
     block_on(async {
@@ -3284,8 +3329,9 @@ fn a_pull_with_no_summary_takes_a_delta_by_name() {
         };
         let opening = ["summary.sig", "summary", "config", "refs/heads/test/main"];
 
-        // The remote holds no delta yet: the from-scratch superblock is asked
-        // for by name, answered 404, and the commit arrives loose.
+        // The remote holds no delta yet. The pull requests the from-scratch
+        // superblock by name and gets a 404. The commit arrives as loose
+        // objects.
         dest.pull("origin", opts()).await.unwrap();
         let seen = server.seen();
         assert_eq!(&seen[..4], opening);
@@ -3300,8 +3346,8 @@ fn a_pull_with_no_summary_takes_a_delta_by_name() {
             Some(first)
         );
 
-        // The remote moves on by one commit and publishes the delta from the
-        // commit the destination holds, still with no summary.
+        // The remote adds one commit and publishes the delta from the commit
+        // that the destination holds. The remote still has no summary.
         std::fs::write(src.join("hello.txt"), b"hello again\n").unwrap();
         std::fs::write(src.join("added.txt"), b"added\n").unwrap();
         let second = commit_tree(
@@ -3349,9 +3395,9 @@ fn a_pull_with_no_summary_takes_a_delta_by_name() {
         parts.sort();
         assert_eq!(parts, parts_on_disk);
         assert_eq!(stats.delta_parts as usize, parts.len());
-        // The delta carried the commit whole: the one object request is the
-        // probe for the commit's detached metadata, and nothing else was asked
-        // for beyond the opening reads, the superblock, and the parts.
+        // The delta carries the whole commit. The one object request is the
+        // probe for the detached metadata of the commit. The pull requests
+        // nothing more than the opening reads, the superblock, and the parts.
         let objects: Vec<&String> = seen
             .iter()
             .filter(|path| path.starts_with("objects/"))
@@ -3373,7 +3419,7 @@ fn a_pull_with_no_summary_takes_a_delta_by_name() {
     });
 }
 
-/// The part requests among `seen`: a path under `deltas/` whose last
+/// Returns the part requests in `seen`: each path under `deltas/` whose last
 /// component is a part number.
 fn part_requests(seen: &[String]) -> Vec<String> {
     seen.iter()
@@ -3387,10 +3433,11 @@ fn part_requests(seen: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// A pull applies the tool's inline deltas with no part request: a
-/// from-scratch one whose part is past the heap threshold, then a from-to one
-/// written under `--set-endianness=B`. The superblock is the one delta request
-/// each time, and no content object is fetched loose.
+/// A pull applies inline deltas from the `ostree` command with no part request.
+/// The first is a from-scratch delta whose part is past the heap threshold. The
+/// second is a from-to delta that the command writes under
+/// `--set-endianness=B`. Each time, the superblock is the one delta request,
+/// and the pull fetches no content object as a loose object.
 #[test]
 fn a_tool_inline_delta_is_pulled_without_a_part_request() {
     if !ostree_available() {
@@ -3483,8 +3530,8 @@ fn a_tool_inline_delta_is_pulled_without_a_part_request() {
     });
 }
 
-/// A pull applies a port-written inline delta whose size fields are
-/// big-endian, with no part request.
+/// A pull applies an inline delta from ostrya with big-endian size fields. The
+/// pull makes no part request.
 #[test]
 fn a_big_endian_inline_delta_is_pulled() {
     block_on(async {
@@ -3539,12 +3586,14 @@ fn a_big_endian_inline_delta_is_pulled() {
 /// The superblock type string, for a test that rewrites a superblock.
 const SUPERBLOCK_SIG: &str = "(a{sv}tayay(a{sv}aya(say)sstayay)aya(uayttay)a(yaytt))";
 
-/// An inline part whose bytes were changed fails the pull at discovery, before
-/// any part request, and the pull publishes nothing. The superblock carries its
-/// last part inline and the parts before it as files, so a check made when
-/// the inline part is applied, and not at discovery, would let the part files
-/// be requested first. The remote serves no summary, so no advertised digest
-/// catches the superblock first.
+/// An inline part with changed bytes fails the pull at discovery, before any
+/// part request. The pull publishes nothing.
+///
+/// The superblock holds its last part inline and the parts before it as files.
+/// If the pull verifies the inline part when it applies the part, the
+/// verification comes after the requests for the part files. Verification at
+/// discovery comes before them. The remote serves no summary, so no advertised
+/// digest catches the superblock first.
 #[test]
 fn a_tampered_inline_part_fails_discovery_before_any_part_request() {
     block_on(async {
@@ -3582,8 +3631,8 @@ fn a_tampered_inline_part_fails_discovery_before_any_part_request() {
         };
         let parts = fields[6].as_array().unwrap().len();
         assert!(parts >= 2, "{parts} parts");
-        // The last part goes inline with one body byte changed. Its file stays,
-        // and the inline part is what a reader takes.
+        // The last part goes inline with one body byte changed. Its file stays
+        // in place, and a reader takes the inline part.
         let last = parts - 1;
         let mut part = std::fs::read(remote_path.join(&relative).join(last.to_string())).unwrap();
         let middle = part.len() / 2;
@@ -3626,17 +3675,17 @@ fn a_tampered_inline_part_fails_discovery_before_any_part_request() {
 
 // --- signature verification --------------------------------------------------
 
-/// A fixed ed25519 keypair the remotes sign with.
+/// A fixed ed25519 keypair that the remotes sign with.
 const SECRET_B64: &str =
     "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
 const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
-/// A second keypair, standing for one a destination does not trust.
+/// A second keypair. It stands for a key that a destination does not trust.
 const OTHER_SECRET_B64: &str =
     "5ILWxT+l9G/u3h0BptRpmSi35C9uog7YDdD+Fp1Xk+Hz52p0NlYh6xBA73kJEJKhKbbnjcE0rsWA5XA/K5Sq5Q==";
 const OTHER_PUBLIC_B64: &str = "8+dqdDZWIesQQO95CRCSoSm2543BNK7FgOVwPyuUquU=";
 
-/// Whether this host has a sign-api key store of its own, whose keys would join
-/// every trusted set a test builds.
+/// Returns `true` if this host has its own sign-api key store. Its keys join
+/// each trusted set that a test builds.
 fn system_sign_keys() -> bool {
     !ostrya::load_sign_keys("ed25519")
         .unwrap()
@@ -3644,8 +3693,8 @@ fn system_sign_keys() -> bool {
         .is_empty()
 }
 
-/// A remote holding `test/main` whose commit and summary are signed with
-/// `secret`, or left unsigned where it is `None`.
+/// Builds a remote that holds `test/main`. The function signs the commit and
+/// the summary with `secret`. If `secret` is `None`, both stay unsigned.
 async fn build_signed_remote(dir: &Path, secret: Option<&str>) -> (Repo, Checksum) {
     let (remote, commit) = build_remote(dir).await;
     if let Some(secret) = secret {
@@ -3656,7 +3705,7 @@ async fn build_signed_remote(dir: &Path, secret: Option<&str>) -> (Repo, Checksu
     (remote, commit)
 }
 
-/// Pull `test/main` from `origin` with the options `opts` supplies.
+/// Pulls `test/main` from `origin` with the options in `opts`.
 async fn pull_main(dest: &Repo, opts: PullOptions) -> Result<PullStats, Error> {
     dest.pull(
         "origin",
@@ -3668,11 +3717,12 @@ async fn pull_main(dest: &Repo, opts: PullOptions) -> Result<PullStats, Error> {
     .await
 }
 
-/// The default policy is the tool's: `gpg-verify` is on unless the remote turns
-/// it off, so a remote publishing unsigned commits is refused and publishes
-/// nothing. A build without the GPG engine refuses the same pull for want of an
-/// engine to make the check with, which is the fail-closed side of the same
-/// rule.
+/// The default policy is the policy of the `ostree` command. `gpg-verify` is on
+/// unless the remote turns it off, so a pull from a remote with unsigned
+/// commits is refused. The pull publishes nothing.
+///
+/// A build without the GPG engine refuses the same pull, because no engine can
+/// verify the signatures. This is the fail-closed side of the same rule.
 #[test]
 fn an_unsigned_commit_is_refused_under_the_default_policy() {
     block_on(async {
@@ -3703,8 +3753,8 @@ fn an_unsigned_commit_is_refused_under_the_default_policy() {
     });
 }
 
-/// `sign-verify` with the key that signed the commit accepts it; the same pull
-/// under another key is refused and publishes nothing.
+/// `sign-verify` with the key that signed the commit accepts the commit. The
+/// same pull under another key is refused and publishes nothing.
 #[test]
 fn sign_verify_accepts_the_configured_key_and_refuses_another() {
     block_on(async {
@@ -3743,10 +3793,10 @@ fn sign_verify_accepts_the_configured_key_and_refuses_another() {
     });
 }
 
-/// The trusted set of an engine comes from both key sources: a
-/// `verification-ed25519-file` holding several keys accepts a commit any one of
-/// them signed, and an engine no source holds a key for is refused before a
-/// signature is read.
+/// The trusted set of an engine comes from both key sources. A
+/// `verification-ed25519-file` with several keys accepts a commit that any one
+/// of the keys signed. If no source holds a key for an engine, the pull refuses
+/// the engine before it reads a signature.
 #[test]
 fn a_key_file_supplies_the_trusted_keys() {
     block_on(async {
@@ -3794,8 +3844,8 @@ fn a_key_file_supplies_the_trusted_keys() {
     });
 }
 
-/// `sign-verify=true` names every engine this build has, and a name no engine
-/// answers to is refused rather than quietly skipped.
+/// `sign-verify=true` names each engine that this build has. If no engine has a
+/// given name, the pull refuses the name. It does not skip it silently.
 #[test]
 fn sign_verify_true_selects_every_engine_and_an_unknown_name_is_refused() {
     block_on(async {
@@ -3834,10 +3884,11 @@ fn sign_verify_true_selects_every_engine_and_an_unknown_name_is_refused() {
     });
 }
 
-/// `sign-verify-summary` holds the remote's summary to the same keys. A summary
-/// another key signed is refused before the first object is requested, and one
-/// the remote publishes no signature for is refused by name. The switch is read
-/// on its own: `sign-verify=false` leaves it in place.
+/// `sign-verify-summary` verifies the summary of the remote with the same keys.
+/// If another key signed the summary, the pull refuses it before the first
+/// object request. If the remote publishes no summary signature, the refusal
+/// names `summary.sig`. The pull reads the switch on its own, so
+/// `sign-verify=false` does not turn it off.
 #[test]
 fn the_summary_signature_is_checked_when_the_remote_asks_for_it() {
     block_on(async {
@@ -3857,10 +3908,10 @@ fn the_summary_signature_is_checked_when_the_remote_asks_for_it() {
         );
         drop(dest);
 
-        // The same summary signed by a key the destination does not trust.
-        // Regeneration drops the signature the trusted key left, so the file
-        // holds the other key's alone. The refusal comes before the remote is
-        // asked for anything else.
+        // A key that the destination does not trust signs the same summary.
+        // Regeneration drops the signature of the trusted key, so the file
+        // holds only the signature of the other key. The refusal comes before
+        // any other request to the remote.
         remote
             .regenerate_summary(&SummaryOptions {
                 last_modified: Some(FIXED_TS),
@@ -3888,7 +3939,8 @@ fn the_summary_signature_is_checked_when_the_remote_asks_for_it() {
         );
         drop(dest);
 
-        // A remote publishing no signature at all is refused by name.
+        // If the remote publishes no signature, the refusal names
+        // `summary.sig`.
         server.hide("summary.sig");
         std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), &extra).await;
@@ -3901,8 +3953,9 @@ fn the_summary_signature_is_checked_when_the_remote_asks_for_it() {
     });
 }
 
-/// Every commit a pull carries is checked, the parents a depth pull follows
-/// included: a signed tip over an unsigned parent is refused at the parent.
+/// A pull verifies each commit that it carries, also the parents that a depth
+/// pull follows. If the tip is signed and its parent is not, the pull refuses
+/// the parent.
 #[test]
 fn a_parent_reached_under_depth_is_checked_too() {
     block_on(async {
@@ -3956,9 +4009,9 @@ fn a_parent_reached_under_depth_is_checked_too() {
             "{err}"
         );
         assert_nothing_published(&dest).await;
-        // The tip passed the policy and was marked before the parent was
-        // refused. The failed pull published neither commit, so it takes that
-        // marker back.
+        // The tip passed the policy and got a marker before the pull refused
+        // the parent. The failed pull published neither commit, so it removes
+        // that marker.
         let marker = dir
             .path()
             .join("dest/state")
@@ -3967,8 +4020,8 @@ fn a_parent_reached_under_depth_is_checked_too() {
     });
 }
 
-/// A commit this repository already holds is checked again: the policy the pull
-/// states is what decides, not what an earlier pull accepted.
+/// A pull verifies again a commit that this repository already holds. The
+/// policy of the current pull decides. The result of an earlier pull does not.
 #[test]
 fn a_commit_already_here_is_checked_again() {
     block_on(async {
@@ -3988,8 +4041,8 @@ fn a_commit_already_here_is_checked_again() {
             Some(commit)
         );
 
-        // The same repository, now holding the commit, under a policy naming a
-        // key that did not sign it.
+        // The same repository now holds the commit. Its new policy names a key
+        // that did not sign the commit.
         drop(dest);
         let dest = reconfigure_dest(
             dir.path(),
@@ -4002,7 +4055,7 @@ fn a_commit_already_here_is_checked_again() {
     });
 }
 
-/// The pull's own switches win over the remote's configuration, in both
+/// The switches of the pull override the configuration of the remote, in both
 /// directions.
 #[test]
 fn the_options_override_the_configured_policy() {
@@ -4011,8 +4064,8 @@ fn the_options_override_the_configured_policy() {
         let (_remote, commit) = build_signed_remote(dir.path(), Some(SECRET_B64)).await;
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
 
-        // Configured to check with a key that did not sign the commit; the pull
-        // asks for no check and lands the ref.
+        // The configuration names a key that did not sign the commit. The pull
+        // turns verification off and writes the ref.
         let dest = build_dest(
             dir.path(),
             RepoMode::Archive,
@@ -4037,8 +4090,8 @@ fn the_options_override_the_configured_policy() {
             Some(commit)
         );
 
-        // Configured to check nothing; the pull asks for every engine and the
-        // key the configuration names is the wrong one.
+        // The configuration turns no verification on. The pull turns on each
+        // engine, and the configuration names the wrong key.
         drop(dest);
         std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
         let dest = build_dest(
@@ -4065,9 +4118,9 @@ fn the_options_override_the_configured_policy() {
     });
 }
 
-/// A static delta is held to the sign-api engines the commit policy names: one
-/// signed by a trusted key is applied, and one signed by another key fails
-/// before a part is fetched.
+/// A pull verifies a static delta with the sign-api engines that the commit
+/// policy names. If a trusted key signed the delta, the pull applies it. If
+/// another key signed it, the pull fails before it fetches a part.
 #[test]
 fn a_delta_is_held_to_the_pulls_signature_policy() {
     block_on(async {
@@ -4094,8 +4147,9 @@ fn a_delta_is_held_to_the_pulls_signature_policy() {
                 .await
                 .unwrap(),
         );
-        // Signed by a key the destination does not trust. The remote serves no
-        // summary, so the superblock is asked for by name.
+        // A key that the destination does not trust signs the delta. The
+        // remote serves no summary, so the pull requests the superblock by
+        // name.
         remote
             .sign_static_delta(
                 &delta,
@@ -4120,8 +4174,9 @@ fn a_delta_is_held_to_the_pulls_signature_policy() {
         );
         drop(dest);
 
-        // The same delta signed by the trusted key is applied, and the commit it
-        // delivers passes the commit policy on its own signature.
+        // The pull applies the same delta with a signature of the trusted key.
+        // The commit that the delta delivers passes the commit policy with its
+        // own signature.
         std::fs::remove_dir_all(&delta).unwrap();
         let delta = remote_path.join(
             remote
@@ -4153,10 +4208,10 @@ fn a_delta_is_held_to_the_pulls_signature_policy() {
     });
 }
 
-/// Interop: the port's pull reads the signatures the `ostree` tool wrote. The
-/// tool builds the remote, signs its commit and its summary with ed25519, and
-/// the port pulls it under a policy naming that key -- and refuses the same
-/// remote under another key.
+/// Interop: a pull by ostrya verifies the signatures that the `ostree` command
+/// writes. The command builds the remote and signs its commit and its summary
+/// with ed25519. ostrya pulls the remote under a policy that names that key. It
+/// refuses the same remote under another key.
 #[test]
 fn a_pull_verifies_what_the_tool_signed() {
     if !ostree_supports_ed25519() {
@@ -4238,11 +4293,13 @@ fn a_pull_verifies_what_the_tool_signed() {
     });
 }
 
-/// The durability options change the sync calls of an HTTP pull and no byte it
-/// writes: a pull under each combination of the two stores the same objects and
-/// refs and reports the same statistics, in an `archive` and a `bare-user`
-/// destination, and a mirror pull of every ref copies the same summary. The
-/// sync calls themselves are read under `strace` by the CLI tests.
+/// The durability options change the sync calls of an HTTP pull. They change no
+/// byte that the pull writes.
+///
+/// The test pulls into an `archive` and a `bare-user` destination under each
+/// combination of the two options. Each pull stores the same objects and refs
+/// and reports the same statistics. A mirror pull of all refs copies the same
+/// summary. The CLI tests read the sync calls under `strace`.
 #[test]
 fn http_pull_durability_options_change_no_byte() {
     block_on(async {
@@ -4288,7 +4345,7 @@ fn http_pull_durability_options_change_no_byte() {
                     let summary = std::fs::read(root.join("summary")).unwrap();
                     files.push(("summary".to_owned(), summary));
                 }
-                // The elapsed time is the one figure a rerun changes.
+                // The elapsed time is the one figure that changes between runs.
                 let stats = PullStats {
                     elapsed: std::time::Duration::ZERO,
                     ..stats
@@ -4309,9 +4366,9 @@ fn http_pull_durability_options_change_no_byte() {
 
 // --- subpaths ----------------------------------------------------------------
 
-/// A source tree with siblings of distinct content under `dir`: the files `top`
-/// and `a`, `sub/f1`, `sub/deeper/f2`, `other/g`, and one directory `x` of
-/// identical content under both `sub` and `other`.
+/// Builds a source tree under `dir` with siblings of distinct content. The tree
+/// holds the files `top`, `a`, `sub/f1`, `sub/deeper/f2`, and `other/g`. It
+/// also holds one directory `x` with the same content under `sub` and `other`.
 fn build_subpath_tree(dir: &Path) {
     for d in ["sub/deeper", "sub/x", "other/x"] {
         std::fs::create_dir_all(dir.join(d)).unwrap();
@@ -4329,8 +4386,8 @@ fn build_subpath_tree(dir: &Path) {
     }
 }
 
-/// A remote under `dir/remote` holding `test/main` over the subpath tree, with
-/// no summary, so a delta is probed for by name.
+/// Builds a remote under `dir/remote` that holds `test/main` over the subpath
+/// tree. The remote has no summary, so a pull probes for a delta by name.
 async fn build_subpath_remote(dir: &Path) -> (Repo, Checksum) {
     build_subpath_tree(&dir.join("src"));
     let repo = Repo::create(&dir.join("remote"), CreateOptions::new(RepoMode::Archive))
@@ -4340,8 +4397,8 @@ async fn build_subpath_remote(dir: &Path) -> (Repo, Checksum) {
     (repo, commit)
 }
 
-/// The objects of the entry at `path` in `commit`: a file object, or a
-/// directory's dirtree and dirmeta.
+/// Returns the objects of the entry at `path` in `commit`. For a file, this is
+/// the file object. For a directory, it is the dirtree and the dirmeta.
 async fn entry_objects(repo: &Repo, commit: &Checksum, path: &str) -> Vec<ostrya::ObjectName> {
     use ostrya::{ObjectName, ObjectType};
     let (commit, _) = repo.load_commit(commit).await.unwrap();
@@ -4364,8 +4421,8 @@ async fn entry_objects(repo: &Repo, commit: &Checksum, path: &str) -> Vec<ostrya
     ]
 }
 
-/// Every object under the directory at `path` in `commit`, the directory's own
-/// dirtree and dirmeta included.
+/// Returns each object under the directory at `path` in `commit`. The set
+/// includes the dirtree and the dirmeta of the directory itself.
 async fn whole_objects(repo: &Repo, commit: &Checksum, path: &str) -> HashSet<ostrya::ObjectName> {
     use ostrya::{ObjectName, ObjectType};
     let own = entry_objects(repo, commit, path).await;
@@ -4385,8 +4442,8 @@ async fn whole_objects(repo: &Repo, commit: &Checksum, path: &str) -> HashSet<os
     out
 }
 
-/// The objects every subpath pull of `commit` fetches: the commit, and the root
-/// dirtree and dirmeta.
+/// Returns the objects that each subpath pull of `commit` fetches. These are
+/// the commit, the root dirtree, and the root dirmeta.
 async fn subpath_base(repo: &Repo, commit: &Checksum) -> HashSet<ostrya::ObjectName> {
     use ostrya::{ObjectName, ObjectType};
     let mut out: HashSet<ObjectName> = entry_objects(repo, commit, "/").await.into_iter().collect();
@@ -4402,8 +4459,8 @@ fn subpath_opts(values: &[&str]) -> PullOptions {
     }
 }
 
-/// The zero-length marker a subpath pull leaves on `commit` in the destination
-/// at `dest`.
+/// Asserts that the destination at `dest` holds the zero-length marker that a
+/// subpath pull leaves on `commit`.
 fn assert_partial_marker(dest: &Path, commit: &Checksum) {
     let marker = dest
         .join("state")
@@ -4411,10 +4468,14 @@ fn assert_partial_marker(dest: &Path, commit: &Checksum) {
     assert_eq!(std::fs::metadata(&marker).unwrap().len(), 0, "{marker:?}");
 }
 
-/// Each subpath form fetches the commit, the root dirtree and dirmeta, the
-/// directories on the path, and the entry the path names whole, and nothing
-/// else; the ref is written and the commit is left partial behind a
-/// zero-length marker.
+/// Each subpath form fetches these objects and no others:
+///
+/// - the commit, the root dirtree, and the root dirmeta
+/// - the directories on the path
+/// - the whole entry that the path names.
+///
+/// The pull writes the ref. The commit stays partial, with a zero-length
+/// marker.
 #[test]
 fn a_subpath_pull_fetches_the_path_and_leaves_the_commit_partial() {
     block_on(async {
@@ -4475,9 +4536,9 @@ fn a_subpath_pull_fetches_the_path_and_leaves_the_commit_partial() {
     });
 }
 
-/// A pull without subpaths completes a commit a subpath pull left partial and
-/// removes its marker, and a subpath pull of a commit already complete here
-/// leaves it complete.
+/// A pull without subpaths completes a commit that a subpath pull left partial.
+/// It removes the marker of the commit. A subpath pull of a commit that is
+/// already complete here leaves it complete.
 #[test]
 fn a_full_pull_completes_a_subpath_pull() {
     block_on(async {
@@ -4503,9 +4564,10 @@ fn a_full_pull_completes_a_subpath_pull() {
     });
 }
 
-/// One dirtree reached at two subpath positions is walked under both: `x`
-/// named whole under `other` fetches its file whatever the order, and named as
-/// a directory alone at both positions fetches none.
+/// If two subpath positions reach one dirtree, the pull walks it under both. If
+/// a subpath names `x` whole under `other`, the pull fetches its file in either
+/// order. If both subpaths name `x` as a directory alone, the pull fetches no
+/// file.
 #[test]
 fn a_dirtree_at_two_subpath_positions_takes_the_union() {
     block_on(async {
@@ -4536,9 +4598,12 @@ fn a_dirtree_at_two_subpath_positions_takes_the_union() {
     });
 }
 
-/// Under `depth` every commit reached is walked under the same subpaths and
-/// left partial; under `COMMIT_ONLY` the commit alone is fetched; under
-/// `MIRROR` the ref is written as a local ref.
+/// Subpaths combine with other options:
+///
+/// - Under `depth`, the pull walks each commit that it reaches under the same
+///   subpaths and leaves each one partial.
+/// - Under `COMMIT_ONLY`, the pull fetches the commit alone.
+/// - Under `MIRROR`, the pull writes the ref as a local ref.
 #[test]
 fn subpaths_combine_with_depth_commit_only_and_mirror() {
     block_on(async {
@@ -4617,8 +4682,8 @@ fn subpaths_combine_with_depth_commit_only_and_mirror() {
     });
 }
 
-/// A from-scratch delta is applied whole under subpaths, as the tool applies
-/// one, and the commit keeps its marker.
+/// A subpath pull applies a from-scratch delta whole, as the `ostree` command
+/// does. The commit keeps its marker.
 #[test]
 fn a_subpath_pull_applies_a_delta_whole() {
     block_on(async {
@@ -4651,8 +4716,8 @@ fn a_subpath_pull_applies_a_delta_whole() {
     });
 }
 
-/// Into an `archive` destination a subpath pull takes no delta: it fetches the
-/// subpath loose and requests no part.
+/// A subpath pull into an `archive` destination takes no delta. It fetches the
+/// subpath as loose objects and requests no part.
 #[test]
 fn a_subpath_pull_into_an_archive_takes_no_delta() {
     block_on(async {
@@ -4691,7 +4756,7 @@ fn a_subpath_pull_into_an_archive_takes_no_delta() {
             "{:?}",
             server.seen()
         );
-        // A pull that requires static deltas takes the delta all the same.
+        // A pull that requires static deltas takes the delta in this case too.
         let required = dir.path().join("required");
         std::fs::create_dir(&required).unwrap();
         let dest = build_dest(&required, RepoMode::Archive, &server.url(), "").await;
@@ -4713,12 +4778,15 @@ fn a_subpath_pull_into_an_archive_takes_no_delta() {
     });
 }
 
-/// A commit whose object the destination holds partial, under a ref naming it,
-/// is looked for a delta for. With a summary the pull leaves the from-scratch
-/// delta alone: a subpath pull after a commit-only pull, and a full pull after
-/// a subpath pull, each fetch what is missing loose. With no summary the
-/// subpath pull asks for the from-scratch delta by name and applies it whole,
-/// and keeps the marker.
+/// The destination holds a commit object partial, under a ref that names it.
+/// The pull looks for a delta for this commit.
+///
+/// With a summary, the pull leaves the from-scratch delta alone. A subpath pull
+/// after a commit-only pull fetches the missing objects as loose objects. A
+/// full pull after the subpath pull does the same.
+///
+/// With no summary, the subpath pull requests the from-scratch delta by name
+/// and applies it whole. The commit keeps its marker.
 #[test]
 fn a_commit_held_partial_under_its_ref_takes_a_delta_only_by_name() {
     block_on(async {
@@ -4815,7 +4883,7 @@ fn a_relative_or_empty_subpath_is_refused() {
     });
 }
 
-/// A depth below -1 is refused before the first request.
+/// The pull refuses a depth less than -1 before the first request.
 #[test]
 fn a_depth_below_minus_one_is_refused() {
     block_on(async {
@@ -4842,10 +4910,12 @@ fn a_depth_below_minus_one_is_refused() {
     });
 }
 
-/// A remote archive repository under `dir/remote` holding `test/main` at a
-/// second commit over the first, both over the small tree with a different
-/// marker. Returns the remote and the two commits, the first one first. The
-/// remote holds no delta and no summary.
+/// Builds a remote archive repository under `dir/remote` with two commits on
+/// `test/main`. The second commit is a child of the first. Both commits hold
+/// the small tree, each with a different marker. The remote holds no delta and
+/// no summary.
+///
+/// Returns the remote and the two commits, the first commit first.
 async fn build_remote_two_commits(dir: &Path) -> (Repo, Checksum, Checksum) {
     build_tree(&dir.join("one"), b"one\n");
     build_tree(&dir.join("two"), b"two\n");
@@ -4857,7 +4927,7 @@ async fn build_remote_two_commits(dir: &Path) -> (Repo, Checksum, Checksum) {
     (repo, first, second)
 }
 
-/// Generate a delta in `repo` with a fixed timestamp, then its summary.
+/// Generates a delta in `repo` with a fixed timestamp, then the summary.
 async fn publish_delta(repo: &Repo, from: Option<&Checksum>, to: &Checksum) {
     repo.generate_static_delta(
         from,
@@ -4877,7 +4947,7 @@ async fn publish_delta(repo: &Repo, from: Option<&Checksum>, to: &Checksum) {
     .unwrap();
 }
 
-/// The options of a pull of `test/main` that requires static deltas.
+/// Returns the options of a pull of `test/main` that requires static deltas.
 fn required_delta_opts() -> PullOptions {
     PullOptions {
         refs: vec!["test/main".to_owned()],
@@ -4886,8 +4956,8 @@ fn required_delta_opts() -> PullOptions {
     }
 }
 
-/// A destination under `dir/dest` holding `commit` complete, imported from
-/// `dir/remote`, with no ref.
+/// Builds a destination under `dir/dest` that holds `commit` complete, with no
+/// ref. The commit comes from `dir/remote`.
 async fn dest_holding(dir: &Path, url: &str, commit: &Checksum) -> Repo {
     let dest = build_dest(dir, RepoMode::BareUser, url, "").await;
     let remote = Repo::open(&dir.join("remote")).await.unwrap();
@@ -4901,8 +4971,8 @@ async fn dest_holding(dir: &Path, url: &str, commit: &Checksum) -> Repo {
     )
     .await
     .unwrap();
-    // A local pull of a checksum writes a ref of that name, which this
-    // destination does not keep.
+    // A local pull of a checksum writes a ref with that name. This destination
+    // does not keep the ref.
     let txn = dest.transaction().await.unwrap();
     txn.set_ref(&commit.to_hex(), None);
     txn.commit().await.unwrap();
@@ -4910,9 +4980,9 @@ async fn dest_holding(dir: &Path, url: &str, commit: &Checksum) -> Repo {
     dest
 }
 
-/// A pull that requires static deltas into a destination holding no source of
-/// any advertised delta is refused, although the summary advertises a delta
-/// from another commit. Nothing is published and no object is asked for.
+/// The pull requires static deltas, and the destination holds the source of no
+/// advertised delta. The summary advertises a delta from another commit. The
+/// pull is refused, publishes nothing, and requests no object.
 #[test]
 fn required_deltas_refuse_a_summary_naming_no_usable_delta() {
     block_on(async {
@@ -4944,7 +5014,7 @@ fn required_deltas_refuse_a_summary_naming_no_usable_delta() {
 }
 
 /// A pull that requires static deltas from a summary that lists no delta is
-/// refused with the same words.
+/// refused with the same message.
 #[test]
 fn required_deltas_refuse_a_summary_listing_no_delta() {
     block_on(async {
@@ -4967,7 +5037,7 @@ fn required_deltas_refuse_a_summary_listing_no_delta() {
 }
 
 /// A pull that requires static deltas from a remote with no summary is refused
-/// before any delta is asked for by name.
+/// before it requests a delta by name.
 #[test]
 fn required_deltas_refuse_a_remote_with_no_summary() {
     block_on(async {
@@ -5005,9 +5075,9 @@ fn required_deltas_refuse_a_remote_with_no_summary() {
     });
 }
 
-/// A superblock the summary advertises and the remote does not hold fails a
-/// pull that requires static deltas, and leaves a pull that does not to fetch
-/// the objects loose.
+/// The summary advertises a superblock that the remote does not hold. A pull
+/// that requires static deltas fails. A pull that does not require them fetches
+/// the objects as loose objects.
 #[test]
 fn required_deltas_refuse_a_stale_advertisement() {
     block_on(async {
@@ -5043,8 +5113,9 @@ fn required_deltas_refuse_a_stale_advertisement() {
     });
 }
 
-/// A destination holding the source of a from-to delta takes that delta,
-/// whatever its own ref names: here it holds the source commit under no ref.
+/// A destination that holds the source of a from-to delta takes that delta, for
+/// any value of its own ref. In this test, it holds the source commit under no
+/// ref.
 #[test]
 fn a_from_to_delta_is_taken_from_any_commit_held_complete() {
     block_on(async {
@@ -5073,9 +5144,10 @@ fn a_from_to_delta_is_taken_from_any_commit_held_complete() {
     });
 }
 
-/// A destination whose ref names a commit it holds leaves an advertised
-/// from-scratch delta alone, also when static deltas are required: that pull
-/// fetches the objects loose and is not refused.
+/// If the ref of a destination names a commit that it holds, the pull leaves an
+/// advertised from-scratch delta alone. This is also true when static deltas
+/// are required. That pull fetches the objects as loose objects and is not
+/// refused.
 #[test]
 fn required_deltas_pass_a_declined_from_scratch_delta() {
     block_on(async {
@@ -5100,11 +5172,13 @@ fn required_deltas_pass_a_declined_from_scratch_delta() {
     });
 }
 
-/// A destination that holds the commit object partial is looked for a delta
-/// for. Where the summary advertises none, a pull that requires static deltas
-/// is refused and fetches no object. Where it advertises the from-scratch
-/// delta, the ref names that commit, so the pull asks for the delta index,
-/// leaves the delta alone, fetches the objects loose, and is not refused.
+/// If a destination holds the commit object partial, the pull looks for a delta
+/// for it. The test pulls with required static deltas.
+///
+/// If the summary advertises no delta, the pull is refused and fetches no
+/// object. If the summary advertises the from-scratch delta, the ref names that
+/// commit, so the pull requests the delta index and leaves the delta alone. It
+/// fetches the objects as loose objects and is not refused.
 #[test]
 fn required_deltas_look_for_a_delta_for_a_commit_held_partial() {
     block_on(async {
@@ -5165,8 +5239,8 @@ fn required_deltas_look_for_a_delta_for_a_commit_held_partial() {
 
 // --- writing no ref --------------------------------------------------------
 
-/// A remote archive repository under `dir/remote` with two commits on
-/// `test/main`, the second a child of the first, and a summary.
+/// Builds a remote archive repository under `dir/remote` with two commits on
+/// `test/main` and a summary. The second commit is a child of the first.
 async fn build_remote_chain(dir: &Path) -> (Repo, Checksum, Checksum) {
     let (remote, first, second) = build_remote_two_commits(dir).await;
     remote
@@ -5179,7 +5253,7 @@ async fn build_remote_chain(dir: &Path) -> (Repo, Checksum, Checksum) {
     (remote, first, second)
 }
 
-/// Assert that `repo` holds no ref, local or under `refs/remotes`.
+/// Asserts that `repo` holds no ref, local or under `refs/remotes`.
 async fn assert_no_refs(repo: &Repo) {
     assert!(repo.list_refs(None).await.unwrap().is_empty());
     assert!(
@@ -5190,9 +5264,11 @@ async fn assert_no_refs(repo: &Repo) {
     );
 }
 
-/// Assert that `commit` is complete in `dest`: its state is normal, it keeps
-/// no `.commitpartial` marker, and every object it reaches in `remote` is
-/// present.
+/// Asserts that `commit` is complete in `dest`:
+///
+/// - its state is normal
+/// - it keeps no `.commitpartial` marker
+/// - each object that it reaches in `remote` is present.
 async fn assert_complete(remote: &Repo, dest: &Repo, dest_dir: &Path, commit: &Checksum) {
     assert_eq!(
         dest.commit_state(commit).await.unwrap(),
@@ -5208,8 +5284,8 @@ async fn assert_complete(remote: &Repo, dest: &Repo, dest_dir: &Path, commit: &C
     }
 }
 
-/// A pull that writes no ref leaves the ref the destination holds as it
-/// stands, and stores the pulled commit complete with its detached metadata.
+/// A pull that writes no ref does not change the ref that the destination
+/// holds. It stores the pulled commit complete, with its detached metadata.
 #[test]
 fn a_pull_with_no_ref_writes_keeps_the_ref_and_completes_the_commit() {
     block_on(async {
@@ -5251,8 +5327,8 @@ fn a_pull_with_no_ref_writes_keeps_the_ref_and_completes_the_commit() {
     });
 }
 
-/// A pull that writes no ref still follows `depth`, writes nothing under
-/// `refs/remotes/origin`, and completes every commit of the chain.
+/// A pull that writes no ref obeys `depth` and writes nothing under
+/// `refs/remotes/origin`. It completes each commit of the chain.
 #[test]
 fn a_pull_with_no_ref_writes_completes_every_parent_under_depth() {
     block_on(async {
@@ -5285,8 +5361,8 @@ fn a_pull_with_no_ref_writes_completes_every_parent_under_depth() {
     });
 }
 
-/// A mirror pull of every ref that writes no ref copies no summary and no
-/// summary signature either.
+/// A mirror pull of all refs that writes no ref copies no summary and no
+/// summary signature.
 #[test]
 fn a_mirror_pull_with_no_ref_writes_copies_no_summary() {
     block_on(async {
@@ -5319,8 +5395,8 @@ fn a_mirror_pull_with_no_ref_writes_copies_no_summary() {
 
 // --- collection refs -------------------------------------------------------
 
-/// An HTTP pull refuses a collection id before its first request, and
-/// publishes nothing. A remote with no section in the configuration gets the
+/// An HTTP pull refuses a collection id before its first request and publishes
+/// nothing. A pull from a remote with no section in the configuration gets the
 /// same refusal.
 #[test]
 fn an_http_pull_refuses_a_collection_id() {
@@ -5364,9 +5440,9 @@ fn an_http_pull_refuses_a_collection_id() {
     });
 }
 
-// --- the remote's proxy key ------------------------------------------------
+// --- the proxy key of a remote ---------------------------------------------
 
-/// The variables the fetcher reads to find a proxy, under both spellings. A
+/// The variables that the fetcher reads to find a proxy, in both spellings. A
 /// child process that pulls through the environment starts with none of them.
 const PROXY_VARIABLES: [&str; 8] = [
     "http_proxy",
@@ -5383,9 +5459,9 @@ const PROXY_VARIABLES: [&str; 8] = [
 /// the `http_proxy` of the child.
 const REFUSED: &str = "refused:";
 
-/// The writer child pulls the ref its argument names from `origin`. Under the
-/// [`REFUSED`] prefix the pull must fail with a refusal that names
-/// `http_proxy` and leaves its credential out.
+/// The writer child pulls from `origin` the ref that its argument names. With
+/// the [`REFUSED`] prefix, the pull must fail with a refusal that names
+/// `http_proxy` and leaves out its credential.
 #[test]
 #[ignore = "helper process for the proxy environment tests"]
 fn writer_child_subprocess() {
@@ -5418,10 +5494,10 @@ fn writer_child_subprocess() {
     });
 }
 
-/// A cleartext pull from a remote with a `proxy` key sends every request to
-/// that proxy in absolute form. The suite runs with `no_proxy="*"`, which
-/// exempts every origin from an environment proxy, so the pull also shows that
-/// the key ignores `no_proxy`.
+/// A cleartext pull from a remote with a `proxy` key sends each request to that
+/// proxy in absolute form. The suite runs with `no_proxy="*"`, which exempts
+/// each origin from an environment proxy. The pull through the key also shows
+/// that the key ignores `no_proxy`.
 #[test]
 fn a_pull_goes_through_the_proxy_key() {
     assert_eq!(
@@ -5466,7 +5542,7 @@ fn a_pull_goes_through_the_proxy_key() {
 }
 
 /// A pull from an `https://` remote with a `proxy` key opens a tunnel to the
-/// remote through the proxy, and the proxy sees nothing else.
+/// remote through the proxy. The proxy sees no other request.
 #[test]
 fn a_tls_pull_tunnels_through_the_proxy_key() {
     block_on(async {
@@ -5534,8 +5610,8 @@ fn remote_fetch_summary_goes_through_the_proxy_key() {
     });
 }
 
-/// A `proxy` key the fetcher cannot connect through fails the pull before its
-/// first request, and the pull publishes nothing.
+/// If the fetcher cannot connect through a `proxy` key, the pull fails before
+/// its first request. The pull publishes nothing.
 #[test]
 fn a_pull_refuses_a_proxy_key_it_cannot_use() {
     block_on(async {
@@ -5566,9 +5642,10 @@ fn a_pull_refuses_a_proxy_key_it_cannot_use() {
     });
 }
 
-/// A `proxy` key with white space at the end of its value, or a value that
-/// the `\s` escape makes one space, fails the pull before its first request,
-/// and the pull publishes nothing. The message leaves the credential out.
+/// A `proxy` key with white space at the end of its value fails the pull before
+/// its first request. A value that the `\s` escape makes one space fails the
+/// pull in the same way. The pull publishes nothing. The message leaves out the
+/// credential.
 #[test]
 fn a_pull_refuses_a_proxy_key_with_white_space_around_it() {
     for (tag, value) in [
@@ -5605,9 +5682,9 @@ fn a_pull_refuses_a_proxy_key_with_white_space_around_it() {
     }
 }
 
-/// Run the pull of `test/main` in a child process whose environment names
-/// the test proxy in `http_proxy` alone, with the `[remote]` keys `extra`.
-/// The pull goes through the proxy and writes the ref.
+/// Runs the pull of `test/main` in a child process, with the `[remote]` keys
+/// `extra`. The environment of the child names the test proxy in `http_proxy`
+/// alone. The pull goes through the proxy and writes the ref.
 fn pull_through_the_environment_proxy(tag: &str, extra: &str) {
     block_on(async {
         let dir = TmpDir::new(tag);
@@ -5624,8 +5701,8 @@ fn pull_through_the_environment_proxy(tag: &str, extra: &str) {
             }
             command.env("http_proxy", proxy_url);
         });
-        // The proxy and the server run on this thread's runtime, so the wait
-        // must not block it.
+        // The proxy and the server run on the runtime of this thread, so the
+        // wait must not block it.
         ostrya_rt::unblock(move || child.wait()).await;
 
         assert!(proxy.requests() > 0);
@@ -5638,10 +5715,10 @@ fn pull_through_the_environment_proxy(tag: &str, extra: &str) {
     });
 }
 
-/// Run the pull of `test/main` in a child process whose environment holds
-/// `http_proxy` alone, set to the test proxy URL with a credential, which
-/// `around` puts white space around. The pull fails before its first request
-/// and publishes nothing.
+/// Runs the pull of `test/main` in a child process. The environment of the
+/// child holds `http_proxy` alone. Its value is the test proxy URL with a
+/// credential, and `around` adds white space to it. The pull fails before its
+/// first request and publishes nothing.
 fn pull_refuses_the_environment_proxy(tag: &str, around: impl Fn(&str) -> String) {
     block_on(async {
         let dir = TmpDir::new(tag);
@@ -5658,8 +5735,8 @@ fn pull_refuses_the_environment_proxy(tag: &str, around: impl Fn(&str) -> String
             }
             command.env("http_proxy", value);
         });
-        // The proxy and the server run on this thread's runtime, so the wait
-        // must not block it.
+        // The proxy and the server run on the runtime of this thread, so the
+        // wait must not block it.
         ostrya_rt::unblock(move || child.wait()).await;
 
         assert_eq!(proxy.requests(), 0);
@@ -5680,13 +5757,14 @@ fn a_pull_refuses_an_http_proxy_with_leading_white_space() {
     pull_refuses_the_environment_proxy("pull-http-proxy-env-leading", |url| format!(" {url}"));
 }
 
-/// An empty `proxy` key leaves the proxy to the environment.
+/// If the `proxy` key is empty, the pull reads the proxy from the environment.
 #[test]
 fn an_empty_proxy_key_reads_the_environment() {
     pull_through_the_environment_proxy("pull-http-proxy-key-empty", "proxy=\n");
 }
 
-/// A remote with no `proxy` key reads the proxy from the environment.
+/// If a remote has no `proxy` key, the pull reads the proxy from the
+/// environment.
 #[test]
 fn no_proxy_key_reads_the_environment() {
     pull_through_the_environment_proxy("pull-http-proxy-key-absent", "");

@@ -1,29 +1,17 @@
-//! The object-store write layer: streaming content ingestion and staging.
+//! The write layer of the object store: content streams and staging.
 //!
-//! This module holds the pieces a [`Transaction`](crate::Transaction) uses to
-//! ingest objects into its staging directory: the logical metadata a writer
-//! consumes ([`FileMeta`]), the push-style streaming primitive
-//! ([`ContentWriter`]), and the per-mode on-disk application plus staging
-//! syscalls the writers finish with.
+//! The public items are [`FileMeta`], [`ContentWriter`], and the object
+//! writers of [`Transaction`]. [`ContentWriter`] holds the
+//! storage and identity facts. The staging functions in this module run the
+//! per-mode syscalls that the writers end with.
 //!
-//! Ingestion goes into an unnamed temp file (`O_TMPFILE` in the staging
-//! directory, materialized with `linkat`) where the filesystem allows it, and a
-//! named temp file otherwise. A regular file's payload streams through an
-//! `rt::File` in bounded chunks and is hashed on the way down; in archive mode
-//! the same pass feeds the raw-DEFLATE encoder of `ostrya-core`
-//! (`ostrya_core::DeflateSink`) at `[archive] zlib-level`. The object identity
-//! is the SHA-256 of the framed uncompressed header followed by the raw
-//! payload, so it is complete when the stream ends regardless of how the bytes
-//! are stored.
+//! The payload of a regular file streams through an `rt::File`. In archive
+//! mode the encoder is `ostrya_core::DeflateSink`.
 //!
-//! Per-mode inode application is always by explicit `fchmod`/`fchown`, never the
-//! umask, reproducing the modes recovered from the `ostree` tool (see
-//! `format-reference.md`, "Write path: loose-object inode modes and
-//! durability").
-//! A regular-file content object is sealed with fs-verity before its logical
-//! mode and owner are applied, because `FS_IOC_ENABLE_VERITY` needs write
-//! permission on the inode. In bare mode the logical xattrs go on after the
-//! seal, between the owner and the mode.
+//! The stager seals a regular-file content object with fs-verity before it
+//! applies the logical mode and owner, because `FS_IOC_ENABLE_VERITY` needs
+//! write permission on the inode. In bare mode the logical xattrs go on after
+//! the seal, between the owner and the mode.
 
 use std::future::poll_fn;
 use std::io::{self, SeekFrom};
@@ -57,30 +45,38 @@ const SYMLINK_MODE: u32 = S_IFLNK | 0o777;
 const PERM_MASK: u32 = 0o7777;
 /// The file-type mask of an `st_mode`.
 const S_IFMT: u32 = 0o170000;
-/// The permission bits `bare-user-only` keeps: the owner bits and the group and
-/// other read and execute bits.
+/// The permission bits that `bare-user-only` keeps: the owner bits, and the
+/// read and execute bits of the group and of others.
 const CANONICAL_PERM_MASK: u32 = 0o755;
-/// The fixed inode mode metadata objects and archive/shared content take.
+/// The fixed inode mode of metadata objects, and of archive and
+/// `bare-user-shared` content objects.
 const FIXED_MODE: u32 = 0o644;
-/// The chunk size for a streaming pass over a content object's payload: the
-/// copy in [`Transaction::write_content`] and the hash `Repo::fsck` takes.
+/// The chunk size of a streaming pass over the payload of a content object.
+///
+/// [`Transaction::write_content`] copies in chunks of this size, and
+/// `Repo::fsck` hashes in them.
 pub(crate) const COPY_CHUNK: usize = 64 * 1024;
-/// Attempts made at an `ETXTBSY` fs-verity enable before it is reported. The
-/// kernel refuses to seal an inode any writable descriptor still holds, and
-/// `fork` copies the file descriptor table, so a child carries a copy of the
-/// writable staging descriptor until its `exec` closes it. The retry outlasts
-/// that fork-to-exec window while a genuine refusal still fails inside 50 ms.
+/// The number of attempts to enable fs-verity before an `ETXTBSY` error is
+/// reported.
+///
+/// The kernel refuses to seal an inode while a writable descriptor to it is
+/// open. `fork` copies the file descriptor table, so a child process holds a
+/// copy of the writable staging descriptor until its `exec` closes it. The
+/// retries outlast this window between `fork` and `exec`. A refusal that stays
+/// still fails within 50 ms.
 const SEAL_ATTEMPTS: u32 = 50;
 /// The pause between fs-verity enable attempts.
 const SEAL_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
 
-/// The logical metadata a content writer applies to an object.
+/// The logical metadata that a writer records for a content object.
 ///
-/// This is the uid, gid, `st_mode`, and xattr set the object header records.
-/// For a regular file the mode carries the `S_IFREG` bits. For a symlink the
-/// mode carries the `S_IFLNK` bits, and [`Transaction::write_symlink`] records
-/// the permission bits beside them; a `mode` naming any other type takes the
-/// model's own `S_IFLNK | 0o777` there.
+/// The fields are the uid, the gid, the `st_mode`, and the xattrs of the
+/// object header. For a regular file, `mode` holds the `S_IFREG` bits. For a
+/// symlink, [`Transaction::write_symlink`] states how it records `mode`.
+///
+/// A `bare-user-only` repository records no ownership and no xattrs. It
+/// reduces the permission bits of a regular file to `perm & 0o755`. The
+/// identity of the object covers this reduced header.
 #[derive(Debug, Clone)]
 pub struct FileMeta {
     /// The logical owning user id.
@@ -94,8 +90,11 @@ pub struct FileMeta {
 }
 
 impl FileMeta {
-    /// Metadata for a regular file with the given owner, permission bits, and
-    /// no xattrs. The `S_IFREG` bit is added to `perm`.
+    /// Creates the metadata of a regular file with an owner, permission bits,
+    /// and no xattrs.
+    ///
+    /// The `mode` field is `S_IFREG` plus the permission bits of `perm`
+    /// (`perm & 0o7777`).
     pub fn regular(uid: u32, gid: u32, perm: u32) -> FileMeta {
         FileMeta {
             uid,
@@ -105,12 +104,12 @@ impl FileMeta {
         }
     }
 
-    /// Whether the mode names a symlink.
+    /// Returns `true` if the mode names a symlink.
     pub(crate) fn is_symlink(&self) -> bool {
         self.mode & S_IFMT == S_IFLNK
     }
 
-    /// The header for a regular-file content object built from this metadata.
+    /// Returns the header of a regular-file content object for this metadata.
     pub(crate) fn regular_header(&self) -> FileHeader {
         FileHeader {
             uid: self.uid,
@@ -121,18 +120,19 @@ impl FileMeta {
         }
     }
 
-    /// The header for a symlink content object with the given target. A mode
-    /// already naming a symlink is recorded as it stands, permission bits
-    /// included, which is what a `--statoverride` entry over a symlink and a
-    /// symlink object copied from another repository both need. A mode naming a
-    /// regular file, and one carrying no file-type bits at all, take the
-    /// model's own `S_IFLNK | 0o777`: those are the forms a caller that states
-    /// permission bits alone builds.
+    /// Returns the header of a symlink content object with the target `target`.
     ///
-    /// Any other file type is recorded as it stands and refused by the header's
-    /// own validation, so a `--statoverride` value that renames a
-    /// symlink to a type the object model does not hold fails the write rather
-    /// than committing a mode the entry never asked for.
+    /// If the mode names a symlink, the header records it unchanged, with its
+    /// permission bits. A `--statoverride` entry on a symlink needs this, and
+    /// so does a symlink object copied from another repository. If the mode
+    /// names a regular file or no file type, the header records
+    /// `S_IFLNK | 0o777`. A caller that states only permission bits builds
+    /// these forms.
+    ///
+    /// The header records any other file type unchanged, and the check of the
+    /// header refuses it. If a `--statoverride` value gives a symlink a type
+    /// that the object model does not hold, the write fails. The write records
+    /// no mode that the entry did not ask for.
     fn symlink_header(&self, target: &str) -> FileHeader {
         FileHeader {
             uid: self.uid,
@@ -147,16 +147,16 @@ impl FileMeta {
     }
 }
 
-/// The logical header a repository of `mode` records for a content object.
+/// Returns the logical header that a repository of mode `mode` records for a
+/// content object.
 ///
-/// Every mode but `bare-user-only` records the header it is given.
-/// `bare-user-only` stores neither ownership nor xattrs and reduces a regular
-/// file's permission bits to `perm & 0o755`, so the header it records is that
-/// reduced form, and an object's identity covers the reduced header rather than
-/// the one the writer supplied. A symlink's mode is fixed by the object model
-/// and is left alone; its ownership and xattrs are discarded like a regular
-/// file's. See `format-reference.md`, "Write path: loose-object inode modes and
-/// durability".
+/// Each mode except `bare-user-only` records the header unchanged.
+/// `bare-user-only` stores no ownership and no xattrs, and it reduces the
+/// permission bits of a regular file to `perm & 0o755`. The header that it
+/// records is this reduced form, and the identity of the object covers the
+/// reduced header. The object model fixes the mode of a symlink, so the
+/// function keeps that mode. A symlink loses its ownership and xattrs as a
+/// regular file does.
 pub(crate) fn canonical_header(mode: RepoMode, mut header: FileHeader) -> FileHeader {
     if mode == RepoMode::BareUserOnly {
         header.uid = 0;
@@ -169,8 +169,10 @@ pub(crate) fn canonical_header(mode: RepoMode, mut header: FileHeader) -> FileHe
     header
 }
 
-/// The directory metadata `bare-user-only` records: no ownership, no xattrs,
-/// and the permission bits reduced the same way a regular file's are.
+/// Returns the directory metadata that `bare-user-only` records.
+///
+/// The metadata has no ownership and no xattrs, and its permission bits are
+/// reduced as for a regular file.
 fn canonical_dirmeta(meta: &DirMeta) -> DirMeta {
     DirMeta {
         uid: 0,
@@ -180,18 +182,21 @@ fn canonical_dirmeta(meta: &DirMeta) -> DirMeta {
     }
 }
 
-/// How a staged temp file is materialized under its final staging name.
+/// How a staged temp file gets its final staging name.
 #[derive(Debug)]
 pub(crate) enum TempKind {
-    /// An `O_TMPFILE` anonymous inode, linked into place via `/proc/self/fd`.
+    /// An `O_TMPFILE` anonymous inode, linked into place through
+    /// `/proc/self/fd`.
     Anonymous,
     /// A named temp file, renamed into place.
     Named(String),
 }
 
-/// An ingestion temp file not yet staged, which is removed when it is dropped:
-/// an anonymous inode goes with its descriptor, and a named temp is unlinked
-/// here. [`into_inner`](PendingTemp::into_inner) hands it on to be staged.
+/// An ingestion temp file that is not staged yet.
+///
+/// A drop removes the temp. An anonymous inode goes away when its descriptor
+/// closes, and the drop unlinks a named temp.
+/// [`into_inner`](PendingTemp::into_inner) hands the temp on for staging.
 struct PendingTemp<'a> {
     staging_fd: BorrowedFd<'a>,
     temp: Option<TempKind>,
@@ -205,7 +210,7 @@ impl<'a> PendingTemp<'a> {
         }
     }
 
-    /// The temp, which is no longer removed on drop.
+    /// Returns the temp and stops its removal on drop.
     fn into_inner(mut self) -> TempKind {
         self.temp
             .take()
@@ -215,25 +220,44 @@ impl<'a> PendingTemp<'a> {
 
 impl Drop for PendingTemp<'_> {
     fn drop(&mut self) {
-        // One unlink of one name, which is what a dedup hit costs as well.
+        // One unlink of one name. A dedup hit costs the same.
         if let Some(temp) = &self.temp {
             cleanup_temp(self.staging_fd, temp);
         }
     }
 }
 
-/// A writer that streams one regular file's payload into a transaction.
+/// A writer that streams the payload of one regular file into a transaction.
 ///
-/// Bytes written pass through a SHA-256 digester seeded with the framed
-/// uncompressed header, so the object identity is complete at
-/// [`finish`](ContentWriter::finish). In archive mode the same bytes feed a
-/// raw-DEFLATE encoder whose output, prefixed by the framed archive header,
-/// becomes the stored `.filez`; the uncompressed size is patched into the
-/// reserved header region at finish. Dropping a writer without `finish`, or a
-/// `finish` that fails before the object is staged, removes the temporary.
+/// [`Transaction::content_writer`] creates the writer, and
+/// [`finish`](ContentWriter::finish) stages the object. The writer implements
+/// `futures_io::AsyncWrite`. With the `tokio` feature, it also implements the
+/// tokio `AsyncWrite`.
 ///
-/// Implements [`futures_io::AsyncWrite`] unconditionally and the tokio
-/// `AsyncWrite` under the `tokio` feature.
+/// If the caller drops the writer before `finish`, or if `finish` fails before
+/// it stages the object, the writer removes its temp file.
+///
+/// # Identity
+///
+/// The identity of a content object is the SHA-256 of the framed uncompressed
+/// header, followed by the raw payload. The writer seeds the hash with the
+/// framed header and hashes each byte that it receives. The identity is
+/// complete when the stream ends, for each storage form.
+///
+/// # Storage
+///
+/// - The payload goes into a temp file in the staging directory. If the file
+///   system supports `O_TMPFILE`, the temp file is an unnamed inode that
+///   `linkat` gives a name. Otherwise it is a named temp file.
+/// - In the bare modes, the temp file receives the raw payload.
+/// - In archive mode, the bytes go through a raw-DEFLATE encoder at the level
+///   of `[archive] zlib-level`, clamped to the range 1-9. The stored `.filez`
+///   is the framed archive header, followed by the DEFLATE output.
+///   [`finish`](ContentWriter::finish) writes the uncompressed size into the
+///   reserved field of the header.
+/// - The inode mode comes from an explicit `fchmod` call, and never from the
+///   umask. It is the mode observed on the objects that the `ostree` command
+///   writes. In `bare` mode, the owner comes from an explicit `fchown` call.
 pub struct ContentWriter<'txn> {
     txn: &'txn Transaction,
     hasher: Sha256,
@@ -242,7 +266,7 @@ pub struct ContentWriter<'txn> {
     expected: Option<Checksum>,
     temp: PendingTemp<'txn>,
     sink: Sink,
-    /// Whether the payload adds to
+    /// `true` if the payload adds to
     /// [`content_bytes_unpacked`](crate::TransactionStats::content_bytes_unpacked).
     counted: bool,
 }
@@ -256,18 +280,41 @@ enum Sink {
 }
 
 impl ContentWriter<'_> {
-    /// The same writer, whose payload adds nothing to
+    /// Returns the same writer, with a payload that adds nothing to
     /// [`content_bytes_unpacked`](crate::TransactionStats::content_bytes_unpacked).
+    ///
     /// A static delta writes its objects through such a writer.
     pub(crate) fn uncounted(mut self) -> Self {
         self.counted = false;
         self
     }
 
-    /// Finish the object: finalize the digest, verify it against the caller's
-    /// expectation, apply per-mode metadata, and stage it under its loose name.
-    /// A dedup hit (the object already in `objects/` or this transaction's
-    /// staging set) returns the existing identity without restaging.
+    /// Finishes the object and returns its checksum.
+    ///
+    /// The call finalizes the digest. If the caller gave an expected checksum,
+    /// the call verifies the digest against it. Then it applies the metadata of
+    /// the repository mode and stages the object under its loose name.
+    ///
+    /// If `objects/` already holds the object, the call removes its temp file
+    /// and stages nothing. If the staging set of the transaction already holds
+    /// the object, the call keeps the staged copy and adds no second one.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ChecksumMismatch`] if the computed checksum differs from the
+    ///   expected checksum.
+    /// - [`Error::InsufficientFreeSpace`] if the object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Unsupported`] if `[ex-integrity] fsverity` is `yes` and the
+    ///   fs-verity seal fails.
+    /// - [`Error::Core`] if `[core] fsync` or `[core] per-object-fsync` in the
+    ///   repository config is malformed.
+    /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
+    ///   `[ex-integrity] composefs` in the repository config is malformed.
+    /// - [`Error::InvalidFormat`] if the repository is in `bare` mode and an
+    ///   xattr name in the header is not valid UTF-8.
+    /// - [`Error::Io`] if a write, a sync, or a syscall of the staging step
+    ///   fails.
     pub async fn finish(self) -> Result<Checksum> {
         let ContentWriter {
             txn,
@@ -288,9 +335,9 @@ impl ContentWriter<'_> {
             Sink::Archive(mut enc) => {
                 close(&mut enc).await?;
                 let mut file = enc.into_inner();
-                // Patch the reserved uncompressed-size field: the archive header
-                // begins after the 4-byte length prefix and 4-byte NUL pad, and
-                // its first member is the big-endian `t` size.
+                // Write the reserved uncompressed-size field. The archive header
+                // starts after the 4-byte length prefix and the 4-byte NUL pad.
+                // Its first member is the big-endian `t` size.
                 seek(&mut file, SeekFrom::Start(8)).await?;
                 write_all(&mut file, &uncompressed.to_be_bytes()).await?;
                 flush(&mut file).await?;
@@ -345,8 +392,8 @@ impl AsyncWrite for ContentWriter<'_> {
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // A ContentWriter is finished through `finish`, not by closing the
-        // stream; closing just flushes so a stray close does not truncate.
+        // `finish` ends a ContentWriter. A close only flushes, so a stray
+        // close does not truncate the object.
         self.poll_flush(cx)
     }
 }
@@ -370,12 +417,27 @@ impl ostrya_rt::tokio_io::AsyncWrite for ContentWriter<'_> {
     }
 }
 
+/// Methods that stage objects.
 impl Transaction {
-    /// A streaming writer for one regular-file payload.
+    /// Creates a streaming writer for the payload of one regular file.
     ///
-    /// `meta` carries the logical uid/gid/mode/xattrs the object header records;
-    /// `mode` must name a regular file. `expected`, when given, is checked
-    /// against the computed identity at [`finish`](ContentWriter::finish).
+    /// `meta` holds the logical uid, gid, mode, and xattrs that the object
+    /// header records. `meta.mode` must name a regular file. The call refuses
+    /// only a mode that names neither a regular file nor a symlink.
+    ///
+    /// If `expected` is given, [`finish`](ContentWriter::finish) verifies the
+    /// computed identity against it. [`ContentWriter`] states the identity and
+    /// the storage form.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`,
+    ///   which ostrya does not write.
+    /// - [`Error::Core`] if the file-type bits of `meta.mode` name neither a
+    ///   regular file nor a symlink.
+    /// - [`Error::Core`] if the repository is in archive mode and
+    ///   `[archive] zlib-level` in the repository config is malformed.
+    /// - [`Error::Io`] if the temp file cannot be created or written.
     pub async fn content_writer(
         &self,
         expected: Option<&Checksum>,
@@ -388,8 +450,8 @@ impl Transaction {
             ));
         }
         let header = canonical_header(mode, meta.regular_header());
-        // Validate the regular-file mode up front and seed the identity with
-        // the framed uncompressed header.
+        // Check the regular-file mode first, and seed the identity with the
+        // framed uncompressed header.
         let framed = frame(&header.serialize()?)?;
         let mut hasher = Sha256::new();
         hasher.update(&framed);
@@ -400,9 +462,10 @@ impl Transaction {
         let mut file = RtFile::from(fd);
 
         let sink = if mode.is_archive() {
-            // Reserve the archive header region; the uncompressed size is
-            // patched in at finish. Its byte length is independent of the
-            // payload, so the length prefix written here is final.
+            // Reserve the region of the archive header. `finish` writes the
+            // uncompressed size into it. The byte length of the region does
+            // not depend on the payload, so the length prefix written here is
+            // final.
             let placeholder = frame(&header.serialize_archive(0)?)?;
             write_all(&mut file, &placeholder).await?;
             let level = archive_level(self.repo().config().zlib_level()?);
@@ -423,7 +486,32 @@ impl Transaction {
         })
     }
 
-    /// Stream a regular file's payload from `reader` into a new content object.
+    /// Streams the payload of a regular file from `reader` into a content
+    /// object.
+    ///
+    /// The call copies `reader` into a [`ContentWriter`] in chunks of 64 KiB,
+    /// so it never holds the whole payload in memory. `meta` and `expected`
+    /// are as for [`content_writer`](Transaction::content_writer). The call
+    /// returns the checksum of the object.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`,
+    ///   or if `[ex-integrity] fsverity` is `yes` and the fs-verity seal fails.
+    /// - [`Error::ChecksumMismatch`] if `expected` is given and differs from
+    ///   the computed checksum.
+    /// - [`Error::InsufficientFreeSpace`] if the object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] if the file-type bits of `meta.mode` name neither a
+    ///   regular file nor a symlink.
+    /// - [`Error::Core`] if a `[core]` or `[archive]` value in the repository
+    ///   config is malformed.
+    /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
+    ///   `[ex-integrity] composefs` in the repository config is malformed.
+    /// - [`Error::InvalidFormat`] if the repository is in `bare` mode and an
+    ///   xattr name in `meta` is not valid UTF-8.
+    /// - [`Error::Io`] if a read from `reader` fails, or if a file system
+    ///   operation fails.
     pub async fn write_content(
         &self,
         expected: Option<&Checksum>,
@@ -435,8 +523,30 @@ impl Transaction {
         writer.finish().await
     }
 
-    /// Write a regular file whose content the caller already holds. The general
-    /// path is [`write_content`](Transaction::write_content), which streams.
+    /// Writes a regular file whose content the caller holds in memory.
+    ///
+    /// [`write_content`](Transaction::write_content) streams a payload from a
+    /// reader. `meta` and `expected` are as for
+    /// [`content_writer`](Transaction::content_writer). The call returns the
+    /// checksum of the object.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`,
+    ///   or if `[ex-integrity] fsverity` is `yes` and the fs-verity seal fails.
+    /// - [`Error::ChecksumMismatch`] if `expected` is given and differs from
+    ///   the computed checksum.
+    /// - [`Error::InsufficientFreeSpace`] if the object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] if the file-type bits of `meta.mode` name neither a
+    ///   regular file nor a symlink.
+    /// - [`Error::Core`] if a `[core]` or `[archive]` value in the repository
+    ///   config is malformed.
+    /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
+    ///   `[ex-integrity] composefs` in the repository config is malformed.
+    /// - [`Error::InvalidFormat`] if the repository is in `bare` mode and an
+    ///   xattr name in `meta` is not valid UTF-8.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_regfile_inline(
         &self,
         expected: Option<&Checksum>,
@@ -448,22 +558,26 @@ impl Transaction {
         writer.finish().await
     }
 
-    /// Store a content object whose payload already arrives DEFLATE-compressed
-    /// in the archive wire form -- an archive remote's own `.filez` bytes --
-    /// writing the fetched bytes to the staging file verbatim instead of
-    /// inflating and recompressing them.
+    /// Stores a content object whose payload arrives DEFLATE-compressed in the
+    /// archive wire form.
     ///
-    /// `framed_header` is stored exactly as given, including the uncompressed
-    /// size it declares, rather than patched to match what `payload` actually
-    /// inflates to. The payload is inflated on a second, discarded branch to
-    /// feed the digest that establishes the object's identity, and the
-    /// inflated byte count is held to equal `declared` rather than treated as
-    /// a ceiling, so a header that over- or understates its payload is
-    /// refused rather than silently stored wrong.
+    /// The payload is the `.filez` bytes of an archive remote. The call writes
+    /// the fetched bytes to the staging file unchanged. It does not inflate
+    /// and compress them again.
     ///
-    /// Valid only for an archive-mode repository. `header` must not be a
-    /// symlink's, which carries no payload -- see
-    /// [`write_symlink`](Transaction::write_symlink).
+    /// The call stores `framed_header` exactly as given, with the uncompressed
+    /// size that it declares. It does not change that size to the size that
+    /// `payload` inflates to. A second branch inflates the payload and
+    /// discards the output, to feed the digest that gives the identity of the
+    /// object.
+    ///
+    /// The inflated byte count must be exactly `declared`. The call refuses a
+    /// header that states a size larger or smaller than its payload, so it
+    /// stores no object with a wrong size.
+    ///
+    /// The repository must be in archive mode. `header` must not be the
+    /// header of a symlink, which has no payload (see
+    /// [`write_symlink`](Transaction::write_symlink)).
     pub(crate) async fn write_archive_payload<R: AsyncRead + Unpin>(
         &self,
         expected: &Checksum,
@@ -502,8 +616,43 @@ impl Transaction {
         .await
     }
 
-    /// Write a symlink content object. The identity is the framed header alone
-    /// (no payload); storage follows the repository mode.
+    /// Writes a symlink content object and returns its checksum.
+    ///
+    /// A symlink object has no payload, so its identity is the SHA-256 of the
+    /// framed header alone. The storage form follows the repository mode:
+    ///
+    /// - In `bare` and `bare-user-only`, a symlink.
+    /// - In `bare-user` and `bare-user-shared`, a regular file with mode
+    ///   `0644` that holds the target and one NUL. The `user.ostreemeta` xattr
+    ///   holds the logical metadata.
+    /// - In `archive`, a framed archive header with no payload.
+    ///
+    /// # Mode
+    ///
+    /// If `meta.mode` names a symlink, the object records it unchanged, with
+    /// its permission bits. If `meta.mode` names a regular file or no file
+    /// type, the object records `S_IFLNK | 0o777`. Any other file type fails
+    /// the write.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`,
+    ///   which ostrya does not write.
+    /// - [`Error::Unsupported`] if `[ex-integrity] fsverity` is `yes`, the
+    ///   object is stored as a regular file, and the fs-verity seal fails.
+    /// - [`Error::ChecksumMismatch`] if `expected` is given and differs from
+    ///   the computed checksum.
+    /// - [`Error::InsufficientFreeSpace`] if the object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] if `meta.mode` names a file type other than a
+    ///   symlink or a regular file, or if `target` holds a NUL byte.
+    /// - [`Error::Core`] if `[core] fsync` or `[core] per-object-fsync` in the
+    ///   repository config is malformed.
+    /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
+    ///   `[ex-integrity] composefs` in the repository config is malformed.
+    /// - [`Error::InvalidFormat`] if the repository is in `bare` mode and an
+    ///   xattr name in `meta` is not valid UTF-8.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_symlink(
         &self,
         target: &str,
@@ -529,29 +678,47 @@ impl Transaction {
         self.stage_symlink(checksum, header).await
     }
 
-    /// Write a directory-metadata object for `meta`, recording what the
-    /// repository mode stores for a directory: `bare-user-only` discards
-    /// ownership and xattrs and reduces the permission bits, so a commit into it
-    /// records the canonical form and the dirmeta's identity covers that form.
-    /// Every other mode records `meta` as given.
+    /// Writes a directory-metadata object for `meta` and returns its checksum.
     ///
-    /// This is the path a commit's own directories take, and it is the path a
-    /// caller assembling a tree takes as well. Serializing a [`DirMeta`] and
-    /// handing the bytes to
-    /// [`write_metadata`](Transaction::write_metadata) stores the form `meta`
-    /// states and names the object for it, which parts from the checksum a
-    /// `bare-user-only` repository records for the same directory.
+    /// The object records what the repository mode stores for a directory.
+    /// `bare-user-only` discards the ownership and the xattrs, and it reduces
+    /// the permission bits as for a regular file. A commit into such a
+    /// repository records this canonical form, and the identity of the
+    /// dirmeta covers it. Each other mode records `meta` unchanged.
     ///
-    /// A dirmeta arriving from elsewhere -- a pull or a delta -- keeps the bytes
-    /// it is named for and goes through
+    /// A commit uses this path for its own directories. A caller that builds a
+    /// tree uses it too.
+    ///
+    /// A caller can serialize a [`DirMeta`] and give the bytes to
+    /// [`write_metadata`](Transaction::write_metadata). The object then stores
+    /// the form that `meta` states, with the checksum of that form. In a
+    /// `bare-user-only` repository, this checksum differs from the checksum
+    /// that the repository records for the same directory.
+    ///
+    /// A dirmeta from another source, for example a pull or a static delta,
+    /// keeps the bytes that its checksum names. It goes through
     /// [`write_metadata`](Transaction::write_metadata).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`,
+    ///   or if `[ex-integrity] fsverity` is `yes` and the fs-verity seal fails.
+    /// - [`Error::InsufficientFreeSpace`] if the object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] if the file-type bits of `meta.mode` are not the
+    ///   directory type, or if a `[core]` value in the repository config is
+    ///   malformed.
+    /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
+    ///   `[ex-integrity] composefs` in the repository config is malformed.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_dirmeta(&self, meta: &DirMeta) -> Result<Checksum> {
         let bytes = self.dirmeta_bytes(meta)?;
         self.write_metadata(ObjectType::DirMeta, None, &bytes).await
     }
 
-    /// The serialized bytes [`write_dirmeta`](Transaction::write_dirmeta)
-    /// records for `meta` under this repository's mode.
+    /// Returns the serialized bytes that
+    /// [`write_dirmeta`](Transaction::write_dirmeta) records for `meta` under
+    /// the mode of this repository.
     fn dirmeta_bytes(&self, meta: &DirMeta) -> Result<Vec<u8>> {
         Ok(if self.repo().mode() == RepoMode::BareUserOnly {
             canonical_dirmeta(meta).serialize()?
@@ -560,16 +727,36 @@ impl Transaction {
         })
     }
 
-    /// The checksum [`write_dirmeta`](Transaction::write_dirmeta) would record
-    /// for `meta`, computed without staging an object. Lets a caller compare
-    /// against a recorded dirmeta before deciding to stage.
+    /// Returns the checksum that [`write_dirmeta`](Transaction::write_dirmeta)
+    /// records for `meta`, and stages no object.
+    ///
+    /// A caller compares it with a recorded dirmeta before it decides to
+    /// stage.
     pub(crate) fn dirmeta_checksum(&self, meta: &DirMeta) -> Result<Checksum> {
         let bytes = self.dirmeta_bytes(meta)?;
         Ok(Checksum::from_bytes(Sha256::digest(&bytes).into()))
     }
 
-    /// Write a metadata object from its normal-form serialized bytes. The
-    /// identity is the SHA-256 of those bytes.
+    /// Writes a metadata object from its serialized bytes in normal form.
+    ///
+    /// The identity is the SHA-256 of `bytes`. The call returns the checksum
+    /// of the object.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`,
+    ///   or if `ty` is not a metadata object type.
+    /// - [`Error::Unsupported`] if `[ex-integrity] fsverity` is `yes` and the
+    ///   fs-verity seal fails.
+    /// - [`Error::ChecksumMismatch`] if `expected` is given and differs from
+    ///   the computed checksum.
+    /// - [`Error::InsufficientFreeSpace`] if the object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] if `[core] fsync` or `[core] per-object-fsync` in the
+    ///   repository config is malformed.
+    /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
+    ///   `[ex-integrity] composefs` in the repository config is malformed.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_metadata(
         &self,
         ty: ObjectType,
@@ -599,11 +786,13 @@ impl Transaction {
     }
 }
 
-/// Read a content object's archive-form payload to its end and check it,
-/// storing nothing: the payload must inflate to exactly `declared` bytes, with
-/// nothing after its DEFLATE end, and hash to `expected` under `header`. The
-/// check of an object whose bytes are dropped because the repository already
-/// holds it.
+/// Reads the archive-form payload of a content object to its end and checks
+/// it.
+///
+/// The function stores nothing. The payload must inflate to exactly
+/// `declared` bytes, with no bytes after its DEFLATE end. It must hash to
+/// `expected` under `header`. This is the check of an object whose bytes are
+/// discarded because the repository already holds the object.
 #[cfg(feature = "receive")]
 pub(crate) async fn check_archive_payload<R: AsyncRead + Unpin>(
     expected: &Checksum,
@@ -615,9 +804,11 @@ pub(crate) async fn check_archive_payload<R: AsyncRead + Unpin>(
     feed_archive_payload(expected, header, declared, payload, buf, None).await
 }
 
-/// Read an archive-form payload to its end, inflating it on a discarded branch
-/// to check its size and its checksum, and write the compressed bytes to
-/// `file` where one is given.
+/// Reads an archive-form payload to its end, and writes the compressed bytes
+/// to `file` if `file` is given.
+///
+/// A discarded branch inflates the payload to check its size and its
+/// checksum.
 async fn feed_archive_payload<R: AsyncRead + Unpin>(
     expected: &Checksum,
     header: &FileHeader,
@@ -630,13 +821,13 @@ async fn feed_archive_payload<R: AsyncRead + Unpin>(
     if buf.len() < COPY_CHUNK {
         buf.resize(COPY_CHUNK, 0);
     }
-    // Once the decoder reports a short write, its DEFLATE stream has ended
-    // within this chunk: it takes no more input, so nothing after that
-    // point is fed to it, only drained to return the connection to the
-    // pool. Anything left unconsumed, here or later in the stream, is
-    // bytes trailing the object. A write error is not a short write: it
-    // means the sink itself refused the payload (an inflated-size
-    // overrun), and `?` lets that failure's own message reach the caller.
+    // A short write from the decoder means that its DEFLATE stream ended in
+    // this chunk. The decoder takes no more input. The loop gives it no more
+    // bytes, and only drains the rest to return the connection to the pool.
+    // Each byte that stays unconsumed, here or later in the stream, trails
+    // the object. A write error is a different case: the sink refused the
+    // payload (an inflated-size overrun). `?` passes the message of that
+    // failure to the caller.
     let mut trailing = false;
     loop {
         let n = read_some(&mut payload, buf).await?;
@@ -675,16 +866,18 @@ async fn feed_archive_payload<R: AsyncRead + Unpin>(
     Ok(())
 }
 
-/// The raw-DEFLATE encoder level for an `[archive] zlib-level` value, clamped to
-/// the 1-9 range the tool accepts.
+/// Returns the raw-DEFLATE encoder level for an `[archive] zlib-level` value.
+///
+/// The level is clamped to the range 1-9 that the `ostree` command accepts.
 pub(crate) fn archive_level(zlib_level: i64) -> u8 {
     zlib_level.clamp(1, 9) as u8
 }
 
-/// Open an ingestion temp file in the staging directory: `O_TMPFILE` where the
-/// filesystem allows it, a named temp file otherwise. Reused by the checkout
-/// copy path, which opens its temporaries in the destination directory the same
-/// way.
+/// Opens an ingestion temp file in the staging directory.
+///
+/// The function uses `O_TMPFILE` if the file system supports it, and a named
+/// temp file otherwise. The checkout copy path also uses this function, to
+/// open its temp files in the destination directory.
 pub(crate) fn open_temp(staging_fd: BorrowedFd<'_>) -> Result<(OwnedFd, TempKind)> {
     match rustix::fs::openat(
         staging_fd,
@@ -693,8 +886,8 @@ pub(crate) fn open_temp(staging_fd: BorrowedFd<'_>) -> Result<(OwnedFd, TempKind
         Mode::from_raw_mode(FIXED_MODE),
     ) {
         Ok(fd) => Ok((fd, TempKind::Anonymous)),
-        // Any failure of the O_TMPFILE attempt falls back to a named temp; a
-        // genuine error (ENOSPC and the like) resurfaces from that open.
+        // Each failure of the O_TMPFILE attempt falls back to a named temp. A
+        // real error, for example ENOSPC, comes back from that open.
         Err(_) => {
             let name = temp_name();
             let fd = rustix::fs::openat(
@@ -708,16 +901,19 @@ pub(crate) fn open_temp(staging_fd: BorrowedFd<'_>) -> Result<(OwnedFd, TempKind
     }
 }
 
-/// The uid and gid an object freshly staged in `staging_fd` takes, measured by
-/// creating a temporary there the way every staged object is created and reading
-/// its inode.
+/// Returns the uid and gid that a newly staged object in `staging_fd` gets.
 ///
-/// Measured rather than derived: the group a created inode receives is the
-/// directory's group when the directory is setgid and the process's effective
-/// group otherwise, and a filesystem mounted with group inheritance gives the
-/// directory's group either way. Creating one costs the same syscalls as reading
-/// the rule's inputs and answers for the filesystem the staging directory is
-/// actually on.
+/// The function creates a temp file there, as for each staged object, and
+/// reads its inode.
+///
+/// The function measures the pair, because the rule has more than one input.
+/// If the directory is setgid, a created inode gets the group of the
+/// directory. Otherwise it gets the effective group of the process. A file
+/// system mounted with group inheritance gives the group of the directory in
+/// both cases.
+///
+/// One create costs the same syscalls as a read of the inputs of the rule. It
+/// also gives the answer for the file system that holds the staging directory.
 pub(crate) fn probe_fresh_owner(staging_fd: BorrowedFd<'_>) -> Result<(u32, u32)> {
     let (fd, temp) = open_temp(staging_fd)?;
     let stat = rustix::fs::fstat(&fd);
@@ -726,96 +922,124 @@ pub(crate) fn probe_fresh_owner(staging_fd: BorrowedFd<'_>) -> Result<(u32, u32)
     Ok((stat.st_uid, stat.st_gid))
 }
 
-/// A per-process-unique ingestion temp file name.
+/// Returns an ingestion temp file name that is unique in the process.
 fn temp_name() -> String {
     format!(".ostrya-tmp-{}-{}", std::process::id(), unique())
 }
 
-/// A per-process-unique counter value for temp file names. Every temp-name
-/// helper in the crate draws from this single counter, so the suffixes they
-/// format stay unique within the process.
+/// Returns the next value of the process-wide counter for temp file names.
+///
+/// Each temp-name helper of the crate draws from this one counter, so the
+/// suffixes of the names stay unique in the process.
 pub(crate) fn unique() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The shared context for the blocking staging helpers: the directory fds, the
-/// repository mode, and the durability settings.
+/// The shared context of the blocking staging helpers: the directory
+/// descriptors, the repository mode, and the durability settings.
 pub(crate) struct StageCtx<'a> {
-    /// The repository `objects/` directory, for the dedup check and fanout.
+    /// The `objects/` directory of the repository, for the dedup check and
+    /// the fanout.
     pub(crate) objects_fd: BorrowedFd<'a>,
-    /// The transaction's staging directory, where objects are ingested.
+    /// The staging directory of the transaction, where the helpers stage
+    /// objects.
     pub(crate) staging_fd: BorrowedFd<'a>,
-    /// The repository storage mode.
+    /// The storage mode of the repository.
     pub(crate) mode: RepoMode,
-    /// Whether durability syncs run at all.
+    /// `true` if durability syncs run at all.
     pub(crate) fsync: bool,
-    /// Whether the file of each content object is synced at ingest. Metadata
-    /// objects are not, unless `sync_metadata` is set.
+    /// `true` if the file of each content object is synced at ingest.
+    ///
+    /// If `sync_metadata` is not set, metadata objects are not synced.
     pub(crate) per_object_fsync: bool,
-    /// Whether the file of a metadata object is synced at ingest, with fsync
-    /// on. A transaction sets it for an object it stages after a `syncfs` made
-    /// the earlier objects durable, so the publication step needs no second
-    /// `syncfs`.
+    /// `true` if the file of a metadata object is synced at ingest, with fsync
+    /// on.
+    ///
+    /// A transaction sets it for an object that it stages after a `syncfs`
+    /// made the earlier objects durable. Then the publication step needs no
+    /// second `syncfs`.
     pub(crate) sync_metadata: bool,
-    /// The effective `[ex-integrity] fsverity` setting. Each freshly staged
-    /// regular-file object is sealed with fs-verity unless this is
-    /// [`Tristate::No`].
+    /// The effective `[ex-integrity] fsverity` setting.
+    ///
+    /// If this is not [`Tristate::No`], each newly staged regular-file object
+    /// is sealed with fs-verity.
     pub(crate) verity: Tristate,
 }
 
-/// How a staged object's bytes reached the staging directory, which decides
-/// whether the object consumes free space on the repository filesystem.
+/// How the bytes of a staged object reached the staging directory.
+///
+/// The kind decides if the object uses free space on the file system of the
+/// repository.
 #[derive(Clone, Copy)]
 pub(crate) enum Blocks {
-    /// Data blocks freshly allocated: a fresh ingest, or a byte copy of another
-    /// repository's object where a reflink was refused. Charged against the
-    /// transaction's free-space budget.
+    /// Newly allocated data blocks: a new ingest, or a byte copy of an object
+    /// of another repository after a refused reflink.
+    ///
+    /// The transaction charges them against its free-space budget.
     Written,
-    /// The source inode shared by hardlink, which allocates no blocks and no
-    /// inode.
+    /// The source inode, shared by a hardlink, which allocates no blocks and
+    /// no inode.
     Linked,
-    /// The source extents shared by a `FICLONE` reflink, which allocates no
-    /// data blocks. Writing to either copy would allocate then, which no path
-    /// in the port does: a loose object is content-addressed and never
-    /// rewritten in place.
+    /// The source extents, shared by a `FICLONE` reflink, which allocates no
+    /// data blocks.
+    ///
+    /// A write to either copy allocates blocks. No path in ostrya does such a
+    /// write, because a loose object is content-addressed and never rewritten
+    /// in place.
     Reflinked,
 }
 
-/// The outcome of staging one object.
+/// The outcome of the staging of one object.
 pub(crate) struct StageOutcome {
-    /// Whether the object was already present in `objects/` (a dedup hit).
+    /// `true` if `objects/` already holds the object (a dedup hit).
     pub(crate) deduped: bool,
-    /// The staged file's on-disk size in bytes, when freshly staged. In archive
-    /// mode this is the compressed `.filez` storage size.
+    /// The size on disk of the staged file in bytes, if the object is newly
+    /// staged.
+    ///
+    /// In archive mode this is the compressed storage size of the `.filez`.
     pub(crate) on_disk_size: u64,
-    /// How the staged bytes reached the staging directory. Read when the
-    /// transaction records the object, which charges its free-space budget for
-    /// the objects that allocate blocks and not for the ones that share them.
+    /// How the staged bytes reached the staging directory.
+    ///
+    /// The transaction reads it when it records the object. It charges its
+    /// free-space budget for the objects that allocate blocks, and not for the
+    /// objects that share them.
     pub(crate) blocks: Blocks,
-    /// The logical (unpacked) content size in bytes: a regular file's
-    /// pre-compression payload length, a symlink's target length, and zero for
-    /// a metadata object (whose size the caller fills from `on_disk_size`).
-    /// This is the `st_size` the tool records for the object in `ostree.sizes`.
-    /// Carried into the archive size map.
+    /// The logical (unpacked) content size in bytes.
+    ///
+    /// - For a regular file, the length of the payload before compression.
+    /// - For a symlink, the length of the target.
+    /// - For a metadata object, zero. The caller fills the size from
+    ///   `on_disk_size`.
+    ///
+    /// This is the `st_size` that the `ostree` command records for the object
+    /// in `ostree.sizes`. It goes into the archive size map.
     pub(crate) unpacked: u64,
-    /// The flat staging name the object was linked under, when freshly staged.
+    /// The flat staging name that the object is linked under, if the object
+    /// is newly staged.
     pub(crate) staging_name: String,
-    /// The loose path the object publishes to, when freshly staged.
+    /// The loose path that the object is published to, if the object is newly
+    /// staged.
     pub(crate) dest: String,
 }
 
-/// Apply per-mode metadata to a content object's inode and materialize it into
-/// the staging directory under its flat loose name. Runs synchronous syscalls.
+/// Applies the per-mode metadata to a content object and links it under its
+/// flat loose name.
 ///
-/// The metadata that needs write permission on the inode goes on first, on the
-/// writable descriptor. The inode is then sealed per `ctx.verity`, and its mode
-/// and owner go on after the seal, on the descriptor that is linked. In bare
-/// mode the logical xattrs also go on after the seal, between the owner and
-/// the mode. The per-object sync follows, then the link. The inode is still an
-/// anonymous or staging temp until the link, so no reader sees the intermediate
-/// mode. Every failure after the dedup check removes a named temp.
+/// The function runs synchronous syscalls, in this order:
+///
+/// 1. The metadata that needs write permission on the inode goes on, on the
+///    writable descriptor.
+/// 2. The function seals the inode per `ctx.verity`.
+/// 3. The mode and the owner go on, on the descriptor that is linked. In bare
+///    mode the logical xattrs also go on, between the owner and the mode.
+/// 4. The per-object sync runs.
+/// 5. The function links the inode into the staging directory.
+///
+/// Until the link, the inode is an anonymous or staging temp, so no reader
+/// sees the intermediate mode. Each failure after the dedup check removes a
+/// named temp.
 pub(crate) fn stage_content_blocking(
     ctx: &StageCtx<'_>,
     checksum: &Checksum,
@@ -837,11 +1061,12 @@ pub(crate) fn stage_content_blocking(
         let stat = rustix::fs::fstat(file.as_fd())?;
         apply_content_pre_seal(file.as_fd(), ctx.mode, ctx.verity, stat.st_mode, header)?;
         let on_disk_size = stat.st_size.max(0) as u64;
-        // Seal with fs-verity while the inode is still anonymous, then link it
-        // from the descriptor that owns it: with verity off, the writable one;
-        // with verity on, a fresh read-only reopen after the writable
-        // descriptor closes. The mode and owner, and in bare mode the xattrs,
-        // go on after the seal, on the descriptor that is linked.
+        // Seal with fs-verity while the inode is still anonymous. Then link
+        // it from the descriptor that owns it. With verity off, this is the
+        // writable descriptor. With verity on, it is a new read-only reopen
+        // after the writable descriptor closes. The mode and the owner, and in
+        // bare mode the xattrs, go on after the seal, on the linked
+        // descriptor.
         let link_fd = if ctx.verity == Tristate::No {
             OwnedFd::from(file)
         } else {
@@ -870,9 +1095,12 @@ pub(crate) fn stage_content_blocking(
     })
 }
 
-/// Stage a symlink content object: a real symlink in the bare family, a regular
-/// file holding the target plus a NUL in the bare-user family, and a payloadless
-/// framed archive header in archive mode.
+/// Stages a symlink content object.
+///
+/// - In `bare` and `bare-user-only`, the object is a symlink.
+/// - In `bare-user` and `bare-user-shared`, it is a regular file that holds
+///   the target and one NUL.
+/// - In archive mode, it is a framed archive header with no payload.
 pub(crate) fn stage_symlink_blocking(
     ctx: &StageCtx<'_>,
     checksum: &Checksum,
@@ -889,7 +1117,7 @@ pub(crate) fn stage_symlink_blocking(
 
     let on_disk_size = match ctx.mode {
         RepoMode::Bare => {
-            // A concurrent writer of the identical symlink may win the race; its
+            // A concurrent writer of the same symlink can win the race. Its
             // content is the same, so an existing entry is not an error.
             if stage_symlink_inode(staging_fd, target, &staging_name)? {
                 rustix::fs::chownat(
@@ -910,8 +1138,8 @@ pub(crate) fn stage_symlink_blocking(
             target.len() as u64
         }
         RepoMode::BareUser | RepoMode::BareUserShared => {
-            // Stored as a regular file: content is the target plus one NUL, the
-            // logical metadata lives in user.ostreemeta, and the inode is 0644.
+            // A regular file: the content is the target and one NUL, the
+            // logical metadata is in user.ostreemeta, and the inode is 0644.
             let mut content = target.clone().into_bytes();
             content.push(0);
             stage_named_regular(
@@ -925,7 +1153,7 @@ pub(crate) fn stage_symlink_blocking(
             )?
         }
         RepoMode::Archive => {
-            // A payloadless framed archive header.
+            // A framed archive header with no payload.
             let body = frame(&header.serialize_archive(0)?)?;
             stage_named_regular(
                 staging_fd,
@@ -947,16 +1175,19 @@ pub(crate) fn stage_symlink_blocking(
         deduped: false,
         on_disk_size,
         blocks: Blocks::Written,
-        // The logical (unpacked) size of a symlink object is its target length,
-        // matching the `st_size` the tool records for it in `ostree.sizes`.
+        // The logical (unpacked) size of a symlink object is the length of
+        // its target. This is the `st_size` that the `ostree` command records
+        // for it in `ostree.sizes`.
         unpacked: target.len() as u64,
         staging_name,
         dest,
     })
 }
 
-/// Stage a metadata object: write the bytes to a temp file, `fchmod` 0644, and
-/// materialize under the flat loose name.
+/// Stages a metadata object.
+///
+/// The function writes the bytes to a temp file, sets the mode 0644 with
+/// `fchmod`, and renames the file to the flat loose name.
 pub(crate) fn stage_metadata_blocking(
     ctx: &StageCtx<'_>,
     checksum: &Checksum,
@@ -974,10 +1205,10 @@ pub(crate) fn stage_metadata_blocking(
         bytes,
         FIXED_MODE,
         None,
-        // A metadata object is made durable by the `syncfs` that opens
-        // publication; the per-object sync covers content objects alone. An
-        // object staged after the transaction ran that `syncfs` ahead of
-        // publication is synced here instead.
+        // The `syncfs` at the start of publication makes a metadata object
+        // durable. The per-object sync covers content objects only. If the
+        // transaction ran that `syncfs` before it staged this object, the
+        // object is synced here.
         ctx.fsync && ctx.sync_metadata,
         ctx.verity,
     )?;
@@ -991,61 +1222,80 @@ pub(crate) fn stage_metadata_blocking(
     })
 }
 
-/// Import one loose object from another repository's `objects/` directory into
-/// the staging directory by sharing the source inode, without reading its
-/// payload.
+/// Imports one loose object of another repository into the staging directory.
 ///
-/// The object is hardlinked, which carries the source inode's mode, ownership,
-/// and xattrs unchanged. A link is therefore admitted only where that inode is
-/// the inode a write into this repository would have produced, which holds in two
-/// cases: a content object into a bare destination, whose uid, gid, permission
-/// bits, and xattrs are all a function of the header the object's checksum covers;
-/// and a source inode already owned by `fresh_owner`, the uid and gid an object
-/// freshly staged here takes. In every other mode the permission bits and xattrs
-/// stay a function of the header while the ownership becomes a function of the
-/// writer, which is what the second case tests.
+/// The function does not read the payload. It hardlinks the object, so the
+/// source inode keeps its mode, ownership, and xattrs. A link is allowed only
+/// if the source inode is the inode that a write into this repository makes.
+/// This is true in two cases:
 ///
-/// The gate reads the source inode's ownership alone. The permission bits and the
-/// xattrs are trusted to match the object's header rather than checked, since for
-/// a content object outside bare mode the header is the read this path exists to
-/// avoid. An inode rewritten out of band therefore carries its state across, and
-/// so do attributes the destination's environment assigns rather than its writer
-/// -- a default POSIX ACL on its directories, a security label -- which a fresh
-/// write inherits and a link keeps the source's copy of.
+/// - A content object into a `bare` destination, because the header that the
+///   checksum covers sets its uid, gid, permission bits, and xattrs.
+/// - A source inode that `fresh_owner` already owns, the uid and gid that a
+///   newly staged object here gets.
 ///
-/// `link_owner` is the uid and gid an object freshly staged here takes, the pair
-/// the second case tests against, or `None` where no link is to be attempted at
-/// all. The caller passes `None` for a forced copy and for a repository sealing
-/// its objects, so the pair, which costs a probe of the staging directory to
-/// measure, is measured only where the gate reads it.
+/// In each other mode, the header sets the permission bits and the xattrs, and
+/// the writer sets the ownership. The second case checks the ownership.
 ///
-/// `Ok(None)` reports a content object that is not staged -- its link refused by
-/// the ownership gate, by an absent `link_owner`, or by the filesystem (the two
-/// repositories on different filesystems, the source inode at its link limit, a
-/// filesystem with no hardlinks, the kernel's protected-hardlink rules) --
-/// leaving the caller to import it through its logical header, the one path that
-/// applies this repository's own inode policy. A link that fails for any other
-/// reason -- no space, a quota, an I/O error -- fails the import with that errno
-/// rather than falling back to a copy that would fail the same way and report a
-/// less specific cause.
+/// # Trust in the source inode
 ///
-/// A metadata object has no header, so its refused link is served here: the
-/// bytes are copied with a `FICLONE` reflink where the filesystem supports one
-/// and byte by byte otherwise, and the copy carries this repository's own
-/// metadata-object inode -- 0644, no xattrs, and the writing process's
-/// ownership.
+/// The gate reads only the ownership of the source inode. It trusts the
+/// permission bits and the xattrs to match the header of the object, and does
+/// not check them. For a content object outside bare mode, this path does not
+/// read the header. So an inode changed out of band carries its state across.
 ///
-/// The caller guarantees the two repositories store this object identically:
-/// metadata objects are mode-independent, and a content object is imported this
-/// way only between repositories that store it the same way.
+/// Attributes that the environment of the destination assigns also carry
+/// across, for example a default POSIX ACL on its directories or a security
+/// label. A new write inherits the attributes of the destination, and a link
+/// keeps the attributes of the source.
 ///
-/// A link is taken only where `[ex-integrity] fsverity` is [`Tristate::No`],
-/// which the caller expresses by withholding `link_owner`. fs-verity is a
-/// per-inode property, so sealing a hardlinked object would seal the source
-/// repository's copy of it as well and make that copy immutable there; leaving it
-/// unsealed would break this repository's own rule that every object stored as a
-/// regular file is sealed. A repository that seals its writes therefore copies
-/// every object instead, and the copy is sealed as any fresh write is.
+/// # Link owner
+///
+/// `link_owner` is the uid and gid that a newly staged object here gets, the
+/// pair that the second case compares. If it is `None`, the function makes no
+/// link attempt. The caller passes `None` for a forced copy and for a
+/// repository that seals its objects. The measure of the pair costs a probe of
+/// the staging directory, so the caller measures it only where the gate reads
+/// it.
+///
+/// # Return value
+///
+/// `Ok(None)` reports a content object that is not staged, for one of these
+/// causes:
+///
+/// - The ownership gate refused the link.
+/// - `link_owner` is `None`.
+/// - The file system refused the link, for one of these causes:
+///   - The two repositories are on different file systems.
+///   - The source inode is at its link limit.
+///   - The file system has no hardlinks.
+///   - The protected-hardlink rules of the kernel apply.
+///
+/// The caller then imports the object through its logical header, the one
+/// path that applies the inode policy of this repository. If a link fails for
+/// another cause, for example no space, a quota, or an I/O error, the import
+/// fails with that errno. A fallback copy fails the same way and reports a
+/// less specific cause, so the function makes no copy.
+///
+/// A metadata object has no header, so this function serves its refused link.
+/// It copies the bytes with a `FICLONE` reflink if the file system supports
+/// one, and byte by byte otherwise. The copy gets the metadata-object inode of
+/// this repository: 0644, no xattrs, and the ownership of the writing process.
+///
+/// The caller guarantees that the two repositories store this object
+/// identically. Metadata objects do not depend on the mode. A content object
+/// comes this way only between repositories that store it the same way.
+///
+/// # fs-verity
+///
+/// The function makes a link only if `[ex-integrity] fsverity` is
+/// [`Tristate::No`]. The caller states this when it gives no `link_owner`.
+/// fs-verity is a property of the inode. So a seal of a hardlinked object also
+/// seals the copy in the source repository, and that copy becomes immutable
+/// there. An unsealed link breaks the rule of this repository that each object
+/// stored as a regular file is sealed. For this reason, a repository that
+/// seals its writes copies each object, and seals the copy as it seals each
+/// new write.
 pub(crate) fn stage_import_blocking(
     ctx: &StageCtx<'_>,
     src_objects_fd: BorrowedFd<'_>,
@@ -1070,8 +1320,9 @@ pub(crate) fn stage_import_blocking(
     let staging_name = flat_name(checksum, ty, ctx.mode);
 
     if let Some(fresh_owner) = link_owner {
-        // The source stat decides whether the link is admissible and supplies the
-        // staged object's size, since a hardlink is the inode it stats.
+        // The stat of the source decides if the link is allowed. It also gives
+        // the size of the staged object, because a hardlink is the inode that
+        // it stats.
         let stat = match rustix::fs::statat(
             src_objects_fd,
             src_path.as_str(),
@@ -1114,13 +1365,12 @@ pub(crate) fn stage_import_blocking(
                         ty,
                     });
                 }
-                // A refusal the filesystem or the kernel imposes -- the two
-                // repositories on different filesystems, the source inode at its
-                // link limit, a filesystem that has no hardlinks, the kernel's
-                // protected-hardlink rules -- leaves the object unstaged, to be
-                // copied below or reported to the caller. Any other failure is
-                // the import's own and carries its errno out: the copy that
-                // follows would fail the same way and report a less specific
+                // A refusal from the file system or the kernel leaves the
+                // object unstaged. The causes are the same as in the
+                // `# Return value` list of this function. The code after this
+                // match copies the object or reports it to the caller. Each
+                // other failure belongs to the import and carries its errno
+                // out. A copy fails the same way and reports a less specific
                 // cause.
                 Err(
                     rustix::io::Errno::XDEV
@@ -1133,8 +1383,8 @@ pub(crate) fn stage_import_blocking(
         }
     }
 
-    // A content object's inode metadata is the destination mode's to decide, and
-    // the header it is decided from is what the caller reads.
+    // The destination mode decides the inode metadata of a content object. The
+    // caller reads the header that this decision uses.
     if ty == ObjectType::File {
         return Ok(None);
     }
@@ -1150,15 +1400,18 @@ pub(crate) fn stage_import_blocking(
     }))
 }
 
-/// Import one regular-file content object between two repositories that store
-/// its payload identically and its inode metadata differently, which is any two
-/// modes of the bare family.
+/// Imports one regular-file content object between two modes of the bare
+/// family.
 ///
-/// The payload is cloned -- a `FICLONE` reflink where the filesystem supports
-/// one, a byte copy otherwise -- and the destination's own inode policy applied
-/// from the object's logical header, so nothing of the source inode carries
-/// over. The payload is neither read into memory nor re-hashed; a caller that
-/// needs the checksum checked reads the object before calling.
+/// Two modes of the bare family store the payload identically and the inode
+/// metadata differently. The function clones the payload: a `FICLONE` reflink
+/// if the file system supports one, and a byte copy otherwise. It applies the
+/// inode policy of the destination from the logical header of the object, so
+/// nothing of the source inode carries over.
+///
+/// The function does not read the payload into memory and does not hash it
+/// again. A caller that needs a checksum check reads the object before the
+/// call.
 pub(crate) fn stage_clone_content_blocking(
     ctx: &StageCtx<'_>,
     src_objects_fd: BorrowedFd<'_>,
@@ -1167,11 +1420,11 @@ pub(crate) fn stage_clone_content_blocking(
     header: &FileHeader,
     unpacked: u64,
 ) -> Result<StageOutcome> {
-    // An import is a write like any other, and a content object crossing modes
-    // reaches this path without passing through `stage_import_blocking`: a
-    // bare-split-xattrs destination needs the `.file-xattrs` and
-    // `.file-xattrs-link` sidecars, which no import path produces. Refused before
-    // the source is opened and its payload cloned.
+    // An import is a write like any other. A content object that crosses modes
+    // comes to this path without `stage_import_blocking`. A bare-split-xattrs
+    // destination needs the `.file-xattrs` and `.file-xattrs-link` sidecars,
+    // which no import path produces. The refusal comes before the source is
+    // opened and its payload cloned.
     if ctx.mode == RepoMode::BareSplitXattrs {
         return Err(Error::Unsupported(
             "bare-split-xattrs is read-only; the port does not write it".into(),
@@ -1185,8 +1438,8 @@ pub(crate) fn stage_clone_content_blocking(
         Mode::empty(),
     ) {
         Ok(src) => src,
-        // A source object that vanished between the plan and the import is
-        // reported as the missing object it is, as the link path reports it.
+        // If the source object disappeared between the plan and the import,
+        // report it as a missing object, as the link path does.
         Err(rustix::io::Errno::NOENT) => {
             return Err(Error::ObjectNotFound {
                 checksum: *checksum,
@@ -1201,30 +1454,32 @@ pub(crate) fn stage_clone_content_blocking(
     Ok(outcome)
 }
 
-/// Move a regular-file object's bytes into a fresh temp file in the staging
-/// directory, applying no metadata: a `FICLONE` reflink where the filesystem
-/// supports one, a byte copy otherwise. Returns the open temp file, the handle
-/// it materializes under, and which of the two moved the bytes, cleaning the
-/// temp up if the copy fails.
+/// Moves the bytes of a regular-file object into a new temp file in the
+/// staging directory, and applies no metadata.
 ///
-/// The byte copy is `std::io::copy`, which for a `File` to `File` transfer on
-/// Linux specializes to `copy_file_range` and moves the payload inside the
-/// kernel, falling back to a fixed stack buffer where the kernel refuses that.
-/// The payload is therefore never buffered whatever its size, which is the
-/// property that matters, and a reflink-less filesystem still gets a kernel-side
-/// copy. The cost of the choice is that the transfer holds one blocking-pool
-/// thread for its duration and cannot be cancelled: dropping the future that
-/// awaits it leaves the copy running to completion, writing into a staging temp
-/// the reaper collects.
+/// The function uses a `FICLONE` reflink if the file system supports one, and
+/// a byte copy otherwise. It returns the open temp file, the handle that the
+/// file is linked under, and the method that moved the bytes. If the copy
+/// fails, it removes the temp file.
+///
+/// The byte copy is `std::io::copy`. On Linux, a `File` to `File` transfer
+/// uses `copy_file_range` and moves the payload in the kernel. If the kernel
+/// refuses that, the copy uses a fixed stack buffer.
+///
+/// In both cases the payload is never buffered, whatever its size. A file
+/// system without reflink still gets a copy in the kernel. The cost is that
+/// the transfer holds one thread of the blocking pool until it ends, and it
+/// cannot be cancelled. If the future that awaits it is dropped, the copy runs
+/// to completion and writes into a staging temp that the reaper collects.
 fn clone_payload(
     staging_fd: BorrowedFd<'_>,
     src: BorrowedFd<'_>,
 ) -> Result<(std::fs::File, TempKind, Blocks)> {
     let (fd, temp) = open_temp(staging_fd)?;
     let mut dst = std::fs::File::from(fd);
-    // A reflink shares the source extents outright; on any refusal (a
-    // filesystem without reflink, a cross-filesystem source) nothing is
-    // written, so the byte copy starts from an empty file.
+    // A reflink shares the source extents fully. If the reflink is refused
+    // (a file system without reflink, a source on another file system), it
+    // writes nothing. So the byte copy starts from an empty file.
     let copy = |dst: &mut std::fs::File| -> Result<Blocks> {
         if rustix::fs::ioctl_ficlone(dst.as_fd(), src).is_ok() {
             return Ok(Blocks::Reflinked);
@@ -1242,13 +1497,15 @@ fn clone_payload(
     }
 }
 
-/// Copy one loose metadata object into the staging directory under
-/// `staging_name`. The bytes move by `FICLONE` reflink where the filesystem
-/// allows and byte by byte otherwise; the copy carries the inode a metadata
-/// object written into this repository carries in every mode -- 0644, no
-/// xattrs, and the writing process's uid and gid, which the staging temporary
-/// holds by construction. Returns the on-disk size and which of the two moves
-/// the bytes took.
+/// Copies one loose metadata object into the staging directory under
+/// `staging_name`.
+///
+/// The bytes move by `FICLONE` reflink if the file system supports it, and
+/// byte by byte otherwise. The copy gets the inode of a metadata object that
+/// this repository writes, in each mode. That inode has the mode 0644, no
+/// xattrs, and the uid and gid of the writing process. The staging temp file has this uid and
+/// gid by construction. The function returns the size on disk and the method
+/// that moved the bytes.
 fn clone_metadata(
     ctx: &StageCtx<'_>,
     src_dir: BorrowedFd<'_>,
@@ -1264,9 +1521,8 @@ fn clone_metadata(
     let (dst, temp, blocks) = clone_payload(ctx.staging_fd, src.as_fd())?;
     let apply = || -> Result<(u64, Blocks)> {
         rustix::fs::fchmod(dst.as_fd(), Mode::from_raw_mode(FIXED_MODE))?;
-        // A metadata object is made durable by the `syncfs` that opens
-        // publication; the per-object sync covers content objects alone
-        // (`docs/format-reference.md`, "Durability and staging").
+        // The `syncfs` at the start of publication makes a metadata object
+        // durable. The per-object sync covers content objects only.
         let on_disk_size = size_of(dst.as_fd())?;
         let link_fd = if ctx.verity == Tristate::No {
             OwnedFd::from(dst)
@@ -1282,11 +1538,16 @@ fn clone_metadata(
     apply().inspect_err(|_| cleanup_temp(ctx.staging_fd, &temp))
 }
 
-/// Publish staged objects into `objects/` per the durability contract: with
-/// `syncfs`, `syncfs` the repository, then rename each object into
-/// `objects/<xx>/`, and with fsync on `fsync` each touched fanout directory and
-/// `objects/` itself. A caller clears `syncfs` with fsync on only where a
-/// `syncfs` after the last object was staged already made them durable.
+/// Publishes staged objects into `objects/` in the order of the durability
+/// rules.
+///
+/// 1. If `syncfs` is set, the function runs `syncfs` on the repository.
+/// 2. It renames each object into `objects/<xx>/`.
+/// 3. If `fsync` is set, it runs `fsync` on each fanout directory that it
+///    changed, and on `objects/`.
+///
+/// A caller clears `syncfs` with fsync on only if a `syncfs` after the staging
+/// of the last object already made the objects durable.
 pub(crate) fn publish_blocking(
     repo_fd: BorrowedFd<'_>,
     objects_fd: BorrowedFd<'_>,
@@ -1323,12 +1584,13 @@ pub(crate) fn publish_blocking(
     Ok(())
 }
 
-/// Create a fanout directory `objects/<xx>/` on demand, ignoring a race that
-/// already created it. The request mode is `0777` reduced by the umask. In a
-/// `bare-user-shared` repository a fanout this call creates is then forced to
-/// [`perm::SHARED_DIR_MODE`], so every member of the repository group adds an
-/// object under it. A fanout that already stands keeps the mode and the group
-/// it has.
+/// Creates the fanout directory `objects/<xx>/` if it does not exist.
+///
+/// If a race created the directory first, the function ignores the race. The
+/// requested mode is `0777`, reduced by the umask. In a `bare-user-shared`
+/// repository, a fanout that this call creates then gets
+/// [`perm::SHARED_DIR_MODE`]. So each member of the repository group can add
+/// an object to it. A fanout that exists keeps its mode and its group.
 fn ensure_fanout(objects_fd: BorrowedFd<'_>, fanout: &str, repo_mode: RepoMode) -> Result<()> {
     match rustix::fs::mkdirat(objects_fd, fanout, Mode::from_raw_mode(0o777)) {
         Ok(()) => Ok(perm::force_created_dir(objects_fd, fanout, repo_mode)?),
@@ -1337,13 +1599,13 @@ fn ensure_fanout(objects_fd: BorrowedFd<'_>, fanout: &str, repo_mode: RepoMode) 
     }
 }
 
-/// A [`StageOutcome`] for an object already present in `objects/`.
+/// Returns a [`StageOutcome`] for an object that `objects/` already holds.
 fn dedup(dest: String) -> StageOutcome {
     StageOutcome {
         deduped: true,
         on_disk_size: 0,
-        // Nothing was staged, so nothing moved bytes; the record path returns on
-        // `deduped` before it reads either field.
+        // Nothing was staged, so nothing moved bytes. The record path returns
+        // on `deduped` before it reads either field.
         blocks: Blocks::Written,
         unpacked: 0,
         staging_name: String::new(),
@@ -1351,21 +1613,27 @@ fn dedup(dest: String) -> StageOutcome {
     }
 }
 
-/// The flat staging name for an object: its full hex checksum plus the loose
-/// extension, holding the whole object in one staging-directory entry.
+/// Returns the flat staging name of an object: its full hex checksum and the
+/// loose extension.
+///
+/// The name holds the whole object in one entry of the staging directory.
 pub(crate) fn flat_name(checksum: &Checksum, ty: ObjectType, mode: RepoMode) -> String {
     format!("{}.{}", checksum.to_hex(), ty.extension(mode))
 }
 
-/// Apply the parts of a regular-file content object's inode metadata that need
-/// write permission on the inode, on the writable descriptor, before the seal.
+/// Applies the inode metadata of a regular-file content object that needs
+/// write permission on the inode.
 ///
+/// The function runs on the writable descriptor, before the seal.
 /// `FS_IOC_ENABLE_VERITY` and a `user.*` xattr both need write permission on
-/// the inode. When `verity` is on and `create_mode`, the inode mode the temp
-/// has, lacks owner read or owner write, the modes that store the logical mode
-/// first set the inode to 0600, so a umask without owner write does not block
-/// the seal, the reopen, or the xattrs. [`apply_content_post_seal`] sets the
-/// final mode, and in bare mode the xattrs.
+/// the inode. `create_mode` is the inode mode of the temp file.
+///
+/// In the modes that store the logical mode (`bare`, `bare-user`,
+/// `bare-user-only`), the function can first set the inode to 0600. It does so
+/// if `verity` is on and `create_mode` has no owner read or no owner write.
+/// Then a umask without owner write does not block the seal, the reopen, or
+/// the xattrs. [`apply_content_post_seal`] sets the final mode, and in bare mode
+/// the xattrs.
 fn apply_content_pre_seal(
     fd: BorrowedFd<'_>,
     mode: RepoMode,
@@ -1387,10 +1655,10 @@ fn apply_content_pre_seal(
     match mode {
         RepoMode::Bare => {}
         RepoMode::BareUser => {
-            // The xattr goes on before the mode: the kernel checks a `user.*`
-            // xattr against the inode's write permission, and this mode's
-            // canonical inode mode leaves no owner-write bit for a logical mode
-            // that has none (0444, 0555).
+            // The xattr goes on before the mode. The kernel checks a `user.*`
+            // xattr against the write permission of the inode. The canonical
+            // inode mode of this repository mode has no owner-write bit if the
+            // logical mode has none (0444, 0555).
             set_ostreemeta(fd, header)?;
         }
         RepoMode::BareUserShared => {
@@ -1410,22 +1678,25 @@ fn apply_content_pre_seal(
     Ok(())
 }
 
-/// Apply the inode mode and owner of a regular-file content object, and in bare
-/// mode its logical xattrs, after the seal, on the descriptor that is linked:
-/// the read-only one when verity is on. The kernel checks the inode owner for
-/// `fchmod` and `fchown`, and the inode permission for an xattr, and not the
-/// access mode of the descriptor. A sealed inode takes xattr changes.
+/// Applies the inode mode and the owner of a regular-file content object after
+/// the seal.
+///
+/// In bare mode, the function also applies the logical xattrs. It runs on the
+/// descriptor that is linked, which is the read-only descriptor if verity is
+/// on. The kernel checks the inode owner for `fchmod` and `fchown`, and the
+/// inode permission for an xattr. It does not check the access mode of the
+/// descriptor. A sealed inode accepts xattr changes.
 fn apply_content_post_seal(fd: BorrowedFd<'_>, mode: RepoMode, header: &FileHeader) -> Result<()> {
     let perm = header.mode & PERM_MASK;
     match mode {
         RepoMode::Bare => {
-            // The owner goes on first: a chown of a regular file removes
-            // `security.capability` and clears the set-user-ID bit, and the
-            // set-group-ID bit when group execute is set, also when the ids do
-            // not change. The xattrs go on before the mode: the kernel checks
-            // a `user.*` xattr against the inode's write permission, which a
-            // logical mode without an owner-write bit (0444, 0555) does not
-            // grant.
+            // The owner goes on first. A chown of a regular file removes
+            // `security.capability` and clears the set-user-ID bit, also if
+            // the ids do not change. If group execute is set, it also clears
+            // the set-group-ID bit. The xattrs go on before the mode. The
+            // kernel checks a `user.*` xattr against the write permission of
+            // the inode. A logical mode without an owner-write bit (0444,
+            // 0555) does not give that permission.
             rustix::fs::fchown(fd, Some(uid(header.uid)), Some(gid(header.gid)))?;
             for (name, value) in header.xattrs.iter() {
                 set_inode_xattr(fd, name, value)?;
@@ -1436,8 +1707,9 @@ fn apply_content_post_seal(fd: BorrowedFd<'_>, mode: RepoMode, header: &FileHead
             rustix::fs::fchmod(fd, Mode::from_raw_mode((perm & 0o775) | 0o400))?;
         }
         RepoMode::BareUserOnly => {
-            // Canonical mode: owner bits preserved, group- and other-write
-            // dropped (recovered by observation, see format-reference.md).
+            // Canonical mode: the owner bits stay, and the group-write and
+            // other-write bits are removed. Observed on the objects that the
+            // `ostree` command writes.
             rustix::fs::fchmod(fd, Mode::from_raw_mode(perm & 0o755))?;
         }
         RepoMode::BareUserShared | RepoMode::Archive => {}
@@ -1450,15 +1722,17 @@ fn apply_content_post_seal(fd: BorrowedFd<'_>, mode: RepoMode, header: &FileHead
     Ok(())
 }
 
-/// Write the `user.ostreemeta` xattr holding the logical `(uuua(ayay))`.
+/// Writes the `user.ostreemeta` xattr that holds the logical `(uuua(ayay))`.
 fn set_ostreemeta(fd: BorrowedFd<'_>, header: &FileHeader) -> Result<()> {
     let meta = header.serialize_stat_metadata()?;
     rustix::fs::fsetxattr(fd, "user.ostreemeta", &meta, XattrFlags::empty())?;
     Ok(())
 }
 
-/// Set one inode xattr, stripping the stored name's terminating NUL. Reused by
-/// the checkout copy path to apply a file object's logical xattrs.
+/// Sets one inode xattr, without the terminating NUL of the stored name.
+///
+/// The checkout copy path also uses this function, to apply the logical xattrs
+/// of a file object.
 pub(crate) fn set_inode_xattr(fd: BorrowedFd<'_>, name: &[u8], value: &[u8]) -> Result<()> {
     let name = name.strip_suffix(&[0]).unwrap_or(name);
     let name = std::str::from_utf8(name)
@@ -1467,10 +1741,13 @@ pub(crate) fn set_inode_xattr(fd: BorrowedFd<'_>, name: &[u8], value: &[u8]) -> 
     Ok(())
 }
 
-/// Set one xattr on a staged symlink inode, stripping the stored name's
-/// terminating NUL. A symlink cannot be opened for an fd, so the attribute is
-/// set no-follow through the `/proc/self/fd` path of the directory. Reused by
-/// the checkout path to apply a symlink object's link xattrs.
+/// Sets one xattr on a staged symlink inode, without the terminating NUL of
+/// the stored name.
+///
+/// A symlink cannot be opened for a descriptor. The function sets the
+/// attribute with no-follow, through the `/proc/self/fd` path of the
+/// directory. The checkout path also uses this function, to apply the link
+/// xattrs of a symlink object.
 pub(crate) fn set_link_xattr(
     dir: BorrowedFd<'_>,
     staging_name: &str,
@@ -1485,10 +1762,18 @@ pub(crate) fn set_link_xattr(
     Ok(())
 }
 
-/// Write `content` into a fresh named temp file, `fchmod` it, optionally set
-/// `user.ostreemeta`, optionally fsync it, seal it with fs-verity per `verity`,
-/// and rename it to `staging_name`. Returns the on-disk size. Used for small
-/// caller-held bodies (symlinks stored as regular files and metadata objects).
+/// Writes `content` into a new named temp file and renames it to
+/// `staging_name`.
+///
+/// Before the rename, the function does these steps:
+///
+/// 1. It sets the mode `perm` with `fchmod`.
+/// 2. If `ostreemeta` is given, it sets `user.ostreemeta`.
+/// 3. If `do_fsync` is set, it runs `fsync` on the file.
+/// 4. It seals the file with fs-verity per `verity`.
+///
+/// The function returns the size on disk. It is for small bodies that the
+/// caller holds: symlinks stored as regular files, and metadata objects.
 fn stage_named_regular(
     staging_fd: BorrowedFd<'_>,
     staging_name: &str,
@@ -1518,8 +1803,8 @@ fn stage_named_regular(
         rustix::fs::fsync(file.as_fd())?;
     }
     let size = size_of(file.as_fd())?;
-    // Seal with fs-verity before the rename, once the writable descriptor is
-    // closed. On any failure the named temp is removed so nothing is left
+    // Seal with fs-verity before the rename, after the writable descriptor
+    // closes. On a failure, remove the named temp so that nothing stays
     // behind.
     if verity != Tristate::No {
         let ro = match reopen_ro(file.as_fd()) {
@@ -1547,10 +1832,12 @@ fn stage_named_regular(
     Ok(size)
 }
 
-/// Reopen an open file read-only through `/proc/self/fd`, so the writable
-/// descriptor to the same inode can be closed before `FS_IOC_ENABLE_VERITY`,
-/// which the kernel refuses while any writable descriptor to the inode is open.
-/// The reopened descriptor also links an anonymous `O_TMPFILE` inode into place.
+/// Reopens an open file read-only through `/proc/self/fd`.
+///
+/// Then the writable descriptor to the same inode can close before
+/// `FS_IOC_ENABLE_VERITY`. The kernel refuses that ioctl while a writable
+/// descriptor to the inode is open. The reopened descriptor also links an
+/// anonymous `O_TMPFILE` inode into place.
 fn reopen_ro(fd: BorrowedFd<'_>) -> Result<OwnedFd> {
     let proc_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
     Ok(rustix::fs::open(
@@ -1560,10 +1847,13 @@ fn reopen_ro(fd: BorrowedFd<'_>) -> Result<OwnedFd> {
     )?)
 }
 
-/// Enable fs-verity on a read-only descriptor per the configured tri-state.
-/// [`Tristate::Maybe`] is best effort and swallows every enable error (a
-/// filesystem without verity returns `ENOTTY`); [`Tristate::Yes`] fails the
-/// write. Never called for [`Tristate::No`].
+/// Enables fs-verity on a read-only descriptor per the configured tri-state.
+///
+/// [`Tristate::Maybe`] is best effort and ignores each enable error. A file
+/// system without verity returns `ENOTTY`. With [`Tristate::Yes`], an enable
+/// error fails the write. The function is never called for [`Tristate::No`].
+/// It tries again after an `ETXTBSY` error, up to [`SEAL_ATTEMPTS`] attempts
+/// with a pause of [`SEAL_PAUSE`].
 fn seal_regular(fd: BorrowedFd<'_>, verity: Tristate) -> Result<()> {
     let mut attempts = 0;
     let err = loop {
@@ -1584,9 +1874,11 @@ fn seal_regular(fd: BorrowedFd<'_>, verity: Tristate) -> Result<()> {
     )))
 }
 
-/// Materialize an ingestion temp file under `staging_name` in the staging
-/// directory: link the anonymous inode (referenced through `link_fd`) into
-/// place, or rename the named temp. For a named temp `link_fd` is unused.
+/// Links an ingestion temp file into the staging directory under
+/// `staging_name`.
+///
+/// For an anonymous inode, the function links it through `link_fd`. For a
+/// named temp, it renames the temp and does not use `link_fd`.
 fn materialize(
     staging_fd: BorrowedFd<'_>,
     link_fd: BorrowedFd<'_>,
@@ -1603,8 +1895,8 @@ fn materialize(
                 staging_name,
                 AtFlags::SYMLINK_FOLLOW,
             ) {
-                // A concurrent writer of the identical object linked it first;
-                // the bytes are the same, so treat it as staged.
+                // A concurrent writer of the same object linked it first. The
+                // bytes are the same, so treat it as staged.
                 Ok(()) | Err(rustix::io::Errno::EXIST) => Ok(()),
                 Err(e) => Err(e.into()),
             }
@@ -1616,9 +1908,11 @@ fn materialize(
     }
 }
 
-/// Create a real symlink object in the staging directory. Returns whether it
-/// was freshly created; an existing entry (a concurrent writer of the identical
-/// symlink) is not an error, since the content is the same.
+/// Creates a symlink object in the staging directory.
+///
+/// The function returns `true` if it created the symlink. An existing entry
+/// comes from a concurrent writer of the same symlink. The content is the
+/// same, so the entry is not an error.
 fn stage_symlink_inode(
     staging_fd: BorrowedFd<'_>,
     target: &str,
@@ -1631,16 +1925,18 @@ fn stage_symlink_inode(
     }
 }
 
-/// Discard an ingestion temp file after a dedup hit, or one abandoned before
-/// it was staged: an anonymous inode vanishes when its fd closes, a named temp
-/// is unlinked.
+/// Removes an ingestion temp file after a dedup hit, or a temp file abandoned
+/// before staging.
+///
+/// An anonymous inode goes away when its descriptor closes. The function
+/// unlinks a named temp.
 fn cleanup_temp(staging_fd: BorrowedFd<'_>, temp: &TempKind) {
     if let TempKind::Named(name) = temp {
         let _ = rustix::fs::unlinkat(staging_fd, name.as_str(), AtFlags::empty());
     }
 }
 
-/// The on-disk size of an open file.
+/// Returns the size on disk of an open file.
 fn size_of(fd: BorrowedFd<'_>) -> Result<u64> {
     Ok(rustix::fs::fstat(fd)?.st_size.max(0) as u64)
 }
@@ -1653,12 +1949,14 @@ fn gid(value: u32) -> Gid {
     Gid::from_raw(value)
 }
 
-/// The write-side sink an archive pass-through's payload is inflated into: it
-/// hashes and counts the inflated bytes without storing them, refusing once
-/// the count passes `declared` so a payload built to inflate past what its
-/// header states cannot do unbounded work before
-/// [`write_archive_payload`](Transaction::write_archive_payload) checks the
-/// final count against it.
+/// The write-side sink into which an archive pass-through inflates its
+/// payload.
+///
+/// The sink hashes and counts the inflated bytes, and stores none of them.
+/// When the count passes `declared`, the sink refuses more bytes. This limit
+/// stops a payload that inflates past its declared size before it does
+/// unbounded work. [`write_archive_payload`](Transaction::write_archive_payload)
+/// then checks the final count against `declared`.
 struct InflatedDigest {
     hasher: ContentHasher,
     checksum: Checksum,
@@ -1726,25 +2024,27 @@ async fn write_all<W: AsyncWrite + Unpin>(w: &mut W, mut buf: &[u8]) -> io::Resu
     .await
 }
 
-/// Feed as much of `buf` into `w` as it accepts, stopping at the first short
-/// write rather than retrying the rest: for the inflating decoder under
-/// [`write_archive_payload`](Transaction::write_archive_payload), a short
-/// write means its DEFLATE stream already ended within this call, and
-/// retrying the remainder would just ask a finished decoder for more --
-/// which it refuses with a hard error of its own, rather than the graceful
-/// `Ok(0)` many `AsyncWrite` implementations give a post-close write. That
-/// retry-after-short-write error is expected and is folded into the short
-/// write it followed, not surfaced. The caller compares the `Ok` value
-/// against `buf.len()` to tell whether anything went unconsumed.
+/// Writes as much of `buf` into `w` as `w` accepts, and stops at the first
+/// short write.
 ///
-/// An error on the first attempt for `buf` -- nothing yet written this call
-/// -- is a different case: the inflating sink under
-/// [`write_archive_payload`](Transaction::write_archive_payload) fails once
-/// bytes it buffers are actually forwarded, which can happen well after the
-/// chunk that overran it, so this may be the first the failure is seen at
-/// all. That error is returned rather than folded away, so its message
-/// reaches the caller instead of being replaced by a generic "trailing
-/// bytes" one.
+/// The function does not retry the rest. For the inflating decoder under
+/// [`write_archive_payload`](Transaction::write_archive_payload), a short
+/// write means that its DEFLATE stream ended in this call. A retry of the rest
+/// asks a finished decoder for more bytes. The decoder refuses with a hard
+/// error of its own, where many `AsyncWrite` implementations return `Ok(0)`
+/// for a write after close.
+///
+/// That error after a short write is expected. The function counts it as part
+/// of the short write, and does not return it. The caller compares the `Ok`
+/// value with `buf.len()` to find out if bytes stayed unconsumed.
+///
+/// An error on the first attempt for `buf`, before any byte of this call is
+/// written, is a different case. The inflating sink under
+/// [`write_archive_payload`](Transaction::write_archive_payload) fails when it
+/// forwards bytes that it buffers. This can occur long after the chunk that
+/// overran it, so this error can be the first sign of the failure. The
+/// function returns that error, so its own message reaches the caller. A
+/// generic "trailing bytes" message does not replace it.
 async fn write_up_to<W: AsyncWrite + Unpin>(w: &mut W, buf: &[u8]) -> io::Result<usize> {
     let mut written = 0;
     while written < buf.len() {
@@ -1774,9 +2074,12 @@ async fn read_some<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> io::Resul
     poll_fn(|cx| Pin::new(&mut *r).poll_read(cx, buf)).await
 }
 
-/// Stream `reader` into `writer` in bounded chunks; no whole blob is buffered.
-/// Reused by the checkout copy path to stream a file object's payload into a
-/// destination temp file.
+/// Streams `reader` into `writer` in bounded chunks, and buffers no whole
+/// blob.
+///
+/// The chunk size is [`COPY_CHUNK`]. The checkout copy path also uses this
+/// function, to stream the payload of a file object into a destination temp
+/// file.
 pub(crate) async fn copy_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut reader: R,
     writer: &mut W,
@@ -1792,7 +2095,7 @@ pub(crate) async fn copy_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// `ContentWriter` moves freely across tasks and threads.
+/// A compile-time check that `ContentWriter` and `FileMeta` are `Send + Sync`.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ContentWriter<'static>>();
@@ -1813,12 +2116,15 @@ mod verity_tests {
     use ostrya_rt::block_on;
     use std::os::fd::AsFd;
 
-    /// The kernel's measured fs-verity digest of a written content object equals
-    /// the port's `FsVerityHasher` over the same payload, confirming the digest
-    /// parameters (SHA-256, 4096-byte blocks, zero salt) the two share. A
-    /// bare-user-shared `.file` stores the raw payload on disk, so the object's
-    /// digest is the digest of the payload bytes. Skips where the filesystem
-    /// does not support fs-verity.
+    /// The fs-verity digest that the kernel measures for a written content
+    /// object equals the digest of ostrya's `FsVerityHasher` over the same
+    /// payload.
+    ///
+    /// The test checks the digest parameters that the two share: SHA-256,
+    /// 4096-byte blocks, and zero salt. A bare-user-shared `.file` stores the
+    /// raw payload on disk, so the digest of the object is the digest of the
+    /// payload bytes. If the file system does not support fs-verity, the test
+    /// skips the check.
     #[test]
     fn kernel_digest_matches_fsverity_hasher() {
         let dir = std::env::temp_dir().join(format!(
@@ -1829,7 +2135,7 @@ mod verity_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let root = dir.join("repo");
-        // A payload spanning several verity blocks (> 4096 bytes).
+        // A payload of several verity blocks (> 4096 bytes).
         let payload = b"fs-verity measure cross-check payload\n".repeat(300);
 
         block_on(async {
@@ -1863,7 +2169,7 @@ mod verity_tests {
                     FsVerityHasher::hash(&payload),
                     "kernel-measured digest equals the FsVerityHasher digest"
                 ),
-                // A filesystem without fs-verity sealed nothing to measure.
+                // A file system without fs-verity sealed nothing to measure.
                 Err(_) => eprintln!("skipping digest check: filesystem lacks fs-verity"),
             }
         });
@@ -1877,9 +2183,11 @@ mod temp_tests {
 
     use super::{PendingTemp, TempKind, unique};
 
-    /// A named temp dropped before it is staged is unlinked, and one handed on
-    /// to be staged is left for the stager. Every filesystem the tests run on
-    /// takes `O_TMPFILE`, so the named form is made here by hand.
+    /// A drop unlinks a named temp that is not staged, and a temp handed on
+    /// for staging stays for the stager.
+    ///
+    /// Each file system that the tests run on supports `O_TMPFILE`, so the
+    /// test makes the named form by hand.
     #[test]
     fn a_pending_named_temp_is_removed_on_drop() {
         let dir = std::env::temp_dir().join(format!(

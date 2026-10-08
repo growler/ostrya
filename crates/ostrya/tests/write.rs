@@ -1,11 +1,17 @@
-//! Write-path integration tests.
+//! Integration tests of the object writers.
 //!
-//! These exercise the object-store write layer against real repositories:
-//! byte-identical loose objects versus the checked-in fixtures for archive and
-//! bare-user (plus the bare-user-shared derivation), a tool cross-check for
-//! bare, the dedup no-op, the free-space guard, concurrent writers on one
-//! `&Transaction`, read-back through `load_file`, and the canonical header
-//! bare-user-only records and names its objects for.
+//! The tests write objects into real repositories and check these items:
+//!
+//! - archive and bare-user loose objects against the checked-in fixtures,
+//!   byte for byte, and the bare-user-shared objects that follow from
+//!   bare-user
+//! - bare objects against the objects of the `ostree` command
+//! - a second write of an object, which is a no-op (dedup)
+//! - the free-space guard
+//! - concurrent writers on one `&Transaction`
+//! - the read-back through `load_file`
+//! - the canonical header that bare-user-only stores and names its objects
+//!   for
 
 mod common;
 
@@ -22,8 +28,8 @@ use ostrya::{
 use ostrya_core::{ObjectType, loose_path};
 use ostrya_rt::block_on;
 
-// The fixture tree the golden repositories were built from (owner 0:0, 0644),
-// and the object checksums the `ostree` tool assigned it.
+// The fixture tree of the golden repositories (owner 0:0, mode 0644), and the
+// object checksums that the `ostree` command gave to it.
 const HELLO: &[u8] = b"hello ostree\n";
 const NESTED: &[u8] = b"nested\n";
 const EMPTY: &[u8] = b"";
@@ -36,14 +42,17 @@ fn csum(hex: &str) -> Checksum {
     Checksum::from_hex(hex).unwrap()
 }
 
-/// A regular-file FileMeta owned 0:0 at mode 0644, as in the fixtures.
+/// Returns a regular-file `FileMeta` with owner 0:0 and mode 0644, as in the
+/// fixtures.
 fn reg() -> FileMeta {
     FileMeta::regular(0, 0, 0o644)
 }
 
-/// Write the four fixture content objects through the port into `txn`,
-/// exercising the inline, streaming, and symlink writers. Asserts each computed
-/// identity equals the tool's fixture checksum.
+/// Writes the four fixture content objects into `txn` through ostrya.
+///
+/// The writes use the inline, streaming, and symlink writers. The function
+/// asserts that each computed checksum is equal to the fixture checksum of the
+/// `ostree` command.
 async fn write_fixture_tree(txn: &Transaction) {
     assert_eq!(
         txn.write_regfile_inline(Some(&csum(HELLO_TXT)), &reg(), HELLO)
@@ -52,7 +61,7 @@ async fn write_fixture_tree(txn: &Transaction) {
         csum(HELLO_TXT),
         "hello.txt identity"
     );
-    // The streaming path must agree with the inline path.
+    // The streaming writer must give the same checksum as the inline writer.
     assert_eq!(
         txn.write_content(None, &reg(), Cursor::new(NESTED.to_vec()))
             .await
@@ -74,12 +83,12 @@ async fn write_fixture_tree(txn: &Transaction) {
     );
 }
 
-/// The on-disk bytes of a loose object in a repository rooted at `root`.
+/// Returns the on-disk bytes of a loose object in the repository at `root`.
 fn object_bytes(root: &Path, hex: &str, ty: ObjectType, mode: RepoMode) -> Vec<u8> {
     std::fs::read(root.join("objects").join(loose_path(&csum(hex), ty, mode))).unwrap()
 }
 
-/// The bytes of a loose object in the checked-in fixture repository for `mode`.
+/// Returns the bytes of a loose object in the checked-in fixture repository.
 fn fixture_bytes(mode_dir: &str, hex: &str, ty: ObjectType, mode: RepoMode) -> Vec<u8> {
     std::fs::read(
         fixture_repo(mode_dir)
@@ -89,7 +98,7 @@ fn fixture_bytes(mode_dir: &str, hex: &str, ty: ObjectType, mode: RepoMode) -> V
     .unwrap()
 }
 
-/// The `user.ostreemeta` xattr of a loose object.
+/// Returns the `user.ostreemeta` xattr of a loose object.
 fn ostreemeta(root: &Path, hex: &str, mode: RepoMode) -> Vec<u8> {
     let path = root
         .join("objects")
@@ -119,8 +128,8 @@ fn archive_objects_are_byte_identical_to_the_fixture() {
         let stats = txn.commit().await.unwrap();
         assert_eq!(stats.content_written, 4);
 
-        // Every stored `.filez` (regular files and the symlink) is byte-for-byte
-        // what the tool wrote.
+        // Each stored `.filez` object (regular files and the symlink) is byte
+        // for byte the same as the object that the `ostree` command wrote.
         for hex in [HELLO_TXT, EMPTY_TXT, NESTED_TXT, LINK] {
             assert_eq!(
                 object_bytes(&root, hex, ObjectType::File, RepoMode::Archive),
@@ -147,7 +156,8 @@ fn bare_user_objects_match_the_fixture() {
         write_fixture_tree(&txn).await;
         txn.commit().await.unwrap();
 
-        // Regular files: raw payload on disk, logical metadata in the xattr.
+        // Regular files: the raw payload is on disk, and the logical metadata
+        // is in the xattr.
         for (hex, payload) in [(HELLO_TXT, HELLO), (EMPTY_TXT, EMPTY), (NESTED_TXT, NESTED)] {
             assert_eq!(
                 object_bytes(&root, hex, ObjectType::File, RepoMode::BareUser),
@@ -164,7 +174,8 @@ fn bare_user_objects_match_the_fixture() {
                 0o644
             );
         }
-        // The symlink is stored as a regular file: target plus a NUL.
+        // bare-user stores the symlink as a regular file: the target and then
+        // a NUL.
         assert_eq!(
             object_bytes(&root, LINK, ObjectType::File, RepoMode::BareUser),
             b"hello.txt\0"
@@ -176,7 +187,7 @@ fn bare_user_objects_match_the_fixture() {
     });
 }
 
-/// The `user.ostreemeta` of a fixture object.
+/// Returns the `user.ostreemeta` xattr of a fixture object.
 fn fixture_ostreemeta(mode_dir: &str, hex: &str) -> Vec<u8> {
     let path = fixture_repo(mode_dir).join("objects").join(loose_path(
         &csum(hex),
@@ -198,12 +209,13 @@ fn bare_user_shared_shares_bare_user_identity_with_fixed_mode() {
             .await
             .unwrap();
         let txn = repo.transaction().await.unwrap();
-        // Identity is unchanged from bare-user (asserted inside write_fixture_tree).
+        // The checksums are the same as in bare-user (`write_fixture_tree`
+        // asserts them).
         write_fixture_tree(&txn).await;
         txn.commit().await.unwrap();
 
-        // Payload and user.ostreemeta match bare-user byte-for-byte; the inode
-        // is the fixed 0644 regardless of the logical mode.
+        // The payload and `user.ostreemeta` are byte for byte the same as in
+        // bare-user. The inode mode is always 0644, for each logical mode.
         for (hex, payload) in [(HELLO_TXT, HELLO), (NESTED_TXT, NESTED)] {
             assert_eq!(
                 object_bytes(&root, hex, ObjectType::File, RepoMode::BareUserShared),
@@ -229,7 +241,7 @@ fn write_metadata_stages_a_metadata_object() {
         let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
             .await
             .unwrap();
-        // A directory metadata object: uid/gid 0, mode 040755, no xattrs.
+        // A directory metadata object: uid 0, gid 0, mode 040755, no xattrs.
         let dirmeta = ostrya_core::DirMeta {
             uid: 0,
             gid: 0,
@@ -252,8 +264,8 @@ fn write_metadata_stages_a_metadata_object() {
         assert_eq!(stats.metadata_written, 1);
         assert_eq!(stats.content_written, 0);
 
-        // The staged object lands at its loose path with the fixed 0644 inode
-        // mode and byte-identical content, and reads back through the repo.
+        // The staged object is at its loose path, with the fixed inode mode
+        // 0644 and the same bytes. The repository reads it back.
         assert_eq!(
             object_bytes(&root, &c.to_hex(), ObjectType::DirMeta, RepoMode::BareUser),
             bytes
@@ -283,8 +295,8 @@ fn write_metadata_rejects_bare_split_xattrs() {
         };
         let bytes = dirmeta.serialize().unwrap();
         let txn = repo.transaction().await.unwrap();
-        // The write surface holds the read-only stance for bare-split-xattrs
-        // uniformly: content, symlinks, and metadata all refuse the mode.
+        // All writers treat bare-split-xattrs as read-only. The content,
+        // symlink, and metadata writers refuse the mode.
         let err = txn
             .write_metadata(ObjectType::DirMeta, None, &bytes)
             .await
@@ -300,8 +312,9 @@ fn write_metadata_rejects_bare_split_xattrs() {
 #[test]
 fn bare_content_applies_inode_xattrs() {
     let tmp = TmpDir::new("write-bare-xattr");
-    // Bare writes logical ownership to the inode, so use ids the process owns
-    // and set only `user.*` names, both applicable unprivileged.
+    // Bare writes the logical ownership to the inode, so the test uses ids
+    // that the process owns. It sets only `user.*` names. A process without
+    // privileges can apply both.
     let owned = rustix::fs::stat(tmp.path()).unwrap();
     let uid = owned.st_uid;
     let gid = owned.st_gid;
@@ -311,8 +324,8 @@ fn bare_content_applies_inode_xattrs() {
             .await
             .unwrap();
         let txn = repo.transaction().await.unwrap();
-        // Stored names are NUL-terminated; the write path strips the NUL before
-        // the setxattr syscall.
+        // Stored names end in a NUL. The writer removes the NUL before the
+        // `setxattr` syscall.
         let xattrs = ostrya_core::Xattrs::new([
             (b"user.one\0".to_vec(), b"first".to_vec()),
             (b"user.two\0".to_vec(), b"second".to_vec()),
@@ -323,8 +336,7 @@ fn bare_content_applies_inode_xattrs() {
         let checksum = txn.write_regfile_inline(None, &meta, HELLO).await.unwrap();
         txn.commit().await.unwrap();
 
-        // Bare stores the payload raw and carries the logical xattrs on the
-        // inode itself.
+        // Bare stores the raw payload and puts the logical xattrs on the inode.
         let hex = checksum.to_hex();
         assert_eq!(
             object_bytes(&root, &hex, ObjectType::File, RepoMode::Bare),
@@ -335,7 +347,7 @@ fn bare_content_applies_inode_xattrs() {
     });
 }
 
-/// The value of a named xattr set directly on a bare loose object's inode.
+/// Returns the value of a named xattr on the inode of a bare loose object.
 fn inode_xattr(root: &Path, hex: &str, name: &str) -> Vec<u8> {
     let path = root
         .join("objects")
@@ -364,7 +376,8 @@ fn rewriting_an_object_is_a_dedup_noop() {
             "the second write is a dedup no-op"
         );
 
-        // A fresh transaction sees the object already in objects/ and dedups.
+        // A new transaction finds the object in `objects/` and does not write
+        // it again (dedup).
         let txn = repo.transaction().await.unwrap();
         assert_eq!(
             txn.write_regfile_inline(None, &reg(), HELLO).await.unwrap(),
@@ -386,7 +399,7 @@ fn free_space_guard_trips_on_an_exhausted_budget() {
         Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
             .await
             .unwrap();
-        // Reserving 100% of the filesystem leaves a zero write budget.
+        // A reservation of 100% of the file system gives a write budget of 0.
         let config = root.join("config");
         let mut text = std::fs::read_to_string(&config).unwrap();
         text.push_str("min-free-space-percent=100\n");
@@ -406,9 +419,13 @@ fn free_space_guard_trips_on_an_exhausted_budget() {
     });
 }
 
-/// A `[core] fsync` value the reader does not hold reaches every write path,
-/// with a [`Transaction::set_fsync`] override of either polarity and with none.
-/// The override replaces the configured policy and never the reading of it.
+/// Checks that each write path refuses a `[core] fsync` value that the reader
+/// does not accept.
+///
+/// The test runs with no [`Transaction::set_fsync`] override and with an
+/// override of each polarity. An override replaces the configured policy. The
+/// reader parses the configured value in all cases, so the bad value stops the
+/// write.
 #[test]
 fn a_bad_configured_fsync_is_refused_under_every_override() {
     let tmp = TmpDir::new("write-fsync-bad-config");
@@ -445,11 +462,14 @@ fn a_bad_configured_fsync_is_refused_under_every_override() {
     });
 }
 
-/// A `[core] per-object-fsync` value the reader does not hold reaches every
-/// write path, with a [`Transaction::set_per_object_fsync`] override of either
-/// polarity, with none, and with fsync turned off by
-/// [`Transaction::set_fsync`]. The override replaces the configured setting and
-/// never the reading of it.
+/// Checks that each write path refuses a `[core] per-object-fsync` value that
+/// the reader does not accept.
+///
+/// The test runs with no [`Transaction::set_per_object_fsync`] override, with
+/// an override of each polarity, and with fsync turned off by
+/// [`Transaction::set_fsync`]. An override replaces the configured setting. The
+/// reader parses the configured value in all cases, so the bad value stops the
+/// write.
 #[test]
 fn a_bad_configured_per_object_fsync_is_refused_under_every_override() {
     let tmp = TmpDir::new("write-per-object-fsync-bad-config");
@@ -546,8 +566,10 @@ fn concurrent_writers_share_one_transaction() {
     });
 }
 
-/// The identity a payload would get, obtained by writing it into a throwaway
-/// transaction and rolling that transaction back.
+/// Returns the checksum of a payload.
+///
+/// The function writes the payload in a temporary transaction and then aborts
+/// that transaction.
 async fn object_checksum_of(repo: &Repo, meta: &FileMeta, payload: &[u8]) -> Checksum {
     let txn = repo.transaction().await.unwrap();
     let c = txn.write_regfile_inline(None, meta, payload).await.unwrap();
@@ -598,11 +620,12 @@ fn content_reads_back_through_load_file() {
 
 #[test]
 fn a_read_only_mode_is_stored_in_bare_user() {
-    // A logical mode with no owner-write bit -- 0444 is ordinary in a system
-    // tree -- is storable in bare-user, where the logical metadata lives in a
-    // `user.ostreemeta` xattr the kernel checks against the inode's write
-    // permission. Both content writers are exercised, since each stages its own
-    // temp before the inode policy is applied.
+    // A logical mode with no owner-write bit is usual in a system tree, for
+    // example 0444. bare-user can store such a mode. In bare-user the logical
+    // metadata is in a `user.ostreemeta` xattr. The kernel checks this xattr
+    // against the write permission of the inode. The test uses both content
+    // writers, because each writer stages its own temporary file before it
+    // applies the inode policy.
     let tmp = TmpDir::new("write-readonly");
     let root = tmp.path().join("repo");
     block_on(async {
@@ -619,8 +642,8 @@ fn a_read_only_mode_is_stored_in_bare_user() {
         txn.commit().await.unwrap();
 
         for checksum in [inline, streamed] {
-            // bare-user's canonical inode mode for a 0444 file is 0444 itself,
-            // and the logical mode reads back from the xattr.
+            // In bare-user the canonical inode mode of a 0444 file is 0444. The
+            // logical mode reads back from the xattr.
             let path = root.join("objects").join(loose_path(
                 &checksum,
                 ObjectType::File,
@@ -636,14 +659,15 @@ fn a_read_only_mode_is_stored_in_bare_user() {
 
 #[test]
 fn a_read_only_mode_with_an_xattr_is_stored_in_bare() {
-    // Bare carries a content object's logical xattrs on the inode, which the
-    // kernel checks a `user.*` name against the inode's write permission for. A
-    // logical mode with no owner-write bit is storable together with such an
-    // entry. Both content writers are exercised, since each stages its own temp
-    // before the inode policy is applied.
+    // Bare puts the logical xattrs of a content object on the inode. The
+    // kernel checks a `user.*` name against the write permission of the inode.
+    // Bare can store a logical mode with no owner-write bit together with such
+    // an xattr. The test uses both content writers, because each writer stages
+    // its own temporary file before it applies the inode policy.
     let tmp = TmpDir::new("write-bare-readonly");
-    // Bare writes logical ownership to the inode, so use ids the process owns
-    // and set only `user.*` names, both applicable unprivileged.
+    // Bare writes the logical ownership to the inode, so the test uses ids
+    // that the process owns. It sets only `user.*` names. A process without
+    // privileges can apply both.
     let owned = rustix::fs::stat(tmp.path()).unwrap();
     let uid = owned.st_uid;
     let gid = owned.st_gid;
@@ -678,15 +702,16 @@ fn bare_objects_match_the_tool() {
         eprintln!("skipping bare_objects_match_the_tool: the ostree tool is unavailable");
         return;
     }
-    // Bare stores logical ownership on the inode, so faithful writes need ids
-    // the process may apply. Take them from a directory this process owns; the
-    // port and the tool then both use those ids, so their objects match.
+    // Bare stores the logical ownership on the inode, so a faithful write
+    // needs ids that the process can apply. The test takes them from a
+    // directory that this process owns. ostrya and the `ostree` command then
+    // use the same ids, so their objects match.
     let tmp = TmpDir::new("write-bare");
     let owned = rustix::fs::stat(tmp.path()).unwrap();
     let uid = owned.st_uid;
     let gid = owned.st_gid;
 
-    // Build a bare repository with the port at that ownership.
+    // Build a bare repository with ostrya, with that ownership.
     let port_root = tmp.path().join("port");
     block_on(async {
         let repo = Repo::create(&port_root, CreateOptions::new(RepoMode::Bare))
@@ -703,7 +728,7 @@ fn bare_objects_match_the_tool() {
         txn.commit().await.unwrap();
     });
 
-    // Build the same tree with the tool into a bare repository.
+    // Build the same tree with the `ostree` command in a bare repository.
     let tool_root = tmp.path().join("tool");
     let src = tmp.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
@@ -732,18 +757,19 @@ fn bare_objects_match_the_tool() {
         src.to_str().unwrap(),
     ]);
 
-    // Every content object the tool wrote is present in the port's repo with
-    // identical bytes, inode mode, and ownership. The port side writes content
-    // objects alone, so the tree and commit metadata objects the tool wrote
-    // are not compared here.
+    // Each content object that the `ostree` command wrote is in the ostrya
+    // repository, with the same bytes, inode mode, and ownership. The ostrya
+    // side writes only content objects, so the test does not compare the tree
+    // and commit metadata objects of the `ostree` command.
     for entry in walk_objects(&tool_root.join("objects")) {
         if entry.extension().and_then(|e| e.to_str()) != Some("file") {
             continue;
         }
         let rel = entry.strip_prefix(tool_root.join("objects")).unwrap();
         let ours = port_root.join("objects").join(rel);
-        // symlink_metadata, not exists(): a symlink object's relative target
-        // dangles inside objects/, so exists() (which follows it) is false.
+        // The test uses `symlink_metadata`. The relative target of a symlink
+        // object does not resolve inside `objects/`. `exists()` follows the
+        // link, so it returns `false`.
         let our_meta = std::fs::symlink_metadata(&ours)
             .unwrap_or_else(|_| panic!("port is missing object {rel:?}"));
         let tool_meta = std::fs::symlink_metadata(&entry).unwrap();
@@ -769,19 +795,22 @@ fn bare_objects_match_the_tool() {
 
 #[test]
 fn bare_user_only_hashes_the_canonical_header() {
-    // bare-user-only stores neither ownership nor xattrs and reduces a regular
-    // file's permission bits to `perm & 0o755`, and an object's identity covers
-    // that reduced header: the object is named for what the mode stores, so it
-    // reads back as it was named and passes fsck. The identity is therefore the
-    // one the same canonical entry has in any other mode, which is what this
-    // compares against. Pinned to the tool by
-    // `bare_user_only_objects_match_the_tool`.
+    // bare-user-only stores no ownership and no xattrs. It reduces the
+    // permission bits of a regular file to `perm & 0o755`. The checksum of an
+    // object covers that reduced header, so the name of the object matches
+    // what the mode stores. As a result, the object reads back as named and
+    // passes fsck.
+    //
+    // The checksum is equal to the checksum of the same canonical entry in
+    // each other mode. The test compares against that checksum. The test
+    // `commit::bare_user_only_commit_matches_the_tool` pins this behavior to
+    // the `ostree` command.
     let tmp = TmpDir::new("write-buo-canon");
     let buo_root = tmp.path().join("buo");
     let bu_root = tmp.path().join("bu");
     block_on(async {
-        // A non-canonical entry: owned by ids the mode discards, a mode with
-        // group-write and other-write set, and one xattr.
+        // A non-canonical entry: ids that the mode discards, a mode with the
+        // group-write and other-write bits set, and one xattr.
         let mut meta = FileMeta::regular(4242, 4242, 0o777);
         meta.xattrs =
             ostrya_core::Xattrs::new([(b"user.demo\0".to_vec(), b"value".to_vec())]).unwrap();
@@ -798,8 +827,8 @@ fn bare_user_only_hashes_the_canonical_header() {
         let link = txn.write_symlink("hello.txt", &meta, None).await.unwrap();
         txn.commit().await.unwrap();
 
-        // The identity of the canonical form of each entry, taken from a mode
-        // that stores the header it is given.
+        // The checksum of the canonical form of each entry, from bare-user. This
+        // mode stores the header that the writer gets.
         let canon = FileMeta::regular(0, 0, 0o755);
         let bu = Repo::create(&bu_root, CreateOptions::new(RepoMode::BareUser))
             .await
@@ -817,7 +846,7 @@ fn bare_user_only_hashes_the_canonical_header() {
         assert_eq!(streamed, canon_streamed, "streamed regular-file identity");
         assert_eq!(link, canon_link, "symlink identity");
 
-        // Each object reads back as the header it is named for.
+        // Each object reads back with the header that its checksum covers.
         for checksum in [inline, streamed] {
             let file = repo.load_file(&checksum).await.unwrap();
             assert_eq!((file.uid, file.gid, file.mode), (0, 0, 0o100755));
@@ -841,7 +870,7 @@ fn run_ostree(args: &[&str]) {
     assert!(status.success(), "ostree {args:?} failed");
 }
 
-/// Every regular file and symlink under an `objects/` directory.
+/// Returns each regular file and symlink under an `objects/` directory.
 fn walk_objects(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     for fanout in std::fs::read_dir(dir).unwrap().flatten() {

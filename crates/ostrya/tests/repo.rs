@@ -1,9 +1,13 @@
-//! Repository open/create integration tests.
+//! Integration tests of the open and the creation of a repository.
 //!
-//! These open a tool-created repository and read its mode and config; create a
-//! repository whose `config` bytes and layout match what the `ostree` tool
-//! writes; and cross-check that the tool opens and operates on a repository
-//! this crate creates.
+//! The tests check three things:
+//!
+//! - ostrya opens a repository that the `ostree` command created, and reads its
+//!   mode and its config.
+//! - ostrya creates a repository with the same `config` bytes and the same
+//!   layout as the `ostree` command writes.
+//! - The `ostree` command opens a repository that ostrya creates, and operates
+//!   on it.
 
 mod common;
 
@@ -16,7 +20,7 @@ use common::{fixture_repo, ostree_available};
 use ostrya::{CreateOptions, Repo, RepoMode};
 use ostrya_rt::block_on;
 
-/// A throwaway directory removed when dropped.
+/// A temporary directory. `Drop` removes it.
 struct TmpDir(PathBuf);
 
 impl TmpDir {
@@ -116,8 +120,8 @@ fn create_is_idempotent_and_preserves_config() {
     let tmp = TmpDir::new("idem");
     let repo_path = tmp.path().join("repo");
     block_on(Repo::create(&repo_path, CreateOptions::new(RepoMode::Bare))).expect("first create");
-    // A second create with a different mode must leave the original config,
-    // matching the tool's `init`.
+    // A second create with a different mode must keep the original config.
+    // `ostree init` does the same.
     let repo = block_on(Repo::create(
         &repo_path,
         CreateOptions::new(RepoMode::Archive),
@@ -158,14 +162,15 @@ fn open_at_and_create_at_use_the_dir_fd() {
     assert_eq!(repo.mode(), RepoMode::Archive);
 }
 
-/// A path that names `target` relative to the current working directory. Each
-/// component of the working directory becomes one `..`, and the components of
-/// `target` follow. The result resolves to `target` with no change of the
-/// process working directory, which every test in this binary shares.
+/// Returns a path that names `target` relative to the current working
+/// directory. Each component of the working directory becomes one `..`, and the
+/// components of `target` come after them. The result resolves to `target`.
+/// The function does not change the working directory of the process, because
+/// all tests in this binary share it.
 ///
 /// Both paths must be absolute, so the first component of each is the root
-/// directory and `skip(1)` drops it. A working directory that is the root
-/// itself contributes no `..`, and the result is still relative.
+/// directory, and `skip(1)` drops it. If the working directory is the root, it
+/// gives no `..`, and the result is still relative.
 fn relative_to_cwd(target: &Path) -> PathBuf {
     let cwd = std::env::current_dir().expect("current dir");
     assert!(cwd.is_absolute(), "the working directory is absolute");
@@ -180,10 +185,10 @@ fn relative_to_cwd(target: &Path) -> PathBuf {
     rel
 }
 
-/// `Repo::path` reports the argument `create` and `open` were given, with no
-/// resolution: a relative path stays relative, `..` components included. The
-/// `config` file under the absolute path shows that the relative path named
-/// the directory the test intended.
+/// `Repo::path` returns the argument that `create` and `open` got, with no
+/// resolution. A relative path stays relative, with its `..` components. The
+/// `config` file under the absolute path shows that the relative path names the
+/// intended directory.
 #[test]
 fn path_reports_the_relative_argument_create_and_open_were_given() {
     let tmp = TmpDir::new("relpath");
@@ -215,8 +220,8 @@ fn path_reports_the_relative_argument_create_and_open_were_given() {
     );
 }
 
-/// `Repo::path` reports the `dir`-relative argument `create_at` and `open_at`
-/// were given, which needs that fd to resolve.
+/// `Repo::path` returns the `dir`-relative argument that `create_at` and
+/// `open_at` got. Only that fd resolves the path.
 #[test]
 fn path_reports_the_dir_relative_argument_the_at_constructors_were_given() {
     let tmp = TmpDir::new("atpath");
@@ -290,8 +295,8 @@ fn tool_operates_on_created_repo() {
     assert!(mode.status.success(), "ostree config get failed: {mode:?}");
     assert_eq!(String::from_utf8_lossy(&mode.stdout).trim(), "archive-z2");
 
-    // The tool accepts the repository for a write operation: committing an
-    // empty tree succeeds, which requires a well-formed layout.
+    // The `ostree` command accepts the repository for a write operation. A
+    // commit of an empty tree succeeds, and this needs a well-formed layout.
     let src = tmp.path().join("tree");
     std::fs::create_dir_all(&src).unwrap();
     let commit = Command::new("ostree")
@@ -307,8 +312,8 @@ fn tool_operates_on_created_repo() {
     );
 }
 
-/// `Repo::write_config` replaces `config` with an edited document, keeping the
-/// file's mode, and a reopen reads the new values.
+/// `Repo::write_config` replaces `config` with an edited document and keeps
+/// the mode of the file. A reopen reads the new values.
 #[test]
 fn write_config_replaces_the_document_and_keeps_the_mode() {
     let tmp = TmpDir::new("write-config");
@@ -340,8 +345,8 @@ fn write_config_replaces_the_document_and_keeps_the_mode() {
         "the rewritten config keeps mode 0644"
     );
 
-    // The handle that wrote keeps the configuration it was opened with; a reopen
-    // reads the new one.
+    // The handle that wrote the config keeps the config that it opened with. A
+    // reopen reads the new config.
     assert!(repo.config().fsync().expect("fsync"));
     let reopened = block_on(Repo::open(&repo_path)).expect("reopen");
     assert!(!reopened.config().fsync().expect("fsync"));
@@ -356,11 +361,12 @@ fn write_config_replaces_the_document_and_keeps_the_mode() {
         Some("https://example.invalid/r")
     );
 
-    // A remote's keyring is removed with its section.
+    // The keyring of a remote goes with its section. `remove_remote_keyring`
+    // deletes it.
     let keyring = repo_path.join("origin.trustedkeys.gpg");
     std::fs::write(&keyring, b"not a real keyring").unwrap();
     block_on(reopened.remove_remote_keyring("origin")).expect("remove keyring");
     assert!(!keyring.exists());
-    // An already-absent keyring is success.
+    // If the keyring is already absent, the removal succeeds.
     block_on(reopened.remove_remote_keyring("origin")).expect("remove keyring again");
 }

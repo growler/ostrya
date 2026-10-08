@@ -1,11 +1,11 @@
-//! `Repo::receive_stream`: one one-way stream into one transaction, and the
-//! refusal of a one-way `Hello` by the two-way receiver.
+//! Tests of `Repo::receive_stream`: one one-way stream into one transaction,
+//! and the refusal of a one-way `Hello` by the two-way receiver.
 //!
-//! Each stream is written by hand with the frame codec of
-//! `ostrya::push::proto`, from the objects of the golden fixture commit,
-//! which binds the ref `test/main`. A stream that commits runs through an
-//! in-process pipe. A stream that fails is read from a byte buffer, so a test
-//! can cut it or change a byte.
+//! The tests write each stream by hand with the frame codec of
+//! `ostrya::push::proto`. A stream carries the objects of the golden fixture
+//! commit, which binds the ref `test/main`. A stream that commits runs through
+//! an in-process pipe. The receiver reads a stream that fails from a byte
+//! buffer, so a test can cut the stream or change a byte.
 
 #![cfg(feature = "receive")]
 
@@ -96,9 +96,9 @@ fn policy() -> ReceivePolicy {
 // The stream.
 // ---------------------------------------------------------------------------
 
-/// A sink that keeps the offset after each write. A frame is one write of
-/// the frame writer, and a chunk is two, so the offsets are the boundaries of
-/// every frame, chunk length, and chunk.
+/// A sink that keeps the offset after each write. The frame writer writes a
+/// frame in one write and a chunk in two writes. The offsets are the
+/// boundaries of each frame, each chunk length, and each chunk.
 #[derive(Default)]
 struct Recorder {
     bytes: Vec<u8>,
@@ -217,8 +217,8 @@ fn fixture_stream(encoding: Encoding) -> Stream {
     stream
 }
 
-/// Run `receive_stream` over an in-process pipe that the stream is written
-/// into.
+/// Runs `receive_stream` over an in-process pipe and writes `bytes` into the
+/// pipe.
 fn receive_piped(
     repo: &Repo,
     policy: &ReceivePolicy,
@@ -229,7 +229,8 @@ fn receive_piped(
         repo.receive_stream(reader, policy),
         async move {
             writer.write_all(&bytes).await.unwrap();
-            // Dropping the writer gives the receiver its end of file.
+            // The block drops the writer at its end, so the receiver reads
+            // an end of file.
         },
     ));
     result
@@ -259,8 +260,9 @@ fn empty_repo(tmp: &TmpDir, core: &str) -> (Repo, Vec<(String, Vec<u8>)>) {
 
 /// A stream of the fixture commit lands in a `bare-user` repository, in each
 /// encoding, with a plain ref, a remote ref, and the detached metadata. The
-/// keys and the summary step of the policy are ignored: the detached metadata
-/// gets no server signature, and no summary and no anchor commit are written.
+/// receiver ignores the keys and the summary step of the policy. The detached
+/// metadata gets no server signature, and the receiver writes no summary and
+/// no anchor commit.
 #[test]
 fn a_stream_commits_the_fixture_commit() {
     let tool = common::ostree_available();
@@ -336,9 +338,9 @@ fn a_stream_commits_into_a_repository_without_locking() {
     assert_eq!(returned_code(&result), Some(ErrorCode::LockingDisabled));
 }
 
-/// A repository lock that another process holds exclusive makes the stream
-/// wait, and past `lock-timeout-secs` the stream fails with `LockTimeout`.
-/// Nothing is published.
+/// If another process holds the repository lock exclusive, the stream waits.
+/// After `lock-timeout-secs`, the stream fails with `LockTimeout`, and
+/// nothing is published.
 #[test]
 fn a_held_repository_lock_times_out() {
     let tmp = TmpDir::new("one-way-repo-lock");
@@ -361,9 +363,9 @@ fn a_held_repository_lock_times_out() {
     assert_nothing_published(&repo, &before);
 }
 
-/// Under `[core] locking=false` the commit still takes the update lock: an
-/// update lock that another process holds past `lock-timeout-secs` fails the
-/// stream with `LockTimeout`, and nothing is published.
+/// Under `[core] locking=false`, the commit also takes the update lock. If
+/// another process holds the update lock past `lock-timeout-secs`, the stream
+/// fails with `LockTimeout`, and nothing is published.
 #[test]
 fn locking_false_still_takes_the_update_lock() {
     let tmp = TmpDir::new("one-way-update-lock");
@@ -382,8 +384,8 @@ fn locking_false_still_takes_the_update_lock() {
 // Refusals.
 // ---------------------------------------------------------------------------
 
-/// Each message that a one-way stream does not carry, where it occurs, is
-/// `protocol`, and nothing is published.
+/// A message that a one-way stream does not carry is `protocol` at each
+/// position, and nothing is published.
 #[test]
 fn messages_out_of_place_are_protocol() {
     let tmp = TmpDir::new("one-way-order");
@@ -507,9 +509,9 @@ fn bytes_after_commit_are_protocol() {
     }
 }
 
-/// An object that the sender abandons, with the abandon marker and `Abort`,
-/// ends the stream with `Aborted`. The marker followed by another frame is
-/// `protocol`. Nothing is published.
+/// If the sender abandons an object with the abandon marker and `Abort`, the
+/// stream ends with `Aborted`. If another frame follows the marker, the
+/// stream is `protocol`. Nothing is published.
 #[test]
 fn an_abandoned_object_is_aborted() {
     let tmp = TmpDir::new("one-way-abandon");
@@ -543,10 +545,14 @@ fn an_abandoned_object_is_aborted() {
     assert_nothing_published(&repo, &before);
 }
 
-/// A stream that ends before `Commit` is complete, at any frame or chunk
-/// boundary, one byte past one, or one byte before one, is an end of file,
-/// in each encoding, and nothing is published. The empty stream is one such
-/// cut.
+/// If a stream ends before `Commit` is complete, the result is an end of
+/// file, and nothing is published. The test cuts the stream of each encoding
+/// at these positions:
+///
+/// - at each frame or chunk boundary
+/// - one byte after a boundary
+/// - one byte before a boundary
+/// - at offset 0, which gives the empty stream
 #[test]
 fn a_cut_stream_is_an_end_of_file() {
     let tmp = TmpDir::new("one-way-cut");
@@ -600,8 +606,8 @@ fn a_corrupted_object_is_checksum_mismatch() {
     }
 }
 
-/// The merge of the stored detached metadata of a commit and the incoming
-/// one, each under the size limit, that is over the limit is
+/// The stored and the incoming detached metadata of a commit are each under
+/// the size limit. If their merge is over the limit, the stream is
 /// `limit-exceeded`, and nothing is published.
 #[test]
 fn merged_detached_metadata_over_the_limit_is_limit_exceeded() {
@@ -648,9 +654,9 @@ fn merged_detached_metadata_over_the_limit_is_limit_exceeded() {
     assert_nothing_published(&repo, &before);
 }
 
-/// A one-way `Hello` gets no reply, so the size of a reply does not bound its
-/// names: a `Hello` whose two-way reply cannot fit in a frame passes, and a
-/// stream of `Hello` alone ends before `Commit`.
+/// A one-way `Hello` gets no reply, so the size of a reply does not limit its
+/// names. A `Hello` whose two-way reply cannot fit in a frame passes. A
+/// stream of this `Hello` alone ends with an end of file before `Commit`.
 #[test]
 fn a_one_way_hello_has_no_bound_of_the_reply() {
     let tmp = TmpDir::new("one-way-many-names");
@@ -706,7 +712,8 @@ fn a_write_to_a_checksum_shaped_name_is_invalid_ref_at_commit() {
     let tmp = TmpDir::new("one-way-hex-ref");
     let (repo, before) = empty_repo(&tmp, "");
     let hex = "a".repeat(64);
-    // A stream of `Hello` alone ends before `Commit`: `Hello` took the name.
+    // A stream of `Hello` alone ends with an end of file before `Commit`, so
+    // `Hello` accepted the name.
     match receive(&repo, &policy(), &Stream::hello(&[&hex], true).bytes()) {
         Err(Error::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {}
         other => panic!("{other:?}"),
@@ -728,10 +735,10 @@ fn a_write_to_a_checksum_shaped_name_is_invalid_ref_at_commit() {
 // The sender.
 // ---------------------------------------------------------------------------
 
-/// `Repo::export_stream` from an `archive` repository into
+/// Tests of `Repo::export_stream` from an `archive` repository into
 /// `Repo::receive_stream`. A stream that commits runs through an in-process
-/// pipe. A stream that fails is kept in a byte buffer, so a test can cut it or
-/// change a byte.
+/// pipe. A test keeps a stream that fails in a byte buffer, so it can cut the
+/// stream or change a byte.
 #[cfg(feature = "push")]
 mod export {
     use std::ops::Range;
@@ -754,7 +761,7 @@ mod export {
     /// The size of the large file: over the chunk limit of 1 MiB.
     const LARGE: usize = 1_500_000;
 
-    /// The kind bytes of the frames the tests look for.
+    /// The kind bytes of the frames that the tests look for.
     const OBJECT_HEADER_FRAME: u8 = 5;
     const OBJECTS_END_FRAME: u8 = 6;
     const COMMIT_FRAME: u8 = 8;
@@ -804,10 +811,10 @@ mod export {
             .collect()
     }
 
-    /// Commit the fixture tree into `repo` with `metadata` and with `large`
-    /// as the bytes of the file `large`, and write its detached metadata.
-    /// The result is the commit and the checksums of the setuid file, the
-    /// file with the capability, and the file `large`.
+    /// Commits the fixture tree into `repo` with `metadata`, with `large` as
+    /// the bytes of the file `large`, and writes its detached metadata.
+    /// Returns the commit and the checksums of the setuid file, the file with
+    /// the capability, and the file `large`.
     fn commit_tree(
         repo: &Repo,
         metadata: Option<Value>,
@@ -912,8 +919,9 @@ mod export {
         }
     }
 
-    /// Export from `source` into an in-process pipe that `target` reads.
-    /// The writer is dropped after the export, which gives the end of file.
+    /// Exports from `source` into an in-process pipe that `target` reads.
+    /// The block drops the writer after the export, so the receiver reads an
+    /// end of file.
     fn export_piped(
         source: &Repo,
         target: &Repo,
@@ -935,8 +943,8 @@ mod export {
         out
     }
 
-    /// Assert that `target` holds the commit of `source` and both refs, with
-    /// its detached metadata, no staging entry, and a passing fsck.
+    /// Asserts that `target` holds the commit of `source` and both refs, with
+    /// its detached metadata, no staging entry, and an fsck without errors.
     fn assert_committed(source: &Source, target: &Repo, report: &ReceiveReport, tool: bool) {
         let outcome = |name: &str| RefOutcome {
             name: name.into(),
@@ -978,8 +986,8 @@ mod export {
     }
 
     /// An export of the fixture commit lands in a new empty `bare-user`
-    /// repository, in each encoding, with a plain ref, a remote ref, and the
-    /// detached metadata. The setuid mode and the capability go into the
+    /// repository, in each encoding. The export carries a plain ref, a remote
+    /// ref, and the detached metadata. The setuid mode and the capability go into the
     /// logical metadata of the objects. The statistics count each object as
     /// offered, needed, and sent.
     #[test]
@@ -1011,8 +1019,8 @@ mod export {
 
     /// The same export into a new empty `bare` repository with
     /// `[ex-integrity] fsverity=yes` also seals each regular-file object,
-    /// and stores the detached metadata. The test runs as root on a
-    /// filesystem with fs-verity alone.
+    /// and stores the detached metadata. The test runs only as root on a file
+    /// system with fs-verity.
     #[test]
     fn an_export_into_a_bare_repository_seals_each_object_as_root() {
         if !is_root() {
@@ -1050,7 +1058,8 @@ mod export {
         let report = received.unwrap();
         exported.unwrap();
         assert_committed(&source, &target, &report, tool);
-        // The repository seals the objects and not the detached metadata.
+        // The repository seals each regular-file object. The check leaves
+        // out the `.commitmeta` file, which the repository does not seal.
         let (metas, regulars): (Vec<_>, Vec<_>) = regular_objects(target.path())
             .into_iter()
             .partition(|p| p.extension().is_some_and(|e| e == "commitmeta"));
@@ -1146,9 +1155,9 @@ mod export {
         assert_nothing_published(&repo, &before);
     }
 
-    /// A captured stream cut inside a chunk of the large file, right after
-    /// `ObjectsEnd`, and inside `Commit` is an end of file. One byte after
-    /// the stream is `protocol`. Each changes nothing.
+    /// A captured stream that ends inside a chunk of the large file, right
+    /// after `ObjectsEnd`, or inside `Commit` gives an end of file. One extra byte after the stream is `protocol`. No case changes
+    /// the repository.
     #[test]
     fn a_cut_or_extended_export_changes_nothing() {
         let source = Source::new("one-way-export-cut-source");
@@ -1200,8 +1209,8 @@ mod export {
             .collect()
     }
 
-    /// Each refusal of the export comes before the first byte. The commits
-    /// hold a small file in place of the large one.
+    /// Each refusal of the export comes before the first byte. In these
+    /// commits, the file `large` holds the 6 bytes `small\n`.
     #[test]
     fn an_export_refuses_before_it_writes_a_byte() {
         let tmp = TmpDir::new("one-way-export-refuse");
@@ -1264,7 +1273,7 @@ mod export {
             "{error:?}"
         );
         assert_eq!(calls, 0);
-        // With a `REMOTE:` part the name is a remote ref, and the receiver
+        // With a `REMOTE:` part, the name is a remote ref, and the receiver
         // writes it.
         let remote = format!("origin:{hex}");
         let bytes = capture(
@@ -1307,10 +1316,10 @@ mod export {
         assert_eq!(calls, 0);
     }
 
-    /// An export whose source lacks a file object ends the stream inside
-    /// that object, with the abandon marker and `Abort`, and returns the
-    /// error of the source. The receiver of that stream returns `Aborted`,
-    /// and nothing is published.
+    /// If the source of an export lacks a file object, the export ends the
+    /// stream inside that object with the abandon marker and `Abort`. The
+    /// export returns the error of the source. The receiver of that stream
+    /// returns `Aborted`, and nothing is published.
     #[test]
     fn a_missing_file_object_aborts_the_stream() {
         let source = Source::new("one-way-export-missing");

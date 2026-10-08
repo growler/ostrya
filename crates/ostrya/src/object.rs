@@ -1,10 +1,12 @@
-//! Blocking loose-object I/O primitives.
+//! Blocking I/O functions for loose objects.
 //!
-//! These synchronous helpers do the `openat`/`statat`/`read`/xattr syscalls
-//! that back the reading path. Each takes a borrowed directory fd and a
-//! precomputed loose path; the async methods on [`Repo`](crate::Repo) run them
-//! on the blocking pool. Metadata reads are bounded by the format's 128 MiB
-//! metadata cap so a malformed object cannot exhaust memory.
+//! These synchronous functions make the `openat`, `statat`, `read`, and xattr
+//! system calls of the read path. Each function takes a borrowed directory
+//! descriptor and a loose path that the caller computes. The async methods on
+//! [`Repo`](crate::Repo) run them on the blocking pool.
+//!
+//! A metadata read stops at the metadata cap of the format, 128 MiB
+//! ([`MAX_METADATA_SIZE`]), so a malformed object cannot use all memory.
 
 use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -15,26 +17,25 @@ use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 
-/// Both metadata reading paths hold the bound: [`crate::Repo::load_object_bytes`]
-/// refuses an object above it, and [`crate::MetadataReader`] refuses one at the
-/// open and again once it has handed over this many bytes and the object still
-/// holds a further one.
 pub use ostrya_core::MAX_METADATA_SIZE;
 
-/// The maximum size of a content object's framed file header the reader will
-/// load, for the archive form on disk and for the same framing received over
-/// HTTP.
+/// The maximum size of the framed file header of a content object.
 ///
-/// A header holds uid, gid, mode, rdev, a symlink target, and the xattr array,
-/// which puts a real header at a few hundred bytes and a header with large
-/// xattrs at a few kilobytes. Linux caps one xattr value at 64 KiB, so 1 MiB
-/// holds a header carrying many of them. The bound sits far below
-/// [`MAX_METADATA_SIZE`] because the header length arrives from the object
-/// stream and the receive path holds one header buffer for each fetch in
-/// flight.
+/// A reader loads a header up to this size. The limit applies to the archive
+/// form on disk and to the same framing that arrives over HTTP.
+///
+/// A header holds the uid, the gid, the mode, the rdev, a symlink target, and
+/// the xattr array. A typical header is a few hundred bytes. A header with
+/// large xattrs is a few kilobytes. Linux limits one xattr value to 64 KiB, so
+/// 1 MiB holds a header with many of them.
+///
+/// The limit is much less than [`MAX_METADATA_SIZE`] (128 MiB) for two reasons:
+///
+/// - The header length comes from the object stream.
+/// - The receive path holds one header buffer for each fetch in flight.
 pub(crate) const MAX_FILE_HEADER_SIZE: u64 = 1024 * 1024;
 
-/// Open a loose object for reading, relative to a directory fd.
+/// Opens a loose object for reading, relative to a directory descriptor.
 pub(crate) fn open_object(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> std::io::Result<OwnedFd> {
     Ok(rustix::fs::openat(
         dir,
@@ -44,9 +45,10 @@ pub(crate) fn open_object(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> std::i
     )?)
 }
 
-/// The error every metadata read reports for an object above the size cap. The
-/// buffered loader and the streaming reader both raise this one error, so the
-/// two paths refuse an oversized object alike.
+/// Returns the error of a metadata read for an object larger than the size cap.
+///
+/// The buffered loader and the streaming reader both return this error, so the
+/// two paths refuse an oversized object in the same way.
 pub(crate) fn metadata_cap_exceeded() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -54,9 +56,10 @@ pub(crate) fn metadata_cap_exceeded() -> std::io::Error {
     )
 }
 
-/// Read a whole metadata object into memory, rejecting anything larger than
-/// `cap`. A missing object surfaces as `ErrorKind::NotFound`, which the async
-/// wrapper maps to [`Error::ObjectNotFound`].
+/// Reads a whole metadata object into memory and refuses one larger than `cap`.
+///
+/// If the object does not exist, the error has the kind `ErrorKind::NotFound`.
+/// The async wrapper maps this kind to [`Error::ObjectNotFound`].
 pub(crate) fn read_meta_object(
     dir: rustix::fd::BorrowedFd<'_>,
     path: &str,
@@ -65,9 +68,10 @@ pub(crate) fn read_meta_object(
     read_meta_fd(open_object(dir, path)?, cap)
 }
 
-/// Read a whole metadata object from an open descriptor, with the cap rule of
-/// [`read_meta_object`]. A descriptor of anything but a regular file is
-/// refused with `ErrorKind::InvalidData`.
+/// Reads a whole metadata object from an open descriptor.
+///
+/// The cap rule is the same as in [`read_meta_object`]. If the descriptor is
+/// not a regular file, the error has the kind `ErrorKind::InvalidData`.
 pub(crate) fn read_meta_fd(fd: OwnedFd, cap: u64) -> std::io::Result<Vec<u8>> {
     let stat = rustix::fs::fstat(&fd)?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
@@ -82,7 +86,7 @@ pub(crate) fn read_meta_fd(fd: OwnedFd, cap: u64) -> std::io::Result<Vec<u8>> {
     }
     let file = std::fs::File::from(fd);
     let mut buf = Vec::with_capacity(size as usize);
-    // `take` guards against a file that grows between stat and read.
+    // `take` stops the read if the file grows between the `fstat` and the read.
     file.take(cap + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > cap {
         return Err(metadata_cap_exceeded());
@@ -90,7 +94,7 @@ pub(crate) fn read_meta_fd(fd: OwnedFd, cap: u64) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Whether a loose object exists at `path` relative to `dir`.
+/// Returns `true` if a loose object exists at `path` relative to `dir`.
 pub(crate) fn object_exists(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> Result<bool> {
     match rustix::fs::statat(dir, path, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(_) => Ok(true),
@@ -99,16 +103,18 @@ pub(crate) fn object_exists(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> Resu
     }
 }
 
-/// The on-disk size in bytes of a loose object at `path` relative to `dir`. A
-/// missing object surfaces as `ErrorKind::NotFound`.
+/// Returns the on-disk size in bytes of a loose object at `path` in `dir`.
+///
+/// If the object does not exist, the error has the kind `ErrorKind::NotFound`.
 pub(crate) fn object_size(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> std::io::Result<u64> {
     let stat = rustix::fs::statat(dir, path, AtFlags::SYMLINK_NOFOLLOW)?;
     Ok(stat.st_size.max(0) as u64)
 }
 
-/// Open a content object as a positioned [`std::fs::File`], seeking past
-/// `skip` bytes (the framed header, for archive objects). The returned file is
-/// handed to a streaming reader.
+/// Opens a content object as a [`std::fs::File`] positioned after `skip` bytes.
+///
+/// For an archive object, `skip` is the length of the framed header. The caller
+/// gives the file to a streaming reader.
 pub(crate) fn open_content_file(
     dir: rustix::fd::BorrowedFd<'_>,
     path: &str,
@@ -123,8 +129,9 @@ pub(crate) fn open_content_file(
     Ok(file)
 }
 
-/// Read the value of one extended attribute from an open fd, or `None` when the
-/// attribute is absent.
+/// Reads the value of one extended attribute from an open descriptor.
+///
+/// If the attribute does not exist, the function returns `None`.
 pub(crate) fn read_xattr(
     fd: rustix::fd::BorrowedFd<'_>,
     name: &str,
@@ -140,15 +147,17 @@ pub(crate) fn read_xattr(
                 let grown = buf.len().saturating_mul(2).max(512);
                 buf.resize(grown, 0);
             }
-            // No such attribute, or the filesystem has no xattr support.
+            // The attribute does not exist, or the file system has no xattr support.
             Err(Errno::NODATA) | Err(Errno::NOTSUP) => return Ok(None),
             Err(e) => return Err(e.into()),
         }
     }
 }
 
-/// Read every extended attribute from an open fd into a canonical [`Xattrs`]
-/// set. Names are stored with their terminating NUL, matching the on-disk form.
+/// Reads all extended attributes of an open descriptor into an [`Xattrs`] set.
+///
+/// The set is canonical. Each name keeps its terminating NUL, as in the on-disk
+/// form.
 pub(crate) fn read_all_xattrs(fd: rustix::fd::BorrowedFd<'_>) -> Result<Xattrs> {
     let mut names_buf = vec![0u8; 256];
     let names = loop {
@@ -165,11 +174,14 @@ pub(crate) fn read_all_xattrs(fd: rustix::fd::BorrowedFd<'_>) -> Result<Xattrs> 
     collect_xattrs(names, |name| read_xattr(fd, name))
 }
 
-/// Read one entry's own extended attributes -- the entry itself, not the target
-/// of a symlink -- relative to a directory fd. A symlink cannot be opened for an
-/// fd, so the fd-based [`read_all_xattrs`] cannot reach it; this addresses the
-/// entry no-follow through `/proc/self/fd` and reads it with the path-based `l`
-/// xattr calls. `name` may name an entry several directories below `dir`.
+/// Reads the extended attributes of an entry relative to a directory descriptor.
+///
+/// If the entry is a symlink, the function reads the attributes of the symlink
+/// itself. `name` can name an entry several directories below `dir`.
+///
+/// A symlink cannot be opened for a descriptor, so [`read_all_xattrs`] cannot
+/// read it. This function addresses the entry through `/proc/self/fd` with
+/// no-follow. It reads the entry with the path-based `l` xattr calls.
 pub(crate) fn read_link_xattrs(
     dir: rustix::fd::BorrowedFd<'_>,
     name: impl AsRef<std::ffi::OsStr>,
@@ -190,9 +202,11 @@ pub(crate) fn read_link_xattrs(
     collect_xattrs(names, |xname| read_link_xattr(&link, xname))
 }
 
-/// Read one extended attribute of an entry addressed by a `/proc/self/fd`
-/// path, no-follow, or `None` when the attribute is absent. Mirrors
-/// [`read_xattr`] with the path-based `lgetxattr`.
+/// Reads one extended attribute of the entry at a `/proc/self/fd` path.
+///
+/// The read does not follow a symlink. If the attribute does not exist, the
+/// function returns `None`. The function is [`read_xattr`] with the path-based
+/// `lgetxattr` call.
 fn read_link_xattr(link: &std::path::Path, name: &str) -> std::io::Result<Option<Vec<u8>>> {
     let mut buf = vec![0u8; 256];
     loop {
@@ -211,10 +225,14 @@ fn read_link_xattr(link: &std::path::Path, name: &str) -> std::io::Result<Option
     }
 }
 
-/// Build a canonical [`Xattrs`] set from a NUL-separated list of attribute
-/// names and a per-name value reader. Names are stored with a single
-/// terminating NUL, matching the on-disk form. A name that races away between
-/// listing and reading is skipped.
+/// Builds a canonical [`Xattrs`] set from a list of names and a value reader.
+///
+/// `names` is a NUL-separated list of attribute names. `read_value` reads the
+/// value of one name. The set stores each name with one terminating NUL, as in
+/// the on-disk form.
+///
+/// If an attribute disappears between the list call and the read of its value,
+/// the function skips it.
 fn collect_xattrs(
     names: &[u8],
     mut read_value: impl FnMut(&str) -> std::io::Result<Option<Vec<u8>>>,
@@ -236,10 +254,12 @@ fn collect_xattrs(
     Ok(Xattrs::new(pairs)?)
 }
 
-/// The `/proc/self/fd/<dirfd>/<name>` path addressing `name` relative to a
-/// directory fd. The path-based no-follow xattr calls reach a symlink this way,
-/// since a symlink cannot be opened for an fd, and they reach an entry of any
-/// other kind without opening it.
+/// Returns the `/proc/self/fd` path of `name` relative to a directory descriptor.
+///
+/// The path has the form `/proc/self/fd/<dirfd>/<name>`. The path-based
+/// no-follow xattr calls use it to reach a symlink, because a symlink cannot be
+/// opened for a descriptor. They also use it to reach an entry of another kind
+/// with no open call.
 fn proc_fd_path(dir: rustix::fd::BorrowedFd<'_>, name: &std::ffi::OsStr) -> std::path::PathBuf {
     let mut path = std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
     path.push(name);
@@ -251,12 +271,16 @@ mod tests {
     use super::*;
     use std::os::fd::AsFd;
 
-    /// `read_link_xattrs` reads the symlink itself, no-follow: a link pointing
-    /// at an xattr-bearing regular file reports the link's own set, never the
-    /// target's. Setting an xattr on a symlink needs a privileged namespace
-    /// (the VFS forbids `user.*` on symlinks and gates the rest behind
-    /// CAP_SYS_ADMIN or an LSM), so the link's own set cannot be populated in an
-    /// unprivileged test; the no-follow contract is what the reader must honor.
+    /// Checks that `read_link_xattrs` reads the symlink itself, with no-follow.
+    ///
+    /// The test makes a symlink to a regular file that has an xattr. The
+    /// function returns the xattr set of the symlink. The set of the target
+    /// does not show through the symlink.
+    ///
+    /// An xattr on a symlink needs a privileged namespace. The VFS refuses
+    /// `user.*` on a symlink. The other namespaces need `CAP_SYS_ADMIN` or the
+    /// permission of an LSM. An unprivileged test cannot put an xattr on the
+    /// symlink, so the test checks only the no-follow rule.
     #[test]
     fn read_link_xattrs_does_not_follow_to_the_target() {
         let dir = std::env::temp_dir().join(format!("ostrya-linkxattr-{}", std::process::id()));
@@ -275,7 +299,7 @@ mod tests {
 
         let dfd = std::fs::File::open(&dir).unwrap();
 
-        // The target, read by its fd, carries the xattr.
+        // The target has the xattr when the test reads it through its descriptor.
         let tfd = rustix::fs::openat(
             dfd.as_fd(),
             "target",
@@ -291,8 +315,8 @@ mod tests {
             "the target file carries user.demo"
         );
 
-        // The link, read no-follow, does not: its own set is empty, and the
-        // target's xattr does not leak through.
+        // The link, read with no-follow, has an empty xattr set. The xattr of
+        // the target does not show through the link.
         let link_xattrs = read_link_xattrs(dfd.as_fd(), "link").unwrap();
         assert_eq!(
             link_xattrs.iter().count(),

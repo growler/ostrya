@@ -1,4 +1,4 @@
-//! The export of commits from a repository as one one-way stream.
+//! The export of commits from a repository as a one-way stream.
 
 use std::collections::HashSet;
 
@@ -16,78 +16,138 @@ use crate::read::CommitState;
 use crate::refs::validate_refspec;
 use crate::repo::Repo;
 
-/// What [`Repo::export_stream`] exports, and how.
+/// The options of [`Repo::export_stream`].
 ///
-/// The struct carries no `#[non_exhaustive]`: build it with
+/// The struct is not `#[non_exhaustive]`. A caller can build it with
 /// `..Default::default()`.
 #[derive(Debug, Clone, Default)]
 pub struct ExportStreamOptions {
-    /// The ref updates of `Commit`. Each one expects
-    /// [`Absent`](Expected::Absent) or [`Any`](Expected::Any) and sets a new
-    /// commit. A name is `NAME` or `REMOTE:NAME`. The new commits are the
-    /// commits of the stream.
+    /// The ref updates that the `Commit` frame of the stream carries.
+    ///
+    /// Each update expects [`Absent`](Expected::Absent) or
+    /// [`Any`](Expected::Any) and sets a new commit. A name is `NAME` or
+    /// `REMOTE:NAME`. The new commits are the commits of the stream.
     pub updates: Vec<RefUpdate>,
     /// The encoding of the content objects.
     pub compression: Compression,
-    /// The filter the detached metadata of each commit passes before the
-    /// stream carries it. Unset, the stream carries every key.
+    /// The filter for the detached metadata of each commit in the stream.
+    ///
+    /// If the filter is unset, the stream carries every key.
     pub detached_metadata_filter: DetachedMetadataFilter,
 }
 
+/// Methods that export commits as a one-way stream.
 impl Repo {
-    /// Write the commits that `opts.updates` name, and the updates, to
-    /// `output` as one one-way stream, for `Repo::receive_stream` of the
-    /// `receive` feature on the other side of a channel that carries data in
-    /// one direction.
+    /// Writes the commits that `opts.updates` name to `output` as a one-way stream.
     ///
-    /// The stream carries each new commit once, with each object its tree
-    /// reaches and the detached metadata of the commit after
+    /// A one-way stream goes over a channel that carries data in one
+    /// direction. On the other side, `Repo::receive_stream` of the `receive`
+    /// feature reads it. The stream ends with the `Commit` frame, which
+    /// carries the updates of `opts.updates`.
+    ///
+    /// The call returns the [`PushStats`] of the stream. The statistics count
+    /// each object of the stream as offered and as needed.
+    ///
+    /// # Stream content
+    ///
+    /// The stream carries each new commit once. With each commit, it carries
+    /// each object that the tree of the commit reaches. It also carries the
+    /// detached metadata of the commit after
     /// [`detached_metadata_filter`](ExportStreamOptions::detached_metadata_filter).
-    /// It carries no parent commit. The sender does no negotiation, so it
-    /// sends each object whatever the receiver holds.
+    /// The stream carries no parent commit.
     ///
-    /// The export holds the lock of the repository shared for the whole
-    /// call. Before it writes a byte, the export refuses:
+    /// The call does no negotiation, so it sends each object, also the
+    /// objects that the receiver holds.
     ///
-    /// - empty `updates`, a ref named twice, an update whose expected state
-    ///   is [`Expected::Commit`], and an update with no new commit, as
-    ///   [`Error::Push`](crate::Error::Push) with
-    ///   [`InvalidInput`](crate::push::Error::InvalidInput);
-    /// - a ref name that [`validate_refspec`] refuses, and a ref name of 64
-    ///   lowercase hex characters with no `REMOTE:` part that an update
-    ///   writes, which a revision reads as a commit checksum, as
-    ///   [`Error::InvalidRefspec`](crate::Error::InvalidRefspec). A delete
-    ///   of such a name is refused as an update with no new commit;
-    /// - a commit that the repository marks partial, as
-    ///   [`Error::Push`](crate::Error::Push) with
-    ///   [`InvalidInput`](crate::push::Error::InvalidInput);
-    /// - a commit whose `ostree.ref-binding` is a list that does not hold the
-    ///   name of its ref, the `REMOTE:` part of a remote ref left out, as
-    ///   [`Error::Push`](crate::Error::Push) with
-    ///   [`BindingMismatch`](crate::push::Error::BindingMismatch). A commit
-    ///   with no binding, or with an empty list, passes;
-    /// - a dirtree or a dirmeta that the repository does not hold, as
-    ///   [`Error::ObjectNotFound`](crate::Error::ObjectNotFound);
-    /// - each input that [`export_stream`](crate::push::session::export_stream)
-    ///   of the session refuses: a level outside 1 through 9, and a `Hello`
-    ///   or a `Commit` frame over 1 MiB, as
-    ///   [`Error::Push`](crate::Error::Push) with
-    ///   [`InvalidInput`](crate::push::Error::InvalidInput).
+    /// If the repository is in `archive` mode and `opts.compression` is
+    /// [`Deflate`](Compression::Deflate), the stream carries each file object
+    /// in `deflate`. The stream copies the bytes of the stored `.filez` file
+    /// of the object.
     ///
-    /// The export does not check before the stream that each file object
-    /// exists. A missing file object, and a source that fails, end the
-    /// stream inside the object it was to send, with the abandon marker and
-    /// `Abort`, and the export returns [`Error::Push`](crate::Error::Push)
-    /// with the error of the source. The receiver then returns
-    /// [`Aborted`](crate::push::Error::Aborted).
+    /// # Lock
     ///
-    /// An `archive` repository sends a file object in `deflate` as the bytes
-    /// of its stored `.filez` file. The export writes `output` in blocks of
-    /// 64 KiB, so the caller need not give a buffered writer. It flushes
-    /// `output` after `Commit` and does not close it. The caller closes it, and the close
-    /// gives the end of file that ends the stream. A caller that keeps its
-    /// writer gives `&mut W`. The statistics count each object of the stream
-    /// as offered and as needed.
+    /// After the checks of `opts.updates`, the call takes the repository lock
+    /// as [`Shared`](LockKind::Shared). It holds the lock to the end of
+    /// the call. [`LockKind`] describes the repository lock.
+    ///
+    /// # Output
+    ///
+    /// The call writes `output` as
+    /// [`export_stream`](crate::push::session::export_stream) of the session
+    /// states. It does not close `output`. The caller closes `output` to end
+    /// the stream.
+    ///
+    /// # Missing file objects
+    ///
+    /// The call does not check before the stream that each file object
+    /// exists. A missing file object or a failed read of the repository ends
+    /// the stream inside the object that the call was to send. The call
+    /// writes the abandon marker and `Abort`, and returns the error. The
+    /// receiver then returns [`Aborted`](crate::push::Error::Aborted).
+    ///
+    /// # Errors
+    ///
+    /// Before the call writes the first byte to `output`, it returns:
+    ///
+    /// - [`Error::Push`](crate::Error::Push) with
+    ///   [`InvalidInput`](crate::push::Error::InvalidInput) if `updates` is
+    ///   empty, or names a ref two times.
+    /// - [`Error::Push`](crate::Error::Push) with
+    ///   [`InvalidInput`](crate::push::Error::InvalidInput) if an update
+    ///   expects [`Expected::Commit`], or has no new commit.
+    /// - [`Error::InvalidRefspec`](crate::Error::InvalidRefspec) if
+    ///   [`validate_refspec`] refuses a ref name.
+    /// - [`Error::InvalidRefspec`](crate::Error::InvalidRefspec) if an update
+    ///   writes a ref name of 64 lowercase hex characters with no `REMOTE:`
+    ///   part. A revision reads such a name as a commit checksum. A delete of
+    ///   such a name gives the error of an update with no new commit.
+    /// - [`Error::LockTimeout`](crate::Error::LockTimeout) if the wait for the
+    ///   lock passes `[core] lock-timeout-secs`.
+    /// - [`Error::InvalidFormat`](crate::Error::InvalidFormat) if
+    ///   `[core] lock-timeout-secs` is less than `-1`.
+    /// - [`Error::Core`](crate::Error::Core) if `[core] locking` is not a
+    ///   boolean or `[core] lock-timeout-secs` is not an integer.
+    /// - [`Error::ObjectNotFound`](crate::Error::ObjectNotFound) if the
+    ///   repository does not hold a new commit, or a dirtree or a dirmeta
+    ///   that the tree of a new commit reaches.
+    /// - [`Error::Core`](crate::Error::Core) if a commit object or a dirtree
+    ///   object does not parse.
+    /// - [`Error::Push`](crate::Error::Push) with
+    ///   [`InvalidInput`](crate::push::Error::InvalidInput) if the repository
+    ///   marks a new commit partial.
+    /// - [`Error::Push`](crate::Error::Push) with
+    ///   [`BindingMismatch`](crate::push::Error::BindingMismatch) if the
+    ///   `ostree.ref-binding` list of a commit does not hold the name of its
+    ///   ref. The check leaves out the `REMOTE:` part of a remote ref. A
+    ///   commit with no binding, or with an empty list, passes.
+    /// - [`Error::Push`](crate::Error::Push) with
+    ///   [`InvalidInput`](crate::push::Error::InvalidInput) if
+    ///   `opts.compression` has a level outside 1 through 9.
+    /// - [`Error::Push`](crate::Error::Push) with
+    ///   [`InvalidInput`](crate::push::Error::InvalidInput) if the `Hello`
+    ///   frame or the `Commit` frame is more than 1 MiB.
+    /// - [`Error::Io`](crate::Error::Io) if the open or the lock of the lock
+    ///   file fails.
+    /// - [`Error::Io`](crate::Error::Io) if a read of a commit, of its
+    ///   `.commitpartial` marker, or of a dirtree fails, or if a lookup of a
+    ///   dirmeta fails. A commit or a dirtree that is not a regular file, or
+    ///   that is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE),
+    ///   also gives this error.
+    ///
+    /// After the first byte, the call returns:
+    ///
+    /// - [`Error::Push`](crate::Error::Push) with
+    ///   [`Source`](crate::push::Error::Source) if the read of an object or
+    ///   of detached metadata fails, also for a missing file object. It holds
+    ///   the error of the repository.
+    /// - [`Error::Push`](crate::Error::Push) with
+    ///   [`InvalidInput`](crate::push::Error::InvalidInput) if the data of an
+    ///   object cannot go in the stream, as
+    ///   [`export_stream`](crate::push::session::export_stream) of the session
+    ///   states.
+    /// - [`Error::Push`](crate::Error::Push) with
+    ///   [`Io`](crate::push::Error::Io) if a write to `output` or a flush of
+    ///   `output` fails.
     pub async fn export_stream<W>(&self, output: W, opts: ExportStreamOptions) -> Result<PushStats>
     where
         W: AsyncWrite + Unpin + Send,
@@ -175,7 +235,8 @@ impl Repo {
     }
 }
 
-/// The options and the future of an export move to another thread.
+/// Checks at compile time that the options are `Send + Sync` and that the
+/// future of an export is `Send`.
 const _: fn() = || {
     fn assert_send<T: Send>(_: T) {}
     fn assert_send_sync<T: Send + Sync>() {}

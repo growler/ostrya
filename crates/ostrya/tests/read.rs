@@ -1,11 +1,16 @@
-//! Reading-path integration tests against the checked-in tool fixtures.
+//! Integration tests of the read path on the checked-in fixtures.
 //!
-//! These read objects, refs, and full trees from a tool-created repository and
-//! match the tool's own view. The metadata and traversal assertions are
-//! mode-independent (the fixtures share object bytes), so they run for both
-//! fixture repositories. The bare-user `load_file` path depends on the
-//! `user.ostreemeta` xattr; the bare-user fixture ships as a tarball that
-//! carries it (unpacked on demand), so these assertions always run.
+//! The `ostree` command wrote the fixture repositories. The tests read objects,
+//! refs, and full trees from them and compare the result with the view of the
+//! `ostree` command.
+//!
+//! The fixtures share the object bytes, so the metadata and traversal
+//! assertions do not depend on the repository mode. They run on both fixture
+//! repositories.
+//!
+//! The bare-user `load_file` path needs the `user.ostreemeta` xattr. The
+//! bare-user fixture is a tarball that keeps this xattr, so these assertions
+//! always run. The tests unpack the tarball on demand.
 
 mod common;
 
@@ -28,7 +33,7 @@ fn csum(hex: &str) -> Checksum {
     Checksum::from_hex(hex).unwrap()
 }
 
-/// Read a file object's whole payload through its streaming reader.
+/// Reads the whole payload of a file object through its streaming reader.
 async fn read_payload(file: &ostrya::FileObject) -> Vec<u8> {
     let mut reader = file.reader().await.expect("open reader");
     let mut buf = Vec::new();
@@ -36,9 +41,11 @@ async fn read_payload(file: &ostrya::FileObject) -> Vec<u8> {
     buf
 }
 
-/// Recompute a file object's content-object checksum from its reconstructed
-/// header and streamed payload; this must equal the object name, proving the
-/// port reads back exactly what the tool wrote.
+/// Computes the checksum of a file object again from its rebuilt header and
+/// its streamed payload.
+///
+/// The result must equal the object name. A match shows that ostrya reads back
+/// exactly the bytes that the `ostree` command wrote.
 async fn recomputed_checksum(file: &ostrya::FileObject) -> Checksum {
     match &file.kind {
         FileKind::Regular { .. } => {
@@ -77,18 +84,19 @@ fn resolves_and_lists_refs() {
                 Some(csum(COMMIT)),
                 "{mode_dir}: resolve test/main"
             );
-            // A bare commit checksum resolves to itself.
+            // A commit checksum alone, as the revision, resolves to itself.
             assert_eq!(
                 repo.resolve_rev(COMMIT, false).await.unwrap(),
                 Some(csum(COMMIT))
             );
-            // Unknown refs honor allow_noent.
+            // If `allow_noent` is `true`, an unknown ref gives `None`. If it is
+            // `false`, an unknown ref gives an error.
             assert_eq!(repo.resolve_rev("no/such", true).await.unwrap(), None);
             assert!(repo.resolve_rev("no/such", false).await.is_err());
 
             let refs = repo.list_refs(None).await.unwrap();
             assert_eq!(refs, vec![("test/main".to_owned(), csum(COMMIT))]);
-            // Prefix filtering keeps the nested ref.
+            // A prefix filter keeps the nested ref.
             assert_eq!(repo.list_refs(Some("test")).await.unwrap(), refs);
             assert!(repo.list_refs(Some("other")).await.unwrap().is_empty());
         });
@@ -115,7 +123,7 @@ fn loads_commit_dirtree_and_dirmeta() {
             assert_eq!(dirs, ["subdir"]);
 
             let meta = repo.load_dirmeta(&csum(ROOT_DIRMETA)).await.unwrap();
-            // `ostree ls` reports the root as d00755 owned 0:0.
+            // `ostree ls` shows the root as d00755, owned by 0:0.
             assert_eq!((meta.uid, meta.gid, meta.mode), (0, 0, 0o40755));
 
             assert!(
@@ -130,14 +138,15 @@ fn loads_commit_dirtree_and_dirmeta() {
                     .unwrap()
             );
 
-            // A missing object is reported as ObjectNotFound, not a bare I/O error.
+            // A missing object gives `Error::ObjectNotFound`, a variant of its
+            // own. A plain I/O error does not pass this assertion.
             let err = repo
                 .load_dirtree(&csum(&"11".repeat(32)))
                 .await
                 .unwrap_err();
             assert!(matches!(err, ostrya::Error::ObjectNotFound { .. }));
 
-            // load_variant yields the dynamic tree for a metadata object.
+            // `load_variant` returns the dynamic tree of a metadata object.
             let value = repo
                 .load_variant(ObjectType::DirMeta, &csum(ROOT_DIRMETA))
                 .await
@@ -156,7 +165,8 @@ fn traverses_the_commit_tree() {
             assert_eq!(commit, csum(COMMIT));
             assert_eq!(root.dirtree_checksum(), &csum(ROOT_DIRTREE));
 
-            // read_dir yields files first, then directories, each name-sorted.
+            // `read_dir` returns the files first, then the directories. Each
+            // group is in name order.
             let entries = root.read_dir().await.unwrap();
             let names: Vec<&str> = entries
                 .iter()
@@ -177,7 +187,7 @@ fn traverses_the_commit_tree() {
             assert!(matches!(&nested[0], TreeEntry::File { name, checksum }
                 if name == "nested.txt" && *checksum == csum(NESTED_TXT)));
 
-            // lookup resolves files, nested files, directories, and symlinks.
+            // `lookup` resolves files, nested files, directories, and symlinks.
             assert!(matches!(
                 root.lookup(Path::new("hello.txt")).await.unwrap(),
                 Some(TreeEntry::File { checksum, .. }) if checksum == csum(HELLO_TXT)
@@ -194,7 +204,8 @@ fn traverses_the_commit_tree() {
                 root.lookup(Path::new("link")).await.unwrap(),
                 Some(TreeEntry::File { checksum, .. }) if checksum == csum(LINK)
             ));
-            // Missing entry, and descending through a file, both resolve to None.
+            // A missing entry resolves to `None`. A path through a file also
+            // resolves to `None`.
             assert!(root.lookup(Path::new("missing")).await.unwrap().is_none());
             assert!(
                 root.lookup(Path::new("hello.txt/x"))
@@ -242,9 +253,11 @@ fn reads_archive_file_content() {
     });
 }
 
-/// An archive object whose compressed stream is far longer than its payload
-/// reads back whole. The stream of an empty file is padded with empty stored
-/// blocks, so it still inflates to no bytes and keeps its checksum.
+/// If the compressed stream of an archive object is far longer than its
+/// payload, the object still reads back whole.
+///
+/// The test pads the stream of an empty file with empty stored blocks. The
+/// stream still inflates to no bytes, and the object keeps its checksum.
 #[test]
 fn reads_an_archive_object_with_a_padded_stream() {
     let tmp = TmpDir::new("read-archive-padded");
@@ -290,8 +303,8 @@ fn reads_an_archive_object_with_a_padded_stream() {
 
 #[test]
 fn reads_bare_user_file_content() {
-    // The bare-user fixture tarball carries the `user.ostreemeta` xattr these
-    // objects rely on, so this cross-check always runs.
+    // The bare-user fixture tarball keeps the `user.ostreemeta` xattr that these
+    // objects need, so this cross-check always runs.
     block_on(async {
         let repo = Repo::open(&repo_path("bare-user"))
             .await
@@ -319,11 +332,11 @@ fn reads_bare_user_file_content() {
     });
 }
 
-/// Place a file of `size` bytes at the loose path of a commit object under
-/// `repo_dir`, and return that path.
+/// Places a file of `size` bytes at the loose path of a commit object under
+/// `repo_dir`, and returns that path.
 ///
 /// `set_len` is `ftruncate`, so the file reads back as zeros and the test writes
-/// no payload. A size at the metadata cap therefore costs no disk space.
+/// no payload. As a result, a size at the metadata cap uses no disk space.
 fn place_sparse_object(repo_dir: &Path, mode: RepoMode, checksum: &Checksum, size: u64) -> PathBuf {
     let path = repo_dir
         .join("objects")
@@ -338,8 +351,8 @@ fn place_sparse_object(repo_dir: &Path, mode: RepoMode, checksum: &Checksum, siz
     path
 }
 
-/// The streaming reader hands over exactly the bytes the buffered loader
-/// returns, whatever chunk size the caller reads in.
+/// The streaming reader returns exactly the bytes that the buffered loader
+/// returns, for each chunk size that the caller reads with.
 #[test]
 fn streams_a_metadata_object_in_chunks() {
     for mode_dir in ["archive", "bare-user"] {
@@ -359,8 +372,8 @@ fn streams_a_metadata_object_in_chunks() {
                 .metadata_reader(ObjectType::Commit, &csum(COMMIT))
                 .await
                 .expect("open the metadata reader");
-            // An empty buffer takes no bytes and disturbs no position: the
-            // stream below still hands over the whole object.
+            // An empty buffer takes no bytes and does not move the position.
+            // The reads that follow still return the whole object.
             assert_eq!(
                 reader
                     .read(&mut [])
@@ -370,8 +383,8 @@ fn streams_a_metadata_object_in_chunks() {
                 "{mode_dir}: an empty buffer takes nothing"
             );
 
-            // A chunk far smaller than the object, so the assertion covers many
-            // reads and a partial final read.
+            // The chunk is far smaller than the object, so the assertion covers
+            // many reads and a partial last read.
             let mut chunk = [0u8; 7];
             let mut streamed = Vec::new();
             loop {
@@ -387,9 +400,10 @@ fn streams_a_metadata_object_in_chunks() {
             }
             assert_eq!(streamed, buffered, "{mode_dir}: streamed commit bytes");
 
-            // A missing object surfaces the refusal the buffered loader gives.
-            // `MetadataReader` carries no `Debug`, matching `ContentReader`, so
-            // the refusal is taken by a match rather than `unwrap_err`.
+            // A missing object gives the refusal of the buffered loader.
+            // `MetadataReader` has no `Debug` implementation, the same as
+            // `ContentReader`. `unwrap_err` needs `Debug`, so the test takes the
+            // refusal with a `match`.
             let err = match repo
                 .metadata_reader(ObjectType::Commit, &csum(&"11".repeat(32)))
                 .await
@@ -405,8 +419,8 @@ fn streams_a_metadata_object_in_chunks() {
     }
 }
 
-/// An object the `fstat` already measures above the cap is refused at the open,
-/// with the error the buffered loader raises for the same object.
+/// If the `fstat` measures an object larger than the cap, the open refuses it.
+/// The error is the same error that the buffered loader gives for the object.
 #[test]
 fn metadata_reader_refuses_an_oversized_object_at_the_open() {
     let tmp = TmpDir::new("meta-cap-open");
@@ -443,10 +457,12 @@ fn metadata_reader_refuses_an_oversized_object_at_the_open() {
     });
 }
 
-/// Under the `tokio` backend the reader also speaks the tokio I/O traits.
-/// Driving that implementation directly -- `poll_read` over a `ReadBuf` --
-/// proves it advances the filled region by exactly the bytes it wrote: a
-/// mismatch there would drop or duplicate bytes against the buffered loader.
+/// Under the `tokio` backend, the reader also implements the tokio I/O traits.
+///
+/// The test calls that implementation directly, with `poll_read` over a
+/// `ReadBuf`. Each read must move the filled region forward by exactly the bytes
+/// that it wrote. If the count is wrong, the stream drops or duplicates bytes,
+/// and it differs from the buffered loader.
 #[cfg(feature = "tokio")]
 #[test]
 fn streams_a_metadata_object_through_the_tokio_trait() {
@@ -467,12 +483,12 @@ fn streams_a_metadata_object_through_the_tokio_trait() {
 
         let mut streamed = Vec::new();
         loop {
-            // A chunk far smaller than the object, so the assertion covers many
-            // reads and a partial final read.
+            // The chunk is far smaller than the object, so the assertion covers
+            // many reads and a partial last read.
             let mut raw = [0u8; 7];
             let taken = futures_lite::future::poll_fn(|cx| {
-                // A fresh `ReadBuf` on every poll: a `Pending` poll fills
-                // nothing, so rebuilding it drops no byte.
+                // Each poll gets a new `ReadBuf`. A `Pending` poll fills
+                // nothing, so the new buffer loses no byte.
                 let mut buf = ReadBuf::new(&mut raw);
                 match Pin::new(&mut reader).poll_read(cx, &mut buf) {
                     Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.filled().len())),
@@ -491,10 +507,11 @@ fn streams_a_metadata_object_through_the_tokio_trait() {
     });
 }
 
-/// An object of exactly `MAX_METADATA_SIZE` bytes sits inside the cap. The
-/// streaming reader hands over every byte and ends at `Ok(0)`, and the buffered
-/// loader takes the same object, so the two paths put the bound on the same
-/// byte.
+/// An object of exactly `MAX_METADATA_SIZE` bytes is inside the cap.
+///
+/// The streaming reader returns every byte and then ends at `Ok(0)`. The
+/// buffered loader also accepts the object, so the two paths put the bound on
+/// the same byte.
 #[test]
 fn metadata_reader_reads_an_object_at_exactly_the_cap() {
     let tmp = TmpDir::new("meta-cap-exact");
@@ -510,8 +527,8 @@ fn metadata_reader_reads_an_object_at_exactly_the_cap() {
             .metadata_reader(ObjectType::Commit, &key)
             .await
             .expect("an object at the cap opens a reader");
-        // A chunk size that does not divide the cap, so the reader ends on a
-        // partial read rather than on a boundary.
+        // The chunk size does not divide the cap, so the last read with data
+        // is a partial read.
         let mut chunk = vec![0u8; 1024 * 1024 - 1];
         let mut taken: u64 = 0;
         loop {
@@ -528,8 +545,8 @@ fn metadata_reader_reads_an_object_at_exactly_the_cap() {
             taken, MAX_METADATA_SIZE,
             "the reader hands over every byte of an object at the cap"
         );
-        // The end of file is stable: the probe at the cap finds no further byte
-        // however often it runs.
+        // The end of file is stable. Each repeated read at the cap finds no
+        // more bytes.
         for round in 0..3 {
             assert_eq!(
                 reader.read(&mut chunk).await.expect("read past the end"),
@@ -538,8 +555,8 @@ fn metadata_reader_reads_an_object_at_exactly_the_cap() {
             );
         }
 
-        // The buffered loader takes the same object, so neither path refuses at
-        // the cap itself.
+        // The buffered loader accepts the same object, so neither path refuses
+        // at the cap itself.
         let buffered = repo
             .load_object_bytes(ObjectType::Commit, &key)
             .await
@@ -548,9 +565,10 @@ fn metadata_reader_reads_an_object_at_exactly_the_cap() {
     });
 }
 
-/// An object that grows past the cap while the reader is open is refused by the
-/// running total, and the reader hands over no more than `MAX_METADATA_SIZE`
-/// bytes before it refuses.
+/// If an object grows past the cap while the reader is open, the running total
+/// refuses the object.
+///
+/// The reader returns no more than `MAX_METADATA_SIZE` bytes before the refusal.
 #[test]
 fn metadata_reader_refuses_an_object_that_grows_past_the_cap() {
     let tmp = TmpDir::new("meta-cap-grow");
@@ -560,15 +578,15 @@ fn metadata_reader_refuses_an_object_that_grows_past_the_cap() {
             .await
             .expect("create repo");
         let key = csum(&"33".repeat(32));
-        // One byte under the cap, so the `fstat` at the open passes.
+        // The size is one byte under the cap, so the `fstat` at the open passes.
         let path = place_sparse_object(&repo_dir, repo.mode(), &key, MAX_METADATA_SIZE - 1);
         let mut reader = repo
             .metadata_reader(ObjectType::Commit, &key)
             .await
             .expect("open the metadata reader");
 
-        // Grow the object past the cap before the first read, the way a writer
-        // racing the reader does.
+        // Grow the object past the cap before the first read. This acts as a
+        // writer that races the reader.
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -576,10 +594,10 @@ fn metadata_reader_refuses_an_object_that_grows_past_the_cap() {
             .set_len(MAX_METADATA_SIZE + 1)
             .expect("grow the loose object past the cap");
 
-        // A chunk size that does not divide the cap, so the last read below the
-        // cap asks for more bytes than the cap leaves. Without the clamp that
-        // read would carry the total past the cap, and the per-read assertion
-        // catches it.
+        // The chunk size does not divide the cap, so the last read before the
+        // cap asks for more bytes than the cap leaves. If the reader has no
+        // clamp, that read carries the total past the cap. The assertion on
+        // each read catches this.
         let mut chunk = vec![0u8; 1024 * 1024 - 1];
         let mut taken: u64 = 0;
         let err = loop {
@@ -606,9 +624,9 @@ fn metadata_reader_refuses_an_object_that_grows_past_the_cap() {
             "the reader stops at the cap, having handed over every byte up to it"
         );
 
-        // The refusal is terminal. A caller that polls again takes the same
-        // error, never a clean end of file that would present the object as
-        // having ended at the cap.
+        // The refusal is terminal. Each later read gives the same error and
+        // never a clean end of file. A clean end of file presents the object as
+        // an object that ends at the cap.
         for round in 0..3 {
             match reader.read(&mut chunk).await {
                 Ok(n) => panic!("read {round} after the refusal returned {n} bytes"),
@@ -628,9 +646,10 @@ fn metadata_reader_refuses_an_object_that_grows_past_the_cap() {
 
 #[test]
 fn matches_the_tool_cat_and_ls() {
-    // A live comparison against the `ostree` tool, when it is on PATH: what the
-    // port reads from the archive fixture must equal what the tool prints. The
-    // archive fixture needs no xattrs, so this is self-contained.
+    // If the `ostree` command is on `PATH`, the test compares ostrya with it
+    // live. The bytes that ostrya reads from the archive fixture must equal the
+    // output of the `ostree` command. The archive fixture needs no xattrs, so
+    // this test is self-contained.
     if !ostree_available() {
         eprintln!("skipping tool cross-check: ostree not on PATH");
         return;
@@ -665,7 +684,8 @@ fn matches_the_tool_cat_and_ls() {
             assert_eq!(read_payload(&file).await, cat(path), "content of {path}");
         }
 
-        // The symlink target the tool reports matches the port's.
+        // The symlink target that `ostree ls` shows matches the target that
+        // ostrya reads.
         let link = repo.load_file(&csum(LINK)).await.unwrap();
         let ls = std::process::Command::new("ostree")
             .arg(&repo_arg)

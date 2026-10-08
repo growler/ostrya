@@ -1,11 +1,13 @@
-//! The `.tombstone-commit` marker and the one call that writes it.
+//! The `.tombstone-commit` marker and the one function that writes it.
 //!
-//! Two commands write the marker. A prune writes it for every commit it removes
-//! where the command line carries `--delete-commit` or the repository config
-//! sets `[core] tombstone-commits`. An `fsck --add-tombstones` writes it for
-//! every commit whose parent commit object is absent, removing that commit
-//! object in the same step. The bytes are the same at both sites and are
-//! recorded in `docs/format-reference.md`, "Object types".
+//! A `.tombstone-commit` object marks a deleted commit. Two operations write
+//! the marker, and both write the same bytes:
+//!
+//! - A prune writes it for each commit that it removes, if the run has
+//!   `--delete-commit` or the repository config sets
+//!   `[core] tombstone-commits`.
+//! - `fsck --add-tombstones` writes it for each commit whose parent commit
+//!   object is absent. The same step removes that commit object.
 
 use std::os::fd::BorrowedFd;
 
@@ -13,17 +15,16 @@ use ostrya_core::{Checksum, DictBuilder, ObjectType, RepoMode, Type, loose_path,
 
 use crate::error::Result;
 
-/// The GVariant type a `.tombstone-commit` object holds.
+/// The GVariant type that a `.tombstone-commit` object holds.
 const TOMBSTONE_SIGNATURE: &str = "a{sv}";
-/// The one key a `.tombstone-commit` dict carries.
+/// The one key that a `.tombstone-commit` dict carries.
 const TOMBSTONE_KEY: &str = "commit";
 
-/// Write the `.tombstone-commit` marker naming `commit`.
+/// Writes the `.tombstone-commit` marker that names `commit`.
 ///
-/// The object is the `a{sv}` holding one `commit` key whose `ay` value is the
-/// commit checksum in lowercase hex, NUL-terminated
-/// (`docs/format-reference.md`, "Object types"). `tmp_fd` is the open `tmp/`
-/// of the repository, where the write creates its temp file.
+/// The object is an `a{sv}` with one key, `commit`. Its `ay` value is the
+/// commit checksum in lowercase hex, with a NUL terminator. `tmp_fd` is the
+/// open `tmp/` of the repository, where the write creates its temp file.
 pub(crate) fn write_tombstone(
     tmp_fd: BorrowedFd<'_>,
     objects_fd: BorrowedFd<'_>,

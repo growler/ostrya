@@ -1,5 +1,7 @@
-//! The steps of one push session that each transport drives: `Hello`, `Have`,
-//! the object stream, and `Commit`, over the session transaction.
+//! The steps of one push session, which each transport drives.
+//!
+//! The steps are `Hello`, `Have`, the object stream, and `Commit`. Each step
+//! uses the session transaction.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
@@ -26,48 +28,56 @@ use crate::push::{self, Encoding};
 use crate::repo::Repo;
 use crate::transaction::Transaction;
 
-/// One open push session: the session transaction, which holds the
-/// repository lock shared, and what the session keeps until `Commit`. Every
-/// step but [`finish`](Self::finish) takes `&self`, so concurrent object
-/// streams can share one session.
+/// One open push session.
+///
+/// The session holds the session transaction and the state that it keeps
+/// until `Commit`. The session transaction holds the repository lock in
+/// shared mode. Each step except [`finish`](Self::finish) takes `&self`, so
+/// concurrent object streams can share one session.
 pub(super) struct SessionCore<P: Deref<Target = ReceivePolicy>> {
     repo: Repo,
     policy: P,
     txn: Transaction,
     rules: ModeRules,
-    /// The refs `Hello` named.
+    /// The refs that `Hello` named.
     named: Vec<String>,
-    /// The session reads a one-way stream.
+    /// `true` if the session reads a one-way stream.
     one_way: bool,
     /// The hooks of the session, which `Commit` calls.
     hooks: Option<Arc<dyn ReceiveHooks>>,
     meta: Mutex<MetaState>,
     /// The bytes of the dirtree, dirmeta, and commit objects that the object
     /// streams of the session read now and did not stage yet. The session
-    /// holds it to [`MAX_METADATA_SIZE`].
+    /// keeps this count at most [`MAX_METADATA_SIZE`].
     reading: AtomicU64,
 }
 
-/// The detached metadata of a session. The lock over it is held for a check
-/// or an update of these fields alone, and never across a read of an object.
+/// The detached metadata of a session.
+///
+/// A step holds the lock on this state only for a check or an update of its
+/// fields. No step holds the lock across a read of an object.
 #[derive(Default)]
 struct MetaState {
     /// The dicts of the session, by commit, as they arrived.
     dicts: HashMap<Checksum, Vec<u8>>,
     /// The commits whose dict an object stream reads or checks now.
     pending: HashSet<Checksum>,
-    /// The bytes of detached metadata the session read, in the dicts it keeps
-    /// and in those it reads now. The session holds it to
-    /// [`MAX_METADATA_SIZE`].
+    /// The bytes of detached metadata that the session read, in the dicts
+    /// that it keeps and in the dicts that it reads now. The session keeps
+    /// this count at most [`MAX_METADATA_SIZE`].
     reserved: u64,
 }
 
 impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
-    /// Answer `Hello` of a two-way session: check the version, the repository,
-    /// and the ref names, and open the session transaction. `parallel_uploads`
-    /// is the value the reply announces, and `hooks` are the hooks that
-    /// `Commit` calls. A `Hello` with `one-way` true is `protocol`, before the
-    /// version check.
+    /// Answers the `Hello` of a two-way session and opens the session
+    /// transaction.
+    ///
+    /// The answer checks the version, the repository, and the ref names.
+    /// `parallel_uploads` is the value that the reply announces. `hooks` are
+    /// the hooks that `Commit` calls.
+    ///
+    /// The session checks `one-way` before the version. A `Hello` with
+    /// `one-way` set to `true` gives a `protocol` failure.
     pub(super) async fn open(
         repo: Repo,
         policy: P,
@@ -99,11 +109,15 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         Ok((core, reply))
     }
 
-    /// Read `Hello` of a one-way stream: the checks of a two-way `Hello`
-    /// except the refusal of `[core] locking=false` and the size of the
-    /// reply, which a one-way stream does not get, and the open of the
-    /// session transaction. A `Hello` without `one-way` true is `protocol`,
-    /// before the version check.
+    /// Reads the `Hello` of a one-way stream and opens the session
+    /// transaction.
+    ///
+    /// The checks are those of a two-way `Hello`, except the refusal of
+    /// `[core] locking=false` and the check of the reply size. A one-way
+    /// stream gets no reply.
+    ///
+    /// The session checks `one-way` before the version. A `Hello` without
+    /// `one-way` set to `true` gives a `protocol` failure.
     pub(super) async fn open_one_way(
         repo: Repo,
         policy: P,
@@ -117,9 +131,11 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         Self::start(repo, policy, None, hello, true).await
     }
 
-    /// Run the checks of [`check_hello`] on `hello`, and open the session
-    /// transaction. A `bare` repository is refused unless the server runs as
-    /// root.
+    /// Runs the checks of [`check_hello`] on `hello` and opens the session
+    /// transaction.
+    ///
+    /// If the repository mode is `bare` and the server does not run as root,
+    /// the result is a `mode-refused` failure.
     async fn start(
         repo: Repo,
         policy: P,
@@ -130,9 +146,9 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         check_hello(&repo, &hello)?;
         let mode = repo.mode();
         let txn = repo.transaction().await.map_err(Failure::Internal)?;
-        // Read the settings the writes of the session read, so a malformed
-        // value fails here as a fault of the server, and not later as a fault
-        // of an object.
+        // Read the settings that the writes of the session use. A malformed
+        // value then fails here as a fault of the server, before an object
+        // can fail on it.
         txn.fsync_flags().map_err(Failure::Internal)?;
         repo.config().fsverity().map_err(Failure::Internal)?;
         if mode.is_archive() {
@@ -162,8 +178,8 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         })
     }
 
-    /// Answer a `Have`: one bit for each object the repository and the session
-    /// do not hold.
+    /// Answers a `Have` with one bit for each object that the repository and
+    /// the session do not hold.
     pub(super) async fn have(
         &self,
         names: Vec<ObjectName>,
@@ -197,10 +213,12 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         Ok(HaveReply::from_missing(present.into_iter().map(|p| !p)))
     }
 
-    /// Read one object stream from `reader`, from its first `ObjectHeader` to
-    /// `ObjectsEnd`. `first` is the header the caller already read, or `None`
-    /// when the caller read `ObjectsEnd`. `buf` is the chunk buffer of the
-    /// stream, shared by every object.
+    /// Reads one object stream from `reader`, from its first `ObjectHeader` to
+    /// `ObjectsEnd`.
+    ///
+    /// `first` is the header that the caller already read. It is `None` if
+    /// the caller read `ObjectsEnd`. `buf` is the chunk buffer of the stream,
+    /// and each object of the stream uses it.
     pub(super) async fn objects<R: AsyncRead + Unpin>(
         &self,
         first: Option<ObjectHeader>,
@@ -223,8 +241,9 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
             match next(reader).await? {
                 Message::ObjectHeader(next) => header = next,
                 Message::ObjectsEnd => break,
-                // A one-way sender that fails abandons the object it sends, so
-                // in a one-way stream `Abort` follows the abandon marker alone.
+                // If a one-way sender fails, it abandons the object that it
+                // sends. As a result, in a one-way stream `Abort` comes only
+                // after the abandon marker.
                 Message::Abort if !self.one_way => return Err(aborted()),
                 other => return Err(out_of_order(&other)),
             }
@@ -235,14 +254,18 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         })
     }
 
-    /// Ingest one object. `Some` with its byte count when it was staged or,
-    /// for a detached metadata object, kept. `None` when it was dropped.
+    /// Ingests one object and returns its byte count if the session keeps it.
+    ///
+    /// The result is `Some` with the byte count if the session staged the
+    /// object. For a detached metadata object, it is `Some` if the session
+    /// kept the object. The result is `None` if the session dropped the
+    /// object.
     ///
     /// The bytes of a dirtree, dirmeta, or commit object count against one
-    /// budget of [`MAX_METADATA_SIZE`] for every object of these types that
-    /// the streams of the session read at the same time, from their arrival
-    /// to the stage step. The bytes of a detached metadata object count
-    /// against the cap of the detached metadata alone.
+    /// budget of [`MAX_METADATA_SIZE`]. The budget covers each object of
+    /// these types that the session streams read at the same time, from its
+    /// arrival to the stage step. The bytes of a detached metadata
+    /// object count only against the cap of the detached metadata.
     async fn ingest<R: AsyncRead + Unpin>(
         &self,
         header: ObjectHeader,
@@ -251,10 +274,10 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
     ) -> std::result::Result<Option<u64>, Failure> {
         let (txn, rules) = (&self.txn, &self.rules);
         let ObjectName { checksum, ty } = header.name;
-        // A metadata object learns whether the repository holds it from the
-        // stage step, which checks the store itself. A content object is
-        // checked here, because one the repository holds is hashed and not
-        // written.
+        // For a metadata object, the stage step checks the object store
+        // itself. This code checks a content object here, because the ingest
+        // hashes a content object that the repository holds and does not
+        // write it.
         let held = match ty {
             ObjectType::CommitMeta => false,
             _ if txn.is_staged(&checksum, ty) => true,
@@ -285,8 +308,8 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         };
         let count = body.count;
         let mut body = body.inner;
-        // A failure of the reader under the ingest wins over the failure it
-        // caused.
+        // If the reader under the ingest fails, its failure wins over the
+        // failure that it caused.
         if let Some(e) = body.take_error() {
             return Err(codec(e));
         }
@@ -305,13 +328,20 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         }
     }
 
-    /// Keep one detached metadata object: a dict `a{sv}` for the commit
-    /// `checksum`. A second one for the same commit is `protocol`, also while
-    /// another stream reads the first, and so is a dict that the merge into
-    /// the stored dict refuses: one that holds a key twice, or a signature key
-    /// whose value is not `aay`. The bytes of every dict of the session count
-    /// against one cap of [`MAX_METADATA_SIZE`], as they arrive, and the read
-    /// that takes the session past it is `limit-exceeded`.
+    /// Keeps one detached metadata object, a dict `a{sv}` for the commit
+    /// `checksum`.
+    ///
+    /// These objects give a `protocol` failure:
+    ///
+    /// - A second object for the same commit, also while another stream
+    ///   reads the first.
+    /// - A dict that the merge into the stored dict refuses. This is a dict
+    ///   that holds a key twice, or a dict with a signature key whose value
+    ///   is not `aay`.
+    ///
+    /// The bytes of each dict of the session count against one cap of
+    /// [`MAX_METADATA_SIZE`] as they arrive. The read that takes the session
+    /// past the cap gives a `limit-exceeded` failure.
     async fn commit_meta_object<B: AsyncRead + Unpin>(
         &self,
         checksum: &Checksum,
@@ -329,8 +359,8 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
             self.reserve(n)
         })
         .await?;
-        // The dict is checked in place on the blocking pool, and no value tree
-        // is built: the session keeps its bytes until the merge.
+        // Check the dict in place on the blocking pool. The check builds no
+        // value tree, because the session keeps the bytes until the merge.
         let (bytes, checked) = ostrya_rt::unblock(move || {
             let checked = check_incoming(&bytes);
             (bytes, checked)
@@ -347,7 +377,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         Ok(true)
     }
 
-    /// Count `n` more bytes of detached metadata against the cap of the
+    /// Counts `n` more bytes of detached metadata against the cap of the
     /// session.
     fn reserve(&self, n: u64) -> std::result::Result<(), Failure> {
         let mut meta = self.lock_meta();
@@ -365,8 +395,10 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         self.meta.lock().expect("detached metadata mutex")
     }
 
-    /// Run `Commit`: the checks of the ref updates, the ref writes, and the
-    /// transaction commit. The session ends with it.
+    /// Runs `Commit`: the checks of the ref updates, the ref writes, and the
+    /// transaction commit.
+    ///
+    /// The session ends with this step.
     pub(super) async fn finish(
         self,
         request: CommitRequest,
@@ -386,10 +418,17 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
     }
 }
 
-/// The checks of `hello` that every session runs before it opens, in this
-/// order: the protocol version, the mode `bare-split-xattrs`, `[core]
-/// locking=false` for a two-way `Hello`, each ref name, and for a two-way
-/// `Hello` the size of its longest `HelloReply`. No check does I/O.
+/// Checks `hello` before a session opens.
+///
+/// Each session runs these checks, in this order:
+///
+/// 1. The protocol version.
+/// 2. The repository mode `bare-split-xattrs`.
+/// 3. `[core] locking=false`, for a two-way `Hello`.
+/// 4. Each ref name.
+/// 5. The size of the longest `HelloReply`, for a two-way `Hello`.
+///
+/// No check does I/O.
 pub(super) fn check_hello(repo: &Repo, hello: &Hello) -> std::result::Result<(), Failure> {
     if hello.version != PROTOCOL_VERSION {
         return Err(Failure::Wire(push::Error::VersionUnsupported(format!(
@@ -421,8 +460,9 @@ pub(super) fn check_hello(repo: &Repo, hello: &Hello) -> std::result::Result<(),
     Ok(())
 }
 
-/// The `HelloReply` of `repo` for the ref states `refs`. `parallel_uploads`
-/// is the value the reply announces.
+/// Returns the `HelloReply` of `repo` for the ref states `refs`.
+///
+/// `parallel_uploads` is the value that the reply announces.
 fn hello_reply(repo: &Repo, parallel_uploads: u32, refs: Vec<RefState>) -> HelloReply {
     HelloReply {
         version: PROTOCOL_VERSION,
@@ -436,14 +476,16 @@ fn hello_reply(repo: &Repo, parallel_uploads: u32, refs: Vec<RefState>) -> Hello
     }
 }
 
-/// The `HelloReply` of `names` fits in a frame of [`MAX_FRAME`], with a
-/// commit for each ref, the longest state a ref can have. A reply over the
-/// limit is `limit-exceeded`. The size comes from the reply with no ref and
-/// the length of each name, and no reply with the refs is built.
+/// Checks that the `HelloReply` for `names` fits in a frame of [`MAX_FRAME`].
+///
+/// The check uses a commit for each ref, which is the longest state that a
+/// ref can have. A reply over the limit gives a `limit-exceeded` failure.
+/// The size comes from the reply with no ref and from the length of each
+/// name. The check builds no reply with the refs.
 fn check_hello_reply_fits(repo: &Repo, names: &[String]) -> std::result::Result<(), Failure> {
-    // A reply the codec refuses is a fault of the server, whatever code the
-    // codec gives it. The value of `parallel_uploads` does not change the
-    // size of the reply.
+    // If the codec refuses the reply, the failure is a fault of the server,
+    // whatever code the codec gives it. The value of `parallel_uploads` does
+    // not change the size of the reply.
     let empty = Message::HelloReply(hello_reply(repo, 1, Vec::new()))
         .encode_body()
         .map_err(|e| Failure::Wire(push::Error::Internal(e.to_string())))?;
@@ -458,15 +500,22 @@ fn check_hello_reply_fits(repo: &Repo, names: &[String]) -> std::result::Result<
     Ok(())
 }
 
-/// The bytes of one ref state `(smay)` with a name of `name` bytes and a
-/// commit: the name and its NUL, the 32 bytes of the commit and the byte
-/// that marks a maybe of variable size, and the framing offset of the name.
+/// Returns the size in bytes of one ref state `(smay)` with a commit and a
+/// name of `name` bytes.
+///
+/// The size is the sum of these parts:
+///
+/// - The name and its NUL byte.
+/// - The 32 bytes of the commit.
+/// - The byte that marks a maybe of variable size.
+/// - The framing offset of the name.
 fn ref_state_len(name: u64) -> u64 {
     let data = name + 1 + 32 + 1;
     data + offset_size(data, 1)
 }
 
-/// The framing offset size of a container of `data` bytes with `n` offsets.
+/// Returns the framing offset size of a container of `data` bytes with `n`
+/// offsets.
 fn offset_size(data: u64, n: u64) -> u64 {
     match (usize::try_from(data), usize::try_from(n)) {
         (Ok(data), Ok(n)) => choose_offset_size(data, n) as u64,
@@ -474,14 +523,18 @@ fn offset_size(data: u64, n: u64) -> u64 {
     }
 }
 
-/// The frame length of a `HelloReply` `(ua{sv}a(smay))` whose body with no
-/// ref is `empty` bytes, with a ref of each name length of `names`, each with
-/// a commit. `None` as soon as the ref states alone pass [`MAX_FRAME`].
+/// Returns the frame length of a `HelloReply` `(ua{sv}a(smay))` with one
+/// ref for each name length in `names`.
+///
+/// The body of the reply with no ref is `empty` bytes. Each ref has a
+/// commit. The result is `None` as soon as the ref states alone pass
+/// [`MAX_FRAME`].
 ///
 /// The body with no ref is the version, its padding, and the dict, then one
-/// framing offset for the end of the dict, whose size the encoder chose from
-/// the length of the body. The array of the ref states follows the dict with
-/// no padding, and holds the states and one framing offset for each.
+/// framing offset for the end of the dict. The encoder chose the size of
+/// this offset from the length of the body. The array of the ref states
+/// follows the dict with no padding. The array holds the states and one
+/// framing offset for each state.
 fn reply_frame_len(empty: usize, names: impl Iterator<Item = usize>) -> Option<u64> {
     let head = (empty - offset_size_for(empty)) as u64;
     let mut states = 0u64;
@@ -503,17 +556,21 @@ fn reply_frame_len(empty: usize, names: impl Iterator<Item = usize>) -> Option<u
 }
 
 /// The bytes of one dirtree, dirmeta, or commit object that an object stream
-/// reads, counted against the budget that every object stream of the session
-/// shares. Dropping it, when the object is staged, dropped, or failed, gives
-/// the bytes back.
+/// reads.
+///
+/// The bytes count against the budget that all object streams of the session
+/// share. A drop of this value gives the bytes back. The drop occurs when the
+/// session stages the object, drops it, or fails on it.
 struct Reading<'a> {
     total: &'a AtomicU64,
     held: u64,
 }
 
 impl Reading<'_> {
-    /// Count `n` more bytes against the budget. The read that takes the
-    /// session past [`MAX_METADATA_SIZE`] is `limit-exceeded`.
+    /// Counts `n` more bytes against the budget.
+    ///
+    /// The read that takes the session past [`MAX_METADATA_SIZE`] gives a
+    /// `limit-exceeded` failure.
     fn reserve(&mut self, n: u64) -> std::result::Result<(), Failure> {
         self.total
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |total| {
@@ -540,9 +597,11 @@ impl Drop for Reading<'_> {
 mod tests {
     use super::*;
 
-    /// A `HelloReply` like the one of a session, with a collection id of
-    /// `collection_id` bytes, or none for 0, and `count` refs with names of
-    /// `name` bytes, each with a commit.
+    /// Returns a `HelloReply` like the one of a session.
+    ///
+    /// The reply has a collection id of `collection_id` bytes, or no
+    /// collection id for 0. It has `count` refs with names of `name` bytes,
+    /// each with a commit.
     fn reply(collection_id: usize, name: usize, count: usize) -> HelloReply {
         let commit = Some(Checksum::from_bytes([7; 32]));
         HelloReply {
@@ -573,9 +632,9 @@ mod tests {
         reply_frame_len(empty.len(), std::iter::repeat_n(name, count))
     }
 
-    /// The computed frame length is the length of the frame the encoder
-    /// writes, across the sizes of the framing offsets of a ref state, of
-    /// the array, and of the reply.
+    /// The computed frame length is the length of the frame that the encoder
+    /// writes. The test covers each size of the framing offsets of a ref
+    /// state, of the array, and of the reply.
     #[test]
     fn the_reply_bound_is_the_encoded_size() {
         for collection_id in [0, 300] {
@@ -592,7 +651,7 @@ mod tests {
     }
 
     /// The largest count of refs whose bound fits in a frame gives a reply
-    /// that fits, and one ref more gives a reply over the limit.
+    /// that fits. One ref more gives a reply over the limit.
     #[test]
     fn the_largest_count_that_fits_is_the_limit_of_the_encoder() {
         let limit = u64::from(MAX_FRAME);
@@ -618,7 +677,7 @@ mod tests {
     }
 
     /// The computation stops as soon as the ref states pass the frame
-    /// limit, and gives `None`.
+    /// limit, and returns `None`.
     #[test]
     fn the_reply_bound_stops_past_the_frame_limit() {
         let empty = Message::HelloReply(reply(0, 0, 0)).encode_body().unwrap();

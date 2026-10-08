@@ -1,35 +1,17 @@
-//! Ref resolution, listing, and writing.
+//! Ref resolution, listing, and writes.
 //!
-//! A ref is a loose file under `refs/` holding a 64-char hex checksum and a
-//! trailing newline (65 bytes). A local ref `name` maps to `refs/heads/name`; a
-//! refspec `remote:name` maps to `refs/remotes/remote/name`; a collection ref
-//! maps to `refs/mirrors/collection/name`. A ref may be a relative symlink
-//! aliasing another ref; opening follows the link and reads the target ref's
-//! checksum. Refspec components are validated to keep resolution inside the
-//! `refs/` tree.
+//! A ref is a file under `refs/` that names a commit by its checksum. The
+//! entry points are:
 //!
-//! A revision string is a refspec, a 64-char lowercase hex checksum, an
-//! abbreviated checksum -- a shorter run of lowercase hex naming the one commit
-//! object whose checksum starts with it -- or any of those followed by one or
-//! more `^` characters, each of which steps one generation back along the
-//! commit's `parent` field.
-//!
-//! Writes are individually atomic -- a fresh file written in the repository's
-//! `tmp/` directory, `fdatasync`-ed when fsync is enabled, and renamed over the
-//! target, with the parent directories created for a `/`-bearing name. No temp
-//! entry stands under `refs/`, so a listing never reads one. Under fsync the
-//! directory holding the ref is `fsync`-ed after the rename, so the name is
-//! durable together with the content. Where the write created parent
-//! directories, the directory holding each created name is `fsync`-ed too,
-//! deepest first, so the whole path of a `/`-bearing name is durable and not
-//! the leaf entry alone. A removal and an alias write carry no content of their
-//! own and sync directories alone. A `None` checksum removes the ref file. A
-//! transaction queues its ref writes with [`Transaction::set_ref`] and applies
-//! them at commit after object publication, under the fsync policy the
-//! transaction resolved for its object writes. It writes every queued ref first
-//! and then `fsync`s each directory that changed once, deepest first, before
-//! the commit returns; [`Repo::set_ref_immediate`](Repo::set_ref_immediate)
-//! writes one outside a transaction and reads `[core] fsync` itself.
+//! - [`Repo::resolve_rev`] resolves a revision string to a commit. Its doc
+//!   gives the revision syntax.
+//! - [`Repo::resolve_ref_tip`] reads one ref from the ref store.
+//! - [`Repo::list_refs`], [`Repo::list_remote_refs`],
+//!   [`Repo::list_mirror_refs`], [`Repo::list_collection_refs`], and
+//!   [`Repo::list_ref_aliases`] list refs.
+//! - [`Repo::set_ref_immediate`] writes one ref outside a transaction. Its doc
+//!   gives the ref file format and the durability rules.
+//! - [`Transaction::set_ref`] queues a ref write for the transaction commit.
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
@@ -46,20 +28,22 @@ use crate::staging::{REF_TEMP_PREFIX, TempEntry, open_tmp_dir};
 use crate::transaction::Transaction;
 use crate::traverse::read_dir_names;
 
-/// A collection-qualified ref: a ref name optionally bound to a collection id.
+/// A ref name with an optional collection id.
 ///
-/// A ref with a collection id maps to `refs/mirrors/<collection>/<name>`; one
-/// without maps to a local `refs/heads/<name>`.
+/// A ref with a collection id maps to `refs/mirrors/<collection>/<name>`. A
+/// ref with no collection id maps to the local ref `refs/heads/<name>`. The
+/// collection id is one path component: it is not `.` or `..`, it holds no
+/// `/`, and it can hold dots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionRef {
     /// The collection id, or `None` for a local ref.
     pub collection_id: Option<String>,
-    /// The ref name, which may contain `/`.
+    /// The ref name, which can contain `/`.
     pub ref_name: String,
 }
 
 impl CollectionRef {
-    /// A ref bound to a collection id.
+    /// Creates a ref bound to a collection id.
     pub fn new(collection_id: impl Into<String>, ref_name: impl Into<String>) -> CollectionRef {
         CollectionRef {
             collection_id: Some(collection_id.into()),
@@ -67,7 +51,7 @@ impl CollectionRef {
         }
     }
 
-    /// A local ref with no collection id.
+    /// Creates a local ref with no collection id.
     pub fn local(ref_name: impl Into<String>) -> CollectionRef {
         CollectionRef {
             collection_id: None,
@@ -76,39 +60,44 @@ impl CollectionRef {
     }
 }
 
-/// One collection-qualified ref of a repository, as
-/// [`Repo::list_collection_refs`] reports it.
+/// One collection-qualified ref of a repository.
+///
+/// [`Repo::list_collection_refs`] returns these entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionRefEntry {
-    /// The collection id the ref is qualified by.
+    /// The collection id that qualifies the ref.
     pub collection: String,
-    /// The ref name, which for a local ref is its refspec.
+    /// The ref name.
+    ///
+    /// For a local ref, this is its refspec.
     pub name: String,
-    /// The commit the ref names.
+    /// The commit that the ref names.
     pub commit: Checksum,
-    /// Whether the ref lives under `refs/heads`, qualified by the repository's
-    /// own collection id, rather than under `refs/mirrors`.
+    /// `true` for a ref under `refs/heads`, `false` for a ref under
+    /// `refs/mirrors`.
+    ///
+    /// The collection id of the repository qualifies a ref under `refs/heads`.
     pub local: bool,
 }
 
-/// One ref stored as an alias: a relative symlink to another ref's file.
+/// A ref stored as an alias: a relative symlink to the file of another ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefAlias {
-    /// The refspec the alias itself is stored under.
+    /// The refspec of the alias itself.
     pub refspec: String,
-    /// The symlink target, verbatim.
+    /// The symlink target, as stored.
     pub target: String,
 }
 
-/// A queued ref target: either a refspec or a collection ref.
+/// A queued ref target: a refspec or a collection ref.
 enum QueuedRef {
     Ref(String),
     Collection(CollectionRef),
 }
 
 impl QueuedRef {
-    /// The path under `refs/` this target writes to, rejecting a name that
-    /// would escape the tree.
+    /// Returns the path under `refs/` that this target writes to. Refuses a
+    /// name that leaves the tree.
     fn relpath(&self) -> Result<String> {
         match self {
             QueuedRef::Ref(refspec) => refspec_to_relpath(refspec),
@@ -139,11 +128,13 @@ pub(crate) struct RefWrite {
     checksum: Option<Checksum>,
 }
 
+/// Methods that queue ref writes for the transaction commit.
 impl Transaction {
-    /// Queue a refspec-to-checksum write, applied at
-    /// [`commit`](Transaction::commit) after object publication. A `None`
-    /// checksum queues the ref's removal. The refspec is validated at commit,
-    /// before any object is published.
+    /// Queues a ref write for the transaction commit.
+    ///
+    /// [`commit`](Transaction::commit) writes the ref after it publishes the
+    /// objects. If `checksum` is `None`, the commit removes the ref. The
+    /// commit checks the refspec before it publishes any object.
     pub fn set_ref(&self, refspec: &str, checksum: Option<&Checksum>) {
         self.refs.lock().unwrap().push(RefWrite {
             target: QueuedRef::Ref(refspec.to_owned()),
@@ -151,9 +142,12 @@ impl Transaction {
         });
     }
 
-    /// Queue a collection-ref write, applied at
-    /// [`commit`](Transaction::commit). A `None` checksum queues the ref's
-    /// removal.
+    /// Queues a collection ref write for the transaction commit.
+    ///
+    /// [`commit`](Transaction::commit) writes the ref after it publishes the
+    /// objects. If `checksum` is `None`, the commit removes the ref. The
+    /// commit checks the collection id and the ref name before it publishes
+    /// any object.
     pub fn set_collection_ref(&self, cref: &CollectionRef, checksum: Option<&Checksum>) {
         self.refs.lock().unwrap().push(RefWrite {
             target: QueuedRef::Collection(cref.clone()),
@@ -161,9 +155,9 @@ impl Transaction {
         });
     }
 
-    /// Map every queued ref to its path under `refs/`, failing on a malformed
-    /// refspec. Called at the start of [`commit`](Transaction::commit) so a bad
-    /// refspec fails before any object is published.
+    /// Maps each queued ref to its path under `refs/`. A malformed refspec
+    /// fails the call. [`commit`](Transaction::commit) calls it first, so a
+    /// malformed refspec fails before the commit publishes any object.
     pub(crate) fn resolve_ref_queue(&self) -> Result<Vec<(String, Option<Checksum>)>> {
         let queue = self.refs.lock().unwrap();
         queue
@@ -173,21 +167,23 @@ impl Transaction {
     }
 }
 
-/// Write the resolved refs of a transaction, each atomically, under the
-/// transaction's resolved fsync policy, so the whole transaction -- the
-/// per-object writes, the publication step, and the ref writes -- reads one
-/// value. Runs on the blocking pool.
+/// Writes the resolved refs of a transaction, each one atomically, on the
+/// blocking pool.
 ///
-/// The durability invariant: with fsync on, every ref file is `fdatasync`-ed
-/// before its rename, and every directory that gained or lost a name is
-/// `fsync`-ed once after the last rename, deepest first, before the call
-/// returns. The caller made the objects and the detached metadata the refs
-/// name durable before the call, so no ref is durable ahead of what it names.
-/// A write that fails still syncs the directories of the refs written before
+/// The call uses the fsync policy that the transaction resolved, so the
+/// object writes, the publication step, and the ref writes read one value.
+///
+/// The durability invariant: with fsync on, each ref file is `fdatasync`-ed
+/// before its rename. After the last rename, each directory that gained or
+/// lost a name is `fsync`-ed once, deepest first, before the call returns.
+///
+/// Before the call, the caller made durable the objects and the detached
+/// metadata that the refs name. So no ref is durable before what it names. A
+/// write that fails still syncs the directories of the refs written before
 /// it.
 ///
-/// `tmp_fd` is the open `tmp/` of the repository, where each ref write creates
-/// its temp file.
+/// `tmp_fd` is the open `tmp/` of the repository. Each ref write creates its
+/// temp file there.
 pub(crate) fn write_resolved_refs_blocking(
     repo_fd: BorrowedFd<'_>,
     tmp_fd: BorrowedFd<'_>,
@@ -211,19 +207,59 @@ pub(crate) fn write_resolved_refs_blocking(
     written.and(synced)
 }
 
-/// The largest ref file the reader will load; a ref is 65 bytes.
+/// The largest ref file that the reader loads. A ref file is 65 bytes.
 const REF_READ_CAP: u64 = 4096;
 
+/// Methods that resolve, list, and write refs.
 impl Repo {
-    /// Resolve a revision string to a commit id. A 64-char lowercase hex string
-    /// resolves to itself; a shorter run of lowercase hex resolves to the one
-    /// commit object whose checksum it prefixes; anything else is a refspec. A
-    /// trailing run of `^` characters steps that many generations back along the
-    /// resolved commit's `parent` field. When the refspec names no ref,
-    /// `allow_noent` chooses between `Ok(None)` and [`Error::RefNotFound`];
-    /// walking past a root commit is [`Error::NoParentCommit`] and a prefix more
-    /// than one commit carries is [`Error::AmbiguousRefspec`] whatever
-    /// `allow_noent` says, since neither is an absent name.
+    /// Resolves a revision string to a commit checksum.
+    ///
+    /// If the revision names no ref, `allow_noent` selects the result:
+    /// `Ok(None)` if it is `true`, and [`Error::RefNotFound`] if it is
+    /// `false`. No other failure depends on `allow_noent`.
+    ///
+    /// # Revision syntax
+    ///
+    /// A revision is a base, followed by zero or more `^` characters. The call
+    /// tries these forms of the base in this order:
+    ///
+    /// 1. A full checksum: 64 lowercase hex characters. It resolves to itself.
+    ///    The call does not check that the commit object exists.
+    /// 2. An abbreviated checksum: 1 to 63 lowercase hex characters. It
+    ///    resolves to the one commit object whose checksum starts with it.
+    /// 3. A refspec. It resolves to the commit that the ref names, as
+    ///    [`resolve_ref_tip`](Repo::resolve_ref_tip) reads it.
+    ///
+    /// A checksum is in lowercase hex only. A 64-character name with an
+    /// uppercase character is a refspec.
+    ///
+    /// Only commit objects match an abbreviated checksum. A `dirtree`, a
+    /// `dirmeta`, or a file object with the same prefix does not match.
+    ///
+    /// An abbreviated checksum comes before the ref store. If a hex name is
+    /// also a ref, and a commit checksum starts with that name, the name
+    /// resolves to the commit. If no commit checksum starts with the name,
+    /// the name resolves as a refspec.
+    ///
+    /// Each `^` steps one generation back along the `parent` field of the
+    /// commit.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::RefNotFound`] if the base names no ref and `allow_noent` is
+    ///   `false`.
+    /// - [`Error::InvalidRefspec`] if the base is not a checksum and not a
+    ///   valid refspec.
+    /// - [`Error::AmbiguousRefspec`] if more than one commit checksum starts
+    ///   with the abbreviated checksum.
+    /// - [`Error::NoParentCommit`] if a `^` steps back from a commit with no
+    ///   parent.
+    /// - [`Error::ObjectNotFound`] if a `^` step reads a commit that is not in
+    ///   the repository.
+    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
+    /// - [`Error::Core`] if a ref file holds no checksum, or a commit object
+    ///   does not parse.
+    /// - [`Error::Io`] if a read from the file system fails.
     pub async fn resolve_rev(&self, rev: &str, allow_noent: bool) -> Result<Option<Checksum>> {
         Ok(self
             .resolve_rev_kind(rev, allow_noent)
@@ -231,9 +267,11 @@ impl Repo {
             .map(|(checksum, _)| checksum))
     }
 
-    /// [`resolve_rev`](Repo::resolve_rev), which also gives the kind of name
-    /// the base of `rev` resolved as: a full or an abbreviated checksum, or a
-    /// ref.
+    /// Resolves a revision as [`resolve_rev`](Repo::resolve_rev) does, and
+    /// also returns the kind of its base.
+    ///
+    /// The kind is the kind of name that the base of `rev` resolved as: a
+    /// full or an abbreviated checksum, or a ref.
     pub(crate) async fn resolve_rev_kind(
         &self,
         rev: &str,
@@ -250,21 +288,22 @@ impl Repo {
         Ok(Some((checksum, kind)))
     }
 
-    /// Resolve a revision with no ancestry suffix: a bare checksum, an
+    /// Resolves a revision with no ancestry suffix: a full checksum, an
     /// abbreviated checksum, or a refspec, tried in that order. The result
-    /// holds the kind the revision resolved as.
+    /// holds the kind that the revision resolved as.
     ///
-    /// A 64-character name is a checksum in lowercase hex alone, so an
-    /// uppercase or mixed-case name of that length is read as a refspec
-    /// (`docs/format-reference.md`, "Revision syntax"). The checksum parser
-    /// keeps its tolerance where a checksum is read as stored bytes, which is
-    /// ref file content and delta metadata.
+    /// A 64-character name is a checksum only in lowercase hex, so an
+    /// uppercase or mixed-case name of that length is a refspec. The checksum
+    /// parser keeps its case tolerance where it reads a checksum from stored
+    /// bytes: ref file content and delta metadata.
     ///
-    /// A shorter run of lowercase hex is an abbreviated checksum, and it stands
-    /// ahead of the ref store: a name the store carries as a ref resolves to the
-    /// commit it prefixes rather than to that ref's target. A prefix no commit
-    /// object carries falls through to the ref store, so a hex name is a ref
-    /// name for as long as no commit begins with it.
+    /// A shorter run of lowercase hex is an abbreviated checksum, and it comes
+    /// before the ref store. If the store also holds a ref of that name, the
+    /// name resolves to the commit that it prefixes. The call does not read
+    /// the ref target.
+    ///
+    /// A prefix that no commit object has falls through to the ref store. So
+    /// a hex name is a ref name while no commit starts with it.
     async fn resolve_base_rev(
         &self,
         rev: &str,
@@ -291,19 +330,31 @@ impl Repo {
         }
     }
 
-    /// The commit a refspec names, reading the ref store alone: no checksum
-    /// syntax, no abbreviated checksum, and no ancestry suffix. This is the
-    /// ref-store read for a caller that holds a ref name rather than a
-    /// revision -- a pull's local tip, the metadata ref a summary chains, and
-    /// the CLI's alias-target check, an alias recording a name. `None` says the
-    /// store carries no such ref.
+    /// Returns the commit that a refspec names, read from the ref store only.
+    ///
+    /// The call does not read `refspec` as a checksum, as an abbreviated
+    /// checksum, or with a `^` suffix. If the ref is an alias, the call
+    /// follows the link. The result is `None` if the store holds no such ref.
+    ///
+    /// Callers that hold a ref name and not a revision use this call. These
+    /// are a pull for its local tip, a summary for the metadata ref that it
+    /// chains, and the CLI for its alias-target check. An alias records a
+    /// name, so the CLI uses this call.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRefspec`] if `refspec` is not a valid refspec.
+    /// - [`Error::InvalidFormat`] if the ref file is not UTF-8.
+    /// - [`Error::Core`] if the ref file holds no checksum.
+    /// - [`Error::Io`] if the read fails, for example if the ref path names a
+    ///   directory.
     pub async fn resolve_ref_tip(&self, refspec: &str) -> Result<Option<Checksum>> {
         self.resolve_relpath_tip(refspec_to_relpath(refspec)?).await
     }
 
-    /// The commit the ref file at `relpath` names, read as
-    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads a refspec: an alias
-    /// is followed, and `None` says no file stands at the path.
+    /// Returns the commit that the ref file at `relpath` names, read as
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads a refspec. The call
+    /// follows an alias. The result is `None` if no file is at the path.
     pub(crate) async fn resolve_relpath_tip(&self, relpath: String) -> Result<Option<Checksum>> {
         let repo = self.clone();
         let bytes = ostrya_rt::unblock(move || read_ref_file(repo.repo_fd(), &relpath)).await?;
@@ -313,10 +364,11 @@ impl Repo {
         }
     }
 
-    /// The commits of several refspecs, as [`resolve_ref_tip`](Repo::resolve_ref_tip)
-    /// reads each, in one pass on the blocking pool. The result holds one entry
-    /// for each refspec, in order. A ref path that names a directory, or that
-    /// passes through a file, holds no ref and reads as absent.
+    /// Returns the commits of several refspecs, each read as
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads it, in one pass on the
+    /// blocking pool. The result holds one entry for each refspec, in order.
+    /// A ref path that names a directory, or that passes through a file,
+    /// holds no ref and reads as absent.
     #[cfg(feature = "receive")]
     pub(crate) async fn resolve_ref_tips(
         &self,
@@ -350,15 +402,18 @@ impl Repo {
             .collect()
     }
 
-    /// The state of each of several refspecs, and the commit of `tip`, in one
-    /// pass on the blocking pool. The result holds one state for each
+    /// Returns the state of each of several refspecs, and the commit of `tip`,
+    /// in one pass on the blocking pool. The result holds one state for each
     /// refspec, in order.
     ///
-    /// Each ref path is read with `lstat` first. A regular file is then opened
-    /// with `O_NOFOLLOW` and parsed, and a ref that does not parse fails the
-    /// call. `tip`, where given, is read as
-    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads it, and its failure
-    /// is given apart, so the caller decides whether it needs the value.
+    /// The call reads each ref path with `lstat` first. It then opens a
+    /// regular file with `O_NOFOLLOW` and parses it. A ref that does not parse
+    /// fails the call.
+    ///
+    /// If `tip` is given, the call reads it as
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) does. The result holds the
+    /// failure of `tip` separately, so the caller decides if it needs the
+    /// value.
     #[cfg(feature = "receive")]
     #[allow(clippy::type_complexity)]
     pub(crate) async fn read_ref_states(
@@ -386,9 +441,19 @@ impl Repo {
         .await
     }
 
-    /// List local refs (under `refs/heads`) as (name, commit) pairs, sorted by
-    /// name. `prefix`, when given, keeps only the ref equal to it or nested
-    /// under it.
+    /// Returns the local refs as `(name, commit)` pairs, sorted by name.
+    ///
+    /// The local refs are under `refs/heads`. If `prefix` is given, the result
+    /// holds only the ref named `prefix` and the refs below `prefix/`. The call
+    /// follows each alias. An alias whose target names no ref is not in the
+    /// result.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
+    /// - [`Error::Core`] if a ref file holds no checksum.
+    /// - [`Error::Io`] if a read from the file system fails, for example for
+    ///   an alias that names a directory.
     pub async fn list_refs(&self, prefix: Option<&str>) -> Result<Vec<(String, Checksum)>> {
         let repo = self.clone();
         let mut refs = ostrya_rt::unblock(move || collect_heads(&repo)).await?;
@@ -400,9 +465,18 @@ impl Repo {
         Ok(refs)
     }
 
-    /// List remote refs (under `refs/remotes`) as `(refspec, commit)` pairs,
-    /// sorted by refspec. The first path component under `refs/remotes` is the
-    /// remote name, so each ref is named by its `remote:name` refspec.
+    /// Returns the remote refs as `(refspec, commit)` pairs, sorted by refspec.
+    ///
+    /// The remote refs are under `refs/remotes`. The first path component
+    /// below `refs/remotes` is the remote name, so the refspec of each ref is
+    /// `remote:name`. A file directly under `refs/remotes` names no remote,
+    /// and the result does not hold it.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
+    /// - [`Error::Core`] if a ref file holds no checksum.
+    /// - [`Error::Io`] if a read from the file system fails.
     pub async fn list_remote_refs(&self) -> Result<Vec<(String, Checksum)>> {
         let repo = self.clone();
         let mut refs = ostrya_rt::unblock(move || collect_remotes(&repo)).await?;
@@ -410,23 +484,43 @@ impl Repo {
         Ok(refs)
     }
 
-    /// List collection-mirror refs (under `refs/mirrors`) as
-    /// `(collection_id, ref_name, commit)` triples. The first path component
-    /// under `refs/mirrors` is the collection id; the remainder is the ref
-    /// name, which may contain `/`. Results are unsorted; callers that need a
-    /// stable order sort them.
+    /// Returns the mirror refs as `(collection_id, ref_name, commit)` triples.
+    ///
+    /// The mirror refs are under `refs/mirrors`. The first path component
+    /// below `refs/mirrors` is the collection id. The rest of the path is the
+    /// ref name, which can contain `/`. A file directly under `refs/mirrors`
+    /// has no collection id, and the result does not hold it.
+    ///
+    /// The result is not sorted. A caller that needs a stable order sorts it.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
+    /// - [`Error::Core`] if a ref file holds no checksum.
+    /// - [`Error::Io`] if a read from the file system fails.
     pub async fn list_mirror_refs(&self) -> Result<Vec<(String, String, Checksum)>> {
         let repo = self.clone();
         ostrya_rt::unblock(move || collect_mirrors(&repo)).await
     }
 
-    /// List the collection-qualified refs of the repository, sorted by
-    /// collection id and then by ref name.
+    /// Returns the collection-qualified refs, sorted by collection id and ref
+    /// name.
     ///
-    /// The set is the local refs qualified by the repository's own
-    /// `[core] collection-id`, where it sets one, together with every ref under
-    /// `refs/mirrors`, which carries its collection id in its path. A mirror
-    /// ref under the repository's own id is listed as a mirror ref.
+    /// The result holds:
+    ///
+    /// - The local refs, qualified by the `[core] collection-id` of the
+    ///   repository, if the config sets one.
+    /// - Each ref under `refs/mirrors`, which holds its collection id in its
+    ///   path.
+    ///
+    /// A mirror ref under the collection id of the repository is in the result
+    /// as a mirror ref.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
+    /// - [`Error::Core`] if a ref file holds no checksum.
+    /// - [`Error::Io`] if a read from the file system fails.
     pub async fn list_collection_refs(&self) -> Result<Vec<CollectionRefEntry>> {
         let heads = match self.config().collection_id() {
             Some(_) => self.list_refs(None).await?,
@@ -435,10 +529,11 @@ impl Repo {
         self.collection_refs_over(&heads).await
     }
 
-    /// The listing [`list_collection_refs`](Repo::list_collection_refs) makes,
-    /// over a `refs/heads` listing the caller has already read. A repository
-    /// carrying no `[core] collection-id` qualifies no local ref, and `heads`
-    /// is then ignored.
+    /// Returns the listing of
+    /// [`list_collection_refs`](Repo::list_collection_refs), made over a
+    /// `refs/heads` listing that the caller read before. A repository with no
+    /// `[core] collection-id` qualifies no local ref, and the call then
+    /// ignores `heads`.
     pub(crate) async fn collection_refs_over(
         &self,
         heads: &[(String, Checksum)],
@@ -466,9 +561,15 @@ impl Repo {
         Ok(all)
     }
 
-    /// List the local and remote refs stored as aliases, sorted by refspec. An
-    /// alias whose target names no ref is listed too, since the listing reads
-    /// the link and not the ref behind it.
+    /// Returns the local and remote refs that are aliases, sorted by refspec.
+    ///
+    /// The result holds an alias whose target names no ref, because the call
+    /// reads the link and not the ref behind it. An alias whose target is not
+    /// UTF-8 is not in the result.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if a read from the file system fails.
     pub async fn list_ref_aliases(&self) -> Result<Vec<RefAlias>> {
         let repo = self.clone();
         let mut aliases = ostrya_rt::unblock(move || collect_aliases(&repo)).await?;
@@ -476,14 +577,22 @@ impl Repo {
         Ok(aliases)
     }
 
-    /// Probe one path below `refs/`, as a listing prefix names it, reporting the
-    /// one condition that ends an enumeration: a component above the last that is
-    /// not a directory, which is `ENOTDIR`.
+    /// Checks a path below `refs/` for a component that is not a directory.
     ///
-    /// A path naming nothing is `Ok(())`, since a prefix matching no ref
-    /// enumerates nothing, and so is every other probe failure -- the prefix
-    /// filters the listing in that case rather than ending it. The last component
-    /// is not followed, so a path naming an alias symlink is the link itself.
+    /// `relpath` is relative to `refs/`, as a listing prefix names it. The
+    /// call fails for one condition only: a component before the last one is
+    /// not a directory (`ENOTDIR`). This condition ends a listing.
+    ///
+    /// If the path names nothing, the call returns `Ok(())`, because a prefix
+    /// that matches no ref lists nothing. Each other failure of the check also
+    /// returns `Ok(())`, and the prefix then filters the listing. The call
+    /// does not follow the last component, so a path that names an alias is
+    /// the link itself.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] with `ENOTDIR` if a component before the last one is
+    ///   not a directory.
     pub async fn check_refs_path(&self, relpath: &str) -> Result<()> {
         let path = format!("refs/{relpath}");
         let repo = self.clone();
@@ -496,19 +605,78 @@ impl Repo {
         .await
     }
 
-    /// Write one ref outside a transaction, atomically. A `None` checksum
-    /// removes the ref file. The write follows the same tmpfile, `fdatasync`,
-    /// rename, directory `fsync` sequence a transaction uses, honoring
-    /// `[core] fsync`.
+    /// Writes one ref outside a transaction.
     ///
-    /// The call takes the repository lock shared and then the update lock, as
-    /// [`Repo::begin_update`] does, and writes under both. Each of the two
-    /// waits fails with [`Error::LockTimeout`] after `lock-timeout-secs`. A
+    /// If `checksum` is `None`, the call removes the ref file. The removal of
+    /// an absent ref file is not an error. The call reads `[core] fsync` from
+    /// the config. A transaction writes its queued refs in the same way, under
+    /// its own fsync policy (see [`Transaction::commit`]).
+    ///
+    /// # Ref files
+    ///
+    /// A ref is a file under `refs/`. It holds a 64-character hex checksum and
+    /// a newline, 65 bytes in all. The file mode is `0644`, independent of the
+    /// umask. The refspec gives the path:
+    ///
+    /// - The local ref `name` is at `refs/heads/name`.
+    /// - The remote ref `remote:name` is at `refs/remotes/remote/name`.
+    /// - A collection ref is at `refs/mirrors/collection/name` (see
+    ///   [`set_collection_ref_immediate`](Repo::set_collection_ref_immediate)).
+    ///
+    /// A ref can also be an alias: a relative symlink to the file of another
+    /// ref. A read follows the link and reads the checksum of the target ref.
+    /// [`validate_refspec`] checks each component, so a ref path stays inside
+    /// `refs/`.
+    ///
+    /// The call creates the missing parent directories of a name with `/` in
+    /// it. It requests mode `0777` for them, which the umask reduces. In a
+    /// `bare-user-shared` repository, each directory that the call creates
+    /// gets mode `02770`.
+    ///
+    /// # Durability
+    ///
+    /// The write is atomic. The call writes the content to a new temp file in
+    /// the `tmp/` directory of the repository. Then it renames the temp file
+    /// over the ref file. No temp entry is under `refs/`, so a listing never
+    /// reads one.
+    ///
+    /// If `tmp/` is on a different file system, the rename fails with
+    /// `EXDEV`, and the call removes the temp file.
+    ///
+    /// If `[core] fsync` is on:
+    ///
+    /// - The call runs `fdatasync` on the temp file before the rename.
+    /// - After the rename, the call runs `fsync` on the directory that holds
+    ///   the ref, so the name is durable together with the content.
+    /// - If the call created parent directories, it also runs `fsync` on the
+    ///   directory that holds each created directory, deepest first. So the
+    ///   full path of the name is durable, and not only the last entry.
+    ///
+    /// A removal and an alias write have no content of their own, so they sync
+    /// directories only. A write that fails still syncs the directories that it
+    /// changed before the failure.
+    ///
+    /// # Locks
+    ///
+    /// The call takes the repository lock
+    /// [`Shared`](crate::LockKind::Shared) and then the update lock, as
+    /// [`begin_update`](Repo::begin_update) does, and writes under both. A
     /// caller that holds an [`UpdateGuard`](crate::UpdateGuard) of this
-    /// repository waits for its own guard until the timeout, and with
-    /// `lock-timeout-secs=-1` it waits forever: write through the guard
-    /// instead. When `[core] locking` is on, a caller that holds the
-    /// repository lock exclusive waits for its own lock the same way.
+    /// repository must write through the guard, with
+    /// [`UpdateGuard::set_ref`](crate::UpdateGuard::set_ref). If `[core]
+    /// locking` is on and the caller holds the repository lock exclusive, the
+    /// call waits for that lock. [`LockKind`](crate::LockKind) states the
+    /// result of this wait.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRefspec`] if `refspec` is not a valid refspec.
+    /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
+    ///   lock-timeout-secs` does not parse.
+    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
+    /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
+    ///   lock-timeout-secs`.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn set_ref_immediate(
         &self,
         refspec: &str,
@@ -518,10 +686,25 @@ impl Repo {
         self.write_ref_relpath(relpath, checksum).await
     }
 
-    /// Write one collection ref outside a transaction, atomically, the way
-    /// [`set_ref_immediate`](Repo::set_ref_immediate) writes a refspec. A
-    /// `None` checksum removes the ref file. The call takes the locks
-    /// `set_ref_immediate` takes and waits for them the same way.
+    /// Writes one collection ref outside a transaction.
+    ///
+    /// A ref with a collection id is at `refs/mirrors/<collection>/<name>`. A
+    /// ref with no collection id is at `refs/heads/<name>`. If `checksum` is
+    /// `None`, the call removes the ref file. The file format, the durability
+    /// rules, and the locks are those of
+    /// [`set_ref_immediate`](Repo::set_ref_immediate).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRefspec`] if the collection id is not one path
+    ///   component, or the ref name is not valid. The error holds
+    ///   `collection:name`, or the ref name alone for a local ref.
+    /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
+    ///   lock-timeout-secs` does not parse.
+    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
+    /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
+    ///   lock-timeout-secs`.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn set_collection_ref_immediate(
         &self,
         cref: &CollectionRef,
@@ -541,14 +724,31 @@ impl Repo {
         .await
     }
 
-    /// Write one ref as an alias of another: a relative symlink from
-    /// `refspec`'s file to `target`'s, replacing whatever `refspec` named
-    /// before. Both refspecs are validated; neither ref need already exist,
-    /// since the link records a name and not a checksum. The write honors
-    /// `[core] fsync`, which for a symlink reaches the directory holding it.
-    /// The call takes the locks
-    /// [`set_ref_immediate`](Repo::set_ref_immediate) takes and waits for them
-    /// the same way.
+    /// Writes one ref as an alias of another ref, outside a transaction.
+    ///
+    /// The alias is a relative symlink from the file of `refspec` to the file
+    /// of `target`. It replaces the ref or the alias that `refspec` named
+    /// before. The call checks both refspecs. The call does not require
+    /// either ref to exist, because the link records a name and not a
+    /// checksum.
+    ///
+    /// The write is atomic: the call creates the link under a temp name in
+    /// `tmp/` and renames it over the ref path. If `[core] fsync` is on, the
+    /// call runs `fsync` on the directory that holds the link. It also runs
+    /// `fsync` on the directory that holds each parent directory that the
+    /// call created. The locks are those of
+    /// [`set_ref_immediate`](Repo::set_ref_immediate).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRefspec`] if `refspec` or `target` is not a valid
+    ///   refspec.
+    /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
+    ///   lock-timeout-secs` does not parse.
+    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
+    /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
+    ///   lock-timeout-secs`.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn set_ref_alias_immediate(&self, refspec: &str, target: &str) -> Result<()> {
         let fsync = self.config().fsync()?;
         let repo_mode = self.mode();
@@ -570,17 +770,17 @@ pub(crate) enum RevKind {
     Ref,
 }
 
-/// Split a revision string into its base and the number of trailing `^`
-/// characters, each of which asks for one more generation of ancestry.
+/// Splits a revision string into its base and the number of trailing `^`
+/// characters. Each `^` asks for one more generation of ancestry.
 fn split_ancestry(rev: &str) -> (&str, usize) {
     let base = rev.trim_end_matches('^');
     (base, rev.len() - base.len())
 }
 
-/// Whether a revision names a commit by an abbreviated checksum: a run of one
-/// to 63 lowercase hex characters. A 64-character run is the checksum itself,
-/// and one uppercase character makes the name a refspec, the case rule a full
-/// checksum carries (`docs/format-reference.md`, "Revision syntax").
+/// Returns `true` if a revision names a commit by an abbreviated checksum: a
+/// run of 1 to 63 lowercase hex characters. A 64-character run is the
+/// checksum itself. One uppercase character makes the name a refspec, the
+/// case rule of a full checksum.
 fn is_abbreviated_checksum(rev: &str) -> bool {
     !rev.is_empty()
         && rev.len() < 64
@@ -591,7 +791,7 @@ fn is_abbreviated_checksum(rev: &str) -> bool {
 
 /// What an abbreviated checksum matched among the commit objects present.
 enum AbbrevMatch {
-    /// No commit object's checksum starts with the prefix.
+    /// No commit object has a checksum that starts with the prefix.
     None,
     /// Exactly one does.
     One(Checksum),
@@ -599,16 +799,18 @@ enum AbbrevMatch {
     Ambiguous,
 }
 
-/// Scan the loose commit objects for the ones whose checksum starts with
+/// Scans the loose commit objects for the ones whose checksum starts with
 /// `prefix`.
 ///
-/// The match set holds commit objects alone: a `dirtree`, a `dirmeta`, or a file
-/// object sharing the prefix takes no part, and a prefix only such an object
-/// carries matches nothing. The `objects/<xx>/` fanout carries the first two
-/// characters of a checksum. A prefix of two or more characters names one
-/// fanout with its first two characters, and that directory is opened by name.
-/// A one-character prefix scans the sixteen fanouts whose name starts with it,
-/// found by listing `objects/`.
+/// Only commit objects match. A `dirtree`, a `dirmeta`, or a file object with
+/// the same prefix does not match. A prefix that only such an object has
+/// matches nothing.
+///
+/// The `objects/<xx>/` fanout holds the first two characters
+/// of a checksum. A prefix of two or more characters names one fanout with its
+/// first two characters, and the call opens that directory by name. A
+/// one-character prefix scans the sixteen fanouts whose name starts with it,
+/// found from a listing of `objects/`.
 fn match_abbreviated(objects_fd: BorrowedFd<'_>, prefix: &str) -> Result<AbbrevMatch> {
     let mut found: Option<Checksum> = None;
     if prefix.len() >= 2 {
@@ -618,8 +820,8 @@ fn match_abbreviated(objects_fd: BorrowedFd<'_>, prefix: &str) -> Result<AbbrevM
         }
     } else {
         for fanout in read_dir_names(objects_fd)? {
-            // Object fanout directories are exactly two hex characters; anything
-            // else under `objects/` is not a loose-object fanout.
+            // The name of an object fanout directory is two hex characters.
+            // Each other entry under `objects/` is not a loose-object fanout.
             if fanout.len() != 2 || !fanout.bytes().all(|b| b.is_ascii_hexdigit()) {
                 continue;
             }
@@ -637,9 +839,9 @@ fn match_abbreviated(objects_fd: BorrowedFd<'_>, prefix: &str) -> Result<AbbrevM
     })
 }
 
-/// Scan one `objects/<fanout>/` directory for the commit objects whose name
-/// starts with `within`, recording each in `found`. An absent fanout directory
-/// holds no match. The returned flag reports the prefix ambiguous.
+/// Scans one `objects/<fanout>/` directory for the commit objects whose name
+/// starts with `within`, and records each match in `found`. An absent fanout
+/// directory holds no match. Returns `true` if the prefix is ambiguous.
 fn scan_fanout(
     objects_fd: BorrowedFd<'_>,
     fanout: &str,
@@ -660,8 +862,9 @@ fn scan_fanout(
         let Some(checksum) = matching_commit(fanout, &entry, within) else {
             continue;
         };
-        // The fanout carries a checksum's first two characters, so two entries
-        // are two commits and a second match is ambiguity.
+        // The fanout holds the first two characters of a checksum, so two
+        // entries are two commits, and a second match makes the prefix
+        // ambiguous.
         if found.replace(checksum).is_some() {
             return Ok(true);
         }
@@ -669,8 +872,8 @@ fn scan_fanout(
     Ok(false)
 }
 
-/// The checksum of one `objects/<fanout>/<rest>.commit` entry whose name starts
-/// with `within`, or `None` for any other entry.
+/// Returns the checksum of one `objects/<fanout>/<rest>.commit` entry whose
+/// name starts with `within`, or `None` for each other entry.
 fn matching_commit(fanout: &str, entry: &str, within: &str) -> Option<Checksum> {
     let (rest, ext) = entry.rsplit_once('.')?;
     if ext != "commit" || rest.len() != 62 || !rest.starts_with(within) {
@@ -679,15 +882,18 @@ fn matching_commit(fanout: &str, entry: &str, within: &str) -> Option<Checksum> 
     Checksum::from_hex_lower(&format!("{fanout}{rest}")).ok()
 }
 
-/// The symlink body an alias at `from_relpath` needs to point at
-/// `to_relpath`, both relative to the repository root: the shared leading
-/// components are dropped, one `..` is emitted per component the alias's own
-/// directory holds beyond them, and the target's remaining components follow.
+/// Returns the symlink body that an alias at `from_relpath` needs to point at
+/// `to_relpath`.
+///
+/// Both paths are relative to the repository root. The body drops the shared
+/// leading components. It then has one `..` for each further component of
+/// the directory of the alias. It ends with the other components of the
+/// target.
 pub(crate) fn relative_link(from_relpath: &str, to_relpath: &str) -> String {
     let from: Vec<&str> = from_relpath.split('/').collect();
     let to: Vec<&str> = to_relpath.split('/').collect();
-    // The alias's own name is not part of the directory the link is read in,
-    // and the target's own name is never a shared component.
+    // The name of the alias is not part of the directory that the link is
+    // read in. The name of the target is never a shared component.
     let from_dir = &from[..from.len() - 1];
     let common = from_dir
         .iter()
@@ -699,7 +905,7 @@ pub(crate) fn relative_link(from_relpath: &str, to_relpath: &str) -> String {
     parts.join("/")
 }
 
-/// Collect every ref under `refs/heads`, walking subdirectories.
+/// Collects each ref under `refs/heads` and its subdirectories.
 fn collect_heads(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
     let Some(heads) = open_refs_dir(repo, "refs/heads")? else {
         return Ok(Vec::new());
@@ -714,8 +920,9 @@ fn collect_heads(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
     Ok(out)
 }
 
-/// Collect every ref under `refs/remotes`, naming each by its `remote:name`
-/// refspec: the first path component is the remote, the remainder the ref name.
+/// Collects each ref under `refs/remotes`, named by its `remote:name`
+/// refspec. The first path component is the remote, and the rest is the ref
+/// name.
 fn collect_remotes(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
     let Some(remotes) = open_refs_dir(repo, "refs/remotes")? else {
         return Ok(Vec::new());
@@ -726,8 +933,8 @@ fn collect_remotes(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
             return Ok(());
         };
         let checksum = parse_ref_content(&bytes)?;
-        // A file directly under refs/remotes names no remote; ignore it, the
-        // way collect_mirrors ignores one naming no collection.
+        // A file directly under refs/remotes names no remote. The walk skips
+        // it, as collect_mirrors skips a file that names no collection.
         if let Some((remote, ref_name)) = entry.path.split_once('/') {
             out.push((format!("{remote}:{ref_name}"), checksum));
         }
@@ -736,8 +943,8 @@ fn collect_remotes(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
     Ok(out)
 }
 
-/// Collect the aliases under `refs/heads` and `refs/remotes`, naming each the
-/// way the corresponding listing names a ref.
+/// Collects the aliases under `refs/heads` and `refs/remotes`. Each alias
+/// gets the name that the listing of its directory gives a ref.
 fn collect_aliases(repo: &Repo) -> Result<Vec<RefAlias>> {
     let mut out = Vec::new();
     if let Some(heads) = open_refs_dir(repo, "refs/heads")? {
@@ -767,7 +974,7 @@ fn collect_aliases(repo: &Repo) -> Result<Vec<RefAlias>> {
     Ok(out)
 }
 
-/// Open one directory under `refs/`, or `None` when it does not exist.
+/// Opens one directory under `refs/`. Returns `None` if it does not exist.
 fn open_refs_dir(repo: &Repo, relpath: &str) -> Result<Option<OwnedFd>> {
     match rustix::fs::openat(
         repo.repo_fd(),
@@ -781,8 +988,8 @@ fn open_refs_dir(repo: &Repo, relpath: &str) -> Result<Option<OwnedFd>> {
     }
 }
 
-/// Collect every ref under `refs/mirrors`, splitting each into its collection
-/// id (the first path component) and ref name (the remainder).
+/// Collects each ref under `refs/mirrors`, split into its collection id (the
+/// first path component) and its ref name (the rest of the path).
 fn collect_mirrors(repo: &Repo) -> Result<Vec<(String, String, Checksum)>> {
     let Some(mirrors) = open_refs_dir(repo, "refs/mirrors")? else {
         return Ok(Vec::new());
@@ -793,10 +1000,11 @@ fn collect_mirrors(repo: &Repo) -> Result<Vec<(String, String, Checksum)>> {
             return Ok(());
         };
         let checksum = parse_ref_content(&bytes)?;
-        // A mirror ref is <collection>/<ref>; the collection id is a single
-        // component, the ref name is everything after the first slash. A file
-        // directly under refs/mirrors has no collection component; ignore it,
-        // matching the tool's collection-qualified layout.
+        // A mirror ref is <collection>/<ref>. The collection id is one
+        // component, and the ref name is the path after the first slash. A
+        // file directly under refs/mirrors has no collection component. The
+        // walk skips it, which matches the collection-qualified layout of the
+        // `ostree` command.
         if let Some((collection, ref_name)) = entry.path.split_once('/') {
             out.push((collection.to_owned(), ref_name.to_owned(), checksum));
         }
@@ -809,23 +1017,24 @@ fn collect_mirrors(repo: &Repo) -> Result<Vec<(String, String, Checksum)>> {
 pub(crate) struct RefEntry<'a> {
     /// The open directory holding the entry.
     pub(crate) dir: BorrowedFd<'a>,
-    /// The entry's name in that directory.
+    /// The name of the entry in that directory.
     pub(crate) name: &'a str,
-    /// The path walked to reach the entry, from the walk's root.
+    /// The path from the root of the walk to the entry.
     pub(crate) path: &'a str,
-    /// The entry's type, classified without following symlinks.
+    /// The type of the entry, read with no symlink followed.
     pub(crate) file_type: FileType,
 }
 
-/// Walk a directory under `refs/`, descending into each subdirectory and
-/// reporting every other entry to `visit`.
+/// Walks a directory under `refs/`. The walk descends into each subdirectory
+/// and reports each other entry to `visit`.
 ///
-/// Entries are classified with `SYMLINK_NOFOLLOW`, so a real directory alone is
-/// descended into and an alias carries [`FileType::Symlink`] whatever it names.
-/// A link naming a directory is reported rather than joined to the walk: a
-/// caller reading it as a ref fails the read with `EISDIR`, and one reading it
-/// as an alias reads the link. A name that is not UTF-8 is skipped, as is one
-/// removed between the directory read and the classification.
+/// The walk classifies entries with `SYMLINK_NOFOLLOW`, so it descends only
+/// into a real directory, and an alias has [`FileType::Symlink`] whatever it
+/// names. The walk reports a link that names a directory and does not
+/// descend into it. A caller that reads it as a ref fails the read with
+/// `EISDIR`, and a caller that reads it as an alias reads the link. The walk
+/// skips a name that is not UTF-8, and a name removed between the directory
+/// read and the classification.
 pub(crate) fn walk_ref_dir(
     dir: BorrowedFd<'_>,
     prefix: &str,
@@ -864,8 +1073,8 @@ pub(crate) fn walk_ref_dir(
     Ok(())
 }
 
-/// The symlink target of an alias entry, verbatim. `None` for an entry that is
-/// not a symlink and for a target that is not UTF-8.
+/// Returns the symlink target of an alias entry, as stored. Returns `None`
+/// for an entry that is not a symlink and for a target that is not UTF-8.
 fn read_alias_target(entry: &RefEntry<'_>) -> Result<Option<String>> {
     if entry.file_type != FileType::Symlink {
         return Ok(None);
@@ -875,8 +1084,8 @@ fn read_alias_target(entry: &RefEntry<'_>) -> Result<Option<String>> {
     Ok(target.into_string().ok())
 }
 
-/// Read a ref file relative to `dir`, following alias symlinks. `None` when the
-/// file does not exist.
+/// Reads a ref file relative to `dir`, and follows alias symlinks. Returns
+/// `None` if the file does not exist.
 fn read_ref_file(
     dir: rustix::fd::BorrowedFd<'_>,
     relpath: &str,
@@ -898,7 +1107,7 @@ fn read_ref_file(
     Ok(Some(buf))
 }
 
-/// The state of the ref path `relpath`, read with `lstat` and then an
+/// Returns the state of the ref path `relpath`, read with `lstat` and then an
 /// `O_NOFOLLOW` open of a regular file. A path that passes through a file
 /// (`ENOTDIR`) is [`RefFileState::NotARef`].
 #[cfg(feature = "receive")]
@@ -932,17 +1141,24 @@ fn ref_file_state(dir: BorrowedFd<'_>, relpath: &str) -> Result<RefFileState> {
     Ok(RefFileState::Commit(parse_ref_content(&buf)?))
 }
 
-/// Parse a ref file's content: a hex checksum with trailing whitespace.
+/// Parses the content of a ref file: a hex checksum with trailing white
+/// space.
 fn parse_ref_content(bytes: &[u8]) -> Result<Checksum> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| Error::InvalidFormat("ref content is not valid UTF-8".into()))?;
     Ok(Checksum::from_hex(text.trim())?)
 }
 
-/// Whether a refspec names a path under `refs/`: a ref name, optionally
-/// preceded by a `<remote>:` prefix. A refspec that would escape the tree is
-/// [`Error::InvalidRefspec`], carrying the refspec as given. The rule is
-/// [`ostrya_core::is_refspec`].
+/// Checks that a refspec names a path under `refs/`.
+///
+/// A refspec is a ref name, with an optional `<remote>:` prefix.
+/// [`ostrya_core::is_refspec`] holds the rule.
+///
+/// # Errors
+///
+/// - [`Error::InvalidRefspec`] if `refspec` does not obey the rule, for
+///   example if it names a path outside `refs/`. The error holds the refspec
+///   as given.
 pub fn validate_refspec(refspec: &str) -> Result<()> {
     if ostrya_core::is_refspec(refspec) {
         Ok(())
@@ -951,8 +1167,8 @@ pub fn validate_refspec(refspec: &str) -> Result<()> {
     }
 }
 
-/// Map a refspec to its path under `refs/`, rejecting anything that would
-/// escape the tree.
+/// Maps a refspec to its path under `refs/`. Refuses a refspec that leaves
+/// the tree.
 pub(crate) fn refspec_to_relpath(refspec: &str) -> Result<String> {
     validate_refspec(refspec)?;
     Ok(match refspec.split_once(':') {
@@ -961,26 +1177,28 @@ pub(crate) fn refspec_to_relpath(refspec: &str) -> Result<String> {
     })
 }
 
-/// Whether the name a listing gave a ref addresses the file it was listed
-/// from: whether [`refspec_to_relpath`] maps `name` to exactly `<top>/<path>`,
-/// where `top` is the directory of `refs/` the listing walked and `path` is the
-/// path of the ref file below it.
+/// Returns `true` if the name that a listing gave a ref addresses the file
+/// that the listing read: if [`refspec_to_relpath`] maps `name` to exactly
+/// `<top>/<path>`. `top` is the directory of `refs/` that the listing walked,
+/// and `path` is the path of the ref file below it.
 ///
-/// Prune classifies a ref only where this answers true, so every ref the
-/// classifier sees reads and deletes through the file it was listed from. A
-/// name the mapping refuses answers false.
+/// Prune classifies a ref only where this returns `true`. So each ref that
+/// the classifier sees reads and deletes through the file that the listing
+/// read. A name that the mapping refuses gives `false`.
 ///
-/// The name alone decides this for a ref below `refs/heads`, where a `:` in the
-/// name sends the mapping to `refs/remotes` and so to a different file. The
-/// name alone cannot decide it for a ref below `refs/remotes`. A listing names
-/// such a ref by replacing the first `/` of its path with a `:`, and the
-/// mapping splits at the first `:`, so two files give one name: both
-/// `refs/remotes/a:b/main` and `refs/remotes/a/b:main` list as `a:b:main`, and
-/// the mapping sends that name to the second of the two. The signature takes
-/// the path for this reason.
+/// The name alone decides this for a ref below `refs/heads`. There, a `:` in
+/// the name sends the mapping to `refs/remotes` and so to a different file.
+///
+/// The name alone cannot decide it for a ref below `refs/remotes`. A listing
+/// names such a ref with a `:` in place of the first `/` of its path. The
+/// mapping splits at the first `:`, so two files give one name.
+///
+/// Both `refs/remotes/a:b/main` and `refs/remotes/a/b:main` list as
+/// `a:b:main`, and the mapping sends that name to the second of the two. For
+/// this reason the signature takes the path.
 ///
 /// No refspec maps to a path below `refs/mirrors`, so a mirror ref always
-/// answers false.
+/// gives `false`.
 ///
 /// The body mirrors [`refspec_to_relpath`] branch for branch and allocates
 /// nothing, because prune calls it once for each ref in the repository.
@@ -998,12 +1216,12 @@ pub(crate) fn listed_name_addresses_it(name: &str, top: &str, path: &str) -> boo
     }
 }
 
-/// The same rule as [`Error::InvalidRefspec`]-bearing validation, for a bare
-/// ref name.
+/// Checks a bare ref name with the ref-name rule of [`validate_refspec`], and
+/// fails with [`Error::InvalidRefspec`].
 ///
-/// An HTTP pull applies it before a ref name becomes a request path: a
-/// traversal component there asks the server for a different resource, the way
-/// it would name a different file here.
+/// An HTTP pull applies it before a ref name becomes a request path. A
+/// traversal component in a request path asks the server for a different
+/// resource, as it names a different file in the repository.
 pub(crate) fn check_ref_path(name: &str) -> Result<()> {
     if is_ref_path(name) {
         Ok(())
@@ -1012,15 +1230,15 @@ pub(crate) fn check_ref_path(name: &str) -> Result<()> {
     }
 }
 
-// A ref name may contain `/` but no empty, `.`, or `..` components, and no
-// interior NUL. A single path component is non-empty, not a traversal, and
-// holds no slash or NUL. `ostrya-core` holds the rule.
+// A ref name can contain `/`. It has no empty, `.`, or `..` component, and
+// no NUL. A single path component is not empty, not a traversal, and holds no
+// slash or NUL. `ostrya-core` holds the rule.
 pub(crate) use ostrya_core::{is_ref_component as is_component, is_ref_name as is_ref_path};
 
-/// Map a collection ref to its path under `refs/`. A collection id places the
-/// ref under `refs/mirrors/<collection>/`; a `None` id is a local
-/// `refs/heads/` ref. The collection id is a single component (dots allowed, no
-/// slash or traversal).
+/// Maps a collection ref to its path under `refs/`. A collection id puts the
+/// ref under `refs/mirrors/<collection>/`. A `None` id gives a local ref under
+/// `refs/heads/`. The collection id is one component (dots are allowed, a
+/// slash or a traversal is not).
 pub(crate) fn collection_ref_to_relpath(cref: &CollectionRef) -> Result<String> {
     let name = &cref.ref_name;
     match &cref.collection_id {
@@ -1039,29 +1257,36 @@ pub(crate) fn collection_ref_to_relpath(cref: &CollectionRef) -> Result<String> 
     }
 }
 
-/// The permission bits forced on a ref file, independent of the umask, matching
-/// the tool's `0644` ref files.
+/// The permission bits forced on a ref file, independent of the umask. The
+/// `ostree` command writes its ref files with mode `0644`.
 const REF_FILE_MODE: u32 = 0o644;
-/// The request mode for a created ref parent directory, reduced by the umask
-/// (the tool's ref subdirectories are `0755` under a `022` umask). In a
-/// `bare-user-shared` repository a parent directory the write creates is then
-/// forced to [`perm::SHARED_DIR_MODE`], so every member of the repository group
-/// publishes a ref under it.
+/// The request mode for a created ref parent directory, reduced by the umask.
+/// The ref subdirectories of the `ostree` command are `0755` under a `022`
+/// umask. In a `bare-user-shared` repository, the write then forces a parent
+/// directory that it creates to [`perm::SHARED_DIR_MODE`]. So each member of
+/// the repository group can publish a ref under it.
 const REF_DIR_MODE: u32 = 0o777;
 
-/// Write or remove one ref file relative to `repo_fd`, atomically.
+/// Writes or removes one ref file relative to `repo_fd`, atomically.
 ///
-/// `Some(checksum)` opens `tmp/` (created as needed), creates the target's
-/// parent directories as needed, writes the 65-byte `<hex>\n` content to a
-/// fresh temp file in `tmp/`, `fdatasync`-es the temp file when `fsync` is set,
-/// and renames it over the target. A `tmp/` on another filesystem makes the
-/// rename fail with `EXDEV`, and the temp file is removed. `None` unlinks the
-/// ref, treating an already-absent file as success, and does not use `tmp/`.
-/// Under `fsync` the directory holding the ref is `fsync`-ed after the rename
-/// or the unlink, so the name the operation created or removed is durable and
-/// not only the file's content, and the name of every parent directory this
-/// write created is made durable too, deepest first. A write that fails still
-/// syncs the directories it changed before the failure.
+/// For `Some(checksum)`, the call:
+///
+/// 1. Opens `tmp/`, and creates it if it is missing.
+/// 2. Creates the missing parent directories of the target.
+/// 3. Writes the 65-byte `<hex>\n` content to a new temp file in `tmp/`.
+/// 4. Runs `fdatasync` on the temp file if `fsync` is set.
+/// 5. Renames the temp file over the target.
+///
+/// If `tmp/` is on a different file system, the rename fails with `EXDEV`,
+/// and the call removes the temp file. `None` unlinks the ref and does not
+/// use `tmp/`. An absent file is success.
+///
+/// Under `fsync`, the call runs `fsync` on the directory that holds the ref
+/// after the rename or the unlink. So the name that the operation created or
+/// removed is durable, and not only the content of the file. The call also
+/// makes the name of each parent directory that it created durable, deepest
+/// first. A write that fails still syncs the directories that it changed
+/// before the failure.
 fn write_ref_blocking(
     repo_fd: BorrowedFd<'_>,
     relpath: &str,
@@ -1074,11 +1299,14 @@ fn write_ref_blocking(
     written.and(sync_ref_dirs(repo_fd, dirs))
 }
 
-/// The body of [`write_ref_blocking`], with the directory syncs left to the
-/// caller: under `fsync`, each directory that gained or lost a name is added to
-/// `dirs`, for [`sync_ref_dirs`]. Those are the directory holding the ref, and
-/// the directory holding each parent this write created. A created parent is
-/// added when it is created, so a write that fails after it still adds it.
+/// Runs the body of [`write_ref_blocking`], and leaves the directory syncs to
+/// the caller.
+///
+/// Under `fsync`, the call adds each directory that gained or lost a name to
+/// `dirs`, for [`sync_ref_dirs`]. These are the directory that holds the ref,
+/// and the directory that holds each parent that this write created. The
+/// call adds a created parent when it creates it, so a write that fails after
+/// that step still adds it.
 pub(crate) fn put_ref_blocking(
     repo_fd: BorrowedFd<'_>,
     relpath: &str,
@@ -1104,8 +1332,8 @@ pub(crate) fn put_ref_blocking(
     }
 }
 
-/// Unlink the ref file `relpath`, treating an already-absent file as success.
-/// Under `fsync` the directory holding the ref is added to `dirs`.
+/// Unlinks the ref file `relpath`. An absent file is success. Under `fsync`,
+/// the call adds the directory that holds the ref to `dirs`.
 fn remove_ref_blocking(
     repo_fd: BorrowedFd<'_>,
     relpath: &str,
@@ -1124,7 +1352,7 @@ fn remove_ref_blocking(
     }
 }
 
-/// Write the ref file `relpath` through a temp file in the open `tmp/` at
+/// Writes the ref file `relpath` through a temp file in the open `tmp/` at
 /// `tmp_fd`, as [`put_ref_blocking`] writes a `Some` checksum.
 fn put_ref_file_blocking(
     repo_fd: BorrowedFd<'_>,
@@ -1153,7 +1381,7 @@ fn put_ref_file_blocking(
     Ok(())
 }
 
-/// Sort `dirs` deepest first, then by name, and drop the repeats.
+/// Sorts `dirs` deepest first, then by name, and drops the repeats.
 fn sort_dirs_deepest_first(dirs: &mut Vec<String>) {
     let depth = |dir: &str| {
         if dir == "." {
@@ -1166,14 +1394,17 @@ fn sort_dirs_deepest_first(dirs: &mut Vec<String>) {
     dirs.dedup();
 }
 
-/// `fsync` each distinct directory of `dirs` once, named relative to the
-/// repository root, deepest first.
+/// Runs `fsync` once on each distinct directory of `dirs`, deepest first. The
+/// names are relative to the repository root.
 ///
-/// A deeper directory is synced before the directory above it: the ref
-/// file's own name, then the name of the directory holding it, then the name
-/// of the directory above that, the order the object fanout uses. A crash
-/// part way through therefore leaves a prefix of each path recorded and never
-/// a directory entry naming a directory whose own contents are unrecorded.
+/// The call syncs a deeper directory before the directory above it. The
+/// first sync records the name of the ref file. The next records the name of
+/// the directory that holds it, and the next the name of the directory above
+/// that. The object fanout uses the same order.
+///
+/// So a crash part way through leaves a prefix of each path recorded. It
+/// never leaves a directory entry that names a directory with unrecorded
+/// contents.
 fn sync_ref_dirs(repo_fd: BorrowedFd<'_>, mut dirs: Vec<String>) -> Result<()> {
     sort_dirs_deepest_first(&mut dirs);
     for dir in &dirs {
@@ -1182,8 +1413,8 @@ fn sync_ref_dirs(repo_fd: BorrowedFd<'_>, mut dirs: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-/// `fsync` each distinct directory of `dirs` once, in the order of
-/// [`sync_ref_dirs`], and return the first error. A failed sync does not stop
+/// Runs `fsync` once on each distinct directory of `dirs`, in the order of
+/// [`sync_ref_dirs`], and returns the first error. A failed sync does not stop
 /// the syncs after it.
 pub(crate) fn sync_dirs_all(repo_fd: BorrowedFd<'_>, mut dirs: Vec<String>) -> Result<()> {
     sort_dirs_deepest_first(&mut dirs);
@@ -1199,10 +1430,10 @@ pub(crate) fn sync_dirs_all(repo_fd: BorrowedFd<'_>, mut dirs: Vec<String>) -> R
     first
 }
 
-/// The directory syncs [`sync_dirs_all`] made, for the unit tests: one entry
-/// for each sync, naming the `(device, inode)` of the repository root and
-/// whether a guard of this process held the update lock of that repository
-/// when the sync ran.
+/// The directory syncs that [`sync_dirs_all`] made, for the unit tests. Each
+/// sync has one entry. The entry holds the `(device, inode)` of the
+/// repository root, and a flag. The flag is `true` if a guard of this process
+/// held the update lock of that repository when the sync ran.
 #[cfg(test)]
 pub(crate) mod test_syncs {
     use std::os::fd::BorrowedFd;
@@ -1246,15 +1477,22 @@ pub(crate) mod test_syncs {
     }
 }
 
-/// Write one alias symlink relative to `repo_fd`, atomically.
+/// Writes one alias symlink relative to `repo_fd`, atomically.
 ///
-/// The write opens `tmp/` (created as needed), creates the target's parent
-/// directories as needed, creates the link under a fresh temp name in `tmp/`,
-/// and renames it over the target, so an existing ref file or an existing
-/// alias is replaced in one step. A symlink carries no content of its
-/// own to sync, so `fsync` reaches the directory holding the link and the
-/// directory holding each parent this write created. A write that fails still
-/// syncs the directories it changed before the failure.
+/// The call:
+///
+/// 1. Opens `tmp/`, and creates it if it is missing.
+/// 2. Creates the missing parent directories of the target.
+/// 3. Creates the link under a new temp name in `tmp/`.
+/// 4. Renames the link over the target.
+///
+/// So the call replaces an existing ref file or an existing alias in one
+/// step. A symlink has no content of its own to sync. So `fsync` reaches the
+/// directory that holds the link, and the directory that holds each parent
+/// that this write created.
+///
+/// A write that fails still syncs the directories that it changed before the
+/// failure.
 fn write_alias_blocking(
     repo_fd: BorrowedFd<'_>,
     relpath: &str,
@@ -1267,10 +1505,10 @@ fn write_alias_blocking(
     written.and(sync_ref_dirs(repo_fd, dirs))
 }
 
-/// The body of [`write_alias_blocking`], with the directory syncs left to the
-/// caller: under `fsync`, the directory holding the link and the directory
-/// holding each parent this write created are added to `dirs`, each parent
-/// when it is created.
+/// Runs the body of [`write_alias_blocking`], and leaves the directory syncs
+/// to the caller. Under `fsync`, the call adds to `dirs` the directory that
+/// holds the link, and the directory that holds each parent that this write
+/// created. It adds each parent when it creates it.
 pub(crate) fn put_alias_blocking(
     repo_fd: BorrowedFd<'_>,
     relpath: &str,
@@ -1289,29 +1527,34 @@ pub(crate) fn put_alias_blocking(
     Ok(())
 }
 
-/// Remove every ref that still names the checksum the caller recorded for it,
-/// relative to `repo_fd`, in one blocking pass.
+/// Removes each ref that still names the checksum that the caller recorded
+/// for it, relative to `repo_fd`, in one blocking pass.
 ///
-/// Each name is mapped to its path by the same refspec rule the asynchronous
-/// writes use, so the read and the unlink address the file the rest of the
-/// library addresses. The read sits immediately ahead of its own unlink: a ref
-/// that now names a different commit is left where it stands, which covers a
-/// repository whose `[core] locking` is false and a caller that moved the ref
-/// after it recorded the checksum. A read that finds no file unlinks all the
-/// same -- the name the caller recorded is gone or dangles, `unlinkat` removes
-/// a symlink and not the file it names, and an already-absent name is success.
+/// The call maps each name to its path with the refspec rule of the
+/// asynchronous writes. So the read and the unlink address the same file as
+/// the rest of the library.
 ///
-/// Under `fsync` each directory an unlink emptied of one name is `fsync`-ed
-/// once, after the last unlink, so every removed name is durable. A directory
-/// is recorded only where its own unlink reported success. A recorded
-/// directory that is gone by the time the pass reaches it holds no entry to
-/// make durable, so its absence is success as well. A hash set carries the
-/// membership test, and a vector carries the order the `fsync` calls run in.
-/// That order is the order the first unlink of each directory ran in. The
-/// membership test reads the borrowed path, so a parent the set already holds
-/// costs no allocation.
+/// Each read comes immediately before its own unlink. The call leaves a ref
+/// that now names a different commit where it is. This covers a repository
+/// whose `[core] locking` is false, and a caller that moved the ref after it
+/// recorded the checksum.
 ///
-/// Returns the names it removed, in the order it was given them.
+/// A read that finds no file unlinks all the same. The name that the caller
+/// recorded is gone or dangles. `unlinkat` removes a symlink and not the file
+/// that it names, and an absent name is success.
+///
+/// Under `fsync`, after the last unlink, the call runs `fsync` once on each
+/// directory from which an unlink removed a name. So each removed name is
+/// durable. The call records a directory only if its own unlink reported
+/// success. A recorded directory that is gone when the pass reaches it holds
+/// no entry to make durable, so its absence is success as well.
+///
+/// A hash set holds the membership test. A vector holds the order of the
+/// `fsync` calls, which is the order of the first unlink in each directory. The
+/// membership test reads the borrowed path, so a parent that the set already
+/// holds costs no allocation.
+///
+/// Returns the names that it removed, in the order that it got them.
 pub(crate) fn delete_matching_refs_blocking(
     repo_fd: BorrowedFd<'_>,
     refs: Vec<(String, Checksum)>,
@@ -1348,16 +1591,16 @@ pub(crate) fn delete_matching_refs_blocking(
     Ok(removed)
 }
 
-/// The directory holding the ref at `relpath`. A refspec always maps below
-/// `refs/`, so the path carries a parent; a bare name names the repository
-/// root.
+/// Returns the directory that holds the ref at `relpath`. A refspec always
+/// maps below `refs/`, so the path has a parent. For a bare name, the result
+/// is the repository root.
 fn ref_parent(relpath: &str) -> &str {
     relpath.rsplit_once('/').map_or(".", |(dir, _)| dir)
 }
 
-/// `fsync` one directory named relative to the repository root, where it still
-/// stands. A directory that is gone carries no entry to make durable, so its
-/// absence is success.
+/// Runs `fsync` on one directory, named relative to the repository root, if
+/// the directory still exists. A directory that is gone holds no entry to make
+/// durable, so its absence is success.
 fn sync_dir_present(repo_fd: BorrowedFd<'_>, path: &str) -> Result<()> {
     match sync_dir(repo_fd, path) {
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1365,7 +1608,7 @@ fn sync_dir_present(repo_fd: BorrowedFd<'_>, path: &str) -> Result<()> {
     }
 }
 
-/// `fsync` one directory named relative to the repository root.
+/// Runs `fsync` on one directory, named relative to the repository root.
 pub(crate) fn sync_dir(repo_fd: BorrowedFd<'_>, path: &str) -> Result<()> {
     let dir = rustix::fs::openat(
         repo_fd,
@@ -1377,21 +1620,23 @@ pub(crate) fn sync_dir(repo_fd: BorrowedFd<'_>, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Create the parent directories of a ref path, idempotently. Every component
-/// but the last is created; existing directories are left in place. Under
-/// `fsync`, the directory that holds each created directory is added to
-/// `dirs` as soon as the `mkdirat` returns, before any step that can fail, so
-/// a write that fails later still leaves the new name to a sync.
+/// Creates the parent directories of a ref path, idempotently.
 ///
-/// A `mkdirat` adds a name to the directory it is called in, so the directory
-/// a caller syncs to make a created `refs/heads/deep/nest` durable is
-/// `refs/heads/deep`, the one that holds the `nest` entry: the
-/// [`ref_parent`] of the created path. A directory the call found already in
-/// place needs no sync; its name is already durable.
+/// The call creates each component except the last, and leaves existing
+/// directories in place. Under `fsync`, the call adds the directory that holds
+/// each created directory to `dirs` when the `mkdirat` returns, before any
+/// step that can fail. So a write that fails later still leaves the new name
+/// to a sync.
 ///
-/// In a `bare-user-shared` repository each directory this call creates is
-/// forced to [`perm::SHARED_DIR_MODE`]. A directory that already stands keeps
-/// the mode and the group it has.
+/// A `mkdirat` adds a name to the directory that it is called in. So to make
+/// a created `refs/heads/deep/nest` durable, a caller syncs `refs/heads/deep`,
+/// which holds the `nest` entry: the [`ref_parent`] of the created path. A
+/// directory that was already in place needs no sync, because its name is
+/// already durable.
+///
+/// In a `bare-user-shared` repository, the call forces each directory that it
+/// creates to [`perm::SHARED_DIR_MODE`]. A directory that already exists
+/// keeps its mode and its group.
 fn create_ref_parents(
     repo_fd: BorrowedFd<'_>,
     relpath: &str,
@@ -1439,8 +1684,8 @@ mod tests {
 
     #[test]
     fn refspec_rejects_traversal() {
-        // The error names the whole refspec, which is what a caller reporting a
-        // refused name has in hand, and not the component that failed.
+        // The error names the whole refspec, which a caller that reports a
+        // refused name has in hand. It does not name the failed component.
         for bad in [
             "",
             "..",
@@ -1497,7 +1742,7 @@ mod tests {
         );
         // A nested alias climbs out of its own directory first.
         assert_eq!(relative_link("refs/heads/p/q", "refs/heads/one"), "../one");
-        // A target one level up from the alias's directory.
+        // A target one level up from the directory of the alias.
         assert_eq!(relative_link("refs/heads/a/b", "refs/heads/a"), "../a");
         // Across the two ref roots.
         assert_eq!(
@@ -1544,7 +1789,7 @@ mod tests {
             "org.example.Coll/mm",
             false,
         ),
-        // A remote refspec at the path it would take under another top answers
+        // A remote refspec at the path that it takes under another top gives
         // false, because the mapping names one top alone.
         ("origin:main", "refs/mirrors", "origin/main", false),
     ];

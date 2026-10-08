@@ -1,86 +1,24 @@
-//! GPG (OpenPGP) commit-signing engine.
+//! GPG (OpenPGP) signature verification, keyring management, and signing.
 //!
-//! Behind the `verify-gpg` feature: keyrings are parsed, signatures are
-//! verified, and a remote's trusted keyring is managed in the process with the
-//! `pgp` crate (rPGP). The `sign-gpg` feature adds signing through
-//! `gpg --detach-sign` and turns on `verify-gpg` with it. The signer is
-//! `GpgSigner` of the `ostrya-sign` crate, re-exported here. Its signing run
-//! and its secret-key listing are the `gpg` runs the library makes, with one
-//! more under the `receive` feature: a server signing key's public certificate
-//! is read with `gpg --export`, so the receive path can recognize a signature
-//! that key already made. The private key stays with GnuPG and its agent and
-//! never passes through the library.
+//! The `verify-gpg` feature turns on this module. The module parses keyrings,
+//! verifies signatures, and manages the trusted keyring of a remote in the
+//! process, with the `pgp` crate (rPGP). The entry points are [`GpgVerifier`],
+//! [`Repo::gpg_import_keys`], and [`Repo::gpg_list_keys`].
 //!
-//! Format (`format-reference.md`, "Signing details -- GPG"):
+//! The `sign-gpg` feature adds `GpgSigner`, which signs with
+//! `gpg --detach-sign`. This feature also turns on `verify-gpg`. `GpgSigner` is
+//! an item of the `ostrya-sign` crate, re-exported here.
 //!
-//! - The `ostree.gpgsigs` value is an `aay`; each `ay` element is one detached
-//!   OpenPGP signature (the binary signature packet stream, unarmored). A blob
-//!   may hold more than one signature packet.
-//! - The signed payload is the same commit bytes as the other engines.
+//! This crate runs the `gpg` command for these operations only:
 //!
-//! [`GpgVerifier`] holds the certificates its keyrings parse to. Keyrings are
-//! loaded through [`from_keyring_bytes`](GpgVerifier::from_keyring_bytes) and
-//! [`from_keyring_files`](GpgVerifier::from_keyring_files) (armored input is
-//! decoded to the binary packet stream the parser reads, and Trust packets are
-//! dropped from that stream, so a legacy GnuPG keyring and the `gpg --export`
-//! stream of the same keys parse to the same certificates).
-//! [`from_system_trust`](GpgVerifier::from_system_trust) loads the global
-//! trusted set -- every `*.gpg` keyring in the directory named by the
-//! `OSTREE_GPG_HOME` environment variable, or `<datadir>/ostree/trusted.gpg.d/`
-//! when it is unset. [`for_remote`](GpgVerifier::for_remote) adds the
-//! per-remote keyring (`<remote>.trustedkeys.gpg` in the repo or under
-//! `/etc/ostree/remotes.d/`) on top of that global set, and
-//! [`for_remote_keyrings`](GpgVerifier::for_remote_keyrings) takes the
-//! repository's keyring as bytes and adds the keyrings a remote's `gpgkeypath`
-//! names, which is what a pull trusts. Every keyring file reaches the trusted
-//! set through one reader: only a regular file is read, and only up to four
-//! mebibytes, so a path naming a fifo and a keyring over that ceiling are each
-//! refused by that path's own name.
+//! - The signing run of `GpgSigner`.
+//! - The secret-key listing of `GpgSigner`.
+//! - `gpg --export` under the `receive` and `sign-gpg` features. It reads the
+//!   public certificate of a server signing key, so the receive path can
+//!   recognize a signature that this key made.
 //!
-//! A keyring is untrusted input, so its load is bounded and its parse is
-//! contained. The four-mebibyte ceiling holds over a keyring supplied as bytes
-//! as well, and one keyring holds at most 256 certificates; each refusal names
-//! the cap it reached. A GnuPG keybox, which carries the `KBXf` magic, is
-//! refused by the name of the file or the blob that holds it, since rPGP reads
-//! OpenPGP packet streams and a keybox is a container of another kind. A
-//! keyring the parser rejects fails the load, and so does a keyring whose
-//! packet stream does not frame to its end, so the trusted set a verification
-//! works over is one that was read whole.
-//!
-//! Verification reads the stored blobs and the loaded certificates and answers
-//! in the process, on the blocking pool. The `verify` module holds the engine,
-//! the trust and validity policy it applies, and the input caps a stored blob
-//! is held to. No process is spawned and no scratch directory is written.
-//!
-//! A remote's own trusted keyring is managed in the process:
-//! [`Repo::gpg_import_keys`] adds certificates to `<remote>.trustedkeys.gpg`
-//! and reports how many the keyring did not already hold, and
-//! [`Repo::gpg_list_keys`] reads back the keys it holds as
-//! [`GpgKey`] records. The keyring the import writes keeps the packet stream it
-//! already held and carries the packets of each added certificate as the
-//! offered stream wrote them, with the Trust packets dropped. The keyring is
-//! written in the binary form, so an armored keyring keeps its packets and
-//! loses its armor. `gpg` and the `ostree` tool both read a keyring of that
-//! form. A certificate for a key the keyring already holds is left as the
-//! keyring holds it, so a new user id or a new subkey for a held key reaches
-//! the keyring through [`Repo::remove_remote_keyring`] and a fresh import. Two
-//! statements are the exceptions, and each replaces the held certificate, which
-//! rewrites the keyring: a key revocation that verifies under the key it
-//! revokes, so a revoked key stops speaking for the remote, and a key expiry
-//! later than the held certificate states, so a key whose owner has extended
-//! its life speaks again. A keyring offered for import is untrusted input and
-//! is held to the same caps and the same containment a keyring loaded for
-//! verification is. Both streams reach the reader a verification load uses,
-//! the offered one and the one the keyring already holds, so a stream that
-//! reader does not read whole fails the import and leaves the keyring as it
-//! was.
-//!
-//! A signature is valid only where it verifies against a trusted key whose
-//! bindings hold and which is neither expired nor revoked. An expired key, a
-//! revoked key, a bad signature, and an absent key are each reported per
-//! signature in [`SignatureInfo`](crate::sign::SignatureInfo). Trust is
-//! membership in the verifier's keyrings; GnuPG's ownertrust model plays no
-//! part.
+//! The private key stays with GnuPG and its agent. It never goes through this
+//! crate.
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -105,64 +43,167 @@ mod verify;
 #[cfg(feature = "sign-gpg")]
 pub use ostrya_sign::GpgSigner;
 
-/// The GPG engine's detached-metadata dict key. Unlike the sign-api engines,
-/// GPG signatures live under `ostree.gpgsigs`, not `ostree.sign.<type>`.
+/// The detached-metadata key of the GPG engine.
 ///
-/// The GPG signer of `ostrya-sign` holds a copy of this key, and the two must
-/// agree.
+/// The sign-api engines use the key `ostree.sign.<type>`. The GPG signer of
+/// `ostrya-sign` holds a copy of this key, and the two values must agree.
 const GPG_METADATA_KEY: &str = "ostree.gpgsigs";
-/// The system directory holding keyrings trusted for every remote.
+/// The system directory of the keyrings that every remote trusts.
 const GLOBAL_TRUSTED_GPG_D: &str = "/usr/share/ostree/trusted.gpg.d";
 /// The environment variable that overrides the global trusted-keyring
-/// directory, as the `ostree` tool honors it.
+/// directory. The `ostree` command reads the same variable.
 const OSTREE_GPG_HOME_ENV: &str = "OSTREE_GPG_HOME";
-/// The system directory holding per-remote configuration and keyrings.
+/// The system directory of the configuration and the keyrings of each remote.
 const SYSTEM_REMOTES_D: &str = "/etc/ostree/remotes.d";
 /// The prefix of a machine-readable status line on the status fd.
 #[cfg(test)]
 const STATUS_PREFIX: &str = "[GNUPG:] ";
-/// The ceiling on one keyring file, whose whole content is read into memory.
-/// One exported ed25519 certificate is a few hundred bytes, so four mebibytes
-/// holds thousands of them, and a remote's trusted set is a handful.
+/// The size limit of one keyring file. The read puts the whole file in memory.
+///
+/// One exported ed25519 certificate is a few hundred bytes. So four mebibytes
+/// hold thousands of certificates, and the trusted set of a remote is a few.
 pub(crate) const MAX_KEYRING: u64 = 4 * 1024 * 1024;
-/// The ceiling on the certificates one keyring may hold. A remote's trusted
-/// set is a handful of certificates, and the ceiling bounds the work a keyring
-/// from a remote or from `trusted.gpg.d` can ask the parser for.
+/// The maximum number of certificates in one keyring.
+///
+/// The trusted set of a remote is a few certificates. The limit bounds the
+/// parser work that a keyring from a remote or from `trusted.gpg.d` can cause.
 const MAX_KEYRING_CERTS: usize = 256;
-/// The magic a GnuPG keybox carries, and the offset it stands at. A keybox
-/// opens with a header blob: a four-byte length, a one-byte blob type, a
-/// one-byte version, and two bytes of flags stand before the magic.
+/// The magic of a GnuPG keybox, and its offset.
+///
+/// A keybox starts with a header blob. A four-byte length, a one-byte blob
+/// type, a one-byte version, and two bytes of flags come before the magic.
 const KEYBOX_MAGIC: &[u8] = b"KBXf";
 const KEYBOX_MAGIC_OFFSET: usize = 8;
 
-/// The GPG commit-verifying engine, holding the trusted certificates its
-/// keyrings parse to.
+/// The GPG commit verifier, with the trusted certificates of its keyrings.
+///
+/// `GpgVerifier` implements [`Verifier`]. Trust is membership in the keyrings
+/// of the verifier. The ownertrust model of GnuPG has no effect. The verifier
+/// reads the stored blobs and the loaded certificates on the blocking pool. It
+/// starts no process and writes no scratch directory.
+///
+/// # Format
+///
+/// - The detached metadata holds the signatures under the key
+///   `ostree.gpgsigs`, as an `aay`.
+/// - Each `ay` element is one detached OpenPGP signature: the binary signature
+///   packet stream, with no armor. One element can hold more than one signature
+///   packet.
+/// - The signed payload is the same commit bytes that the other engines sign.
+///
+/// # Verdict
+///
+/// The verifier reports one [`SignatureInfo`](crate::sign::SignatureInfo)
+/// for each signature packet in the `aay` blobs stored under
+/// `ostree.gpgsigs`. One blob holds one or more signature packets, so a blob
+/// can give several records. If the parser reads no signature from a blob,
+/// that blob gives one record of its own. So the record count follows the
+/// stored blob count.
+///
+/// Each signature names its issuer in a subpacket. The verifier reads the
+/// issuer fingerprint first and the issuer key id second. It compares each
+/// with the primary key of each certificate and then with its subkeys. If no
+/// loaded certificate holds the issuer, the record has
+/// [`key_missing`](crate::sign::SignatureInfo::key_missing) set. Its
+/// fingerprint, creation time, and two algorithm names then come from the
+/// signature packet.
+///
+/// Each certificate that matches the issuer takes part in the verdict. The
+/// verifier groups the matches by the primary key of their certificate, and
+/// reads one group as one certificate. The direct signatures, the user ids
+/// with their certifications, and the subkey bindings of every copy form one
+/// set. The key expiry rule runs once over this set, so the newest statement
+/// of any copy applies.
+///
+/// Across groups, a revocation in any group refuses the signature. The key
+/// expires at the earliest instant that any group states. So the load order of
+/// the trusted set has no effect on revocation and expiry. The first match
+/// gives the reported user id, the primary-key fingerprint, the cryptography,
+/// and the cross-certification check, so the load order sets these values.
+///
+/// A signature is valid if all of these are true:
+///
+/// - The signature verifies.
+/// - The certificate that holds the signing key is loaded.
+/// - The signature is over a document.
+/// - The bindings hold.
+/// - The digest algorithm is allowed.
+/// - The signature itself states no expiry time, or a time later than now.
+/// - The key is not expired and not revoked.
+///
+/// The record of each signature reports an expired key, a revoked key, a bad
+/// signature, and an absent key. A self-signature whose own expiry time is in
+/// the past sets no key expiry, binds no subkey, and ranks no user id. These
+/// rules give the behavior of `gpgv` 2.4.9.
+///
+/// # Limits of a keyring
+///
+/// A keyring is untrusted input. Each keyring, as bytes or as a file, has
+/// these limits:
+///
+/// - At most 4 MiB (`4194304` bytes).
+/// - At most 256 certificates.
+/// - No GnuPG keybox. A keybox carries the `KBXf` magic at byte offset 8. rPGP
+///   reads OpenPGP packet streams, and a keybox is a container of a different
+///   kind.
+///
+/// Each refusal names the file or the blob, and the limit that it reached. If
+/// the parser refuses a keyring, the load fails. If the packet stream of a
+/// keyring does not frame to its end, the load also fails. So each
+/// verification uses a trusted set that was read whole.
+///
+/// The parse runs under `catch_unwind`, so a panic in the parser gives
+/// [`Error::Signature`]. If the binary is built with `panic = "abort"`, a panic
+/// stops the process. The containment does not find a parser that returns a
+/// wrong answer with no panic.
+///
+/// # Limits of a stored blob
+///
+/// A stored blob is untrusted input. One blob has a limit of 1 MiB, which the
+/// verifier checks before the parser reads the bytes. One blob also has a limit
+/// of 64 signature packets, which the verifier checks as it reads the packets.
+/// Each refusal names the limit that it reached. The policy runs in the same
+/// containment. So if a crafted certificate causes a panic in a public-key
+/// operation, the result is the same as for a blob that the parser refuses.
 #[derive(Debug, Clone, Default)]
 pub struct GpgVerifier {
-    /// The certificates the loaded keyrings hold, in load order. The parse
-    /// happens as a keyring is loaded, so a keyring the parser rejects fails
-    /// the load rather than a verification made over it.
+    /// The certificates of the loaded keyrings, in load order.
     ///
-    /// A key the sources hold several certificates for keeps every one of
-    /// them here. The verdict reads all the certificates that answer for a
-    /// signature's issuer, so a revocation any of them carries refuses the
-    /// signature whatever order the sources loaded in.
+    /// The parse runs when a keyring loads. So if the parser refuses a keyring,
+    /// the load fails, and no verification uses that keyring.
     ///
-    /// One reference count holds the set. A verification hands the set to the
-    /// blocking pool through a count of its own. The certificates are parsed
-    /// once and shared by every commit a pull verifies.
+    /// If the sources hold several certificates for one key, this list keeps
+    /// all of them. The verdict reads all the certificates that match the
+    /// issuer of a signature. So a revocation in any of them refuses the
+    /// signature, and the load order has no effect on this result.
+    ///
+    /// One reference count holds the set. A verification gives the set to the
+    /// blocking pool through a count of its own. The parse runs once, and every
+    /// commit that a pull verifies uses the same certificates.
     certs: Arc<Vec<SignedPublicKey>>,
 }
 
 impl GpgVerifier {
-    /// Build a verifier trusting every certificate in the given keyring
-    /// blobs. Each blob is a binary or ASCII-armored OpenPGP keyring and may
-    /// hold several certificates; armored input is decoded to the binary
-    /// form, and all blobs merge into one trusted set.
+    /// Creates a verifier that trusts each certificate in the keyring blobs.
     ///
-    /// Each blob is held to four mebibytes and to 256 certificates, and a blob
-    /// carrying a GnuPG keybox is refused. A refusal names the blob by its
-    /// position in the sequence and states the cap it reached.
+    /// Each blob is a binary or ASCII-armored OpenPGP keyring, and can hold
+    /// several certificates. All blobs merge into one trusted set. The load
+    /// decodes armored input to the binary packet stream. It drops the Trust
+    /// packets from that stream. So a legacy GnuPG keyring and the
+    /// `gpg --export` stream of the same keys parse to the same certificates.
+    ///
+    /// Each blob has
+    /// [the limits of a keyring](GpgVerifier#limits-of-a-keyring). A refusal
+    /// names the blob by its position in the sequence, as
+    /// `the keyring blob <index>`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] if a blob is over 4 MiB, is a GnuPG keybox, holds
+    ///   more than 256 certificates, or does not parse as an OpenPGP keyring.
+    /// - [`Error::Signature`] if an armored blob is not valid UTF-8.
+    /// - [`Error::Core`] if the armor of a blob holds text that is not valid
+    ///   base64.
     pub fn from_keyring_bytes<I, B>(keyrings: I) -> Result<GpgVerifier>
     where
         I: IntoIterator<Item = B>,
@@ -175,11 +216,23 @@ impl GpgVerifier {
         Ok(verifier)
     }
 
-    /// Build a verifier from keyring files on disk (binary or armored). A
-    /// missing file is skipped rather than an error, so an absent optional
-    /// keyring does not fail the build. Only a regular file is read, and only
-    /// up to four mebibytes; a path of another kind and a keyring over that
-    /// ceiling are each refused by the path's own name.
+    /// Creates a verifier from keyring files on disk, binary or armored.
+    ///
+    /// If a file does not exist, the load skips it. So an absent optional
+    /// keyring does not cause a failure. The load reads only a regular file, up
+    /// to 4 MiB. The decode rules of
+    /// [`from_keyring_bytes`](GpgVerifier::from_keyring_bytes) and
+    /// [the limits of a keyring](GpgVerifier#limits-of-a-keyring) apply. A
+    /// refusal names the path.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] if a path cannot be opened for a reason other
+    ///   than a missing file, or a read of the file fails.
+    /// - [`Error::Signature`] if a path names a file that is not a regular
+    ///   file, for example a directory or a fifo.
+    /// - The errors of [`from_keyring_bytes`](GpgVerifier::from_keyring_bytes)
+    ///   for the content of each file.
     pub fn from_keyring_files<I, P>(paths: I) -> Result<GpgVerifier>
     where
         I: IntoIterator<Item = P>,
@@ -190,31 +243,60 @@ impl GpgVerifier {
         Ok(verifier)
     }
 
-    /// Build a verifier from the keyrings trusted for `remote` in the
-    /// repository at `repo_path`: `<remote>.trustedkeys.gpg` in the repository
-    /// and under `/etc/ostree/remotes.d/`, plus the global trusted set
-    /// (see [`from_system_trust`](GpgVerifier::from_system_trust)). Missing
-    /// paths are skipped.
+    /// Creates a verifier from the keyrings that `remote` trusts.
+    ///
+    /// The trusted set is the union of these keyrings:
+    ///
+    /// - `<remote>.trustedkeys.gpg` in the repository at `repo_path`.
+    /// - `<remote>.trustedkeys.gpg` in `/etc/ostree/remotes.d/`.
+    /// - The global trusted set of
+    ///   [`from_system_trust`](GpgVerifier::from_system_trust).
+    ///
+    /// If a path does not exist, the load skips it.
+    ///
+    /// # Errors
+    ///
+    /// - The errors of [`from_keyring_files`](GpgVerifier::from_keyring_files)
+    ///   for each keyring file.
+    /// - [`Error::Io`] if the global trusted directory cannot be listed for a
+    ///   reason other than its absence.
     pub fn for_remote(repo_path: &Path, remote: &str) -> Result<GpgVerifier> {
         let keyring = repo_path.join(format!("{remote}.trustedkeys.gpg"));
         let repo_keyring = read_keyring_path(&keyring)?;
         GpgVerifier::for_remote_keyrings(repo_keyring, remote, &[])
     }
 
-    /// Build a verifier from a remote's whole trusted set, with the
-    /// repository's own keyring supplied as bytes.
+    /// Creates a verifier from the whole trusted set of a remote.
     ///
-    /// `repo_keyring` is the repository's `<remote>.trustedkeys.gpg`, which a
-    /// caller holding a descriptor rather than a path reads for itself. On top
-    /// of it come the system per-remote keyring
-    /// (`/etc/ostree/remotes.d/<remote>.trustedkeys.gpg`), the global trusted
-    /// set (see [`from_system_trust`](GpgVerifier::from_system_trust)), and
-    /// every entry of `keypath`, which is what a remote's `gpgkeypath` names.
+    /// `repo_keyring` holds the bytes of the `<remote>.trustedkeys.gpg` file
+    /// of the repository. A caller that holds a descriptor and no path reads
+    /// this file itself. A pull trusts the union of these keyrings:
     ///
-    /// A `keypath` entry is a keyring file or a directory of `*.gpg` keyrings,
-    /// and an entry that names neither fails the build, so a keyring path that
-    /// has gone missing is reported rather than silently reducing the trusted
-    /// set. The other sources are optional and a missing one is skipped.
+    /// - `repo_keyring`.
+    /// - The system keyring of the remote,
+    ///   `/etc/ostree/remotes.d/<remote>.trustedkeys.gpg`.
+    /// - The global trusted set of
+    ///   [`from_system_trust`](GpgVerifier::from_system_trust).
+    /// - Each entry of `keypath`, which holds the values of the `gpgkeypath`
+    ///   key of the remote.
+    ///
+    /// A `keypath` entry is a keyring file or a directory of `*.gpg` keyrings.
+    /// The keyrings of a directory load in name order. The load takes only the
+    /// regular files of a directory, and skips a symlink. If an entry names
+    /// neither, the build fails. So a missing keyring path gives an error, and
+    /// the trusted set does not become smaller with no message. The other
+    /// sources are optional, and the load skips a missing one.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] if the metadata of a `keypath` entry cannot be
+    ///   read. The message names `gpgkeypath` and the entry.
+    /// - [`Error::Io`] if a directory that an entry names, or the global
+    ///   trusted directory, cannot be listed.
+    /// - The errors of [`from_keyring_bytes`](GpgVerifier::from_keyring_bytes)
+    ///   for `repo_keyring`.
+    /// - The errors of [`from_keyring_files`](GpgVerifier::from_keyring_files)
+    ///   for each keyring file.
     pub fn for_remote_keyrings(
         repo_keyring: Option<Vec<u8>>,
         remote: &str,
@@ -232,15 +314,18 @@ impl GpgVerifier {
         Ok(verifier)
     }
 
-    /// Build a verifier from the keyrings `keypath` names, and from nothing
-    /// else: no per-remote keyring and no global trusted set take part.
+    /// Creates a verifier from the keyrings that `keypath` names, and from no
+    /// other source.
     ///
-    /// Each entry is a keyring file or a directory of `*.gpg` keyrings, and an
-    /// entry that names neither fails the build. Keyrings that hold no
-    /// certificate among them, such as an empty file or a directory with no
-    /// `*.gpg` keyring, fail the build as [`Error::Signature`]: a verifier with
-    /// no trusted key would refuse every commit. `key` is the configuration key
-    /// the entries come from, which a refusal names.
+    /// No keyring of a remote and no global trusted set take part. Each entry
+    /// is a keyring file or a directory of `*.gpg` keyrings. If an entry names
+    /// neither, the build fails. `key` is the configuration key of the entries,
+    /// and a refusal names it.
+    ///
+    /// If the keyrings hold no certificate, the build fails with
+    /// [`Error::Signature`]. An empty file and a directory with no `*.gpg`
+    /// keyring are examples. A verifier with no trusted key refuses every
+    /// commit.
     #[cfg(feature = "receive")]
     pub(crate) fn from_keypath(key: &str, keypath: &[String]) -> Result<GpgVerifier> {
         let mut verifier = GpgVerifier::default();
@@ -253,18 +338,29 @@ impl GpgVerifier {
         Ok(verifier)
     }
 
-    /// Build a verifier from the global trusted keyrings alone: every `*.gpg`
-    /// keyring in the directory named by the `OSTREE_GPG_HOME` environment
-    /// variable, or, when that variable is unset or empty, the system
-    /// `/usr/share/ostree/trusted.gpg.d/` directory. No per-remote keyring
-    /// participates. This is the trust applied to a commit named with no
-    /// remote. A missing directory yields an empty trusted set.
+    /// Creates a verifier from the global trusted keyrings only.
+    ///
+    /// The global trusted set is each `*.gpg` keyring in the directory that the
+    /// `OSTREE_GPG_HOME` environment variable names. If this variable is unset
+    /// or empty, the directory is `/usr/share/ostree/trusted.gpg.d/`. The
+    /// keyrings load in name order. The load takes only the regular files of
+    /// the directory, and skips a symlink. No keyring of a remote takes part.
+    ///
+    /// This is the trust for a commit that names no remote. If the directory
+    /// does not exist, the trusted set is empty.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if the directory cannot be listed for a reason other
+    ///   than its absence.
+    /// - The errors of [`from_keyring_files`](GpgVerifier::from_keyring_files)
+    ///   for each keyring file.
     pub fn from_system_trust() -> Result<GpgVerifier> {
         GpgVerifier::from_keyring_files(keyring_files_in(&global_trusted_dir())?)
     }
 
-    /// Add every keyring `paths` names to the trusted set, in the order given.
-    /// A path naming no file is skipped.
+    /// Adds each keyring that `paths` names to the trusted set, in the given
+    /// order. If a path names no file, the load skips it.
     fn add_keyring_files<I, P>(&mut self, paths: I) -> Result<()>
     where
         I: IntoIterator<Item = P>,
@@ -279,15 +375,16 @@ impl GpgVerifier {
         Ok(())
     }
 
-    /// Add one keyring to the trusted set: decode armor, hold the blob to the
-    /// input caps, refuse a keybox, and parse the certificates it carries.
-    /// `subject` names the source, so a refusal states which keyring reached
-    /// which cap.
+    /// Adds one keyring to the trusted set.
     ///
-    /// The extend runs in place. Every constructor calls this on a value it
-    /// owns alone, so the count over the set is one and no certificate is
-    /// copied. A caller holding a second count would extend a copy, which is
-    /// why this stays private.
+    /// The call decodes the armor, applies the input limits, refuses a keybox,
+    /// and parses the certificates of the keyring. `subject` names the source,
+    /// so a refusal states which keyring reached which limit.
+    ///
+    /// The extend runs in place. Each constructor calls this function on a
+    /// value that only it holds. So the count over the set is one, and no
+    /// certificate is copied. A caller with a second count extends a copy, so
+    /// this function stays private.
     fn add_keyring(&mut self, bytes: &[u8], subject: &str) -> Result<()> {
         let binary = keyring_stream(bytes, subject)?;
         let certs = parse_keyring(&binary, subject)?;
@@ -296,9 +393,11 @@ impl GpgVerifier {
     }
 }
 
-/// The binary packet stream one keyring blob carries: armor decoded, the blob
-/// held to [`MAX_KEYRING`], and a GnuPG keybox refused. `subject` names the
-/// source, so a refusal states which keyring reached which cap.
+/// Returns the binary packet stream of one keyring blob.
+///
+/// The call applies [`MAX_KEYRING`], decodes the armor, and refuses a GnuPG
+/// keybox. `subject` names the source, so a refusal states which keyring
+/// reached which limit.
 fn keyring_stream(bytes: &[u8], subject: &str) -> Result<Vec<u8>> {
     if bytes.len() as u64 > MAX_KEYRING {
         return Err(Error::Signature(format!(
@@ -317,14 +416,19 @@ fn keyring_stream(bytes: &[u8], subject: &str) -> Result<Vec<u8>> {
     Ok(binary)
 }
 
-/// The packets a binary OpenPGP stream carries, each as its tag and the byte
-/// range it occupies, together with the length of the prefix that framed.
+/// Returns the packets of a binary OpenPGP stream and the length of the
+/// framed prefix.
 ///
-/// The walk frames each packet with rPGP's own header parser, which is the
-/// parser the packet stream is read with, so a packet boundary here is a packet
-/// boundary there. A header the parser refuses, a length form other than a
-/// fixed one, and a length that runs past the end each stop the walk, and the
-/// reported prefix length then falls short of the input.
+/// Each packet comes as its tag and its byte range. The walk frames each
+/// packet with the header parser of rPGP. The same parser reads the packet
+/// stream, so the packet boundaries are the same in both reads.
+///
+/// These conditions stop the walk, and the prefix length is then shorter than
+/// the input:
+///
+/// - The parser refuses a header.
+/// - A length form is not a fixed length.
+/// - A length goes past the end of the input.
 fn packet_spans(binary: &[u8]) -> (Vec<(Tag, Range<usize>)>, usize) {
     let mut spans: Vec<(Tag, Range<usize>)> = Vec::new();
     let mut at = 0usize;
@@ -347,27 +451,27 @@ fn packet_spans(binary: &[u8]) -> (Vec<(Tag, Range<usize>)>, usize) {
     (spans, at)
 }
 
-/// The certificates a binary keyring stream carries, each as the packets of one
-/// transferable public key with the Trust packets dropped.
+/// Returns the certificates of a binary keyring stream, with no Trust packets.
 ///
-/// A Public-Key packet opens a certificate and every packet up to the next one
-/// belongs to it. A packet standing before the first Public-Key packet belongs
-/// to no certificate, and it is dropped.
+/// Each certificate is the packets of one transferable public key. A
+/// Public-Key packet starts a certificate. Each packet up to the next
+/// Public-Key packet is part of it. A packet before the first Public-Key packet
+/// is part of no certificate, and the call drops it.
 ///
-/// A Trust packet (tag 12) holds a GnuPG-local trust value and carries no part
-/// of a transferable public key, so it is dropped as well. A legacy GnuPG
-/// keyring writes one after the primary key packet, after each user id packet,
-/// and after each signature packet. rPGP's certificate parser reads the packets
-/// of one certificate through runs of tag tests, and a packet of any other tag
-/// ends a run, so a Trust packet standing after the primary key leaves the
-/// certificate with no user id and no subkey. With the Trust packets gone, a
-/// legacy keyring parses to the certificates the `gpg --export` form of the
-/// same keys parses to.
+/// A Trust packet (tag 12) holds a trust value that is local to GnuPG. It is
+/// not part of a transferable public key, so the call also drops it. A legacy
+/// GnuPG keyring writes one after the primary key packet, after each user id
+/// packet, and after each signature packet. The certificate parser of rPGP
+/// reads the packets of one certificate in runs of tag tests. A packet of a
+/// different tag ends a run. So a Trust packet after the primary key gives a
+/// certificate with no user id and no subkey. With no Trust packets, a legacy
+/// keyring parses to the same certificates as the `gpg --export` form of the
+/// same keys.
 ///
-/// `None` where the packet stream does not frame to its end, which is what a
-/// truncated keyring reaches, and which the `ostree` tool refuses as well. The
-/// result is at most as long as the input, which [`keyring_stream`] has already
-/// held to [`MAX_KEYRING`].
+/// Returns `None` if the packet stream does not frame to its end. A truncated
+/// keyring gives this result, and the `ostree` command also refuses such a
+/// keyring. The result is not longer than the input, and [`keyring_stream`]
+/// already applied [`MAX_KEYRING`] to the input.
 fn certificate_chunks(binary: &[u8]) -> Option<Vec<Vec<u8>>> {
     let (spans, framed) = packet_spans(binary);
     if framed != binary.len() {
@@ -388,22 +492,24 @@ fn certificate_chunks(binary: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(chunks)
 }
 
-/// Parse a binary OpenPGP keyring into the certificates it carries, each with
-/// the packets it is made of, holding the result to [`MAX_KEYRING_CERTS`].
+/// Parses a binary OpenPGP keyring into its certificates, each with its
+/// packets.
 ///
-/// The stream is split into one packet run per certificate and each run is
-/// parsed on its own (see [`certificate_chunks`]), so the Trust packets and a
-/// packet standing ahead of the first certificate reach no parser: a legacy
-/// GnuPG keyring and a `gpg --export` stream of the same keys parse to the same
-/// certificates. A keyring carrying no packet parses to no certificate.
+/// The result has the limit [`MAX_KEYRING_CERTS`]. The call splits the stream
+/// into one packet run for each certificate, and parses each run separately
+/// (see [`certificate_chunks`]). So the Trust packets and a packet before the
+/// first certificate go to no parser. A legacy GnuPG keyring and a
+/// `gpg --export` stream of the same keys parse to the same certificates. A
+/// keyring with no packet parses to no certificate.
 ///
-/// A stream that does not frame to its end and a certificate the parser rejects
-/// each fail the read by the name of the source, so a keyring reaches a caller
-/// whole. `subject` names the source, so a refusal states which keyring was
-/// read. Every path that reads a keyring reads it here: a verification load, a
-/// key listing, and both streams of an import.
+/// If the stream does not frame to its end, or the parser refuses a
+/// certificate, the read fails by the name of the source. So a caller gets
+/// only a keyring that was read whole. `subject` names the source, so a
+/// refusal states which keyring was read.
 ///
-/// The parse runs inside [`contained`], since a keyring is untrusted input.
+/// Each read of a keyring goes through this function: a verification load, a
+/// key listing, and both streams of an import. The parse runs inside
+/// [`contained`], because a keyring is untrusted input.
 fn parse_keyring(binary: &[u8], subject: &str) -> Result<Vec<(SignedPublicKey, Vec<u8>)>> {
     let refusal = format!("{subject} is not readable as an OpenPGP keyring: the parser panicked");
     contained(&refusal, || {
@@ -430,14 +536,17 @@ fn parse_keyring(binary: &[u8], subject: &str) -> Result<Vec<(SignedPublicKey, V
     })
 }
 
-/// Run `work`, which reads OpenPGP packets, with a panic inside it converted to
-/// the refusal `refusal` states.
+/// Runs `work`, which reads OpenPGP packets, and changes a panic in it to the
+/// error that `refusal` states.
 ///
-/// A keyring is untrusted input, so every read over one runs here and a caught
-/// panic reads as input the parser rejects. Two limits hold: `catch_unwind`
-/// catches nothing where the final binary is built with `panic = "abort"`, and
-/// it says nothing about a parser that returns a wrong answer without
-/// panicking.
+/// A keyring is untrusted input, so each read of a keyring runs here. A caught
+/// panic gives the same result as input that the parser refuses. Two limits
+/// apply:
+///
+/// - If the final binary is built with `panic = "abort"`, `catch_unwind`
+///   catches nothing.
+/// - The call does not find a parser that returns a wrong answer with no
+///   panic.
 fn contained<T>(refusal: &str, work: impl FnOnce() -> Result<T>) -> Result<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
         Ok(result) => result,
@@ -455,10 +564,10 @@ impl Verifier for GpgVerifier {
             if signatures.is_empty() {
                 return Ok(VerifyOutcome::default());
             }
-            // Public-key cryptography over untrusted input, so it runs on the
-            // blocking pool. The pool holds each input for itself: the payload
-            // and the signature blobs as copies, the trusted set as a
-            // reference count over the one parse.
+            // Public-key cryptography over untrusted input runs on the
+            // blocking pool. The pool gets copies of the payload and the
+            // signature blobs. It also gets a reference count over the one
+            // parse of the trusted set.
             let certs = Arc::clone(&self.certs);
             let payload = data.to_vec();
             let blobs = signatures.to_vec();
@@ -467,70 +576,108 @@ impl Verifier for GpgVerifier {
     }
 }
 
-/// One key in a remote's trusted keyring, as `remote gpg-list-keys` reports it.
+/// One key in the trusted keyring of a remote.
 ///
-/// The fields are what a certificate states about its primary key: the
-/// fingerprint, the instant it was created, and its user ids in listing order.
-/// Subkeys are not reported on their own; a subkey's parent carries it.
+/// The fields are the data that a certificate states about its primary key,
+/// as `ostree remote gpg-list-keys` reports them. These are the fingerprint,
+/// the creation time, and the user ids in listing order. A subkey has no
+/// record of its own. The record of its primary key represents it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpgKey {
     /// The primary key fingerprint, uppercase hex.
     pub fingerprint: String,
-    /// When the key was created, in seconds since the Unix epoch.
+    /// The creation time of the key, in seconds since the Unix epoch.
+    ///
+    /// `None` if the certificate states the time `0`.
     pub created: Option<u64>,
     /// The user ids bound to the key, in listing order.
     pub user_ids: Vec<String>,
 }
 
+/// Methods that manage the GPG keyring of a remote.
 impl Repo {
-    /// Import the OpenPGP certificates `keys` holds into `remote`'s trusted
-    /// keyring, `<remote>.trustedkeys.gpg`, and report how many the keyring did
-    /// not already hold.
+    /// Imports OpenPGP certificates into the trusted keyring of `remote`.
     ///
-    /// `keys` is a binary or ASCII-armored certificate stream, which is what an
-    /// exported public keyring is. With `key_ids` non-empty only the keys those
-    /// selectors name are imported (a fingerprint, a key id, or a user id
-    /// substring); a selector that names nothing in `keys` fails the import and
-    /// the keyring is left as it was, as does a `keys` holding no certificate.
+    /// The keyring is `<remote>.trustedkeys.gpg` at the repository root.
+    /// `keys` is a binary or ASCII-armored certificate stream, as an exported
+    /// public keyring is. The call returns the number of certificates that the
+    /// keyring did not already hold.
     ///
-    /// The keyring is replaced atomically at the repository root. It keeps the
-    /// packet stream it already held and carries the packets of each added
-    /// certificate as `keys` wrote them, with the Trust packets dropped (see
-    /// `merge_offered`). It is written in the binary form, so an armored
-    /// keyring keeps its packets and loses its armor.
+    /// If `key_ids` is not empty, the call imports only the keys that these
+    /// selectors name. A selector is a fingerprint, a key id, or a user id
+    /// substring.
     ///
-    /// A certificate for a key the keyring already holds is left as the keyring
-    /// holds it, and is counted as a key the keyring already held. So a new user
-    /// id or a new subkey for a held key reaches the keyring through
-    /// [`Repo::remove_remote_keyring`] and a fresh import, and not through a
-    /// second call here. `docs/conformance/cli-surface.md`, "P3", records what
-    /// the `ostree` tool does instead.
+    /// # Import rules
     ///
-    /// A key revocation and a later key expiry are the exceptions. A
-    /// certificate carrying a key revocation signature that verifies under the
-    /// key it revokes replaces the held certificate, so a revoked key stops
-    /// speaking for the remote. A certificate stating a later key expiry than
-    /// the held one states, an absent expiry counting as later than any instant,
-    /// replaces it as well, so a key whose owner has extended its life speaks
-    /// again. Each replacement rewrites the keyring and drops the Trust packets
-    /// it carried (see `merge_offered`), and the key is still counted as one
-    /// the keyring already held. The offered stream and the keyring the remote
-    /// already holds reach one keyring reader, so a keyring carrying bytes past
-    /// its last framed packet is refused by the name of the keyring, which
-    /// leaves the keyring as it was.
+    /// The call replaces the keyring atomically. The keyring keeps the packet
+    /// stream that it already held. The packets of each added certificate
+    /// follow, as `keys` wrote them, with no Trust packets. The keyring is
+    /// written in the binary form, so an armored keyring keeps its packets and
+    /// loses its armor. `gpg` and the `ostree` command both read a keyring of
+    /// this form.
     ///
-    /// A bare revocation certificate carries no public-key packet
-    /// and holds no certificate, so it is refused; the re-export of the revoked
-    /// key is the stream that carries a revocation in.
+    /// If the keyring already holds a key, the call keeps the certificate of
+    /// that key as it is, and counts the key as already held. So a new user id
+    /// or a new subkey of a held key gets into the keyring only through
+    /// [`Repo::remove_remote_keyring`] and a new import. The `ostree` command
+    /// merges the offered user ids, signatures, and subkeys into the held
+    /// certificate. Both report `Imported 0 GPG keys`.
     ///
-    /// The call takes the repository lock shared and then the update lock, as
-    /// [`Repo::begin_update`] does, and reads, merges, and writes the keyring
-    /// under both, so two imports into one keyring keep the keys of both. Each
-    /// of the two waits fails with [`Error::LockTimeout`] after
-    /// `lock-timeout-secs`. A caller that holds an
-    /// [`UpdateGuard`](crate::UpdateGuard) of this repository waits for its own
-    /// guard until the timeout, and with `lock-timeout-secs=-1` it waits
-    /// forever.
+    /// Two statements are exceptions. Each one replaces the held certificate:
+    ///
+    /// - A key revocation signature that verifies under the key that it
+    ///   revokes, or under a designated revoker of that key. So a revoked key
+    ///   stops speaking for the remote.
+    /// - A key expiry that is later than the expiry of the held certificate.
+    ///   An absent expiry is later than any instant. So a key whose owner
+    ///   extended its life speaks again.
+    ///
+    /// The call looks for a designated revoker in all certificates of the
+    /// offered stream and of the keyring. Each replacement writes the keyring
+    /// again, with no Trust packets, and the count still treats the key as
+    /// already held. A bare revocation certificate holds no public-key packet
+    /// and no certificate, so the call refuses it. The re-export of the revoked
+    /// key is the stream that brings a revocation in.
+    ///
+    /// The offered stream is untrusted input. It has
+    /// [the limits of a keyring](GpgVerifier#limits-of-a-keyring). The offered
+    /// stream and the keyring of the remote both go through the reader of a
+    /// verification load. So if either stream does not frame to its end, the
+    /// import fails, and the keyring does not change.
+    ///
+    /// # Locks
+    ///
+    /// The call takes the repository lock shared, as
+    /// [`LockKind`](crate::LockKind) describes. It then takes the update lock,
+    /// as [`Repo::begin_update`] does. It reads, merges, and writes the keyring
+    /// under both locks, so two imports into one keyring keep the keys of
+    /// both. The call parses the offered stream before it takes the locks.
+    /// [`UpdateGuard`](crate::UpdateGuard) describes a caller that holds a
+    /// guard of this repository.
+    ///
+    /// # Errors
+    ///
+    /// For each error, the keyring does not change. The one exception is a
+    /// failed sync of the repository directory, which comes after the rename
+    /// of the new keyring.
+    ///
+    /// - [`Error::Signature`] if `keys` or the keyring is over 4 MiB, holds
+    ///   more than 256 certificates, or is a GnuPG keybox.
+    /// - [`Error::Signature`] if `keys` or the keyring does not parse as an
+    ///   OpenPGP keyring.
+    /// - [`Error::Signature`] if `keys` holds no certificate, or a selector in
+    ///   `key_ids` names no key in `keys`.
+    /// - [`Error::Signature`] if an armored stream is not valid UTF-8.
+    /// - [`Error::Core`] if the armor of a stream holds text that is not valid
+    ///   base64.
+    /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or
+    ///   `[core] lock-timeout-secs` has a value that does not parse.
+    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is less than
+    ///   `-1`.
+    /// - [`Error::LockTimeout`] if the wait for a lock passes
+    ///   `[core] lock-timeout-secs`.
+    /// - [`Error::Io`] if a lock file, the read of the keyring, the write of
+    ///   the keyring, or the sync of the repository directory fails.
     pub async fn gpg_import_keys(
         &self,
         remote: &str,
@@ -557,7 +704,21 @@ impl Repo {
         .await
     }
 
-    /// The keys `remote`'s trusted keyring holds. An absent keyring holds none.
+    /// Returns the keys in the trusted keyring of `remote`.
+    ///
+    /// The keyring is `<remote>.trustedkeys.gpg` at the repository root. The
+    /// keys come in the order of their certificates in the keyring. If the
+    /// keyring does not exist, the list is empty.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] if the keyring is over 4 MiB, is a GnuPG keybox,
+    ///   holds more than 256 certificates, or does not parse as an OpenPGP
+    ///   keyring.
+    /// - [`Error::Signature`] if an armored keyring is not valid UTF-8.
+    /// - [`Error::Core`] if the armor of the keyring holds text that is not
+    ///   valid base64.
+    /// - [`Error::Io`] if the read of the keyring fails.
     pub async fn gpg_list_keys(&self, remote: &str) -> Result<Vec<GpgKey>> {
         let name = remote_keyring_name(remote);
         let Some(keyring) = self.read_root_file(&name).await? else {
@@ -568,9 +729,10 @@ impl Repo {
     }
 }
 
-/// Merge the certificates `offered` holds into the keyring `existing` holds and
-/// report how many certificates the keyring did not already hold, as one
-/// import does: [`read_offered`] and then [`merge_offered`].
+/// Merges the certificates of `offered` into the keyring `existing`, as one
+/// import does, and returns the number of new certificates.
+///
+/// The call runs [`read_offered`] and then [`merge_offered`].
 #[cfg(test)]
 fn merge_keyring(
     existing: &[u8],
@@ -581,29 +743,33 @@ fn merge_keyring(
     merge_offered(existing, read_offered(offered, key_ids, subject), subject)
 }
 
-/// The offered stream of an import, read by [`read_offered`] before the
-/// keyring under edit is read.
+/// The offered stream of an import.
+///
+/// [`read_offered`] reads it before the read of the keyring that the import
+/// changes.
 enum OfferedKeys {
-    /// The stream is refused before its packets are read: it is over
-    /// [`MAX_KEYRING`], it does not dearmor, or it is a keybox.
+    /// A stream that is refused before the read of its packets. It is over
+    /// [`MAX_KEYRING`], its armor does not decode, or it is a keybox.
     Refused(Error),
     /// The packets of the stream: each certificate with its packets, and the
-    /// indices of the certificates the selectors take. `Err` holds the
-    /// refusal of the read, of a stream that holds no certificate, or of a
-    /// selector.
+    /// indices of the certificates that the selectors take.
+    ///
+    /// `Err` holds the refusal of the read, of a stream with no certificate,
+    /// or of a selector.
     Read(Result<OfferedCerts>),
 }
 
-/// Each certificate of an offered stream with its packets, and the indices
-/// of the certificates the selectors take, in selection order.
+/// The certificates of an offered stream with their packets, and the indices
+/// of the selected certificates in selection order.
 type OfferedCerts = (Vec<(SignedPublicKey, Vec<u8>)>, Vec<usize>);
 
-/// Read the offered stream of an import into the keyring `subject` names,
-/// and select the certificates `key_ids` name. The call needs no byte of the
-/// keyring, so an import runs it before it takes the locks.
-/// [`merge_offered`] reports each refusal at the point where the merge of
-/// the two streams reaches it, so the result of an import does not depend on
-/// where the stream was read.
+/// Reads the offered stream of an import into the keyring that `subject`
+/// names, and selects the certificates that `key_ids` names.
+///
+/// The call uses no byte of the keyring, so an import runs it before it takes
+/// the locks. [`merge_offered`] reports each refusal at the point where the
+/// merge of the two streams gets to it. So the result of an import does not
+/// change with the place where the stream was read.
 fn read_offered(offered: &[u8], key_ids: &[String], subject: &str) -> OfferedKeys {
     let source = "the keyring to import";
     let stream = match keyring_stream(offered, source) {
@@ -623,46 +789,48 @@ fn read_offered(offered: &[u8], key_ids: &[String], subject: &str) -> OfferedKey
     }))
 }
 
-/// Merge the certificates of `offered`, which [`read_offered`] read, into the
-/// keyring `existing` holds and report how many certificates the keyring did
-/// not already hold.
+/// Merges the certificates of `offered` into the keyring `existing`, and
+/// returns the number of new certificates.
 ///
-/// The packet stream `existing` carries is kept as it stands and the packets of
-/// each certificate the keyring does not hold are appended, so a keyring another
-/// implementation wrote keeps its own packets and an added certificate stands as
-/// the offered stream wrote it. The result is a binary packet stream: an armored
-/// `existing` decodes to the packets it holds, the merge keeps those packets,
-/// and the result carries no armor. The keyring carries no Trust packet of this
-/// import's making.
+/// [`read_offered`] read `offered`. The call keeps the packet stream of
+/// `existing` as it is, and appends the packets of each certificate that the
+/// keyring does not hold. So a keyring that a different implementation wrote
+/// keeps its own packets. An added certificate is as the offered stream wrote
+/// it. The result is a binary packet stream with no armor. An armored
+/// `existing` decodes to its packets, and the merge keeps these packets. This
+/// import adds no Trust packet to the keyring.
 ///
-/// A certificate whose fingerprint the keyring already holds is left as the
-/// keyring holds it, with two exceptions, each of which replaces the held
-/// certificate with the offered one (see [`replaces`]): an offered certificate
-/// carrying a key revocation that verifies, so a revoked key stops speaking for
-/// the remote, and an offered certificate stating a later key expiry, so a key
-/// whose owner has extended its life speaks again. A designated revoker is
-/// resolved among every certificate the two streams hold, so a revocation such
-/// a revoker made carries in where either stream states the revoker (see
-/// [`KeyState`]). The replacement rewrites the
-/// keyring, since a keyring is a run of packets per certificate and a signature
-/// written at the end of the stream would attach to the last certificate in it,
-/// and the rewrite drops the Trust packets the keyring carried (see
-/// [`replace_certificates`]). Either way the certificate is counted as a key the
-/// keyring already held.
+/// If the keyring already holds a fingerprint, the call keeps that
+/// certificate as it is. Two exceptions replace the held certificate with the
+/// offered one (see [`replaces`]):
 ///
-/// The same two rules hold inside one offered stream: where a stream carries
-/// several states of one key, the first state stands unless a later one revokes
-/// the key or states a later expiry, and the key is counted once.
+/// - An offered certificate with a key revocation that verifies. So a revoked
+///   key stops speaking for the remote.
+/// - An offered certificate with a later key expiry. So a key whose owner
+///   extended its life speaks again.
 ///
-/// Each stream is read with [`parse_keyring`], the reader a verification load
-/// uses, so each of them frames to its end. A keyring carrying bytes past its
-/// last framed packet fails the merge by its own name, and the file keeps the
-/// bytes it held.
+/// The call looks for a designated revoker in all certificates of the two
+/// streams. So a revocation by such a revoker gets in if either stream
+/// states the revoker (see [`KeyState`]). The replacement writes the keyring
+/// again, because a keyring is one run of packets for each certificate. A
+/// signature at the end of the stream attaches to the last certificate in it.
+/// The new keyring has no Trust packets (see [`replace_certificates`]). In all
+/// cases, the count treats the certificate as already held.
 ///
-/// Both streams are untrusted input, so each is held to [`MAX_KEYRING`] and to
-/// [`MAX_KEYRING_CERTS`], a keybox is refused, and every packet read runs inside
-/// [`contained`]. `subject` names the keyring the repository holds, so a refusal
-/// over it states which file was read.
+/// The same two rules apply inside one offered stream. If a stream holds
+/// several states of one key, the first state applies. A later state replaces
+/// it only if it revokes the key or states a later expiry. The count includes
+/// the key once.
+///
+/// [`parse_keyring`], the reader of a verification load, reads each stream. So
+/// each stream must frame to its end. If a keyring holds bytes after its last
+/// framed packet, the merge fails by the name of the keyring, and the file
+/// keeps its bytes.
+///
+/// Both streams are untrusted input. So each one has the limits
+/// [`MAX_KEYRING`] and [`MAX_KEYRING_CERTS`], the call refuses a keybox, and
+/// each packet read runs inside [`contained`]. `subject` names the keyring of
+/// the repository, so a refusal states which file was read.
 fn merge_offered(existing: &[u8], offered: OfferedKeys, subject: &str) -> Result<(usize, Vec<u8>)> {
     let source = "the keyring to import";
     let mut keyring = keyring_stream(existing, subject)?;
@@ -672,10 +840,10 @@ fn merge_offered(existing: &[u8], offered: OfferedKeys, subject: &str) -> Result
     };
     let refusal = format!("{source} cannot be merged into {subject}: the parser panicked");
     let (imported, rewritten, appended) = contained(&refusal, || {
-        // The certificate runs the keyring holds, in the order they stand in,
-        // and the state of every key it holds, by fingerprint. A keyring
-        // holding one key through two certificates answers once here, over both
-        // of them, which is the reach the verify path gives them.
+        // The certificate runs of the keyring in their order, and the state
+        // of each key in it, by fingerprint. If the keyring holds one key in
+        // two certificates, the key has one state over both. The verify path
+        // reads the two certificates in the same way.
         let mut runs: Vec<(String, Vec<u8>)> = Vec::new();
         let mut copies: BTreeMap<String, Vec<SignedPublicKey>> = BTreeMap::new();
         for (cert, packets) in parse_keyring(&keyring, subject)? {
@@ -684,9 +852,9 @@ fn merge_offered(existing: &[u8], offered: OfferedKeys, subject: &str) -> Result
             copies.entry(fingerprint).or_default().push(cert);
         }
         let (offered, selected) = offered?;
-        // The set a designated revoker is resolved among: every certificate the
-        // two streams hold, whatever key each of them states and whether or not
-        // the selector names it (see [`KeyState`]).
+        // The set in which the call looks for a designated revoker. It holds
+        // all certificates of the two streams, for all keys, with or without a
+        // selector match (see [`KeyState`]).
         let known: Vec<&SignedPublicKey> = copies
             .values()
             .flatten()
@@ -696,8 +864,8 @@ fn merge_offered(existing: &[u8], offered: OfferedKeys, subject: &str) -> Result
             .iter()
             .map(|(fingerprint, copies)| (fingerprint.clone(), KeyState::over(copies, &known)))
             .collect();
-        // The certificates to append, in append order, each with the state it
-        // states, and the held certificates a replacement rewrites.
+        // The certificates to append, in append order, each with its state,
+        // and the held certificates that a replacement writes again.
         let mut added: Vec<(String, KeyState, Vec<u8>)> = Vec::new();
         let mut replaced: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut imported = 0;
@@ -738,53 +906,61 @@ fn merge_offered(existing: &[u8], offered: OfferedKeys, subject: &str) -> Result
     Ok((imported, keyring))
 }
 
-/// What the certificates for one key state about it.
+/// The statements of the certificates of one key about that key.
 #[derive(Clone, Copy)]
 struct KeyState {
-    /// Whether a verified key revocation signature stands over the key: one the
-    /// key itself made, or one a key the certificate designates as a revoker
-    /// made, where the certificate of that revoker is among the ones the import
-    /// knows.
+    /// `true` if a verified key revocation signature applies to the key.
     ///
-    /// A revocation is read through the verify engine, so the import reads the
-    /// signature the verdict reads. The engine resolves a designated revoker
-    /// among the certificates it is given, and the import gives it every
-    /// certificate the two streams it was handed hold: the certificates of the
-    /// keyring under edit and the certificates of the offered stream. A
-    /// selector governs what the import writes and not what it knows, so a
-    /// certificate the selector leaves out still resolves a revoker.
+    /// The key itself made the signature, or a designated revoker of the
+    /// certificate made it. A designated revoker counts only if its
+    /// certificate is among the certificates that the import knows.
     ///
-    /// Two states stand outside that set, and in each of them the keyring keeps
-    /// trusting a key the `ostree` tool's own keyring stops trusting
-    /// (`docs/conformance/cli-surface.md`, "P3"): a revoker whose certificate
-    /// stands in the global trusted directory or in a `gpgkeypath` entry rather
-    /// than in the keyring under edit, and a revoker imported after the
-    /// revocation was offered. The import is a function of the two byte streams
-    /// it is given, so one import writes the same bytes on every host, and it
-    /// writes no revocation it cannot verify, so an offered keyring is no way
-    /// to strike a held certificate out.
+    /// The import reads a revocation through the verify engine, so the import
+    /// and the verdict read the same signature. The engine looks for a
+    /// designated revoker in the certificates that it gets. The import gives it
+    /// all certificates of its two streams: the keyring that the import
+    /// changes, and the offered stream. A selector controls what the import
+    /// writes, and has no effect on what it knows. So a certificate that the
+    /// selector leaves out still identifies a revoker.
+    ///
+    /// Two states are outside that set. In each one, the keyring keeps the
+    /// trust in a key, and the keyring of the `ostree` command stops the trust
+    /// in it. This is a divergence:
+    ///
+    /// - The certificate of the revoker is in the global trusted directory or
+    ///   in a `gpgkeypath` entry, and not in the keyring that the import
+    ///   changes.
+    /// - The revoker is imported after the revocation was offered.
+    ///
+    /// The import is a function of its two byte streams only. So one import
+    /// writes the same bytes on each host. It writes no revocation that it
+    /// cannot verify, so an offered keyring cannot remove a held certificate.
     revoked: bool,
-    /// The instant the key expires at, absent where they state no expiry. The
-    /// instant is read through the verify engine, so the import and the verdict
-    /// answer off the same signature.
+    /// The expiry instant of the key, or `None` if the certificates state no
+    /// expiry.
+    ///
+    /// The import reads the instant through the verify engine, so the import
+    /// and the verdict use the same signature.
     expires: Option<u64>,
 }
 
 impl KeyState {
-    /// What `cert` states, with a designated revoker resolved among `known`.
+    /// Returns the state that `cert` gives, with designated revokers looked up
+    /// in `known`.
     fn of(cert: &SignedPublicKey, known: &[&SignedPublicKey]) -> KeyState {
         KeyState::over(std::slice::from_ref(cert), known)
     }
 
-    /// What the copies of one certificate state together: a revocation any copy
-    /// carries, and the key expiry the newest self-signature of the union
-    /// states. This is the reach the verify path gives a keyring that holds one
-    /// key through several certificates.
+    /// Returns the state that the copies of one certificate give together.
     ///
-    /// `known` is the set a designated revoker is resolved among, which is the
-    /// reach [`KeyState::revoked`] states. The copies of the key under decision
-    /// are one thing and that set is another: a revocation stands over the key
-    /// these copies state, and the revoker is a key of its own.
+    /// The state holds a revocation in any copy, and the key expiry of the
+    /// newest self-signature of the union. The verify path reads a keyring
+    /// with one key in several certificates in the same way.
+    ///
+    /// `known` is the set in which the call looks for a designated revoker, as
+    /// [`KeyState::revoked`] describes. The copies and `known` are two
+    /// different sets. A revocation applies to the key of the copies, and the
+    /// revoker is a different key.
     fn over(copies: &[SignedPublicKey], known: &[&SignedPublicKey]) -> KeyState {
         KeyState {
             revoked: copies
@@ -795,35 +971,37 @@ impl KeyState {
     }
 }
 
-/// Whether an offered certificate stating `offered` replaces a held
-/// certificate stating `held`.
+/// Returns `true` if an offered certificate with the state `offered` replaces
+/// a held certificate with the state `held`.
 ///
-/// Two statements are carried into a held certificate, and each of them is one
-/// the keyring has no other way to take in:
+/// Two statements go into a held certificate. The keyring has no other way to
+/// get either of them:
 ///
-/// - a key revocation the held certificate does not carry. A revocation is
-///   permanent, so a keyring holding a certificate that states none takes it;
-/// - a key expiry later than the held certificate states, where an absent
-///   expiry counts as later than any instant. An expiry is renewable, so a held
-///   certificate can state a lifetime the key's owner has replaced.
+/// - A key revocation that the held certificate does not have. A revocation
+///   is permanent, so a keyring whose certificate states no revocation takes
+///   it.
+/// - A key expiry later than the expiry of the held certificate. An absent
+///   expiry is later than any instant. An expiry is renewable, so a held
+///   certificate can state a lifetime that the owner of the key replaced.
 ///
 /// A held certificate that revokes its key takes no expiry replacement. The
-/// replacement writes the offered packets where the held run stood, so an
-/// offered certificate carrying no revocation would leave the keyring stating
-/// none.
+/// replacement writes the offered packets in the place of the held run. An
+/// offered certificate with no revocation in that place removes the revocation
+/// from the keyring, so this rule prevents it.
 ///
-/// Two consequences follow from the direction of the expiry rule. A shortened
-/// expiry does not reach the keyring. An older certificate that states a longer
-/// expiry replaces a shorter statement the keyring holds.
+/// The direction of the expiry rule has two results. A shorter expiry does not
+/// get into the keyring. An older certificate with a longer expiry replaces a
+/// shorter expiry in the keyring.
 fn replaces(held: &KeyState, offered: &KeyState) -> bool {
     let revocation = offered.revoked && !held.revoked;
     let extension = !held.revoked && states_later(offered.expires, held.expires);
     revocation || extension
 }
 
-/// Whether `offered` states a later key expiry than `held`. An absent instant
-/// is the later statement, since a key stating no expiry outlives one that
-/// states any instant.
+/// Returns `true` if `offered` states a later key expiry than `held`.
+///
+/// An absent instant is the later statement, because a key with no expiry
+/// lives longer than a key with an expiry instant.
 fn states_later(offered: Option<u64>, held: Option<u64>) -> bool {
     match (offered, held) {
         (None, Some(_)) => true,
@@ -832,17 +1010,17 @@ fn states_later(offered: Option<u64>, held: Option<u64>) -> bool {
     }
 }
 
-/// The keyring the certificate runs `runs` hold, with the run of each
-/// fingerprint `replaced` names written as those packets state it.
+/// Returns the keyring of the certificate runs `runs`, with the packets of
+/// `replaced` in the place of the run of each fingerprint that it names.
 ///
-/// A keyring is a run of packets per certificate, so a certificate is replaced
-/// where it stands and every other run passes through as it stands. A keyring
-/// holding one key through two runs takes the replacement in both, which leaves
-/// the offered packets twice over and the key in the state those packets state.
+/// A keyring is one run of packets for each certificate. So the call replaces
+/// a certificate in its position, and copies each other run as it is. If a
+/// keyring holds one key in two runs, the call replaces both. The offered
+/// packets then occur two times, and the key has the state of these packets.
 ///
 /// `runs` comes from [`parse_keyring`], which drops the Trust packets and a
-/// packet standing ahead of the first Public-Key packet: the keyring the rewrite
-/// writes is of the same form the import writes for a certificate it adds.
+/// packet before the first Public-Key packet. So the new keyring has the same
+/// form that the import writes for an added certificate.
 fn replace_certificates(
     runs: &[(String, Vec<u8>)],
     replaced: &BTreeMap<String, Vec<u8>>,
@@ -854,9 +1032,11 @@ fn replace_certificates(
     rewritten
 }
 
-/// The offered certificates `key_ids` names, by index, in selector order. An
-/// empty `key_ids` names every offered certificate, and a selector that names
-/// none is refused by name, which leaves the keyring as it was.
+/// Returns the indices of the offered certificates that `key_ids` names, in
+/// selector order.
+///
+/// An empty `key_ids` names all offered certificates. If a selector names no
+/// certificate, the call refuses it by name, and the keyring does not change.
 fn select_keys(offered: &[(SignedPublicKey, Vec<u8>)], key_ids: &[String]) -> Result<Vec<usize>> {
     if key_ids.is_empty() {
         return Ok((0..offered.len()).collect());
@@ -879,12 +1059,12 @@ fn select_keys(offered: &[(SignedPublicKey, Vec<u8>)], key_ids: &[String]) -> Re
     Ok(selected)
 }
 
-/// Whether `selector` names `cert`.
+/// Returns `true` if `selector` names `cert`.
 ///
-/// A selector names a key, a user id, or nothing, per [`read_selector`]. A key
-/// selector is read over the primary key and over every subkey; a user id
-/// selector is a case-insensitive substring of one of the certificate's user
-/// ids, folded over ASCII alone.
+/// A selector names a key, a user id, or nothing, as [`read_selector`] reads
+/// it. A key selector applies to the primary key and to each subkey. A user id
+/// selector is a substring of a user id of the certificate. The match ignores
+/// case for ASCII letters only.
 fn selector_matches(cert: &SignedPublicKey, selector: &str) -> bool {
     match read_selector(selector) {
         Selector::Key(hex) => {
@@ -903,9 +1083,9 @@ fn selector_matches(cert: &SignedPublicKey, selector: &str) -> bool {
     }
 }
 
-/// What a `KEY-ID` selector names.
+/// The item that a `KEY-ID` selector names.
 enum Selector {
-    /// A key, by the lowercase hex a key id or a fingerprint holds.
+    /// A key, by the lowercase hex of a key id or a fingerprint.
     Key(String),
     /// A substring of a user id, ASCII-lowercased.
     UserId(String),
@@ -913,34 +1093,34 @@ enum Selector {
     Nothing,
 }
 
-/// What `selector` names, read as `gpg --export` reads a key name.
+/// Returns the item that `selector` names, as `gpg --export` reads a key name.
 ///
-/// Measured against `gpg` 2.4.9 over `gpg --export -- <selector>`, where a
-/// selector read as a key exports nothing when no key answers to it and a
-/// selector read as a user id substring exports the key whose user id holds it:
+/// These rules come from `gpg --export -- <selector>` on `gpg` 2.4.9. If no key
+/// matches a key selector, the export is empty. A user id selector exports the
+/// key whose user id holds the substring.
 ///
-/// - Hex digits alone name a key at five lengths: 8 digits a short key id, 16 a
-///   key id, and 32, 40, or 64 a fingerprint. Any other length is a user id
-///   substring -- `0123456789ab` exports the key whose user id holds those
-///   twelve digits.
-/// - A `0x` prefix names a key and never a user id: `0xhello` reports
+/// - Hex digits only name a key at five lengths. 8 digits are a short key id,
+///   16 a key id, and 32, 40, or 64 a fingerprint. Each other length is a
+///   user id substring. `0123456789ab` exports the key whose user id holds
+///   these twelve digits.
+/// - A `0x` prefix names a key, and never a user id. `0xhello` reports
 ///   `key "0xhello" not found: Invalid user ID` over a certificate whose user id
-///   holds `0xhello`. The prefix is read in lower case alone, so `0X1234` is a
-///   user id substring and exports the key whose user id holds `0X1234`.
-/// - Interior spaces are admitted in one shape, the printed v4 fingerprint: ten
-///   groups of four hex digits with one space between them. Every other spaced
-///   shape is a user id substring -- forty hex digits in groups of two, and
-///   thirty-two or sixty-four in groups of four, each export the key whose user
-///   id holds them, and a `0x` prefix with a space reports `Invalid user ID`.
-/// - Leading and trailing whitespace around a key selector is dropped, and
-///   leading whitespace before a user id selector is dropped as well.
-/// - A selector holding no character other than whitespace names nothing:
+///   holds `0xhello`. Only the lower-case prefix counts. So `0X1234` is a user
+///   id substring, and exports the key whose user id holds `0X1234`.
+/// - Interior spaces are allowed in one shape only, the printed v4
+///   fingerprint: ten groups of four hex digits with one space between them.
+///   Each other spaced shape is a user id substring. Forty hex digits in groups
+///   of two, and 32 or 64 in groups of four, each export the key whose user id
+///   holds them. A `0x` prefix with a space reports `Invalid user ID`.
+/// - The read drops white space before and after a key selector. It also drops
+///   white space before a user id selector.
+/// - A selector that holds only white space names nothing.
 ///   `gpg --export -- ''` reports `key "" not found: Invalid user ID`.
-/// - The user id search folds ASCII case alone. Over the user id `Ärger`,
-///   `ÄRGER` exports the key and `ärger` exports nothing.
+/// - The user id search ignores case for ASCII letters only. Over the user id
+///   `Ärger`, `ÄRGER` exports the key and `ärger` exports nothing.
 fn read_selector(selector: &str) -> Selector {
-    // `gpg` reads a space and a tab as the whitespace it drops, and no other
-    // character, so a selector opening with one of those loses it here.
+    // `gpg` drops a space and a tab as white space, and no other character.
+    // So the read drops these characters at the start of a selector.
     let space = |c: char| c == ' ' || c == '\t';
     let head = selector.trim_start_matches(space);
     if let Some(rest) = head.strip_prefix("0x") {
@@ -959,15 +1139,15 @@ fn read_selector(selector: &str) -> Selector {
     Selector::UserId(head.to_ascii_lowercase())
 }
 
-/// The lowercase hex `text` holds, where it is hex digits alone of a key id's or
-/// a fingerprint's length.
+/// Returns the lowercase hex of `text` if `text` is hex digits only, with the
+/// length of a key id or a fingerprint.
 fn key_hex(text: &str) -> Option<String> {
     let named = matches!(text.len(), 8 | 16 | 32 | 40 | 64);
     (named && text.chars().all(|c| c.is_ascii_hexdigit())).then(|| text.to_ascii_lowercase())
 }
 
-/// The lowercase hex a printed v4 fingerprint holds: ten groups of four hex
-/// digits with one space between them.
+/// Returns the lowercase hex of a printed v4 fingerprint: ten groups of four
+/// hex digits with one space between them.
 fn spaced_fingerprint(text: &str) -> Option<String> {
     let groups: Vec<&str> = text.split(' ').collect();
     let shaped = groups.len() == 10
@@ -977,7 +1157,7 @@ fn spaced_fingerprint(text: &str) -> Option<String> {
     shaped.then(|| groups.concat().to_ascii_lowercase())
 }
 
-/// Whether one key answers to the hex a key selector holds.
+/// Returns `true` if one key matches the hex of a key selector.
 fn key_matches<K: KeyDetails>(key: &K, hex: &str) -> bool {
     let id = key.legacy_key_id().to_string();
     match hex.len() {
@@ -987,13 +1167,14 @@ fn key_matches<K: KeyDetails>(key: &K, hex: &str) -> bool {
     }
 }
 
-/// The primary key fingerprint of a certificate, uppercase hex.
+/// Returns the primary key fingerprint of a certificate, in uppercase hex.
 fn fingerprint_hex(cert: &SignedPublicKey) -> String {
     format!("{:X}", cert.fingerprint())
 }
 
-/// The keys a keyring holds, in the order its certificates stand in. The read
-/// runs inside [`contained`], since a keyring is untrusted input.
+/// Returns the keys of a keyring, in the order of its certificates.
+///
+/// The read runs inside [`contained`], because a keyring is untrusted input.
 fn keyring_keys(keyring: &[u8], subject: &str) -> Result<Vec<GpgKey>> {
     let binary = keyring_stream(keyring, subject)?;
     let refusal = format!("{subject} is not readable as an OpenPGP keyring: the parser panicked");
@@ -1018,10 +1199,12 @@ fn keyring_keys(keyring: &[u8], subject: &str) -> Result<Vec<GpgKey>> {
     })
 }
 
-/// Decode ASCII-armored OpenPGP data (RFC 4880 radix-64) into the binary
-/// packet stream, concatenating every armored block found. Binary input
-/// passes through unchanged. The optional armor headers and the `=XXXX`
-/// checksum line are skipped.
+/// Decodes ASCII-armored OpenPGP data (RFC 4880 radix-64) into the binary
+/// packet stream.
+///
+/// The result is the concatenation of all armored blocks. Binary input comes
+/// back with no change. The call skips the optional armor headers and the
+/// `=XXXX` checksum line.
 fn dearmor(bytes: &[u8]) -> Result<Vec<u8>> {
     let is_armored = bytes
         .iter()
@@ -1049,14 +1232,14 @@ fn dearmor(bytes: &[u8]) -> Result<Vec<u8>> {
                     in_headers = false;
                     continue;
                 }
-                // An armor header is `Key: Value`; a line without a colon is
-                // already body (the blank separator was absent).
+                // An armor header is `Key: Value`. A line with no colon is
+                // body, because the blank separator line is absent.
                 if line.contains(':') {
                     continue;
                 }
                 in_headers = false;
             }
-            // The `=XXXX` line is the radix-64 checksum, not body.
+            // The `=XXXX` line is the radix-64 checksum. It is not body.
             if line.starts_with('=') {
                 continue;
             }
@@ -1067,9 +1250,11 @@ fn dearmor(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// The directory of keyrings trusted for every remote: the value of the
-/// `OSTREE_GPG_HOME` environment variable when set to a non-empty value,
-/// otherwise the system `/usr/share/ostree/trusted.gpg.d` directory.
+/// Returns the directory of the keyrings that every remote trusts.
+///
+/// If the `OSTREE_GPG_HOME` environment variable has a value that is not
+/// empty, the result is this value. If not, the result is the system directory
+/// `/usr/share/ostree/trusted.gpg.d`.
 fn global_trusted_dir() -> PathBuf {
     match std::env::var_os(OSTREE_GPG_HOME_ENV) {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
@@ -1077,8 +1262,9 @@ fn global_trusted_dir() -> PathBuf {
     }
 }
 
-/// The `*.gpg` keyring files in `dir`, sorted by name. A missing directory
-/// yields an empty list rather than an error.
+/// Returns the `*.gpg` keyring files in `dir`, sorted by name.
+///
+/// If the directory does not exist, the result is an empty list.
 fn keyring_files_in(dir: &Path) -> Result<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -1097,10 +1283,13 @@ fn keyring_files_in(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// The keyring files the entries of a keyring path name, in entry order: an
-/// entry naming a file gives that file, and an entry naming a directory gives
-/// the `*.gpg` keyrings in it, sorted by name. An entry that cannot be read is
-/// refused by `key`, the configuration key it comes from, and by its own text.
+/// Returns the keyring files that the entries of a keyring path name, in
+/// entry order.
+///
+/// An entry that names a file gives that file. An entry that names a directory
+/// gives the `*.gpg` keyrings in it, sorted by name. If an entry cannot be
+/// read, the refusal names `key`, the configuration key of the entry, and the
+/// text of the entry.
 fn keypath_files(key: &str, keypath: &[String]) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for entry in keypath {
@@ -1116,21 +1305,23 @@ fn keypath_files(key: &str, keypath: &[String]) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// The public certificate of the key `fingerprint` names, as `gpg --export`
-/// writes it from the GnuPG home `homedir`, or from gpg's own default home
-/// where `homedir` is `None`.
+/// Returns the public certificate of the key that `fingerprint` names, as
+/// `gpg --export` writes it.
 ///
-/// The receive path trusts this certificate to recognize a signature its own
-/// server key made. The export is held to [`MAX_KEYRING`]: the read stops one
-/// byte past the ceiling and refuses the export, so the size of what `gpg`
-/// writes cannot decide an allocation. An export that fails or writes nothing
-/// is refused.
+/// `gpg` uses the GnuPG home `homedir`, or its own default home if `homedir`
+/// is `None`. The receive path trusts this certificate to recognize a
+/// signature that its own server key made.
 ///
-/// `gpg` writes its standard error to the standard error of this process: the
-/// call does not capture it. A refused export names the exit status of `gpg`
-/// and does not carry the text `gpg` wrote.
+/// The export has the limit [`MAX_KEYRING`]. The read stops one byte after
+/// the limit and refuses the export. So the output size of `gpg` cannot set
+/// the size of an allocation. The call also refuses an export that fails or
+/// writes nothing.
 ///
-/// The fingerprint stands after `--`, so gpg reads it as a key name alone.
+/// `gpg` writes its standard error to the standard error of this process. The
+/// call does not capture it. A refused export names the exit status of `gpg`,
+/// and does not hold the text that `gpg` wrote.
+///
+/// The fingerprint comes after `--`, so `gpg` reads it only as a key name.
 #[cfg(all(feature = "receive", feature = "sign-gpg"))]
 pub(crate) async fn export_public_key(
     homedir: Option<&Path>,
@@ -1178,21 +1369,25 @@ pub(crate) async fn export_public_key(
     Ok(exported)
 }
 
-/// Read the keyring at `path`, up to [`MAX_KEYRING`], or `None` where no file
-/// is there. This is how every keyring source reaches the trusted set.
+/// Reads the keyring at `path`, up to [`MAX_KEYRING`].
+///
+/// Returns `None` if no file is at `path`. Each keyring source gets into the
+/// trusted set through this function.
 fn read_keyring_path(path: &Path) -> Result<Option<Vec<u8>>> {
     let subject = format!("the keyring '{}'", path.display());
     read_key_path(path, &subject, MAX_KEYRING)
 }
 
-/// Read an opened keyring, holding it to its kind and to [`MAX_KEYRING`] through
-/// [`read_key_source`], the reader every key source is read under. `name` is
-/// what a refusal reports, so an operator can find the entry that named it.
+/// Reads an open keyring through [`read_key_source`], the reader of each key
+/// source.
 ///
-/// The ceiling a keyring is held to is its own: a keyring carries certificates
-/// rather than base64 lines, and refusing one over the ceiling by name rather
-/// than reading the part it admits is the rule `gpgkeypath` already states for
-/// an entry that names nothing.
+/// The reader accepts only a regular file, up to [`MAX_KEYRING`]. A refusal
+/// reports `name`, so an operator can find the entry that named the keyring.
+///
+/// A keyring has its own limit, because it holds certificates and no base64
+/// lines. The call refuses a keyring over the limit by name, and does not read
+/// the part under the limit. `gpgkeypath` applies the same rule to an entry
+/// that names nothing.
 pub(crate) fn read_keyring_fd(fd: OwnedFd, name: &str) -> Result<Vec<u8>> {
     Ok(read_key_source(
         std::fs::File::from(fd),
@@ -1201,9 +1396,12 @@ pub(crate) fn read_keyring_fd(fd: OwnedFd, name: &str) -> Result<Vec<u8>> {
     )?)
 }
 
-/// A process-unique scratch directory path for one test fixture: the GnuPG home
-/// directory its `gpg` runs work in, or a directory of keyring files. The
-/// fixtures of this module and of [`verify`] both take their paths from it.
+/// Returns a scratch directory path for one test fixture, unique in the
+/// process.
+///
+/// The path is the GnuPG home of the `gpg` runs of the fixture, or a directory
+/// of keyring files. The fixtures of this module and of [`verify`] both get
+/// their paths from this function.
 #[cfg(test)]
 fn scratch_dir() -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1216,11 +1414,13 @@ fn scratch_dir() -> PathBuf {
     ))
 }
 
-/// Stop every GnuPG daemon of the home directory `dir` and remove the socket
-/// directory GnuPG made for it under the user runtime directory. GnuPG names
+/// Stops each GnuPG daemon of the home directory `dir`, and removes its
+/// socket directory.
+///
+/// GnuPG makes the socket directory under the user runtime directory. It names
 /// that directory from the path string of `dir`, so the call also works after
-/// `dir` is removed. The fixtures of this module and of [`verify`] call it
-/// before they remove their home. Failures are ignored.
+/// the removal of `dir`. The fixtures of this module and of [`verify`] call it
+/// before they remove their home. The call ignores failures.
 #[cfg(test)]
 fn remove_home_sockets(dir: &Path) {
     use std::process::{Command, Stdio};
@@ -1236,9 +1436,10 @@ fn remove_home_sockets(dir: &Path) {
     }
 }
 
-/// Parse a status-line epoch field, treating `0` as absent. The reference
-/// reader the differential cases in [`verify`] compare against reads the
-/// `gpgv` status stream through it.
+/// Parses an epoch field of a status line. The value `0` gives `None`.
+///
+/// The differential cases in [`verify`] compare with a reference reader. This
+/// reader reads the `gpgv` status stream through this function.
 #[cfg(test)]
 fn parse_epoch(field: &str) -> Option<u64> {
     match field.parse::<u64>() {
@@ -1248,7 +1449,7 @@ fn parse_epoch(field: &str) -> Option<u64> {
     }
 }
 
-/// The GPG public types move freely across tasks and threads.
+/// A compile-time check that the public GPG types are `Send` and `Sync`.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<GpgVerifier>();
@@ -1258,7 +1459,7 @@ const _: fn() = || {
 pub(crate) mod tests {
     use super::*;
 
-    /// The signer of `ostrya-sign` writes under the key this module reads.
+    /// The signer of `ostrya-sign` writes under the key that this module reads.
     #[cfg(feature = "sign-gpg")]
     #[test]
     fn gpg_signer_metadata_key_agrees() {
@@ -1317,8 +1518,10 @@ IHdvcmxk\n\
         assert!(keyring_files_in(&scratch_dir()).unwrap().is_empty());
     }
 
-    /// Whether the `gpg` binary answers. The keyring cases below build their
-    /// fixtures with it, so an absent binary skips them and never passes one.
+    /// Returns `true` if the `gpg` binary runs.
+    ///
+    /// The keyring cases build their fixtures with `gpg`. So if the binary is
+    /// absent, these cases are skipped, and none of them passes.
     pub(crate) fn gpg_available() -> bool {
         std::process::Command::new("gpg")
             .arg("--version")
@@ -1326,20 +1529,21 @@ IHdvcmxk\n\
             .is_ok_and(|out| out.status.success())
     }
 
-    /// A private GnuPG home holding freshly generated, passphrase-free ed25519
-    /// signing keys, under the test scratch tree. Every `gpg` run names this
-    /// directory with `--homedir`, so the invoking user's GnuPG home and any
-    /// agent of theirs take no part. Dropping the fixture stops the GnuPG
-    /// daemons of the directory, removes their socket directory, and removes
-    /// the directory.
+    /// A private GnuPG home with new ed25519 signing keys that have no
+    /// passphrase, under the test scratch tree.
+    ///
+    /// Each `gpg` run names this directory with `--homedir`. So the GnuPG home
+    /// and the agents of the user that runs the tests take no part. When the
+    /// fixture drops, it stops the GnuPG daemons of the directory, removes
+    /// their socket directory, and removes the directory.
     pub(crate) struct KeyFixture {
         pub(crate) dir: PathBuf,
-        /// Whether every `gpg` run in this home stands at [`FAKED_CLOCK`].
+        /// `true` if each `gpg` run in this home uses the time [`FAKED_CLOCK`].
         faked: bool,
     }
 
     impl KeyFixture {
-        /// A new home directory holding one key for `uid` that never expires.
+        /// Creates a home directory with one key for `uid` that never expires.
         pub(crate) fn new(uid: &str) -> KeyFixture {
             let fixture = KeyFixture {
                 dir: KeyFixture::make_dir(),
@@ -1349,12 +1553,12 @@ IHdvcmxk\n\
             fixture
         }
 
-        /// A new home directory holding one key for `uid` that was created at
-        /// the instant [`FAKED_CLOCK`] names and lives for `expiry` from it.
+        /// Creates a home directory with one key for `uid`, created at
+        /// [`FAKED_CLOCK`], with the lifetime `expiry` from that instant.
         ///
-        /// Every `gpg` run in this home stands at that instant, so a signature
-        /// it makes was made while the key was live. The verify path reads the
-        /// real clock, which is what makes an expired key expired.
+        /// Each `gpg` run in this home uses that instant. So the key is live
+        /// when it makes a signature. The verify path reads the real clock, so
+        /// an expired key is expired there.
         fn expiring(uid: &str, expiry: &str) -> KeyFixture {
             let fixture = KeyFixture {
                 dir: KeyFixture::make_dir(),
@@ -1364,8 +1568,8 @@ IHdvcmxk\n\
             fixture
         }
 
-        /// A fresh directory under the test scratch tree, readable by its owner
-        /// alone, which is what `gpg` asks of a home directory.
+        /// Creates a new directory under the test scratch tree that only its
+        /// owner can read. `gpg` requires this of a home directory.
         fn make_dir() -> PathBuf {
             use std::os::unix::fs::DirBuilderExt;
             let dir = scratch_dir();
@@ -1373,12 +1577,12 @@ IHdvcmxk\n\
             dir
         }
 
-        /// Generate one more key, for `uid`, in the same home directory.
+        /// Generates one more key, for `uid`, in the same home directory.
         pub(crate) fn add_key(&self, uid: &str) {
             self.generate(uid, "never");
         }
 
-        /// Generate one key for `uid` with the lifetime `expiry`.
+        /// Generates one key for `uid` with the lifetime `expiry`.
         fn generate(&self, uid: &str, expiry: &str) {
             let status = self
                 .gpg()
@@ -1389,13 +1593,13 @@ IHdvcmxk\n\
             assert!(status.success(), "gpg --quick-gen-key failed");
         }
 
-        /// Set the first key's expiry, with `gpg` standing at `when`.
+        /// Sets the expiry of the first key, with `gpg` at the time `when`.
         ///
-        /// A fresh self-signature carries a creation time, and `gpg` refuses to
-        /// write one at the instant the self-signature it replaces carries: it
-        /// reports "make_keysig_packet failed: Time conflict". The clock option
-        /// stated last answers, so a run at a later instant writes the
-        /// signature a run at the fixture's own instant cannot.
+        /// A new self-signature has a creation time. `gpg` refuses to write one
+        /// at the same instant as the self-signature that it replaces. It
+        /// reports "make_keysig_packet failed: Time conflict". The last clock
+        /// option applies. So a run at a later instant writes the signature
+        /// that a run at the instant of the fixture cannot write.
         fn set_expire_at(&self, when: &str, expiry: &str) {
             let primary = self.fingerprint();
             let status = self
@@ -1408,7 +1612,8 @@ IHdvcmxk\n\
             assert!(status.success(), "gpg --quick-set-expire failed");
         }
 
-        /// One detached signature over `payload` by the home's first key.
+        /// Returns one detached signature over `payload` by the first key of
+        /// the home.
         pub(crate) fn sign(&self, payload: &[u8]) -> Vec<u8> {
             let file = self.dir.join("payload");
             std::fs::write(&file, payload).unwrap();
@@ -1424,7 +1629,7 @@ IHdvcmxk\n\
             out.stdout
         }
 
-        /// Add a signing subkey to the home's first key.
+        /// Adds a signing subkey to the first key of the home.
         fn add_signing_subkey(&self) {
             let primary = self.fingerprint();
             let status = self
@@ -1436,7 +1641,8 @@ IHdvcmxk\n\
             assert!(status.success(), "gpg --quick-add-key failed");
         }
 
-        /// The fingerprint of the home's first key, uppercase hex.
+        /// Returns the fingerprint of the first key of the home, in uppercase
+        /// hex.
         pub(crate) fn fingerprint(&self) -> String {
             let out = self
                 .gpg()
@@ -1452,7 +1658,7 @@ IHdvcmxk\n\
                 .unwrap()
         }
 
-        /// A `gpg` command bound to this home directory, batch mode.
+        /// Returns a `gpg` command for this home directory, in batch mode.
         fn gpg(&self) -> std::process::Command {
             let mut cmd = std::process::Command::new("gpg");
             cmd.arg("--homedir").arg(&self.dir).arg("--batch");
@@ -1462,7 +1668,7 @@ IHdvcmxk\n\
             cmd
         }
 
-        /// The exported public keyring, binary or ASCII-armored.
+        /// Returns the exported public keyring, binary or ASCII-armored.
         pub(crate) fn export(&self, armored: bool) -> Vec<u8> {
             let mut cmd = self.gpg();
             cmd.arg("--export");
@@ -1474,12 +1680,13 @@ IHdvcmxk\n\
             out.stdout
         }
 
-        /// The keybox `gpg` keeps this home directory's public keys in.
+        /// Returns the keybox in which `gpg` keeps the public keys of this
+        /// home.
         fn keybox(&self) -> Vec<u8> {
             std::fs::read(self.dir.join("pubring.kbx")).unwrap()
         }
 
-        /// Bind one more user id to the home's first key.
+        /// Binds one more user id to the first key of the home.
         fn add_uid(&self, uid: &str) {
             let primary = self.fingerprint();
             let status = self
@@ -1491,7 +1698,9 @@ IHdvcmxk\n\
             assert!(status.success(), "gpg --quick-add-uid failed");
         }
 
-        /// The `--with-colons` key listing of this home, as `gpg` writes it.
+        /// Returns the `--with-colons` key listing of this home, as `gpg`
+        /// writes it.
+        ///
         /// The differential listing case reads its `pub`, `fpr`, and `uid`
         /// records as the reference.
         fn listing(&self) -> String {
@@ -1504,9 +1713,11 @@ IHdvcmxk\n\
             String::from_utf8_lossy(&out.stdout).into_owned()
         }
 
-        /// The primary-key fingerprints `gpg` reports over `keyring`, in
-        /// listing order. This is the reader the `ostree` tool drives through
-        /// gpgme, so a keyring it lists is a keyring the tool reads.
+        /// Returns the primary-key fingerprints that `gpg` reports over
+        /// `keyring`, in listing order.
+        ///
+        /// The `ostree` command uses this reader through gpgme. So if `gpg`
+        /// lists a keyring, the `ostree` command reads it.
         fn fingerprints_of(&self, keyring: &[u8]) -> Vec<String> {
             let path = self.dir.join("listed.gpg");
             std::fs::write(&path, keyring).unwrap();
@@ -1542,8 +1753,8 @@ IHdvcmxk\n\
             found
         }
 
-        /// The `gpg --export-secret-keys` stream of this home's keys, which
-        /// carries no transferable public key.
+        /// Returns the `gpg --export-secret-keys` stream of the keys of this
+        /// home. The stream holds no transferable public key.
         fn export_secret(&self) -> Vec<u8> {
             let out = self
                 .gpg()
@@ -1555,7 +1766,8 @@ IHdvcmxk\n\
             out.stdout
         }
 
-        /// The `gpg --export` stream of the one key `selector` names.
+        /// Returns the `gpg --export` stream of the one key that `selector`
+        /// names.
         fn export_one(&self, selector: &str) -> Vec<u8> {
             let out = self
                 .gpg()
@@ -1568,22 +1780,25 @@ IHdvcmxk\n\
             out.stdout
         }
 
-        /// The legacy keyring `gpg --import` writes for this home's own keys.
-        /// GnuPG puts a Trust packet after the primary key packet, after each
-        /// user id packet, and after each signature packet of such a keyring,
-        /// which is the form the `ostree` tool's own import leaves at the
+        /// Returns the legacy keyring that `gpg --import` writes for the keys
+        /// of this home.
+        ///
+        /// In such a keyring, GnuPG puts a Trust packet after the primary key
+        /// packet, after each user id packet, and after each signature packet.
+        /// The import of the `ostree` command leaves this form at the
         /// repository root.
         fn legacy_keyring(&self) -> Vec<u8> {
             self.imported_keyring("legacy", &[&self.export(false)])
         }
 
-        /// The legacy keyring `gpg --import` writes for `streams`, imported in
-        /// the order they stand in. `name` names the home directory the import
-        /// runs in, so one fixture builds more than one such keyring.
+        /// Returns the legacy keyring that `gpg --import` writes for
+        /// `streams`, imported in their order.
         ///
-        /// `gpg` writes a keybox when it creates a keyring file itself, and a
-        /// legacy keyring when the file is already there, so the import runs
-        /// in a home of its own over an empty keyring file.
+        /// `name` names the home directory of the import, so one fixture can
+        /// build more than one such keyring. If `gpg` creates a keyring file
+        /// itself, it writes a keybox. If the file exists, it writes a legacy
+        /// keyring. So the import runs in its own home over an empty keyring
+        /// file.
         fn imported_keyring(&self, name: &str, streams: &[&[u8]]) -> Vec<u8> {
             use std::os::unix::fs::DirBuilderExt;
             let home = self.dir.join(name);
@@ -1613,8 +1828,8 @@ IHdvcmxk\n\
             std::fs::read(&ring).unwrap()
         }
 
-        /// Revoke the home's first key by importing the revocation certificate
-        /// `gpg` stored when it generated it.
+        /// Revokes the first key of the home. The call imports the revocation
+        /// certificate that `gpg` stored when it generated the key.
         fn revoke_primary(&self) {
             let path = self.dir.join("revocation.asc");
             std::fs::write(&path, self.revocation_armor()).unwrap();
@@ -1622,8 +1837,8 @@ IHdvcmxk\n\
             assert!(status.success(), "gpg --import of the revocation failed");
         }
 
-        /// The key revocation signature packet `gpg` stored for the home's
-        /// first key, in the binary form.
+        /// Returns the key revocation signature packet that `gpg` stored for
+        /// the first key of the home, in the binary form.
         fn revocation_packet(&self) -> Vec<u8> {
             let packet = dearmor(&self.revocation_armor()).unwrap();
             let (spans, framed) = packet_spans(&packet);
@@ -1631,7 +1846,7 @@ IHdvcmxk\n\
             packet
         }
 
-        /// Import a certificate stream into this home.
+        /// Imports a certificate stream into this home.
         fn import(&self, bytes: &[u8]) {
             let path = self.dir.join("import.gpg");
             std::fs::write(&path, bytes).unwrap();
@@ -1639,26 +1854,30 @@ IHdvcmxk\n\
             assert!(status.success(), "gpg --import failed");
         }
 
-        /// Import a stream `gpg` merges while it reports a failure.
+        /// Imports a stream that `gpg` merges, although it reports a failure.
         ///
-        /// `gpg --import` exits 2 over the stream `gpg --desig-revoke` writes,
-        /// and it does so whether or not the home holds the revoker's
-        /// certificate: without it the run reports "no public key - can't apply
-        /// revocation certificate", and with it "invalid revocation
-        /// certificate: Bad signature - rejected" against the revoker's own key
-        /// id. Either way it reports "revocation certificate added" for the
-        /// revoked key and merges the class 0x20 signature into the certificate
-        /// it holds, so the export of the home carries the packet.
+        /// `gpg --import` exits 2 over the stream that `gpg --desig-revoke`
+        /// writes. It exits 2 with or without the certificate of the revoker
+        /// in the home. Without it, the run reports "no public key - can't
+        /// apply revocation certificate". With it, the run reports "invalid
+        /// revocation certificate: Bad signature - rejected" against the key id
+        /// of the revoker.
+        ///
+        /// In both cases it reports "revocation certificate added" for the
+        /// revoked key. It merges the class 0x20 signature into its
+        /// certificate, so the export of the home holds the packet.
         fn import_merging(&self, bytes: &[u8]) {
             let path = self.dir.join("import.gpg");
             std::fs::write(&path, bytes).unwrap();
             self.gpg().arg("--import").arg(&path).status().unwrap();
         }
 
-        /// Designate the key `revoker` names as a revoker of this home's first
-        /// key. `gpg` writes a fresh direct-key self-signature carrying
-        /// signature subpacket 12, so this home must already hold the revoker's
-        /// certificate.
+        /// Designates the key that `revoker` names as a revoker of the first
+        /// key of this home.
+        ///
+        /// `gpg` writes a new direct-key self-signature with signature
+        /// subpacket 12. So this home must already hold the certificate of the
+        /// revoker.
         fn add_revoker(&self, revoker: &str) {
             let mut cmd = self.gpg_interactive();
             cmd.arg("--edit-key").arg(self.fingerprint());
@@ -1669,12 +1888,14 @@ IHdvcmxk\n\
             );
         }
 
-        /// The key revocation a designated revoker makes over the key `key`
-        /// names, as the binary packet stream `gpg --desig-revoke` writes: a
-        /// transferable public key of the revoked key carrying the class 0x20
-        /// signature right after the primary key packet. This home must hold
-        /// the revoker's secret key and a certificate of the revoked key that
-        /// designates the revoker.
+        /// Returns the key revocation that a designated revoker makes over the
+        /// key that `key` names.
+        ///
+        /// The result is the binary packet stream that `gpg --desig-revoke`
+        /// writes. It is a transferable public key of the revoked key, with the
+        /// class 0x20 signature immediately after the primary key packet. This
+        /// home must hold the secret key of the revoker. It must also hold a
+        /// certificate of the revoked key that designates the revoker.
         fn desig_revoke(&self, key: &str) -> Vec<u8> {
             let path = self.dir.join("desig-revoke.asc");
             let mut cmd = self.gpg_interactive();
@@ -1687,8 +1908,8 @@ IHdvcmxk\n\
             dearmor(&std::fs::read(&path).unwrap()).unwrap()
         }
 
-        /// A `gpg` command bound to this home that reads its answers from
-        /// standard input, for the commands that take no batch form.
+        /// Returns a `gpg` command for this home that reads its answers from
+        /// standard input. It is for the commands that have no batch form.
         fn gpg_interactive(&self) -> std::process::Command {
             let mut cmd = std::process::Command::new("gpg");
             cmd.arg("--homedir").arg(&self.dir).args([
@@ -1704,10 +1925,12 @@ IHdvcmxk\n\
             cmd
         }
 
-        /// The armored block of the revocation certificate `gpg` stored for
-        /// the home's first key. The stored file carries prose before the
-        /// block, and a colon before the block's first dash so that an
-        /// accidental import does nothing.
+        /// Returns the armored block of the revocation certificate that `gpg`
+        /// stored for the first key of the home.
+        ///
+        /// The stored file has prose before the block. It also has a colon
+        /// before the first dash of the block, so an accidental import does
+        /// nothing.
         fn revocation_armor(&self) -> Vec<u8> {
             let stored = self
                 .dir
@@ -1719,7 +1942,7 @@ IHdvcmxk\n\
         }
     }
 
-    /// Run `cmd`, writing `answers` to its standard input, and assert that it
+    /// Runs `cmd` with `answers` on its standard input, and asserts that it
     /// reported success. `what` names the command in the assertion message.
     fn answer(mut cmd: std::process::Command, answers: &[u8], what: &str) {
         use std::io::Write;
@@ -1755,9 +1978,9 @@ IHdvcmxk\n\
         assert_eq!(verifier.certs.len(), 1);
     }
 
-    /// An armored keyring loads to the same certificate as the binary form,
-    /// and the armor decoder reaches the binary export byte for byte, so the
-    /// parser reads the same packet stream out of either form.
+    /// An armored keyring loads to the same certificate as the binary form.
+    /// The armor decoder gives the binary export byte for byte, so the parser
+    /// reads the same packet stream from both forms.
     #[test]
     fn loads_an_armored_keyring() {
         if !gpg_available() {
@@ -1787,14 +2010,14 @@ IHdvcmxk\n\
     }
 
     /// An empty keyring loads and holds no certificate. An optional keyring
-    /// that is there and holds nothing is not a failure.
+    /// that exists and holds nothing does not cause a failure.
     #[test]
     fn loads_an_empty_keyring() {
         let verifier = GpgVerifier::from_keyring_bytes([b""]).unwrap();
         assert!(verifier.certs.is_empty());
     }
 
-    /// A truncated keyring is refused by the name of the blob that carried it.
+    /// The load refuses a truncated keyring by the name of its blob.
     #[test]
     fn refuses_a_truncated_keyring() {
         if !gpg_available() {
@@ -1812,9 +2035,11 @@ IHdvcmxk\n\
         );
     }
 
-    /// A GnuPG keybox is refused by name. rPGP reads an OpenPGP packet stream,
-    /// and a keybox is a container of another kind, so reading it as a keyring
-    /// would leave the trusted set empty with nothing said about it.
+    /// The load refuses a GnuPG keybox by name.
+    ///
+    /// rPGP reads an OpenPGP packet stream, and a keybox is a container of a
+    /// different kind. A read of a keybox as a keyring gives an empty trusted
+    /// set with no message.
     #[test]
     fn refuses_a_keybox() {
         if !gpg_available() {
@@ -1835,8 +2060,8 @@ IHdvcmxk\n\
         );
     }
 
-    /// A keyring over the four-mebibyte ceiling is refused by name, and the
-    /// refusal states the ceiling. The blob is bounded before it is parsed.
+    /// The load refuses a keyring over the four-mebibyte limit by name, and
+    /// the refusal states the limit. The size check comes before the parse.
     #[test]
     fn refuses_an_oversized_keyring() {
         let oversized = vec![0u8; MAX_KEYRING as usize + 1];
@@ -1848,9 +2073,9 @@ IHdvcmxk\n\
         );
     }
 
-    /// A keyring holding more than 256 certificates is refused by name, and
-    /// the refusal states the cap. The keyring is one certificate repeated,
-    /// which is 257 transferable public keys in one packet stream.
+    /// The load refuses a keyring with more than 256 certificates by name, and
+    /// the refusal states the limit. The keyring is one certificate 257 times:
+    /// 257 transferable public keys in one packet stream.
     #[test]
     fn refuses_too_many_certificates() {
         if !gpg_available() {
@@ -1867,14 +2092,16 @@ IHdvcmxk\n\
                 && m.contains("256 certificates")),
             "{err}"
         );
-        // One certificate short of the cap loads, so the cap is what refused.
+        // One certificate less than the limit loads, so the limit caused the
+        // refusal.
         let allowed = one.repeat(MAX_KEYRING_CERTS);
         let verifier = GpgVerifier::from_keyring_bytes([&allowed]).unwrap();
         assert_eq!(verifier.certs.len(), MAX_KEYRING_CERTS);
     }
-    /// The user ids each certificate carries, one list per certificate, with
-    /// both the certificates and the ids sorted, so two trusted sets compare as
-    /// one value whatever order their keyrings held them in.
+    /// Returns the user ids of each certificate, one list for each
+    /// certificate. The certificates and the ids are sorted. So two trusted
+    /// sets compare as one value, and the order in their keyrings has no
+    /// effect.
     fn user_ids(verifier: &GpgVerifier) -> Vec<Vec<String>> {
         let mut all: Vec<Vec<String>> = verifier
             .certs
@@ -1894,10 +2121,11 @@ IHdvcmxk\n\
         all
     }
 
-    /// A legacy keyring, which carries a Trust packet after the primary key
-    /// packet and after each user id and signature packet, parses to what the
-    /// `gpg --export` stream of the same keys parses to: the same certificate
-    /// count, the same user ids, and the same subkeys.
+    /// A legacy keyring and the `gpg --export` stream of the same keys parse to
+    /// the same certificate count, user ids, and subkeys.
+    ///
+    /// A legacy keyring has a Trust packet after the primary key packet and
+    /// after each user id and signature packet.
     #[test]
     fn loads_a_trust_packet_keyring() {
         if !gpg_available() {
@@ -1908,7 +2136,8 @@ IHdvcmxk\n\
         home.add_key("Second <second@ostrya.example>");
         let exported = home.export(false);
         let legacy = home.legacy_keyring();
-        // The fixture is the shape under test: the two forms differ in bytes.
+        // The fixture has the shape under test: the two forms have different
+        // bytes.
         assert_ne!(legacy, exported);
         assert!(legacy.len() > exported.len());
 
@@ -1930,9 +2159,10 @@ IHdvcmxk\n\
         assert_eq!(subkeys(&from_legacy), subkeys(&from_export));
     }
 
-    /// A signing subkey reaches the trusted set out of a legacy keyring. The
-    /// subkey packet stands after the primary key's Trust packet, so this is
-    /// what a keyring holding Trust packets loses when they reach the parser.
+    /// A signing subkey from a legacy keyring gets into the trusted set.
+    ///
+    /// The subkey packet comes after the Trust packet of the primary key. If
+    /// the Trust packets go to the parser, the keyring loses this subkey.
     #[test]
     fn loads_a_subkey_from_a_trust_packet_keyring() {
         if !gpg_available() {
@@ -1946,29 +2176,35 @@ IHdvcmxk\n\
         assert_eq!(verifier.certs[0].public_subkeys.len(), 1);
     }
 
-    /// A keyring whose packet stream stops framing part way through is refused
-    /// by the name of the blob that carried it, and every certificate it holds
-    /// goes with it.
+    /// If the packet stream of a keyring stops framing part of the way, the
+    /// load refuses the keyring by the name of its blob. All its certificates
+    /// are refused with it.
     ///
-    /// The stream holds one whole certificate, then a second one whose primary
-    /// key packet is followed by a Trust packet written with an indeterminate
-    /// length. The packet walk frames a fixed length alone, so it stops there,
-    /// while the certificate parser reads the rest of the stream as the body of
-    /// that packet. The second certificate stands past the point the walk
-    /// framed to and carries its own Trust packets there, so it would reach the
-    /// trusted set with no user id and no subkey. The refusal covers the whole
-    /// keyring, so a verification works over a keyring that was read whole.
+    /// The stream holds one whole certificate, then a second one. In the second
+    /// one, a Trust packet with an indeterminate length follows the primary key
+    /// packet. The packet walk frames only a fixed length, so it stops there.
+    /// The certificate parser reads the rest of the stream as the body of that
+    /// packet.
     ///
-    /// The reference tools read such a keyring up to the packet they stop at
-    /// and trust the certificates that stand before it. Measured over this
-    /// shape, `gpgv` 2.4.9 reports `GOODSIG` at exit 0 over a signature the
-    /// first certificate made and
-    /// `[don't know]: indeterminate length for invalid packet type 12`,
-    /// `keydb_search failed: Invalid packet`, `ERRSIG`, and `NO_PUBKEY` at
-    /// exit 2 over a signature the second one made; `gpg --list-keys` over the
-    /// file lists the first key alone; and `ostree show --gpg-verify-remote`
-    /// reports `Good signature from "..."` for the first and
-    /// `Can't check signature: public key not found` for the second.
+    /// The second certificate is after the point where the walk stopped, and
+    /// has its own Trust packets there. So without the refusal, it gets into
+    /// the trusted set with no user id and no subkey. The refusal covers the
+    /// whole keyring, so a verification uses a keyring that was read whole.
+    ///
+    /// The reference tools read such a keyring up to the packet where they
+    /// stop, and trust the certificates before it. These results are measured
+    /// over this shape:
+    ///
+    /// - `gpgv` 2.4.9 reports `GOODSIG` at exit 0 over a signature by the
+    ///   first certificate.
+    /// - `gpgv` 2.4.9 reports
+    ///   `[don't know]: indeterminate length for invalid packet type 12`,
+    ///   `keydb_search failed: Invalid packet`, `ERRSIG`, and `NO_PUBKEY` at
+    ///   exit 2 over a signature by the second one.
+    /// - `gpg --list-keys` over the file lists only the first key.
+    /// - `ostree show --gpg-verify-remote` reports `Good signature from "..."`
+    ///   for the first and `Can't check signature: public key not found` for
+    ///   the second.
     #[test]
     fn refuses_a_keyring_holding_a_certificate_past_its_framed_prefix() {
         if !gpg_available() {
@@ -1979,13 +2215,13 @@ IHdvcmxk\n\
         let second = KeyFixture::new("Second <second@ostrya.example>");
         second.add_signing_subkey();
         // A Trust packet, tag 12, in the old header form with length type 3,
-        // the indeterminate length.
+        // which is the indeterminate length.
         let indeterminate_trust = [0xb3];
         let legacy = second.legacy_keyring();
         let mut keyring = first.export(false);
         keyring.extend_from_slice(&insert_after_primary(&legacy, &indeterminate_trust));
-        // The fixture is the shape under test: the walk stops inside the second
-        // certificate and the run split answers nothing.
+        // The fixture has the shape under test: the walk stops inside the
+        // second certificate, and the run split returns nothing.
         assert!(packet_spans(&keyring).1 < keyring.len());
         assert!(certificate_chunks(&keyring).is_none());
 
@@ -1996,8 +2232,8 @@ IHdvcmxk\n\
             "{err}"
         );
 
-        // The same two certificates, in a keyring holding that packet nowhere,
-        // load with the user id and the subkey each of them states.
+        // The same two certificates, in a keyring without that packet, load
+        // with the user id and the subkey of each one.
         let intact = [first.export(false), legacy].concat();
         let verifier = GpgVerifier::from_keyring_bytes([&intact]).unwrap();
         assert_eq!(verifier.certs.len(), 2);
@@ -2005,9 +2241,9 @@ IHdvcmxk\n\
         assert_eq!(verifier.certs[1].public_subkeys.len(), 1);
     }
 
-    /// The certificate cap counts the certificates a keyring parses to,
-    /// whether or not the keyring carries Trust packets: 257 legacy
-    /// certificates are refused by name and 256 load.
+    /// The certificate limit counts the certificates that a keyring parses
+    /// to, with or without Trust packets. The load refuses 257 legacy
+    /// certificates by name, and 256 load.
     #[test]
     fn refuses_too_many_certificates_with_trust_packets() {
         if !gpg_available() {
@@ -2029,11 +2265,11 @@ IHdvcmxk\n\
         assert_eq!(verifier.certs.len(), MAX_KEYRING_CERTS);
     }
 
-    /// A keyring carrying no Trust packet parses to the packets it holds, byte
-    /// for byte, and a packet standing ahead of its first certificate is
-    /// dropped. A keyring holding no packet parses to no certificate, and a
-    /// stream the header parser cannot frame to its end is refused by the name
-    /// of the source.
+    /// A keyring with no Trust packet parses to its packets, byte for byte.
+    ///
+    /// The parse drops a packet before the first certificate. A keyring with
+    /// no packet parses to no certificate. If the header parser cannot frame a
+    /// stream to its end, the parse refuses it by the name of the source.
     #[test]
     fn parse_keyring_reads_the_packets_of_a_trust_free_stream() {
         assert!(parse_keyring(b"", SUBJECT).unwrap().is_empty());
@@ -2048,20 +2284,20 @@ IHdvcmxk\n\
         let read = parse_keyring(&exported, SUBJECT).unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].1, exported);
-        // A packet standing ahead of the first Public-Key packet belongs to no
+        // A packet before the first Public-Key packet is part of no
         // certificate, so the keyring parses to the certificate after it.
         let mut prefixed = home.revocation_packet();
         prefixed.extend_from_slice(&exported);
         let read = parse_keyring(&prefixed, SUBJECT).unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].1, exported);
-        // A truncated keyring is refused by the name of the source.
+        // The parse refuses a truncated keyring by the name of the source.
         refuses_the_stream(&exported[..exported.len() / 2]);
     }
 
-    /// Assert that [`parse_keyring`] refuses `stream` by the name of the
-    /// source, which is what a keyring the certificate reader does not read
-    /// whole draws.
+    /// Asserts that [`parse_keyring`] refuses `stream` by the name of the
+    /// source. A keyring that the certificate reader does not read whole gets
+    /// this refusal.
     fn refuses_the_stream(stream: &[u8]) {
         let err = parse_keyring(stream, SUBJECT).unwrap_err();
         assert!(
@@ -2071,9 +2307,10 @@ IHdvcmxk\n\
         );
     }
 
-    /// The packets a keyring parses to, concatenated: the stream with its Trust
-    /// packets dropped and with any packet standing ahead of its first
-    /// certificate dropped.
+    /// Returns the concatenated packets that a keyring parses to.
+    ///
+    /// The result is the stream without its Trust packets, and without a
+    /// packet before its first certificate.
     fn certificate_stream(keyring: &[u8]) -> Vec<u8> {
         parse_keyring(keyring, SUBJECT)
             .unwrap()
@@ -2082,19 +2319,20 @@ IHdvcmxk\n\
             .collect()
     }
 
-    /// The subject a refusal over the repository's own keyring names.
+    /// The subject that a refusal names for the keyring of the repository.
     const SUBJECT: &str = "the keyring 'origin.trustedkeys.gpg'";
 
-    /// The instant a faked-clock fixture stands at, 2025-01-01T00:00:00Z.
+    /// The time of a faked-clock fixture, 2025-01-01T00:00:00Z.
     const FAKED_CLOCK: &str = "20250101T000000!";
 
-    /// The payload a fixture's signature covers.
+    /// The payload that the signature of a fixture covers.
     const PAYLOAD: &[u8] = b"ostrya commit payload";
 
-    /// Whether the certificates `keyring` holds report `blob` as a valid
-    /// signature over [`PAYLOAD`]. This is the verdict a remote's trusted
-    /// keyring draws after an import, read through the same engine a
-    /// verification runs.
+    /// Returns `true` if the certificates of `keyring` report `blob` as a
+    /// valid signature over [`PAYLOAD`].
+    ///
+    /// This is the verdict of the trusted keyring of a remote after an import.
+    /// The call reads it through the same engine as a verification.
     fn signature_is_valid(keyring: &[u8], blob: &[u8]) -> bool {
         let certs = GpgVerifier::from_keyring_bytes([keyring]).unwrap().certs;
         verify::verify_signatures(&certs, PAYLOAD, &[blob.to_vec()])
@@ -2102,9 +2340,9 @@ IHdvcmxk\n\
             .valid
     }
 
-    /// An import into no keyring writes the offered stream as it stands and
-    /// counts each certificate, `gpg` reads the result, and a repeated import
-    /// counts none and leaves the bytes alone.
+    /// An import into no keyring writes the offered stream as it is and counts
+    /// each certificate. `gpg` reads the result. A repeated import counts no
+    /// certificate and does not change the bytes.
     #[test]
     fn an_import_writes_the_offered_certificates() {
         if !gpg_available() {
@@ -2118,8 +2356,8 @@ IHdvcmxk\n\
         let (imported, keyring) = merge_keyring(b"", &offered, &[], SUBJECT).unwrap();
         assert_eq!(imported, 2);
         assert_eq!(keyring, offered);
-        // The keyring the import writes is one `gpg` reads, which is the
-        // reader the `ostree` tool drives through gpgme.
+        // `gpg` reads the keyring that the import writes. The `ostree` command
+        // uses this reader through gpgme.
         assert_eq!(home.fingerprints_of(&keyring).len(), 2);
 
         let (again, repeated) = merge_keyring(&keyring, &offered, &[], SUBJECT).unwrap();
@@ -2127,10 +2365,11 @@ IHdvcmxk\n\
         assert_eq!(repeated, keyring);
     }
 
-    /// An import onto a keyring GnuPG wrote keeps that keyring byte for byte
-    /// and appends the packets of the added certificate. `gpg` reads the
-    /// result, which holds both keys, so a keyring carrying Trust packets for
-    /// one key and none for another is a keyring both implementations read.
+    /// An import into a keyring that GnuPG wrote keeps that keyring byte for
+    /// byte, and appends the packets of the added certificate.
+    ///
+    /// `gpg` reads the result, which holds both keys. So both implementations
+    /// read a keyring with Trust packets for one key and none for the other.
     #[test]
     fn an_import_keeps_the_keyring_it_was_given() {
         if !gpg_available() {
@@ -2150,11 +2389,12 @@ IHdvcmxk\n\
         assert_eq!(listed, [held.fingerprint(), added.fingerprint()]);
     }
 
-    /// An import onto an armored keyring keeps the packet stream that keyring
-    /// held and writes it back in the binary form: the armor decodes to the
-    /// packets the binary export of the same key holds, those packets open the
-    /// result, and the added certificate's packets follow them. `gpg` reads the
-    /// result and lists both keys.
+    /// An import into an armored keyring keeps the packet stream of that
+    /// keyring, and writes it back in the binary form.
+    ///
+    /// The armor decodes to the packets of the binary export of the same key.
+    /// These packets start the result, and the packets of the added
+    /// certificate follow them. `gpg` reads the result and lists both keys.
     #[test]
     fn an_import_keeps_the_packet_stream_of_an_armored_keyring() {
         if !gpg_available() {
@@ -2176,12 +2416,12 @@ IHdvcmxk\n\
         assert_eq!(listed, [held.fingerprint(), added.fingerprint()]);
     }
 
-    /// The Trust packets are the whole difference between the keyring GnuPG
-    /// writes and the keyring this import writes for the same keys.
+    /// The Trust packets are the only difference between the keyring that
+    /// GnuPG writes and the keyring that this import writes for the same keys.
     ///
-    /// A legacy keyring offered for import loses its Trust packets, so the
-    /// keyring the import writes carries none whichever form the offered stream
-    /// took.
+    /// An offered legacy keyring loses its Trust packets. So the keyring that
+    /// the import writes has no Trust packets for each form of the offered
+    /// stream.
     #[test]
     fn the_trust_packets_are_the_whole_difference() {
         if !gpg_available() {
@@ -2199,16 +2439,16 @@ IHdvcmxk\n\
             assert_eq!(imported, 1);
             assert_eq!(keyring, exported);
         }
-        // A selection off a legacy keyring writes the selected certificate
-        // without its Trust packets as well.
+        // A selection from a legacy keyring also writes the selected
+        // certificate without its Trust packets.
         let selector = [home.fingerprint()];
         let (imported, keyring) = merge_keyring(b"", &legacy, &selector, SUBJECT).unwrap();
         assert_eq!(imported, 1);
         assert_eq!(keyring, exported);
     }
 
-    /// Splice one packet in right after a certificate's primary key packet,
-    /// where a key revocation signature stands.
+    /// Inserts one packet immediately after the primary key packet of a
+    /// certificate, the position of a key revocation signature.
     fn insert_after_primary(cert: &[u8], packet: &[u8]) -> Vec<u8> {
         let (spans, framed) = packet_spans(cert);
         assert_eq!(framed, cert.len());
@@ -2220,16 +2460,17 @@ IHdvcmxk\n\
         spliced
     }
 
-    /// A re-export carrying a key revocation replaces the certificate the
-    /// keyring holds for that key, and the import counts no key.
+    /// A re-export with a key revocation replaces the certificate of that key
+    /// in the keyring, and the import counts no key.
     ///
-    /// The keyring the merge is given is the one the `ostree` tool's own import
-    /// leaves at the repository root, which carries the Trust packets. The
-    /// merged keyring holds the offered certificate where the held one stood,
-    /// which is the shape the tool writes: measured against `ostree` 2026.1
-    /// over the re-export of a revoked RSA key, the merged run carried the key
-    /// revocation right after the primary key packet and ahead of the first
-    /// user id packet, and the tool reported `Imported 0 GPG keys`.
+    /// The merge gets the keyring that the import of the `ostree` command
+    /// leaves at the repository root, with the Trust packets. The merged
+    /// keyring holds the offered certificate in the place of the held one. The
+    /// `ostree` command writes the same shape. Measured against `ostree` 2026.1
+    /// over the re-export of a revoked RSA key, the merged run had the key
+    /// revocation immediately after the primary key packet. The revocation came
+    /// before the first user id packet, and the `ostree` command reported
+    /// `Imported 0 GPG keys`.
     #[test]
     fn a_revoked_re_export_replaces_the_held_certificate() {
         if !gpg_available() {
@@ -2241,34 +2482,34 @@ IHdvcmxk\n\
         let held = home.legacy_keyring();
         home.revoke_primary();
         let revoked = home.export(false);
-        // The fixture is the shape under test: the revoked export carries the
-        // revocation packet the unrevoked one does not.
+        // The fixture has the shape under test: the revoked export has the
+        // revocation packet, and the unrevoked export does not.
         assert!(revoked.len() > unrevoked.len());
 
         let (imported, keyring) = merge_keyring(&held, &revoked, &[], SUBJECT).unwrap();
         assert_eq!(imported, 0);
         assert_ne!(keyring, certificate_stream(&held));
-        // One certificate run per key, holding the offered packets.
+        // One certificate run for each key, with the offered packets.
         assert_eq!(keyring, revoked);
-        // `gpg` reads the result, which is the reader the `ostree` tool drives
-        // through gpgme, and the certificate it holds revokes the key.
+        // `gpg` reads the result, and its certificate revokes the key. The
+        // `ostree` command uses this reader through gpgme.
         assert_eq!(home.fingerprints_of(&keyring), [home.fingerprint()]);
         let certs = GpgVerifier::from_keyring_bytes([&keyring]).unwrap().certs;
         assert_eq!(certs.len(), 1);
         assert!(verify::key_revoked(&certs[0], certs.as_slice()));
 
-        // The Trust packets stay the whole difference against the keyring
-        // GnuPG writes for the same two imports.
+        // The Trust packets are still the only difference from the keyring
+        // that GnuPG writes for the same two imports.
         let gnupg = home.imported_keyring("merged", &[&unrevoked, &revoked]);
         assert!(gnupg.len() > keyring.len());
         assert_eq!(certificate_stream(&gnupg), keyring);
 
-        // One offered stream carrying both states of the key reaches the same
-        // keyring whichever order they stand in, and counts one key. The tool
-        // answers the same way: over the revoked export alone and over the two
-        // exports concatenated in either order, `ostree` 2026.1 reported
-        // `Imported 1 GPG key` and wrote three byte-identical keyrings, each
-        // holding the revocation.
+        // One offered stream with both states of the key gives the same
+        // keyring in either order, and counts one key. The `ostree` command
+        // gives the same result. Over the revoked export alone, and over the
+        // two exports concatenated in either order, `ostree` 2026.1 reported
+        // `Imported 1 GPG key`. It wrote three byte-identical keyrings, each
+        // with the revocation.
         for stream in [
             revoked.clone(),
             [unrevoked.clone(), revoked.clone()].concat(),
@@ -2280,12 +2521,12 @@ IHdvcmxk\n\
         }
     }
 
-    /// A key revocation signature another key made, stapled onto an offered
-    /// certificate, does not strike the held key out of the keyring.
+    /// A key revocation signature by a different key, attached to an offered
+    /// certificate, does not remove the held key from the keyring.
     ///
-    /// A revocation is verified before it is honored, so a packet anyone can
-    /// attach carries no weight and the keyring keeps the bytes it held. This
-    /// is the rule the verify engine applies to the same packet.
+    /// The import verifies a revocation before it accepts it. So a packet that
+    /// anyone can attach has no effect, and the keyring keeps its bytes. The
+    /// verify engine applies the same rule to the same packet.
     #[test]
     fn a_stapled_revocation_does_not_replace_the_held_certificate() {
         if !gpg_available() {
@@ -2297,8 +2538,8 @@ IHdvcmxk\n\
         let existing = home.export(false);
         let offered = insert_after_primary(&existing, &other.revocation_packet());
 
-        // The stapled packet reaches the parsed certificate, so it is the
-        // merge that refused it and not the parse.
+        // The attached packet gets into the parsed certificate. So the merge
+        // refused it, and the parse did not.
         let certs = GpgVerifier::from_keyring_bytes([&offered]).unwrap().certs;
         assert_eq!(certs.len(), 1);
         assert_eq!(certs[0].details.revocation_signatures.len(), 1);
@@ -2308,7 +2549,8 @@ IHdvcmxk\n\
         assert_eq!(imported, 0);
         assert_eq!(keyring, existing);
 
-        // The same packet over the certificate it was made for replaces it.
+        // The same packet on the certificate that it was made for replaces
+        // that certificate.
         let own = other.export(false);
         let revoked = insert_after_primary(&own, &other.revocation_packet());
         let (imported, keyring) = merge_keyring(&own, &revoked, &[], SUBJECT).unwrap();
@@ -2316,28 +2558,31 @@ IHdvcmxk\n\
         assert_eq!(keyring, revoked);
     }
 
-    /// The certificate streams a revocation a designated revoker made is
-    /// stated over: a signing key K that designates a revoker R, R's own
-    /// certificate, and the re-export of K carrying the class 0x20 signature R
-    /// made over it.
+    /// The certificate streams for a revocation by a designated revoker.
     ///
-    /// [`verify`] has its own builder for these states, which splices a
-    /// revocation into a certificate that carries no designation. The import
-    /// cases need no such state, so this builder reaches every stream it needs
-    /// through `gpg` runs alone and the splicing stays where it is.
+    /// The streams are:
+    ///
+    /// - A signing key K that designates a revoker R.
+    /// - The certificate of R.
+    /// - The re-export of K with the class 0x20 signature that R made over K.
+    ///
+    /// [`verify`] has its own builder for these states. It inserts a revocation
+    /// into a certificate that has no designation. The import cases need no
+    /// such state. So this builder makes each stream with `gpg` runs only, and
+    /// the insertion stays in [`verify`].
     struct Revoked {
-        /// K's home, which made [`Revoked::blob`] and reads every keyring the
-        /// cases build.
+        /// The home of K. It made [`Revoked::blob`], and it reads each keyring
+        /// that the cases build.
         home: KeyFixture,
-        /// K's primary key fingerprint, uppercase hex.
+        /// The primary key fingerprint of K, in uppercase hex.
         key: String,
-        /// R's primary key fingerprint, uppercase hex.
+        /// The primary key fingerprint of R, in uppercase hex.
         revoker: String,
-        /// R's certificate.
+        /// The certificate of R.
         revoker_cert: Vec<u8>,
-        /// K carrying the designation and no revocation.
+        /// K with the designation and no revocation.
         designating: Vec<u8>,
-        /// The re-export of K carrying the revocation R made.
+        /// The re-export of K with the revocation that R made.
         revoked: Vec<u8>,
         /// The detached signature K made over [`PAYLOAD`].
         blob: Vec<u8>,
@@ -2350,18 +2595,18 @@ IHdvcmxk\n\
             let (key, revoker) = (home.fingerprint(), revoker_home.fingerprint());
             let blob = home.sign(PAYLOAD);
             let revoker_cert = revoker_home.export(false);
-            // The designation names the revoker by fingerprint, so K's home
-            // holds R's certificate while it writes the self-signature that
-            // carries the designation.
+            // The designation names the revoker by fingerprint. So the home of
+            // K holds the certificate of R when it writes the self-signature
+            // with the designation.
             home.import(&revoker_cert);
             home.add_revoker(&revoker);
             let designating = home.export_one(&key);
-            // The revocation is made in the home holding R's secret key and a
-            // certificate of K that designates it.
+            // The revocation is made in the home with the secret key of R and a
+            // certificate of K that designates R.
             revoker_home.import(&designating);
             let revocation = revoker_home.desig_revoke(&key);
-            // The re-export of K carries the class 0x20 signature `gpg`
-            // merges into the certificate the home holds.
+            // The re-export of K holds the class 0x20 signature that `gpg`
+            // merges into the certificate of the home.
             home.import_merging(&revocation);
             let revoked = home.export_one(&key);
             let state = Revoked {
@@ -2377,10 +2622,11 @@ IHdvcmxk\n\
             state
         }
 
-        /// Assert that the streams are the state the cases name: the re-export
-        /// carries one key revocation signature the designating certificate
-        /// does not, and that revocation is the one R made, so a case fails
-        /// where its fixture is not the state it names.
+        /// Asserts that the streams have the state that the cases name.
+        ///
+        /// The re-export has one key revocation signature that the designating
+        /// certificate does not have, and R made that revocation. So a case
+        /// fails if its fixture does not have the state that it names.
         fn assert_shape(&self) {
             let designating = self.certs(&self.designating);
             assert_eq!(designating[0].details.revocation_signatures.len(), 0);
@@ -2391,7 +2637,7 @@ IHdvcmxk\n\
             assert!(verify::key_revoked(&revoked[0], &revoker));
         }
 
-        /// The certificates `keyring` holds.
+        /// Returns the certificates of `keyring`.
         fn certs(&self, keyring: &[u8]) -> Vec<SignedPublicKey> {
             GpgVerifier::from_keyring_bytes([keyring])
                 .unwrap()
@@ -2399,9 +2645,11 @@ IHdvcmxk\n\
                 .to_vec()
         }
 
-        /// What a verifier built over `keyring` answers about the signature K
-        /// made: whether it reports the key revoked, and whether the load is
-        /// valid.
+        /// Returns the result of a verifier over `keyring` for the signature
+        /// that K made.
+        ///
+        /// The result tells if the verifier reports the key as revoked, and if
+        /// the load is valid.
         fn verdict(&self, keyring: &[u8]) -> (bool, bool) {
             let certs = self.certs(keyring);
             let outcome =
@@ -2412,20 +2660,21 @@ IHdvcmxk\n\
         }
     }
 
-    /// A re-export carrying a key revocation a designated revoker made
-    /// replaces the certificate a keyring holding the revoker holds for the
-    /// revoked key, the import counts no key, and a verifier built over the
-    /// result refuses a signature that key made.
+    /// A re-export with a key revocation by a designated revoker replaces the
+    /// certificate of the revoked key in a keyring that holds the revoker.
     ///
-    /// The revoker is resolved among the certificates of both streams, so the
-    /// import and the verdict answer off the same signature for every key one
-    /// keyring holds. The `ostree` tool carries the same revocation in by
-    /// merging the offered packets into its own keyblock: measured against
-    /// `ostree` 2026.1, over a remote whose keyring held K and R, the import
-    /// of the re-export reported `Imported 0 GPG keys` at exit 0, the keyring
-    /// grew by the class 0x20 packet, and `ostree show
-    /// --gpg-verify-remote=origin` then reported `Key revoked`
-    /// (`docs/conformance/cli-surface.md`, "P3").
+    /// The import counts no key. A verifier over the result refuses a
+    /// signature by the revoked key. The import looks for the revoker in the
+    /// certificates of both streams. So the import and the verdict use the
+    /// same signature for each key of one keyring.
+    ///
+    /// The `ostree` command also takes this revocation in. It merges the
+    /// offered packets into its own keyblock. Measured against `ostree` 2026.1
+    /// over a remote whose keyring held K and R:
+    ///
+    /// - The import of the re-export reported `Imported 0 GPG keys` at exit 0.
+    /// - The keyring became longer by the class 0x20 packet.
+    /// - `ostree show --gpg-verify-remote=origin` then reported `Key revoked`.
     #[test]
     fn a_designated_revokers_revocation_replaces_the_held_certificate() {
         if !gpg_available() {
@@ -2433,25 +2682,25 @@ IHdvcmxk\n\
             return;
         }
         let state = Revoked::build();
-        // The keyring the `ostree` tool's own import leaves at the repository
-        // root, holding the signing key and the revoker, in that order.
+        // The keyring that the import of the `ostree` command leaves at the
+        // repository root, with the signing key and the revoker, in that order.
         let held = state
             .home
             .imported_keyring("held", &[&state.designating, &state.revoker_cert]);
-        // Over the keyring as it stands the signature is good, so the merge is
-        // what changes the answer.
+        // Over the keyring before the merge, the signature is good. So the
+        // merge changes the result.
         assert_eq!(state.verdict(&certificate_stream(&held)), (false, true));
 
         let (imported, keyring) = merge_keyring(&held, &state.revoked, &[], SUBJECT).unwrap();
         assert_eq!(imported, 0);
-        // The revoked re-export stands where the held run stood, and the
-        // revoker's run passes through as it stands.
+        // The revoked re-export is in the place of the held run, and the run
+        // of the revoker does not change.
         assert_eq!(
             keyring,
             [&state.revoked[..], &state.revoker_cert[..]].concat()
         );
-        // `gpg` reads the result, which is the reader the `ostree` tool drives
-        // through gpgme, and both keys stand in it.
+        // `gpg` reads the result, and both keys are in it. The `ostree`
+        // command uses this reader through gpgme.
         assert_eq!(
             state.home.fingerprints_of(&keyring),
             [state.key.clone(), state.revoker.clone()]
@@ -2459,21 +2708,27 @@ IHdvcmxk\n\
         assert_eq!(state.verdict(&keyring), (true, false));
     }
 
-    /// The offered stream is read for the revoker as well: a stream carrying
-    /// the revoked re-export and the revoker's certificate revokes the key a
-    /// keyring holds, whether or not the keyring held the revoker, and the
-    /// count reports the revoker as the one key added.
+    /// The import also looks for the revoker in the offered stream.
     ///
-    /// A `KEY-ID` selector governs what the import writes and not what it
-    /// knows. Where the selector names the revoked key alone the revocation
-    /// still carries in and the revoker's certificate is not written, so the
-    /// keyring states the revocation and no key in it resolves the revoker.
-    /// The `ostree` tool answers the same way over both selections: measured
-    /// against `ostree` 2026.1, the unselected import reported `Imported 1 GPG
-    /// key` and `ostree show --gpg-verify-remote=origin` then reported `Key
-    /// revoked`, and the import naming the revoked key reported `Imported 0
-    /// GPG keys`, wrote the class 0x20 packet into the keyring, and reported a
-    /// good signature (`docs/conformance/cli-surface.md`, "P3").
+    /// A stream with the revoked re-export and the certificate of the revoker
+    /// revokes the key in a keyring. The result is the same with or without
+    /// the revoker in the keyring. The count reports the revoker as the one
+    /// added key.
+    ///
+    /// A `KEY-ID` selector controls what the import writes, and has no effect
+    /// on what it knows. If the selector names only the revoked key, the
+    /// revocation still gets in, and the certificate of the revoker is not
+    /// written. So the keyring states the revocation, and no key in it
+    /// identifies the revoker.
+    ///
+    /// The `ostree` command gives the same results for both selections.
+    /// Measured against `ostree` 2026.1:
+    ///
+    /// - The import with no selector reported `Imported 1 GPG key`.
+    ///   `ostree show --gpg-verify-remote=origin` then reported `Key revoked`.
+    /// - The import that named the revoked key reported `Imported 0 GPG keys`,
+    ///   wrote the class 0x20 packet into the keyring, and reported a good
+    ///   signature.
     #[test]
     fn an_offered_revoker_certificate_resolves_the_revocation() {
         if !gpg_available() {
@@ -2492,9 +2747,9 @@ IHdvcmxk\n\
         );
         assert_eq!(state.verdict(&keyring), (true, false));
 
-        // The selector names the revoked key alone. The revocation carries in
-        // and the revoker's certificate is left out, so the keyring holds one
-        // key and the revocation it states resolves no revoker.
+        // The selector names only the revoked key. The revocation gets in,
+        // and the certificate of the revoker stays out. So the keyring holds
+        // one key, and its revocation identifies no revoker.
         let (imported, keyring) =
             merge_keyring(&held, &offered, std::slice::from_ref(&state.key), SUBJECT).unwrap();
         assert_eq!(imported, 0);
@@ -2506,14 +2761,14 @@ IHdvcmxk\n\
         assert_eq!(state.verdict(&keyring), (false, true));
     }
 
-    /// The wider set does not let one key's revoker strike another key out of
-    /// the keyring. A key revocation signature R made over the key K, stapled
-    /// onto an offered certificate of a third key that designates R too,
-    /// leaves the keyring at the bytes it held.
+    /// With the wider set, the revoker of one key still cannot remove a
+    /// different key from the keyring.
     ///
-    /// The designation is resolved and the revoker's certificate stands in the
-    /// keyring, so the requirement the revocation verify over the key it
-    /// stands on is the whole of what refuses it.
+    /// R made a key revocation signature over the key K. The case attaches it
+    /// to an offered certificate of a third key that also designates R. The
+    /// keyring keeps its bytes. The designation resolves, and the certificate
+    /// of R is in the keyring. So only the rule that the revocation must verify
+    /// over its own key refuses it.
     #[test]
     fn a_revocation_over_another_key_strikes_out_no_held_key() {
         if !gpg_available() {
@@ -2522,20 +2777,20 @@ IHdvcmxk\n\
         }
         let state = Revoked::build();
         let packet = revocation_packet_of(&state.revoked);
-        // The packet is the revocation R made: over a certificate of K it
-        // stands on, with R's certificate in the trusted set, it revokes.
+        // The packet is the revocation that R made. On a certificate of K,
+        // with the certificate of R in the trusted set, it revokes K.
         let spliced = insert_after_primary(&state.designating, &packet);
         let revoker = state.certs(&state.revoker_cert);
         assert!(verify::key_revoked(&state.certs(&spliced)[0], &revoker));
 
-        // A third key that designates R as a revoker too.
+        // A third key that also designates R as a revoker.
         let third = KeyFixture::new("Third <third@ostrya.example>");
         third.import(&state.revoker_cert);
         third.add_revoker(&state.revoker);
         let designating = third.export_one(&third.fingerprint());
         let stapled = insert_after_primary(&designating, &packet);
-        // The stapled packet reaches the parsed certificate, so it is the merge
-        // that refuses it and not the parse.
+        // The attached packet gets into the parsed certificate. So the merge
+        // refuses it, and the parse does not.
         assert_eq!(
             state.certs(&stapled)[0].details.revocation_signatures.len(),
             1
@@ -2544,19 +2799,20 @@ IHdvcmxk\n\
         let held = third.imported_keyring("held", &[&designating, &state.revoker_cert]);
         let (imported, keyring) = merge_keyring(&held, &stapled, &[], SUBJECT).unwrap();
         assert_eq!(imported, 0);
-        // No replacement is due, so the file keeps every byte it held, the
-        // Trust packets the tool's own import wrote included.
+        // No replacement applies, so the file keeps all its bytes. This
+        // includes the Trust packets that the import of the `ostree` command
+        // wrote.
         assert_eq!(keyring, held);
     }
 
-    /// `certs` as the set a designated revoker is resolved among, which is what
-    /// [`merge_keyring`] hands [`KeyState::over`] for the streams it was given.
+    /// Returns `certs` as the set in which a designated revoker is looked up.
+    /// [`merge_keyring`] gives this set to [`KeyState::over`] for its streams.
     fn known(certs: &[SignedPublicKey]) -> Vec<&SignedPublicKey> {
         certs.iter().collect()
     }
 
-    /// The key revocation signature packet the certificate stream `cert`
-    /// carries, which `gpg --desig-revoke` writes right after the primary key
+    /// Returns the key revocation signature packet of the certificate stream
+    /// `cert`. `gpg --desig-revoke` writes it immediately after the primary key
     /// packet.
     fn revocation_packet_of(cert: &[u8]) -> Vec<u8> {
         let (spans, _) = packet_spans(cert);
@@ -2569,13 +2825,13 @@ IHdvcmxk\n\
         cert[span].to_vec()
     }
 
-    /// A re-export stating a later key expiry replaces the certificate the
-    /// keyring holds for that key, the import counts no key, and the key the
-    /// keyring then holds verifies a signature it made.
+    /// A re-export with a later key expiry replaces the certificate of that
+    /// key in the keyring, and the import counts no key. The key in the
+    /// keyring then verifies a signature that it made.
     ///
-    /// The keyring the merge is given is the one the `ostree` tool's own import
-    /// leaves at the repository root, which carries the Trust packets. The
-    /// merged keyring holds the offered certificate where the held one stood.
+    /// The merge gets the keyring that the import of the `ostree` command
+    /// leaves at the repository root, with the Trust packets. The merged
+    /// keyring holds the offered certificate in the place of the held one.
     #[test]
     fn an_expiry_extension_replaces_the_held_certificate() {
         if !gpg_available() {
@@ -2588,9 +2844,9 @@ IHdvcmxk\n\
         let held = home.legacy_keyring();
         home.set_expire_at("20250102T000000!", "10y");
         let extended = home.export(false);
-        // The fixture is the shape under test: the held keyring states an
-        // expiry that has passed, so it refuses the signature, and the offered
-        // re-export states one ten years out.
+        // The fixture has the shape under test. The held keyring states an
+        // expiry in the past, so it refuses the signature. The offered
+        // re-export states an expiry ten years in the future.
         assert_ne!(extended, expiring);
         assert!(
             !signature_is_valid(&held, &blob),
@@ -2600,20 +2856,20 @@ IHdvcmxk\n\
         let (imported, keyring) = merge_keyring(&held, &extended, &[], SUBJECT).unwrap();
         assert_eq!(imported, 0);
         assert_ne!(keyring, certificate_stream(&held));
-        // One certificate run per key, holding the offered packets.
+        // One certificate run for each key, with the offered packets.
         assert_eq!(keyring, extended);
-        // `gpg` reads the result, which is the reader the `ostree` tool drives
-        // through gpgme, and the key it holds is live again.
+        // `gpg` reads the result, and its key is live again. The `ostree`
+        // command uses this reader through gpgme.
         assert_eq!(home.fingerprints_of(&keyring), [home.fingerprint()]);
         assert!(
             signature_is_valid(&keyring, &blob),
             "the merged keyring must state the extended expiry"
         );
 
-        // The keyring GnuPG writes for the same two imports states the same
-        // expiry and carries one signature packet more: its merge keeps the
-        // self-signature the earlier export carried, where the replacement
-        // writes the offered packets alone. Both keyrings report the key live.
+        // The keyring that GnuPG writes for the same two imports states the
+        // same expiry, and has one more signature packet. The GnuPG merge keeps
+        // the self-signature of the earlier export. The replacement writes
+        // only the offered packets. Both keyrings report the key as live.
         let gnupg = home.imported_keyring("merged", &[&expiring, &extended]);
         let merged = certificate_stream(&gnupg);
         let signatures = |bytes: &[u8]| {
@@ -2632,16 +2888,15 @@ IHdvcmxk\n\
         assert!(signature_is_valid(&gnupg, &blob));
     }
 
-    /// A keyring holding one key through two certificates states the expiry
-    /// their newest self-signature states, which is the instant the verify path
-    /// reads over the pair, so a re-export later than that instant replaces
-    /// both runs.
+    /// A keyring with one key in two certificates states the expiry of their
+    /// newest self-signature. The verify path reads the same instant over the
+    /// pair. So a re-export later than that instant replaces both runs.
     ///
-    /// The two held certificates disagree in the direction that parts the newest
-    /// statement from the widest one: the older one states ten years and the
-    /// newer one an instant that has passed. The offered re-export states five
-    /// years, which stands later than the newest held statement and earlier
-    /// than the widest.
+    /// The two held certificates have different expiries, so the newest
+    /// statement and the widest statement are different. The older one states
+    /// ten years, and the newer one an instant in the past. The offered
+    /// re-export states five years. This is later than the newest held
+    /// statement and earlier than the widest.
     #[test]
     fn two_held_certificates_state_their_newest_expiry() {
         if !gpg_available() {
@@ -2657,8 +2912,8 @@ IHdvcmxk\n\
         let offered = home.export(false);
         let mut held = widest.clone();
         held.extend_from_slice(&newest);
-        // The fixture is the shape under test: the pair reads as expired, so
-        // the widest statement does not answer for it.
+        // The fixture has the shape under test: the pair reads as expired, so
+        // the widest statement does not apply to it.
         assert!(
             !signature_is_valid(&held, &blob),
             "the pair must read as expired"
@@ -2670,7 +2925,7 @@ IHdvcmxk\n\
 
         let (imported, keyring) = merge_keyring(&held, &offered, &[], SUBJECT).unwrap();
         assert_eq!(imported, 0);
-        // A keyring holding one key through two runs takes the replacement in
+        // If a keyring holds one key in two runs, the replacement applies to
         // both.
         assert_eq!(keyring, [&offered[..], &offered[..]].concat());
         assert!(
@@ -2679,10 +2934,11 @@ IHdvcmxk\n\
         );
     }
 
-    /// An offered certificate stating an expiry no later than the held one's
-    /// leaves the keyring at the bytes it held. Two directions state it: a
-    /// shortened expiry over a longer held one, and an expiry over a held
-    /// certificate that states none.
+    /// If an offered certificate states an expiry that is not later than the
+    /// held expiry, the keyring keeps its bytes.
+    ///
+    /// The case has two directions: a shorter expiry over a longer held one,
+    /// and an expiry over a held certificate that states no expiry.
     #[test]
     fn an_earlier_expiry_leaves_the_held_certificate() {
         if !gpg_available() {
@@ -2708,9 +2964,10 @@ IHdvcmxk\n\
         assert_eq!(keyring, held);
     }
 
-    /// A held certificate that revokes its key takes no expiry replacement. A
-    /// revocation is permanent, so the keyring keeps the bytes that carry it
-    /// where the offered certificate carries none.
+    /// A held certificate that revokes its key takes no expiry replacement.
+    ///
+    /// A revocation is permanent. So if the offered certificate has no
+    /// revocation, the keyring keeps the bytes that hold the revocation.
     #[test]
     fn a_revoked_key_takes_no_expiry_replacement() {
         if !gpg_available() {
@@ -2722,9 +2979,9 @@ IHdvcmxk\n\
         let held = insert_after_primary(&home.export(false), &home.revocation_packet());
         home.set_expire_at("20250102T000000!", "10y");
         let extended = home.export(false);
-        // The fixture is the shape under test: the held certificate revokes the
-        // key, the offered one does not, and the offered one states the later
-        // expiry.
+        // The fixture has the shape under test. The held certificate revokes
+        // the key, and the offered one does not. The offered one states the
+        // later expiry.
         let certs = GpgVerifier::from_keyring_bytes([&held]).unwrap().certs;
         assert_eq!(certs.len(), 1);
         let held_state = KeyState::over(&certs, &known(&certs));
@@ -2739,25 +2996,30 @@ IHdvcmxk\n\
         assert_eq!(keyring, held);
     }
 
-    /// A keyring carrying bytes past its last framed packet takes no import.
-    /// The merge reads the keyring the repository holds with the reader a
-    /// verification load uses, so the refusal names the keyring and the merge
-    /// writes none.
+    /// A keyring with bytes after its last framed packet takes no import.
     ///
-    /// The refusal stands whatever the offered stream holds: a revocation for
-    /// the key the keyring holds, which a replacement would write where the
-    /// held run stands, and a certificate for a key it does not hold, which an
-    /// append would write after the bytes it holds.
+    /// The merge reads the keyring of the repository with the reader of a
+    /// verification load. So the refusal names the keyring, and the merge
+    /// writes no keyring.
     ///
-    /// Measured over the same shape -- one exported ed25519 certificate with
-    /// one `0xff` byte appended -- `gpgv` 2.4.9 reports
-    /// `[don't know]: 1st length byte missing`,
-    /// `keyring_get_keyblock: read error: Invalid packet`,
-    /// `keydb_search failed: Invalid keyring`, `ERRSIG`, and `NO_PUBKEY` at
-    /// exit 2 over a signature that key made, `gpg --list-keys` over the file
-    /// lists no key, and `ostree show --gpg-verify-remote` reports
-    /// `Can't check signature: public key not found`. No implementation trusts
-    /// a key out of a file of that shape.
+    /// The refusal applies for each content of the offered stream. The case
+    /// offers a revocation for the key in the keyring, which a replacement
+    /// writes in the place of the held run. It also offers a certificate for a
+    /// key that the keyring does not hold, which an append writes after the
+    /// held bytes.
+    ///
+    /// These results are measured over the same shape: one exported ed25519
+    /// certificate with one `0xff` byte appended.
+    ///
+    /// - `gpgv` 2.4.9 reports `[don't know]: 1st length byte missing`,
+    ///   `keyring_get_keyblock: read error: Invalid packet`,
+    ///   `keydb_search failed: Invalid keyring`, `ERRSIG`, and `NO_PUBKEY` at
+    ///   exit 2 over a signature by that key.
+    /// - `gpg --list-keys` over the file lists no key.
+    /// - `ostree show --gpg-verify-remote` reports
+    ///   `Can't check signature: public key not found`.
+    ///
+    /// No implementation trusts a key from a file of that shape.
     #[test]
     fn an_unframeable_keyring_takes_no_import() {
         if !gpg_available() {
@@ -2771,8 +3033,8 @@ IHdvcmxk\n\
         let revoked = home.export(false);
         let mut held = unrevoked.clone();
         held.push(0xff);
-        // The fixture is the shape under test: the walk frames the export and
-        // stops at the trailing byte, so the run split answers nothing.
+        // The fixture has the shape under test: the walk frames the export and
+        // stops at the trailing byte, so the run split returns nothing.
         assert_eq!(packet_spans(&held).1, unrevoked.len());
         assert!(certificate_chunks(&held).is_none());
 
@@ -2784,9 +3046,14 @@ IHdvcmxk\n\
         }
     }
 
-    /// Each selector form takes the key it names out of the offered stream: a
-    /// fingerprint plain, `0x`-prefixed, and spaced, a key id long and short, a
-    /// subkey fingerprint, and a user id substring in another case.
+    /// Each selector form takes the key that it names from the offered stream.
+    ///
+    /// The forms are:
+    ///
+    /// - A fingerprint: plain, with a `0x` prefix, and with spaces.
+    /// - A long and a short key id.
+    /// - A subkey fingerprint.
+    /// - A user id substring in a different case.
     #[test]
     fn a_selector_takes_the_key_it_names() {
         if !gpg_available() {
@@ -2831,17 +3098,19 @@ IHdvcmxk\n\
             );
         }
 
-        // Two selectors take two keys, and one selector matching both user ids
-        // takes both.
+        // Two selectors take two keys. One selector that matches both user
+        // ids takes both keys.
         let both = [primary.clone(), "other".to_owned()];
         assert_eq!(merge_keyring(b"", &offered, &both, SUBJECT).unwrap().0, 2);
         let shared = ["ostrya.example".to_owned()];
         assert_eq!(merge_keyring(b"", &offered, &shared, SUBJECT).unwrap().0, 2);
     }
 
-    /// A selector naming no offered key is refused by name, and the keyring is
-    /// then left as it was. A hex selector names a key alone: it is no user id
-    /// substring, which is how `gpg --export` reads one.
+    /// The import refuses a selector that names no offered key by name, and
+    /// the keyring does not change.
+    ///
+    /// A hex selector names only a key, and is not a user id substring.
+    /// `gpg --export` reads a hex selector in the same way.
     #[test]
     fn a_selector_naming_nothing_is_refused() {
         if !gpg_available() {
@@ -2858,25 +3127,26 @@ IHdvcmxk\n\
                 "{err}"
             );
         }
-        // The person's own name is a user id substring and takes the key.
+        // The name of the person is a user id substring and takes the key.
         let taken = ["DEADBEEF Person".to_owned()];
         assert_eq!(merge_keyring(b"", &offered, &taken, SUBJECT).unwrap().0, 1);
     }
 
-    /// A selector `gpg --export` reads as a user id substring is no key
-    /// selector here either, so a shape the key reader does not carry names
-    /// nothing rather than a key of its own choosing.
+    /// If `gpg --export` reads a selector as a user id substring, this crate
+    /// also does not read it as a key selector. So a shape that the key reader
+    /// does not accept names no key.
     ///
     /// Each row was measured against `gpg --export -- <selector>` on
-    /// `gpg` 2.4.9, and none of them exports the key the hex names.
+    /// `gpg` 2.4.9. No row exports the key that the hex names.
     #[test]
     fn a_selector_the_key_reader_does_not_carry_names_nothing() {
         if !gpg_available() {
             eprintln!("skipping: gpg not available");
             return;
         }
-        // The user id holds a `0x`-prefixed word, so a `0x` selector that is no
-        // key would take this key if it were read as a user id substring.
+        // The user id holds a word with a `0x` prefix. So if the read takes a
+        // `0x` selector that is not a key as a user id substring, the selector
+        // takes this key.
         let home = KeyFixture::new("Narrow 0xnope <narrow@ostrya.example>");
         let offered = home.export(false);
         let primary = home.fingerprint();
@@ -2888,17 +3158,21 @@ IHdvcmxk\n\
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        // Ten groups the same fingerprint splits into at uneven widths.
+        // The same fingerprint in ten groups of different widths.
         let uneven = format!(
             "{} {} {}",
             &primary[..3],
             &primary[3..8],
             group(4)[10..].to_owned()
         );
-        // The `0x` prefix is read in lower case alone and names a key or
-        // nothing; a key id carries no interior space; the one spaced shape is a
-        // printed v4 fingerprint, ten groups of four; a tab is no space; and
-        // `0x` admits no space.
+        // These rows check five rules:
+        // - Only the lower-case `0x` prefix counts, and it names a key or
+        //   nothing.
+        // - A key id has no interior space.
+        // - The one shape with spaces is a printed v4 fingerprint, ten groups
+        //   of four.
+        // - An interior tab is not a space.
+        // - `0x` accepts no space.
         let narrowed = [
             format!("0X{primary}"),
             format!("0X{}", &primary[32..]),
@@ -2919,7 +3193,7 @@ IHdvcmxk\n\
                     if m == &format!("no key matching '{selector}' among the keys to import")),
                 "the selector '{selector}' took a key: {err}"
             );
-            // The reference: the selector exports nothing through `gpg`.
+            // The reference: the export of the selector through `gpg` is empty.
             let out = home
                 .gpg()
                 .arg("--export")
@@ -2932,9 +3206,9 @@ IHdvcmxk\n\
                 "gpg --export took a key for '{selector}'"
             );
         }
-        // The forms the reader does carry still take the key: a printed
-        // fingerprint in its ten groups of four, and either hex case, with
-        // leading and trailing spaces dropped.
+        // The forms that the reader accepts still take the key: a printed
+        // fingerprint in its ten groups of four, and both hex cases. The read
+        // drops spaces before and after the selector.
         for selector in [group(4), format!(" {} ", primary.to_lowercase())] {
             assert_eq!(
                 merge_keyring(b"", &offered, std::slice::from_ref(&selector), SUBJECT)
@@ -2946,8 +3220,8 @@ IHdvcmxk\n\
         }
     }
 
-    /// The user id search folds ASCII case alone, which is what `gpg` folds:
-    /// over the user id `Ärger`, `ÄRGER` takes the key and `ärger` takes none.
+    /// The user id search ignores case for ASCII letters only, as `gpg` does.
+    /// Over the user id `Ärger`, `ÄRGER` takes the key and `ärger` takes none.
     #[test]
     fn a_user_id_selector_folds_ascii_case_alone() {
         if !gpg_available() {
@@ -2976,9 +3250,9 @@ IHdvcmxk\n\
         }
     }
 
-    /// A stream carrying no certificate, one the packet walk cannot frame to
-    /// its end, and a keybox are each refused, and the keyring is then left as
-    /// it was. The `ostree` tool refuses all three as well.
+    /// The import refuses a stream with no certificate, a stream that the
+    /// packet walk cannot frame to its end, and a keybox. The keyring does not
+    /// change. The `ostree` command also refuses all three.
     #[test]
     fn an_unreadable_offered_stream_is_refused() {
         let empty = merge_keyring(b"", b"", &[], SUBJECT).unwrap_err();
@@ -3010,15 +3284,15 @@ IHdvcmxk\n\
             "{err}"
         );
         // A keyring holds transferable public keys, so a secret-key export
-        // holds none. The `ostree` tool takes the public part of such a stream;
-        // `cli-surface.md`, "P3", records the divergence.
+        // holds none. The `ostree` command takes the public part of such a
+        // stream. This is a divergence.
         let err = merge_keyring(b"", &home.export_secret(), &[], SUBJECT).unwrap_err();
         assert!(
             matches!(&err, Error::Signature(m) if m.contains("no OpenPGP certificate")),
             "{err}"
         );
-        // The certificate cap holds over an offered stream as well: 257 are
-        // refused by name and 256 are taken.
+        // The certificate limit also applies to an offered stream. The import
+        // refuses 257 by name, and takes 256.
         let many = offered.repeat(MAX_KEYRING_CERTS + 1);
         assert!(many.len() as u64 <= MAX_KEYRING);
         let err = merge_keyring(b"", &many, &[], SUBJECT).unwrap_err();
@@ -3031,9 +3305,9 @@ IHdvcmxk\n\
         assert_eq!(merge_keyring(b"", &allowed, &[], SUBJECT).unwrap().0, 1);
     }
 
-    /// The listing reports what `gpg` reports over the same keyring: the
-    /// fingerprint, the creation instant, and the user ids in listing order.
-    /// A keyring holding no key lists none.
+    /// The listing reports the same data as `gpg` over the same keyring: the
+    /// fingerprint, the creation time, and the user ids in listing order. A
+    /// keyring with no key gives an empty list.
     #[test]
     fn the_listing_agrees_with_gpg() {
         if !gpg_available() {
@@ -3045,8 +3319,9 @@ IHdvcmxk\n\
         home.add_signing_subkey();
         home.add_key("Another <another@ostrya.example>");
 
-        // The reference: the `pub`, `fpr`, and `uid` records of gpg's own
-        // machine-readable listing, one record set per primary key.
+        // The reference: the `pub`, `fpr`, and `uid` records of the
+        // machine-readable listing of `gpg`, one record set for each primary
+        // key.
         let listing = home.listing();
         let mut reference: Vec<GpgKey> = Vec::new();
         let mut in_subkey = false;

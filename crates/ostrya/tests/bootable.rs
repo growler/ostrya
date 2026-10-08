@@ -1,15 +1,20 @@
 #![forbid(unsafe_code)]
 
-//! Kernel-version derivation tests.
+//! Integration tests of the kernel version of a tree.
 //!
-//! Each tree shape runs through both entry points: [`Transaction::kernel_version`]
-//! over the tree while it is still staged, and [`RepoTree::kernel_version`] over
-//! the same tree once the commit that holds it is published. The two must reach
-//! the same answer for every shape, since one walk serves both.
+//! Each tree shape goes through the two entry points:
 //!
-//! A further pair of tests holds the boundary between them: the staged form
-//! reads a kernel directory that exists only in the open transaction, and the
-//! published form reads one out of `objects/` with no transaction at all.
+//! - [`Transaction::kernel_version`] reads the tree while it is staged.
+//! - [`RepoTree::kernel_version`] reads the same tree after the commit that
+//!   holds it is published.
+//!
+//! The two must give the same answer for each shape, because one walk serves
+//! both.
+//!
+//! Two more tests check the boundary between the two forms. The staged form
+//! reads a kernel directory that exists only in the open transaction. The
+//! published form reads a kernel directory from `objects/` with no open
+//! transaction.
 
 mod common;
 
@@ -23,8 +28,8 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// Build one tree shape under `base/src` and return the directory holding it.
-/// `kernels` names the directories under `/usr/lib/modules` that get a
+/// Builds one tree shape under `base/src` and returns the directory that holds
+/// it. `kernels` names the directories under `/usr/lib/modules` that get a
 /// `vmlinuz` entry.
 fn build_tree(base: &Path, kernels: &[&str]) -> std::path::PathBuf {
     let src = base.join("src");
@@ -38,8 +43,8 @@ fn build_tree(base: &Path, kernels: &[&str]) -> std::path::PathBuf {
     src
 }
 
-/// Ingest `src` into a fresh root tree with canonical permissions, so the shape
-/// alone decides the answer.
+/// Ingests `src` into a new root tree with canonical permissions, so that only
+/// the shape of the tree decides the answer.
 async fn ingest(txn: &Transaction, src: &Path) -> RepoTree {
     let mut modifier = CommitModifier::new(
         CommitModifierFlags::CANONICAL_PERMISSIONS | CommitModifierFlags::SKIP_XATTRS,
@@ -53,10 +58,11 @@ async fn ingest(txn: &Transaction, src: &Path) -> RepoTree {
     txn.write_mtree(&mut mtree).await.unwrap()
 }
 
-/// Run `src` through both entry points and return the two answers: the staged
-/// one and the published one.
+/// The answer of one entry point: a kernel version or a refusal.
 type Answer = std::result::Result<String, BootableRefusal>;
 
+/// Runs `src` through the two entry points and returns the two answers: the
+/// staged answer, then the published answer.
 async fn both_answers(repo_dir: &Path, src: &Path) -> (Answer, Answer) {
     let repo = Repo::create(repo_dir, CreateOptions::new(RepoMode::Archive))
         .await
@@ -74,8 +80,8 @@ async fn both_answers(repo_dir: &Path, src: &Path) -> (Answer, Answer) {
     (staged, published)
 }
 
-/// Build `src`, run it through both entry points, and require them to agree on
-/// `expected`.
+/// Builds `src`, runs it through the two entry points, and checks that both
+/// answers are `expected`.
 fn assert_both(tag: &str, expected: Answer, build: impl FnOnce(&Path) -> std::path::PathBuf) {
     let tmp = TmpDir::new(tag);
     let src = build(tmp.path());
@@ -93,7 +99,7 @@ fn one_kernel_names_the_version() {
     });
 }
 
-/// Two kernel directories name no single version.
+/// Two kernel directories do not name one version.
 #[test]
 fn two_kernels_are_refused() {
     assert_both(
@@ -103,7 +109,7 @@ fn two_kernels_are_refused() {
     );
 }
 
-/// A `/usr/lib/modules` holding directories, none of them a kernel.
+/// A `/usr/lib/modules` that holds directories, but no kernel, is refused.
 #[test]
 fn no_kernel_directory_is_refused() {
     assert_both("bootable-none", Err(BootableRefusal::NoKernel), |base| {
@@ -114,7 +120,7 @@ fn no_kernel_directory_is_refused() {
     });
 }
 
-/// A tree with no `/usr` names the first component it does not hold.
+/// A tree with no `/usr` names the first component that it does not hold.
 #[test]
 fn a_missing_usr_names_that_component() {
     assert_both(
@@ -131,7 +137,7 @@ fn a_missing_usr_names_that_component() {
     );
 }
 
-/// A tree holding `/usr` but not `/usr/lib` names the deeper component.
+/// A tree that holds `/usr`, but not `/usr/lib`, names the deeper component.
 #[test]
 fn a_missing_lib_names_that_component() {
     assert_both(
@@ -148,8 +154,9 @@ fn a_missing_lib_names_that_component() {
     );
 }
 
-/// A tree holding `/usr/lib` but not `/usr/lib/modules` names the last
-/// component of the path, the third of the three the walk can report absent.
+/// A tree that holds `/usr/lib`, but not `/usr/lib/modules`, names the last
+/// component of the path. This is the third of the three components that the
+/// walk can report as absent.
 #[test]
 fn a_missing_modules_names_that_component() {
     assert_both(
@@ -166,7 +173,8 @@ fn a_missing_modules_names_that_component() {
     );
 }
 
-/// A file where `/usr/lib/modules` belongs is not a directory to descend.
+/// A file at `/usr/lib/modules` is not a directory, and the walk does not
+/// descend into it.
 #[test]
 fn a_file_at_modules_is_not_a_directory() {
     assert_both(
@@ -184,9 +192,9 @@ fn a_file_at_modules_is_not_a_directory() {
 }
 
 /// The staged form reads the objects of the open transaction. Before the
-/// transaction commits, the published form over the same tree cannot read its
-/// root dirtree at all, which is what makes the staged form the one a caller
-/// deriving commit metadata needs.
+/// transaction commits, the published form cannot read the root dirtree of
+/// the same tree. A caller that derives commit metadata needs the staged form for
+/// this reason.
 #[test]
 fn the_staged_form_reads_an_uncommitted_tree() {
     let tmp = TmpDir::new("bootable-staged");

@@ -1,62 +1,10 @@
-//! Comparing two trees.
+//! The comparison of two trees.
 //!
-//! [`Repo::diff`] compares two sides -- a commit in the repository or a
-//! directory on the filesystem -- and reports the paths that changed.
-//! [`Repo::diff_commits`] is the two-commit case with the default options, and
-//! [`Repo::diff_stats`] reports the object counts and the shared size of two
-//! commits. The classification and the print order reproduce `ostree diff`
-//! (recovered by black-box observation, and recorded in
-//! `format-reference.md`, "CLI output formats", `diff`):
-//!
-//! - A regular file or a symlink present on both sides whose content object
-//!   checksum differs is [`Modified`](DiffChange::Modified). That checksum
-//!   covers the uid, the gid, the mode, the extended attributes, the symlink
-//!   target, and the payload.
-//! - A directory present on both sides whose directory metadata checksum
-//!   differs is [`Modified`](DiffChange::Modified); the comparison still
-//!   descends to find nested changes.
-//! - A device, a fifo, and a socket carry no change kind of their own. Two of
-//!   them compare on the uid, the gid, the mode, and the extended attributes.
-//! - A name whose type differs between the two sides is a single
-//!   [`Modified`](DiffChange::Modified) entry, with no descent into it.
-//! - A name only on the second side is [`Added`](DiffChange::Added); an added
-//!   directory lists itself and, recursively, every descendant.
-//! - A name only on the first side is [`Removed`](DiffChange::Removed); a
-//!   removed directory is a single entry, without its former children.
-//!
-//! The root directory's own metadata is outside the comparison.
-//!
-//! The returned entries are grouped as the tool prints them -- modified, then
-//! removed, then added. Within one group the order is the order the walk found
-//! the entries: at each pair of directories of one name the walk reads the
-//! first side's entries in that side's own order, descending into a pair of
-//! directories where it stands, and then reads the second side's entries in
-//! that side's own order. A commit side's own order is the files of the
-//! directory in stored order followed by the subdirectories in stored order; a
-//! directory side's own order is the order the directory returns its entries
-//! in.
-//!
-//! A commit side reads the checksums the directory tree objects hold, so no
-//! payload is read for it. A directory side reads what the pairing needs and
-//! nothing more:
-//!
-//! - the extended attributes of a name both sides hold whose two kinds pair,
-//!   and of no other name, so a pair of differing kinds and an entry one side
-//!   alone holds are named without being opened;
-//! - a content object checksum for a pair a fact already in hand leaves
-//!   undecided. Two local entries whose uid, gid, mode, extended attributes, or
-//!   size differ are decided as they stand; where those agree, both payloads
-//!   are streamed through a fixed buffer and the two checksums decide.
-//!
-//! A directory side holds one descriptor for its root and opens every entry
-//! below it from that descriptor by the relative path the walk builds, so the
-//! descriptor count does not follow the depth.
-//!
-//! A directory side's entry names and symlink targets are carried as the bytes
-//! the filesystem returned, so a name that is not valid UTF-8 is compared,
-//! descended into, and listed. [`DiffEntry::path`] is a `String`, so such a
-//! name reaches it through a lossy conversion
-//! (`docs/conformance/cli-surface.md`, "P2").
+//! [`Repo::diff`] compares two sides and returns the paths that changed. Each
+//! side is a commit in the repository or a directory on the file system, as
+//! [`DiffSide`] states. [`Repo::diff_commits`] compares two commits with the
+//! default options. [`Repo::diff_stats`] returns the object counts and the
+//! shared size of two commits.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -84,8 +32,8 @@ use crate::object;
 use crate::repo::Repo;
 use crate::write::FileMeta;
 
-/// The payload chunk a local file is hashed in, so a file of any size costs a
-/// fixed amount of memory.
+/// The size of the payload chunk that hashes a local file. A file of any size
+/// uses a fixed amount of memory.
 const HASH_CHUNK: usize = 64 * 1024;
 
 /// The kind of change to a path between two sides.
@@ -95,19 +43,24 @@ pub enum DiffChange {
     Added,
     /// The path exists only on the first side.
     Removed,
-    /// The path exists on both sides but its stored form differs.
+    /// The path exists on both sides, and its stored form or its type differs.
     Modified,
 }
 
-/// One entry in a diff.
+/// One entry in the result of a comparison.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffEntry {
-    /// What changed.
+    /// The kind of change.
     pub change: DiffChange,
-    /// The absolute path within the tree, for example `/etc/hostname`. The
-    /// side that names it is the second side for [`Added`](DiffChange::Added)
-    /// and the first side for the other two. A directory side's name that is
-    /// not valid UTF-8 reaches this field through a lossy conversion.
+    /// The absolute path in the tree, for example `/etc/hostname`.
+    ///
+    /// An [`Added`](DiffChange::Added) path names an entry of the second side.
+    /// A [`Modified`](DiffChange::Modified) or [`Removed`](DiffChange::Removed)
+    /// path names an entry of the first side.
+    ///
+    /// If the name of an entry on a directory side is not valid UTF-8, this
+    /// field holds a lossy conversion of the name. Each byte sequence that is
+    /// not valid UTF-8 becomes U+FFFD.
     pub path: String,
 }
 
@@ -116,62 +69,72 @@ pub struct DiffEntry {
 pub enum DiffSide<'a> {
     /// A commit in the repository.
     Commit(&'a Checksum),
-    /// A directory on the filesystem.
+    /// A directory on the file system.
     Directory(&'a Path),
 }
 
-/// How the two sides are read.
+/// The options that control how [`Repo::diff`] reads the two sides.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DiffOptions {
-    /// Read no extended attributes from a directory side. A commit side is
-    /// unaffected, its objects carrying the attributes they were committed
-    /// with.
+    /// If `true`, the comparison reads no extended attributes from a directory
+    /// side.
+    ///
+    /// This option does not change a commit side. Its objects hold the
+    /// extended attributes of the commit.
     pub skip_xattrs: bool,
-    /// The user id given to the entries of the `to` side, where that side is a
-    /// directory.
+    /// The user id of each entry of the `to` side, if that side is a directory.
+    ///
+    /// `None` keeps the user id that the file system returns.
     pub owner_uid: Option<u32>,
-    /// The group id given to the entries of the `to` side, on the same terms.
+    /// The group id of each entry of the `to` side, if that side is a
+    /// directory.
+    ///
+    /// `None` keeps the group id that the file system returns.
     pub owner_gid: Option<u32>,
 }
 
 /// The object counts and the shared size of two commits.
+///
+/// [`Repo::diff_stats`] states which objects the object set of a commit holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiffStats {
-    /// The size of the first commit's own object set.
+    /// The number of objects in the object set of the first commit.
     pub from_objects: usize,
-    /// The size of the second commit's own object set.
+    /// The number of objects in the object set of the second commit.
     pub to_objects: usize,
-    /// The size of the intersection of the two sets.
+    /// The number of objects in the intersection of the two sets.
     pub common_objects: usize,
-    /// The sum of the on-disk sizes of the loose object files of the
+    /// The sum of the on-disk sizes of the loose object files in the
     /// intersection.
     pub common_bytes: u64,
 }
 
-/// One directory of one side, ready to enumerate.
+/// One directory of one side, ready for a listing.
 enum Side {
-    /// A directory of a commit, named by its directory tree object.
+    /// A directory of a commit, named by its dirtree object.
     Repo(Checksum),
-    /// A directory on the filesystem.
+    /// A directory on the file system.
     Local(LocalDir),
 }
 
-/// A directory on the filesystem, named by its path below the side's root.
+/// A directory on the file system, named by its path below the root of the
+/// side.
 ///
-/// Only the root is held open. Every read below it opens what it needs from the
-/// root descriptor by `rel` and closes it again, so a walk of any depth holds
-/// one descriptor per side.
+/// Only the root stays open. Each read below the root opens what it needs from
+/// the root descriptor by `rel`, and then closes it. A walk of any depth holds
+/// one descriptor for each side.
 struct LocalDir {
     root: Arc<OwnedFd>,
-    /// The path below the root, empty at the root itself.
+    /// The path below the root. It is empty at the root.
     rel: PathBuf,
-    /// The path the argument reached this directory by, which a read failure
-    /// names.
+    /// The path from the argument to this directory. A read failure names
+    /// this path.
     path: PathBuf,
 }
 
 impl LocalDir {
-    /// The name `openat` reaches this directory by from the root descriptor.
+    /// Returns the name that `openat` uses for this directory from the root
+    /// descriptor.
     fn at(&self) -> &Path {
         if self.rel.as_os_str().is_empty() {
             Path::new(".")
@@ -180,7 +143,7 @@ impl LocalDir {
         }
     }
 
-    /// The subdirectory `name` names, opening nothing.
+    /// Returns the subdirectory `name`. It opens nothing.
     fn child(&self, name: &OsStr) -> LocalDir {
         LocalDir {
             root: self.root.clone(),
@@ -190,23 +153,23 @@ impl LocalDir {
     }
 }
 
-/// One entry of one directory, in the order the side names it.
+/// One entry of one directory, in the order of its side.
 struct SideEntry {
     name: OsString,
     kind: EntryKind,
 }
 
-/// One directory's entries as its side names them, before the comparison
-/// decides which of them must be read any further.
+/// The entries of one directory as its side lists them. The comparison then
+/// decides which entries it reads further.
 enum SideList {
-    /// A committed directory, whose entries are complete as they are listed.
+    /// A committed directory. The listing holds all data of each entry.
     Repo(Vec<SideEntry>),
-    /// A directory on the filesystem, listed with no extended attributes.
+    /// A directory on the file system, listed with no extended attributes.
     Local(Vec<RawEntry>),
 }
 
 impl SideList {
-    /// Every entry name paired with the class it compares in, in listing order.
+    /// Returns each entry name with its comparison class, in listing order.
     fn classes(&self) -> Vec<(&OsStr, Class)> {
         match self {
             SideList::Repo(entries) => entries
@@ -227,46 +190,46 @@ impl SideList {
     }
 }
 
-/// What one entry compares as.
+/// The data that the comparison uses for one entry.
 enum EntryKind {
-    /// A regular file or a symlink of a commit, whose content object checksum
-    /// the directory tree object holds.
+    /// A regular file or a symlink of a commit. The dirtree object holds its
+    /// content object checksum.
     Content(Checksum),
-    /// A directory of a commit, with its metadata checksum and the directory
-    /// tree object to descend into.
+    /// A directory of a commit, with its dirmeta checksum and the dirtree
+    /// object for the descent.
     Dir { meta: Checksum, dirtree: Checksum },
-    /// A regular file on the filesystem. The payload is read only where the
-    /// metadata and the size leave the pair undecided.
+    /// A regular file on the file system. The comparison reads the payload
+    /// only if the metadata and the size do not decide the pair.
     File { meta: FileMeta, size: u64 },
-    /// A symlink on the filesystem, with the target bytes the filesystem
-    /// returned.
+    /// A symlink on the file system, with the target bytes that the file
+    /// system returned.
     Symlink { meta: FileMeta, target: Vec<u8> },
-    /// A directory on the filesystem.
+    /// A directory on the file system.
     LocalDir { meta: FileMeta },
     /// A device, a fifo, or a socket.
     Other(FileMeta),
 }
 
-/// The class an entry compares in. Two entries of one name are read any further
-/// only where their classes pair.
+/// The comparison class of an entry. The comparison reads two entries of one
+/// name further only if their classes pair.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Class {
-    /// A directory, on either kind of side.
+    /// A directory, on a side of either kind.
     Dir,
-    /// A regular file or a symlink of a commit, which a directory tree object
-    /// names by one checksum and does not tell apart.
+    /// A regular file or a symlink of a commit. A dirtree object names both
+    /// kinds by one checksum and does not tell them apart.
     Content,
-    /// A regular file on the filesystem.
+    /// A regular file on the file system.
     File,
-    /// A symlink on the filesystem.
+    /// A symlink on the file system.
     Symlink,
     /// A device, a fifo, or a socket.
     Other,
 }
 
-/// Whether two classes pair, which decides whether either side is read any
-/// further. A pair that does not pair is one modification, reached from the
-/// listing alone.
+/// Returns `true` if two classes pair. Only then does the comparison read
+/// either entry further. Two entries that do not pair are one modification,
+/// which the listing alone decides.
 fn classes_pair(left: Class, right: Class) -> bool {
     matches!(
         (left, right),
@@ -282,7 +245,7 @@ fn classes_pair(left: Class, right: Class) -> bool {
     )
 }
 
-/// The three lists a walk fills, each in walk order.
+/// The three lists that a walk fills, each in walk order.
 #[derive(Default)]
 struct Lists {
     modified: Vec<String>,
@@ -290,13 +253,111 @@ struct Lists {
     added: Vec<String>,
 }
 
-/// The boxed future one level of the walk returns; async recursion needs the
-/// indirection.
+/// The boxed future that one level of the walk returns. Async recursion needs
+/// this indirection.
 type WalkFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
+/// Methods that compare two trees.
 impl Repo {
-    /// Compare two sides and return the changed paths, in the order
-    /// `ostree diff` prints them.
+    /// Compares two sides and returns the paths that changed.
+    ///
+    /// The classification and the order match the observed output of the
+    /// `ostree diff` command.
+    ///
+    /// # Classification
+    ///
+    /// - If a regular file or a symlink is on both sides and its content object
+    ///   checksum differs, the path is [`Modified`](DiffChange::Modified). This
+    ///   checksum covers the uid, the gid, the mode, the extended attributes,
+    ///   the symlink target, and the payload.
+    /// - If a directory is on both sides and its dirmeta checksum differs, the
+    ///   path is [`Modified`](DiffChange::Modified). The comparison also
+    ///   descends into the directory to find the changes below it.
+    /// - A device, a fifo, or a socket has no change kind of its own. If such
+    ///   an entry is on both sides and its uid, gid, mode, or extended
+    ///   attributes differ, the path is [`Modified`](DiffChange::Modified).
+    /// - If the type of a name differs between the two sides, the path is one
+    ///   [`Modified`](DiffChange::Modified) entry. The comparison does not
+    ///   descend into it.
+    /// - If a name is only on the second side, the path is
+    ///   [`Added`](DiffChange::Added). An added directory gives one entry for
+    ///   itself and one entry for each entry below it, at each depth.
+    /// - If a name is only on the first side, the path is
+    ///   [`Removed`](DiffChange::Removed). A removed directory gives one entry,
+    ///   with no entries for its children.
+    ///
+    /// The comparison does not include the metadata of the root directory.
+    ///
+    /// # Order
+    ///
+    /// The result holds the [`Modified`](DiffChange::Modified) entries first,
+    /// then the [`Removed`](DiffChange::Removed) entries, then the
+    /// [`Added`](DiffChange::Added) entries. The `ostree diff` command prints
+    /// the groups in this order. In each group, the entries are in the order
+    /// in which the walk finds them.
+    ///
+    /// At each pair of directories with the same name, the walk does these
+    /// steps:
+    ///
+    /// 1. It reads the entries of the first side in the order of that side. It
+    ///    descends into each pair of directories at the position of the pair.
+    /// 2. It reads the entries of the second side in the order of that side.
+    ///
+    /// The order of a commit side is the files of the directory in stored
+    /// order, then the subdirectories in stored order. The order of a
+    /// directory side is the order in which the directory returns its
+    /// entries.
+    ///
+    /// # Directory side
+    ///
+    /// A commit side reads the checksums that its dirtree objects hold. It
+    /// reads no payload. A directory side reads only the data that the
+    /// comparison needs.
+    ///
+    /// Two entries of one name pair if both are directories, both are regular
+    /// files, or both are symlinks. Two devices, fifos, or sockets also pair. A
+    /// file or a symlink of a commit side pairs with a regular file or a
+    /// symlink of a directory side.
+    ///
+    /// - A directory side reads the extended attributes of a name only if both
+    ///   sides hold the name and the two entries pair. It does not open an
+    ///   entry that only one side holds, or two entries that do not pair.
+    /// - It computes a content object checksum only for a pair that the known
+    ///   data does not decide. If two local entries differ in uid, gid, mode,
+    ///   extended attributes, or size, this difference decides the pair.
+    /// - If these values agree for two local regular files, the comparison
+    ///   streams both payloads through a fixed buffer, and the two checksums
+    ///   decide. Two local symlinks compare their metadata and their targets.
+    /// - A local regular file against a committed object always streams the
+    ///   local payload, and the checksum decides.
+    ///
+    /// A directory side holds one descriptor for its root. It opens each entry
+    /// below the root from this descriptor, by the relative path that the walk
+    /// builds. The number of open descriptors does not grow with the depth of
+    /// the tree.
+    ///
+    /// A directory side keeps entry names and symlink targets as the bytes
+    /// that the file system returns. It compares, descends into, and lists a
+    /// name that is not valid UTF-8. [`DiffEntry::path`] states how the result
+    /// holds such a name. If the target of a local symlink is not valid UTF-8,
+    /// the symlink differs from each committed file or symlink.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if a commit side names a commit that the
+    ///   repository does not hold, or if a dirtree that the walk reads is
+    ///   absent.
+    /// - [`Error::Core`] if a commit or a dirtree does not parse.
+    /// - [`Error::InvalidFormat`] if the name of an extended attribute on a
+    ///   directory side is not valid UTF-8.
+    /// - [`Error::Io`] if a read of the repository fails. This includes a
+    ///   commit or a dirtree that is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or that is not a
+    ///   regular file.
+    /// - [`Error::Io`] if a read of a directory side fails. The message has the
+    ///   form `call(path): reason`, for example
+    ///   `open(/srv/tree/etc/shadow): Permission denied`. The call is
+    ///   `opendir`, `readdir`, `stat`, `readlink`, `open`, or `getxattr`.
     pub async fn diff(
         &self,
         from: DiffSide<'_>,
@@ -325,9 +386,20 @@ impl Repo {
         Ok(out)
     }
 
-    /// Compare the trees of commits `from` and `to`, returning the changed
-    /// paths. Equal to [`diff`](Repo::diff) over two
-    /// [`Commit`](DiffSide::Commit) sides with the default options.
+    /// Compares the trees of two commits and returns the paths that changed.
+    ///
+    /// This call is [`diff`](Repo::diff) with two [`Commit`](DiffSide::Commit)
+    /// sides and the default options.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if the repository does not hold `from` or
+    ///   `to`, or if a dirtree that the walk reads is absent.
+    /// - [`Error::Core`] if a commit or a dirtree does not parse.
+    /// - [`Error::Io`] if a read of the repository fails. This includes a
+    ///   commit or a dirtree that is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or that is not a
+    ///   regular file.
     pub async fn diff_commits(&self, from: &Checksum, to: &Checksum) -> Result<Vec<DiffEntry>> {
         self.diff(
             DiffSide::Commit(from),
@@ -337,23 +409,42 @@ impl Repo {
         .await
     }
 
-    /// The object counts and the shared size of two commits.
+    /// Returns the object counts and the shared size of two commits.
     ///
-    /// Each count is the size of that commit's own object set: the commit
-    /// object, the root directory metadata object, every directory tree
-    /// object, every further directory metadata object, and every content
-    /// object the commit's tree reaches. The set holds neither the commit's
-    /// parents nor its detached metadata object. `common_bytes` sums the
-    /// on-disk sizes of the loose object files of the intersection, so an
-    /// `archive` repository counts the compressed size and a `bare` repository
-    /// the payload size.
+    /// Each count is the number of objects in the object set of one commit.
+    /// This set holds these objects:
+    ///
+    /// - the commit object
+    /// - the root dirmeta object
+    /// - each dirtree object and each other dirmeta object
+    /// - each content object that the tree of the commit reaches
+    ///
+    /// The set does not hold the parent commits or the detached metadata
+    /// object.
+    ///
+    /// [`common_bytes`](DiffStats::common_bytes) is the sum of the on-disk
+    /// sizes of the loose object files in the intersection of the two sets. In
+    /// an `archive` repository, this sum counts the compressed size. In a
+    /// `bare` repository, it counts the payload size.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if the repository does not hold `from` or
+    ///   `to`.
+    /// - [`Error::ObjectNotFound`] if the repository does not hold an object of
+    ///   the intersection.
+    /// - [`Error::Core`] if a commit or a dirtree does not parse.
+    /// - [`Error::Io`] if a read of the object store fails. This includes a
+    ///   commit or a dirtree that is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or that is not a
+    ///   regular file.
     pub async fn diff_stats(&self, from: &Checksum, to: &Checksum) -> Result<DiffStats> {
         let from_set = self.traverse_commit(from, 0).await?;
         let to_set = self.traverse_commit(to, 0).await?;
         let common: Vec<ObjectName> = from_set.intersection(&to_set).copied().collect();
         let common_objects = common.len();
-        // The whole intersection is sized in one pass on the blocking pool, so
-        // the cost is one dispatch and not one per object.
+        // One pass on the blocking pool sizes the whole intersection. The cost
+        // is one dispatch for all objects.
         let repo = self.clone();
         let mode = self.mode();
         let common_bytes = ostrya_rt::unblock(move || {
@@ -383,7 +474,7 @@ impl Repo {
         })
     }
 
-    /// Open one side's root directory.
+    /// Opens the root directory of one side.
     async fn open_side(&self, side: DiffSide<'_>) -> Result<Side> {
         match side {
             DiffSide::Commit(commit) => {
@@ -411,11 +502,13 @@ impl Repo {
     }
 }
 
-/// Compare one pair of directories of the same name and record what differs.
+/// Compares one pair of directories with the same name and records the
+/// differences.
 ///
-/// The first pass reads `from`'s entries in that side's own order, descending
-/// into a pair of directories where it stands. The second pass reads `to`'s
-/// entries in that side's own order and records the ones `from` does not hold.
+/// The first pass reads the entries of `from` in the order of that side. It
+/// descends into each pair of directories at the position of the pair. The
+/// second pass reads the entries of `to` in the order of that side. It records
+/// the entries that `from` does not hold.
 fn walk<'a>(
     repo: &'a Repo,
     from: Side,
@@ -425,12 +518,13 @@ fn walk<'a>(
     out: &'a mut Lists,
 ) -> WalkFuture<'a> {
     Box::pin(async move {
-        // Both sides are listed before either is read any further, so the
-        // extended attributes are read for the names both sides hold whose two
-        // kinds pair and for no other. An entry one side alone holds, and a
-        // name the two sides hold at different kinds, is named without being
-        // opened, which is what lets an unreadable added file be listed and a
-        // type change be reported over an unreadable entry.
+        // The walk lists both sides before it reads either side further. It
+        // reads extended attributes only for the names that both sides hold
+        // with kinds that pair. The walk names an entry that only one side
+        // holds without an open. The same applies to a name with two kinds
+        // that do not pair. As a result, the walk can list an added file that
+        // the process cannot read. It can also report a type change over an
+        // entry that the process cannot read.
         let (from_list, to_list) = zip(read_list(repo, &from), read_list(repo, &to)).await;
         let (from_list, to_list) = (from_list?, to_list?);
         let wanted = paired_names(&from_list, &to_list, options);
@@ -466,8 +560,8 @@ fn walk<'a>(
                     if dirmeta_differs(&entry.kind, &other.kind)? {
                         out.modified.push(render(&path));
                     }
-                    // Two commit sides naming one directory tree object hold
-                    // the same subtree, so the descent would find nothing.
+                    // If two commit sides name one dirtree object, they hold
+                    // the same subtree. The descent finds nothing there.
                     if let (
                         EntryKind::Dir { dirtree: left, .. },
                         EntryKind::Dir { dirtree: right, .. },
@@ -486,10 +580,10 @@ fn walk<'a>(
                         out.modified.push(render(&path));
                     }
                 }
-                // Two local regular files. A difference the listing already
-                // holds decides the pair, so no payload is read to reach a
-                // conclusion the metadata already carries. Equal sizes decide
-                // nothing, so both payloads are hashed there.
+                // Two local regular files. If the listing already holds a
+                // difference, this difference decides the pair, and the walk
+                // reads no payload. Equal sizes decide nothing, so the walk
+                // hashes both payloads.
                 (
                     EntryKind::File {
                         meta: left,
@@ -513,8 +607,8 @@ fn walk<'a>(
                         }
                     }
                 }
-                // Two local symlinks, whose whole stored form is the metadata
-                // and the target, so neither side is opened.
+                // Two local symlinks. The metadata and the target are the full
+                // stored form, so the walk opens neither side.
                 (
                     EntryKind::Symlink {
                         meta: left,
@@ -529,8 +623,8 @@ fn walk<'a>(
                         out.modified.push(render(&path));
                     }
                 }
-                // A file or a symlink held against a committed content object,
-                // which the checksums decide.
+                // A file or a symlink against a committed content object. The
+                // checksums decide the pair.
                 (
                     EntryKind::Content(_),
                     EntryKind::Content(_) | EntryKind::File { .. } | EntryKind::Symlink { .. },
@@ -546,8 +640,8 @@ fn walk<'a>(
                         _ => out.modified.push(render(&path)),
                     }
                 }
-                // A name whose type differs between the two sides is one
-                // entry, and the comparison does not descend into it.
+                // If the type of a name differs between the two sides, the
+                // name is one entry. The comparison does not descend into it.
                 _ => out.modified.push(render(&path)),
             }
         }
@@ -570,8 +664,9 @@ fn walk<'a>(
     })
 }
 
-/// Record every entry of an added directory, in that side's own order,
-/// descending into each subdirectory where it stands.
+/// Records each entry of an added directory, in the order of its side.
+///
+/// It descends into each subdirectory at the position of the subdirectory.
 fn collect_added<'a>(
     repo: &'a Repo,
     dir: Side,
@@ -580,8 +675,8 @@ fn collect_added<'a>(
     out: &'a mut Lists,
 ) -> WalkFuture<'a> {
     Box::pin(async move {
-        // An added subtree is listed and never compared, so no entry of it is
-        // opened and no extended attribute of it is read.
+        // The walk lists an added subtree and does not compare it. It opens
+        // no entry of the subtree and reads no extended attribute of it.
         let list = read_list(repo, &dir).await?;
         let entries = shape(&dir, list, &HashSet::new(), options, to_owner(options)).await?;
         for entry in &entries {
@@ -599,9 +694,10 @@ fn collect_added<'a>(
     })
 }
 
-/// The names both sides hold whose two kinds pair, which are the names whose
-/// extended attributes the comparison reads. The set is built only where a
-/// directory side is going to be asked for them.
+/// Returns the names that both sides hold with kinds that pair.
+///
+/// The comparison reads the extended attributes of these names. The set is
+/// empty if no side is a directory side or if `skip_xattrs` is set.
 fn paired_names(from: &SideList, to: &SideList, options: &DiffOptions) -> HashSet<OsString> {
     let local = matches!(from, SideList::Local(_)) || matches!(to, SideList::Local(_));
     if options.skip_xattrs || !local {
@@ -619,7 +715,7 @@ fn paired_names(from: &SideList, to: &SideList, options: &DiffOptions) -> HashSe
         .collect()
 }
 
-/// The path one entry of a directory named by `prefix` carries.
+/// Returns the path of one entry in the directory at `prefix`.
 fn join(prefix: &OsStr, name: &OsStr) -> OsString {
     let mut path = prefix.to_owned();
     path.push("/");
@@ -627,15 +723,17 @@ fn join(prefix: &OsStr, name: &OsStr) -> OsString {
     path
 }
 
-/// One path as [`DiffEntry`] carries it. A directory side's name that is not
-/// valid UTF-8 is converted lossily here, which is the one place the byte form
-/// is lost.
+/// Returns one path in the form that [`DiffEntry`] holds.
+///
+/// This function converts a name of a directory side that is not valid UTF-8
+/// with a lossy conversion. It is the one place where the byte form is lost.
 fn render(path: &OsStr) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// The ownership a directory side on the `to` side declares. The first side
-/// and every commit side are unaffected.
+/// Returns the ownership that applies to a directory side on the `to` side.
+///
+/// The ownership does not apply to the first side or to a commit side.
 fn to_owner(options: &DiffOptions) -> Owner {
     Owner {
         uid: options.owner_uid,
@@ -643,14 +741,16 @@ fn to_owner(options: &DiffOptions) -> Owner {
     }
 }
 
-/// Whether two metadata sets record the same entry.
+/// Returns `true` if two metadata sets record the same entry.
 fn meta_eq(a: &FileMeta, b: &FileMeta) -> bool {
     a.uid == b.uid && a.gid == b.gid && a.mode == b.mode && a.xattrs == b.xattrs
 }
 
-/// Whether the two directory metadata records differ. Two local directories are
-/// held against each other directly; a commit's recorded checksum is matched by
-/// building the local directory's own.
+/// Returns `true` if the two directory metadata records differ.
+///
+/// The function compares two local directories directly. For a commit, it
+/// builds the dirmeta checksum of the local directory and compares it with the
+/// checksum that the commit records.
 fn dirmeta_differs(left: &EntryKind, right: &EntryKind) -> Result<bool> {
     match (left, right) {
         (EntryKind::Dir { meta: a, .. }, EntryKind::Dir { meta: b, .. }) => Ok(a != b),
@@ -665,8 +765,9 @@ fn dirmeta_differs(left: &EntryKind, right: &EntryKind) -> Result<bool> {
     }
 }
 
-/// List one directory's entries in the order its side names them, reading no
-/// extended attributes and opening nothing below it.
+/// Lists the entries of one directory in the order of its side.
+///
+/// It reads no extended attributes and opens nothing below the directory.
 async fn read_list(repo: &Repo, side: &Side) -> Result<SideList> {
     match side {
         Side::Repo(dirtree) => Ok(SideList::Repo(repo_entries(
@@ -692,8 +793,10 @@ async fn read_list(repo: &Repo, side: &Side) -> Result<SideList> {
     }
 }
 
-/// Turn a listing into the form the comparison reads, reading the extended
-/// attributes of the entries `wanted` names and of no others.
+/// Turns a listing into the form that the comparison reads.
+///
+/// It reads the extended attributes of the entries in `wanted` and of no other
+/// entries.
 async fn shape(
     side: &Side,
     list: SideList,
@@ -741,8 +844,10 @@ async fn shape(
         .collect())
 }
 
-/// The entries of one committed directory: the files in stored order, then the
-/// subdirectories in stored order.
+/// Returns the entries of one committed directory.
+///
+/// The files come first in stored order, then the subdirectories in stored
+/// order.
 fn repo_entries(dirtree: &DirTree) -> Vec<SideEntry> {
     let mut entries = Vec::with_capacity(dirtree.files.len() + dirtree.dirs.len());
     for (name, checksum) in &dirtree.files {
@@ -763,8 +868,9 @@ fn repo_entries(dirtree: &DirTree) -> Vec<SideEntry> {
     entries
 }
 
-/// Shape one filesystem entry into the form it compares in, with the extended
-/// attributes the comparison asked for.
+/// Turns one file system entry into the form that the comparison reads.
+///
+/// The entry gets the extended attributes that the comparison asked for.
 fn local_entry(raw: RawEntry, xattrs: Xattrs, owner: Owner) -> SideEntry {
     let base = FileMeta {
         uid: raw.uid,
@@ -789,21 +895,24 @@ fn local_entry(raw: RawEntry, xattrs: Xattrs, owner: Owner) -> SideEntry {
     }
 }
 
-/// The checksum of a directory metadata object built from `meta`. The identity
-/// is the SHA-256 of the serialized normal form, which is what a directory side
-/// compares against the checksum a commit recorded.
+/// Returns the checksum of a dirmeta object built from `meta`.
+///
+/// The checksum is the SHA-256 of the serialized normal form. A directory side
+/// compares it with the checksum that a commit records.
 fn dirmeta_checksum(meta: &DirMeta) -> Result<Checksum> {
     Ok(Checksum::from_bytes(
         Sha256::digest(meta.serialize()?).into(),
     ))
 }
 
-/// The content object checksum of one entry, computed for a filesystem entry
-/// and read off the directory tree object for a committed one.
+/// Returns the content object checksum of one entry.
 ///
-/// A local symlink whose target is not valid UTF-8 has no content object form,
-/// so it reports `None`. A commit's target is always valid UTF-8, so such an
-/// entry differs from every committed object.
+/// For a file system entry, the function computes the checksum. For a
+/// committed entry, it reads the checksum from the dirtree object.
+///
+/// If the target of a local symlink is not valid UTF-8, the symlink has no
+/// content object form, and the function returns `None`. A committed target is
+/// always valid UTF-8, so such an entry differs from each committed object.
 async fn content_checksum(side: &Side, name: &OsStr, kind: &EntryKind) -> Result<Option<Checksum>> {
     match kind {
         EntryKind::Content(checksum) => Ok(Some(*checksum)),
@@ -812,8 +921,8 @@ async fn content_checksum(side: &Side, name: &OsStr, kind: &EntryKind) -> Result
             let Ok(target) = std::str::from_utf8(target) else {
                 return Ok(None);
             };
-            // A symlink's target is in its header, so there is no payload to
-            // read.
+            // The header of a symlink holds its target, so there is no
+            // payload to read.
             let header = local_header(meta, target);
             Ok(Some(ContentHasher::new(&header)?.finish()))
         }
@@ -823,7 +932,7 @@ async fn content_checksum(side: &Side, name: &OsStr, kind: &EntryKind) -> Result
     }
 }
 
-/// The content object header one filesystem entry carries.
+/// Returns the content object header of one file system entry.
 fn local_header(meta: &FileMeta, symlink_target: &str) -> FileHeader {
     FileHeader {
         uid: meta.uid,
@@ -834,12 +943,14 @@ fn local_header(meta: &FileMeta, symlink_target: &str) -> FileHeader {
     }
 }
 
-/// Hash a local regular file as a content object, streaming the payload through
-/// a fixed buffer. Nothing is written to the repository.
+/// Hashes a local regular file as a content object.
 ///
-/// The open and the first chunk share one dispatch, and a file no longer than
-/// the chunk is read to its end inside it. `size` is the size the walk read,
-/// which bounds the read-ahead of the rest of the file.
+/// The function streams the payload through a fixed buffer. It writes nothing
+/// to the repository.
+///
+/// The open and the first chunk share one dispatch. If the file is not longer
+/// than one chunk, this dispatch reads it to its end. `size` is the size that
+/// the walk read. It sets the limit of the read-ahead for the rest of the file.
 async fn hash_local_file(
     side: &Side,
     name: &OsStr,
@@ -872,9 +983,11 @@ async fn hash_local_file(
     Ok(hasher.finish())
 }
 
-/// Open one file below `root` and read its first chunk. A read that reports the
-/// end of the file inside the chunk returns no descriptor, so a file no longer
-/// than one chunk costs one dispatch in all.
+/// Opens one file below `root` and reads its first chunk.
+///
+/// If a read reports the end of the file in the chunk, the function returns no
+/// descriptor. A file that is not longer than one chunk costs one dispatch in
+/// all.
 fn open_and_read(
     root: BorrowedFd<'_>,
     at: &Path,
@@ -902,9 +1015,10 @@ fn open_and_read(
     Ok((Some(OwnedFd::from(file)), buf, filled))
 }
 
-/// The subdirectory `entry` names, ready to enumerate. A directory side opens
-/// nothing here: the child carries the root descriptor and the relative path,
-/// and the listing pass opens it.
+/// Returns the subdirectory that `entry` names, ready for a listing.
+///
+/// A directory side opens nothing here. The child holds the root descriptor and
+/// the relative path, and the listing pass opens it.
 fn descend(side: &Side, entry: &SideEntry) -> Result<Side> {
     match side {
         Side::Repo(_) => {
@@ -919,31 +1033,32 @@ fn descend(side: &Side, entry: &SideEntry) -> Result<Side> {
     }
 }
 
-/// One filesystem entry as the directory pass captured it.
+/// One file system entry as the directory pass captured it.
 struct RawEntry {
     name: OsString,
     kind: RawKind,
     uid: u32,
     gid: u32,
-    /// The full `st_mode`, including the file-type bits.
+    /// The full `st_mode`, with the file-type bits.
     mode: u32,
-    /// The payload length, which parts two regular files with no read.
+    /// The payload length. A different length tells two regular files apart
+    /// with no read.
     size: u64,
 }
 
-/// What kind of entry a directory pass found.
+/// The kind of entry that a directory pass found.
 enum RawKind {
     Dir,
     Regular,
-    /// A symlink, with the target bytes the filesystem returned.
+    /// A symlink, with the target bytes that the file system returned.
     Symlink(Vec<u8>),
-    /// A device, a fifo, or a socket. The comparison holds such an entry
-    /// against another of its kind and never reads it.
+    /// A device, a fifo, or a socket. The comparison compares such an entry
+    /// with another entry of its class and never reads it.
     Other,
 }
 
 impl RawKind {
-    /// The class this entry compares in.
+    /// Returns the comparison class of this entry.
     fn class(&self) -> Class {
         match self {
             RawKind::Dir => Class::Dir,
@@ -954,10 +1069,11 @@ impl RawKind {
     }
 }
 
-/// Capture one directory's entries in one blocking pass, in the order the
-/// directory returns them. Nothing below the directory is opened here, so an
-/// entry the comparison never reads costs one `statat` and, for a symlink, one
-/// `readlinkat`.
+/// Captures the entries of one directory in one blocking pass.
+///
+/// The entries are in the order in which the directory returns them. The
+/// function opens nothing below the directory. An entry that the comparison
+/// never reads costs one `statat`, and for a symlink also one `readlinkat`.
 fn snapshot_dir(dir: BorrowedFd<'_>, path: &Path) -> Result<Vec<RawEntry>> {
     let mut entries = Vec::new();
     for entry in Dir::read_from(dir).map_err(|err| path_error("opendir", path, err))? {
@@ -993,11 +1109,11 @@ fn snapshot_dir(dir: BorrowedFd<'_>, path: &Path) -> Result<Vec<RawEntry>> {
     Ok(entries)
 }
 
-/// Read the extended attributes of the named entries in one blocking pass,
-/// keyed by each entry's position in the listing.
+/// Reads the extended attributes of the named entries in one blocking pass.
 ///
-/// Every kind is read through the path-based no-follow reader, so an entry the
-/// comparison later opens for its payload is opened once and not twice.
+/// The key of each result is the position of the entry in the listing. Each
+/// kind goes through the path-based no-follow reader. An entry that the
+/// comparison later opens for its payload is opened only once.
 fn read_xattrs(
     root: BorrowedFd<'_>,
     rel: &Path,
@@ -1015,12 +1131,13 @@ fn read_xattrs(
     Ok(out)
 }
 
-/// An I/O failure that names the path it happened at and the call that made it.
+/// Returns an I/O error that names the path and the call of a failure.
 fn path_error(call: &str, path: &Path, err: Errno) -> Error {
     path_error_io(call, path, &std::io::Error::from(err))
 }
 
-/// The same for a failure already carried as an [`std::io::Error`].
+/// Returns the error of `path_error` for a failure that is already an
+/// [`std::io::Error`].
 fn path_error_io(call: &str, path: &Path, err: &std::io::Error) -> Error {
     let reason = err.to_string();
     let reason = match reason.find(" (os error ") {
@@ -1033,7 +1150,7 @@ fn path_error_io(call: &str, path: &Path, err: &std::io::Error) -> Error {
     ))
 }
 
-/// Turn a list of paths into diff entries of one change kind.
+/// Turns a list of paths into diff entries of one change kind.
 fn entries(change: DiffChange, paths: Vec<String>) -> impl Iterator<Item = DiffEntry> {
     paths
         .into_iter()

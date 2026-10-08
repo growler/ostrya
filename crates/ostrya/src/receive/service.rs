@@ -1,5 +1,5 @@
-//! One push session as steps, for a transport that carries each step in a
-//! request of its own, such as HTTP.
+//! A push session as steps, for a transport that carries each step in a
+//! request of its own, for example HTTP.
 
 use std::collections::HashMap;
 use std::io;
@@ -24,62 +24,76 @@ use crate::repo::Repo;
 
 type Core = SessionCore<Arc<ReceivePolicy>>;
 
-/// One push session as steps, one for each request of the transport.
+/// A push session as steps, one step for each request of the transport.
 ///
-/// [`hello`](Self::hello) opens the session, and [`have`](Self::have),
+/// [`hello`](Self::hello) opens the session. [`have`](Self::have),
 /// [`objects`](Self::objects), and [`commit`](Self::commit) are its later
 /// steps. Each step does what the message of the same name does in
 /// [`Repo::receive`](crate::Repo::receive), with the same checks and the same
-/// wire codes, and the host sends the reply. Every step takes `&self`, so the
-/// host keeps the service in an `Arc` and runs steps of one session at the
-/// same time:
-///
-/// - Up to `parallel_uploads` [`objects`](Self::objects) calls run at the
-///   same time, and write through the one session transaction. One more is
-///   `limit-exceeded`.
-/// - One [`have`](Self::have) runs next to the other steps, and does not
-///   count toward `parallel_uploads`. A second one while the first is in
-///   flight is `limit-exceeded`.
-/// - [`commit`](Self::commit) runs only when no other step is in flight, and
-///   is `protocol` otherwise. While it runs, each other step is `protocol`.
-///
-/// The detached metadata of the session has one byte cap for the whole
-/// session, [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), over every
-/// object stream, and the read that takes the session past it is
-/// `limit-exceeded`. The dirtree, dirmeta, and commit objects that the
-/// streams read at the same time share a second budget of the same size,
-/// from the arrival of their bytes to their stage step, and the read that
-/// takes the session past it is `limit-exceeded`. The bytes of a detached
-/// metadata object count against the first cap alone.
-///
-/// A step that fails ends the session with no commit, as one error ends a
-/// session over a stream, and so does a refused step. An `objects` call in
-/// flight then fails at its next read. A step future that is dropped before
-/// it completes also ends the session. Once no step holds the session, the
-/// session transaction is dropped in a task on the blocking pool, which
-/// removes its staging directory and releases the repository lock in the
-/// background: the call that ends the session does not wait for it. Under
-/// the `tokio` backend, a call outside the context of a runtime drops the
-/// transaction inline. After
-/// the end, and after a commit, every step is `protocol`.
-///
-/// Each failure with a wire code returns as [`Error::Push`], and each failure
-/// on the server side returns as the error it is, which the host sends as
-/// `internal`. An I/O error of the input of `objects`, other than an end of
-/// file, returns as [`Error::Io`]. A step of a session that an earlier
-/// failure or [`abort`](Self::abort) ended returns [`push::Error::Protocol`]
-/// with the message `the session was aborted: CAUSE`.
-///
-/// A step that completes after the session ended, by a failure of another
-/// step or by [`abort`](Self::abort), returns the same `protocol` error in
-/// place of its result. A service dropped while the session is open ends the
-/// session in the same way.
+/// wire codes. The host sends the reply.
 ///
 /// [`hello_with_hooks`](Self::hello_with_hooks) opens a session with the
-/// [`ReceiveHooks`] of the host, which [`commit`](Self::commit) calls.
+/// [`ReceiveHooks`] of the host, which [`commit`](Self::commit) calls. The
+/// session id, the owner of the session, its idle timeout, and the session
+/// limit belong to the host.
 ///
-/// The session id, the owner of the session, its idle timeout, and the
-/// session limit belong to the host.
+/// # Concurrency
+///
+/// Every step takes `&self`, so the host can keep the service in an `Arc` and
+/// run steps of one session at the same time:
+///
+/// - Up to `parallel_uploads` [`objects`](Self::objects) calls run at the
+///   same time. They write through the one session transaction. One more
+///   call is `limit-exceeded`.
+/// - One [`have`](Self::have) runs next to the other steps. It does not count
+///   toward `parallel_uploads`. A second `have` while the first is in flight
+///   is `limit-exceeded`.
+/// - [`commit`](Self::commit) runs only when no other step is in flight. If
+///   another step is in flight, `commit` is `protocol`. While `commit` runs,
+///   each other step is `protocol`.
+///
+/// # Metadata budgets
+///
+/// The detached metadata of the session has one byte cap for the whole
+/// session, over every object stream:
+/// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE). The read that takes the
+/// session past this cap is `limit-exceeded`.
+///
+/// The dirtree, dirmeta, and commit objects that the streams read at the same
+/// time share a second budget of the same size. Their bytes count from their
+/// arrival to their stage step. The read that takes the session past this
+/// budget is `limit-exceeded`. The bytes of a detached metadata object count
+/// against the first cap alone.
+///
+/// # End of a session
+///
+/// A step that fails ends the session with no commit, as one error ends a
+/// session over a stream. A refused step also ends the session. An `objects`
+/// call in flight then fails at its next read. If a step future is dropped
+/// before it completes, the session also ends. If the service is dropped
+/// while the session is open, the session ends in the same way.
+///
+/// When no step holds the session, a task on the blocking pool drops the
+/// session transaction. The drop removes the staging directory and releases
+/// the repository lock in the background. The call that ends the session does
+/// not wait for it. Under the `tokio` backend, a call outside the context of a
+/// runtime drops the transaction inline.
+///
+/// After the end, and after a commit, every step is `protocol`.
+///
+/// # Failures
+///
+/// - A failure with a wire code returns as [`Error::Push`].
+/// - A failure on the server side returns as the error it is. The host sends
+///   it as `internal`.
+/// - If the input of `objects` fails with an I/O error that is not an end of
+///   file, the step returns [`Error::Io`].
+/// - A step of a session that an earlier failure or [`abort`](Self::abort)
+///   ended returns [`push::Error::Protocol`] with the message
+///   `the session was aborted: CAUSE`.
+/// - A step can complete after a failure of another step or
+///   [`abort`](Self::abort) ended the session. Then the step drops its result
+///   and returns the same `protocol` error.
 pub struct ReceiveService {
     state: Mutex<State>,
     signal: AbortSignal,
@@ -88,8 +102,8 @@ pub struct ReceiveService {
 
 enum State {
     /// The session takes steps. `uploads` counts the `objects` calls in
-    /// flight, and `haves` the `have` calls, 0 or 1. Each step in flight
-    /// holds a clone of `core`.
+    /// flight. `haves` counts the `have` calls in flight, 0 or 1. Each step
+    /// in flight holds a clone of `core`.
     Open {
         core: Arc<Core>,
         uploads: u32,
@@ -112,9 +126,10 @@ fn protocol(message: impl Into<String>) -> Error {
     Error::Push(push::Error::Protocol(message.into()))
 }
 
-/// The error a step returns for `failure`. An `Abort` of the client, and an
-/// input that ends before its last message, have no reply on a stream, and
-/// here are `protocol`, which the host sends.
+/// Returns the error that a step returns for `failure`.
+///
+/// An `Abort` of the client and an input that ends before its last message
+/// get no reply on a stream. Here they are `protocol`, which the host sends.
 fn into_error(failure: Failure) -> Error {
     match failure {
         Failure::Wire(e) => Error::Push(e),
@@ -130,16 +145,35 @@ fn into_error(failure: Failure) -> Error {
 }
 
 impl ReceiveService {
-    /// Open the session: answer `Hello`, and open the session transaction,
-    /// which holds the repository lock shared until the session ends.
-    /// `parallel_uploads` is the value `HelloReply` announces, and the number
-    /// of `objects` calls the session runs at the same time. A
-    /// `parallel_uploads` of 0 is [`Error::InvalidInput`]. The service sets
-    /// no upper bound: the host keeps the value in a range of its own. A
-    /// `Hello` with `one-way` true is `protocol`.
+    /// Opens a session: answers `Hello` and opens the session transaction.
     ///
-    /// The session has no hooks. It is
+    /// The session transaction holds the repository lock shared until the
+    /// session ends. `parallel_uploads` is the value that `HelloReply`
+    /// announces. It is also the number of `objects` calls that the session
+    /// runs at the same time. The service sets no upper bound, so the host
+    /// keeps the value in a range of its own.
+    ///
+    /// The session has no hooks. The call is
     /// [`hello_with_hooks`](Self::hello_with_hooks) with `None`.
+    ///
+    /// # Errors
+    ///
+    /// A wire code returns inside [`Error::Push`].
+    ///
+    /// - [`Error::InvalidInput`] if `parallel_uploads` is 0.
+    /// - [`push::Error::Protocol`] if `Hello` has `one-way` true.
+    /// - The errors of [`check_hello`](Self::check_hello).
+    /// - The errors of [`Repo::transaction`](crate::Repo::transaction) if the
+    ///   session transaction cannot open. These include
+    ///   [`Error::LockTimeout`] if the wait for the repository lock passes
+    ///   `[core] lock-timeout-secs`.
+    /// - [`push::Error::ModeRefused`] if the repository mode is `bare` and the
+    ///   process does not run as root.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if `[core] fsync`,
+    ///   `[core] per-object-fsync`, `[ex-integrity] fsverity`, or, in an
+    ///   archive repository, `[archive] zlib-level` holds a malformed value.
+    /// - An I/O error from the file system, if a read of the staging
+    ///   directory or of the refs of `Hello` fails.
     pub async fn hello(
         repo: Repo,
         policy: Arc<ReceivePolicy>,
@@ -149,11 +183,17 @@ impl ReceiveService {
         Self::hello_with_hooks(repo, policy, None, parallel_uploads, hello).await
     }
 
-    /// Open the session as [`hello`](Self::hello) does, with the hooks of the
-    /// host. [`commit`](Self::commit) calls
-    /// [`ReceiveHooks::before_update`] of `hooks` just before the update
-    /// lock, and [`ReceiveHooks::after_update`] after the update lock is
-    /// released. `None` gives a session with no hooks.
+    /// Opens a session as [`hello`](Self::hello) does, with the hooks of the
+    /// host.
+    ///
+    /// [`commit`](Self::commit) calls [`ReceiveHooks::before_update`] of
+    /// `hooks` just before the update lock. It calls
+    /// [`ReceiveHooks::after_update`] after the release of the update lock.
+    /// `None` gives a session with no hooks.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`hello`](Self::hello).
     pub async fn hello_with_hooks(
         repo: Repo,
         policy: Arc<ReceivePolicy>,
@@ -181,47 +221,116 @@ impl ReceiveService {
         Ok((service, reply))
     }
 
-    /// The checks of `hello` that every session runs before it opens, in
-    /// this order: the protocol version (`version-unsupported`), the mode
-    /// `bare-split-xattrs` (`mode-refused`), `[core] locking=false` for a
-    /// `Hello` with `one-way` false (`locking-disabled`), each ref name
-    /// (`invalid-ref`), and for a `Hello` with `one-way` false, the
-    /// `HelloReply` with a commit for each ref against [`MAX_FRAME`]
-    /// (`limit-exceeded`). The call is sync and does no I/O.
+    /// Runs the checks of `hello` that every session runs before it opens.
     ///
-    /// [`hello`](Self::hello), [`Repo::receive`](crate::Repo::receive), and
+    /// The checks run in this order:
+    ///
+    /// 1. The protocol version (`version-unsupported`).
+    /// 2. The mode `bare-split-xattrs` (`mode-refused`).
+    /// 3. For a `Hello` with `one-way` false, `[core] locking=false`
+    ///    (`locking-disabled`).
+    /// 4. Each ref name (`invalid-ref`).
+    /// 5. For a `Hello` with `one-way` false, the size of the `HelloReply`
+    ///    with a commit for each ref, against [`MAX_FRAME`]
+    ///    (`limit-exceeded`).
+    ///
+    /// The call is sync and does no I/O. [`hello`](Self::hello),
+    /// [`Repo::receive`](crate::Repo::receive), and
     /// [`Repo::receive_stream`](crate::Repo::receive_stream) run the same
-    /// checks. A `Hello` that passes can still fail to open: the open of the
-    /// session transaction, the reads of `[core] fsync`, `[ex-integrity]
-    /// fsverity`, and `[archive] zlib-level`, and the refusal of a `bare`
-    /// repository when the process does not run as root come after them.
-    /// The call does not refuse a `Hello` with `one-way` true, which
+    /// checks. The call does not refuse a `Hello` with `one-way` true, which
     /// [`hello`](Self::hello) refuses.
+    ///
+    /// A `Hello` that passes can still fail to open. These steps of the open
+    /// come after the checks:
+    ///
+    /// - The open of the session transaction.
+    /// - The reads of `[core] fsync`, `[core] per-object-fsync`,
+    ///   `[ex-integrity] fsverity`, and `[archive] zlib-level`.
+    /// - The refusal of a `bare` repository if the process does not run as
+    ///   root.
+    ///
+    /// # Errors
+    ///
+    /// A wire code returns inside [`Error::Push`].
+    ///
+    /// - [`push::Error::VersionUnsupported`] if `hello` names a protocol
+    ///   version that the server does not speak.
+    /// - [`push::Error::ModeRefused`] if the repository mode is
+    ///   `bare-split-xattrs`.
+    /// - [`push::Error::LockingDisabled`] if `hello` has `one-way` false and
+    ///   the repository sets `[core] locking=false`.
+    /// - [`push::Error::InvalidRef`] if a ref name of `hello` is not valid.
+    /// - [`push::Error::LimitExceeded`] if `hello` has `one-way` false and
+    ///   its `HelloReply` can need a frame over [`MAX_FRAME`].
+    /// - [`push::Error::Internal`] if the encoder refuses the `HelloReply`
+    ///   with no ref.
+    /// - [`Error::Core`] if `[core] locking` is not a boolean.
     pub fn check_hello(repo: &Repo, hello: &Hello) -> Result<()> {
         super::core::check_hello(repo, hello).map_err(into_error)
     }
 
-    /// Answer a `Have`: one bit for each object the repository and the session
-    /// do not hold. A call while another `have` of the session is in flight
-    /// is `limit-exceeded`, and ends the session.
+    /// Answers a `Have`: one bit for each object, set if the object is missing.
+    ///
+    /// An object is missing if neither the repository nor the session holds
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// A wire code returns inside [`Error::Push`]. Each error ends the
+    /// session.
+    ///
+    /// - [`push::Error::LimitExceeded`] if another `have` of the session is in
+    ///   flight, or if `names` holds more than
+    ///   [`MAX_HAVE`](crate::push::proto::MAX_HAVE) entries.
+    /// - [`push::Error::Protocol`] if the session ended or a
+    ///   [`commit`](Self::commit) runs.
+    /// - An I/O error from the file system, if the check of an object in the
+    ///   object store fails.
     pub async fn have(&self, names: Vec<ObjectName>) -> Result<HaveReply> {
         let step = self.enter(Kind::Have)?;
         let result = step.core().have(names).await;
         step.end(result)
     }
 
-    /// Read one object stream from `input`: frames from `ObjectHeader` or
-    /// `ObjectsEnd` on, to `ObjectsEnd`, and then the end of `input`. A byte
-    /// after `ObjectsEnd`, and an `input` that ends before it, are
-    /// `protocol`. An `Abort` frame of the client ends the session, and is
-    /// `protocol`. An I/O error of `input` other than an end of file returns
-    /// as [`Error::Io`]. A call past `parallel_uploads` calls in flight is
-    /// `limit-exceeded`, and ends the session.
+    /// Reads one object stream from `input` and stages its objects.
     ///
-    /// The counts of `ObjectsReply` are those of this stream. A content,
-    /// dirtree, dirmeta, or commit object that two streams of the session
-    /// send at the same time can count in both. A detached metadata object
-    /// that two streams send is `protocol`, and ends the session.
+    /// The stream is a sequence of frames from `ObjectHeader` or `ObjectsEnd`
+    /// to `ObjectsEnd`, and then the end of `input`. The counts of
+    /// `ObjectsReply` are the counts of this stream. If two streams of the
+    /// session send a content, dirtree, dirmeta, or commit object at the same
+    /// time, the object can count in both.
+    ///
+    /// # Errors
+    ///
+    /// A wire code returns inside [`Error::Push`]. Each error ends the
+    /// session.
+    ///
+    /// - [`push::Error::LimitExceeded`] if `parallel_uploads` calls are in
+    ///   flight already, or if a read passes one of the
+    ///   [metadata budgets](ReceiveService#metadata-budgets).
+    /// - [`push::Error::LimitExceeded`] if one metadata object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if the header
+    ///   of a content object is larger than its limit.
+    /// - [`push::Error::Protocol`] if a byte follows `ObjectsEnd`, or if
+    ///   `input` ends before `ObjectsEnd`.
+    /// - [`push::Error::Protocol`] if the client sends an `Abort` frame, or a
+    ///   message out of order, or bytes after the end of an object.
+    /// - [`push::Error::Protocol`] if two detached metadata objects of the
+    ///   session name the same commit, or if a detached metadata dict is
+    ///   malformed.
+    /// - [`push::Error::Protocol`] if the payload of an object is malformed,
+    ///   for example a corrupt DEFLATE stream or a size that does not match
+    ///   its header.
+    /// - [`push::Error::Protocol`] if the session ended or a
+    ///   [`commit`](Self::commit) runs.
+    /// - [`push::Error::ChecksumMismatch`] if the bytes of an object do not
+    ///   hash to its checksum.
+    /// - [`push::Error::ModeRefused`] if an object breaks the content rules of
+    ///   the repository mode or of the policy.
+    /// - The wire code of the frame decoder, if it refuses a frame.
+    /// - [`Error::Io`] if `input` fails with an I/O error that is not an end
+    ///   of file.
+    /// - An I/O error from the file system, if the stage of an object fails.
     pub async fn objects<R>(&self, input: R) -> Result<ObjectsReply>
     where
         R: AsyncRead + Unpin + Send,
@@ -231,50 +340,113 @@ impl ReceiveService {
         step.end(result)
     }
 
-    /// Run `Commit`: the checks of the ref updates, the ref writes, and the
-    /// transaction commit, as [`Repo::receive`](crate::Repo::receive) runs
-    /// them. The session ends with it. A call while another step of the
-    /// session is in flight is `protocol`, and ends the session.
+    /// Runs `Commit`: the checks of the ref updates, the ref writes, and the
+    /// transaction commit.
     ///
-    /// In a session with hooks, the commit calls
-    /// [`ReceiveHooks::before_update`] after its checks, its server
-    /// signatures, and its ancestry walks, just before the update lock, and
-    /// writes the detached-metadata entries of the host with the refs. A
-    /// refusal of the hook ends the session with its code, and no ref
-    /// changes. [`ReceiveHooks`] states the rules.
+    /// The checks and the writes are the ones that
+    /// [`Repo::receive`](crate::Repo::receive) runs. The session ends with
+    /// the call.
     ///
-    /// After the transaction commit, the commit releases the update lock and
-    /// calls [`ReceiveHooks::after_update`] with the report and the carried
-    /// value, also when no ref changes. An error of the hook is `internal`,
-    /// and the session ends as aborted. The refs and the detached metadata
-    /// stay written, and the session does not undo them. The time of the hook
-    /// adds to the time the commit takes to return. A panic in
-    /// `after_update` is not caught: it comes after the refs are written, and
-    /// resumes in the caller of `commit`.
+    /// # Hooks
     ///
-    /// The transaction commit is not atomic. A failure of a detached-metadata
-    /// write, of a ref write, or of the `fsync` of a ref directory can leave
-    /// the detached metadata and some refs written. The commit then returns
-    /// the error, the carried value drops, and `after_update` does not run.
+    /// In a session with hooks, the call runs [`ReceiveHooks::before_update`]
+    /// just before the update lock. It runs [`ReceiveHooks::after_update`]
+    /// after the release of the update lock, also when no ref changes.
+    /// [`ReceiveHooks`] states when each hook runs, the entries of the host,
+    /// the locks, and the result of an error or a panic in a hook.
     ///
-    /// The host sends `CommitReply` from the refs of the report. When that
-    /// send fails, the host adds a warning of the step
+    /// # Partial writes
+    ///
+    /// The transaction commit is not atomic. These failures can leave the
+    /// detached metadata and some refs written:
+    ///
+    /// - a failure of a detached-metadata write
+    /// - a failure of a ref write
+    /// - a failure of the `fsync` of a ref directory
+    ///
+    /// The call then returns the error. In a session with hooks, the carried
+    /// value drops, and `after_update` does not run.
+    ///
+    /// # Reply
+    ///
+    /// The host sends `CommitReply` from the refs of the report. If that send
+    /// fails, the host adds a warning of the step
     /// [`ReplyNotDelivered`](super::ReceiveStep::ReplyNotDelivered) to the
     /// report. The report that `after_update` gets never holds this warning.
     ///
-    /// The commit owns the session transaction while it runs. A `commit`
-    /// future that is dropped before it completes drops the transaction
-    /// inline, on the thread that drops the future, and each later step is
-    /// `protocol`. A host drops it only when it drops the commit task, for
-    /// example at the shutdown of the runtime.
+    /// # Dropped future
     ///
-    /// The transaction commit writes the detached metadata and the refs on
-    /// the blocking pool. A `commit` future that is dropped while these
-    /// writes go on releases the update lock, and drops the carried value of
-    /// the hooks, before the writes end. A `commit` future that is dropped
-    /// while `after_update` runs drops the future of the hook and the carried
-    /// value, and the refs can be written. So the host runs each commit to its
-    /// end, for example in a task that it joins.
+    /// The call owns the session transaction while it runs. If the `commit`
+    /// future is dropped before it completes, the transaction drops inline,
+    /// on the thread that drops the future. Each later step is then
+    /// `protocol`. A host drops the future only when it drops the commit task,
+    /// for example at the shutdown of the runtime.
+    ///
+    /// The transaction commit writes the detached metadata and the refs on the
+    /// blocking pool. If the future is dropped during these writes, the update
+    /// lock and the carried value of the hooks drop before the writes end. If
+    /// the future is dropped while `after_update` runs, the future of the hook
+    /// and the carried value drop, and the refs can be written.
+    ///
+    /// The host must run each commit to its end, for example in a task that
+    /// it joins.
+    ///
+    /// # Errors
+    ///
+    /// A wire code returns inside [`Error::Push`]. Each error ends the
+    /// session.
+    ///
+    /// - [`push::Error::Protocol`] if another step of the session is in
+    ///   flight, if the session ended, or if another `commit` runs.
+    /// - [`push::Error::Protocol`] if the request holds no update, or names a
+    ///   ref that `Hello` does not name, or names one ref twice.
+    /// - [`push::Error::Protocol`] if a detached metadata dict belongs to a
+    ///   commit that is not a commit of the session.
+    /// - [`push::Error::Protocol`] if a staged commit or a staged dirtree does
+    ///   not parse.
+    /// - [`push::Error::InvalidRef`] if a ref name is not valid, or if an
+    ///   update writes a commit to a ref name of 64 lowercase hex characters.
+    /// - [`push::Error::LimitExceeded`] if the `CommitReply` can need a frame
+    ///   over [`MAX_FRAME`], or if a merged detached metadata dict is larger
+    ///   than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`push::Error::RefDenied`] if a rule refuses an update, or if an
+    ///   update names the collection anchor ref of a repository with a
+    ///   collection id.
+    /// - [`push::Error::RefDenied`] if a ref path fails a check under the
+    ///   update lock: a ref is an alias, a ref write cannot replace a path, or
+    ///   one update names a directory of another.
+    /// - [`push::Error::RefDenied`] or [`push::Error::Internal`] if
+    ///   `before_update` refuses with
+    ///   [`HookRefusal::denied`](super::HookRefusal::denied) or
+    ///   [`HookRefusal::internal`](super::HookRefusal::internal).
+    /// - [`push::Error::MissingObjects`] if a new commit, or an object of the
+    ///   tree of a commit of the session, is neither staged nor present.
+    /// - [`push::Error::BindingMismatch`] if the ref binding or the collection
+    ///   binding of a new commit does not name its ref or the repository.
+    /// - [`push::Error::SignatureRequired`] if a new commit fails the
+    ///   signature verification of a rule.
+    /// - [`push::Error::RefMismatch`] if a ref is not in the state that its
+    ///   update expects.
+    /// - [`push::Error::DeleteDenied`] if an update deletes a ref and the
+    ///   policy does not allow it.
+    /// - [`push::Error::NonFastForward`] if the new commit does not descend
+    ///   from the commit of the ref. If the client sends `force` and the rule
+    ///   allows an update that is not a fast-forward, this check does not run.
+    /// - [`push::Error::Internal`] if `after_update` returns an error.
+    /// - [`Error::InvalidInput`] if the plan of `before_update` breaks a rule
+    ///   that [`ReceiveHooks`] states. The host sends it as `internal`.
+    /// - [`Error::InvalidFormat`] if a commit or a dirtree that the repository
+    ///   holds does not parse.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if a stored detached
+    ///   metadata dict is not an `a{sv}` in normal form.
+    /// - [`Error::InvalidFormat`] if a stored dict holds a value that is not an
+    ///   `aay` under a signature key that the merge extends.
+    /// - The error of the signing engine, for example [`Error::Signature`], if
+    ///   a server key fails to sign a commit.
+    /// - [`Error::LockTimeout`] if the wait for the update lock passes
+    ///   `[core] lock-timeout-secs`.
+    /// - An I/O error from the file system, if a read of the repository or a
+    ///   write of the transaction commit fails.
     pub async fn commit(&self, request: CommitRequest) -> Result<ReceiveReport> {
         let core = {
             let mut state = self.lock();
@@ -314,10 +486,12 @@ impl ReceiveService {
         result
     }
 
-    /// End the session with no commit. Each `objects` call in flight fails at
-    /// its next read, and every later step is `protocol`. The call returns at
-    /// once, and the staging directory is removed in the background. A
-    /// `commit` that runs is not stopped, and the call does nothing to it.
+    /// Ends the session with no commit.
+    ///
+    /// Each `objects` call in flight fails at its next read, and every later
+    /// step is `protocol`. The call returns at once. A task on the blocking
+    /// pool removes the staging directory in the background. If a `commit`
+    /// runs, the call does not stop it and does nothing to it.
     pub fn abort(&self) {
         let core = close_locked(&mut self.lock(), "the host ended the session");
         self.closed(core);
@@ -327,7 +501,7 @@ impl ReceiveService {
         self.state.lock().expect("receive service mutex")
     }
 
-    /// Count one step of `kind` in flight, and give it a clone of the core.
+    /// Counts one step of `kind` in flight and gives it a clone of the core.
     fn enter(&self, kind: Kind) -> Result<Step<'_>> {
         let mut state = self.lock();
         let (core, uploads, haves) = match &mut *state {
@@ -363,9 +537,11 @@ impl ReceiveService {
         })
     }
 
-    /// The error of a step that failed. A session that is open ends with it.
-    /// A session that already ended gives its own reason, because the end is
-    /// what failed the step.
+    /// Returns the error of a step that failed.
+    ///
+    /// A session that is open ends with the error. A session that already
+    /// ended gives its own reason, because the end is the cause of the
+    /// failure of the step.
     fn fail(&self, failure: Failure) -> Error {
         let mut state = self.lock();
         if let State::Closed { reason } = &*state {
@@ -378,7 +554,7 @@ impl ReceiveService {
         error
     }
 
-    /// Refuse a step with `error`, and end the open session with it in the
+    /// Refuses a step with `error` and ends the open session with it, in the
     /// same hold of the lock that `state` holds.
     fn refuse(&self, mut state: MutexGuard<'_, State>, error: push::Error) -> Error {
         let core = close_locked(&mut state, &error.to_string());
@@ -387,9 +563,10 @@ impl ReceiveService {
         Error::Push(error)
     }
 
-    /// Finish the end of a session after the lock is released: fire the
-    /// signal, and release the reference of the state to the core. `None`,
-    /// for a session that did not end here, does nothing.
+    /// Completes the end of a session after the release of the lock.
+    ///
+    /// The call fires the signal and releases the reference of the state to
+    /// the core. `None`, for a session that did not end here, does nothing.
     fn closed(&self, core: Option<Arc<Core>>) {
         if let Some(core) = core {
             self.signal.fire();
@@ -398,10 +575,11 @@ impl ReceiveService {
     }
 }
 
-/// End an open session with `cause`, under the lock of the state. The
-/// reference of the state to the core is returned, for
-/// [`ReceiveService::closed`] to release after the lock. A session that is
-/// not open is left as it is, and gives `None`.
+/// Ends an open session with `cause`, under the lock of the state.
+///
+/// The call returns the reference of the state to the core.
+/// [`ReceiveService::closed`] releases it after the lock. A session that is
+/// not open stays as it is, and the call returns `None`.
 fn close_locked(state: &mut State, cause: &str) -> Option<Arc<Core>> {
     if !matches!(state, State::Open { .. }) {
         return None;
@@ -413,10 +591,12 @@ fn close_locked(state: &mut State, cause: &str) -> Option<Arc<Core>> {
     }
 }
 
-/// Drop a reference to the core. The last reference drops the session
-/// transaction in a detached task on the blocking pool, because the drop
-/// removes the staging directory, and the caller does not wait for it.
-/// Under the `tokio` backend with no runtime, the drop runs inline.
+/// Drops a reference to the core.
+///
+/// The last reference drops the session transaction in a detached task on
+/// the blocking pool, because the drop removes the staging directory. The
+/// caller does not wait for it. Under the `tokio` backend with no runtime,
+/// the drop runs inline.
 fn release(core: Arc<Core>) {
     if let Some(core) = Arc::into_inner(core) {
         ostrya_rt::unblock_detached(move || drop(core));
@@ -424,9 +604,10 @@ fn release(core: Arc<Core>) {
 }
 
 impl Drop for ReceiveService {
-    /// A session that is still open ends with no commit. No step is in flight,
-    /// because each step borrows the service, so the state holds the last
-    /// reference to the core.
+    /// Ends a session that is still open, with no commit.
+    ///
+    /// Each step borrows the service, so no step is in flight at the drop. A
+    /// task on the blocking pool drops the session transaction.
     fn drop(&mut self) {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         let closed = State::Closed {
@@ -438,7 +619,7 @@ impl Drop for ReceiveService {
     }
 }
 
-/// The `protocol` error of a step on a session that does not take it.
+/// Returns the `protocol` error of a step on a session that does not take it.
 fn refusal(state: &State) -> Error {
     match state {
         State::Open { .. } => unreachable!("an open session takes steps"),
@@ -447,7 +628,7 @@ fn refusal(state: &State) -> Error {
     }
 }
 
-/// Read one object stream of [`ReceiveService::objects`].
+/// Reads one object stream of [`ReceiveService::objects`].
 async fn read_objects<R: AsyncRead + Unpin>(
     core: &Core,
     signal: &AbortSignal,
@@ -483,8 +664,10 @@ async fn read_objects<R: AsyncRead + Unpin>(
     Ok(reply)
 }
 
-/// One step in flight. Dropping it leaves the count of the session, and a
-/// step that did not reach [`end`](Self::end) ends the session.
+/// One step in flight.
+///
+/// The drop of a step removes it from the count of the session. A step that
+/// did not reach [`end`](Self::end) ends the session when it drops.
 struct Step<'a> {
     service: &'a ReceiveService,
     kind: Kind,
@@ -497,8 +680,10 @@ impl Step<'_> {
         self.core.as_ref().expect("the step holds the core")
     }
 
-    /// The result of the step. A failure ends the session. A step that
-    /// completes after the session ended gives the reason of the end.
+    /// Returns the result of the step.
+    ///
+    /// A failure ends the session. A step that completes after the session
+    /// ended gives the reason of the end.
     fn end<T>(mut self, result: std::result::Result<T, Failure>) -> Result<T> {
         self.done = true;
         match result {
@@ -541,10 +726,12 @@ impl Drop for Step<'_> {
     }
 }
 
-/// Closes the session when `commit` ends, also when its future is dropped.
+/// A guard that closes the session when `commit` ends, also when its future
+/// is dropped.
 struct Ending<'a> {
     service: &'a ReceiveService,
-    /// Why the session ended. `None` when the commit did not run to its end.
+    /// The reason of the end of the session. `None` if the commit did not run
+    /// to its end.
     reason: Option<String>,
 }
 
@@ -557,12 +744,13 @@ impl Drop for Ending<'_> {
     }
 }
 
-/// A signal that fires once, when the session ends with no commit, and wakes
-/// each object stream that waits for input.
+/// A signal that fires once, when the session ends with no commit.
+///
+/// The signal wakes each object stream that waits for input.
 #[derive(Default)]
 struct AbortSignal {
-    /// Set under the lock of `waiters` when the signal fires, and read with
-    /// no lock before each read.
+    /// The flag of the signal. The signal sets it under the lock of `waiters`
+    /// when it fires. Each read reads it with no lock first.
     fired: AtomicBool,
     waiters: Mutex<Waiters>,
 }
@@ -572,7 +760,8 @@ struct Waiters {
     next_id: u64,
     /// The waker of each reader that waits, by its id.
     wakers: HashMap<u64, Waker>,
-    /// How many times a reader stored a waker, for the test of the reuse.
+    /// The number of times that a reader stored a waker, for the test of the
+    /// reuse.
     #[cfg(test)]
     stores: usize,
 }
@@ -594,13 +783,14 @@ impl AbortSignal {
     }
 }
 
-/// A reader whose reads fail once the signal fires. A read that waits for
-/// input wakes when the signal fires. A read that waits again with the
-/// waker the slot holds takes no lock.
+/// A reader whose reads fail after the signal fires.
+///
+/// A read that waits for input wakes when the signal fires. A read that waits
+/// again with the waker that the slot holds takes no lock.
 struct Abortable<'a, R> {
     inner: R,
     signal: &'a AbortSignal,
-    /// The waker slot of the reader, once it waited.
+    /// The waker slot of the reader, after its first wait.
     id: Option<u64>,
     /// The waker stored in the slot.
     waker: Option<Waker>,
@@ -624,13 +814,14 @@ impl<R: AsyncRead + Unpin> AsyncRead for Abortable<'_, R> {
             return Poll::Ready(read);
         }
         // The stored waker stays in the slot until the signal takes it and
-        // wakes it, and the flag is set before that wake, so the next poll
-        // sees the signal.
+        // wakes it. The signal sets the flag before that wake, so the next
+        // poll sees the signal.
         if me.waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
             return Poll::Pending;
         }
-        // The signal sets the flag under the lock, so a check under the lock
-        // either sees it or stores the waker before the signal takes it.
+        // The signal sets the flag under the lock. As a result, a check under
+        // the lock sees the flag or stores the waker before the signal takes
+        // it.
         let mut waiters = me.signal.lock();
         if me.signal.fired.load(Ordering::Acquire) {
             return Poll::Ready(Err(aborted_read()));
@@ -658,7 +849,7 @@ impl<R> Drop for Abortable<'_, R> {
     }
 }
 
-/// The futures of the steps can run on a thread pool.
+// The futures of the steps are `Send`, so they can run on a thread pool.
 const _: fn() = || {
     fn assert_send<T: Send>(_: T) {}
     let _ = |repo: Repo, policy: Arc<ReceivePolicy>, hello: Hello| {
@@ -708,9 +899,9 @@ mod tests {
         }
     }
 
-    /// A read that waits again with the waker the slot holds stores no
-    /// waker, a read with another waker replaces it, and the signal wakes
-    /// the waker the slot holds and fails the next read.
+    /// A read that waits again with the waker that the slot holds stores no
+    /// waker. A read with another waker replaces it. The signal wakes the
+    /// waker that the slot holds and fails the next read.
     #[test]
     fn a_waiting_read_stores_its_waker_once() {
         let signal = AbortSignal::default();

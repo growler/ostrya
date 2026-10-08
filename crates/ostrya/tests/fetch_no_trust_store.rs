@@ -1,17 +1,16 @@
 #![forbid(unsafe_code)]
 
-//! A fetcher on a host with no CA bundle.
+//! Tests of a fetcher on a host with no CA bundle.
 //!
-//! `SSL_CERT_FILE` and `SSL_CERT_DIR` are what the system trust store is read
-//! from, so pointing both at paths that do not exist presents the fetcher with
-//! the store of a container without ca-certificates. The environment is set for
-//! a child process, which keeps the process that reads it free of an in-process
-//! `set_var`, and keeps the store the child runs with -- one that trusts nothing
-//! -- away from every other test.
+//! The fetcher reads the system trust store from `SSL_CERT_FILE` and
+//! `SSL_CERT_DIR`. If both point at paths that do not exist, the fetcher sees
+//! the store of a container with no ca-certificates package. The test sets the
+//! two variables only in a child process. Because of this, the test needs no
+//! in-process `set_var`, and the empty store does not reach other tests.
 //!
-//! The same child covers the verification bypass: a bypass variant of
-//! `TrustRoots` reads no store, so it builds an `https` fetcher where
-//! `TrustRoots::System` fails.
+//! The same child process also checks the verification bypass. A bypass
+//! variant of `TrustRoots` reads no store, so it builds an `https` fetcher
+//! where `TrustRoots::System` fails.
 
 use std::process::Command;
 
@@ -21,9 +20,10 @@ use ostrya_rt::block_on;
 const NO_CERT_FILE: &str = "/nonexistent/ca-bundle.pem";
 const NO_CERT_DIR: &str = "/nonexistent/certs";
 
-/// Options for a fetcher whose mirror is `url` and which reaches every origin
-/// directly, so the proxy variables the host running the suite holds decide
-/// nothing here.
+/// Returns the options of a fetcher with the mirror `url` and no proxy.
+///
+/// The fetcher connects to each origin directly, so the proxy variables of the
+/// host that runs the tests have no effect.
 fn direct_options(url: impl Into<String>) -> FetcherOptions {
     FetcherOptions {
         proxy: Proxy::None,
@@ -33,7 +33,8 @@ fn direct_options(url: impl Into<String>) -> FetcherOptions {
 
 #[test]
 fn a_cleartext_fetcher_needs_no_trust_store() {
-    // Re-execute this test binary with the trust store pointed at nothing.
+    // Run this test binary again, with the trust store variables set to
+    // paths that do not exist.
     let child = Command::new(std::env::current_exe().unwrap())
         .args([
             "an_absent_trust_store_subprocess",
@@ -54,14 +55,15 @@ fn a_cleartext_fetcher_needs_no_trust_store() {
     );
 }
 
-/// The half of [`a_cleartext_fetcher_needs_no_trust_store`] that builds the
-/// fetchers, run only when this test binary is re-executed with the environment
-/// set.
+/// Builds the fetchers for `a_cleartext_fetcher_needs_no_trust_store`.
+///
+/// This test does its work only when the parent test runs this binary again
+/// with the variables set.
 #[test]
 #[ignore = "helper process for a_cleartext_fetcher_needs_no_trust_store"]
 fn an_absent_trust_store_subprocess() {
-    // Without the parent's environment this reads the host's real store, which
-    // decides nothing either way.
+    // If the parent test did not set the variables, this process reads the
+    // real store of the host, and the result proves nothing.
     if std::env::var("SSL_CERT_FILE").ok().as_deref() != Some(NO_CERT_FILE) {
         return;
     }
@@ -76,7 +78,7 @@ fn an_absent_trust_store_subprocess() {
             .expect_err("an https mirror needs anchors the handshake can use");
         assert!(err.to_string().contains("no trusted certificates"), "{err}");
 
-        // One https mirror among cleartext ones is enough to need them.
+        // If one mirror of many uses https, the fetcher needs trust anchors.
         let mixed = FetcherOptions {
             mirrors: vec![
                 "http://example.invalid/repo".to_owned(),
@@ -90,11 +92,10 @@ fn an_absent_trust_store_subprocess() {
             .expect_err("an https mirror needs anchors the handshake can use");
         assert!(err.to_string().contains("no trusted certificates"), "{err}");
 
-        // A verification bypass reads no store, so the same https mirror that
-        // fails above builds here. `TrustRoots::System` failing in the same
-        // process is what shows the store this child runs with is empty, so
-        // the bypass is what carried the constructor and not a store that
-        // happened to hold something.
+        // A verification bypass reads no store, so the https mirror that
+        // fails with `TrustRoots::System` builds here. The failure of
+        // `TrustRoots::System` in this process shows that the store of this
+        // child is empty. The bypass alone lets the constructor succeed.
         for roots in [
             TrustRoots::DangerousAcceptAnyChain,
             TrustRoots::DangerousAcceptAny,

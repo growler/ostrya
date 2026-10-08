@@ -1,4 +1,4 @@
-//! Shared helpers for the reading-path integration tests.
+//! Helpers that the integration tests of `ostrya` share.
 
 #![allow(dead_code)]
 
@@ -19,17 +19,21 @@ pub mod pipe;
 #[cfg(feature = "receive")]
 pub mod receive;
 
-/// Root of the tool-generated fixture repositories, one subdirectory per mode.
+/// Returns the root directory of the fixture repositories of the `ostree` command.
+///
+/// The `ostree` command generated these repositories. The root holds one
+/// subdirectory for each repository mode.
 pub fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/generated")
 }
 
-/// The `repo/` path of a fixture, materializing it if needed.
+/// Returns the `repo/` path of a fixture, and unpacks the fixture if necessary.
 ///
-/// The `archive` and `bare` fixtures are plain trees and their path is returned
-/// directly. The bare-user-family fixtures (`bare-user`, `canon`, `xattr`) store
-/// each file's logical metadata in a `user.ostreemeta` xattr, which git does not
-/// track, so they ship as tarballs and are unpacked on demand.
+/// The `archive` and `bare` fixtures are plain trees, so the function returns
+/// their path directly. The fixtures of the bare-user family (`bare-user`,
+/// `canon`, `xattr`) keep the logical metadata of each file in a
+/// `user.ostreemeta` xattr. Git does not track xattrs, so these fixtures ship
+/// as tarballs, and the function unpacks them on demand.
 pub fn fixture_repo(mode: &str) -> PathBuf {
     match mode {
         "bare-user" | "canon" | "xattr" => unpack_fixture(mode).join("repo"),
@@ -37,10 +41,13 @@ pub fn fixture_repo(mode: &str) -> PathBuf {
     }
 }
 
-/// Unpack the xattr-preserving fixture tarball `<fixture_root>/<name>.tar` once
-/// per test process and return the directory holding its `repo/`. The unpack is
-/// memoized and persists for the process, so the returned paths stay valid for
-/// the whole test run.
+/// Unpacks the fixture tarball `<fixture_root>/<name>.tar` with its `user.*`
+/// xattrs.
+///
+/// The function returns the directory that holds the `repo/` of the fixture.
+/// It unpacks each tarball once in each test process. It keeps the result for
+/// the rest of the process, so the returned paths stay valid for the whole
+/// test run.
 pub fn unpack_fixture(name: &str) -> PathBuf {
     static REGISTRY: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
@@ -66,9 +73,11 @@ pub fn unpack_fixture(name: &str) -> PathBuf {
     dir
 }
 
-/// The commit and object checksums recorded by the fixture generator. These are
-/// mode-independent (the cross-mode commit-identity invariant), so they hold for
-/// every fixture repository.
+/// The commit and object checksums that the fixture generator recorded.
+///
+/// These checksums do not depend on the repository mode, so they are the same
+/// in every fixture repository. This is the invariant of commit identity
+/// across modes.
 pub const COMMIT: &str = "b3c8e8525e8a5c3409bf6e6db5f5d656da77ae76d08cbc4f8b75b71879757a89";
 pub const CONTENT: &str = "d79e5560a90877b47660b639e3d7c88c20ca5a7604f867960e155c552025e104";
 pub const ROOT_DIRTREE: &str = "1075002e681eb1fe7ff54ae6b76b1f65285e514b54d96deaa0952330b10c7983";
@@ -78,11 +87,13 @@ pub const HELLO_TXT: &str = "cfffd52f38d14c87cf46e18d5260074421ba5961f0895954e99
 pub const LINK: &str = "f66efa496a72379413c44593de510dc344beb045294f1a543da87b2b6118db35";
 pub const SUBDIR_DIRTREE: &str = "78154b9650d2a28716fd4a83584a2d9cba1833be4851714d8a0e89e8933c875a";
 pub const NESTED_TXT: &str = "a4d80a620354908d76238bea8185775d2f6d60f55a1506d16ee06af212b4a125";
-/// The commit of the archive `--generate-sizes` fixture (its metadata carries
-/// the `ostree.sizes` key, so it differs from the sizes-free [`COMMIT`]).
+/// The commit of the archive fixture that `--generate-sizes` made.
+///
+/// Its metadata holds the `ostree.sizes` key, so it differs from [`COMMIT`],
+/// which has no sizes.
 pub const SIZES_COMMIT: &str = "3ecadc59022c36743e1b233afbf3bde7b25239b77035185a3acc2af9d84478f0";
 
-/// A throwaway directory removed when dropped.
+/// A temporary directory that is removed when the value drops.
 pub struct TmpDir(PathBuf);
 
 impl TmpDir {
@@ -110,7 +121,7 @@ impl Drop for TmpDir {
 /// The time limit of each wait on a writer that an update guard holds back.
 pub const GUARD_WAIT: Duration = Duration::from_secs(30);
 
-/// Run `fut`, and fail the test when it takes longer than [`GUARD_WAIT`].
+/// Runs `fut` and fails the test if `fut` takes longer than [`GUARD_WAIT`].
 pub async fn within<T>(what: &str, fut: impl Future<Output = T>) -> T {
     futures_lite::future::or(fut, async {
         ostrya_rt::Timer::after(GUARD_WAIT).await;
@@ -119,14 +130,15 @@ pub async fn within<T>(what: &str, fut: impl Future<Output = T>) -> T {
     .await
 }
 
-/// How long a test keeps an update guard held after the commit object of a
+/// The time that a test holds an update guard after the commit object of a
 /// pull under that guard lands.
 pub const GUARD_HOLD: Duration = Duration::from_millis(500);
 
-/// Wait until the commit object `commit` is in `repo`, then hold for
-/// [`GUARD_HOLD`]. Fail the test when the pull `task` ends while the commit
-/// object is absent, or when the commit object takes longer than
-/// [`GUARD_WAIT`].
+/// Waits until the commit object `commit` is in `repo`, then waits for
+/// [`GUARD_HOLD`].
+///
+/// The test fails if the pull `task` ends while the commit object is absent.
+/// The test also fails if the commit object takes longer than [`GUARD_WAIT`].
 pub async fn wait_for_commit_under_guard<F>(
     repo: &ostrya::Repo,
     commit: &ostrya::Checksum,
@@ -163,14 +175,15 @@ const FOREIGN_LOCK_REPO: &str = "OSTRYA_TEST_FOREIGN_LOCK_REPO";
 /// relative to the repository.
 const FOREIGN_LOCK_FILE: &str = "OSTRYA_TEST_FOREIGN_LOCK_FILE";
 
-/// The file the lock helper writes once it holds the lock.
+/// The file that the lock helper writes after it takes the lock.
 const FOREIGN_LOCK_MARKER: &str = ".foreign-held";
 
-/// The name of the ignored test each test binary that starts a lock helper
-/// defines, which calls [`lock_holder_main`].
+/// The name of the ignored test that calls [`lock_holder_main`].
+///
+/// Each test binary that starts a lock helper defines this test.
 pub const LOCK_HOLDER_TEST: &str = "lock_holder_subprocess";
 
-/// A spawned child, killed and reaped when the guard drops.
+/// A child process that is killed and reaped when the guard drops.
 pub struct ChildGuard(std::process::Child);
 
 impl Drop for ChildGuard {
@@ -180,7 +193,7 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Wait until `marker` exists, for at most ten seconds.
+/// Waits for at most ten seconds until `marker` exists.
 fn wait_for_marker(marker: &Path, what: &str) {
     let started = Instant::now();
     while !marker.exists() {
@@ -189,8 +202,11 @@ fn wait_for_marker(marker: &Path, what: &str) {
     }
 }
 
-/// Start this test binary again as a process that holds `<repo>/<lock_file>`
-/// exclusive, with a raw record lock, until it is killed.
+/// Starts this test binary again as a process that holds a lock on
+/// `<repo>/<lock_file>`.
+///
+/// The child holds an exclusive raw record lock on the file until it is
+/// killed.
 pub fn foreign_holder(repo: &Path, lock_file: &str) -> ChildGuard {
     let holder = ChildGuard(
         Command::new(std::env::current_exe().unwrap())
@@ -210,9 +226,11 @@ pub fn foreign_holder(repo: &Path, lock_file: &str) -> ChildGuard {
     holder
 }
 
-/// The body of the lock helper: take the record lock the environment names,
-/// write the readiness marker, and wait until standard input closes. Outside
-/// a helper process it does nothing.
+/// Runs the body of the lock helper.
+///
+/// The helper takes the record lock that the environment names and writes the
+/// readiness marker. Then it waits until standard input closes. Outside a
+/// helper process, the function does nothing.
 pub fn lock_holder_main() {
     use rustix::fs::{FlockOperation, Mode, OFlags};
     use std::io::Read;
@@ -243,15 +261,16 @@ pub fn lock_holder_main() {
 /// The environment variable that names the repository of the guard helper.
 const GUARD_HOLDER_REPO: &str = "OSTRYA_TEST_GUARD_HOLDER_REPO";
 
-/// The file the guard helper writes once it holds the guard.
+/// The file that the guard helper writes after it takes the guard.
 pub const GUARD_HELD_MARKER: &str = ".guard-held";
 
-/// The file the guard helper writes after its standard input closed and
+/// The file that the guard helper writes after its standard input closes and
 /// before it releases the guard.
 pub const GUARD_RELEASING_MARKER: &str = ".guard-releasing";
 
-/// The name of the ignored test each test binary that starts a guard helper
-/// defines, which calls [`guard_holder_main`].
+/// The name of the ignored test that calls [`guard_holder_main`].
+///
+/// Each test binary that starts a guard helper defines this test.
 pub const GUARD_HOLDER_TEST: &str = "guard_holder_subprocess";
 
 /// A child process that holds an `UpdateGuard` of one repository.
@@ -260,8 +279,10 @@ pub struct GuardHolder {
 }
 
 impl GuardHolder {
-    /// Close the standard input of the child, so it releases the guard, and
-    /// wait for it to exit. Fails when the child failed.
+    /// Closes the standard input of the child and waits for the child to exit.
+    ///
+    /// The closed input makes the child release the guard. If the child
+    /// fails, or its output does not report `1 passed`, the test fails.
     pub fn release(mut self) {
         let mut child = self.child.take().unwrap();
         drop(child.stdin.take());
@@ -274,7 +295,7 @@ impl GuardHolder {
         );
     }
 
-    /// The process id of the child.
+    /// Returns the process id of the child.
     pub fn pid(&self) -> u32 {
         self.child.as_ref().unwrap().id()
     }
@@ -289,9 +310,11 @@ impl Drop for GuardHolder {
     }
 }
 
-/// Start this test binary again as a process that opens the repository at
-/// `repo`, takes an `UpdateGuard`, and holds it until its standard input
-/// closes. The call returns once the child holds the guard.
+/// Starts this test binary again as a process that holds an `UpdateGuard` of
+/// `repo`.
+///
+/// The child opens the repository, takes the guard, and holds it until its
+/// standard input closes. The call returns after the child takes the guard.
 pub fn guard_holder(repo: &Path) -> GuardHolder {
     let child = Command::new(std::env::current_exe().unwrap())
         .args([GUARD_HOLDER_TEST, "--exact", "--ignored", "--nocapture"])
@@ -309,10 +332,12 @@ pub fn guard_holder(repo: &Path) -> GuardHolder {
     holder
 }
 
-/// The body of the guard helper: take an `UpdateGuard` of the repository
-/// the environment names, write the readiness marker, wait until standard
-/// input closes, write the releasing marker, and finish the guard. Outside a
-/// helper process it does nothing.
+/// Runs the body of the guard helper.
+///
+/// The helper takes an `UpdateGuard` of the repository that the environment
+/// names and writes the readiness marker. Then it waits until standard input
+/// closes. After that, it writes the releasing marker and finishes the guard.
+/// Outside a helper process, the function does nothing.
 pub fn guard_holder_main() {
     use std::io::Read;
 
@@ -340,8 +365,9 @@ const WRITER_CHILD_REPO: &str = "OSTRYA_TEST_WRITER_CHILD_REPO";
 /// The environment variable that carries the argument of the writer helper.
 const WRITER_CHILD_ARG: &str = "OSTRYA_TEST_WRITER_CHILD_ARG";
 
-/// The name of the ignored test each test binary that starts a writer helper
-/// defines, which calls [`writer_child_main`].
+/// The name of the ignored test that calls [`writer_child_main`].
+///
+/// Each test binary that starts a writer helper defines this test.
 pub const WRITER_CHILD_TEST: &str = "writer_child_subprocess";
 
 /// A child process that runs one write on one repository.
@@ -350,7 +376,10 @@ pub struct WriterChild {
 }
 
 impl WriterChild {
-    /// Wait for the child to exit. Fails when the write failed.
+    /// Waits for the child to exit.
+    ///
+    /// If the write fails, or the output of the child does not report
+    /// `1 passed`, the test fails.
     pub fn wait(mut self) {
         let child = self.child.take().unwrap();
         let output = child.wait_with_output().unwrap();
@@ -362,7 +391,7 @@ impl WriterChild {
         );
     }
 
-    /// Whether the child has exited.
+    /// Returns `true` if the child exited.
     pub fn finished(&mut self) -> bool {
         let child = self.child.as_mut().unwrap();
         child.try_wait().unwrap().is_some()
@@ -378,15 +407,18 @@ impl Drop for WriterChild {
     }
 }
 
-/// Start this test binary again as a process that runs the write of the test
-/// binary on the repository at `repo`, with the argument `arg`. The call
-/// returns at once.
+/// Starts this test binary again as a process that runs the write of the test
+/// binary on `repo`.
+///
+/// The child runs the write with the argument `arg`. The call returns at once.
 pub fn writer_child(repo: &Path, arg: &str) -> WriterChild {
     writer_child_with(repo, arg, |_| {})
 }
 
-/// Start the writer process of [`writer_child`], after `configure` changes
-/// its command, for example its environment.
+/// Starts the writer process of [`writer_child`] with a changed command.
+///
+/// Before the start, `configure` changes the command, for example its
+/// environment.
 pub fn writer_child_with(
     repo: &Path,
     arg: &str,
@@ -405,8 +437,10 @@ pub fn writer_child_with(
     WriterChild { child: Some(child) }
 }
 
-/// The body of the writer helper: run `write` on the repository and the
-/// argument the environment names. Outside a helper process it does nothing.
+/// Runs the body of the writer helper.
+///
+/// The helper runs `write` on the repository and the argument that the
+/// environment names. Outside a helper process, the function does nothing.
 pub fn writer_child_main(write: impl FnOnce(&Path, &str)) {
     let (Some(path), Ok(arg)) = (
         std::env::var_os(WRITER_CHILD_REPO).map(PathBuf::from),
@@ -417,16 +451,22 @@ pub fn writer_child_main(write: impl FnOnce(&Path, &str)) {
     write(&path, &arg);
 }
 
-/// The environment variable that turns the reference-absent skip into a
-/// failure. A harness setting it declares that `ostree` is installed, so a run
-/// where it is not is a broken harness rather than a test to pass over.
+/// The environment variable that turns the skip for an absent `ostree` command
+/// into a failure.
+///
+/// A harness that sets it declares that the `ostree` command is installed. If
+/// the command is absent in such a run, the harness is broken, so the test
+/// fails.
 pub const REQUIRE_OSTREE: &str = "OSTRYA_REQUIRE_OSTREE";
 
-/// Whether the `ostree` tool is available for cross-check tests. Some of these
-/// tests are the proof a matrix record cites with `evidence:`, so a harness
-/// without the tool would otherwise report the cited cells as covered while no
-/// assertion ran. With [`REQUIRE_OSTREE`] set the absence fails; without it the
-/// caller skips and says so.
+/// Returns `true` if the `ostree` command is available for the cross-check
+/// tests.
+///
+/// Some of these tests are the proof that a matrix record cites with
+/// `evidence:`. If the command is absent and the test does not fail, the
+/// harness reports the cited cells as covered, and no assertion runs. If
+/// [`REQUIRE_OSTREE`] is set, an absent command fails the test. If it is not
+/// set, the caller skips the test and writes a message about the skip.
 pub fn ostree_available() -> bool {
     let found = Command::new("ostree")
         .arg("--version")
@@ -441,7 +481,7 @@ pub fn ostree_available() -> bool {
     found
 }
 
-/// Run `ostree fsck` on `root`, and assert that it passes.
+/// Runs `ostree fsck` on `root` and asserts that it passes.
 pub fn tool_fsck(root: &Path) {
     let out = Command::new("ostree")
         .arg("fsck")
@@ -456,21 +496,26 @@ pub fn tool_fsck(root: &Path) {
     );
 }
 
-/// The environment variable that turns the ed25519-unsupported skip into a
-/// failure. A harness setting it declares that the installed `ostree` carries
-/// the engine, so a run where it does not is a broken harness rather than a
-/// test to pass over.
+/// The environment variable that turns the skip for a missing ed25519 engine
+/// into a failure.
+///
+/// A harness that sets it declares that the installed `ostree` command has the
+/// ed25519 engine. If the engine is absent in such a run, the harness is
+/// broken, so the test fails.
 pub const REQUIRE_OSTREE_ED25519: &str = "OSTRYA_REQUIRE_OSTREE_ED25519";
 
-/// Whether the `ostree` tool carries its ed25519 signing engine, which
-/// `ostree --version` reports as the `sign-ed25519` feature. The engine is a
-/// build option: a tool built without it refuses every ed25519 invocation with
+/// Returns `true` if the `ostree` command has its ed25519 signing engine.
+///
+/// `ostree --version` reports the engine as the `sign-ed25519` feature. The
+/// engine is a build option. A build of the command without the engine
+/// refuses each ed25519 invocation with
 /// `Requested signature type is not implemented`.
 ///
-/// Tests that ask the tool to sign or verify with ed25519 skip when the engine
-/// is absent. Such a refusal describes the tool's build and states nothing
-/// about the port, and it would otherwise satisfy a test that asserts the tool
-/// rejects a signature. With [`REQUIRE_OSTREE_ED25519`] set the absence fails.
+/// Tests that tell the command to sign or verify with ed25519 skip if the
+/// engine is absent. Such a refusal describes the build of the command and
+/// states nothing about ostrya. Without the skip, the refusal also satisfies a
+/// test that asserts that the command rejects a signature. If
+/// [`REQUIRE_OSTREE_ED25519`] is set, an absent engine fails the test.
 pub fn ostree_supports_ed25519() -> bool {
     let supported = ostree_available()
         && Command::new("ostree")
@@ -486,7 +531,8 @@ pub fn ostree_supports_ed25519() -> bool {
     supported
 }
 
-/// Whether the `openssl` tool is available for cross-check tests.
+/// Returns `true` if the `openssl` command is available for the cross-check
+/// tests.
 pub fn openssl_available() -> bool {
     Command::new("openssl")
         .arg("version")
@@ -495,17 +541,21 @@ pub fn openssl_available() -> bool {
         .unwrap_or(false)
 }
 
-/// The environment variable that turns the absent-GnuPG skip into a failure. A
-/// harness setting it declares that the GnuPG binaries are installed, so a run
-/// where one is not is a broken harness rather than a test to pass over.
+/// The environment variable that turns the skip for an absent GnuPG binary
+/// into a failure.
+///
+/// A harness that sets it declares that the GnuPG binaries are installed. If a
+/// binary is absent in such a run, the harness is broken, so the test fails.
 pub const REQUIRE_GNUPG: &str = "OSTRYA_REQUIRE_GNUPG";
 
-/// Whether every named GnuPG binary answers, naming the absent one when one
-/// does not. The GPG cases build their fixtures with `gpg`, and the agreement
-/// gate compares against `gpgv`, so a harness without a binary would otherwise
-/// report those cases as tested while no assertion ran. With [`REQUIRE_GNUPG`]
-/// set the absence fails; without it the caller skips and the name of the
-/// absent binary is written to stderr.
+/// Returns `true` if each named GnuPG binary answers.
+///
+/// The GPG cases build their fixtures with `gpg`, and the agreement gate
+/// compares against `gpgv`. If a binary is absent and the test does not fail,
+/// the harness reports these cases as tested, and no assertion runs. If
+/// [`REQUIRE_GNUPG`] is set, an absent binary fails the test. If it is not
+/// set, the function writes the name of the absent binary to stderr, and the
+/// caller skips the test.
 pub fn gnupg_available(programs: &[&str]) -> bool {
     for program in programs {
         let found = Command::new(program)
@@ -526,10 +576,12 @@ pub fn gnupg_available(programs: &[&str]) -> bool {
     true
 }
 
-/// Stop every GnuPG daemon of the home directory `dir` and remove the socket
-/// directory GnuPG made for it under the user runtime directory. GnuPG names
-/// that directory from the path string of `dir`, so the call also works after
-/// `dir` is removed. Failures are ignored.
+/// Stops each GnuPG daemon of the home directory `dir` and removes its socket
+/// directory.
+///
+/// GnuPG makes the socket directory under the user runtime directory. GnuPG
+/// names that directory from the path string of `dir`, so the call also works
+/// after `dir` is removed. The function ignores failures.
 pub fn remove_gnupg_sockets(dir: &Path) {
     for action in [&["--kill", "all"][..], &["--remove-socketdir"][..]] {
         let _ = Command::new("gpgconf")
@@ -542,8 +594,10 @@ pub fn remove_gnupg_sockets(dir: &Path) {
     }
 }
 
-/// Every regular file and symlink under `root/sub`, as its path relative to
-/// `root` and its bytes (a symlink's target), sorted by path.
+/// Returns each regular file and symlink under `root/sub`, sorted by path.
+///
+/// Each entry holds the path relative to `root` and the bytes of the file. For
+/// a symlink, the bytes are the target of the symlink.
 pub fn file_inventory(root: &Path, sub: &str) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
     let mut stack = vec![root.join(sub)];
@@ -573,7 +627,7 @@ pub fn file_inventory(root: &Path, sub: &str) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// Mark `commit` partial in `repo`, as a pull that stopped would.
+/// Marks `commit` as partial in `repo`, as a stopped pull leaves it.
 pub fn mark_partial(repo: &ostrya::Repo, commit: &ostrya::Checksum) {
     std::fs::write(
         repo.path().join(format!("state/{commit}.commitpartial")),
@@ -582,13 +636,15 @@ pub fn mark_partial(repo: &ostrya::Repo, commit: &ostrya::Checksum) {
     .unwrap();
 }
 
-/// Whether a regular file is sealed with fs-verity: a sealed file refuses an
-/// open for writing. The objects are owner-writable, so a refusal is the seal.
+/// Returns `true` if fs-verity seals the regular file at `path`.
+///
+/// A sealed file refuses an open for writing. The objects are writable by the
+/// owner, so a refusal shows the seal.
 pub fn is_sealed(path: &Path) -> bool {
     std::fs::OpenOptions::new().write(true).open(path).is_err()
 }
 
-/// The regular-file loose objects under `root/objects`.
+/// Returns the loose objects under `root/objects` that are regular files.
 pub fn regular_objects(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for fanout in std::fs::read_dir(root.join("objects")).unwrap().flatten() {

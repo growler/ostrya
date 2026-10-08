@@ -1,57 +1,19 @@
-//! Static-delta generation.
+//! Static-delta generation: the writer of the superblock and the part files,
+//! and the `delta-indexes/` cache.
 //!
-//! [`Repo::generate_static_delta`] writes the delta that turns one commit into
-//! another (or produces a commit from scratch) in the wire format
-//! `format-reference.md` records: a `superblock` carrying the target commit
-//! whole plus per-part and fallback tables, and numbered part files carrying the
-//! objects. [`Repo::sign_static_delta`] wraps a written superblock in the signed
-//! envelope, [`DeltaOptions::signers`] signs the superblock as it is written,
-//! and [`Repo::reindex_static_deltas`] rebuilds the `delta-indexes/` cache.
-//! The read side is in [`crate::delta`], and the two are tested against each
-//! other as well as against the `ostree` tool.
+//! The rules that a caller sees are on `Repo::generate_static_delta`, under
+//! `# Object routes`, `# Memory`, and `# Blocking pool`, and on the fields of
+//! `DeltaOptions`. The read side is in [`crate::delta`]. The tests check each
+//! side against the other and against the `ostree` command.
 //!
-//! An object reaches the receiver one of four ways, decided per object:
+//! The private items that carry the rules:
 //!
-//! - as a loose fallback, when its stream is at least
-//!   [`DeltaOptions::min_fallback_size`] -- the delta names it and the receiver
-//!   fetches it whole;
-//! - as a rollsum delta against the object at the same path in the source
-//!   commit, when content-defined chunking finds shared chunks -- the operation
-//!   stream copies the unchanged runs out of the source object and carries only
-//!   the changed ones;
-//! - as a bspatch stream against that same source object, when the object is
-//!   small enough that chunking finding nothing shared is not itself evidence
-//!   that the two are unrelated (see [`BSDIFF_CONTENT_LIMIT`]) and the patch
-//!   carries substantially less novel data than the content
-//!   (see [`patch_beats_splicing`]);
-//! - spliced verbatim out of the part payload otherwise, which is also the only
-//!   route for metadata objects and symlinks.
-//!
-//! Generation is memory-bounded. A part's data source accumulates in a
-//! [`Spill`] buffer that moves to an anonymous temp file past
-//! [`MMAP_THRESHOLD`], spliced content streams into it in [`IO_CHUNK`] pieces
-//! without ever being held whole, and the part payload is serialized straight
-//! into the xz encoder rather than built in a buffer: its GVariant framing is
-//! written around the two large byte arrays, which stream from the spill buffer.
-//! The dominant term in the footprint is the xz encoder itself, which holds
-//! about 370 MiB per part being compressed (see [`PART_XZ_LEVEL`]).
-//!
-//! Diffing is the exception to the streaming rule, since both objects need random
-//! access: source and target load through the same heap-or-mmap [`Blob`] the read
-//! path uses, and chunking scans both end to end, so every page of both is
-//! resident while a pair is being planned. Peak resident set size therefore tracks
-//! the two objects' sizes together, in mapped temp-file pages rather than heap.
-//! [`DeltaOptions::min_fallback_size`] bounds the target -- an object at or past it
-//! is handed over loose and never diffed, and a zero threshold removes that bound
-//! -- while the source it pairs with is whatever object sits at the same path in
-//! the source commit and carries no bound of its own.
-//! [`DeltaOptions::max_bsdiff_size`] bounds the patch attempt alone, whose suffix
-//! sort costs several times the source size on top of the pair.
-//!
-//! The CPU-bound stages run on the blocking pool rather than on an executor
-//! thread: chunking and hashing both objects of a diff candidate, bsdiff's
-//! suffix sort ([`bsdiff_stream`]), and each part's compression
-//! ([`compress_part`]).
+//! - [`BSDIFF_CONTENT_LIMIT`] and [`patch_beats_splicing`] decide if a bspatch
+//!   stream replaces a splice.
+//! - [`Spill`] holds the data source of a part, on the heap up to
+//!   [`MMAP_THRESHOLD`] and in a temp file after it.
+//! - [`compress_part`] and [`bsdiff_stream`] run the CPU-bound stages on the
+//!   blocking pool. [`PART_XZ_LEVEL`] sets the memory of the xz encoder.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::SeekFrom;
@@ -86,117 +48,152 @@ use crate::repo::Repo;
 use crate::rollsum::{self, Run};
 use crate::sign::{Signer, append_signature};
 
-/// The delta part format version the meta-entry records.
+/// The format version of a delta part that the meta-entry records.
 const PART_VERSION: u32 = 0;
 
-/// The xz preset every part is compressed with, pinned so part bytes depend on
-/// this project rather than on the compression crate's default. Preset 8,
-/// non-extreme, with the CRC64 check xz uses by default: an LZMA2 dictionary of
-/// 32 MiB, which `xz -8 -T1 -vv` reports as 370 MiB of encoder memory per
-/// concurrent part and 33 MiB to decode. The same dictionary size the tool's
-/// parts carry.
+/// The xz preset of each part.
+///
+/// The value is fixed, so the part bytes do not depend on the default of the
+/// compression crate. Preset 8 is not extreme, and it uses the CRC64 check that
+/// xz uses by default. Its LZMA2 dictionary is 32 MiB. `xz -8 -T1 -vv` reports
+/// 370 MiB of encoder memory for each concurrent part and 33 MiB to decode. The
+/// parts of the `ostree` command carry the same dictionary size.
 const PART_XZ_LEVEL: i32 = 8;
 
-/// The largest content size a bspatch stream is attempted for, applied on top of
-/// [`DeltaOptions::max_bsdiff_size`].
+/// The largest content size for which a bspatch stream is tried. The smaller
+/// of this value and [`DeltaOptions::max_bsdiff_size`] applies.
 ///
-/// bsdiff is reached only after chunking found nothing shared. For an object
-/// spanning many chunks that means no chunk-sized window of the target occurs
-/// anywhere in the source, which is evidence the two objects are unrelated --
-/// and a patch against unrelated content runs about the target's length, so it
-/// loses to splicing after paying for a suffix sort. Below the chunker's
-/// [`rollsum::MAX_CHUNK`] an object is one chunk or a handful, where an edit
-/// anywhere defeats chunking on its own and its failure carries no such
-/// evidence. That is also where the tool emits bspatch (`format-reference.md`
-/// records a 1,024-byte object with a small edit).
+/// bsdiff runs only after chunking found no shared chunk. For an object of many
+/// chunks, this result means that no chunk-sized window of the target occurs
+/// in the source. That is evidence that the two objects are unrelated. A patch
+/// against unrelated content is about as long as the target, so it loses to a
+/// splice after the cost of a suffix sort.
 ///
-/// It bounds the source as well as the target, since the suffix sort is over the
-/// source: pairing is by path with no size-ratio rule, so a small object can be
-/// paired with a large one it replaced.
+/// An object smaller than [`rollsum::MAX_CHUNK`] is one chunk or a small
+/// number of chunks. One edit anywhere in it defeats chunking, so a failure of chunking
+/// is no such evidence. The `ostree` command also emits bspatch at this size.
+/// It was observed to emit bspatch for a 1,024-byte object with a small edit.
+///
+/// The limit applies to the source and to the target, because the suffix sort
+/// is over the source. Pairing is by path, with no rule on the size ratio, so a
+/// small object can pair with a large object that it replaced.
 const BSDIFF_CONTENT_LIMIT: u64 = rollsum::MAX_CHUNK as u64;
 
-/// The superblock file name inside a delta directory.
+/// The name of the superblock file in a delta directory.
 pub(crate) const SUPERBLOCK_FILE: &str = "superblock";
-/// The delta directory tree, relative to the repository root.
+/// The tree of delta directories, relative to the repository root.
 const DELTAS_DIR: &str = "deltas";
-/// The delta index tree, relative to the repository root.
+/// The tree of delta index files, relative to the repository root.
 const DELTA_INDEXES_DIR: &str = "delta-indexes";
 /// The suffix of an index file under `delta-indexes/`.
 const INDEX_SUFFIX: &str = ".index";
-/// The `a{sv}` key an index file (and the summary) stores the delta map under.
+/// The `a{sv}` key under which an index file and the summary store the delta
+/// map.
 pub(crate) const STATIC_DELTAS_KEY: &str = "ostree.static-deltas";
 
-/// The mode of the delta files and index files, which the tool gives them
-/// whatever the umask is.
+/// The mode of the delta files and the index files. The `ostree` command gives
+/// them this mode whatever the umask is.
 const DELTA_FILE_MODE: u32 = 0o644;
-/// The mode delta directories are created with. The umask reduces it, as it
-/// does for the tool.
+/// The mode of a new delta directory. The umask reduces it, as it does for the
+/// `ostree` command.
 const DELTA_DIR_MODE: u32 = 0o755;
 
-/// Knobs for [`Repo::generate_static_delta`].
+/// The options of [`Repo::generate_static_delta`].
 ///
-/// The three size thresholds are the ones the tool exposes on
-/// `static-delta generate`, in bytes rather than the tool's decimal megabytes:
-/// pass `4 * 1_000_000` where the tool takes `--min-fallback-size=4`.
+/// The three size thresholds are the thresholds of the `ostree static-delta
+/// generate` command, in bytes. The `ostree` command takes decimal megabytes:
+/// pass `4 * 1_000_000` where the command takes `--min-fallback-size=4`.
 #[derive(Clone)]
 pub struct DeltaOptions {
-    /// An object whose uncompressed stream (file header plus content) reaches
-    /// this size is delivered as a loose fallback instead of being packed into a
-    /// part. Default 4,000,000. Zero turns fallbacks off, as the tool's
-    /// `--min-fallback-size=0` does, so every object is packed whatever its
-    /// size.
+    /// The stream size at which an object travels as a loose fallback.
+    ///
+    /// The stream is the file header and the content, uncompressed. If the
+    /// stream of an object is this size or larger, the object is not packed
+    /// into a part and is never diffed. The size compared is the serialized
+    /// file header, plus 7 bytes, plus the content, as the `ostree` command
+    /// compares it.
+    ///
+    /// Default 4,000,000. Zero turns fallbacks off, as `--min-fallback-size=0`
+    /// of the `ostree` command does. Each object is then packed whatever its
+    /// size, and the memory of a diff has no bound from this value.
     pub min_fallback_size: u64,
-    /// The largest content size bsdiff is attempted for. bsdiff's suffix sort
-    /// costs a multiple of the input size in memory, so this bounds the peak.
-    /// Default 64,000,000. A second bound derived from the chunker's maximum
-    /// chunk size applies as well, and the tighter of the two wins, so at this
-    /// default the chunker's 64 KiB is what decides.
+    /// The largest content size for which a bspatch stream is tried.
+    ///
+    /// The suffix sort of bsdiff costs several times the source size in
+    /// memory, on top of the two objects, so this value bounds the peak.
+    /// Default 64,000,000. A second bound of 64 KiB comes from the largest
+    /// chunk of the chunker, and the smaller bound applies. At the default,
+    /// the 64 KiB bound decides. Both bounds apply to the source object and to
+    /// the target object.
     pub max_bsdiff_size: u64,
-    /// The payload size at which a part is closed and the next one started.
-    /// Default 32,000,000.
+    /// The payload size at which a part closes and the next part starts.
+    ///
+    /// Default 32,000,000. Zero is refused with [`Error::InvalidFormat`].
     pub max_chunk_size: u64,
-    /// Whether bsdiff may be used at all. With bsdiff off, an object that
-    /// chunking cannot express is spliced whole.
+    /// The switch that allows bspatch streams.
+    ///
+    /// If `false`, an object that chunking cannot express is spliced whole.
+    /// Default `true`.
     pub bsdiff: bool,
-    /// The superblock timestamp (seconds since the Unix epoch). `None` uses the
-    /// current time, as the tool does; setting it makes the output reproducible.
+    /// The superblock timestamp, in seconds since the Unix epoch.
+    ///
+    /// `None` uses the current time, as the `ostree` command does. A fixed
+    /// value makes the output reproducible.
     pub timestamp: Option<u64>,
-    /// Write the delta's files -- the superblock and the numbered part files --
-    /// into this directory instead of the repository's `deltas/` tree. The
-    /// directory is created if absent, and its other contents are left alone:
-    /// files this delta writes are replaced, and nothing else is removed, so a
-    /// longer previous delta's extra part files stay behind. A reader takes the
-    /// parts the superblock lists, so they cost disk rather than correctness.
+    /// A directory that receives the superblock and the part files.
+    ///
+    /// If set, no file goes into the `deltas/` tree. The generation creates
+    /// the directory if it is absent.
+    ///
+    /// The generation replaces the files that this delta writes and removes
+    /// no other file. The extra part files of a longer previous delta stay. A
+    /// reader takes only the parts that the superblock lists, so these files
+    /// cost disk space and cause no error.
     pub output_dir: Option<PathBuf>,
-    /// Write the superblock to this file and the numbered part files to the
-    /// directory that holds it, instead of the repository's `deltas/` tree. A
-    /// path with no `/` puts both in the working directory. The directory must
-    /// exist; it is not created. A path that names a directory, and a path
-    /// whose last component is empty, `.`, `..`, or a part file name (`0`, `1`,
-    /// ...), are refused before anything is written. A file already at the path
-    /// is replaced only by the rename that puts the superblock in place, so a
-    /// generation that fails leaves it as it was. `None` by default. Setting it
-    /// together with [`output_dir`](DeltaOptions::output_dir) is refused.
+    /// A file path for the superblock, with the part files in its directory.
+    ///
+    /// If set, no file goes into the `deltas/` tree. A path with no `/` puts
+    /// the superblock and the parts in the working directory. The directory
+    /// must exist, and the generation does not create it. `None` by default.
+    ///
+    /// The generation refuses these paths before it writes a file:
+    ///
+    /// - a path that names a directory
+    /// - a path whose last component is empty, `.`, or `..`
+    /// - a path whose last component is a part file name, such as `0` or `1`
+    ///
+    /// Only the rename that puts the superblock in place replaces a file at
+    /// the path. If the generation fails, that file stays as it was. If
+    /// [`output_dir`](DeltaOptions::output_dir) is also set, the generation is
+    /// refused.
     pub superblock_file: Option<PathBuf>,
-    /// The engines that sign the superblock before it is written, each once, in
-    /// order. Empty by default, which writes an unsigned superblock. A signer
-    /// that fails fails the generation with no superblock written.
+    /// The engines that sign the superblock before it is written.
+    ///
+    /// Each engine signs once, in order. Empty by default, which writes an
+    /// unsigned superblock. If a signer fails, the generation fails and writes
+    /// no superblock.
     pub signers: Vec<Arc<dyn Signer>>,
-    /// Carry each part in the superblock metadata dict under
-    /// `deltas/<fanout>/<rest>/<i>` as a `(yay)` variant, and write no part
-    /// file. The value holds the bytes a part file would hold. The key is the
-    /// repository-relative name also under
-    /// [`output_dir`](DeltaOptions::output_dir) and
-    /// [`superblock_file`](DeltaOptions::superblock_file). The parts count
-    /// toward the superblock ceiling of 128 MiB. A generation whose
-    /// superblock passes it fails before the superblock is written, and a
-    /// superblock that an earlier delta left at the same location stays in
-    /// place. Default false.
+    /// The switch that puts the parts into the superblock.
+    ///
+    /// If `true`, the metadata dict of the superblock holds each part under
+    /// the key `deltas/<fanout>/<rest>/<i>`, as a `(yay)` variant, and no part
+    /// file is written. The value holds the bytes that a part file holds. The
+    /// key is the repository-relative name, also with
+    /// [`output_dir`](DeltaOptions::output_dir) or
+    /// [`superblock_file`](DeltaOptions::superblock_file).
+    ///
+    /// The parts count toward the superblock limit of 128 MiB. If the
+    /// superblock passes the limit, the generation fails before it writes
+    /// the superblock. A superblock that an earlier delta left at the same
+    /// location then stays in place. Default `false`.
     pub inline: bool,
-    /// The byte order written into `ostree.endianness` and used for a
-    /// meta-entry's `size` and `usize` and a fallback's two sizes. The
-    /// timestamp, the parts, and the embedded commit do not change with it.
-    /// Default [`DeltaEndianness::Little`], on every host.
+    /// The byte order of the size fields of the superblock.
+    ///
+    /// The superblock records the order in `ostree.endianness`. The order
+    /// applies to the `size` and the `usize` of a meta-entry and to the two
+    /// sizes of a fallback. The timestamp, the parts, and the embedded commit
+    /// do not change with it. Default [`DeltaEndianness::Little`], on each
+    /// host.
     pub endianness: DeltaEndianness,
 }
 
@@ -235,59 +232,174 @@ impl Default for DeltaOptions {
     }
 }
 
+/// Methods that generate, sign, and index static deltas.
 impl Repo {
-    /// Generate the static delta from `from` (or from scratch when `None`) to
-    /// `to`, and return the directory it was written to.
+    /// Generates the static delta from `from` to `to` and returns its directory.
     ///
-    /// Both commits and every object the delta packs must be present. The
-    /// delta's files land under `deltas/` by default, in the base64-fanout
-    /// directory the tool uses, in [`DeltaOptions::output_dir`] when set, or,
-    /// with [`DeltaOptions::superblock_file`] set, the superblock at that path
-    /// and the parts in the directory that holds it. Part files are written
-    /// before the superblock, so a delta interrupted part-way leaves no
-    /// superblock for a reader to trust. With [`DeltaOptions::inline`] set the
-    /// parts go into the superblock and no part file is written. The
-    /// superblock is signed before it is written, so a generation that fails
-    /// at signing writes no superblock.
-    /// Each file is written
-    /// under a temp name that is unlinked unless the rename putting it in place
-    /// runs, so a generation that fails or is cancelled leaves no partial file
-    /// in the directory. Regenerating over an
-    /// existing delta overwrites its parts in place, so that delta's superblock
-    /// is unlinked before the first part is written rather than being left to
-    /// describe files this run has replaced. An inline generation replaces no
-    /// part file, so the previous superblock stays in place until the rename
-    /// of the new one replaces it, and an inline generation that fails leaves
-    /// the previous delta as it was. A file at a
-    /// [`DeltaOptions::superblock_file`] path is the caller's and is not
-    /// unlinked. Once the new superblock is in place,
-    /// part files left by a longer previous delta are removed (every numbered
-    /// part file where the new delta carries its parts inline), along with temp
-    /// files a generation that was killed mid-write left behind once they are an
-    /// hour old (see `TEMP_STALE_SECS`). That pass covers the repository's own
-    /// `deltas/` tree; a directory named through [`DeltaOptions::output_dir`]
-    /// or [`DeltaOptions::superblock_file`] belongs to the caller and nothing
-    /// else in it is removed.
-    ///
-    /// Generating the same delta twice at once, into one directory, is not
-    /// supported: both runs write the same file names, so they overwrite each
-    /// other's parts and superblock. Generating different deltas concurrently is,
-    /// since each has its own directory.
-    ///
-    /// For the default location the returned directory is relative to the
-    /// repository root, which the caller supplies, since a handle carries
-    /// descriptors rather than a path: `root.join(returned)` is the directory
-    /// [`apply_static_delta_offline`](Repo::apply_static_delta_offline) and
-    /// [`sign_static_delta`](Repo::sign_static_delta) take. With
-    /// [`DeltaOptions::output_dir`] or [`DeltaOptions::superblock_file`] set
-    /// the returned path is that option verbatim, resolved against the
-    /// process's working directory when relative, and is passed on unchanged.
-    ///
-    /// Set [`DeltaOptions::signers`] to sign the superblock.
+    /// If `from` is `None`, the delta is a delta from scratch. Both commits and
+    /// each object that the delta packs must be present. Set
+    /// [`DeltaOptions::signers`] to sign the superblock.
     /// [`sign_static_delta`](Repo::sign_static_delta) adds a signature to a
-    /// delta already written. Pass the result to
-    /// [`reindex_static_deltas`](Repo::reindex_static_deltas) to publish it in
-    /// the index cache.
+    /// delta that exists. Call [`reindex_static_deltas`](Repo::reindex_static_deltas)
+    /// to publish the new delta in the index cache.
+    ///
+    /// # Location
+    ///
+    /// - By default, the files go under `deltas/`, in the base64-fanout
+    ///   directory of [`static_delta_relative_dir`]. The `ostree` command uses
+    ///   the same directory.
+    /// - If [`DeltaOptions::output_dir`] is set, the files go in that
+    ///   directory.
+    /// - If [`DeltaOptions::superblock_file`] is set, the superblock goes at
+    ///   that path, and the parts go in the directory that holds it.
+    /// - If [`DeltaOptions::inline`] is set, the parts go into the superblock,
+    ///   and no part file is written.
+    ///
+    /// For the default location, the returned path is relative to the
+    /// repository root. The caller supplies the root, because a handle holds
+    /// descriptors and no path. `root.join(returned)` is the directory that
+    /// [`apply_static_delta_offline`](Repo::apply_static_delta_offline) and
+    /// [`sign_static_delta`](Repo::sign_static_delta) take. If
+    /// [`DeltaOptions::output_dir`] or [`DeltaOptions::superblock_file`] is
+    /// set, the returned path is that option as given. A relative path
+    /// resolves against the working directory of the process.
+    ///
+    /// # Write order
+    ///
+    /// The part files are written before the superblock, so an interrupted
+    /// generation leaves no superblock for a reader to trust. The superblock
+    /// is signed before it is written, so a failure of a signer writes no
+    /// superblock.
+    ///
+    /// Each file is written under a temp name. Only the rename that puts the
+    /// file in place keeps the temp file. If a generation fails or is
+    /// cancelled, the temp file is unlinked, so no partial file stays in the
+    /// directory.
+    ///
+    /// The new parts overwrite the parts of a delta at the same location. For
+    /// this reason, the generation unlinks the old superblock before it writes
+    /// the first part. The old superblock then cannot describe files that this
+    /// run replaced. A file at a [`DeltaOptions::superblock_file`] path
+    /// belongs to the caller, and the generation does not unlink it.
+    ///
+    /// An inline generation replaces no part file. The previous superblock
+    /// stays in place until the rename of the new superblock replaces it. If an
+    /// inline generation fails, the previous delta stays as it was.
+    ///
+    /// # Cleanup
+    ///
+    /// After the new superblock is in place, the generation removes these
+    /// files from the delta directory:
+    ///
+    /// - the part files of a longer previous delta, or each numbered part file
+    ///   if the new delta carries its parts inline
+    /// - the temp files of a generation that was killed mid-write, when they
+    ///   are one hour old or older
+    ///
+    /// This pass covers the `deltas/` tree of the repository only. A directory
+    /// named through [`DeltaOptions::output_dir`] or
+    /// [`DeltaOptions::superblock_file`] belongs to the caller. The generation
+    /// removes no other file in it.
+    ///
+    /// # Concurrency
+    ///
+    /// Two generations of the same delta at the same time, into one directory,
+    /// are not supported. Both runs write the same file names, so each run
+    /// overwrites the parts and the superblock of the other. Generations of
+    /// different deltas can run concurrently, because each delta has its own
+    /// directory.
+    ///
+    /// # Object routes
+    ///
+    /// The delta carries the objects that `to` reaches and `from` does not
+    /// reach. The superblock holds the commit object of `to`. Each other
+    /// object reaches the receiver by one of four routes, chosen for each
+    /// object:
+    ///
+    /// - Loose fallback: if the stream of the object is
+    ///   [`DeltaOptions::min_fallback_size`] or larger, the delta names the
+    ///   object, and the receiver fetches it whole.
+    /// - Rollsum delta: the source object is the object at the same path in
+    ///   `from`. If content-defined chunking finds chunks that the two objects
+    ///   share, the operation stream copies the unchanged runs from the source
+    ///   object. The part holds only the changed runs.
+    /// - bspatch stream: if chunking finds no shared chunk, the generation
+    ///   tries a bspatch stream against the same source object. Both objects
+    ///   must be at most 64 KiB and at most [`DeltaOptions::max_bsdiff_size`].
+    ///   The patch stays only if its count of nonzero bytes is less than half
+    ///   the content size.
+    /// - Splice: in all other cases, the part payload holds the object bytes as
+    ///   they are. Metadata objects and symlinks always take this route.
+    ///
+    /// An object smaller than 64 KiB is one chunk or a small number of chunks,
+    /// so one edit defeats chunking. In a patch against unrelated high-entropy
+    /// content, about 255 bytes in 256 are nonzero. A patch for a small edit
+    /// has a few dozen nonzero bytes. If the source object is not present, the
+    /// object is spliced.
+    ///
+    /// # Memory
+    ///
+    /// The generation holds a bounded amount of memory:
+    ///
+    /// - The data source of a part collects in a buffer on the heap. Past
+    ///   128 KiB, the buffer moves to an anonymous temp file in `tmp/`.
+    /// - Spliced content streams into this buffer in 128 KiB pieces, and the
+    ///   generation never holds it whole.
+    /// - The part payload streams straight into the xz encoder. Its GVariant
+    ///   framing goes around the two large byte arrays, which stream from the
+    ///   buffer.
+    /// - The xz encoder uses most of the memory: about 370 MiB for each part
+    ///   that it compresses.
+    ///
+    /// A diff needs random access to both objects, so a diff does not stream.
+    /// The source object and the target object load on the heap, as in the
+    /// read path. If they are large, they load in a read-only mapping of a
+    /// temp file. Chunking scans both objects from end to end, so each page of
+    /// both is resident while the generation plans the pair. The peak resident
+    /// set size follows the sum of the two object sizes, in mapped pages of
+    /// temp files.
+    ///
+    /// [`DeltaOptions::min_fallback_size`] bounds the target object of a diff.
+    /// The source object has no bound of its own.
+    /// [`DeltaOptions::max_bsdiff_size`] bounds the patch attempt alone.
+    ///
+    /// # Blocking pool
+    ///
+    /// The CPU-bound stages run on the blocking pool, off the executor
+    /// threads:
+    ///
+    /// - the chunking and the hashing of both objects of a diff candidate
+    /// - the suffix sort of bsdiff
+    /// - the compression of each part
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if [`DeltaOptions::max_chunk_size`] is `0`.
+    /// - [`Error::InvalidFormat`] if [`DeltaOptions::output_dir`] and
+    ///   [`DeltaOptions::superblock_file`] are both set.
+    /// - [`Error::ObjectNotFound`] if the commit `to` or the commit `from` is
+    ///   not present, or if an object that the delta carries is not present.
+    /// - [`Error::Io`] with `EISDIR` if the [`DeltaOptions::superblock_file`]
+    ///   path names a directory, or if its last component is empty, `.`, or
+    ///   `..`.
+    /// - [`Error::InvalidFormat`] if the last component of the
+    ///   [`DeltaOptions::superblock_file`] path is not UTF-8 or is a part file
+    ///   name.
+    /// - [`Error::InvalidFormat`] if the superblock is larger than 128 MiB
+    ///   ([`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE)), or if inline parts
+    ///   pass this limit.
+    /// - [`Error::InvalidFormat`] if the mode table and the xattr table of a
+    ///   part are larger than 128 MiB together.
+    /// - [`Error::InvalidFormat`] if the temp file of the data source of a part
+    ///   holds a byte count other than the count that the generation wrote.
+    /// - [`Error::InvalidFormat`] if [`DeltaOptions::timestamp`] is `None` and
+    ///   the system clock is before the Unix epoch.
+    /// - [`Error::Core`] if the commit or its detached metadata does not parse,
+    ///   or if `[core] fsync` in the config is not a boolean.
+    /// - [`Error::Signature`] if a signer fails. A signer can also return
+    ///   [`Error::InvalidFormat`] or [`Error::Core`].
+    /// - [`Error::Io`] if a metadata object is larger than 128 MiB, or if a
+    ///   read, a write, or an unlink on the file system fails.
     pub async fn generate_static_delta(
         &self,
         from: Option<&Checksum>,
@@ -298,10 +410,11 @@ impl Repo {
             .await
     }
 
-    /// [`generate_static_delta`](Repo::generate_static_delta), with the
-    /// superblock size that inline parts are budgeted against given as
-    /// `ceiling`. The public call gives [`MAX_SUPERBLOCK`]. A test gives a
-    /// smaller ceiling to reach the inline refusal without a 128 MiB part.
+    /// Runs [`generate_static_delta`](Repo::generate_static_delta) with
+    /// `ceiling` as the superblock size for the budget of inline parts.
+    ///
+    /// The public call gives [`MAX_SUPERBLOCK`]. A test gives a smaller
+    /// ceiling to reach the inline refusal without a 128 MiB part.
     async fn generate_static_delta_under(
         &self,
         from: Option<&Checksum>,
@@ -319,10 +432,10 @@ impl Repo {
                 "static delta output_dir and superblock_file cannot both be set".to_owned(),
             ));
         }
-        // The target commit is embedded in the superblock whole, so it is
-        // loaded (and its presence required) before anything is written. Its
-        // detached metadata rides in the superblock beside it, since that copy
-        // is what a verifying tool pull checks the delivered commit against.
+        // The superblock embeds the whole target commit, so the commit loads,
+        // and must be present, before any write. Its detached metadata goes
+        // into the superblock beside it, because a verifying pull of the
+        // `ostree` command checks the delivered commit against that copy.
         let commit_bytes = self.load_object_bytes(ObjectType::Commit, to).await?;
         let detached = self.read_commit_detached_metadata(to).await?;
         let commit = Target {
@@ -338,8 +451,8 @@ impl Repo {
             });
         }
 
-        // A superblock-file target creates nothing when it opens, so it opens
-        // before the selection walk, and a target it refuses costs no walk.
+        // A superblock-file target creates nothing when it opens. It opens
+        // before the selection walk, so a refused target costs no walk.
         let superblock_target = match &opts.superblock_file {
             Some(file) => {
                 let target = file.clone();
@@ -361,26 +474,27 @@ impl Repo {
         let tmp_fd = self.open_tmp_dir().await?;
         let fsync = self.config().fsync()?;
 
-        // Parts are overwritten in place, so a superblock describing the
-        // previous delta at this location goes before the first of them. A file
-        // at a superblock-file path is the caller's: only the final rename
-        // replaces it, so a generation that fails leaves it as it was. An inline
-        // generation overwrites no part file, so the previous superblock stays
-        // until the rename replaces it, and a generation that fails leaves the
-        // previous delta whole.
+        // The new parts overwrite the old parts in place, so the superblock of
+        // the previous delta at this location goes before the first part. A
+        // file at a superblock-file path belongs to the caller. Only the final
+        // rename replaces it, so a failed generation leaves it as it was. An
+        // inline generation overwrites no part file. The previous superblock
+        // stays until the rename replaces it, and a failed generation leaves
+        // the previous delta whole.
         if opts.superblock_file.is_none() && !opts.inline {
             remove_superblock(&dir_fd).await?;
         }
 
-        // Inline parts are held until the superblock is serialized, so they
-        // share the superblock ceiling: each part is compressed into a buffer
-        // capped at what the rest of the superblock and the parts before it
-        // left. The rest is counted at its least -- the embedded commit, 33
-        // bytes for each object in the meta-entries, and 49 for each fallback
-        // -- so a delta whose parts cannot fit is refused at the part that
-        // passes the ceiling. The framing, the detached metadata copy, and any
-        // signature are not counted, and the size check on the serialized
-        // superblock refuses what they push past the ceiling.
+        // The generation holds inline parts until it serializes the
+        // superblock, so the parts share the superblock ceiling. Each part
+        // compresses into a buffer capped at the space that the rest of the
+        // superblock and the earlier parts leave. The count of the rest is its
+        // minimum: the embedded commit, 33 bytes for each object in the
+        // meta-entries, and 49 bytes for each fallback. A delta whose parts
+        // cannot fit is then refused at the part that passes the ceiling. The
+        // count leaves out the framing, the copy of the detached metadata, and
+        // the signatures. The size check on the serialized superblock refuses
+        // a superblock that they push past the ceiling.
         let mut target = if opts.inline {
             let fixed = commit_bytes
                 .len()
@@ -397,13 +511,14 @@ impl Repo {
         let mut entries: Vec<PartEntry> = Vec::new();
         let mut part = Part::default();
         for item in &selection.packed {
-            // A part closes once its payload would pass the chunk ceiling. The
-            // object's own content size is the estimate: exact for a splice, an
-            // upper bound for a diffed object. The decision comes before the
-            // object is appended, so a part's payload never passes the ceiling,
-            // and an object that rollsums down to a small payload still closes the
-            // part it would have fit in -- one extra xz stream and one extra pair
-            // of mode and xattr tables, in exchange for the ceiling holding.
+            // A part closes if the next object can push its payload past the
+            // chunk ceiling. The content size of the object is the estimate. It
+            // is exact for a splice and an upper bound for a diffed object. The
+            // decision comes before the object goes into the part, so the
+            // payload of a part with more than one object never passes the
+            // ceiling. An object that rollsums down to a small payload still
+            // closes the part that it fits in. The cost is one more xz stream
+            // and one more pair of mode and xattr tables, and the ceiling holds.
             if !part.is_empty() && part.payload_len() + item.content_size > opts.max_chunk_size {
                 entries.push(write_part(&mut target, entries.len(), part, fsync).await?);
                 part = Part::default();
@@ -424,27 +539,43 @@ impl Repo {
             superblock = sign_superblock(superblock, Value::Array(Vec::new()), &signers).await?;
         }
         write_delta_file(&dir_fd, &superblock_name, &superblock, fsync).await?;
-        // The sweep recognizes what it removes by name, which holds only where
-        // every entry is this code's own: an output directory the caller named can
-        // hold files whose names a delta's own files also take.
+        // The sweep finds what it removes by name. This is safe only where
+        // this code wrote each entry. An output directory of the caller can
+        // hold files with the names of delta files.
         if opts.output_dir.is_none() && opts.superblock_file.is_none() {
             clean_delta_dir(&dir_fd, part_files).await?;
         }
         Ok(dir_path)
     }
 
-    /// Sign a written delta with `signer`, wrapping its superblock in the signed
-    /// envelope.
+    /// Signs the superblock of the delta in `dir` with `signer`.
     ///
-    /// The signed payload is the raw superblock bytes. Signing an already-signed
-    /// delta appends to the engine's signature array and leaves other engines'
-    /// arrays in place, so calling this once per engine accumulates signatures.
-    /// The superblock is replaced atomically; re-index afterwards, since the
-    /// index records the superblock's digest. The envelope adds to the
-    /// superblock's size, so the result is held to the same ceiling
-    /// [`generate_static_delta`](Repo::generate_static_delta) applies: signing a
-    /// superblock just under it fails rather than producing one the read path
-    /// refuses.
+    /// The signed payload is the raw superblock bytes, and the new superblock
+    /// is the signed envelope. If the delta is already signed, the signature
+    /// goes at the end of the signature array of the engine. The arrays of the
+    /// other engines stay, so one call for each engine collects the signatures.
+    ///
+    /// The call replaces the superblock atomically. Call
+    /// [`reindex_static_deltas`](Repo::reindex_static_deltas) after it,
+    /// because the index records the digest of the superblock. The envelope
+    /// adds to the superblock size, so the result is held to the 128 MiB
+    /// limit of [`generate_static_delta`](Repo::generate_static_delta). If
+    /// the signed superblock passes the limit, the call fails. It never
+    /// writes a superblock that the read path refuses.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if the `superblock` file in `dir` cannot be read, or if
+    ///   it is larger than 128 MiB.
+    /// - [`Error::Core`] if the superblock starts with the magic of the signed
+    ///   envelope and does not parse as one.
+    /// - [`Error::Signature`] if the signer fails. A signer can also return
+    ///   [`Error::InvalidFormat`] or [`Error::Core`].
+    /// - [`Error::InvalidFormat`] if the signed superblock is larger than
+    ///   128 MiB.
+    /// - [`Error::Core`] if `[core] fsync` in the config is not a boolean.
+    /// - [`Error::Io`] if `dir` cannot be opened, or if the write of the
+    ///   superblock fails.
     pub async fn sign_static_delta(&self, dir: &Path, signer: &dyn Signer) -> Result<()> {
         let bytes = read_capped(dir.join(SUPERBLOCK_FILE)).await?;
         let (payload, signatures) = split_envelope(bytes)?;
@@ -455,17 +586,29 @@ impl Repo {
         write_delta_file(&dir_fd, SUPERBLOCK_FILE, &encoded, fsync).await
     }
 
-    /// Rebuild the `delta-indexes/` cache from the deltas present under
-    /// `deltas/`.
+    /// Rebuilds the `delta-indexes/` cache from the deltas under `deltas/`.
     ///
-    /// One index file per target commit lists every delta that produces it,
-    /// keyed by the delta's name and holding its superblock's SHA-256 -- the
-    /// same map the summary carries. The pass removes the index file of a target
-    /// that has no delta left, so a stale entry cannot advertise a delta that is
-    /// gone; the fanout directory that removal empties stays, as it does for the
-    /// tool. A delta whose superblock is missing is skipped, so a half-written
-    /// delta does not fail the pass. The entries are in delta-name order, and
-    /// the tool writes them in hash-table order.
+    /// Each target commit gets one index file. The file lists each delta that
+    /// produces the target, keyed by the delta name, with the SHA-256 of its
+    /// superblock. The summary carries the same map. The entries are in
+    /// delta-name order, and the `ostree` command writes them in hash-table
+    /// order.
+    ///
+    /// The pass removes the index file of a target that has no delta left, so
+    /// a stale entry cannot advertise a delta that is gone. The fanout
+    /// directory that this removal empties stays, as it does for the `ostree`
+    /// command. The pass skips a delta with no superblock, so a half-written
+    /// delta does not fail the pass.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Core`] if a delta directory that holds a superblock has a
+    ///   name that does not decode to a checksum.
+    /// - [`Error::Core`] if `[core] fsync` in the config is not a boolean.
+    /// - [`Error::Io`] if a superblock is larger than 128 MiB.
+    /// - [`Error::Io`] if an entry of `delta-indexes/` is not a directory.
+    /// - [`Error::Io`] if a scan, a read, a write, or an unlink on the file
+    ///   system fails.
     pub async fn reindex_static_deltas(&self) -> Result<()> {
         let mut by_target: BTreeMap<Checksum, BTreeMap<String, Checksum>> = BTreeMap::new();
         for entry in self.static_delta_digests().await? {
@@ -485,19 +628,33 @@ impl Repo {
         self.prune_delta_indexes(written).await
     }
 
-    /// Rewrite the index file of the target commit `to` alone,
-    /// `delta-indexes/<fanout>/<rest>.index`, from the deltas under `deltas/`
-    /// whose target is `to`.
+    /// Rewrites the index file of the target commit `to` alone.
     ///
-    /// The deltas are found by the scan rule of
-    /// [`reindex_static_deltas`](Repo::reindex_static_deltas), and only the
-    /// superblocks of `to` are read. With no delta for `to` the index file is
-    /// removed. An absent file, fanout directory, or `delta-indexes/` is no
-    /// error, and no directory is created for it. A fanout or `delta-indexes`
-    /// that is no directory, a regular file for example, is an error. The fanout
-    /// directory that the removal empties stays. The index files of other targets stay as they
-    /// are, stale ones included. `to` is not checked for a commit object, so a
+    /// The file is `delta-indexes/<fanout>/<rest>.index`. It lists the deltas
+    /// under `deltas/` whose target is `to`. The scan rule of
+    /// [`reindex_static_deltas`](Repo::reindex_static_deltas) finds the
+    /// deltas, and the call reads only the superblocks of `to`.
+    ///
+    /// If no delta for `to` exists, the call removes the index file. An absent
+    /// file, fanout directory, or `delta-indexes/` is no error, and the call
+    /// creates no directory for it. The fanout directory that the removal
+    /// empties stays.
+    ///
+    /// The index files of other targets stay as they are, stale files
+    /// included. The call does not check that `to` names a commit object, so a
     /// target that the repository does not hold is valid.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if the fanout or `delta-indexes` is not a directory, a
+    ///   regular file for example.
+    /// - [`Error::Io`] if a directory is at the path of the index file.
+    /// - [`Error::Io`] if a superblock of `to` is larger than 128 MiB.
+    /// - [`Error::Core`] if a delta directory that holds a superblock has a
+    ///   name that does not decode to a checksum.
+    /// - [`Error::Core`] if `[core] fsync` in the config is not a boolean.
+    /// - [`Error::Io`] if a scan, a read, a write, or an unlink on the file
+    ///   system fails.
     pub async fn reindex_static_deltas_to(&self, to: &Checksum) -> Result<()> {
         let deltas: BTreeMap<String, Checksum> = self
             .static_delta_digests_of(Some(to))
@@ -517,8 +674,8 @@ impl Repo {
         self.write_delta_index(to, &deltas, fsync).await
     }
 
-    /// Write the index file of the target commit `to` from its delta map,
-    /// creating the fanout directory and its parents.
+    /// Writes the index file of the target commit `to` from its delta map, and
+    /// creates the fanout directory and its parents.
     async fn write_delta_index(
         &self,
         to: &Checksum,
@@ -533,22 +690,23 @@ impl Repo {
         write_delta_file(&dir_fd, &name, &index, fsync).await
     }
 
-    /// Every delta under `deltas/`, sorted by delta name, with the SHA-256 of
-    /// its superblock.
+    /// Returns each delta under `deltas/`, sorted by delta name, with the
+    /// SHA-256 of its superblock.
     ///
-    /// This is what the `delta-indexes/` cache and the summary's
-    /// `ostree.static-deltas` map both advertise, so both are built from it. The
-    /// scan lists only a directory that holds a superblock, so a half-written
-    /// delta stays unadvertised. A superblock that goes between the scan and
-    /// the read is skipped too, and does not fail the caller.
+    /// The `delta-indexes/` cache and the `ostree.static-deltas` map of the
+    /// summary both advertise this list, so both are built from it. The scan
+    /// lists only a directory that holds a superblock, so a half-written delta
+    /// stays unadvertised. If a superblock goes away between the scan and the
+    /// read, the call skips it and does not fail.
     pub(crate) async fn static_delta_digests(&self) -> Result<Vec<DeltaDigest>> {
         self.static_delta_digests_of(None).await
     }
 
-    /// The deltas of [`static_delta_digests`](Repo::static_delta_digests),
-    /// limited to the target commit `to` when it is given. The limit applies
-    /// before a superblock is read, so a pass over one target reads only the
-    /// superblocks of that target.
+    /// Returns the deltas of [`static_delta_digests`](Repo::static_delta_digests),
+    /// limited to the target commit `to` if it is given.
+    ///
+    /// The limit applies before a superblock is read, so a pass over one
+    /// target reads only the superblocks of that target.
     async fn static_delta_digests_of(&self, to: Option<&Checksum>) -> Result<Vec<DeltaDigest>> {
         let mut out = Vec::new();
         for (from, target) in self.list_static_delta_targets().await? {
@@ -568,16 +726,19 @@ impl Repo {
                 digest: Checksum::sha256(&bytes),
             });
         }
-        // The tool writes the index files and the summary map in hash-table
-        // order, which the port does not rebuild. Sorting by name gives both one
-        // order whatever order the filesystem returns the `deltas/` tree in.
+        // The `ostree` command writes the index files and the summary map in
+        // hash-table order, and ostrya does not reproduce that order. A sort by
+        // name gives both one order, whatever order the file system returns
+        // for the `deltas/` tree.
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
 
-    /// The summary's `ostree.static-deltas` value: an `a{sv}` mapping each
-    /// delta's name to its 32-byte superblock digest, or `None` when the
-    /// repository holds no delta.
+    /// Returns the `ostree.static-deltas` value of the summary, or `None` if
+    /// the repository holds no delta.
+    ///
+    /// The value is an `a{sv}` that maps the name of each delta to the 32-byte
+    /// digest of its superblock.
     pub(crate) async fn static_deltas_summary_value(&self) -> Result<Option<Value>> {
         let entries = self.static_delta_digests().await?;
         if entries.is_empty() {
@@ -592,39 +753,45 @@ impl Repo {
         Ok(Some(Value::variant(map_ty, map)))
     }
 
-    /// The target commits the `delta-indexes/` cache holds an index file for,
-    /// sorted.
+    /// Returns the target commits of the index files in `delta-indexes/`, sorted.
     ///
-    /// An index file is a regular file `delta-indexes/<fanout>/<rest>.index`
-    /// whose fanout is a two-character directory and whose `<fanout><rest>` is
-    /// the 43-character modified-base64 form of the target checksum. Every other
-    /// entry is skipped, a symlink included, and no delta directory is read, so
-    /// a target is listed whether or not a delta for it exists. A repository
-    /// with no `delta-indexes/` lists nothing.
+    /// An index file is a regular file `delta-indexes/<fanout>/<rest>.index`.
+    /// Its fanout is a directory with a two-character name, and
+    /// `<fanout><rest>` is the 43-character modified-base64 form of the target
+    /// checksum. The call skips each other entry, symlinks included.
+    ///
+    /// The call reads no delta directory, so it lists a target also if no
+    /// delta for it exists. A repository with no `delta-indexes/` lists
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if `delta-indexes/` or a fanout directory cannot be
+    ///   opened or read.
     pub async fn list_static_delta_indexes(&self) -> Result<Vec<Checksum>> {
         let repo = self.clone();
         ostrya_rt::unblock(move || list_delta_indexes_blocking(repo.repo_fd())).await
     }
 
-    /// Remove the index files under `delta-indexes/` that this pass did not
+    /// Removes the index files under `delta-indexes/` that this pass did not
     /// write.
     ///
-    /// `written` holds the `<fanout>/<rest>.index` names the pass produced. A
-    /// name that does not end in [`INDEX_SUFFIX`] is left in place, so a temp
-    /// file from a concurrent write survives.
+    /// `written` holds the `<fanout>/<rest>.index` names that the pass wrote.
+    /// The call leaves each name that does not end in [`INDEX_SUFFIX`], so a
+    /// temp file of a concurrent write stays.
     async fn prune_delta_indexes(&self, written: BTreeSet<String>) -> Result<()> {
         let repo = self.clone();
         ostrya_rt::unblock(move || prune_delta_indexes_blocking(repo.repo_fd(), &written)).await
     }
 
-    /// Split the objects the delta must deliver into the ones packed into parts
-    /// and the ones handed over as loose fallbacks, and pair each packed content
-    /// object with the object at the same path in the source commit.
+    /// Splits the objects that the delta delivers into packed objects and
+    /// loose fallbacks.
     ///
-    /// Objects already reachable from `from` are not delivered at all, and the
-    /// target commit object itself rides in the superblock. Metadata objects are
-    /// emitted before content objects, and both are ordered by checksum, so the
-    /// same inputs produce the same delta.
+    /// Each packed content object pairs with the object at the same path in
+    /// the source commit. Objects that `from` reaches are not delivered, and
+    /// the superblock carries the target commit object. Metadata objects come
+    /// before content objects, and each group is in checksum order, so the
+    /// same inputs give the same delta.
     async fn select_objects(
         &self,
         from: Option<&Checksum>,
@@ -642,8 +809,8 @@ impl Repo {
         let mut content: Vec<Checksum> = Vec::new();
         for name in needed {
             match name.ty {
-                // The target commit is embedded in the superblock, and no other
-                // commit object is reachable at depth 0.
+                // The superblock embeds the target commit, and no other commit
+                // object is reachable at depth 0.
                 ObjectType::Commit => {}
                 ty if ty.is_meta() => metadata.push((ty, name.checksum)),
                 _ => content.push(name.checksum),
@@ -659,8 +826,8 @@ impl Repo {
 
         let mut selection = Selection::default();
         for (ty, checksum) in metadata {
-            // Metadata objects are stored uncompressed in every repository
-            // mode, so the on-disk size is the size the part will carry.
+            // Each repository mode stores metadata objects uncompressed, so
+            // the size on disk is the size that the part carries.
             selection.packed.push(PackItem {
                 objtype: ty,
                 checksum,
@@ -680,8 +847,8 @@ impl Repo {
                 });
                 continue;
             }
-            // A source object that is no longer present cannot be diffed
-            // against, so the object is delivered whole instead.
+            // A diff needs the source object. If the source object is no
+            // longer present, the object is delivered whole.
             let source = match sources.get(&checksum) {
                 Some(source) if self.has_object(ObjectType::File, source).await? => Some(*source),
                 _ => None,
@@ -697,11 +864,12 @@ impl Repo {
         Ok(selection)
     }
 
-    /// Map each content object of `to` to the object at the same path in `from`.
+    /// Maps each content object of `to` to the object at the same path in
+    /// `from`.
     ///
-    /// Pairing is by path, so a file that moved is not paired with its old self;
-    /// an object appearing at several paths takes the first pairing in path
-    /// order.
+    /// Pairing is by path, so a file that moved does not pair with its old
+    /// version. An object at more than one path takes the first pairing in
+    /// path order.
     async fn pair_by_path(
         &self,
         from: &Checksum,
@@ -719,8 +887,8 @@ impl Repo {
         Ok(sources)
     }
 
-    /// Collect every file path a commit's tree holds, with the content object at
-    /// that path.
+    /// Returns each file path in the tree of a commit, with the content object
+    /// at that path.
     async fn file_paths(&self, commit: &Checksum) -> Result<BTreeMap<String, Checksum>> {
         let (commit, _) = self.load_commit(commit).await?;
         let mut paths = BTreeMap::new();
@@ -737,8 +905,8 @@ impl Repo {
         Ok(paths)
     }
 
-    /// Append one object to the part under construction: its bytes into the
-    /// data source and its operations onto the stream.
+    /// Adds one object to the part under construction: its bytes go into the
+    /// data source, and its operations go onto the stream.
     async fn add_object(
         &self,
         part: &mut Part,
@@ -746,8 +914,8 @@ impl Repo {
         opts: &DeltaOptions,
         tmp: BorrowedFd<'_>,
     ) -> Result<()> {
-        // Only a content object carries a loaded file object; a metadata object
-        // is spliced from its serialized bytes.
+        // Only a content object carries a loaded file object. A metadata
+        // object is spliced from its serialized bytes.
         let Some(file) = &item.file else {
             let bytes = self.load_object_bytes(item.objtype, &item.checksum).await?;
             let offset = part.blob.append(&bytes, tmp).await?;
@@ -769,9 +937,9 @@ impl Repo {
             return Ok(());
         }
 
-        // A diff candidate needs random access to both objects, so both load as
-        // heap-or-mmap blobs; without a source the content streams straight into
-        // the data source and is never held whole.
+        // A diff candidate needs random access to both objects, so both load
+        // as heap-or-mmap blobs. Without a source, the content streams straight
+        // into the data source, and the generation never holds it whole.
         let Some(source) = item.source else {
             let reader = file.reader().await?;
             let (offset, len) = part.blob.append_reader(reader, tmp).await?;
@@ -787,17 +955,17 @@ impl Repo {
         let source_blob = self
             .load_content_blob(&self.load_file(&source).await?, tmp)
             .await?;
-        // Chunking and hashing both objects end to end is CPU-bound, so it runs
-        // on the blocking pool like the patch attempt below does; the blobs are
-        // owned values, so they move in with the work and come back with the
-        // plan.
+        // The chunking and the hashing of both objects from end to end are
+        // CPU-bound, so they run on the blocking pool, as the patch attempt
+        // does. The blobs are owned values. They move in with the work and
+        // come back with the plan.
         let (plan, source_blob, target_blob) = ostrya_rt::unblock(move || {
             let plan = rollsum::plan(source_blob.as_slice(), target_blob.as_slice());
             (plan, source_blob, target_blob)
         })
         .await;
-        // The object is reconstructed from these bytes, so its declared output
-        // size comes from them rather than from the size the header recorded.
+        // The receiver rebuilds the object from these bytes, so its declared
+        // output size comes from them. The size in the header is not used.
         let output_size = target_blob.as_slice().len() as u64;
 
         if plan.copied > 0 {
@@ -832,14 +1000,15 @@ impl Repo {
             return Ok(());
         }
 
-        // Nothing shared to copy: try a patch where the object is small enough
-        // that chunking's failure says nothing about how related the two are, and
-        // keep the patch only when it beats carrying the content itself. The
-        // blobs move into the patch attempt, which hands the target back for the
-        // splice fallback.
+        // Chunking found nothing shared to copy. If the object is small enough
+        // that the failure of chunking says nothing about the relation of the
+        // two objects, the code tries a patch. It keeps the patch only if the
+        // patch beats a splice of the content. The blobs move into the patch
+        // attempt, which gives the target back for the splice.
         let mut target_blob = target_blob;
-        // The suffix sort is over the source, so both objects are held to the
-        // limit: the tighter of the chunker-derived bound and the caller's knob.
+        // The suffix sort is over the source, so the limit applies to both
+        // objects. The limit is the smaller of the chunker bound and the
+        // option of the caller.
         let limit = BSDIFF_CONTENT_LIMIT.min(opts.max_bsdiff_size);
         let source_size = source_blob.as_slice().len() as u64;
         if opts.bsdiff && output_size <= limit && source_size <= limit {
@@ -867,26 +1036,29 @@ impl Repo {
         Ok(())
     }
 
-    /// Load a content object's payload for random access, on the heap when small
-    /// and in a read-only mapping of a temp file when large.
+    /// Loads the payload of a content object for random access.
+    ///
+    /// A small payload loads on the heap. A large payload loads in a read-only
+    /// mapping of a temp file.
     async fn load_content_blob(&self, file: &FileObject, tmp: BorrowedFd<'_>) -> Result<Blob> {
         let reader = file.reader().await?;
         let owned = tmp.try_clone_to_owned()?;
         spill_to_blob(reader, &owned, None).await
     }
 
-    /// Assemble the superblock GVariant.
+    /// Builds the superblock GVariant.
     ///
-    /// The target commit's detached metadata is copied into the metadata dict
-    /// under the delta's own directory with `/commitmeta` appended. A tool pull
-    /// checks a delta-delivered commit against that copy, so a signed commit
-    /// reaches a verifying destination only where the copy is here. A commit
-    /// holding no detached metadata gets no entry.
+    /// The metadata dict holds a copy of the detached metadata of the target
+    /// commit, under the delta directory with `/commitmeta` added. A pull of
+    /// the `ostree` command verifies a commit from a delta against that copy.
+    /// A signed commit then reaches a verifying destination only if the copy
+    /// is here. A commit with no detached metadata gets no entry.
     ///
-    /// The dict entries are in the tool's order: `ostree.endianness`, then each
-    /// inline part in part order under `<dir>/<i>`, then `<dir>/commitmeta`.
-    /// The inline bytes move out of `entries` into the dict, and are dropped
-    /// with it once the superblock is serialized.
+    /// The dict entries are in the order of the `ostree` command:
+    /// `ostree.endianness`, then each inline part in part order under
+    /// `<dir>/<i>`, then `<dir>/commitmeta`. The inline bytes move out of
+    /// `entries` into the dict. They are dropped with the dict after the
+    /// superblock is serialized.
     fn build_superblock(
         &self,
         from: Option<&Checksum>,
@@ -900,9 +1072,9 @@ impl Repo {
             DeltaEndianness::Little => (ENDIANNESS_LITTLE, false),
             DeltaEndianness::Big => (ENDIANNESS_BIG, true),
         };
-        // Sizes are host order, which the `ostree.endianness` byte declares.
-        // The serializer writes little-endian on every host, so a big-endian
-        // field is swapped here.
+        // The sizes are in host order, which the `ostree.endianness` byte
+        // declares. The serializer writes little-endian on each host, so the
+        // code swaps a big-endian field here.
         let host = |value: u64| {
             if big_endian {
                 value.swap_bytes()
@@ -975,7 +1147,7 @@ impl Repo {
 
         let superblock = Value::Tuple(vec![
             metadata,
-            // The timestamp is big-endian regardless of the endianness byte.
+            // The timestamp is big-endian, whatever the endianness byte is.
             Value::U64(resolve_timestamp(opts.timestamp)?.swap_bytes()),
             Value::Bytes(from.map_or_else(Vec::new, |from| from.as_bytes().to_vec())),
             Value::Bytes(to.as_bytes().to_vec()),
@@ -991,17 +1163,19 @@ impl Repo {
         Ok(bytes)
     }
 
-    /// The `(from, to)` pair of every delta under `deltas/`.
+    /// Returns the `(from, to)` pair of each delta under `deltas/`.
     async fn list_static_delta_targets(&self) -> Result<Vec<(Option<Checksum>, Checksum)>> {
         let repo = self.clone();
         ostrya_rt::unblock(move || crate::delta::list_delta_targets(repo.repo_fd())).await
     }
 
-    /// Read a file under the repository root, or `None` when it is absent.
-    /// Bounded by the metadata ceiling, so it serves superblocks and index
-    /// files but not object payloads. A file past the ceiling is an error, as it
-    /// is for [`read_capped`], since a prefix of a superblock would index a
-    /// digest that covers part of it.
+    /// Reads a file under the repository root, or returns `None` if it is
+    /// absent.
+    ///
+    /// The metadata ceiling bounds the read, so it serves superblocks and index
+    /// files, and no object payloads. A file past the ceiling is an error, as
+    /// for [`read_capped`]. A prefix of a superblock gives an index digest that
+    /// covers only part of the superblock.
     async fn read_repo_file(&self, relative: &str) -> Result<Option<Vec<u8>>> {
         use std::io::Read;
 
@@ -1031,15 +1205,16 @@ impl Repo {
         .await
     }
 
-    /// Open a directory under the repository root, creating it and its parents.
+    /// Opens a directory under the repository root, and creates it and its
+    /// parents if they are absent.
     async fn open_repo_subdir(&self, relative: &str) -> Result<OwnedFd> {
         let repo = self.clone();
         let relative = relative.to_owned();
         ostrya_rt::unblock(move || open_subdir_blocking(repo.repo_fd(), &relative)).await
     }
 
-    /// Open the repository's `tmp/` directory, where spill files are created.
-    /// [`crate::staging::open_tmp_dir`] creates it where it is absent.
+    /// Opens the `tmp/` directory of the repository, which holds the spill
+    /// files. [`crate::staging::open_tmp_dir`] creates it if it is absent.
     pub(crate) async fn open_tmp_dir(&self) -> Result<OwnedFd> {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
@@ -1048,8 +1223,8 @@ impl Repo {
         .await
     }
 
-    /// Create and open the directory the delta's files are written to, and
-    /// return its path as well.
+    /// Creates and opens the directory for the files of the delta, and returns
+    /// its path with the descriptor.
     async fn open_delta_dir(
         &self,
         from: Option<&Checksum>,
@@ -1072,72 +1247,72 @@ impl Repo {
     }
 }
 
-/// The target commit as the superblock carries it: the commit object's
-/// serialized bytes, and its detached metadata where it has any.
+/// The target commit as the superblock carries it: the serialized commit
+/// object, and its detached metadata if it has any.
 struct Target<'a> {
     bytes: &'a [u8],
     detached: Option<&'a Value>,
 }
 
-/// The objects a delta delivers, split by how they travel.
+/// The objects that a delta delivers, split by their route.
 #[derive(Default)]
 struct Selection {
     packed: Vec<PackItem>,
     fallbacks: Vec<FallbackItem>,
 }
 
-/// One object a part carries.
+/// One object that a part carries.
 struct PackItem {
     objtype: ObjectType,
     checksum: Checksum,
-    /// The object's payload size: the serialized bytes of a metadata object, the
-    /// content size of a file, the target length of a symlink.
+    /// The payload size of the object: the serialized size of a metadata
+    /// object, the content size of a file, or the target length of a symlink.
     content_size: u64,
-    /// The object at the same path in the source commit, when there is one to
-    /// diff against.
+    /// The object at the same path in the source commit, if one exists for a
+    /// diff.
     source: Option<Checksum>,
-    /// The content object, loaded once during selection and reused when the
-    /// object is packed. `None` for a metadata object, which is packed from its
-    /// serialized bytes.
+    /// The content object, loaded once at selection and used again when the
+    /// object is packed. `None` for a metadata object, which is packed from
+    /// its serialized bytes.
     file: Option<FileObject>,
 }
 
-/// One object the delta names but does not carry.
+/// One object that the delta names and does not carry.
 struct FallbackItem {
     checksum: Checksum,
     compressed_size: u64,
     content_size: u64,
 }
 
-/// A written part: what its meta-entry records.
+/// A written part, as its meta-entry records it.
 struct PartEntry {
     checksum: Checksum,
-    /// The part file's on-disk size.
+    /// The size of the part file on disk.
     size: u64,
-    /// The uncompressed payload the part delivers, summed over its objects.
+    /// The sum of the uncompressed payloads of the objects of the part.
     uncompressed_size: u64,
     objects: Vec<(ObjectType, Checksum)>,
-    /// The bytes a part file would hold, where the superblock carries the part
-    /// inline: the compression byte, and the body after it. The superblock
-    /// build takes them.
+    /// The bytes of a part file, if the superblock carries the part inline:
+    /// the compression byte, and the body after it. The superblock build takes
+    /// them.
     inline: Option<(u8, Vec<u8>)>,
 }
 
-/// Where [`write_part`] puts a part's bytes.
+/// The destination of the bytes of a part in [`write_part`].
 enum PartTarget<'a> {
     /// The numbered part file in this delta directory.
     File(&'a OwnedFd),
-    /// A buffer the superblock carries inline. `budget` is what the superblock
-    /// ceiling leaves for the parts not yet written.
+    /// A buffer that the superblock carries inline. `budget` is the space that
+    /// the superblock ceiling leaves for the parts not yet written.
     Inline { budget: usize },
 }
 
 /// A part under construction: the mode and xattr tables, the data source, the
-/// operation stream, and the objects the stream produces in order.
+/// operation stream, and the objects that the stream produces, in order.
 ///
-/// Each table is a vector in wire order beside a map from entry to index, so an
-/// object's lookup costs one hash rather than a scan of the entries already
-/// there.
+/// Each table is a vector in wire order, with a map from entry to index beside
+/// it. The lookup of an object then costs one hash, with no scan of the
+/// entries.
 #[derive(Default)]
 struct Part {
     modes: Vec<(u32, u32, u32)>,
@@ -1155,12 +1330,13 @@ impl Part {
         self.objects.is_empty()
     }
 
-    /// The payload accumulated so far, which the chunk ceiling applies to.
+    /// Returns the size of the payload so far, to which the chunk ceiling
+    /// applies.
     fn payload_len(&self) -> u64 {
         self.blob.len() + self.ops.len() as u64
     }
 
-    /// Append one operation: its opcode followed by LEB128 operands.
+    /// Appends one operation: its opcode, then its LEB128 operands.
     fn push_op(&mut self, opcode: u8, operands: &[u64]) {
         self.ops.push(opcode);
         for &operand in operands {
@@ -1168,13 +1344,14 @@ impl Part {
         }
     }
 
-    /// Record that the operations just emitted complete one object.
+    /// Records that the operations just emitted complete one object.
     fn finish_object(&mut self, objtype: ObjectType, checksum: Checksum, payload: u64) {
         self.objects.push((objtype, checksum));
         self.uncompressed_size += payload;
     }
 
-    /// The index of `(uid, gid, mode)` in the mode table, appending it if new.
+    /// Returns the index of `(uid, gid, mode)` in the mode table, and appends
+    /// the entry if it is new.
     fn mode_index(&mut self, uid: u32, gid: u32, mode: u32) -> u64 {
         let triple = (uid, gid, mode);
         if let Some(&index) = self.mode_slots.get(&triple) {
@@ -1186,7 +1363,8 @@ impl Part {
         index
     }
 
-    /// The index of an xattr set in the xattr table, appending it if new.
+    /// Returns the index of an xattr set in the xattr table, and appends the
+    /// set if it is new.
     fn xattr_index(&mut self, xattrs: &Xattrs) -> u64 {
         if let Some(&index) = self.xattr_slots.get(xattrs) {
             return index;
@@ -1198,9 +1376,11 @@ impl Part {
     }
 }
 
-/// An append-only buffer for a part's data source: on the heap until it passes
-/// [`MMAP_THRESHOLD`], then in an anonymous temp file. Only the streaming window
-/// is resident either way, so a part's payload costs disk rather than heap.
+/// An append-only buffer for the data source of a part: on the heap up to
+/// [`MMAP_THRESHOLD`], then in an anonymous temp file.
+///
+/// After the move, the payload of a part costs disk space, and only the
+/// streaming window is resident.
 enum Spill {
     Ram(Vec<u8>),
     File { file: RtFile, len: u64 },
@@ -1220,7 +1400,7 @@ impl Spill {
         }
     }
 
-    /// Append `bytes`, returning the offset they were written at.
+    /// Appends `bytes` and returns the offset at which they were written.
     async fn append(&mut self, bytes: &[u8], tmp: BorrowedFd<'_>) -> Result<u64> {
         let offset = self.len();
         if let Spill::Ram(buf) = self
@@ -1238,9 +1418,11 @@ impl Spill {
         Ok(offset)
     }
 
-    /// Append everything `reader` yields, returning the offset and the length
-    /// written. The reader is drained in [`IO_CHUNK`] pieces, so an object of any
-    /// size passes through a bounded buffer.
+    /// Appends all bytes that `reader` yields, and returns the offset and the
+    /// length written.
+    ///
+    /// The reader drains in [`IO_CHUNK`] pieces, so an object of any size goes
+    /// through a bounded buffer.
     async fn append_reader<R: futures_io::AsyncRead + Unpin>(
         &mut self,
         mut reader: R,
@@ -1262,7 +1444,7 @@ impl Spill {
         Ok((offset, total))
     }
 
-    /// Move an in-memory buffer into a temp file.
+    /// Moves an in-memory buffer into a temp file.
     async fn spill(&mut self, tmp: BorrowedFd<'_>) -> Result<()> {
         let Spill::Ram(buf) = self else {
             return Ok(());
@@ -1276,23 +1458,23 @@ impl Spill {
         Ok(())
     }
 
-    /// Hand the buffer over as a blocking handle, positioned at its start, so a
-    /// part's payload can be streamed from a blocking-pool thread.
+    /// Returns the buffer as a blocking handle at its start, so a blocking-pool
+    /// thread can stream the payload of a part.
     async fn into_blocking(self) -> Result<BlockingSpill> {
         match self {
             Spill::Ram(buf) => Ok(BlockingSpill::Ram(buf)),
             Spill::File { mut file, len } => {
-                // The async file performs its writes on a background task, so a
-                // write that fails is reported by the next `flush` rather than by
-                // `write_all`, and `into_std` settles pending writes without
-                // reporting. Flushing here is what turns an `ENOSPC` or `EIO` on
-                // the spill file into a failed generation: otherwise the part
-                // would be compressed from a truncated data source while its
-                // framing offsets still counted the bytes the spill accepted.
+                // The async file writes on a background task. The next `flush`
+                // reports a failed write, and `write_all` does not. `into_std`
+                // completes pending writes and reports no error. This flush
+                // turns an `ENOSPC` or `EIO` on the spill file into a failed
+                // generation. Without it, the part compresses from a truncated
+                // data source, and its framing offsets still count the bytes
+                // that the spill accepted.
                 file.flush().await.map_err(Error::Io)?;
-                // The recovered file shares the open file description, so the
-                // read starts from an explicit rewind rather than wherever
-                // appending left the offset.
+                // The recovered file shares the open file description. The read
+                // starts from an explicit rewind, because the appends moved the
+                // offset.
                 let mut file = file.into_std().await;
                 std::io::Seek::seek(&mut file, SeekFrom::Start(0)).map_err(Error::Io)?;
                 Ok(BlockingSpill::File { file, len })
@@ -1301,22 +1483,21 @@ impl Spill {
     }
 }
 
-/// A part's data source ready to stream from a blocking-pool thread: the same
-/// heap-or-temp-file split [`Spill`] accumulated it under.
+/// The data source of a part, ready to stream from a blocking-pool thread, in
+/// the same heap or temp-file form that [`Spill`] used.
 enum BlockingSpill {
     Ram(Vec<u8>),
     File { file: std::fs::File, len: u64 },
 }
 
 impl BlockingSpill {
-    /// Stream the buffer's contents into `out` in [`IO_CHUNK`] pieces, so a
-    /// payload of any size passes through a bounded buffer.
+    /// Streams the contents of the buffer into `out` in [`IO_CHUNK`] pieces, so
+    /// a payload of any size goes through a bounded buffer.
     ///
-    /// The temp-file form counts what it streams and refuses a count other than
-    /// the length the spill recorded, which is the length the part's framing
-    /// offsets were derived from. A data source that lost bytes then fails
-    /// generation instead of producing a part that decodes short when it is
-    /// applied.
+    /// The temp-file form counts the bytes that it streams. It refuses a count
+    /// other than the length that the spill recorded, which is the source of
+    /// the framing offsets of the part. If the data source lost bytes, the
+    /// generation fails, and no part decodes short when it is applied.
     async fn write_into<W: futures_io::AsyncWrite + Unpin>(self, out: &mut W) -> Result<()> {
         match self {
             BlockingSpill::Ram(buf) => out.write_all(&buf).await.map_err(Error::Io),
@@ -1325,7 +1506,7 @@ impl BlockingSpill {
                 let mut streamed = 0u64;
                 loop {
                     let n = match std::io::Read::read(&mut file, &mut chunk) {
-                        // Retried rather than reported, as `read_to_end` does.
+                        // An interrupted read is retried, as `read_to_end` does.
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         result => result.map_err(Error::Io)?,
                     };
@@ -1347,17 +1528,22 @@ impl BlockingSpill {
     }
 }
 
-/// Write one part and return its meta-entry: to its numbered part file, or
-/// into a buffer the superblock carries inline.
+/// Writes one part, to its numbered part file or to an inline buffer, and
+/// returns its meta-entry.
 ///
-/// The payload GVariant `(a(uuu)aa(ayay)ayay)` is emitted straight into the xz
-/// encoder: the two tables first (bounded metadata, built in memory), then the
-/// data source streamed out of its spill buffer, then the operation stream, then
-/// the tuple's framing offsets, whose width follows from the payload length that
-/// is known before the first byte is written. The SHA-256 covers the whole
-/// on-disk file, compression byte included, which is what the meta-entry
-/// records. Framing and the two tables are assembled here; the compression and
-/// the file write happen in [`compress_part`], on the blocking pool.
+/// The payload GVariant `(a(uuu)aa(ayay)ayay)` goes straight into the xz
+/// encoder, in this order:
+///
+/// 1. The two tables, which are bounded metadata built in memory.
+/// 2. The data source, streamed from its spill buffer.
+/// 3. The operation stream.
+/// 4. The framing offsets of the tuple. Their width follows from the payload
+///    length, which is known before the first byte is written.
+///
+/// The SHA-256 covers the whole file on disk, with the compression byte. The
+/// meta-entry records this digest. This function builds the framing and the
+/// two tables. [`compress_part`] does the compression and the file write, on
+/// the blocking pool.
 async fn write_part(
     target: &mut PartTarget<'_>,
     index: usize,
@@ -1370,8 +1556,8 @@ async fn write_part(
     let blob_len = part.blob.len();
     let ops_len = part.ops.len() as u64;
 
-    // Field alignments: `a(uuu)` needs 4 and sits at offset 0; the xattr table,
-    // the data source, and the operation stream all align to 1, so no padding
+    // Field alignments: `a(uuu)` needs 4 and is at offset 0. The xattr table,
+    // the data source, and the operation stream align to 1, so no padding
     // falls between the members.
     let body = modes.len() as u64 + xattrs.len() as u64 + blob_len + ops_len;
     let body =
@@ -1422,8 +1608,8 @@ async fn write_part(
         ostrya_rt::unblock(move || create_file_blocking(owned.as_fd(), &temp)).await?
     };
 
-    // The spill buffer hands over a blocking handle, so the payload, its
-    // compression, and the file write all happen on one blocking-pool thread.
+    // The spill buffer gives a blocking handle, so the payload, its
+    // compression, and the file write all run on one blocking-pool thread.
     let blob = part.blob.into_blocking().await?;
     let ops = part.ops;
     let (checksum, size) = ostrya_rt::unblock(move || {
@@ -1443,10 +1629,12 @@ async fn write_part(
     })
 }
 
-/// A buffer that takes at most `limit` bytes. A write past the limit fills the
-/// buffer to the limit and then fails, so a caller finds the cause by the
-/// length. The first byte, the compression byte of a part, is held apart from
-/// the body after it, which is the form the superblock carries.
+/// A buffer that takes at most `limit` bytes.
+///
+/// A write past the limit fills the buffer to the limit and then fails, so a
+/// caller finds the cause from the length. The buffer holds the first byte, the
+/// compression byte of a part, apart from the body after it. The superblock
+/// carries the part in this form.
 struct CappedBuf {
     compression: Option<u8>,
     body: Vec<u8>,
@@ -1462,13 +1650,14 @@ impl CappedBuf {
         }
     }
 
-    /// The bytes taken, the compression byte included.
+    /// Returns the count of bytes taken, with the compression byte.
     fn len(&self) -> usize {
         usize::from(self.compression.is_some()) + self.body.len()
     }
 
-    /// The compression byte and the body. A part always starts with its
-    /// compression byte, so a buffer that took no byte reads as uncompressed.
+    /// Returns the compression byte and the body. A part always starts with
+    /// its compression byte, so a buffer that took no byte reads as
+    /// uncompressed.
     fn into_parts(self) -> (u8, Vec<u8>) {
         (self.compression.unwrap_or(0), self.body)
     }
@@ -1499,27 +1688,27 @@ impl std::io::Write for CappedBuf {
     }
 }
 
-/// The refusal of inline parts that do not fit in a superblock the read path
-/// accepts.
+/// Returns the refusal of inline parts that do not fit in a superblock that the
+/// read path accepts.
 fn inline_ceiling_error() -> Error {
     Error::InvalidFormat(format!(
         "static delta inline parts pass the {MAX_SUPERBLOCK}-byte superblock ceiling"
     ))
 }
 
-/// Compress a part's payload into `out`, a part file or an inline buffer,
-/// returning the SHA-256 of what was written and its size.
+/// Compresses the payload of a part into `out`, a part file or an inline
+/// buffer, and returns the SHA-256 and the size of the output.
 ///
-/// This is the expensive half of writing a part: xz at [`PART_XZ_LEVEL`] costs
-/// seconds of CPU per tens of megabytes and holds about 370 MiB of encoder state,
-/// and `XzEncoder` compresses inside `poll_write` without ever yielding. Running
-/// it here keeps it off the executor threads, as [`bsdiff_stream`] does for the
-/// other CPU-bound stage.
+/// This is the expensive half of a part write. xz at [`PART_XZ_LEVEL`] costs
+/// seconds of CPU for each tens of megabytes and holds about 370 MiB of encoder
+/// state. `XzEncoder` compresses inside `poll_write` and never yields. The
+/// callers run this function on the blocking pool, off the executor threads, as
+/// [`bsdiff_stream`] does for the other CPU-bound stage.
 ///
-/// The encoder is the same streaming one either way, so the payload is still
-/// never buffered whole. [`SyncWriter`] and [`BlockingSpill`] complete every I/O
-/// call in place, so the future never returns `Pending` and `block_on` drives it
-/// to completion on this thread with no executor behind it.
+/// The encoder streams in both cases, so the payload is never buffered whole.
+/// [`SyncWriter`] and [`BlockingSpill`] complete each I/O call in place. The
+/// future never returns `Pending`, so `block_on` drives it to completion on
+/// this thread with no executor.
 fn compress_part<W: std::io::Write + Unpin>(
     out: W,
     modes: &[u8],
@@ -1547,11 +1736,11 @@ fn compress_part<W: std::io::Write + Unpin>(
     Ok(hashing.finalize())
 }
 
-/// A `futures-io` writer over a blocking writer: a file, or a buffer.
+/// A `futures-io` writer over a blocking writer: a file or a buffer.
 ///
-/// Every method performs its syscall and returns `Ready`, so a future built over
-/// it never parks. That is what lets [`compress_part`] drive the async xz encoder
-/// to completion on a blocking-pool thread.
+/// Each method does its syscall and returns `Ready`, so a future over it never
+/// parks. [`compress_part`] can then drive the async xz encoder to completion
+/// on a blocking-pool thread.
 struct SyncWriter<W>(W);
 
 impl<W: std::io::Write + Unpin> futures_io::AsyncWrite for SyncWriter<W> {
@@ -1560,9 +1749,9 @@ impl<W: std::io::Write + Unpin> futures_io::AsyncWrite for SyncWriter<W> {
         _: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        // An interrupted write is retried here, since the `write_all` driving
-        // this is the futures-io one, which surfaces `Interrupted` as an error
-        // rather than retrying it the way `std::io::Write::write_all` does.
+        // An interrupted write is retried here. The `write_all` that drives
+        // this writer is the futures-io one, which returns `Interrupted` as an
+        // error. `std::io::Write::write_all` retries it.
         let file = &mut self.get_mut().0;
         loop {
             match std::io::Write::write(file, buf) {
@@ -1581,8 +1770,8 @@ impl<W: std::io::Write + Unpin> futures_io::AsyncWrite for SyncWriter<W> {
     }
 }
 
-/// The mode table `a(uuu)`: fixed-size 12-byte triples, big-endian on the wire
-/// regardless of the superblock's endianness byte.
+/// Returns the mode table `a(uuu)`: fixed-size 12-byte triples, big-endian on
+/// the wire whatever the endianness byte of the superblock is.
 fn mode_table(modes: &[(u32, u32, u32)]) -> Vec<u8> {
     let mut out = Vec::with_capacity(modes.len() * 12);
     for &(uid, gid, mode) in modes {
@@ -1593,8 +1782,8 @@ fn mode_table(modes: &[(u32, u32, u32)]) -> Vec<u8> {
     out
 }
 
-/// The xattr table `aa(ayay)`: one entry per distinct xattr set, in the order
-/// the objects referenced them.
+/// Returns the xattr table `aa(ayay)`: one entry for each distinct xattr set,
+/// in the order in which the objects use them.
 fn xattr_table(xattrs: &[Xattrs]) -> Result<Vec<u8>> {
     let entries = xattrs
         .iter()
@@ -1615,7 +1804,8 @@ fn xattr_table(xattrs: &[Xattrs]) -> Result<Vec<u8>> {
     Ok(to_bytes(&ty, &Value::Array(entries)).map_err(ostrya_core::Error::from)?)
 }
 
-/// The stride-33 objtype-plus-checksum array a meta-entry carries.
+/// Returns the array of 33-byte entries, an object type and a checksum, that a
+/// meta-entry carries.
 fn object_array(objects: &[(ObjectType, Checksum)]) -> Vec<u8> {
     let mut out = Vec::with_capacity(objects.len() * 33);
     for (objtype, checksum) in objects {
@@ -1625,11 +1815,12 @@ fn object_array(objects: &[(ObjectType, Checksum)]) -> Vec<u8> {
     out
 }
 
-/// Generate the bspatch stream that turns `source` into `target`, handing the
-/// target blob back so a caller that rejects the patch can still splice from it.
+/// Generates the bspatch stream that turns `source` into `target`, and gives
+/// the target blob back.
 ///
-/// The patch is produced off the async threads: bsdiff sorts the suffixes of the
-/// source, which is CPU-bound and costs several times the source size in memory.
+/// A caller that rejects the patch can then splice from the blob. The patch
+/// runs on the blocking pool, because bsdiff sorts the suffixes of the source.
+/// The sort is CPU-bound and costs several times the source size in memory.
 async fn bsdiff_stream(source: Blob, target: Blob) -> Result<(Vec<u8>, Blob)> {
     ostrya_rt::unblock(move || {
         let mut stream = Vec::new();
@@ -1639,58 +1830,66 @@ async fn bsdiff_stream(source: Blob, target: Blob) -> Result<(Vec<u8>, Blob)> {
     .await
 }
 
-/// How much novel data a bspatch stream carries.
+/// Returns the count of novel bytes in a bspatch stream.
 ///
-/// A patch's bulk is its diff stream, which holds the byte-wise difference
-/// between target and source and so is zero wherever the two agree. The
-/// enclosing part is xz'd as a whole, which reduces those zero runs to almost
-/// nothing, so the size that matters is the count of nonzero bytes rather than
-/// the stream length: a patch against a near-identical source counts a few dozen
-/// bytes whatever the object's size.
+/// Most of a patch is its diff stream, which holds the byte-wise difference
+/// between target and source. It is zero where the two agree. xz compresses
+/// the part as a whole, which reduces those zero runs to almost nothing.
+///
+/// The size that matters is the count of nonzero bytes. A patch against a
+/// near-identical source counts a few dozen bytes, whatever the object size.
 fn novel_bytes(stream: &[u8]) -> u64 {
     stream.iter().filter(|&&byte| byte != 0).count() as u64
 }
 
-/// Whether a bspatch stream is worth keeping over splicing the content itself.
+/// Returns `true` if a bspatch stream is worth more than a splice of the
+/// content.
 ///
-/// The bound is half the content's size. It has to be a fraction rather than the
-/// content size itself, because the two cases sit too close together at 1.0: a
-/// patch against unrelated content has diff and extra blocks running about the
-/// target's length, and its bytes are nonzero except where target and source
-/// coincide -- about 1 byte in 256 of high-entropy content -- so
-/// [`novel_bytes`] lands near 0.996 of the output size and clears any bound at
-/// 1.0, while the delta it produces comes out larger than the splice for several
-/// times the CPU. A genuine small edit counts a few dozen bytes, so it stays far
-/// inside a one-half bound at any object size.
+/// The bound is half the content size. A bound of the full content size does
+/// not separate the two cases. A patch against unrelated content has diff and
+/// extra blocks about as long as the target. Its bytes are nonzero except where
+/// target and source agree, about 1 byte in 256 of high-entropy content.
+///
+/// For such a patch, [`novel_bytes`] is near 0.996 of the output size, which
+/// passes a bound of 1.0. The delta from such a patch is larger than the splice
+/// and costs several times the CPU. A real small edit counts a few dozen bytes,
+/// so it stays far inside a bound of one half at any object size.
 fn patch_beats_splicing(stream: &[u8], output_size: u64) -> bool {
     novel_bytes(stream) * 2 < output_size
 }
 
-/// The bytes the tool adds to a content size when it compares an object against
-/// [`DeltaOptions::min_fallback_size`]: the size compared is the file header
-/// variant plus this constant plus the content.
+/// The bytes that the `ostree` command adds to a content size when it compares
+/// an object against [`DeltaOptions::min_fallback_size`].
 ///
-/// The on-disk content-stream framing is eight bytes -- a big-endian `u32`
-/// length and four NUL bytes -- and the count the tool compares is one below it.
-/// Measured at a 1,000,000-byte threshold over three header shapes: a plain
-/// no-xattr `uid=gid=0` file packs at a content size of 999,974 and falls back at
-/// 999,975 with an 18-byte header; one carrying an 8-byte xattr switches at
-/// 999,954 with a 39-byte header; and one carrying a 300-byte xattr, whose header
-/// crosses the GVariant offset-width boundary at 334 bytes, switches at 999,659.
-/// The overhead is 25, 46, and 341 bytes, seven above each header in every case,
-/// so the header's own offset table counts and the constant is flat.
+/// The size compared is the file header variant, plus this constant, plus the
+/// content. The content-stream framing on disk is eight bytes: a big-endian
+/// `u32` length and four NUL bytes. The count that the `ostree` command
+/// compares is one less.
+///
+/// The observed switch points at a 1,000,000-byte threshold, for three header
+/// shapes:
+///
+/// - A plain file with no xattr and `uid=gid=0` has an 18-byte header. It packs
+///   at a content size of 999,974 and falls back at 999,975.
+/// - A file with an 8-byte xattr has a 39-byte header. It switches at 999,954.
+/// - A file with a 300-byte xattr has a 334-byte header, past the GVariant
+///   offset-width boundary. It switches at 999,659.
+///
+/// The overhead is 25, 46, and 341 bytes, seven more than the header in each
+/// case. The offset table of the header counts, and the constant is flat.
 const FALLBACK_FRAMING: u64 = 7;
 
-/// The stream size of a content object as the fallback threshold compares it:
-/// the file header variant, [`FALLBACK_FRAMING`], and the payload. A large object
-/// travels as a loose object instead of inflating a part.
+/// Returns the stream size of a content object, as the fallback threshold
+/// compares it: the file header variant, [`FALLBACK_FRAMING`], and the payload.
+///
+/// A large object travels as a loose object, and the part stays small.
 fn stream_size(file: &FileObject) -> Result<u64> {
     let header = file.header();
     Ok(FALLBACK_FRAMING + header.serialize()?.len() as u64 + content_size(file))
 }
 
-/// The payload size of a content object: a regular file's content length, or a
-/// symlink's target length.
+/// Returns the payload size of a content object: the content length of a
+/// regular file, or the target length of a symlink.
 fn content_size(file: &FileObject) -> u64 {
     match &file.kind {
         FileKind::Regular { size } => *size,
@@ -1698,8 +1897,8 @@ fn content_size(file: &FileObject) -> u64 {
     }
 }
 
-/// Split a superblock file into the payload signatures cover and the signature
-/// dict it already carries (an empty dict when the delta is unsigned).
+/// Splits a superblock file into the payload that signatures cover and the
+/// signature dict that it carries (an empty dict if the delta is unsigned).
 fn split_envelope(bytes: Vec<u8>) -> Result<(Vec<u8>, Value)> {
     if !bytes.starts_with(SIGNED_MAGIC) {
         return Ok((bytes, Value::Array(Vec::new())));
@@ -1711,8 +1910,10 @@ fn split_envelope(bytes: Vec<u8>) -> Result<(Vec<u8>, Value)> {
     Ok((payload, fields[2].clone()))
 }
 
-/// Sign `payload` with each signer in order, appending to `signatures`, and
-/// return the signed envelope, held to the superblock ceiling.
+/// Signs `payload` with each signer in order, adds the signatures to
+/// `signatures`, and returns the signed envelope.
+///
+/// The envelope is held to the superblock ceiling.
 async fn sign_superblock(
     payload: Vec<u8>,
     mut signatures: Value,
@@ -1733,20 +1934,22 @@ async fn sign_superblock(
     Ok(encoded)
 }
 
-/// One delta present under `deltas/`: its name, its target commit, and the
-/// SHA-256 of its superblock, which is what both advertisements carry.
+/// One delta under `deltas/`: its name, its target commit, and the SHA-256 of
+/// its superblock, which both advertisements carry.
 pub(crate) struct DeltaDigest {
-    /// The delta's tool name: `<to>` for a from-scratch delta, `<from>-<to>`
-    /// otherwise, in hex.
+    /// The name of the delta in hex, as the `ostree` command names it: `<to>`
+    /// for a delta from scratch, and `<from>-<to>` for other deltas.
     pub(crate) name: String,
     /// The target commit, which the index files are keyed by.
     pub(crate) to: Checksum,
-    /// The SHA-256 of the delta's `superblock` file.
+    /// The SHA-256 of the `superblock` file of the delta.
     pub(crate) digest: Checksum,
 }
 
-/// The `a{sv}` map both advertisements carry: each delta's name to the 32-byte
-/// digest of its superblock, in the order the entries arrive.
+/// Returns the `a{sv}` map that both advertisements carry: the name of each
+/// delta to the 32-byte digest of its superblock.
+///
+/// The entries keep the order of the input.
 fn delta_map_value<'a>(deltas: impl Iterator<Item = (&'a str, &'a Checksum)>) -> Result<Value> {
     let ay = Type::parse("ay").map_err(ostrya_core::Error::from)?;
     let mut map = Value::Array(Vec::new());
@@ -1760,8 +1963,8 @@ fn delta_map_value<'a>(deltas: impl Iterator<Item = (&'a str, &'a Checksum)>) ->
     Ok(map)
 }
 
-/// Build an index file's `a{sv}`: the delta map under the shared
-/// `ostree.static-deltas` key, each delta naming its superblock's digest.
+/// Builds the `a{sv}` of an index file: the delta map under the shared
+/// `ostree.static-deltas` key, with the superblock digest of each delta.
 fn index_value(deltas: &BTreeMap<String, Checksum>) -> Result<Vec<u8>> {
     let map = delta_map_value(deltas.iter().map(|(name, digest)| (name.as_str(), digest)))?;
     let mut dict = Value::Array(Vec::new());
@@ -1774,8 +1977,11 @@ fn index_value(deltas: &BTreeMap<String, Checksum>) -> Result<Vec<u8>> {
     Ok(to_bytes(&map_ty, &dict).map_err(ostrya_core::Error::from)?)
 }
 
-/// A delta's name as an advertisement keys it and as a message names it: the
-/// target commit's hex for a from-scratch delta, `<from>-<to>` otherwise.
+/// Returns the name of a delta, as an advertisement keys it and a message
+/// names it.
+///
+/// The name is the hex of the target commit for a delta from scratch, and
+/// `<from>-<to>` for other deltas.
 pub(crate) fn delta_name(from: Option<&Checksum>, to: &Checksum) -> String {
     match from {
         Some(from) => format!("{}-{}", from.to_hex(), to.to_hex()),
@@ -1783,37 +1989,39 @@ pub(crate) fn delta_name(from: Option<&Checksum>, to: &Checksum) -> String {
     }
 }
 
-/// The delta index of one target commit, split into the fanout directory under
-/// [`DELTA_INDEXES_DIR`] that holds it and its file name.
+/// Returns the fanout directory under [`DELTA_INDEXES_DIR`] and the file name
+/// of the delta index of one target commit.
 fn delta_index_parts(to: &Checksum) -> (String, String) {
     let b64 = to.to_base64_modified();
     let (fanout, rest) = b64.split_at(2);
     (fanout.to_owned(), format!("{rest}{INDEX_SUFFIX}"))
 }
 
-/// The delta index of one target commit, relative to the repository root:
-/// `delta-indexes/<fanout>/<rest>.index`.
+/// Returns the path of the delta index of one target commit, relative to the
+/// repository root: `delta-indexes/<fanout>/<rest>.index`.
 pub(crate) fn delta_index_relative_path(to: &Checksum) -> String {
     let (fanout, name) = delta_index_parts(to);
     format!("{DELTA_INDEXES_DIR}/{fanout}/{name}")
 }
 
-/// A delta's directory relative to the repository root,
-/// `deltas/<fanout>/<rest>`: the modified-base64 form of the target commit for
-/// a delta from scratch, and of the source commit followed by `-` and the target
-/// for a delta from a source commit, the first two characters forming the
-/// fanout.
+/// Returns the directory of a delta, relative to the repository root.
+///
+/// The path is `deltas/<fanout>/<rest>`. For a delta from scratch,
+/// `<fanout><rest>` is the modified-base64 form of `to`. For a delta from
+/// `from`, it is the modified-base64 form of `from`, then `-`, then the form
+/// of `to`. The fanout is the first two characters. Modified base64 replaces
+/// `/` with `_` and keeps `+`.
 pub fn static_delta_relative_dir(from: Option<&Checksum>, to: &Checksum) -> String {
     delta_relative_dir(from, to)
 }
 
-/// The delta's directory relative to the repository root: base64-checksum
-/// fanout, with the source checksum leading a from-to delta's name.
+/// Returns the directory of a delta, relative to the repository root, by the
+/// rule of [`static_delta_relative_dir`].
 ///
-/// The names reach the wire as written when a pull requests this path. Modified
-/// base64 replaces `/` with `_` and keeps `+`, which is a path character, so no
-/// escaping enters here -- the tool was observed to request these paths with `+`
-/// unencoded.
+/// A pull requests this path with the names as written. Modified base64
+/// replaces `/` with `_` and keeps `+`, which is a path character, so no escape
+/// is added here. The `ostree` command was observed to request these paths with
+/// `+` unencoded.
 pub(crate) fn delta_relative_dir(from: Option<&Checksum>, to: &Checksum) -> String {
     let to_b64 = to.to_base64_modified();
     match from {
@@ -1829,7 +2037,7 @@ pub(crate) fn delta_relative_dir(from: Option<&Checksum>, to: &Checksum) -> Stri
     }
 }
 
-/// Resolve the superblock timestamp: an explicit value, else the current time.
+/// Returns the superblock timestamp: the explicit value, else the current time.
 fn resolve_timestamp(explicit: Option<u64>) -> Result<u64> {
     match explicit {
         Some(timestamp) => Ok(timestamp),
@@ -1837,7 +2045,7 @@ fn resolve_timestamp(explicit: Option<u64>) -> Result<u64> {
     }
 }
 
-/// Write a whole file into a delta directory atomically.
+/// Writes a whole file into a delta directory atomically.
 async fn write_delta_file(dir_fd: &OwnedFd, name: &str, bytes: &[u8], fsync: bool) -> Result<()> {
     let temp = TempFile::create(dir_fd, name);
     let fd = {
@@ -1854,10 +2062,12 @@ async fn write_delta_file(dir_fd: &OwnedFd, name: &str, bytes: &[u8], fsync: boo
     Ok(())
 }
 
-/// A delta file's temp name, unlinked on drop until the rename that puts the
-/// file in place disarms it. Every path between creating the temp file and
-/// renaming it goes through one, so a write that fails or is cancelled leaves
-/// the directory holding the finished files alone.
+/// A guard on the temp name of a delta file.
+///
+/// A drop unlinks the file until the rename that puts the file in place
+/// disarms the guard. Each code path from the creation of the temp file to its
+/// rename holds a guard. A failed or cancelled write then leaves only the
+/// finished files in the directory.
 struct TempFile<'a> {
     dir: &'a OwnedFd,
     name: String,
@@ -1877,16 +2087,16 @@ impl<'a> TempFile<'a> {
         &self.name
     }
 
-    /// Give up ownership: the file is in place under its final name.
+    /// Disarms the guard, because the file is in place under its final name.
     fn keep(mut self) {
         self.armed = false;
     }
 }
 
 impl Drop for TempFile<'_> {
-    /// The unlink runs on whatever thread drops the guard, which can be an
-    /// executor thread. It is one `unlinkat` against an open directory
-    /// descriptor, the syscall the write path already performs inline.
+    /// The unlink runs on the thread that drops the guard, which can be an
+    /// executor thread. It is one `unlinkat` on an open directory descriptor, a
+    /// syscall that the write path also does inline.
     fn drop(&mut self) {
         if self.armed {
             let _ = rustix::fs::unlinkat(
@@ -1898,7 +2108,7 @@ impl Drop for TempFile<'_> {
     }
 }
 
-/// Sync a freshly written temp file into place under its final name.
+/// Renames a new temp file to its final name, with a sync if `fsync` is set.
 async fn finish_file(dir_fd: &OwnedFd, temp: &str, name: &str, fsync: bool) -> Result<()> {
     let owned = dir_fd.try_clone()?;
     let temp_owned = temp.to_owned();
@@ -1931,13 +2141,13 @@ async fn finish_file(dir_fd: &OwnedFd, temp: &str, name: &str, fsync: bool) -> R
     .await
 }
 
-/// Unlink the superblock a previous delta left at this location, before the
-/// first part of the new delta overwrites its files.
+/// Unlinks the superblock that a previous delta left at this location.
 ///
-/// A reader trusts a superblock's part checksums, so leaving the old one in place
-/// while parts are replaced would turn an interrupted regeneration into a delta
-/// that fails its own checksum test. With the superblock gone first, the
-/// directory reads as a delta that was never finished.
+/// The unlink comes before the first part of the new delta overwrites the old
+/// files. A reader trusts the part checksums of a superblock. If the old
+/// superblock stayed while the parts change, an interrupted regeneration gives
+/// a delta that fails its own checksum test. With the superblock gone first,
+/// the directory reads as a delta that was never finished.
 async fn remove_superblock(dir_fd: &OwnedFd) -> Result<()> {
     let owned = dir_fd.try_clone()?;
     ostrya_rt::unblock(move || {
@@ -1949,17 +2159,23 @@ async fn remove_superblock(dir_fd: &OwnedFd) -> Result<()> {
     .await
 }
 
-/// Remove what the finished delta does not consist of: numbered part files at or
-/// past `count`, left by a previous delta at the same location that had more
-/// parts, and temp files left by a generation that was killed mid-write, once they
-/// have aged past [`TEMP_STALE_SECS`]. A delta directory then holds exactly its
-/// superblock and its numbered parts, which is what `format-reference.md` records,
-/// apart from a temp file too young for the sweep to judge abandoned.
+/// Removes the files that are not part of the finished delta.
 ///
-/// The pass matches by name, so it runs only over a repository-managed delta
-/// directory, whose every entry this code wrote. A caller-supplied output
-/// directory can hold anything, and a file there named `0` or `.x.tmp-1-2` is not
-/// this delta's to remove.
+/// The sweep removes these files:
+///
+/// - numbered part files at or past `count`, from a previous delta at the same
+///   location with more parts
+/// - temp files of a generation that was killed mid-write, at the age
+///   [`TEMP_STALE_SECS`] or older
+///
+/// The delta directory then holds only its superblock and its numbered parts,
+/// which is the layout of a delta directory. A temp file that is too young for
+/// the sweep to call abandoned can also stay.
+///
+/// The pass matches by name, so it runs only over a delta directory of the
+/// repository, where this code wrote each entry. An output directory of the
+/// caller can hold any file. A file there named `0` or `.x.tmp-1-2` does not
+/// belong to this delta.
 async fn clean_delta_dir(dir_fd: &OwnedFd, count: usize) -> Result<()> {
     let owned = dir_fd.try_clone()?;
     let now = unix_seconds()?;
@@ -1982,20 +2198,23 @@ async fn clean_delta_dir(dir_fd: &OwnedFd, count: usize) -> Result<()> {
     .await
 }
 
-/// The age a temp file has to reach before the sweep removes it.
+/// The age at which the sweep removes a temp file.
 ///
-/// A generation renames each of its own temp files into place as it goes, so
-/// every temp name the sweep meets belongs to another run: either an abandoned
-/// leftover, or the file a generation running right now is still writing. The
-/// process id in a temp name does not separate the two, since two concurrent
-/// generations in one process share it, and unlinking a file that is still being
-/// written fails that run's rename with `ENOENT`. Age separates them. An hour is
-/// far past the time a temp file lives before its rename -- a 200 MB part
-/// compresses in about ninety seconds -- so nothing in flight is touched.
+/// A generation renames each of its own temp files into place before its
+/// sweep. Each temp name that the sweep finds belongs to another run. It is an
+/// abandoned leftover, or a file that a running generation still writes.
+///
+/// The process id in a temp name does not separate the two, because two
+/// concurrent generations in one process share it. If the sweep unlinks a file
+/// in progress, the rename of that run fails with `ENOENT`.
+///
+/// The age separates the two cases. A temp file lives much less than one hour
+/// before its rename: a 200 MB part compresses in about ninety seconds. The
+/// sweep then touches no file in progress.
 const TEMP_STALE_SECS: u64 = 60 * 60;
 
-/// Whether a temp file is old enough to be a leftover rather than a write in
-/// progress. A file whose metadata cannot be read is left in place.
+/// Returns `true` if a temp file is old enough to be a leftover, and not a
+/// write in progress. A file whose metadata cannot be read stays in place.
 fn temp_is_stale(dir: BorrowedFd<'_>, name: &str, now: u64) -> bool {
     let Ok(stat) = rustix::fs::statat(dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) else {
         return false;
@@ -2006,7 +2225,7 @@ fn temp_is_stale(dir: BorrowedFd<'_>, name: &str, now: u64) -> bool {
     now.saturating_sub(mtime) >= TEMP_STALE_SECS
 }
 
-/// The current time in seconds since the Unix epoch.
+/// Returns the current time in seconds since the Unix epoch.
 fn unix_seconds() -> Result<u64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2014,8 +2233,10 @@ fn unix_seconds() -> Result<u64> {
     Ok(now.as_secs())
 }
 
-/// Refuse a superblock past the ceiling the read path enforces, so the delta
-/// fails at write time rather than when it is applied or signed.
+/// Refuses a superblock past the ceiling of the read path.
+///
+/// The delta then fails at write time, and not later when it is applied or
+/// signed.
 fn check_superblock_size(len: usize) -> Result<()> {
     if len as u64 > MAX_SUPERBLOCK {
         return Err(Error::InvalidFormat(format!(
@@ -2025,9 +2246,10 @@ fn check_superblock_size(len: usize) -> Result<()> {
     Ok(())
 }
 
-/// Refuse a part whose mode and xattr tables together pass the ceiling the read
-/// path collects them under, so a part the port's own reader would reject fails
-/// at write time instead.
+/// Refuses a part whose mode and xattr tables together pass the ceiling of the
+/// read path.
+///
+/// A part that the reader of ostrya refuses then fails at write time.
 fn check_table_size(len: usize) -> Result<()> {
     if len > MAX_TABLE_BYTES {
         return Err(Error::InvalidFormat(format!(
@@ -2038,9 +2260,10 @@ fn check_table_size(len: usize) -> Result<()> {
     Ok(())
 }
 
-/// Walk `delta-indexes/<fanout>/` and unlink every index file whose
-/// `<fanout>/<name>` is absent from `written`. A repository with no
-/// `delta-indexes/` yields nothing to do.
+/// Walks `delta-indexes/<fanout>/` and unlinks each index file whose
+/// `<fanout>/<name>` is not in `written`.
+///
+/// A repository with no `delta-indexes/` needs no work.
 fn prune_delta_indexes_blocking(repo_fd: BorrowedFd<'_>, written: &BTreeSet<String>) -> Result<()> {
     use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
 
@@ -2064,11 +2287,13 @@ fn prune_delta_indexes_blocking(repo_fd: BorrowedFd<'_>, written: &BTreeSet<Stri
     Ok(())
 }
 
-/// Unlink the index file at `relative` under the repository root. An absent
-/// file, fanout directory, or `delta-indexes/` is no error, and a dangling
-/// symlink on the path is absent too. Any other failure is an error, as it is
-/// for the tool: a directory at the path, and a path component that is no
-/// directory, a regular file at the fanout or at `delta-indexes` included.
+/// Unlinks the index file at `relative` under the repository root.
+///
+/// An absent file, fanout directory, or `delta-indexes/` is no error. A
+/// dangling symlink on the path also counts as absent. Each other failure is an
+/// error, as it is for the `ostree` command. This includes a directory at the
+/// path. It also includes a path component that is not a directory, such as a
+/// regular file at the fanout or at `delta-indexes`.
 fn remove_delta_index_blocking(repo_fd: BorrowedFd<'_>, relative: &str) -> Result<()> {
     use rustix::fs::{AtFlags, unlinkat};
 
@@ -2078,8 +2303,8 @@ fn remove_delta_index_blocking(repo_fd: BorrowedFd<'_>, relative: &str) -> Resul
     }
 }
 
-/// Walk `delta-indexes/<fanout>/` and collect the target of every index file,
-/// by the rule [`Repo::list_static_delta_indexes`] states.
+/// Walks `delta-indexes/<fanout>/` and collects the target of each index file,
+/// by the rule of [`Repo::list_static_delta_indexes`].
 fn list_delta_indexes_blocking(repo_fd: BorrowedFd<'_>) -> Result<Vec<Checksum>> {
     use rustix::fs::{Dir, FileType, Mode, OFlags, openat};
 
@@ -2125,9 +2350,10 @@ fn list_delta_indexes_blocking(repo_fd: BorrowedFd<'_>) -> Result<Vec<Checksum>>
     Ok(out)
 }
 
-/// The names of the entries of an open directory whose type is `ty`, not
-/// following a symlink. Where the directory reports no type for an entry, the
-/// entry is examined.
+/// Returns the names of the entries of type `ty` in an open directory, with no
+/// symlink followed.
+///
+/// If the directory reports no type for an entry, a `statat` reads the type.
 fn entries_of_type(dir: &mut rustix::fs::Dir, ty: rustix::fs::FileType) -> Result<Vec<Vec<u8>>> {
     use rustix::fs::{AtFlags, FileType, statat};
 
@@ -2157,7 +2383,8 @@ fn entries_of_type(dir: &mut rustix::fs::Dir, ty: rustix::fs::FileType) -> Resul
     Ok(out)
 }
 
-/// The temp name a delta file is written under before being renamed into place.
+/// Returns the temp name under which a delta file is written before its rename
+/// into place.
 fn temp_name(name: &str) -> String {
     format!(
         ".{name}.tmp-{}-{}",
@@ -2166,13 +2393,15 @@ fn temp_name(name: &str) -> String {
     )
 }
 
-/// Whether `name` is one of the temp names [`temp_name`] produces.
+/// Returns `true` if `name` is a temp name that [`temp_name`] makes.
 fn is_temp_name(name: &str) -> bool {
     name.starts_with('.') && name.contains(".tmp-")
 }
 
-/// Create a file for writing, replacing any leftover of the same name, and
-/// set its mode to [`DELTA_FILE_MODE`] whatever the umask is, as the tool does.
+/// Creates a file for writing and replaces a leftover with the same name.
+///
+/// The call sets the mode to [`DELTA_FILE_MODE`] whatever the umask is, as the
+/// `ostree` command does.
 fn create_file_blocking(dir: BorrowedFd<'_>, name: &str) -> Result<OwnedFd> {
     use rustix::fs::{Mode, OFlags, fchmod, openat};
 
@@ -2188,7 +2417,8 @@ fn create_file_blocking(dir: BorrowedFd<'_>, name: &str) -> Result<OwnedFd> {
     Ok(fd)
 }
 
-/// Open a directory relative to `base`, creating each component that is absent.
+/// Opens a directory relative to `base`, and creates each component that is
+/// absent.
 fn open_subdir_blocking(base: BorrowedFd<'_>, relative: &str) -> Result<OwnedFd> {
     use rustix::fs::{Mode, OFlags, mkdirat, openat};
 
@@ -2213,10 +2443,12 @@ fn open_subdir_blocking(base: BorrowedFd<'_>, relative: &str) -> Result<OwnedFd>
     Ok(current)
 }
 
-/// Create a directory at an absolute or relative path (with its parents) and
-/// open it. The mode is [`DELTA_DIR_MODE`], the same one the repository path
-/// passes to `mkdirat`, so an output directory does not take its permissions
-/// from the caller's umask alone.
+/// Creates a directory and its parents at an absolute or relative path, and
+/// opens it.
+///
+/// The mode is [`DELTA_DIR_MODE`], the mode that the repository path gives to
+/// `mkdirat`. An output directory then does not take its permissions from the
+/// umask of the caller alone.
 fn create_dir_path_blocking(path: &Path) -> Result<OwnedFd> {
     use std::os::unix::fs::DirBuilderExt;
 
@@ -2228,22 +2460,23 @@ fn create_dir_path_blocking(path: &Path) -> Result<OwnedFd> {
     open_dir_blocking(path)
 }
 
-/// Open the existing directory that holds a superblock file, and return the
-/// descriptor and the file's name in it.
+/// Opens the directory that holds a superblock file, and returns the
+/// descriptor and the file name in it.
 ///
-/// The directory is the path's parent, or the working directory for a path
-/// with no `/`, and it is not created. A path whose last component is empty,
-/// `.`, or `..` (the empty path, `/`, and `x/.` among them) and a path that
-/// names a directory are refused with `EISDIR`; a name that is a part file name is
-/// refused too, since the superblock would replace a part. A symlink at the
-/// path is not followed: the rename that puts the superblock in place replaces
-/// the link.
+/// The directory is the parent of the path, or the working directory for a
+/// path with no `/`. The call does not create it. A path whose last component
+/// is empty, `.`, or `..` is refused with `EISDIR`, for example the empty path,
+/// `/`, and `x/.`. A path that names a directory is also refused with `EISDIR`.
+///
+/// A part file name is refused, because the superblock replaces a part of that
+/// name. A symlink at the path is not followed: the rename that puts the
+/// superblock in place replaces the link.
 fn open_superblock_parent_blocking(path: &Path) -> Result<(OwnedFd, String)> {
     use std::os::unix::ffi::OsStrExt;
 
     let is_dir = || Error::Io(rustix::io::Errno::ISDIR.into());
-    // The last component comes from the bytes: `Path::file_name` skips a
-    // trailing `.`, which would make `x/.` name `x`.
+    // The last component comes from the bytes. `Path::file_name` skips a
+    // trailing `.`, so it gives `x` for `x/.`.
     let bytes = path.as_os_str().as_bytes();
     let (parent, name) = match bytes.iter().rposition(|b| *b == b'/') {
         Some(slash) => (&bytes[..slash], &bytes[slash + 1..]),
@@ -2285,7 +2518,7 @@ fn open_superblock_parent_blocking(path: &Path) -> Result<(OwnedFd, String)> {
     Ok((fd, name.to_owned()))
 }
 
-/// Open an existing directory by path.
+/// Opens an existing directory by path.
 fn open_dir_blocking(path: &Path) -> Result<OwnedFd> {
     use rustix::fs::{Mode, OFlags, open};
 
@@ -2297,13 +2530,14 @@ fn open_dir_blocking(path: &Path) -> Result<OwnedFd> {
     .map_err(|e| Error::Io(e.into()))
 }
 
-/// Open an existing directory by path, off the async threads.
+/// Opens an existing directory by path, on the blocking pool.
 async fn open_dir_path(path: &Path) -> Result<OwnedFd> {
     let path = path.to_owned();
     ostrya_rt::unblock(move || open_dir_blocking(&path)).await
 }
 
-/// `DeltaOptions` and `DeltaSuperblock` move freely across tasks and threads.
+/// Checks at compile time that `DeltaOptions` and `DeltaSuperblock` are `Send`
+/// and `Sync`.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<DeltaOptions>();
@@ -2318,8 +2552,9 @@ mod tests {
         Checksum::from_bytes([byte; 32])
     }
 
-    /// The two path shapes, against the paths the tool was observed to write
-    /// and to request. A pull requests these same names on the wire.
+    /// Checks the two path shapes against the paths that the `ostree` command
+    /// was observed to write and to request. A pull requests the same names on
+    /// the wire.
     #[test]
     fn delta_paths_take_the_base64_fanout() {
         let to = checksum(0x11);
@@ -2383,10 +2618,9 @@ mod tests {
 
     #[test]
     fn a_patch_of_unrelated_content_loses_to_splicing() {
-        // A diff against unrelated content is nonzero except where the two bytes
-        // happen to coincide, which is the shape the bound has to reject: it
-        // counts just under the output size, so a bare `< output_size`
-        // comparison would keep it.
+        // A diff against unrelated content is nonzero except where the two
+        // bytes agree. The bound must reject this shape. It counts just under
+        // the output size, so a plain `< output_size` comparison keeps it.
         let output_size = 4_096u64;
         let stream: Vec<u8> = (0..output_size)
             .map(|i| if i % 256 == 0 { 0 } else { 0xa5 })
@@ -2401,8 +2635,8 @@ mod tests {
 
     #[test]
     fn a_patch_of_a_small_edit_beats_splicing() {
-        // A diff against a near-identical source is zero everywhere but the edit,
-        // which stays far inside the bound however large the object is.
+        // A diff against a near-identical source is zero except at the edit,
+        // which stays far inside the bound at any object size.
         let mut stream = vec![0u8; 4_096];
         stream[100] = 0x01;
         stream[101] = 0x02;
@@ -2425,19 +2659,21 @@ mod tests {
         dir
     }
 
-    /// A write to a part's data source that the async file defers until its next
-    /// flush has to fail the handover to the blocking side. The part's framing
-    /// offsets come from the length the spill counted, so a data source that lost
-    /// bytes would otherwise be compressed into a part that verifies its own
-    /// checksum and fails only when the delta is applied.
+    /// A write to the data source of a part that the async file defers to its
+    /// next flush must fail the handover to the blocking side.
+    ///
+    /// The framing offsets of the part come from the length that the spill
+    /// counted. Without this check, a data source that lost bytes compresses
+    /// into a part that verifies its own checksum and fails only when the
+    /// delta is applied.
     #[test]
     fn a_deferred_spill_write_error_fails_the_handover() {
         let dir = scratch("spill-error");
         let path = dir.join("target");
         std::fs::write(&path, b"").unwrap();
-        // A read-only descriptor, so the write against it fails with EBADF. The
-        // async file performs writes on a background task, so `write_all` accepts
-        // the bytes and the error surfaces at the flush.
+        // A read-only descriptor, so the write to it fails with EBADF. The
+        // async file writes on a background task, so `write_all` accepts the
+        // bytes, and the error comes at the flush.
         let file = std::fs::File::open(&path).unwrap();
         let spill_dir = std::fs::File::open(&dir).unwrap();
 
@@ -2455,9 +2691,9 @@ mod tests {
         outcome.expect_err("a failed spill write must fail the handover");
     }
 
-    /// A data source holding fewer bytes than the length the framing counts fails
-    /// the part rather than producing a payload whose two byte arrays disagree
-    /// with their offsets.
+    /// A data source with fewer bytes than the length that the framing counts
+    /// fails the part. No payload is made whose two byte arrays disagree with
+    /// their offsets.
     #[test]
     fn a_short_data_source_fails_the_part() {
         let dir = scratch("short-source");
@@ -2483,11 +2719,12 @@ mod tests {
     }
 
     /// A part whose write fails after its temp file exists leaves the delta
-    /// directory as it found it, so an interrupted generation does not leave a
-    /// partial part beside the finished files. The failure is the count check
-    /// [`BlockingSpill::write_into`] performs from inside [`compress_part`],
-    /// reached by giving the part a data source whose recorded length overstates
-    /// the file.
+    /// directory as it was. An interrupted generation then leaves no partial
+    /// part beside the finished files.
+    ///
+    /// The failure is the count check of [`BlockingSpill::write_into`] in
+    /// [`compress_part`]. The test gives the part a data source whose recorded
+    /// length is more than the file length.
     #[test]
     fn a_failed_part_write_leaves_no_temp_file_behind() {
         let root = scratch("part-temp-leak");
@@ -2518,8 +2755,8 @@ mod tests {
         );
     }
 
-    /// A repository at `root/repo` holding one commit of `files`, each a
-    /// file of `size` bytes of noise, as `(repo, commit)`.
+    /// Returns `(repo, commit)` for a repository at `root/repo` with one
+    /// commit of `files` files, each of `size` bytes of noise.
     async fn noise_commit(root: &Path, files: usize, size: usize) -> (Repo, Checksum) {
         use crate::{
             CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree,
@@ -2570,9 +2807,9 @@ mod tests {
     }
 
     /// An inline generation whose parts pass the superblock ceiling is
-    /// refused, and it leaves what was there before: the earlier delta at the
-    /// repository location keeps its superblock and its part files and stays
-    /// listed, and a fresh output directory receives no file.
+    /// refused, and it changes nothing. The earlier delta at the repository
+    /// location keeps its superblock and its part files and stays listed. A
+    /// new output directory receives no file.
     #[test]
     fn an_inline_generation_over_the_ceiling_keeps_the_earlier_delta() {
         let root = scratch("inline-ceiling");
@@ -2639,8 +2876,9 @@ mod tests {
     }
 
     /// The inline part buffer takes bytes up to its limit and refuses the
-    /// first byte past it, and the part write reports the superblock ceiling
-    /// where the buffer filled, so the ceiling holds without a 128 MiB part.
+    /// first byte past it. The part write reports the superblock ceiling where
+    /// the buffer filled, so the test checks the ceiling without a 128 MiB
+    /// part.
     #[test]
     fn the_capped_part_buffer_refuses_past_its_limit() {
         use std::io::Write;

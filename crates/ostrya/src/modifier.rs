@@ -1,20 +1,14 @@
-//! The commit modifier: what a filesystem walk commits and how.
+//! The commit modifier: the options that shape the ingest of a directory.
 //!
 //! [`Transaction::write_dfd_to_mtree`](crate::Transaction::write_dfd_to_mtree)
-//! ingests an on-disk tree into a [`MutableTree`](crate::MutableTree). A
-//! [`CommitModifier`] shapes that ingest: a set of [`CommitModifierFlags`], a
-//! declared owner uid and gid that replace what the source carries, a
-//! synchronous filter that includes or prunes each entry, a synchronous mode
-//! callback that replaces an entry's recorded `st_mode`, a synchronous xattr
-//! callback that replaces an entry's stored xattr set, an optional SELinux
-//! label callback, and an optional [`DevInoCache`] that skips re-hashing a file
-//! already known by its `(device, inode)`.
+//! reads a directory on disk into a [`MutableTree`](crate::MutableTree). A
+//! [`CommitModifier`] changes what that walk records for each entry. It holds:
 //!
-//! The callbacks are synchronous `FnMut` closures held in public boxed
-//! fields, invoked once per path during the walk. The walk borrows the
-//! modifier exclusively (`Option<&mut CommitModifier>`), so a callback
-//! mutates its own captured state through that borrow. Every callback box is
-//! `Send`, which keeps the modifier and the walk future `Send`.
+//! - a set of [`CommitModifierFlags`]
+//! - a declared owner uid and gid
+//! - a filter, a mode callback, an xattr callback, and a SELinux label
+//!   callback
+//! - a [`DevInoCache`], which is optional
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -29,59 +23,76 @@ use crate::repo::Repo;
 use crate::traverse::read_dir_names;
 use crate::write::FileMeta;
 
-/// The loose-object file-name suffix of an uncompressed content object. A
-/// compressed one (`.filez`) is never a hardlink target, so only this form
-/// enters a devino cache.
+/// The file-name suffix of a loose uncompressed content object. A compressed
+/// object (`.filez`) is never a hardlink target, so only this form enters a
+/// devino cache.
 const CONTENT_SUFFIX: &str = ".file";
-/// The hex-character count of a loose object's name below its fanout directory.
+/// The number of hex characters in the name of a loose object in its fanout
+/// directory.
 const LOOSE_NAME_HEX: usize = 62;
 
-/// Flags controlling how a filesystem tree is ingested.
+/// The flags that control the ingest of a directory tree.
 ///
-/// A bitset over the individual flag constants. Combine with `|` and test with
-/// [`contains`](CommitModifierFlags::contains).
+/// The value is a bitset of the flag constants. Combine flags with `|`, and
+/// test them with [`contains`](CommitModifierFlags::contains).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CommitModifierFlags(u32);
 
 impl CommitModifierFlags {
-    /// No flags set.
+    /// The flag set with no flags.
     pub const NONE: CommitModifierFlags = CommitModifierFlags(0);
-    /// Do not read on-disk extended attributes; the stored xattr set starts
-    /// empty (a callback may still add to it).
+    /// The flag that stops the walk from reading the extended attributes on
+    /// disk.
+    ///
+    /// The xattr set of each entry starts empty. A callback can add to it.
     pub const SKIP_XATTRS: CommitModifierFlags = CommitModifierFlags(1 << 0);
-    /// Mark the transaction to emit `ostree.sizes` at commit. Archive-only:
-    /// elsewhere the request is a silent no-op.
+    /// The flag that marks the transaction to write `ostree.sizes` in the
+    /// commit.
+    ///
+    /// The flag has an effect in an `archive` repository only. In other modes
+    /// it does nothing and gives no error.
     pub const GENERATE_SIZES: CommitModifierFlags = CommitModifierFlags(1 << 1);
-    /// Force owner 0:0, canonicalize each permission set (`perm & 0o755` for
-    /// regular files and directories; symlinks unchanged), and record no
-    /// extended attributes. The xattr set is emptied before the callbacks run,
-    /// so a callback may still add to it, as under
-    /// [`SKIP_XATTRS`](CommitModifierFlags::SKIP_XATTRS).
+    /// The flag that records canonical ownership and permissions.
+    ///
+    /// Each entry gets owner 0:0 and no extended attributes. A regular file or
+    /// a directory gets `perm & 0o755`, and a symlink keeps its mode. The walk
+    /// empties the xattr set before the callbacks run, so a callback can add to
+    /// it, as under [`SKIP_XATTRS`](CommitModifierFlags::SKIP_XATTRS).
     pub const CANONICAL_PERMISSIONS: CommitModifierFlags = CommitModifierFlags(1 << 2);
-    /// With a label callback present, treat a path the callback leaves
-    /// unlabeled as an error.
+    /// The flag that makes a path with no label an error.
+    ///
+    /// If a label callback is set and returns no label for a path, the walk
+    /// fails with [`Error::InvalidFormat`](crate::Error::InvalidFormat).
     pub const ERROR_ON_UNLABELED: CommitModifierFlags = CommitModifierFlags(1 << 3);
-    /// Delete each source file as it is consumed and remove emptied
-    /// directories, including the walk root.
+    /// The flag that deletes the source tree during the walk.
+    ///
+    /// The walk deletes each source file after it consumes the file. It
+    /// removes each directory that becomes empty, the walk root included.
+    /// [`Transaction::write_dfd_to_mtree`](crate::Transaction::write_dfd_to_mtree)
+    /// gives the rules for the walk root.
     pub const CONSUME: CommitModifierFlags = CommitModifierFlags(1 << 4);
-    /// Trust a [`DevInoCache`] hit as the file's identity and skip ingestion.
+    /// The flag that takes a [`DevInoCache`] hit as the identity of the file.
+    ///
+    /// The walk does not ingest a file that the cache knows.
     pub const DEVINO_CANONICAL: CommitModifierFlags = CommitModifierFlags(1 << 5);
-    /// Select the version-1 SELinux labeling rules for the label callback. A
-    /// real policy backend is out of scope; the flag is carried for callers
-    /// that implement their own labeling.
+    /// The flag that selects the version-1 SELinux labeling rules.
+    ///
+    /// ostrya has no SELinux policy backend and does not read this flag. The
+    /// flag is for callers that implement their own labeling in the label
+    /// callback.
     pub const SELINUX_LABEL_V1: CommitModifierFlags = CommitModifierFlags(1 << 6);
 
-    /// The empty flag set.
+    /// Returns the empty flag set.
     pub const fn empty() -> CommitModifierFlags {
         CommitModifierFlags(0)
     }
 
-    /// Whether every bit in `other` is set in `self`.
+    /// Returns `true` if `self` holds every bit of `other`.
     pub const fn contains(self, other: CommitModifierFlags) -> bool {
         self.0 & other.0 == other.0
     }
 
-    /// The raw bits.
+    /// Returns the raw bits.
     pub const fn bits(self) -> u32 {
         self.0
     }
@@ -101,89 +112,108 @@ impl std::ops::BitOrAssign for CommitModifierFlags {
     }
 }
 
-/// A filter callback's verdict for one entry.
+/// The verdict of a filter callback for one entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterResult {
-    /// Include the entry (and, for a directory, descend into it).
+    /// The walk includes the entry, and descends into it if it is a directory.
     Allow,
-    /// Exclude the entry; for a directory, prune its whole subtree.
+    /// The walk excludes the entry, with the whole subtree of a directory.
     Skip,
 }
 
-/// A `(device, inode)` to content-checksum map.
+/// A map from `(device, inode)` to the checksum of a content object.
 ///
-/// Populated by checkout, which records the inode of each object it
-/// writes, and by [`Repo::devino_cache`](crate::Repo::devino_cache), which
-/// reads the same mapping out of a repository's own loose objects. A source
-/// file whose `(device, inode)` is present is taken to be that object and its
-/// content is never read.
+/// Two sources fill the cache:
 ///
-/// The cache is consulted whenever it is attached to a modifier. Without
-/// [`DEVINO_CANONICAL`](CommitModifierFlags::DEVINO_CANONICAL) a hit supplies
-/// the stored object's own metadata, the modifier is applied over that
-/// metadata, and the object is rewritten from the stored content where the
-/// result differs. With the flag the hit is taken verbatim and the filter and
-/// every callback are skipped for that entry.
+/// - A checkout with
+///   [`CheckoutOptions::devino_cache`](crate::CheckoutOptions::devino_cache)
+///   set records the inode of each regular file that it writes or links.
+/// - [`Repo::devino_cache`](crate::Repo::devino_cache) reads the same map
+///   from the loose objects of a repository.
+///
+/// If the `(device, inode)` of a source file is in the cache, the walk takes
+/// the file to be that object. It never reads the content of the file.
+///
+/// # Hits
+///
+/// If the cache is attached to a modifier, the walk looks up each entry that
+/// is not a directory.
+/// Without [`DEVINO_CANONICAL`](CommitModifierFlags::DEVINO_CANONICAL), a hit
+/// gives the metadata of the stored object, and the walk applies the modifier
+/// to that metadata. If the result differs, the walk writes a new object from
+/// the stored content.
+///
+/// With the flag, the walk takes the hit as it is. It skips the filter and
+/// every callback for that entry.
 #[derive(Debug, Default, Clone)]
 pub struct DevInoCache {
     map: HashMap<(u64, u64), Checksum>,
 }
 
 impl DevInoCache {
-    /// An empty cache.
+    /// Creates an empty cache.
     pub fn new() -> DevInoCache {
         DevInoCache {
             map: HashMap::new(),
         }
     }
 
-    /// Record that the object at `(dev, ino)` has the given content checksum.
+    /// Records that the object at `(dev, ino)` has the given content checksum.
     pub fn insert(&mut self, dev: u64, ino: u64, checksum: Checksum) {
         self.map.insert((dev, ino), checksum);
     }
 
-    /// The checksum recorded for `(dev, ino)`, if any.
+    /// Returns the checksum recorded for `(dev, ino)`, if there is one.
     pub fn get(&self, dev: u64, ino: u64) -> Option<Checksum> {
         self.map.get(&(dev, ino)).copied()
     }
 
-    /// The number of entries.
+    /// Returns the number of entries.
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
-    /// Whether the cache is empty.
+    /// Returns `true` if the cache has no entries.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 }
 
+/// Methods that build a device and inode cache.
 impl Repo {
-    /// Build a [`DevInoCache`] from this repository's own uncompressed loose
-    /// content objects.
+    /// Builds a [`DevInoCache`] from the uncompressed loose content objects.
     ///
-    /// Each `objects/<xx>/<62hex>.file` entry that is a regular file
-    /// contributes its `(st_dev, st_ino)` and the checksum its name spells. A
-    /// checkout that hardlinks those objects into a destination tree therefore
-    /// produces files this cache resolves, whichever process made the
-    /// checkout.
+    /// Each `objects/<xx>/<62hex>.file` entry that is a regular file or a
+    /// symlink adds its `(st_dev, st_ino)` and the checksum that its name
+    /// spells. The scan reads lower-case hex names only. If a checkout
+    /// hardlinks these objects into a destination tree, the cache resolves the
+    /// files of that tree, whatever process made the checkout.
     ///
-    /// An `archive` repository stores every content object compressed
-    /// (`.filez`), so it contributes nothing and the cache comes back empty.
+    /// An `archive` repository stores each content object compressed
+    /// (`.filez`), so its cache is empty.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`](crate::Error::Io) if the read of `objects/` or of a
+    ///   fanout directory fails.
+    /// - [`Error::Io`](crate::Error::Io) if the open of a fanout directory
+    ///   fails with an error other than `ENOENT`.
     pub async fn devino_cache(&self) -> Result<DevInoCache> {
         let repo = self.clone();
         ostrya_rt::unblock(move || devino_cache_blocking(repo.objects_fd())).await
     }
 }
 
-/// Scan an `objects/` directory fd for uncompressed loose content objects.
+/// Scans an `objects/` directory descriptor for loose uncompressed content
+/// objects.
 fn devino_cache_blocking(objects_fd: BorrowedFd<'_>) -> Result<DevInoCache> {
     let mut cache = DevInoCache::new();
-    // The reader accepts only the lower-case namespace both implementations
-    // write. A name holding upper-case hex folds to a checksum no writer here
-    // produced, and the entry it adds is what `-I` then commits for a source
-    // file hardlinked to that object. Such a name exists only if something
-    // outside either implementation wrote it, so no test produces one.
+    // The scan reads lower-case names only, because ostrya and the `ostree`
+    // command write only these. An upper-case hex name folds to a checksum
+    // that no writer produced. If the scan added such an entry, `-I` commits
+    // that checksum for a source file hardlinked to the object. Only a writer
+    // outside ostrya and the `ostree` command can make such a name, so no
+    // test produces one.
     for fanout in read_dir_names(objects_fd)? {
         if fanout.len() != 2
             || !fanout
@@ -216,10 +246,10 @@ fn devino_cache_blocking(objects_fd: BorrowedFd<'_>) -> Result<DevInoCache> {
             else {
                 continue;
             };
-            // A `bare` repository stores a symlink object as a symlink, and a
+            // A `bare` repository stores a symlink object as a symlink. A
             // hardlinking checkout links that inode into the destination, so
             // both file types can be one end of a hardlink pair with a source
-            // entry. Nothing else under `objects/` can.
+            // entry. No other entry under `objects/` can.
             if !matches!(
                 FileType::from_raw_mode(st.st_mode),
                 FileType::RegularFile | FileType::Symlink
@@ -232,57 +262,79 @@ fn devino_cache_blocking(objects_fd: BorrowedFd<'_>) -> Result<DevInoCache> {
     Ok(cache)
 }
 
-/// A synchronous filter over ingested paths.
+/// A synchronous filter over the ingested paths.
 pub type FilterFn = Box<dyn FnMut(&Path, &FileMeta) -> FilterResult + Send>;
-/// A synchronous callback that replaces an entry's recorded `st_mode`. The
-/// returned value carries the file-type bits as well as the permission bits.
+/// A synchronous callback that replaces the recorded `st_mode` of an entry.
+///
+/// The returned value holds the file-type bits and the permission bits.
 pub type ModeFn = Box<dyn FnMut(&Path, &FileMeta) -> u32 + Send>;
-/// A synchronous callback that replaces an entry's stored xattr set.
+/// A synchronous callback that replaces the stored xattr set of an entry.
 pub type XattrFn = Box<dyn FnMut(&Path, &FileMeta) -> Xattrs + Send>;
-/// A synchronous callback that returns the SELinux label for an entry.
+/// A synchronous callback that returns the SELinux label of an entry.
 pub type LabelFn = Box<dyn FnMut(&Path, &FileMeta) -> Option<Vec<u8>> + Send>;
 
-/// The stored name of the SELinux label xattr, in on-disk NUL-terminated form.
+/// The stored name of the SELinux label xattr, in the NUL-terminated form on
+/// disk.
 const SELINUX_XATTR: &[u8] = b"security.selinux\0";
 
-/// Shapes what a filesystem walk commits.
+/// The options that shape what the walk of a directory commits.
 ///
-/// Construct with [`new`](CommitModifier::new) and set the callback fields
-/// directly. The walk takes the modifier as `&mut`, so the callbacks run
-/// through an exclusive borrow.
+/// Create a modifier with [`new`](CommitModifier::new), then set the fields.
+/// [`Transaction::write_dfd_to_mtree`](crate::Transaction::write_dfd_to_mtree)
+/// gives the order in which the walk applies them.
+///
+/// # Callbacks
+///
+/// The callbacks are synchronous `FnMut` closures in public boxed fields. The
+/// walk calls each callback at most once for each path. It borrows the
+/// modifier exclusively (`Option<&mut CommitModifier>`), so a callback can
+/// change its own captured state. Each callback box is `Send`, so the modifier
+/// and the walk future are `Send`.
 pub struct CommitModifier {
-    /// Flags controlling the ingest.
+    /// The flags that control the ingest.
     pub flags: CommitModifierFlags,
-    /// The owner uid every ingested entry records, in place of the uid its
-    /// source carries. Applied after the
+    /// The owner uid that each ingested entry records, in place of the uid of
+    /// its source.
+    ///
+    /// The walk applies it after the
     /// [`CANONICAL_PERMISSIONS`](CommitModifierFlags::CANONICAL_PERMISSIONS)
-    /// reduction and before the callbacks, so a declared id wins over that
-    /// flag's `0`.
+    /// reduction and before the callbacks, so a declared id replaces the `0`
+    /// of that flag.
     pub owner_uid: Option<u32>,
-    /// The owner gid every ingested entry records, on the same terms as
+    /// The owner gid that each ingested entry records, by the rules of
     /// [`owner_uid`](CommitModifier::owner_uid).
     pub owner_gid: Option<u32>,
-    /// A filter called per path to include or prune entries.
+    /// A filter that the walk calls for each path to include or skip the
+    /// entry.
     pub filter: Option<FilterFn>,
-    /// A callback whose return value replaces an entry's recorded `st_mode`.
-    /// Runs after the
+    /// A callback whose return value replaces the recorded `st_mode` of an
+    /// entry.
+    ///
+    /// The callback runs after the
     /// [`CANONICAL_PERMISSIONS`](CommitModifierFlags::CANONICAL_PERMISSIONS)
-    /// reduction and the declared ownership, and ahead of the xattr callback
-    /// and the SELinux label hook.
+    /// reduction and the declared ownership. It runs before the xattr callback
+    /// and the SELinux label callback. Under `CANONICAL_PERMISSIONS`, the walk
+    /// applies the reduction again to the returned mode, and the entry keeps
+    /// the file type that the walk found.
     pub mode_callback: Option<ModeFn>,
-    /// A callback whose return value replaces an entry's stored xattr set.
+    /// A callback whose return value replaces the stored xattr set of an
+    /// entry.
     pub xattr_callback: Option<XattrFn>,
-    /// A callback returning an entry's SELinux label. A pre-existing
-    /// `security.selinux` xattr is dropped before the callback runs, so a
-    /// returned label is never double-counted.
+    /// A callback that returns the SELinux label of an entry.
+    ///
+    /// The walk removes the `security.selinux` xattr of the entry before the
+    /// callback runs, so the returned label counts only once.
     pub label_callback: Option<LabelFn>,
-    /// A devino cache, consulted under
+    /// A devino cache that the walk looks up for each regular file and
+    /// symlink.
+    ///
+    /// [`DevInoCache`] gives the rules for a hit, with and without
     /// [`DEVINO_CANONICAL`](CommitModifierFlags::DEVINO_CANONICAL).
     pub devino_cache: Option<DevInoCache>,
 }
 
 impl CommitModifier {
-    /// A modifier with the given flags, no declared ownership, and no
+    /// Creates a modifier with the given flags, no declared ownership, and no
     /// callbacks.
     pub fn new(flags: CommitModifierFlags) -> CommitModifier {
         CommitModifier {
@@ -298,8 +350,10 @@ impl CommitModifier {
     }
 }
 
-/// The declared ownership a walk applies to every entry, read out of the
-/// modifier once so the per-entry adjustment holds no borrow.
+/// The declared ownership that a walk applies to each entry.
+///
+/// The walk reads it from the modifier once, so the adjustment of each entry
+/// holds no borrow.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Owner {
     pub(crate) uid: Option<u32>,
@@ -307,7 +361,8 @@ pub(crate) struct Owner {
 }
 
 impl Owner {
-    /// The ownership `modifier` declares; nothing declared for `None`.
+    /// Returns the ownership that `modifier` declares, or no ownership for
+    /// `None`.
     pub(crate) fn of(modifier: Option<&CommitModifier>) -> Owner {
         modifier.map_or(Owner::default(), |m| Owner {
             uid: m.owner_uid,
@@ -315,7 +370,7 @@ impl Owner {
         })
     }
 
-    /// Replace the ids `meta` carries with the declared ones.
+    /// Replaces the ids in `meta` with the declared ids.
     pub(crate) fn apply(self, meta: &mut FileMeta) {
         if let Some(uid) = self.uid {
             meta.uid = uid;
@@ -326,8 +381,9 @@ impl Owner {
     }
 }
 
-/// Rebuild an xattr set with any `security.selinux` entry removed. Used by the
-/// label hook so a pre-existing label is not double-counted.
+/// Returns a copy of an xattr set without its `security.selinux` entry.
+///
+/// The label callback step uses it, so an existing label counts only once.
 pub(crate) fn without_selinux(xattrs: &Xattrs) -> ostrya_core::Result<Xattrs> {
     let pairs: Vec<(Vec<u8>, Vec<u8>)> = xattrs
         .iter()
@@ -337,7 +393,8 @@ pub(crate) fn without_selinux(xattrs: &Xattrs) -> ostrya_core::Result<Xattrs> {
     Xattrs::new(pairs)
 }
 
-/// Rebuild an xattr set with a `security.selinux` entry carrying `label`.
+/// Returns a copy of an xattr set with a `security.selinux` entry that holds
+/// `label`, in place of an existing one.
 pub(crate) fn with_selinux(xattrs: &Xattrs, label: Vec<u8>) -> ostrya_core::Result<Xattrs> {
     let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = xattrs
         .iter()

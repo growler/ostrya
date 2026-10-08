@@ -1,9 +1,9 @@
 //! Local pull between two repositories.
 //!
-//! The source repositories are built with the port itself, so the flag and
-//! traversal behavior is covered without the `ostree` tool; the interop tests
-//! that need the tool build a source with it, or hand it what the port pulled,
-//! and are skipped when it is absent.
+//! ostrya builds the source repositories, so these tests cover the flags and
+//! the traversal without the `ostree` command. The interop tests that need the
+//! `ostree` command build a source with it, or give it what ostrya pulled. If
+//! the `ostree` command is absent, these tests skip.
 
 mod common;
 
@@ -23,12 +23,12 @@ use ostrya::{
 };
 use ostrya_rt::{block_on, spawn};
 
-/// A fixed timestamp, so a source repository's commits are reproducible.
+/// A fixed timestamp that makes the commits of a source repository reproducible.
 const FIXED_TS: u64 = 1_700_000_000;
 
 // --- helpers -------------------------------------------------------------
 
-/// Run the `ostree` tool and assert it succeeded.
+/// Runs the `ostree` command and asserts that it succeeds.
 fn ostree(args: &[&str]) -> Vec<u8> {
     let out = Command::new("ostree")
         .args(args)
@@ -42,8 +42,8 @@ fn ostree(args: &[&str]) -> Vec<u8> {
     out.stdout
 }
 
-/// Build a small source tree under `dir`: two regular files of differing modes,
-/// a symlink, and a nested subdirectory.
+/// Builds a small source tree under `dir`: two regular files with different
+/// modes, a symlink, and a nested subdirectory.
 fn build_tree(dir: &Path, marker: &[u8]) {
     std::fs::create_dir_all(dir.join("subdir")).unwrap();
     std::fs::write(dir.join("hello.txt"), marker).unwrap();
@@ -58,7 +58,8 @@ fn build_tree(dir: &Path, marker: &[u8]) {
     std::fs::set_permissions(dir.join("exec.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// The `ostree.ref-binding` metadata dict binding a commit to `branch`.
+/// Returns the `ostree.ref-binding` metadata dict that binds a commit to
+/// `branch`.
 fn ref_binding(branch: &str) -> Value {
     Value::Array(vec![Value::Tuple(vec![
         Value::Str("ostree.ref-binding".to_owned()),
@@ -69,8 +70,8 @@ fn ref_binding(branch: &str) -> Value {
     ])])
 }
 
-/// Commit subtree `sub` of `base` into `repo` under `branch`, with a fixed
-/// timestamp and the branch's ref binding.
+/// Commits subtree `sub` of `base` into `repo` under `branch`, with a fixed
+/// timestamp and the ref binding of the branch.
 async fn commit_tree(
     repo: &Repo,
     base: &Path,
@@ -90,9 +91,9 @@ async fn commit_tree(
     .await
 }
 
-/// Commit subtree `sub` as [`commit_tree`] does, under the given modifier flags
-/// and, where `owner` names one, a declared uid and gid in place of the ones the
-/// source carries.
+/// Commits subtree `sub` as [`commit_tree`] does, under the given modifier
+/// flags. If `owner` is set, the commit declares that uid and gid and ignores
+/// the uid and gid of the source files.
 async fn commit_tree_with(
     repo: &Repo,
     base: &Path,
@@ -132,30 +133,30 @@ async fn commit_tree_with(
     commit
 }
 
-/// Create a repository of the given mode under `base/<name>`.
+/// Creates a repository of the given mode under `base/<name>`.
 async fn make_repo(base: &Path, name: &str, mode: RepoMode) -> (PathBuf, Repo) {
     let path = base.join(name);
     let repo = Repo::create(&path, CreateOptions::new(mode)).await.unwrap();
     (path, repo)
 }
 
-/// Create a repository of the given mode inside a setgid `2775` directory owned
-/// by group `gid`. The setgid bit carries `gid` to the repository root and, from
-/// there, to every directory below it, so every object written there takes
-/// `gid`.
+/// Creates a repository of the given mode in a setgid `2775` directory owned by
+/// group `gid`. The setgid bit gives `gid` to the repository root and to each
+/// directory under it, so each object written there gets `gid`.
 async fn make_repo_in_group(base: &Path, name: &str, mode: RepoMode, gid: u32) -> (PathBuf, Repo) {
     let parent = base.join(format!("{name}-group"));
     std::fs::create_dir(&parent).unwrap();
     std::os::unix::fs::chown(&parent, None, Some(gid)).unwrap();
-    // The group is set first: changing a file's owner may clear its setgid bit.
+    // Set the group first, because a change of the owner of a file can clear
+    // its setgid bit.
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o2775)).unwrap();
     let path = parent.join(name);
     let repo = Repo::create(&path, CreateOptions::new(mode)).await.unwrap();
     (path, repo)
 }
 
-/// A source repository holding two commits on `main`, the second a child of the
-/// first. Returns its path, handle, and the two commit checksums.
+/// Creates a source repository with two commits on `main`. The second commit is
+/// a child of the first. Returns the path, the handle, and the two checksums.
 async fn source_repo(base: &Path, mode: RepoMode) -> (PathBuf, Repo, Checksum, Checksum) {
     build_tree(&base.join("v1"), b"hello one\n");
     build_tree(&base.join("v2"), b"hello two\n");
@@ -165,9 +166,9 @@ async fn source_repo(base: &Path, mode: RepoMode) -> (PathBuf, Repo, Checksum, C
     (path, repo, c1, c2)
 }
 
-/// A source repository as [`source_repo`], committed with canonical permissions
-/// so every object it holds carries the header a bare-user-only destination
-/// stores and can therefore be imported under its own name.
+/// Creates a source repository as [`source_repo`] does, with canonical
+/// permissions. Each object then carries the header that a bare-user-only
+/// destination stores, so that destination can import it under its own name.
 async fn canonical_source_repo(base: &Path, mode: RepoMode) -> (PathBuf, Repo, Checksum, Checksum) {
     build_tree(&base.join("v1"), b"hello one\n");
     build_tree(&base.join("v2"), b"hello two\n");
@@ -178,10 +179,10 @@ async fn canonical_source_repo(base: &Path, mode: RepoMode) -> (PathBuf, Repo, C
     (path, repo, c1, c2)
 }
 
-/// A source repository as [`source_repo`], committed with a declared non-root
-/// owner so every object it holds carries a uid and gid a bare-user-only
-/// destination discards. The ownership is declared rather than inherited from the
-/// committing process, so the objects are the same whoever runs the test.
+/// Creates a source repository as [`source_repo`] does, with a declared
+/// non-root owner. Each object then carries a uid and gid that a bare-user-only
+/// destination discards. The commit declares the owner and ignores the ids of
+/// the process, so the objects are the same for each user that runs the test.
 async fn owned_source_repo(base: &Path, mode: RepoMode) -> (PathBuf, Repo, Checksum, Checksum) {
     build_tree(&base.join("v1"), b"hello one\n");
     build_tree(&base.join("v2"), b"hello two\n");
@@ -193,7 +194,8 @@ async fn owned_source_repo(base: &Path, mode: RepoMode) -> (PathBuf, Repo, Check
     (path, repo, c1, c2)
 }
 
-/// The path of a commit's `.commitmeta` file inside a repository directory.
+/// Returns the path of the `.commitmeta` file of a commit in a repository
+/// directory.
 fn commitmeta_path(repo_dir: &Path, commit: &Checksum) -> PathBuf {
     let hex = commit.to_hex();
     repo_dir
@@ -202,8 +204,8 @@ fn commitmeta_path(repo_dir: &Path, commit: &Checksum) -> PathBuf {
         .join(format!("{}.commitmeta", &hex[2..]))
 }
 
-/// The `(device, inode)` of a loose object in a repository, or `None` when the
-/// object is absent.
+/// Returns the `(device, inode)` of a loose object in a repository, or `None`
+/// if the object is absent.
 fn object_ino(repo_dir: &Path, name: &str) -> Option<(u64, u64)> {
     let path = repo_dir.join("objects").join(&name[..2]).join(&name[2..]);
     std::fs::symlink_metadata(path)
@@ -211,8 +213,8 @@ fn object_ino(repo_dir: &Path, name: &str) -> Option<(u64, u64)> {
         .map(|m| (m.dev(), m.ino()))
 }
 
-/// The permission bits of a loose object in a repository, or `None` when the
-/// object is absent.
+/// Returns the permission bits of a loose object in a repository, or `None` if
+/// the object is absent.
 fn object_mode(repo_dir: &Path, name: &str) -> Option<u32> {
     let path = repo_dir.join("objects").join(&name[..2]).join(&name[2..]);
     std::fs::symlink_metadata(path)
@@ -220,7 +222,7 @@ fn object_mode(repo_dir: &Path, name: &str) -> Option<u32> {
         .map(|m| m.mode() & 0o7777)
 }
 
-/// Pull `main` from `src` into `dst` under `flags`.
+/// Pulls `main` from `src` into `dst` under `flags`.
 async fn pull_main(dst: &Repo, src: &Repo, flags: PullFlags) {
     dst.pull_local(
         src,
@@ -234,8 +236,8 @@ async fn pull_main(dst: &Repo, src: &Repo, flags: PullFlags) {
     .unwrap();
 }
 
-/// Every loose object name (`<2>/<62>.<ext>` flattened to `<64>.<ext>`) in a
-/// repository, sorted.
+/// Returns the sorted names of the loose objects in a repository. Each name is
+/// flattened from `<2>/<62>.<ext>` to `<64>.<ext>`.
 fn object_names(repo_dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let objects = repo_dir.join("objects");
@@ -255,9 +257,9 @@ fn object_names(repo_dir: &Path) -> Vec<String> {
     out
 }
 
-/// The lowest-numbered content object of `commit` that is a regular file with a
-/// payload. Chosen by checksum order so the pick does not depend on the
-/// traversal set's iteration order.
+/// Returns the content object of `commit` with the lowest checksum that is a
+/// regular file with a payload. The checksum order makes the pick independent
+/// of the iteration order of the traversal set.
 async fn first_regular_content(repo: &Repo, commit: &Checksum) -> ostrya::ObjectName {
     let mut names: Vec<ostrya::ObjectName> = repo
         .traverse_commit(commit, 0)
@@ -278,8 +280,9 @@ async fn first_regular_content(repo: &Repo, commit: &Checksum) -> ostrya::Object
     panic!("the commit holds no regular content object with a payload");
 }
 
-/// The symlink content object of `commit`, chosen by checksum order so the pick
-/// does not depend on the traversal set's iteration order.
+/// Returns the symlink content object of `commit` with the lowest checksum. The
+/// checksum order makes the pick independent of the iteration order of the
+/// traversal set.
 async fn symlink_content(repo: &Repo, commit: &Checksum) -> ostrya::ObjectName {
     let mut names: Vec<ostrya::ObjectName> = repo
         .traverse_commit(commit, 0)
@@ -297,8 +300,9 @@ async fn symlink_content(repo: &Repo, commit: &Checksum) -> ostrya::ObjectName {
     panic!("the commit holds no symlink content object");
 }
 
-/// The subdirectory's dirtree object of `commit`: the one dirtree the commit
-/// reaches that is not its root, which `build_tree` gives it exactly one of.
+/// Returns the dirtree object of the subdirectory of `commit`. It is the one
+/// dirtree that the commit reaches and that is not the root. `build_tree` makes
+/// exactly one such dirtree.
 async fn subdir_dirtree(repo: &Repo, commit: &Checksum) -> ostrya::ObjectName {
     let bytes = repo
         .load_object_bytes(ostrya::ObjectType::Commit, commit)
@@ -313,25 +317,25 @@ async fn subdir_dirtree(repo: &Repo, commit: &Checksum) -> ostrya::ObjectName {
         .expect("the commit holds a subdirectory dirtree")
 }
 
-/// The absolute path of a loose object in a repository.
+/// Returns the absolute path of a loose object in a repository.
 fn object_path(repo_dir: &Path, name: &ostrya::ObjectName, mode: RepoMode) -> PathBuf {
     repo_dir.join("objects").join(name.loose_path(mode))
 }
 
-/// Whether a loose object carries the named xattr.
+/// Returns `true` if a loose object carries the named xattr.
 fn has_xattr(path: &Path, name: &str) -> bool {
     let mut buf = [0u8; 256];
     rustix::fs::getxattr(path, name, &mut buf).is_ok()
 }
 
-/// Whether a loose object carries the `user.ostreemeta` xattr.
+/// Returns `true` if a loose object carries the `user.ostreemeta` xattr.
 fn has_ostreemeta(path: &Path) -> bool {
     has_xattr(path, "user.ostreemeta")
 }
 
-/// A group the process belongs to other than `own`, or `None` when it belongs to
-/// only one. Used to give a source object an ownership no write into the
-/// destination repository would produce.
+/// Returns a group of the process other than `own`, or `None` if the process is
+/// in one group only. A test uses it to give a source object an ownership that
+/// no write into the destination repository produces.
 fn other_group(own: u32) -> Option<u32> {
     let out = Command::new("id").arg("-G").output().ok()?;
     String::from_utf8_lossy(&out.stdout)
@@ -340,17 +344,17 @@ fn other_group(own: u32) -> Option<u32> {
         .find(|g| *g != own)
 }
 
-/// The environment variable that turns the multi-group skip into a failure. A
-/// harness setting it declares that the arrangement is available, so a run where
-/// it is not is a broken harness rather than a test to pass over.
+/// The environment variable that turns the multi-group skip into a failure. If
+/// a harness sets it, the harness declares that a second group is available. A
+/// run without a second group is then a broken harness, and the test fails.
 const REQUIRE_MULTIGROUP: &str = "OSTRYA_REQUIRE_MULTIGROUP";
 
-/// A group the process belongs to other than `own`, for a test that cannot run
-/// without one. These tests are the whole of the ownership gate's coverage, so a
-/// single-group harness -- a container running as root with only `root` -- would
-/// otherwise report the gate as tested when nothing exercised it. With
-/// [`REQUIRE_MULTIGROUP`] set the absence fails; without it the test skips and
-/// says so.
+/// Returns a group of the process other than `own`, for a test that cannot run
+/// without one. These tests are the only coverage of the ownership gate.
+/// Without this check, a single-group harness reports the gate as tested when
+/// no test exercised it. An example is a container that runs as root with only
+/// the group `root`. If [`REQUIRE_MULTIGROUP`] is set, a missing group fails
+/// the test. If it is not set, the test skips and prints a message.
 fn required_other_group(own: u32) -> Option<u32> {
     if let Some(gid) = other_group(own) {
         return Some(gid);
@@ -364,14 +368,15 @@ fn required_other_group(own: u32) -> Option<u32> {
     None
 }
 
-/// The path of a loose object named by the flattened `<64>.<ext>` name
+/// Returns the path of a loose object from the flattened `<64>.<ext>` name that
 /// [`object_names`] returns.
 fn flat_object_path(repo_dir: &Path, flat: &str) -> PathBuf {
     repo_dir.join("objects").join(&flat[..2]).join(&flat[2..])
 }
 
-/// Create a repository of the given mode with `[ex-integrity] fsverity` set to
-/// `fsverity`, reopened so the setting is parsed.
+/// Creates a repository of the given mode with `[ex-integrity] fsverity` set to
+/// `fsverity`. The function reopens the repository so that it parses the
+/// setting.
 async fn verity_repo(base: &Path, name: &str, mode: RepoMode, fsverity: &str) -> (PathBuf, Repo) {
     let (path, repo) = make_repo(base, name, mode).await;
     drop(repo);
@@ -383,15 +388,15 @@ async fn verity_repo(base: &Path, name: &str, mode: RepoMode, fsverity: &str) ->
     (path, repo)
 }
 
-/// Whether a loose object is sealed with fs-verity, which a sealed regular file
-/// reports by refusing to be opened for writing. Every object examined is
-/// owner-writable, so a refused write-open is verity rather than permissions.
+/// Returns `true` if a loose object is sealed with fs-verity. A sealed regular
+/// file refuses an open for writing. Each examined object is writable by its
+/// owner, so the permissions do not cause a refused open.
 fn is_sealed(path: &Path) -> bool {
     std::fs::OpenOptions::new().write(true).open(path).is_err()
 }
 
-/// Whether the filesystem holding `base` can seal a file with fs-verity, probed by
-/// committing into a `maybe` repository, which succeeds either way.
+/// Returns `true` if the file system of `base` can seal a file with fs-verity.
+/// The probe commits into a `maybe` repository, which succeeds in both cases.
 async fn fs_supports_verity(base: &Path) -> bool {
     build_tree(&base.join("verity-probe"), b"probe\n");
     let (path, repo) = verity_repo(base, "verity-probe-repo", RepoMode::BareUser, "maybe").await;
@@ -401,10 +406,10 @@ async fn fs_supports_verity(base: &Path) -> bool {
         .any(|flat| is_sealed(&flat_object_path(&path, flat)))
 }
 
-/// Create a repository of the given mode reserving the whole filesystem through
-/// `min-free-space-percent=100`, so a transaction there starts with a zero write
-/// budget and any object that allocates blocks fails it. Reopened so the setting
-/// is parsed.
+/// Creates a repository of the given mode with `min-free-space-percent=100`,
+/// which reserves the whole file system. A transaction there starts with a
+/// write budget of zero, so each object that allocates blocks makes it fail.
+/// The function reopens the repository so that it parses the setting.
 async fn zero_budget_repo(base: &Path, name: &str, mode: RepoMode) -> (PathBuf, Repo) {
     let (path, repo) = make_repo(base, name, mode).await;
     drop(repo);
@@ -416,7 +421,7 @@ async fn zero_budget_repo(base: &Path, name: &str, mode: RepoMode) -> (PathBuf, 
     (path, repo)
 }
 
-/// Whether a commit's `.commitpartial` marker is present.
+/// Returns `true` if the `.commitpartial` marker of a commit is present.
 fn has_partial_marker(repo_dir: &Path, commit: &Checksum) -> bool {
     repo_dir
         .join("state")
@@ -451,7 +456,7 @@ fn pulls_a_ref_its_commit_and_its_tree() {
                 .await
                 .unwrap()
         );
-        // depth 0: the parent commit is not pulled.
+        // At depth 0, the pull does not import the parent commit.
         assert!(
             !dst.has_object(ostrya::ObjectType::Commit, &c1)
                 .await
@@ -461,7 +466,8 @@ fn pulls_a_ref_its_commit_and_its_tree() {
         assert!(!has_partial_marker(&dst_dir, &c2));
         assert!(stats.metadata_imported > 0 && stats.content_imported > 0);
 
-        // Every object the pulled commit reaches is present, and nothing else.
+        // The destination holds each object that the pulled commit reaches, and
+        // no other object.
         let reached = src.traverse_commit(&c2, 0).await.unwrap();
         for name in &reached {
             assert!(
@@ -542,8 +548,8 @@ fn a_local_pull_ignores_the_mirror_flag() {
         let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
-        // The flag belongs to `Repo::pull`. A local pull writes its refs under
-        // the prefix `remote` names whether or not the flag is set.
+        // The flag applies to `Repo::pull` only. A local pull writes its refs
+        // under the prefix that `remote` names, with or without the flag.
         dst.pull_local(
             &src,
             PullOptions {
@@ -603,8 +609,8 @@ fn depth_does_not_depend_on_ref_order() {
     let tmp = TmpDir::new("pull-depth-order");
     block_on(async {
         let base = tmp.path();
-        // A chain c1 <- c2 <- c3 <- c4 with `old` at c3 and `main` at c4, so at
-        // depth 1 `main` reaches c3 and `old` reaches c2.
+        // A chain c1 <- c2 <- c3 <- c4, with `old` at c3 and `main` at c4. At
+        // depth 1, `main` reaches c3 and `old` reaches c2.
         for (sub, marker) in [
             ("v1", "one\n"),
             ("v2", "two\n"),
@@ -672,9 +678,9 @@ fn a_deep_pull_imports_every_commits_tree() {
         .await
         .unwrap();
 
-        // The two commits differ in their root tree and share the
-        // subdirectory's, so a walk that descends into each dirtree once still
-        // has to enumerate both commits' trees whole.
+        // The two commits have different root trees and share the tree of the
+        // subdirectory. A walk that descends into each dirtree once must still
+        // list the full trees of both commits.
         let reached = src.traverse_commit(&c2, -1).await.unwrap();
         for name in &reached {
             assert!(
@@ -692,8 +698,8 @@ fn a_parent_the_source_lacks_ends_the_chain() {
     block_on(async {
         let base = tmp.path();
         let (src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
-        // Drop the parent commit object, leaving the source with a truncated
-        // history the deep pull must tolerate.
+        // Delete the parent commit object. The source then has a truncated
+        // history, and the deep pull must accept it.
         std::fs::remove_file(
             src_dir
                 .join("objects")
@@ -818,8 +824,8 @@ fn force_copy_clones_the_object_instead_of_linking() {
                 .join(&object[2..]);
             let src_meta = std::fs::symlink_metadata(&src_path).unwrap();
             let dst_meta = std::fs::symlink_metadata(&dst_path).unwrap();
-            // Both repositories are bare-user, so the mode the copy is given
-            // afresh is the mode the source object was written with.
+            // Both repositories are bare-user, so the destination gives the
+            // copy the mode that the source gave the object at its write.
             assert_eq!(
                 src_meta.permissions().mode(),
                 dst_meta.permissions().mode(),
@@ -833,8 +839,8 @@ fn force_copy_clones_the_object_instead_of_linking() {
             }
         }
 
-        // The copies read back as the objects they are named for: a bare-user
-        // object's logical metadata lives in an xattr the clone had to carry.
+        // Each copy reads back as the object of its name. A bare-user object
+        // keeps its logical metadata in an xattr, so the clone must carry it.
         let report = dst.fsck(&ostrya::FsckOptions::new()).await.unwrap();
         assert!(report.is_ok(), "fsck reported {:?}", report.errors);
     });
@@ -848,10 +854,11 @@ fn a_refused_link_imports_a_content_object_through_its_header() {
         let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::BareUser).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
 
-        // A bare-user object's logical metadata lives in `user.ostreemeta`, so
-        // its inode's own bits and xattrs say nothing about the object. Drift
-        // them apart in the source, and the destination's copy shows which of
-        // the two the import derives the inode from.
+        // A bare-user object keeps its logical metadata in `user.ostreemeta`,
+        // so the mode bits and xattrs of its inode tell nothing about the
+        // object. Change them in the source so that they differ from the
+        // logical metadata. The copy in the destination then shows which of the
+        // two the import uses for its inode.
         let content = first_regular_content(&src, &c2).await;
         let src_path = object_path(&src_dir, &content, RepoMode::BareUser);
         std::fs::set_permissions(&src_path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -874,9 +881,10 @@ fn a_refused_link_imports_a_content_object_through_its_header() {
         .await
         .unwrap();
 
-        // The import went through the object's header, so the copy carries what
-        // a commit into this repository writes: the bare-user mode derived from
-        // the logical mode, `user.ostreemeta`, and nothing of the source inode.
+        // The import used the header of the object, so the copy carries what a
+        // commit into this repository writes. That is the bare-user mode
+        // derived from the logical mode, plus `user.ostreemeta`, and nothing of
+        // the source inode.
         let dst_path = object_path(&dst_dir, &content, RepoMode::BareUser);
         let logical = src.load_file(&content.checksum).await.unwrap().mode;
         assert_eq!(
@@ -907,8 +915,8 @@ fn a_cloned_metadata_object_takes_the_destination_policy() {
         let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Bare).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Bare).await;
 
-        // The baseline: what a metadata object written into the destination
-        // carries, read off a commit made there.
+        // The baseline: the inode that a write into the destination gives a
+        // metadata object. A commit in the destination supplies it.
         build_tree(&base.join("baseline"), b"baseline\n");
         let baseline = commit_tree(&dst, base, "baseline", "baseline", None).await;
         let want = std::fs::symlink_metadata(object_path(
@@ -918,10 +926,13 @@ fn a_cloned_metadata_object_takes_the_destination_policy() {
         ))
         .unwrap();
 
-        // A metadata object carries no header, so nothing of the source inode is
-        // authoritative. Drift the source's away from what a write produces: 0600
-        // instead of 0644, a stray xattr, and a second group of the process where
-        // it has one, which a bare destination is the mode that would chown to.
+        // A metadata object carries no header, so no part of the source inode
+        // is authoritative. Make the source inode differ from what a write
+        // produces:
+        // - the mode 0600, where a write gives 0644
+        // - a stray xattr
+        // - a second group of the process, if it has one. A bare destination is
+        //   the mode that does a chown.
         let name = ostrya::ObjectName::new(c2, ostrya::ObjectType::Commit);
         let src_path = object_path(&src_dir, &name, RepoMode::Bare);
         std::fs::set_permissions(&src_path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -947,7 +958,7 @@ fn a_cloned_metadata_object_takes_the_destination_policy() {
         .await
         .unwrap();
 
-        // The clone carries the destination's own inode policy, not the source's.
+        // The clone carries the inode policy of the destination.
         let dst_path = object_path(&dst_dir, &name, RepoMode::Bare);
         let got = std::fs::symlink_metadata(&dst_path).unwrap();
         assert_eq!(
@@ -978,8 +989,9 @@ fn differing_ownership_refuses_the_link_and_writes_the_destinations_own() {
         };
         let (dst_dir, dst) = make_repo_in_group(base, "dst", RepoMode::BareUserShared, gid).await;
 
-        // The baseline: what an object written into the destination is owned by.
-        // Its group is the setgid directory's, not the process's.
+        // The baseline: the owner of an object that a write into the
+        // destination makes. Its group is the group of the setgid directory,
+        // and the group of the process differs from it.
         build_tree(&base.join("baseline"), b"baseline\n");
         let baseline = commit_tree(&dst, base, "baseline", "baseline", None).await;
         let want = std::fs::symlink_metadata(object_path(
@@ -1001,9 +1013,9 @@ fn differing_ownership_refuses_the_link_and_writes_the_destinations_own() {
         .await
         .unwrap();
 
-        // Sharing the source inode would carry the source's group into a
-        // repository whose group is the one that may repair it, so every object
-        // is written afresh instead.
+        // A shared source inode brings the group of the source into the
+        // destination. The group of the destination is the group that can
+        // repair it, so the pull writes each object as a new inode.
         let reached = src.traverse_commit(&c2, 0).await.unwrap();
         assert!(!reached.is_empty());
         for name in &reached {
@@ -1023,8 +1035,8 @@ fn differing_ownership_refuses_the_link_and_writes_the_destinations_own() {
             );
         }
 
-        // The tool is not the judge here: bare-user-shared is a mode it refuses to
-        // open at all.
+        // The `ostree` command does not check this repository, because it
+        // refuses to open a bare-user-shared repository.
         let report = dst.fsck(&ostrya::FsckOptions::new()).await.unwrap();
         assert!(report.is_ok(), "fsck reported {:?}", report.errors);
     });
@@ -1061,9 +1073,9 @@ fn a_bare_content_object_links_whatever_the_repositories_ownership() {
             let got =
                 std::fs::symlink_metadata(object_path(&dst_dir, name, RepoMode::Bare)).unwrap();
             if name.ty == ostrya::ObjectType::File {
-                // A bare content object's uid and gid come from the header its
-                // checksum covers, so the source inode is the inode a write here
-                // would have produced and the link stands.
+                // The uid and gid of a bare content object come from the header
+                // that its checksum covers. A write here produces the same inode
+                // as the source inode, so the link stands.
                 content += 1;
                 assert_eq!(
                     object_ino(&src_dir, &object),
@@ -1072,8 +1084,8 @@ fn a_bare_content_object_links_whatever_the_repositories_ownership() {
                 );
                 assert_eq!(got.gid(), own, "{name} should carry the header's group");
             } else {
-                // A metadata object carries no header, so its ownership is the
-                // writer's and the link is refused.
+                // A metadata object carries no header, so its owner is the
+                // writer, and the pull refuses the link.
                 metadata += 1;
                 assert_ne!(
                     object_ino(&src_dir, &object),
@@ -1089,9 +1101,9 @@ fn a_bare_content_object_links_whatever_the_repositories_ownership() {
         }
         assert!(content > 0 && metadata > 0);
 
-        // A bare object's inode is its metadata, so fsck recomputing each
-        // checksum is what proves the linked inodes are the ones a write here
-        // would have produced.
+        // The inode of a bare object is its metadata. fsck computes each
+        // checksum again, and this proves that the linked inodes equal the
+        // inodes that a write here produces.
         let report = dst.fsck(&ostrya::FsckOptions::new()).await.unwrap();
         assert!(report.is_ok(), "fsck reported {:?}", report.errors);
         if ostree_available() {
@@ -1118,8 +1130,9 @@ fn crossing_repository_modes_reingests_the_content() {
         .await
         .unwrap();
 
-        // The commit identity is mode-independent, so the same checksums land;
-        // the content objects are stored in the destination's own form.
+        // The commit identity does not depend on the mode, so the same
+        // checksums arrive. The destination stores the content objects in its
+        // own form.
         for name in src.traverse_commit(&c2, 0).await.unwrap() {
             assert!(dst.has_object(name.ty, &name.checksum).await.unwrap());
         }
@@ -1133,8 +1146,9 @@ fn a_bare_family_cross_mode_pull_clones_the_content() {
     let tmp = TmpDir::new("pull-bare-family");
     block_on(async {
         let base = tmp.path();
-        // A bare-user-only destination imports an object only under the name its
-        // own stored form hashes to, so the source is committed canonically.
+        // A bare-user-only destination imports an object only under the name
+        // that its own stored form hashes to, so the source commit uses
+        // canonical permissions.
         let (src_dir, src, _c1, c2) = canonical_source_repo(base, RepoMode::BareUser).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUserOnly).await;
 
@@ -1148,10 +1162,11 @@ fn a_bare_family_cross_mode_pull_clones_the_content() {
         .await
         .unwrap();
 
-        // The bare family shares a regular file's payload bytes and differs
-        // only on the inode, so the object is cloned: the bytes arrive
-        // unchanged on a fresh inode carrying the destination's policy, which
-        // for bare-user-only is the canonical mode and no xattr at all.
+        // The modes of the bare family store the same payload bytes for a
+        // regular file. They differ only on the inode, so the pull clones the
+        // object. The bytes arrive unchanged on a new inode with the policy of
+        // the destination. For bare-user-only, that policy is the canonical
+        // mode and no xattr.
         let content = first_regular_content(&src, &c2).await;
         let src_path = object_path(&src_dir, &content, RepoMode::BareUser);
         let dst_path = object_path(&dst_dir, &content, RepoMode::BareUserOnly);
@@ -1177,8 +1192,8 @@ fn a_bare_family_cross_mode_pull_clones_the_content() {
             logical & 0o755
         );
 
-        // The object reads back as the header it is named for, which is what the
-        // destination's own writer would have stored for it.
+        // The object reads back as the header of its name. That header is what
+        // the writer of the destination stores for the object.
         let landed = dst.load_file(&content.checksum).await.unwrap();
         assert_eq!((landed.uid, landed.gid), (0, 0));
         assert_eq!(landed.mode, (logical & 0o755) | 0o100000);
@@ -1197,10 +1212,10 @@ fn a_bare_user_only_destination_refuses_a_header_it_cannot_store() {
     let tmp = TmpDir::new("pull-buo-header");
     block_on(async {
         let base = tmp.path();
-        // Committed under a declared non-root owner, so every object carries a
-        // uid and gid this mode discards. A commit inheriting the running
-        // process's ids would carry 0:0 under a root test run, which is what
-        // this mode stores, and the refusal under test would not arise.
+        // The source commit declares a non-root owner, so each object carries
+        // a uid and gid that this mode discards. If the commit takes the ids of
+        // the process and the test runs as root, the objects carry 0:0. This
+        // mode stores 0:0, so the refusal under test does not occur.
         let (_src_dir, src, _c1, _c2) = owned_source_repo(base, RepoMode::BareUser).await;
         let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUserOnly).await;
 
@@ -1242,10 +1257,10 @@ fn a_symlink_object_is_shared_between_bare_user_and_bare_user_shared() {
         .await
         .unwrap();
 
-        // The two modes store a symlink object identically -- a 0644 regular
-        // file of the target plus a NUL, with the logical metadata in
-        // user.ostreemeta -- so it is hardlinked. A regular file, whose inode
-        // mode the two modes disagree on, is cloned instead.
+        // The two modes store a symlink object in the same form, so the pull
+        // hardlinks it. The form is a 0644 regular file that holds the target
+        // plus a NUL, with the logical metadata in `user.ostreemeta`. The two
+        // modes give a regular file different inode modes, so the pull clones it.
         let link = symlink_content(&src, &c2).await;
         let link_flat = link.loose_path(RepoMode::BareUser).replace('/', "");
         assert_eq!(
@@ -1297,11 +1312,11 @@ fn a_verity_destination_seals_every_imported_object() {
         .await
         .unwrap();
 
-        // bare-user stores every object as a regular file, and this destination
-        // seals every regular-file object it writes. A hardlink cannot carry that:
-        // fs-verity is a per-inode property, so sealing a shared inode would seal
-        // the source's copy. Every object therefore arrives on a fresh inode,
-        // sealed, and the source is left as it was.
+        // bare-user stores each object as a regular file, and this destination
+        // seals each regular-file object that it writes. A hardlink cannot
+        // carry that seal. fs-verity is a property of an inode, so a seal on a
+        // shared inode also seals the copy of the source. As a result, each
+        // object arrives sealed on a new inode, and the source stays unchanged.
         let names = object_names(&dst_dir);
         assert!(!names.is_empty(), "the pull imported nothing");
         for flat in &names {
@@ -1333,24 +1348,26 @@ fn a_bare_split_xattrs_destination_is_refused() {
     block_on(async {
         let base = tmp.path();
         let (_src_dir, src, _c1, _c2) = source_repo(base, RepoMode::BareUser).await;
-        // A branch whose tree is one regular file, so the only content object a
-        // full pull of it imports is one the clone path serves. `main` holds a
-        // symlink too, which a bare-user source and this destination store
-        // differently, and that would be refused by the re-ingest instead.
+        // A branch whose tree is one regular file. The only content object that
+        // a full pull of it imports is then an object of the clone path. `main`
+        // also holds a symlink, which a bare-user source and this destination
+        // store in different forms. In a full pull of `main`, the re-ingest
+        // path for that symlink can give the refusal, so `main` does not
+        // isolate the clone path.
         std::fs::create_dir(base.join("flat")).unwrap();
         std::fs::write(base.join("flat/only.txt"), b"only\n").unwrap();
         commit_tree(&src, base, "flat", "flat", None).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareSplitXattrs).await;
 
-        // Both import paths reach the destination, and each tests its mode before
-        // it touches the source. The link path serves every metadata object and
-        // every same-mode content object; the clone path serves a content object
-        // whose payload the two modes share, which bare-user and
-        // bare-split-xattrs do. Neither writes the `.file-xattrs` and
-        // `.file-xattrs-link` sidecars this mode needs, so the destination refuses
-        // the import the way the rest of the write surface refuses the mode. A
-        // commit-only pull isolates the link path; a full pull of `flat` reaches
-        // the clone path.
+        // Both import paths reach the destination, and each checks the mode of
+        // the destination before it touches the source. The link path serves
+        // each metadata object and each same-mode content object. The clone
+        // path serves a content object whose payload the two modes share, as
+        // bare-user and bare-split-xattrs do. Neither path writes the
+        // `.file-xattrs` and `.file-xattrs-link` sidecars that this mode needs,
+        // so the destination refuses the import. The rest of the write surface
+        // refuses the mode in the same way. A commit-only pull isolates the link
+        // path, and a full pull of `flat` reaches the clone path.
         for (ref_name, flags) in [("main", PullFlags::COMMIT_ONLY), ("flat", PullFlags::NONE)] {
             let err = dst
                 .pull_local(
@@ -1379,11 +1396,12 @@ fn a_read_only_file_imports_on_every_path() {
     let tmp = TmpDir::new("pull-readonly");
     block_on(async {
         let base = tmp.path();
-        // A tree whose file has no owner-write bit, which is ordinary in a system
-        // tree. In bare-user the logical metadata lives in a `user.ostreemeta`
-        // xattr the kernel checks against the inode's write permission, so every
-        // path that applies the destination's inode policy has to set the xattr
-        // before the mode drops that bit.
+        // The tree holds a file with no owner-write bit. Such a file is common
+        // in a system tree. In bare-user, the logical metadata is in a
+        // `user.ostreemeta` xattr, and the kernel checks the write permission of
+        // the inode for that xattr. As a result, each path that applies the
+        // inode policy of the destination must set the xattr before the mode
+        // removes that bit.
         let tree = base.join("ro");
         std::fs::create_dir_all(&tree).unwrap();
         std::fs::write(tree.join("ro.txt"), b"read only\n").unwrap();
@@ -1399,7 +1417,7 @@ fn a_read_only_file_imports_on_every_path() {
         let content = first_regular_content(&src, &commit).await;
         let object = content.loose_path(RepoMode::BareUser).replace('/', "");
 
-        // The link path shares the source's read-only inode.
+        // The link path shares the read-only inode of the source.
         let (link_dir, link_dst) = make_repo(base, "link", RepoMode::BareUser).await;
         pull_main(&link_dst, &src, PullFlags::NONE).await;
         assert_eq!(
@@ -1408,7 +1426,7 @@ fn a_read_only_file_imports_on_every_path() {
             "the link path shares the inode"
         );
 
-        // The clone path applies the destination's own inode policy.
+        // The clone path applies the inode policy of the destination.
         let (copy_dir, copy_dst) = make_repo(base, "copy", RepoMode::BareUser).await;
         pull_main(&copy_dst, &src, PullFlags::FORCE_COPY).await;
         assert_ne!(
@@ -1417,7 +1435,8 @@ fn a_read_only_file_imports_on_every_path() {
             "force_copy writes a fresh inode"
         );
 
-        // Crossing the archive boundary writes the object through the ingest path.
+        // A pull from an archive source writes the object through the ingest
+        // path.
         let (ingest_dir, ingest_dst) = make_repo(base, "ingest", RepoMode::BareUser).await;
         pull_main(&ingest_dst, &archive, PullFlags::NONE).await;
 
@@ -1451,9 +1470,9 @@ fn a_shared_import_debits_no_free_space() {
     block_on(async {
         let base = tmp.path();
         let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::BareUser).await;
-        // The whole filesystem is reserved, so the pull has no room for a single
-        // freshly allocated block. Every object of a same-mode pull is
-        // hardlinked, which allocates none.
+        // The config reserves the whole file system, so the pull has no room
+        // for one new block. A same-mode pull hardlinks each object, and a
+        // hardlink allocates no block.
         let (dst_dir, dst) = zero_budget_repo(base, "dst", RepoMode::BareUser).await;
 
         let stats = dst
@@ -1477,11 +1496,12 @@ fn a_shared_import_debits_no_free_space() {
                 "{name} should share the source inode"
             );
         }
-        // The stats count the storage the imported objects occupy, which the
-        // shared inodes hold whatever the budget said.
+        // The stats count the storage that the imported objects use. The shared
+        // inodes hold that storage, whatever the budget is.
         assert!(stats.content_bytes_written > 0);
-        // A hardlinked object's payload is never written, so the figure the
-        // tool reports as the content written is zero.
+        // The pull never writes the payload of a hardlinked object, so the
+        // figure that the `ostree` command reports as the content written is
+        // zero.
         assert_eq!(stats.content_bytes_unpacked, 0);
         assert!(!has_partial_marker(&dst_dir, &c2));
     });
@@ -1493,9 +1513,10 @@ fn a_reingested_import_debits_the_free_space_budget() {
     block_on(async {
         let base = tmp.path();
         let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::BareUser).await;
-        // Archive stores a regular file's payload in a framed, deflated form the
-        // bare family does not share, so each content object is written afresh
-        // and charged against the budget the reserve leaves at zero.
+        // Archive stores the payload of a regular file in a framed, deflated
+        // form that the bare family does not share. The pull writes each content
+        // object as a new file and charges it against the budget, which the
+        // reserve keeps at zero.
         let (dst_dir, dst) = zero_budget_repo(base, "dst", RepoMode::Archive).await;
 
         let err = dst
@@ -1548,13 +1569,14 @@ fn commit_metadata_only_leaves_the_commit_partial() {
             vec![format!("{}.commit", c2.to_hex())]
         );
         assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Partial);
-        // The marker the tool writes for a pull is zero-length, unlike fsck's.
+        // The marker that the `ostree` command writes for a pull is
+        // zero-length. The marker of fsck holds a state byte.
         let marker = dst_dir
             .join("state")
             .join(format!("{}.commitpartial", c2.to_hex()));
         assert_eq!(std::fs::metadata(&marker).unwrap().len(), 0);
 
-        // Completing the pull imports the rest and clears the marker.
+        // A complete pull imports the remaining objects and removes the marker.
         dst.pull_local(
             &src,
             PullOptions {
@@ -1575,7 +1597,7 @@ fn a_failed_pull_publishes_nothing_and_clears_the_marker() {
     block_on(async {
         let base = tmp.path();
         let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
-        // Delete one content object the tip commit reaches.
+        // Delete one content object that the tip commit reaches.
         let content = src
             .traverse_commit(&c2, 0)
             .await
@@ -1601,8 +1623,8 @@ fn a_failed_pull_publishes_nothing_and_clears_the_marker() {
 
         assert!(object_names(&dst_dir).is_empty());
         assert!(dst.resolve_rev("main", true).await.unwrap().is_none());
-        // The commit was never published, so the marker the pull wrote for it
-        // goes with the objects the transaction discarded.
+        // The pull did not publish the commit, so its marker goes away with the
+        // objects that the transaction discarded.
         assert!(!has_partial_marker(&dst_dir, &c2));
     });
 }
@@ -1620,7 +1642,7 @@ fn a_pull_leaves_an_fsck_marker_as_it_found_it() {
         };
         dst.pull_local(&src, opts()).await.unwrap();
 
-        // One content object removed from the destination, so fsck marks the
+        // Remove one content object from the destination, so fsck marks the
         // commit partial with its own state byte.
         let content = dst
             .traverse_commit(&c2, 0)
@@ -1638,13 +1660,15 @@ fn a_pull_leaves_an_fsck_marker_as_it_found_it() {
             .join(format!("{}.commitpartial", c2.to_hex()));
         assert_eq!(std::fs::read(&marker).unwrap(), b"f");
 
-        // The same object removed from the source, so the repair pull marks the
-        // commit it already found partial and then fails on the missing object.
+        // Remove the same object from the source. The repair pull then marks
+        // the commit, which it finds partial already, and fails on the missing
+        // object.
         std::fs::remove_file(src_dir.join("objects").join(&object)).unwrap();
         let err = dst.pull_local(&src, opts()).await.unwrap_err();
         assert!(matches!(err, Error::ObjectNotFound { .. }));
 
-        // fsck's state byte survives: the pull does not rewrite a marker it finds.
+        // The state byte of fsck stays, because the pull does not rewrite a
+        // marker that it finds.
         assert_eq!(std::fs::read(&marker).unwrap(), b"f");
     });
 }
@@ -1657,10 +1681,10 @@ fn untrusted_rejects_a_corrupt_source_object() {
     block_on(async {
         let base = tmp.path();
         let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::BareUser).await;
-        // A regular file with a payload: flipping a payload byte leaves the
-        // object decodable and changes only what it hashes to. A symlink
-        // object, stored in bare-user as its target plus a NUL, would instead
-        // fail to decode.
+        // Use a regular file with a payload. A changed payload byte keeps the
+        // object decodable and changes only its checksum. bare-user stores a
+        // symlink object as its target plus a NUL, and a changed byte in such
+        // an object makes the decode fail.
         let content = first_regular_content(&src, &c2).await;
         let path = src_dir
             .join("objects")
@@ -1669,8 +1693,9 @@ fn untrusted_rejects_a_corrupt_source_object() {
         bytes[0] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
 
-        // Trusted: the object is linked without being read, so the corruption
-        // travels, matching the tool.
+        // Trusted: the pull links the object and does not read it, so the
+        // corruption goes to the destination. The `ostree` command does the
+        // same.
         let (_trusted_dir, trusted) = make_repo(base, "trusted", RepoMode::BareUser).await;
         trusted
             .pull_local(
@@ -1689,7 +1714,7 @@ fn untrusted_rejects_a_corrupt_source_object() {
                 .unwrap()
         );
 
-        // Untrusted: every object is read first, so the pull fails.
+        // Untrusted: the pull reads each object first, so it fails.
         let (untrusted_dir, untrusted) = make_repo(base, "untrusted", RepoMode::BareUser).await;
         let err = untrusted
             .pull_local(
@@ -1722,9 +1747,9 @@ fn a_cross_mode_clone_is_trusted_and_untrusted_verifies_it() {
         bytes[0] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
 
-        // A bare-family clone moves the payload without hashing it, so a
-        // trusted pull carries the corruption across modes exactly as the
-        // same-mode link does; a re-ingest would have caught it.
+        // A bare-family clone moves the payload and does not hash it, so a
+        // trusted pull carries the corruption across modes. The same-mode link
+        // does the same. A re-ingest catches the corruption.
         let (trusted_dir, trusted) = make_repo(base, "trusted", RepoMode::BareUserShared).await;
         trusted
             .pull_local(
@@ -1746,7 +1771,7 @@ fn a_cross_mode_clone_is_trusted_and_untrusted_verifies_it() {
             bytes
         );
 
-        // UNTRUSTED reads the object once, ahead of the clone, and rejects it.
+        // `UNTRUSTED` reads the object once, before the clone, and rejects it.
         let (untrusted_dir, untrusted) =
             make_repo(base, "untrusted", RepoMode::BareUserShared).await;
         let err = untrusted
@@ -1780,11 +1805,12 @@ fn a_reingest_rejects_a_corrupt_payload_with_or_without_untrusted() {
         bytes[0] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
 
-        // Archive stores a regular file's payload in a framed, deflated form the
-        // bare family shares nothing with, so the object crosses on the re-ingest
-        // path, which hashes it as it streams and compares the result against its
-        // name. The corruption is rejected there with or without UNTRUSTED, which
-        // is what lets the flag skip its own read of an object bound for this path.
+        // Archive stores the payload of a regular file in a framed, deflated
+        // form that the bare family does not share. As a result, the object
+        // crosses on the re-ingest path. That path hashes the object as it streams and
+        // compares the result with the name. It rejects the corruption with or
+        // without `UNTRUSTED`. For this reason, the flag can skip its own read
+        // of an object that goes to this path.
         for flags in [PullFlags::NONE, PullFlags::UNTRUSTED] {
             let (dst_dir, dst) =
                 make_repo(base, &format!("dst-{}", flags.bits()), RepoMode::Archive).await;
@@ -1814,8 +1840,9 @@ fn untrusted_rejects_a_corrupt_metadata_object() {
     block_on(async {
         let base = tmp.path();
         let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
-        // Edit the commit's subject in place: the object still parses, so the
-        // pull reaches the checksum check rather than failing on the decode.
+        // Change the subject of the commit in place. The object still parses,
+        // so the pull gets to the checksum verification and does not fail on
+        // the decode.
         let path = src_dir.join("objects").join(
             ostrya::ObjectName::new(c2, ostrya::ObjectType::Commit).loose_path(RepoMode::Archive),
         );
@@ -1845,8 +1872,9 @@ fn untrusted_rejects_a_corrupt_metadata_object() {
             "unexpected error: {err}"
         );
 
-        // Trusted, the metadata object is linked without being read, matching
-        // the tool: the corruption travels.
+        // Trusted: the pull links the metadata object and does not read it, so
+        // the corruption goes to the destination. The `ostree` command does the
+        // same.
         let (_trusted_dir, trusted) = make_repo(base, "trusted", RepoMode::Archive).await;
         trusted
             .pull_local(
@@ -1873,7 +1901,8 @@ fn a_ref_binding_that_omits_the_pulled_ref_is_rejected() {
     block_on(async {
         let base = tmp.path();
         let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
-        // A second name for the same commit, which its binding does not list.
+        // Add a second ref for the same commit. The binding of the commit does
+        // not list that ref.
         src.set_ref_immediate("other", Some(&c2)).await.unwrap();
 
         let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
@@ -1986,7 +2015,7 @@ fn bareuseronly_files_rejects_a_world_writable_mode() {
         assert!(err.to_string().contains("invalid mode"));
 
         // A bare-user-only destination refuses the same object without the flag,
-        // under its own rule: that mode cannot store this mode's bits.
+        // under its own rule. That mode cannot store the mode bits of this file.
         let (_buo_dir, buo) = make_repo(base, "buo", RepoMode::BareUserOnly).await;
         let err = buo
             .pull_local(
@@ -2000,7 +2029,7 @@ fn bareuseronly_files_rejects_a_world_writable_mode() {
             .unwrap_err();
         assert!(matches!(err, Error::Pull(_)), "{err}");
 
-        // Without the flag, an archive destination takes it.
+        // Without the flag, an archive destination accepts the object.
         let (_plain_dir, plain) = make_repo(base, "plain", RepoMode::Archive).await;
         plain
             .pull_local(
@@ -2052,8 +2081,8 @@ fn detached_metadata_travels_with_the_commit() {
     });
 }
 
-/// An `a{sv}` of two properties: one a signature stands in for, one the
-/// repository keeps to itself.
+/// Returns an `a{sv}` with two properties: a stand-in for a signature, and a
+/// property that the repository keeps local.
 fn two_property_metadata() -> Value {
     let entry = |key: &str, value: &str| {
         Value::Tuple(vec![
@@ -2070,7 +2099,8 @@ fn two_property_metadata() -> Value {
     ])
 }
 
-/// The value of one property of a stored commit's detached metadata.
+/// Returns the value of one property of the stored detached metadata of a
+/// commit.
 async fn detached_property(repo: &Repo, commit: &Checksum, key: &str) -> Option<Value> {
     repo.read_commit_detached_metadata(commit)
         .await
@@ -2119,7 +2149,8 @@ fn a_filter_drops_the_properties_it_skips_and_keeps_the_rest() {
             None,
             "a skipped property is not"
         );
-        // The source keeps what it had: the filter shapes what is stored here.
+        // The source stays unchanged. The filter changes only what the
+        // destination stores.
         assert_eq!(
             src.read_commit_detached_metadata(&c2).await.unwrap(),
             Some(two_property_metadata())
@@ -2193,10 +2224,10 @@ fn a_filter_that_skips_everything_stores_nothing() {
     });
 }
 
-/// A pull whose commit fails at the step that writes detached metadata and
-/// refs, because a guard holds the update lock, keeps the marker of the
-/// commit it published and writes no `.commitmeta` and no ref. The next pull
-/// completes the commit, its detached metadata included.
+/// A guard holds the update lock, so the pull fails at the step that writes
+/// detached metadata and refs. The pull keeps the marker of the commit that it
+/// published, and writes no `.commitmeta` and no ref. The next pull completes
+/// the commit and its detached metadata.
 #[test]
 fn a_pull_that_times_out_at_the_ref_step_keeps_its_markers() {
     let tmp = TmpDir::new("pull-ref-step-timeout");
@@ -2244,10 +2275,10 @@ fn a_pull_that_times_out_at_the_ref_step_keeps_its_markers() {
     });
 }
 
-/// A pull into one handle of a repository whose other handle holds a guard
-/// publishes its objects and waits at the step that writes detached metadata
-/// and refs. With `lock-timeout-secs=-1` it completes that step once the guard
-/// is finished.
+/// One handle of a repository holds a guard, and a pull runs into a second
+/// handle. The pull publishes its objects and waits at the step that writes
+/// detached metadata and refs. With `lock-timeout-secs=-1`, it completes that
+/// step after the guard finishes.
 #[test]
 fn a_pull_under_a_guard_publishes_its_objects_and_waits_at_the_ref_step() {
     let tmp = TmpDir::new("pull-under-guard");
@@ -2297,9 +2328,9 @@ fn a_pull_under_a_guard_publishes_its_objects_and_waits_at_the_ref_step() {
     });
 }
 
-/// `DetachedMetadataFilter::excluding` is the constructor the `ostrya` CLI
-/// builds from `[ex-ostrya] detached-metadata-exclude`. It drops the properties
-/// the list names and keeps every other one.
+/// `DetachedMetadataFilter::excluding` is the constructor that the `ostrya`
+/// CLI uses for `[ex-ostrya] detached-metadata-exclude`. The filter drops the
+/// properties that the list names and keeps each other property.
 #[test]
 fn an_exclude_list_drops_the_named_properties_and_keeps_the_rest() {
     let tmp = TmpDir::new("pull-detached-exclude");
@@ -2338,8 +2369,9 @@ fn an_exclude_list_drops_the_named_properties_and_keeps_the_rest() {
     });
 }
 
-/// An empty exclude list is the absent-key case the CLI turns into the default
-/// filter. Built directly it keeps every property all the same.
+/// The CLI treats an empty exclude list as an absent key and uses the default
+/// filter. A filter built directly from an empty list also keeps each
+/// property.
 #[test]
 fn an_empty_exclude_list_keeps_every_property() {
     let tmp = TmpDir::new("pull-detached-exclude-empty");
@@ -2370,8 +2402,8 @@ fn an_empty_exclude_list_keeps_every_property() {
     });
 }
 
-/// A filter allowing no property leaves the destination's own `.commitmeta`
-/// where it stands, which is what a source holding none does.
+/// A filter that allows no property keeps the `.commitmeta` of the
+/// destination. A source that holds no `.commitmeta` has the same result.
 #[test]
 fn a_filter_that_skips_everything_keeps_the_destinations_own_metadata() {
     let tmp = TmpDir::new("pull-detached-filter-skip-keep");
@@ -2399,7 +2431,7 @@ fn a_filter_that_skips_everything_keeps_the_destinations_own_metadata() {
             .unwrap();
         let before = std::fs::read(commitmeta_path(&dst_dir, &c2)).unwrap();
 
-        // A callback the caller holds, which is what `from_fn` takes.
+        // `from_fn` takes a callback that the caller holds.
         let skip: DetachedMetadataFilterFn =
             std::sync::Arc::new(|_: &Checksum, _: &str, _: &Value| FilterResult::Skip);
         dst.pull_local(
@@ -2421,7 +2453,7 @@ fn a_filter_that_skips_everything_keeps_the_destinations_own_metadata() {
     });
 }
 
-/// An `a{sv}` of one string property.
+/// Returns an `a{sv}` with one string property.
 fn dict_of(key: &str, value: &str) -> Value {
     Value::Array(vec![Value::Tuple(vec![
         Value::Str(key.to_owned()),
@@ -2444,7 +2476,8 @@ fn the_filter_sees_the_commit_it_is_filtering_for() {
                 .unwrap();
         }
 
-        // Only the tip's private property is dropped; the parent keeps its own.
+        // The filter drops the private property of the tip only. The parent
+        // keeps its private property.
         let tip = c2;
         let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
         dst.pull_local(
@@ -2482,7 +2515,8 @@ fn a_localcache_repo_supplies_an_object_the_source_lacks() {
         let base = tmp.path();
         let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
 
-        // A cache holding everything, and a source missing one content object.
+        // The cache holds all objects, and the source lacks one content
+        // object.
         let (_cache_dir, cache) = make_repo(base, "cache", RepoMode::Archive).await;
         cache
             .pull_local(
@@ -2531,8 +2565,8 @@ fn a_localcache_supplied_dirtree_is_descended_into() {
         let base = tmp.path();
         let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
 
-        // A cache holding everything, and a source missing the subdirectory's
-        // dirtree, so what lies under it can only be named through the cache.
+        // The cache holds all objects, and the source lacks the dirtree of the
+        // subdirectory. Only the cache can then name the objects under it.
         let (_cache_dir, cache) = make_repo(base, "cache", RepoMode::Archive).await;
         cache
             .pull_local(
@@ -2560,8 +2594,8 @@ fn a_localcache_supplied_dirtree_is_descended_into() {
         .await
         .unwrap();
 
-        // The whole tree arrives, the content under the cache-supplied dirtree
-        // included, and the published commit is complete.
+        // The full tree arrives, with the content under the dirtree from the
+        // cache, and the published commit is complete.
         let reached = cache.traverse_commit(&c2, 0).await.unwrap();
         for name in &reached {
             assert!(
@@ -2574,8 +2608,9 @@ fn a_localcache_supplied_dirtree_is_descended_into() {
         assert!(!has_partial_marker(&dst_dir, &c2));
         assert_eq!(dst.resolve_rev("main", false).await.unwrap(), Some(c2));
 
-        // With no cache to name them, the objects under the missing dirtree
-        // cannot be reached and the pull fails rather than publishing the hole.
+        // Without a cache, no repository names the objects under the missing
+        // dirtree. The pull cannot reach them, so it fails and publishes no
+        // commit with a hole.
         let (bare_dir, bare) = make_repo(base, "dst2", RepoMode::Archive).await;
         let err = bare
             .pull_local(
@@ -2593,7 +2628,7 @@ fn a_localcache_supplied_dirtree_is_descended_into() {
     });
 }
 
-// --- interop with the tool ----------------------------------------------
+// --- interop with the ostree command ------------------------------------
 
 #[test]
 fn pulls_from_a_tool_built_repository_and_the_tool_reads_the_result() {
@@ -2638,8 +2673,8 @@ fn pulls_from_a_tool_built_repository_and_the_tool_reads_the_result() {
             .unwrap();
 
             let dst_arg = format!("--repo={}", dst_dir.display());
-            // The tool resolves the ref, reads the tree, and validates every
-            // object the port imported.
+            // The `ostree` command resolves the ref, reads the tree, and
+            // verifies each object that ostrya imported.
             let resolved = String::from_utf8(ostree(&[&dst_arg, "rev-parse", "main"])).unwrap();
             assert_eq!(resolved.trim(), tip, "{name}");
             ostree(&[&dst_arg, "fsck"]);
@@ -2663,11 +2698,12 @@ fn the_tool_validates_a_bare_family_cross_mode_clone() {
         let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Bare).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
 
-        // bare and bare-user share a regular file's payload and disagree on the
-        // inode, so every regular file crosses on the clone path. The tool is
-        // the judge of what the destination's inode policy produced: fsck
-        // recomputes each object's checksum from the stored form, which for
-        // bare-user means the payload plus the user.ostreemeta the clone wrote.
+        // bare and bare-user store the same payload for a regular file and
+        // differ on the inode, so each regular file crosses on the clone path.
+        // The `ostree` command checks the result of the inode policy of the
+        // destination. Its fsck computes the checksum of each object again from
+        // the stored form. For bare-user, that form is the payload plus the
+        // `user.ostreemeta` that the clone wrote.
         dst.pull_local(
             &src,
             PullOptions {
@@ -2714,16 +2750,17 @@ fn the_tool_pulls_from_a_repository_the_port_wrote() {
 
 // --- signature verification ----------------------------------------------
 
-/// The fixed ed25519 keypair the signed sources sign with.
+/// The fixed ed25519 keypair that signs the signed sources.
 const SECRET_B64: &str =
     "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
 const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
-/// A second public key, standing for one the destination does not trust.
+/// A second public key, which stands for a key that the destination does not
+/// trust.
 const OTHER_PUBLIC_B64: &str = "8+dqdDZWIesQQO95CRCSoSm2543BNK7FgOVwPyuUquU=";
 
-/// A destination repository under `base/dst` whose config names the remote
-/// `origin`, with the `[remote]` keys `extra` supplies. A local pull reads no
-/// URL, so the section states the verification policy alone.
+/// Creates a destination repository under `base/dst` with the remote `origin`
+/// in its config. The `[remote]` section gets the keys of `extra`. A local
+/// pull reads no URL, so the section states only the verification policy.
 async fn dest_with_remote(base: &Path, extra: &str) -> Repo {
     let (path, repo) = make_repo(base, "dst", RepoMode::Archive).await;
     drop(repo);
@@ -2736,7 +2773,7 @@ async fn dest_with_remote(base: &Path, extra: &str) -> Repo {
     Repo::open(&path).await.unwrap()
 }
 
-/// Pull `main` from `src` into `dst` with the options `opts` supplies.
+/// Pulls `main` from `src` into `dst` with the options of `opts`.
 async fn pull_main_with(dst: &Repo, src: &Repo, opts: PullOptions) -> Result<(), Error> {
     dst.pull_local(
         src,
@@ -2749,9 +2786,10 @@ async fn pull_main_with(dst: &Repo, src: &Repo, opts: PullOptions) -> Result<(),
     .map(|_| ())
 }
 
-/// A local pull checks nothing unless it is asked to, even where the remote it
-/// writes its refs under asks for GPG verification. This is what the tool's
-/// `pull-local` does: the checks are its own flags, not the remote's config.
+/// A local pull verifies nothing by default. This is also true if the remote
+/// for its refs sets `gpg-verify` and `sign-verify`. `ostree pull-local` does
+/// the same: only its own flags turn on a verification, and the remote config
+/// does not.
 #[test]
 fn a_local_pull_checks_nothing_by_default() {
     let tmp = TmpDir::new("pull-local-verify-default");
@@ -2777,9 +2815,9 @@ fn a_local_pull_checks_nothing_by_default() {
     });
 }
 
-/// A local pull asked to check reads the keys from the remote it names: the
-/// source's signed commits pass under the key that signed them, and the same
-/// pull under another key is refused with nothing imported.
+/// If a local pull must verify, it reads the keys from the remote that it
+/// names. The signed commits of the source pass under the key that signed
+/// them. Under another key, the pull fails and imports nothing.
 #[test]
 fn a_local_pull_checks_the_commits_when_asked() {
     let tmp = TmpDir::new("pull-local-verify-asked");
@@ -2827,9 +2865,9 @@ fn a_local_pull_checks_the_commits_when_asked() {
     });
 }
 
-/// The filter runs after the signature check, over the metadata the source
-/// holds, so a filter that drops the signature does not defeat the verification
-/// the pull was asked for. The commit that is stored then carries none.
+/// The filter runs after the signature verification, on the metadata of the
+/// source. As a result, a filter that drops the signature cannot stop the
+/// verification. The stored commit then carries no signature.
 #[test]
 fn the_filter_runs_after_the_signature_check() {
     let tmp = TmpDir::new("pull-local-filter-after-verify");
@@ -2866,8 +2904,9 @@ fn the_filter_runs_after_the_signature_check() {
     });
 }
 
-/// The summary check reads the source repository's own `summary` and
-/// `summary.sig`, and a source publishing no signature is refused by name.
+/// The summary verification reads the `summary` and `summary.sig` of the
+/// source repository. If the source publishes no signature, the error names
+/// the missing file.
 #[test]
 fn a_local_pull_checks_the_source_summary_when_asked() {
     let tmp = TmpDir::new("pull-local-verify-summary");
@@ -2908,10 +2947,11 @@ fn a_local_pull_checks_the_source_summary_when_asked() {
     });
 }
 
-/// A local pull checks the detached metadata it leaves in place. A source
-/// holding no `.commitmeta` leaves this repository's own alone, so the stored
-/// signature is what the check reads; a source holding the zero-length "no
-/// metadata" marker replaces it, so that pull is refused.
+/// A local pull verifies the detached metadata that it keeps in place. If the
+/// source holds no `.commitmeta`, the pull keeps the `.commitmeta` of the
+/// destination and verifies that stored signature. If the source holds the
+/// zero-length "no metadata" marker, the marker replaces the signature, so the
+/// pull fails.
 #[test]
 fn a_local_pull_checks_the_metadata_it_leaves_in_place() {
     let tmp = TmpDir::new("pull-local-verify-stored-meta");
@@ -2940,8 +2980,8 @@ fn a_local_pull_checks_the_metadata_it_leaves_in_place() {
                 .is_some()
         );
 
-        // The source drops both signatures, file and all. The destination's own
-        // copies stay in place, so the second pull passes on them.
+        // Delete the two signature files from the source. The copies in the
+        // destination stay, so the second pull passes with them.
         for commit in [c1, c2] {
             let hex = commit.to_hex();
             let path = src_path
@@ -2958,8 +2998,8 @@ fn a_local_pull_checks_the_metadata_it_leaves_in_place() {
                 .is_some()
         );
 
-        // The source now holds the zero-length marker, which the pull would copy
-        // over the destination's signature, so it is refused instead.
+        // The source now holds the zero-length marker. A copy of it replaces
+        // the signature of the destination, so the pull fails.
         src.write_commit_detached_metadata(&c2, None).await.unwrap();
         let err = pull_main_with(&dst, &src, asked).await.unwrap_err();
         assert!(
@@ -2969,9 +3009,9 @@ fn a_local_pull_checks_the_metadata_it_leaves_in_place() {
     });
 }
 
-/// The keys of every check come from a remote's configuration, so a pull that
-/// asks for one and names no remote is refused before the source is read. The
-/// tool refuses the same combination.
+/// The keys of each verification come from the config of a remote. If a pull
+/// sets a verification and names no remote, it fails before it reads the
+/// source. The `ostree` command refuses the same combination.
 #[test]
 fn a_check_without_a_remote_name_is_refused() {
     let tmp = TmpDir::new("pull-local-verify-no-remote");
@@ -3001,11 +3041,11 @@ fn a_check_without_a_remote_name_is_refused() {
     });
 }
 
-/// The durability options change the sync calls of a pull and no byte it
-/// writes: a pull under each combination of the two stores the same objects,
-/// the same refs, and reports the same statistics, whether the objects are
-/// linked (`archive` to `archive`) or re-ingested (`archive` to `bare-user`).
-/// The sync calls themselves are read under `strace` by the CLI tests.
+/// The durability options change the sync calls of a pull and no byte that it
+/// writes. Each combination of the two options gives the same objects, the
+/// same refs, and the same statistics. This is true for linked objects
+/// (`archive` to `archive`) and for re-ingested objects (`archive` to
+/// `bare-user`). The CLI tests read the sync calls under `strace`.
 #[test]
 fn pull_local_durability_options_change_no_byte() {
     let tmp = TmpDir::new("pull-durability");
@@ -3031,7 +3071,8 @@ fn pull_local_durability_options_change_no_byte() {
                     )
                     .await
                     .unwrap();
-                // The elapsed time is the one figure a rerun changes.
+                // The elapsed time is the only figure that a second run
+                // changes.
                 let seen = (
                     file_inventory(&dst_dir, "objects"),
                     dst.list_refs(None).await.unwrap(),
@@ -3053,7 +3094,7 @@ fn pull_local_durability_options_change_no_byte() {
     });
 }
 
-/// A local pull takes no subpath: it refuses the option before it reads the
+/// A local pull takes no subpath. It refuses the option before it reads the
 /// source, and imports nothing.
 #[test]
 fn a_local_pull_refuses_subpaths() {
@@ -3079,8 +3120,8 @@ fn a_local_pull_refuses_subpaths() {
     });
 }
 
-/// A depth below -1 is refused before the source is read, and nothing is
-/// imported.
+/// A local pull refuses a depth less than -1 before it reads the source, and
+/// imports nothing.
 #[test]
 fn a_local_pull_refuses_a_depth_below_minus_one() {
     let tmp = TmpDir::new("pull-depth-refused");
@@ -3114,8 +3155,8 @@ fn a_local_pull_refuses_a_depth_below_minus_one() {
 
 // --- static deltas -------------------------------------------------------
 
-/// Generate a delta in `repo` with a fixed timestamp under `opts`, and return
-/// its directory.
+/// Generates a delta in `repo` with a fixed timestamp under `opts`, and
+/// returns its directory.
 async fn delta_with(
     repo: &Repo,
     from: Option<&Checksum>,
@@ -3136,7 +3177,7 @@ async fn delta_with(
     repo.path().join(dir)
 }
 
-/// Regenerate the summary of `repo` with a fixed timestamp.
+/// Regenerates the summary of `repo` with a fixed timestamp.
 async fn summarize(repo: &Repo) {
     repo.regenerate_summary(&SummaryOptions {
         last_modified: Some(FIXED_TS),
@@ -3146,9 +3187,9 @@ async fn summarize(repo: &Repo) {
     .unwrap();
 }
 
-/// An archive source as [`source_repo`] holding the from-scratch delta to the
-/// second commit, its index, and a summary. Returns what [`source_repo`]
-/// returns and the delta's directory.
+/// Creates an archive source as [`source_repo`] does, with the from-scratch
+/// delta to the second commit, its index, and a summary. Returns the values of
+/// [`source_repo`] and the directory of the delta.
 async fn delta_source(base: &Path) -> (PathBuf, Repo, Checksum, Checksum, PathBuf) {
     let (path, repo, c1, c2) = source_repo(base, RepoMode::Archive).await;
     let dir = delta_with(&repo, None, &c2, DeltaOptions::default()).await;
@@ -3157,7 +3198,7 @@ async fn delta_source(base: &Path) -> (PathBuf, Repo, Checksum, Checksum, PathBu
     (path, repo, c1, c2, dir)
 }
 
-/// The options of a pull of `main` that requires static deltas.
+/// Returns the options of a pull of `main` that requires static deltas.
 fn required(flags: PullFlags) -> PullOptions {
     PullOptions {
         refs: vec!["main".to_owned()],
@@ -3167,8 +3208,8 @@ fn required(flags: PullFlags) -> PullOptions {
     }
 }
 
-/// A destination under `base/<name>` holding `commit` of `src` complete, with
-/// no ref.
+/// Creates a destination under `base/<name>` that holds `commit` of `src`
+/// complete, with no ref.
 async fn dst_holding(base: &Path, name: &str, src: &Repo, commit: &Checksum) -> (PathBuf, Repo) {
     let (path, dst) = make_repo(base, name, RepoMode::BareUser).await;
     dst.pull_local(
@@ -3188,7 +3229,7 @@ async fn dst_holding(base: &Path, name: &str, src: &Repo, commit: &Checksum) -> 
     (path, dst)
 }
 
-/// The size of each file under `dir`, added up.
+/// Returns the sum of the sizes of the files under `dir`.
 fn tree_size(dir: &Path) -> u64 {
     let mut total = 0;
     for entry in std::fs::read_dir(dir).unwrap().flatten() {
@@ -3202,7 +3243,7 @@ fn tree_size(dir: &Path) -> u64 {
     total
 }
 
-/// Assert that a failed pull left `dst` with no ref, no object, and no marker
+/// Asserts that a failed pull left `dst` with no ref, no object, and no marker
 /// for `commit`.
 async fn assert_nothing_left(dst_dir: &Path, dst: &Repo, commit: &Checksum) {
     assert!(dst.list_refs(None).await.unwrap().is_empty());
@@ -3210,8 +3251,8 @@ async fn assert_nothing_left(dst_dir: &Path, dst: &Repo, commit: &Checksum) {
     assert!(!has_partial_marker(dst_dir, commit));
 }
 
-/// By default a local pull reads no delta: a source whose delta tree is corrupt
-/// and unreadable pulls as it does with deltas disabled.
+/// By default, a local pull reads no delta. A source with a corrupt and
+/// unreadable delta tree gives the same pull as with deltas disabled.
 #[test]
 fn a_local_pull_reads_no_delta_by_default() {
     let tmp = TmpDir::new("pull-delta-default");
@@ -3242,9 +3283,9 @@ fn a_local_pull_reads_no_delta_by_default() {
     });
 }
 
-/// A pull that requires static deltas applies the source's from-scratch delta:
-/// it lands the objects a plain import lands, the commit is complete, and the
-/// counts are those of a fetch.
+/// A pull that requires static deltas applies the from-scratch delta of the
+/// source. It stores the same objects as a plain import, the commit is
+/// complete, and the counts are those of a fetch.
 #[test]
 fn a_required_delta_applies_from_scratch() {
     let tmp = TmpDir::new("pull-delta-scratch");
@@ -3287,8 +3328,9 @@ fn a_required_delta_applies_from_scratch() {
     });
 }
 
-/// A destination holding the source of a from-to delta takes that delta, with
-/// or without a remote name, whatever ref it holds.
+/// A destination that holds the source commit of a from-to delta takes that
+/// delta. This is true with or without a remote name, and for each ref that
+/// it holds.
 #[test]
 fn a_required_from_to_delta_applies() {
     let tmp = TmpDir::new("pull-delta-from-to");
@@ -3311,8 +3353,9 @@ fn a_required_from_to_delta_applies() {
                 .await
                 .unwrap();
             assert_eq!(stats.delta_parts, 1, "{remote:?}");
-            // The summary lists the delta and no index is published, so the
-            // index read finds nothing and still counts.
+            // The summary lists the delta and the source publishes no index.
+            // The read of the index finds nothing, and the count still
+            // includes it.
             assert_eq!(stats.metadata_fetched, 2, "{remote:?}");
             assert_eq!(stats.bytes_transferred, tree_size(&dir), "{remote:?}");
             assert_eq!(stats.content_bytes_unpacked, 0, "{remote:?}");
@@ -3322,8 +3365,8 @@ fn a_required_from_to_delta_applies() {
     });
 }
 
-/// A pull that requires static deltas is refused where no advertised delta
-/// produces the commit from what the destination holds, and writes nothing.
+/// If no advertised delta makes the commit from what the destination holds, a
+/// pull that requires static deltas fails and writes nothing.
 #[test]
 fn a_required_delta_that_is_not_published_is_refused() {
     let tmp = TmpDir::new("pull-delta-none-found");
@@ -3345,8 +3388,8 @@ fn a_required_delta_that_is_not_published_is_refused() {
     });
 }
 
-/// A pull that requires static deltas from a source with no summary is
-/// refused, although the source holds a delta and its index.
+/// A pull that requires static deltas fails on a source with no summary. The
+/// source holds a delta and its index, and the pull still fails.
 #[test]
 fn a_required_delta_needs_a_summary() {
     let tmp = TmpDir::new("pull-delta-no-summary");
@@ -3369,7 +3412,7 @@ fn a_required_delta_needs_a_summary() {
     });
 }
 
-/// A pull that requires static deltas reads an archive source alone.
+/// A pull that requires static deltas reads only an archive source.
 #[test]
 fn a_required_delta_refuses_a_source_outside_archive_mode() {
     let tmp = TmpDir::new("pull-delta-bare-source");
@@ -3389,8 +3432,9 @@ fn a_required_delta_refuses_a_source_outside_archive_mode() {
     });
 }
 
-/// A superblock off the digest the summary advertises fails the pull, and a
-/// part file off its checksum fails it too. Neither publishes anything.
+/// If a superblock does not match the digest in the summary, the pull fails.
+/// If a part file does not match its checksum, the pull also fails. Neither
+/// pull publishes anything.
 #[test]
 fn a_tampered_delta_fails_and_publishes_nothing() {
     let tmp = TmpDir::new("pull-delta-tampered");
@@ -3427,8 +3471,9 @@ fn a_tampered_delta_fails_and_publishes_nothing() {
     });
 }
 
-/// A destination that already holds the commit is not refused, although no
-/// delta produces the commit from what it holds.
+/// A pull into a destination that holds the commit does not fail. No delta
+/// makes the commit from what the destination holds, and the pull still
+/// passes.
 #[test]
 fn a_required_delta_pull_of_a_held_commit_is_not_refused() {
     let tmp = TmpDir::new("pull-delta-held");
@@ -3448,8 +3493,8 @@ fn a_required_delta_pull_of_a_held_commit_is_not_refused() {
     });
 }
 
-/// A commit-only pull that requires static deltas looks for none and is not
-/// refused; it counts the commit object as fetched.
+/// A commit-only pull that requires static deltas looks for no delta and does
+/// not fail. It counts the commit object as fetched.
 #[test]
 fn a_required_delta_commit_only_pull_takes_the_commit_loose() {
     let tmp = TmpDir::new("pull-delta-commit-only");
@@ -3476,8 +3521,8 @@ fn a_required_delta_commit_only_pull_takes_the_commit_loose() {
     });
 }
 
-/// Into an `archive` destination a pull that requires static deltas applies
-/// the delta, and the destination passes its fsck.
+/// A pull that requires static deltas applies the delta into an `archive`
+/// destination, and the destination passes its fsck.
 #[test]
 fn a_required_delta_applies_into_archive() {
     let tmp = TmpDir::new("pull-delta-archive");
@@ -3495,8 +3540,8 @@ fn a_required_delta_applies_into_archive() {
     });
 }
 
-/// `BAREUSERONLY_FILES` reaches an object a local delta delivers, and the
-/// refusal publishes nothing.
+/// `BAREUSERONLY_FILES` applies to an object from a local delta. The pull
+/// refuses the object and publishes nothing.
 #[test]
 fn bareuseronly_files_rejects_a_local_delta_object_outside_0775() {
     let tmp = TmpDir::new("pull-delta-mode-bits");
@@ -3531,9 +3576,11 @@ fn bareuseronly_files_rejects_a_local_delta_object_outside_0775() {
     });
 }
 
-/// A delta of several parts, one of them carrying a 256 KiB file, and a delta
-/// whose parts ride inline in the superblock each land the commit whole. Only
-/// a part read as a file counts.
+/// Each of these two deltas delivers the full commit:
+/// - a delta of several parts, one of which carries a 256 KiB file
+/// - a delta with its parts inline in the superblock
+///
+/// Only a part that the pull reads as a file counts.
 #[test]
 fn multi_part_and_inline_deltas_apply() {
     let tmp = TmpDir::new("pull-delta-parts");
@@ -3585,11 +3632,11 @@ fn multi_part_and_inline_deltas_apply() {
     });
 }
 
-/// A destination that holds the commit object partial is looked for a delta
-/// for. Where the source advertises none, a pull that requires static deltas
-/// is refused and leaves the commit partial. Where the source advertises the
-/// from-scratch delta, the ref names that commit, so the pull leaves the delta
-/// alone, fetches the objects loose, and is not refused.
+/// If the destination holds the commit object partial, the pull looks for a
+/// delta. If the source advertises no delta, a pull that requires static
+/// deltas fails and keeps the commit partial. If the source advertises the
+/// from-scratch delta, the ref names that commit. The pull then does not use
+/// the delta, fetches the objects loose, and does not fail.
 #[test]
 fn a_required_delta_pull_of_a_partial_commit_looks_for_a_delta() {
     let tmp = TmpDir::new("pull-delta-partial");
@@ -3628,8 +3675,8 @@ fn a_required_delta_pull_of_a_partial_commit_looks_for_a_delta() {
 }
 
 /// A pull that requires static deltas refuses a source with no summary before
-/// it reads the source's mode, and a source outside archive mode before it
-/// resolves a ref, which is the order the tool refuses in.
+/// it reads the mode of the source. It refuses a source outside archive mode
+/// before it resolves a ref. The `ostree` command refuses in the same order.
 #[test]
 fn a_required_delta_pull_refuses_in_the_tool_order() {
     let tmp = TmpDir::new("pull-delta-refusal-order");
@@ -3653,8 +3700,8 @@ fn a_required_delta_pull_refuses_in_the_tool_order() {
     });
 }
 
-/// A FIFO at the source's summary is refused, and the read does not wait on
-/// a writer.
+/// The pull refuses a FIFO at the summary path of the source. The read does
+/// not wait for a writer.
 #[test]
 fn a_required_delta_pull_refuses_a_summary_that_is_not_a_regular_file() {
     let tmp = TmpDir::new("pull-delta-summary-fifo");
@@ -3676,8 +3723,8 @@ fn a_required_delta_pull_refuses_a_summary_that_is_not_a_regular_file() {
     });
 }
 
-/// A part file longer than the superblock declares is refused, and the pull
-/// publishes nothing.
+/// The pull refuses a part file that is longer than the size in the
+/// superblock, and publishes nothing.
 #[test]
 fn a_part_file_past_its_declared_size_is_refused() {
     let tmp = TmpDir::new("pull-delta-grown-part");
@@ -3702,8 +3749,9 @@ fn a_part_file_past_its_declared_size_is_refused() {
 
 // --- writing no ref ------------------------------------------------------
 
-/// Assert that `commit` is complete in `dst`: its state is normal, it keeps no
-/// `.commitpartial` marker, and every object it reaches in `src` is present.
+/// Asserts that `commit` is complete in `dst`: its state is normal, it has no
+/// `.commitpartial` marker, and each object that it reaches in `src` is
+/// present.
 async fn assert_complete(src: &Repo, dst: &Repo, dst_dir: &Path, commit: &Checksum) {
     assert_eq!(dst.commit_state(commit).await.unwrap(), CommitState::Normal);
     assert!(!has_partial_marker(dst_dir, commit));
@@ -3715,8 +3763,8 @@ async fn assert_complete(src: &Repo, dst: &Repo, dst_dir: &Path, commit: &Checks
     }
 }
 
-/// A pull that writes no ref leaves the ref the destination holds as it
-/// stands, and stores the pulled commit complete with its detached metadata.
+/// A pull that writes no ref keeps the ref of the destination unchanged. It
+/// stores the pulled commit complete, with its detached metadata.
 #[test]
 fn a_pull_with_no_ref_writes_keeps_the_ref_and_completes_the_commit() {
     let tmp = TmpDir::new("pull-no-ref-writes");
@@ -3753,7 +3801,7 @@ fn a_pull_with_no_ref_writes_keeps_the_ref_and_completes_the_commit() {
     });
 }
 
-/// A pull that writes no ref writes none under the remote prefix either.
+/// A pull that writes no ref also writes no ref under the remote prefix.
 #[test]
 fn a_pull_with_no_ref_writes_writes_no_remote_ref() {
     let tmp = TmpDir::new("pull-no-ref-writes-remote");
@@ -3782,8 +3830,8 @@ fn a_pull_with_no_ref_writes_writes_no_remote_ref() {
     });
 }
 
-/// A pull that writes no ref still follows `depth` and completes every
-/// commit of the chain.
+/// A pull that writes no ref still obeys `depth` and completes each commit of
+/// the chain.
 #[test]
 fn a_pull_with_no_ref_writes_completes_every_parent_under_depth() {
     let tmp = TmpDir::new("pull-no-ref-writes-depth");
@@ -3815,11 +3863,11 @@ fn a_pull_with_no_ref_writes_completes_every_parent_under_depth() {
 
 // --- collection refs -----------------------------------------------------
 
-/// The collection id the collection-ref tests read.
+/// The collection id that the collection-ref tests read.
 const COLLECTION: &str = "org.example.Os";
 
-/// The options of a pull of `refs` as collection refs of [`COLLECTION`], under
-/// the remote name `origin`, that writes no ref.
+/// Returns the options of a pull that writes no ref. The pull reads `refs` as
+/// collection refs of [`COLLECTION`], under the remote name `origin`.
 fn collection_pull(refs: &[&str]) -> PullOptions {
     PullOptions {
         refs: refs.iter().map(|name| (*name).to_owned()).collect(),
@@ -3830,18 +3878,18 @@ fn collection_pull(refs: &[&str]) -> PullOptions {
     }
 }
 
-/// Point the collection ref `name` of `collection` in `repo` at `commit`.
+/// Points the collection ref `name` of `collection` in `repo` at `commit`.
 async fn set_collection_ref(repo: &Repo, collection: &str, name: &str, commit: &Checksum) {
     let txn = repo.transaction().await.unwrap();
     txn.set_collection_ref(&CollectionRef::new(collection, name), Some(commit));
     txn.commit().await.unwrap();
 }
 
-/// An archive source under `base/thin` that holds only the objects `c2`
-/// reaches in `src` and `c1` does not, copied from the archive `src` at
-/// `src_dir`, with `c2` under the collection ref `main` of [`COLLECTION`].
-/// Returns its path, a handle opened after the copy, and the objects the two
-/// commits share.
+/// Creates an archive source under `base/thin` with a copy of some objects of
+/// the archive `src` at `src_dir`. The copy holds only the objects that `c2`
+/// reaches and `c1` does not reach. The collection ref `main` of
+/// [`COLLECTION`] points at `c2`. Returns the path, a handle opened after the
+/// copy, and the objects that the two commits share.
 async fn thin_source(
     base: &Path,
     src_dir: &Path,
@@ -3864,7 +3912,7 @@ async fn thin_source(
     (path, thin, shared)
 }
 
-/// Copy the files under `from` to `to`, creating the directories.
+/// Copies the files under `from` to `to`, and creates the directories.
 fn copy_tree(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap().flatten() {
@@ -3877,9 +3925,9 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-/// A pull of a collection ref from a source that holds only the objects the
-/// new commit adds takes the shared objects from the destination: it reads
-/// no object the destination holds and leaves the commit complete.
+/// The source holds only the objects that the new commit adds. A pull of a
+/// collection ref from it takes the shared objects from the destination. It
+/// reads no object that the destination holds, and the commit is complete.
 #[test]
 fn a_collection_pull_takes_the_shared_objects_from_the_destination() {
     let tmp = TmpDir::new("pull-collection-thin");
@@ -3914,8 +3962,8 @@ fn a_collection_pull_takes_the_shared_objects_from_the_destination() {
     });
 }
 
-/// The same pull into an empty destination fails, since no repository holds
-/// the shared objects, and publishes nothing.
+/// The same pull into an empty destination fails, because no repository holds
+/// the shared objects. The pull publishes nothing.
 #[test]
 fn a_collection_pull_from_a_thin_source_into_an_empty_destination_fails() {
     let tmp = TmpDir::new("pull-collection-thin-empty");
@@ -3935,8 +3983,8 @@ fn a_collection_pull_from_a_thin_source_into_an_empty_destination_fails() {
     });
 }
 
-/// A collection pull reads the collection ref alone: the ref of the same name
-/// under `refs/heads` is not read.
+/// A collection pull reads only the collection ref. It does not read the ref
+/// of the same name under `refs/heads`.
 #[test]
 fn a_collection_pull_reads_the_ref_under_refs_mirrors() {
     let tmp = TmpDir::new("pull-collection-mirrors");
@@ -3956,9 +4004,11 @@ fn a_collection_pull_reads_the_ref_under_refs_mirrors() {
     });
 }
 
-/// A name the source holds no collection ref for fails with the path of the
-/// collection ref, also where the source holds the name under `refs/heads` or
-/// under another collection, and a checksum is read as a ref name.
+/// If the source has no collection ref for a name, the pull fails with the
+/// path of the collection ref. This is also true in these cases:
+/// - the source holds the name under `refs/heads`
+/// - the source holds the name under another collection
+/// - the name is a checksum, which the pull reads as a ref name
 #[test]
 fn an_absent_collection_ref_is_not_found() {
     let tmp = TmpDir::new("pull-collection-absent");
@@ -3986,7 +4036,7 @@ fn an_absent_collection_ref_is_not_found() {
 }
 
 /// A collection pull that requires static deltas takes the delta from the
-/// commit the ref under the remote name holds, and leaves that ref as it is.
+/// commit of the ref under the remote name. The pull keeps that ref unchanged.
 #[test]
 fn a_collection_pull_takes_a_required_delta() {
     let tmp = TmpDir::new("pull-collection-delta");
@@ -4029,8 +4079,9 @@ fn a_collection_pull_takes_a_required_delta() {
     });
 }
 
-/// The ref-binding check reads the name of the collection ref: a commit bound
-/// to `main` is refused under `other`, and is taken with the check off.
+/// The ref-binding check reads the name of the collection ref. The pull
+/// refuses a commit bound to `main` under `other`. With the check off, the
+/// pull takes the commit.
 #[test]
 fn a_collection_pull_checks_the_ref_binding_against_the_name() {
     let tmp = TmpDir::new("pull-collection-binding");
@@ -4061,11 +4112,12 @@ fn a_collection_pull_checks_the_ref_binding_against_the_name() {
     });
 }
 
-/// A collection pull that would write refs, and one that names no ref, are
-/// refused before the source is read, and change nothing in the destination.
-/// The source holds no collection ref, so a refusal after the read of the
-/// collection ref would fail with [`Error::RefNotFound`], and an empty list
-/// would pull the refs under `refs/heads`.
+/// A collection pull that writes refs fails before it reads the source. A
+/// collection pull that names no ref also fails before it reads the source.
+/// Neither pull changes the destination. The source holds no collection ref.
+/// If the check comes after the read of the collection ref, the error is
+/// [`Error::RefNotFound`]. If the pull reads an empty list, it pulls the refs
+/// under `refs/heads`.
 #[test]
 fn a_collection_pull_is_refused_without_no_ref_writes_or_a_ref() {
     let tmp = TmpDir::new("pull-collection-refused");
@@ -4105,9 +4157,8 @@ fn a_collection_pull_is_refused_without_no_ref_writes_or_a_ref() {
     });
 }
 
-/// A collection ref path that names a directory, or that passes through a
-/// file, holds no ref: the pull fails with the path of the collection ref, as
-/// for an absent one.
+/// A collection ref path to a directory, or through a file, holds no ref. The
+/// pull fails with the path of the collection ref, as for an absent ref.
 #[test]
 fn a_collection_ref_path_through_a_directory_or_a_file_is_not_found() {
     let tmp = TmpDir::new("pull-collection-not-a-ref");
@@ -4135,7 +4186,8 @@ fn a_collection_ref_path_through_a_directory_or_a_file_is_not_found() {
 
 /// With a collection id, an abbreviated checksum and an ancestry suffix are
 /// part of the ref name. The source holds `main` under `refs/heads` and as a
-/// collection ref, so a revision read of either name would find a commit.
+/// collection ref. If the pull reads either name as a revision, it finds a
+/// commit.
 #[test]
 fn a_collection_ref_name_takes_no_revision_syntax() {
     let tmp = TmpDir::new("pull-collection-revision");
@@ -4162,11 +4214,11 @@ fn a_collection_ref_name_takes_no_revision_syntax() {
     });
 }
 
-/// An invalid collection id, and a name that holds `:`, are refused with the
-/// pair as the payload before the source is read. The pull requires static
-/// deltas and the source holds no summary, so a check after the first read
-/// of the source would fail with the error of the absent summary, as the
-/// valid pair does.
+/// The pull refuses an invalid collection id, and a name that holds `:`,
+/// before it reads the source. The error holds the pair. The pull requires
+/// static deltas and the source holds no summary. If the check comes after the
+/// first read of the source, the error is that of the absent summary, as for
+/// the valid pair.
 #[test]
 fn an_invalid_collection_id_or_name_is_refused_before_the_source_is_read() {
     let tmp = TmpDir::new("pull-collection-invalid");
@@ -4213,12 +4265,13 @@ fn an_invalid_collection_id_or_name_is_refused_before_the_source_is_read() {
 
 // --- what the destination holds ------------------------------------------
 
-/// Whether the tests run as root, which reads a file of mode `0000`.
+/// Returns `true` if the tests run as root. Root can read a file of mode
+/// `0000`.
 fn is_root() -> bool {
     rustix::process::geteuid().is_root()
 }
 
-/// Give a loose object of `repo_dir` mode `0000`, so a read of it fails with
+/// Gives a loose object of `repo_dir` mode `0000`, so a read of it fails with
 /// `EACCES` for a user other than root.
 fn make_unreadable(repo_dir: &Path, name: &ObjectName, mode: RepoMode) {
     std::fs::set_permissions(
@@ -4228,10 +4281,10 @@ fn make_unreadable(repo_dir: &Path, name: &ObjectName, mode: RepoMode) {
     .unwrap();
 }
 
-/// A destination of `mode` under `base/<name>` holding `commit` of `src`
-/// complete, with no ref. Each object is copied, so the destination shares
-/// no inode with the source and a mode change in the source does not reach
-/// it.
+/// Creates a destination of `mode` under `base/<name>` that holds `commit` of
+/// `src` complete, with no ref. The pull copies each object, so the
+/// destination shares no inode with the source. A mode change in the source
+/// then does not reach the destination.
 async fn dst_copy_holding(
     base: &Path,
     name: &str,
@@ -4255,8 +4308,8 @@ async fn dst_copy_holding(
     (path, dst)
 }
 
-/// Assert that a dirtree of the destination is a separate inode from the
-/// same dirtree in the source.
+/// Asserts that a dirtree of the destination is a separate inode from the same
+/// dirtree in the source.
 fn assert_own_inode(src_dir: &Path, dst_dir: &Path, dirtree: &ObjectName, dst_mode: RepoMode) {
     let ino = |path: PathBuf| {
         let meta = std::fs::symlink_metadata(path).unwrap();
@@ -4269,8 +4322,8 @@ fn assert_own_inode(src_dir: &Path, dst_dir: &Path, dirtree: &ObjectName, dst_mo
     );
 }
 
-/// The content object of `nested.txt`, the one file of the subdirectory
-/// `build_tree` makes.
+/// Returns the content object of `nested.txt`, the one file of the
+/// subdirectory that `build_tree` makes.
 async fn nested_content(repo: &Repo, commit: &Checksum) -> ObjectName {
     let subdir = subdir_dirtree(repo, commit).await;
     let dirtree = repo.load_dirtree(&subdir.checksum).await.unwrap();
@@ -4282,12 +4335,14 @@ async fn nested_content(repo: &Repo, commit: &Checksum) -> ObjectName {
     ObjectName::new(file, ObjectType::File)
 }
 
-/// A pull of a commit the destination holds complete reads no object of its
-/// tree: each dirtree, dirmeta, and content object of the commit is
-/// unreadable in the source, each dirtree of the commit is unreadable in the
-/// destination too, so a walk of the tree fails wherever it reads its root,
-/// and the pull imports the detached metadata alone. A commit the destination
-/// holds partial is walked, and the same pull fails on the first unreadable
+/// A pull of a commit that the destination holds complete reads no object of
+/// its tree. The test makes these objects unreadable:
+/// - each dirtree, dirmeta, and content object of the commit in the source
+/// - each dirtree of the commit in the destination
+///
+/// A walk of the tree then fails where it reads its root, and the pull
+/// imports only the detached metadata. If the destination holds the commit
+/// partial, the same pull walks the tree and fails on the first unreadable
 /// dirtree.
 #[test]
 fn a_commit_the_destination_holds_complete_reads_no_object_of_its_tree() {
@@ -4367,9 +4422,9 @@ fn a_commit_the_destination_holds_complete_reads_no_object_of_its_tree() {
     });
 }
 
-/// A dirtree the destination holds is read from the destination: each
-/// dirtree the two commits share is unreadable in the source, and a pull of
-/// the second commit into a destination that holds the first completes it.
+/// The pull reads a dirtree from the destination if the destination holds it.
+/// Each dirtree that the two commits share is unreadable in the source. A pull
+/// of the second commit into a destination with the first commit completes it.
 #[test]
 fn a_dirtree_the_destination_holds_is_read_from_the_destination() {
     if is_root() {
@@ -4419,9 +4474,9 @@ fn a_dirtree_the_destination_holds_is_read_from_the_destination() {
     }
 }
 
-/// The walk descends into a dirtree the destination holds: a content object
-/// below it that the destination lacks is imported from the source, which
-/// holds the dirtree unreadable.
+/// The walk descends into a dirtree that the destination holds. The pull
+/// imports a content object under it from the source if the destination
+/// lacks the object. The dirtree in the source is unreadable.
 #[test]
 fn a_hole_below_a_dirtree_the_destination_holds_is_filled_from_the_source() {
     if is_root() {
@@ -4463,11 +4518,11 @@ fn a_hole_below_a_dirtree_the_destination_holds_is_filled_from_the_source() {
     });
 }
 
-/// A dirtree the destination holds and no source holds is descended into
-/// too. A content object below it that neither the destination nor a source
-/// holds fails the pull with [`Error::ObjectNotFound`], and the pull leaves
-/// the destination as it found it. Once the source holds the object, the
-/// same pull imports it.
+/// The walk also descends into a dirtree that the destination holds and no
+/// source holds. If neither the destination nor a source holds a content
+/// object under it, the pull fails with [`Error::ObjectNotFound`]. The pull
+/// does not change the destination.
+/// After the source gets the object, the same pull imports it.
 #[test]
 fn a_hole_below_a_dirtree_no_source_holds_fails_the_pull() {
     let tmp = TmpDir::new("pull-held-dirtree-thin");
@@ -4513,10 +4568,10 @@ fn a_hole_below_a_dirtree_no_source_holds_fails_the_pull() {
     });
 }
 
-/// A dirtree the destination holds as a dangling symlink is read from the
-/// destination, and the read fails the pull with [`Error::ObjectNotFound`]
-/// for that dirtree, although the source holds it. The pull publishes no
-/// commit object, no marker, and no ref.
+/// The destination holds a dirtree as a dangling symlink. The pull reads the
+/// dirtree from the destination and fails with [`Error::ObjectNotFound`] for
+/// it. The source holds the dirtree, and the pull still fails. The pull
+/// publishes no commit object, no marker, and no ref.
 #[test]
 fn a_dangling_symlink_at_a_dirtree_the_destination_holds_fails_the_pull() {
     let tmp = TmpDir::new("pull-held-dirtree-symlink");
@@ -4553,9 +4608,10 @@ fn a_dangling_symlink_at_a_dirtree_the_destination_holds_fails_the_pull() {
     });
 }
 
-/// A pull of a commit the destination holds complete does not walk its tree,
-/// so it leaves a content object the destination lost absent. fsck marks the
-/// commit partial, and the next pull walks the tree and imports the object.
+/// A pull of a commit that the destination holds complete does not walk its
+/// tree, so a content object that the destination lost stays absent. fsck
+/// marks the commit partial, and the next pull walks the tree and imports the
+/// object.
 #[test]
 fn a_hole_in_a_commit_held_complete_is_filled_after_fsck_marks_it() {
     let tmp = TmpDir::new("pull-held-commit-hole");

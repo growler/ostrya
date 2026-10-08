@@ -1,6 +1,6 @@
-//! `Repo::push_over_stream` against `Repo::receive` over two in-process
-//! pipes. The tests cover the negotiation, the depth of the chains, the
-//! refusals of the client, and the lock of the local repository.
+//! Tests of `Repo::push_over_stream` against `Repo::receive` over two
+//! in-process pipes. The tests cover the negotiation, the depth of the chains,
+//! the refusals of the client, and the lock of the local repository.
 
 #![cfg(all(feature = "push", feature = "receive"))]
 
@@ -31,7 +31,7 @@ use ostrya_rt::block_on;
 // ---------------------------------------------------------------------------
 
 /// A client repository and a server repository, each in a directory of its
-/// own. `server_core` is appended to the config of the server.
+/// own. The constructors append `server_core` to the config of the server.
 struct Pair {
     _client_dir: TmpDir,
     _server_dir: TmpDir,
@@ -64,7 +64,7 @@ impl Pair {
     }
 }
 
-/// Commit a tree onto `branch` of `repo`, with `parent` and `metadata`. The
+/// Commits a tree onto `branch` of `repo`, with `parent` and `metadata`. The
 /// tree holds a file `file` with `content`, a symlink `link` to it, and a
 /// directory `sub` whose file is the same in every commit.
 fn commit(
@@ -309,7 +309,7 @@ impl AsyncWrite for Hook {
     }
 }
 
-/// Run `work` to its end on a thread of its own, with an executor of its
+/// Runs `work` to its end on a thread of its own, with an executor of its
 /// own, while the push waits in a hook.
 fn on_own_thread<T: Send>(work: impl FnOnce() -> T + Send) -> T {
     std::thread::scope(|s| s.spawn(work).join().unwrap())
@@ -539,8 +539,8 @@ fn a_collection_binding_mismatch_is_refused_before_any_upload() {
         }
         other => panic!("expected BindingMismatch, got {other:?}"),
     }
-    // The client refuses after `Hello`, with no `Have`: the check of the
-    // server runs only after the upload.
+    // The client refuses after `Hello` and sends no `Have`. The check of
+    // the server runs only after the upload.
     let kinds = kinds.lock().unwrap().clone();
     assert!(!kinds.contains(&HAVE_FRAME), "{kinds:?}");
     assert_eq!(kinds.last(), Some(&ABORT_FRAME), "{kinds:?}");
@@ -666,8 +666,8 @@ fn the_filter_drops_the_excluded_keys_from_the_detached_metadata() {
 #[test]
 fn deflate_objects_of_an_archive_source_equal_the_stored_filez() {
     // The server deflates a `raw` object at level 1, and the client stored
-    // its objects at level 6. So the `.filez` bytes of the server equal
-    // those of the client only when the push sends the stored bytes.
+    // its objects at level 6. The `.filez` bytes of the server equal those
+    // of the client only if the push sends the stored bytes.
     let pair = Pair::new(
         "filez",
         RepoMode::Archive,
@@ -699,8 +699,8 @@ fn deflate_objects_of_an_archive_source_equal_the_stored_filez() {
     assert_eq!(files, 4);
 }
 
-/// About `len` bytes of text of words in an order that does not repeat
-/// soon, so that deflate levels 1 and 6 give different bytes.
+/// Returns about `len` bytes of text with words in an order that does not
+/// repeat soon. Deflate levels 1 and 6 give different bytes for this text.
 fn text(len: usize) -> String {
     const WORDS: [&str; 16] = [
         "tree", "commit", "object", "branch", "remote", "delta", "summary", "mode", "file", "link",
@@ -967,8 +967,8 @@ fn a_forced_push_expects_any_state_of_the_ref() {
     let c2 = commit(&pair.client, "main", Some(c1), "c2", None);
 
     // Another writer moves the ref of the server to an unrelated commit
-    // after `HelloReply`. So the update is no fast-forward from the state
-    // that `HelloReply` reported.
+    // after `HelloReply`. The update is then not a fast-forward from the
+    // state that `HelloReply` reported.
     let policy = ReceivePolicy {
         default_rule: ReceiveRule {
             allow_non_fast_forward: true,
@@ -999,8 +999,9 @@ fn a_forced_push_expects_any_state_of_the_ref() {
     assert_eq!(tip(&pair.server, "main"), Some(c2));
 }
 
-/// A `DST` of 64 lowercase hex characters, which a revision reads as a
-/// commit checksum, is an invalid refspec, refused before any byte.
+/// A revision reads a `DST` of 64 lowercase hex characters as a commit
+/// checksum. The client refuses this `DST` as an invalid refspec before it
+/// writes a byte.
 #[test]
 fn a_destination_of_64_lowercase_hex_characters_is_refused_before_any_byte() {
     let dir = TmpDir::new("push-repo-hex-dst");
@@ -1046,9 +1047,9 @@ fn a_delete_of_a_destination_of_64_lowercase_hex_characters_removes_the_ref() {
     assert_eq!(tip(&pair.server, "main"), Some(c1));
 }
 
-/// The content bytes a push reads end at the byte total of its source, in
-/// each mode of the client that the port writes, and with each encoding. A
-/// symlink counts no byte.
+/// The content bytes that a push reads end at the byte total of its source.
+/// This holds in each client mode that ostrya writes, and with each
+/// encoding. A symlink counts no byte.
 #[test]
 fn the_content_bytes_end_at_the_byte_total() {
     let deflate = Compression::Deflate { level: 6 };
@@ -1099,7 +1100,8 @@ fn the_content_bytes_end_at_the_byte_total() {
 // Compile-time checks.
 // ---------------------------------------------------------------------------
 
-/// The options move freely across tasks and threads.
+/// The options are `Send` and `Sync`, so they can move across tasks and
+/// threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<RepoPushOptions>();

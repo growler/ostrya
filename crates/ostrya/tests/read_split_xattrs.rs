@@ -1,15 +1,22 @@
-//! Reading-path tests for bare-split-xattrs.
+//! Tests of the read path of the `bare-split-xattrs` mode.
 //!
-//! The `ostree` tool refuses to write this mode, so there is no tool-generated
-//! golden fixture. These tests build a repository by hand and read it back
-//! through the port. The recovered on-disk shape (see docs/format-reference.md)
-//! is: bare inode storage (real uid/gid/mode, real symlinks, no `user.ostreemeta`)
-//! with the logical xattrs held in a separate `.file-xattrs` object reached
-//! through a `.file-xattrs-link` object keyed by the file checksum. Because the
-//! inode carries the identity's uid/gid/mode, a repository the tool accepts must
-//! own its objects as the identity expects; a self-consistent repository is
-//! therefore built with the running user's ownership, and the tool cross-check
-//! runs only when `ostree` is on PATH.
+//! The `ostree` command refuses to write this mode, so no golden fixture from
+//! the `ostree` command exists. These tests build a repository by hand and
+//! read it back through ostrya.
+//!
+//! The observed on-disk shape has these parts:
+//!
+//! - Bare inode storage: the real uid, gid, and mode, real symlinks, and no
+//!   `user.ostreemeta` xattr.
+//! - The logical xattrs, in a separate `.file-xattrs` object.
+//! - A `.file-xattrs-link` object, keyed by the file checksum, that reaches
+//!   the `.file-xattrs` object.
+//!
+//! The inode carries the uid, gid, and mode of the object identity. A
+//! repository that the `ostree` command accepts must therefore own its
+//! objects as the identity states. The tests build each repository with the
+//! ownership of the running user. The cross-checks with the `ostree` command
+//! run only when `ostree` is on `PATH`.
 
 mod common;
 
@@ -39,15 +46,18 @@ async fn read_payload(file: &ostrya::FileObject) -> Vec<u8> {
     buf
 }
 
-/// Absolute path of a loose object within a repository, parents created.
+/// Returns the absolute path of a loose object in a repository, and creates
+/// its parent directories.
 fn object_path(root: &Path, checksum: &Checksum, ty: ObjectType) -> PathBuf {
     let full = root.join("objects").join(loose_path(checksum, ty, MODE));
     fs::create_dir_all(full.parent().unwrap()).unwrap();
     full
 }
 
-/// The running user's uid/gid, read off a freshly created file so the
-/// hand-built inodes carry the ownership the object identity encodes.
+/// Returns the uid and gid of the running user.
+///
+/// The function reads them from a new file, so that the hand-built inodes
+/// carry the ownership that the object identity encodes.
 fn current_owner(tmp: &Path) -> (u32, u32) {
     let probe = tmp.join(".owner-probe");
     fs::write(&probe, b"").unwrap();
@@ -55,10 +65,12 @@ fn current_owner(tmp: &Path) -> (u32, u32) {
     (md.uid(), md.gid())
 }
 
-/// Write the `.file`, `.file-xattrs`, and `.file-xattrs-link` objects for one
-/// file and return its object identity. Regular files store the raw payload on
-/// an inode chmodded to the logical mode; symlinks are real symlinks. Every
-/// file gets a `.file-xattrs-link` hardlinked to the shared `.file-xattrs`.
+/// Writes the `.file`, `.file-xattrs`, and `.file-xattrs-link` objects of one
+/// file, and returns its object identity.
+///
+/// A regular file stores the raw payload on an inode with the logical mode.
+/// A symlink is a real symlink. Each file gets a `.file-xattrs-link` object
+/// that is a hardlink to the shared `.file-xattrs` object.
 fn write_file_object(
     root: &Path,
     uid: u32,
@@ -88,9 +100,9 @@ fn write_file_object(
         fs::set_permissions(&file_path, fs::Permissions::from_mode(mode & 0o7777)).unwrap();
     }
 
-    // The xattr object holds the raw GVariant a(ayay); the link is a hardlink to
-    // it, named by the file checksum. The empty set is the shared object whose
-    // content is the zero-byte empty array.
+    // The xattr object holds the raw GVariant `a(ayay)`. The link is a hardlink
+    // to the xattr object, and the file checksum names the link. The empty set
+    // is the shared object whose content is the zero-byte empty array.
     let xbytes = xattrs.to_gvariant().unwrap();
     let xid = Checksum::sha256(&xbytes);
     let xattrs_path = object_path(root, &xid, ObjectType::FileXattrs);
@@ -103,7 +115,7 @@ fn write_file_object(
     id
 }
 
-/// Build a self-consistent single-directory commit and return its checksum.
+/// Builds a self-consistent commit of one directory and returns its checksum.
 fn write_commit(root: &Path, files: &[(&str, Checksum)]) -> Checksum {
     let dirmeta = DirMeta {
         uid: 0,
@@ -166,8 +178,9 @@ fn reads_metadata_from_inode_and_xattrs_from_the_split_object() {
         assert_eq!(repo.mode(), MODE);
         let (uid, gid) = current_owner(tmp.path());
 
-        // A regular file: uid/gid/mode come from the inode, the user.demo xattr
-        // from the split object, and the payload from the inode content.
+        // A regular file. The uid, gid, and mode come from the inode. The
+        // `user.demo` xattr comes from the split object. The payload comes from
+        // the inode content.
         let demo = Xattrs::new([(b"user.demo\0".to_vec(), b"bar".to_vec())]).unwrap();
         let hello = write_file_object(&root, uid, gid, 0o100644, "", &demo, b"hello ostree\n");
         let file = repo.load_file(&hello).await.unwrap();
@@ -177,8 +190,8 @@ fn reads_metadata_from_inode_and_xattrs_from_the_split_object() {
         assert_eq!(names, [b"user.demo\0".as_slice()]);
         assert_eq!(read_payload(&file).await, b"hello ostree\n");
 
-        // A symlink with no xattrs: real symlink, empty xattr set from the
-        // shared empty split object.
+        // A symlink with no xattrs. It is a real symlink, and its empty xattr
+        // set comes from the shared empty split object.
         let link = write_file_object(
             &root,
             uid,
@@ -207,7 +220,7 @@ fn a_missing_file_xattrs_link_is_a_format_error() {
         let root = tmp.path().join("repo");
         let repo = Repo::create(&root, CreateOptions::new(MODE)).await.unwrap();
 
-        // A `.file` object with no companion `.file-xattrs-link`.
+        // A `.file` object with no companion `.file-xattrs-link` object.
         let id = csum(&"22".repeat(32));
         fs::write(object_path(&root, &id, ObjectType::File), b"orphan").unwrap();
         let err = repo.load_file(&id).await.unwrap_err();
@@ -220,9 +233,10 @@ fn a_missing_file_xattrs_link_is_a_format_error() {
 
 #[test]
 fn tool_accepts_the_hand_built_repository() {
-    // The recovered layout is confirmed by the tool: a self-consistent repo,
-    // owned by the running user so identities match the inodes, must pass
-    // `ostree fsck` and report the split xattrs through `ostree ls -X`.
+    // The `ostree` command confirms the observed layout. A self-consistent
+    // repository, owned by the running user so that the identities match the
+    // inodes, must pass `ostree fsck`. `ostree ls -X` must report the split
+    // xattrs.
     if !ostree_available() {
         eprintln!("skipping bare-split-xattrs tool cross-check: ostree not on PATH");
         return;
@@ -265,8 +279,8 @@ fn tool_accepts_the_hand_built_repository() {
         .expect("run ostree ls -X");
     assert!(ls.status.success(), "ostree ls -X failed");
     let ls = String::from_utf8_lossy(&ls.stdout);
-    // The tool reads user.demo out of the split object and the symlink target
-    // off the real symlink.
+    // The `ostree` command reads `user.demo` from the split object and the
+    // symlink target from the real symlink.
     assert!(
         ls.contains("user.demo"),
         "tool ls -X missing the xattr:\n{ls}"
@@ -277,10 +291,11 @@ fn tool_accepts_the_hand_built_repository() {
     );
 }
 
-/// The port and the tool export the same composefs image from a
-/// bare-split-xattrs repository, under both verity policies. The file's
-/// attributes come from the split object and each redirect names the `.file`
-/// object the repository holds.
+/// This crate and the `ostree` command export the same composefs image from a
+/// `bare-split-xattrs` repository, under both verity policies.
+///
+/// The attributes of the file come from the split object. Each redirect names
+/// the `.file` object that the repository holds.
 #[test]
 fn composefs_export_matches_the_tool() {
     if !ostree_available() {
@@ -310,8 +325,8 @@ fn composefs_export_matches_the_tool() {
         ("--composefs", ostrya::VerityPolicy::Computed),
         ("--composefs-noverity", ostrya::VerityPolicy::Disabled),
     ] {
-        // The tool writes the image through a temporary file in the working
-        // directory, so it runs from the directory the destination sits in.
+        // The `ostree` command writes the image through a temporary file in the
+        // working directory, so it runs in the directory of the destination.
         let dest = tmp.path().join(format!("tool{flag}.cfs"));
         let out = Command::new("ostree")
             .current_dir(tmp.path())
@@ -344,13 +359,16 @@ fn composefs_export_matches_the_tool() {
     }
 }
 
-/// The tool treats a `.file` with no companion `.file-xattrs-link` as
-/// corruption, even for a file with no xattrs (which links to the shared
-/// empty-set object). Recovered by observation: removing the link from an
-/// otherwise self-consistent commit makes `ostree fsck` mark the commit partial
-/// and fail, and `ostree ls -X` fail opening the link. This confirms the port's
-/// matching strictness in `a_missing_file_xattrs_link_is_a_format_error` is
-/// faithful to the tool, not stricter than it.
+/// The `ostree` command treats a `.file` object with no companion
+/// `.file-xattrs-link` object as corruption.
+///
+/// This also applies to a file with no xattrs, which links to the shared
+/// empty-set object. Observed: if a test removes the link from a commit that
+/// is self-consistent in all other parts, `ostree fsck` marks the commit
+/// partial and fails. `ostree ls -X` fails when it opens the link.
+///
+/// The check of ostrya in `a_missing_file_xattrs_link_is_a_format_error` has
+/// the same strictness as the `ostree` command, as this observation confirms.
 #[test]
 fn tool_rejects_a_missing_file_xattrs_link() {
     if !ostree_available() {

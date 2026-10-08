@@ -1,25 +1,7 @@
-//! Streaming SHA-256 wrappers, the primitives the write path builds on.
+//! Streaming SHA-256 wrappers for async readers and writers.
 //!
-//! [`HashingReader`] and [`HashingWriter`] wrap an inner async stream and feed
-//! a SHA-256 digester with every byte they pass through, tracking the byte
-//! count. [`finalize`](HashingReader::finalize) consumes the wrapper and
-//! yields the object identity and the number of bytes seen. ostree hashes with
-//! SHA-256 throughout, so the digester is fixed rather than generic.
-//!
-//! The digester is supplied by value and may be pre-seeded: a content-object
-//! identity covers the framed file header before the raw payload, so the write
-//! path seeds the header bytes and then streams the payload through the reader.
-//!
-//! [`VerifyingReader`] is the checking counterpart: it hashes what it passes
-//! through and fails the read that reaches EOF, and every read after it, when
-//! the result differs from the digest the caller expected. Pull wraps fetched
-//! payloads in one, so a body that does not hash to the object's identity
-//! cannot be stored.
-//!
-//! All three implement the `futures-io` traits when their inner stream does,
-//! and the tokio I/O traits under the `tokio` feature, so they compose with
-//! `rt::File`, [`ContentReader`](crate::ContentReader), and network streams
-//! without a caller-side adapter.
+//! The crate root re-exports [`HashingReader`], [`HashingWriter`], and
+//! [`VerifyingReader`]. Their docs hold the facts for API readers.
 
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
@@ -29,7 +11,27 @@ use pin_project_lite::pin_project;
 use sha2::{Digest, Sha256};
 
 pin_project! {
-    /// An async reader that hashes every byte it yields.
+    /// An async reader that hashes every byte that it yields.
+    ///
+    /// The reader feeds each byte that it reads from the inner stream to a
+    /// SHA-256 digester and counts the bytes. [`finalize`](Self::finalize)
+    /// consumes the reader and returns the checksum and the byte count. The
+    /// digester is always SHA-256, the one hash function of the ostree object
+    /// format.
+    ///
+    /// If `R` implements `futures_io::AsyncRead`, the reader implements it
+    /// too. Under the `tokio` feature, the same rule applies to the tokio
+    /// `AsyncRead`. The reader can wrap an `ostrya_rt::File`, a
+    /// [`ContentReader`](crate::ContentReader), or a network stream with no
+    /// adapter.
+    ///
+    /// # Seeded digesters
+    ///
+    /// [`new`](Self::new) takes the digester by value, so the caller can feed
+    /// leading bytes to it before the stream. The checksum of a content object
+    /// covers the framed file header and then the raw payload. To compute it,
+    /// seed the digester with the header bytes and stream the payload through
+    /// the reader. The byte count holds the stream bytes alone.
     pub struct HashingReader<R> {
         hasher: Sha256,
         count: u64,
@@ -39,9 +41,12 @@ pin_project! {
 }
 
 impl<R> HashingReader<R> {
-    /// Wrap `inner`, feeding read bytes into `hasher`. Pass `Sha256::new()`
-    /// for an unseeded digest, or a pre-updated digester to cover leading
-    /// bytes (such as a framed file header) before the stream.
+    /// Creates a reader that feeds the bytes that it reads from `inner` to
+    /// `hasher`.
+    ///
+    /// For a digest of the stream alone, pass `Sha256::new()`. To include
+    /// leading bytes before the stream, for example a framed file header, pass
+    /// a digester that already holds them.
     pub fn new(hasher: Sha256, inner: R) -> HashingReader<R> {
         HashingReader {
             hasher,
@@ -50,13 +55,15 @@ impl<R> HashingReader<R> {
         }
     }
 
-    /// The number of stream bytes hashed so far.
+    /// Returns the number of stream bytes hashed so far.
     pub fn size(&self) -> u64 {
         self.count
     }
 
-    /// Consume the reader and return the SHA-256 digest and the byte count.
-    /// Meaningful once the inner stream has been read to EOF.
+    /// Consumes the reader and returns the SHA-256 checksum and the byte count.
+    ///
+    /// The checksum covers the whole stream only if the caller read the inner
+    /// stream to EOF.
     pub fn finalize(self) -> (Checksum, u64) {
         (
             Checksum::from_bytes(self.hasher.finalize().into()),
@@ -64,16 +71,25 @@ impl<R> HashingReader<R> {
         )
     }
 
-    /// The digest of the bytes hashed so far, leaving the reader usable.
-    /// [`VerifyingReader`] checks this at EOF, where consuming the reader is
-    /// not an option.
+    /// Returns the digest of the bytes hashed so far and keeps the reader.
+    /// [`VerifyingReader`] verifies this digest at EOF, where it cannot
+    /// consume the reader.
     fn digest_now(&self) -> Checksum {
         Checksum::from_bytes(self.hasher.clone().finalize().into())
     }
 }
 
 pin_project! {
-    /// An async writer that hashes every byte it forwards.
+    /// An async writer that hashes every byte that it forwards.
+    ///
+    /// The writer feeds each byte that the inner writer accepts to a SHA-256
+    /// digester and counts the bytes. [`finalize`](Self::finalize) consumes
+    /// the writer and returns the checksum and the byte count. [`new`](Self::new)
+    /// takes a seeded digester, as [`HashingReader::new`] does.
+    ///
+    /// If `W` implements `futures_io::AsyncWrite`, the writer implements it
+    /// too. Under the `tokio` feature, the same rule applies to the tokio
+    /// `AsyncWrite`.
     pub struct HashingWriter<W> {
         hasher: Sha256,
         count: u64,
@@ -83,9 +99,12 @@ pin_project! {
 }
 
 impl<W> HashingWriter<W> {
-    /// Wrap `inner`, feeding forwarded bytes into `hasher`. Pass
-    /// `Sha256::new()` for an unseeded digest, or a pre-updated digester to
-    /// cover leading bytes before the stream.
+    /// Creates a writer that feeds the bytes that it forwards to `inner` to
+    /// `hasher`.
+    ///
+    /// For a digest of the stream alone, pass `Sha256::new()`. To include
+    /// leading bytes before the stream, pass a digester that already holds
+    /// them.
     pub fn new(hasher: Sha256, inner: W) -> HashingWriter<W> {
         HashingWriter {
             hasher,
@@ -94,13 +113,15 @@ impl<W> HashingWriter<W> {
         }
     }
 
-    /// The number of stream bytes hashed so far.
+    /// Returns the number of stream bytes hashed so far.
     pub fn size(&self) -> u64 {
         self.count
     }
 
-    /// Consume the writer and return the SHA-256 digest and the byte count.
-    /// Flush or close the inner writer first for the bytes to be durable.
+    /// Consumes the writer and returns the SHA-256 checksum and the byte count.
+    ///
+    /// To make the bytes durable, the caller must flush or close the inner
+    /// writer before this call.
     pub fn finalize(self) -> (Checksum, u64) {
         (
             Checksum::from_bytes(self.hasher.finalize().into()),
@@ -109,29 +130,44 @@ impl<W> HashingWriter<W> {
     }
 }
 
-/// Where a [`VerifyingReader`]'s digest check stands.
+/// The state of the digest check of a [`VerifyingReader`].
 enum Checked {
-    /// EOF has not been reached, so no comparison has run.
+    /// The reader did not reach EOF, so no comparison ran.
     Pending,
     /// The stream hashed to the expected digest.
     Passed,
-    /// The stream hashed to the digest held here, which is not the expected
-    /// one.
+    /// The stream hashed to the digest held here, which differs from the
+    /// expected one.
     Failed(Checksum),
 }
 
 pin_project! {
-    /// An async reader that checks the stream against an expected digest.
+    /// An async reader that verifies a stream against an expected checksum.
     ///
-    /// Bytes pass through unchanged. The check happens at EOF: the final read,
-    /// the one that yields zero bytes, fails with
-    /// [`InvalidData`](std::io::ErrorKind::InvalidData) when the digest of what
-    /// was read differs from the expected one, and every read after it fails
-    /// the same way, so a consumer that keeps reading past the mismatch never
-    /// sees a clean end of stream. A consumer that stops early never observes
-    /// EOF and so never verifies -- the checked property is "this stream, read
-    /// whole, hashed to this" -- and a read into an empty buffer touches
-    /// neither the stream nor the check.
+    /// The bytes pass through unchanged. The reader hashes them with SHA-256
+    /// and verifies the digest at EOF. A caller can wrap a fetched payload in
+    /// one. Then a body that does not hash to the checksum of the object fails
+    /// at EOF.
+    ///
+    /// If `R` implements `futures_io::AsyncRead`, the reader implements it
+    /// too. Under the `tokio` feature, the same rule applies to the tokio
+    /// `AsyncRead`.
+    ///
+    /// # Verification
+    ///
+    /// - The read that reaches EOF is the read that yields zero bytes. If the
+    ///   digest of the stream differs from the expected checksum, this read
+    ///   fails with [`InvalidData`](std::io::ErrorKind::InvalidData).
+    /// - The error message is `checksum mismatch: expected <expected>,
+    ///   computed <actual>`.
+    /// - Each read after a mismatch fails with the same error. A consumer that
+    ///   reads past the mismatch never sees a clean end of stream.
+    /// - After a match, each later read returns zero bytes.
+    /// - A consumer that stops before EOF never verifies the stream. The
+    ///   verified property is "this stream, read whole, hashes to this
+    ///   checksum".
+    /// - A read into an empty buffer reads nothing from the stream and does
+    ///   not change the state of the check.
     pub struct VerifyingReader<R> {
         expected: Checksum,
         checked: Checked,
@@ -141,10 +177,12 @@ pin_project! {
 }
 
 impl<R> VerifyingReader<R> {
-    /// Wrap `inner`, expecting its contents to hash to `expected`. As with
-    /// [`HashingReader::new`], `hasher` may be pre-seeded to cover leading
-    /// bytes -- a content object's framed header, for instance -- that the
-    /// stream itself does not carry.
+    /// Creates a reader that expects the contents of `inner` to hash to
+    /// `expected`.
+    ///
+    /// As with [`HashingReader::new`], `hasher` can hold leading bytes that
+    /// the stream does not carry, for example the framed header of a content
+    /// object.
     pub fn new(expected: Checksum, hasher: Sha256, inner: R) -> VerifyingReader<R> {
         VerifyingReader {
             expected,
@@ -153,18 +191,18 @@ impl<R> VerifyingReader<R> {
         }
     }
 
-    /// The digest the stream is checked against.
+    /// Returns the checksum that the reader verifies the stream against.
     pub fn expected(&self) -> &Checksum {
         &self.expected
     }
 
-    /// The number of stream bytes read so far.
+    /// Returns the number of stream bytes read so far.
     pub fn size(&self) -> u64 {
         self.inner.size()
     }
 }
 
-/// The mismatch reported by the read that reaches EOF.
+/// Returns the error that reports a digest mismatch at EOF and after it.
 fn mismatch(expected: &Checksum, actual: &Checksum) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -308,7 +346,8 @@ impl<W: ostrya_rt::tokio_io::AsyncWrite> ostrya_rt::tokio_io::AsyncWrite for Has
     }
 }
 
-/// The hashing streams move freely across tasks and threads.
+/// Checks at compile time that the hashing streams are `Send + Sync`, so they
+/// move across tasks and threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<HashingReader<ostrya_rt::File>>();
@@ -316,8 +355,8 @@ const _: fn() = || {
     assert_send_sync::<VerifyingReader<ostrya_rt::File>>();
 };
 
-/// Under the `tokio` feature the hashing streams speak the tokio I/O traits
-/// when their inner stream does, so tokio-native callers need no adapter.
+/// Checks at compile time that, under the `tokio` feature, the hashing streams
+/// implement the tokio I/O traits if their inner stream does.
 #[cfg(feature = "tokio")]
 const _: fn() = || {
     fn assert_tokio_read<T: ostrya_rt::tokio_io::AsyncRead>() {}
@@ -332,7 +371,7 @@ mod tests {
     use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
     use ostrya_rt::block_on;
 
-    /// A minimal in-memory `futures-io` writer for exercising `HashingWriter`.
+    /// An in-memory `futures-io` writer for the tests of `HashingWriter`.
     struct VecSink(Vec<u8>);
 
     impl futures_io::AsyncWrite for VecSink {
@@ -380,9 +419,9 @@ mod tests {
             let mut out = Vec::new();
             reader.read_to_end(&mut out).await.unwrap();
             let (digest, size) = reader.finalize();
-            // The size counts only the streamed payload, not the seed.
+            // The size counts the streamed payload and excludes the seed.
             assert_eq!(size, payload.len() as u64);
-            // The digest covers header followed by payload.
+            // The digest covers the header and then the payload.
             let mut whole = Vec::new();
             whole.extend_from_slice(header);
             whole.extend_from_slice(payload);
@@ -433,7 +472,7 @@ mod tests {
             let err = reader.read_to_end(&mut out).await.unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
             assert!(err.to_string().contains("checksum mismatch"), "{err}");
-            // The bytes were delivered before the check fired at EOF.
+            // The reader delivered the bytes before the check failed at EOF.
             assert_eq!(out, data);
         });
     }
@@ -450,7 +489,7 @@ mod tests {
             let mut out = Vec::new();
             let first = reader.read_to_end(&mut out).await.unwrap_err();
 
-            // Reading past the failure reports it again rather than EOF.
+            // Each read after the failure returns the same error, never EOF.
             let mut buf = [0u8; 8];
             for _ in 0..2 {
                 let err = reader.read(&mut buf).await.unwrap_err();
@@ -497,7 +536,7 @@ mod tests {
         block_on(async {
             let data = b"a longer payload than the caller reads";
             let mut reader = VerifyingReader::new(
-                // A digest that cannot match, to prove no check fires.
+                // This digest cannot match, so the test shows that no check runs.
                 Checksum::sha256(b"something else"),
                 Sha256::new(),
                 futures_lite::io::Cursor::new(data),
@@ -506,7 +545,7 @@ mod tests {
             reader.read_exact(&mut head).await.unwrap();
             assert_eq!(&head, b"a longer");
 
-            // An empty buffer neither reads bytes nor latches EOF.
+            // A read into an empty buffer reads no bytes and records no EOF.
             assert_eq!(reader.read(&mut []).await.unwrap(), 0);
             assert_eq!(reader.size(), 8);
         });

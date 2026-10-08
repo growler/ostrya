@@ -1,13 +1,16 @@
-//! Summary generation, signing, and verification.
+//! Tests of summary generation, signing, and verification.
 //!
-//! Byte-identity is checked against golden summaries the `ostree` tool wrote for
-//! the same repositories (`tests/fixtures/generated/summary` and
-//! `summary-collection`, produced by `generate.sh`). The tool's wall-clock
-//! `ostree.summary.last-modified` is patched in the golden to a fixed epoch, and
-//! the port is asked to reproduce that epoch, so the comparison is deterministic.
-//! The collection fixture ships the repository in its pre-summary state, so the
-//! port generates the `ostree-metadata` anchor commit itself and its checksum is
-//! checked against the tool's.
+//! The tests compare the summary bytes with golden summaries that the
+//! `ostree` command wrote for the same repositories. `generate.sh` writes the
+//! fixtures `tests/fixtures/generated/summary` and `summary-collection`. The
+//! `ostree` command writes a wall-clock `ostree.summary.last-modified`, and
+//! `generate.sh` patches that value in each golden summary to a fixed epoch.
+//! ostrya writes the same epoch, so the comparison is deterministic.
+//!
+//! The collection fixture holds the repository in its state before the first
+//! summary, so ostrya generates the `ostree-metadata` anchor commit itself.
+//! The test compares its checksum with the checksum that the `ostree` command
+//! wrote.
 
 mod common;
 
@@ -21,21 +24,27 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// The fixed epoch patched into both golden summaries' `last-modified` and used
-/// as the collection anchor commit's timestamp (`generate.sh`).
+/// The fixed epoch in the `last-modified` value of both golden summaries.
+///
+/// `generate.sh` patches this epoch into the golden summaries. It is also the
+/// timestamp of the collection anchor commit.
 const FIXED_EPOCH: u64 = 1_700_000_000;
 /// The collection id of the `summary-collection` fixture.
 const COLLECTION_ID: &str = "org.ostrya.Test";
-/// The `ostree-metadata` anchor commit the tool wrote for the collection
-/// fixture (first generation, parentless, timestamp `FIXED_EPOCH`).
+/// The `ostree-metadata` anchor commit of the collection fixture.
+///
+/// The `ostree` command wrote this commit in the first generation, with no
+/// parent and with the timestamp `FIXED_EPOCH`.
 const ANCHOR_COMMIT: &str = "04fd8792152380dd12ef240cda008ef098407791011c01b3dd4f75f9964d6068";
 
-/// A fixed ed25519 keypair for sign/verify round-trips (from `sign_ed25519.rs`).
+/// A fixed ed25519 keypair for sign and verify round trips.
+///
+/// The keypair comes from `sign_ed25519.rs`.
 const SECRET_B64: &str =
     "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
 const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
 
-/// Recursively copy a directory tree, preserving attributes.
+/// Copies a directory tree with its attributes (`cp -a`).
 fn copy_tree(from: &Path, to: &Path) {
     let status = Command::new("cp")
         .args(["-a"])
@@ -46,7 +55,9 @@ fn copy_tree(from: &Path, to: &Path) {
     assert!(status.success(), "cp -a {from:?} {to:?} failed");
 }
 
-/// Copy a fixture's `repo/` into a fresh writable temp directory and return it.
+/// Copies the `repo/` of a fixture into a new writable temp directory.
+///
+/// Returns the temp directory and the path of the copy.
 fn writable_fixture(fixture: &str, tag: &str) -> (TmpDir, std::path::PathBuf) {
     let tmp = TmpDir::new(tag);
     let repo = tmp.path().join("repo");
@@ -93,7 +104,8 @@ fn regenerate_removes_a_stale_signature() {
             .unwrap();
         assert!(repo.read_summary_signature().await.unwrap().is_some());
 
-        // A fresh summary invalidates the old signature, so it is removed.
+        // A new summary makes the old signature invalid, so regeneration
+        // removes it.
         repo.regenerate_summary(&SummaryOptions {
             last_modified: Some(FIXED_EPOCH),
             metadata_commit_timestamp: None,
@@ -123,7 +135,8 @@ fn collection_summary_and_anchor_match_the_tool() {
         .await
         .unwrap();
 
-        // The port generated the anchor commit; its checksum matches the tool's.
+        // ostrya generated the anchor commit. Its checksum matches the commit
+        // that the `ostree` command wrote.
         let anchor = repo
             .resolve_rev("ostree-metadata", false)
             .await
@@ -173,10 +186,13 @@ fn sign_and_verify_round_trip() {
     });
 }
 
-/// The reverse-direction gate: the `ostree` tool verifies a summary the port
-/// generated and signed. Wrong-key rejection is covered by the port's own
-/// `verify_summary` above; the tool's summary cache makes a second in-process
-/// verify under a different key unreliable, so it is not asserted here.
+/// The gate in the reverse direction: the `ostree` command verifies a summary
+/// that ostrya generated and signed.
+///
+/// `sign_and_verify_round_trip` tests the refusal of a wrong key with the
+/// `verify_summary` of ostrya. The `ostree` command keeps a summary cache. A
+/// second verification under a different key in the same test is then not
+/// reliable, so this test does not assert it.
 #[test]
 fn tool_verifies_a_port_signed_summary() {
     if !ostree_supports_ed25519() {
@@ -225,10 +241,11 @@ fn tool_verifies_a_port_signed_summary() {
     );
 }
 
-/// A repository holding static deltas advertises them in its summary:
-/// `ostree.static-deltas` maps each delta's name to the SHA-256 of its
-/// superblock, and the key sits between `tombstone-commits` and
-/// `indexed-deltas`, which is where the tool was observed to write it.
+/// A repository that holds static deltas advertises them in its summary.
+///
+/// `ostree.static-deltas` maps the name of each delta to the SHA-256 of its
+/// superblock. The key is between `tombstone-commits` and `indexed-deltas`.
+/// The `ostree` command was observed to write the key at this position.
 #[test]
 fn the_summary_advertises_the_deltas_the_repository_holds() {
     let (_tmp, repo_dir) = writable_fixture("summary", "summary-deltas");
@@ -273,8 +290,8 @@ fn the_summary_advertises_the_deltas_the_repository_holds() {
         let map = summary
             .metadata_value("ostree.static-deltas")
             .expect("the summary advertises the deltas");
-        // Each delta the repository holds is named in the map under the digest of
-        // its own superblock.
+        // The map names each delta of the repository under the digest of its
+        // own superblock.
         let advertised = |name: &str| {
             map.dict_get(name)
                 .and_then(Value::as_variant)
@@ -296,8 +313,8 @@ fn the_summary_advertises_the_deltas_the_repository_holds() {
             "the map must carry the from-to delta's superblock digest"
         );
 
-        // The key's neighbours: the entries appear in the order byte identity
-        // relies on.
+        // The neighbors of the key: the entries appear in the order that byte
+        // identity needs.
         let keys: Vec<String> = match &summary.metadata {
             Value::Array(entries) => entries
                 .iter()
@@ -317,9 +334,10 @@ fn the_summary_advertises_the_deltas_the_repository_holds() {
     });
 }
 
-/// The `ostree` tool reads the delta map the port wrote, which is the
-/// interoperability the advertisement exists for: a fetcher finds the deltas
-/// through it.
+/// The `ostree` command reads the delta map that ostrya wrote.
+///
+/// This interoperability is the purpose of the advertisement: a fetcher finds
+/// the deltas through the map.
 #[test]
 fn the_tool_reads_the_port_written_delta_map() {
     if !ostree_available() {
@@ -368,7 +386,7 @@ fn the_tool_reads_the_port_written_delta_map() {
     );
 }
 
-/// A caller key paired with a string variant.
+/// Returns a caller key paired with a string variant.
 fn string_entry(key: &str, value: &str) -> (String, Value) {
     (
         key.to_owned(),
@@ -376,7 +394,7 @@ fn string_entry(key: &str, value: &str) -> (String, Value) {
     )
 }
 
-/// The keys of the summary's global metadata dict, in the order it stores them.
+/// Returns the keys of the global metadata dict of a summary, in stored order.
 fn metadata_keys(summary: &Summary) -> Vec<String> {
     summary
         .metadata
@@ -387,8 +405,9 @@ fn metadata_keys(summary: &Summary) -> Vec<String> {
         .collect()
 }
 
-/// Regenerate `repo` at the fixed epoch with `added` as the caller keys and
-/// parse the summary written.
+/// Regenerates the summary of `repo` at the fixed epoch and parses it.
+///
+/// `added` gives the caller keys.
 async fn regenerate_with(repo: &Repo, added: Vec<(String, Value)>) -> Summary {
     repo.regenerate_summary(&SummaryOptions {
         last_modified: Some(FIXED_EPOCH),
@@ -400,9 +419,12 @@ async fn regenerate_with(repo: &Repo, added: Vec<(String, Value)>) -> Summary {
     Summary::parse(&repo.read_summary().await.unwrap().unwrap()).unwrap()
 }
 
-/// The caller keys follow the standard entries in first-occurrence order. A
-/// repeated key keeps its first position and its last value, the empty key is
-/// kept, and a key the writer writes in the same run keeps the writer's value.
+/// The caller keys come after the standard entries, in first-occurrence order.
+///
+/// - A repeated key keeps its first position and its last value.
+/// - The summary keeps the empty key.
+/// - If the writer writes a key in the same run, the key keeps the value of
+///   the writer.
 #[test]
 fn caller_metadata_follows_the_standard_entries() {
     let (_tmp, repo_dir) = writable_fixture("summary", "summary-added");
@@ -451,9 +473,10 @@ fn caller_metadata_follows_the_standard_entries() {
     });
 }
 
-/// A caller key the writer does not write in this run survives, whatever its
-/// name: `ostree.summary.expires` and a `ostree.static-deltas` in a repository
-/// that holds no delta.
+/// The summary keeps a caller key that the writer does not write in this run.
+///
+/// This is true for each key name. The test uses `ostree.summary.expires`, and
+/// `ostree.static-deltas` in a repository that holds no delta.
 #[test]
 fn caller_metadata_keeps_keys_the_writer_does_not_write() {
     let (_tmp, repo_dir) = writable_fixture("summary", "summary-added-kept");
@@ -483,8 +506,10 @@ fn caller_metadata_keeps_keys_the_writer_does_not_write() {
     });
 }
 
-/// A caller value that is not a variant is refused before anything is written:
-/// the summary stays as it stood and the collection anchor commit does not
+/// A regeneration refuses a caller value that is not a variant before it
+/// writes.
+///
+/// The summary does not change, and the collection anchor commit does not
 /// advance.
 #[test]
 fn caller_metadata_that_is_no_variant_is_refused_first() {
@@ -513,8 +538,10 @@ fn caller_metadata_that_is_no_variant_is_refused_first() {
     });
 }
 
-/// With no caller keys the summary stays byte-identical to the tool's golden,
-/// for the plain and the collection fixture alike.
+/// With no caller keys, the summary is byte-identical to the golden summary.
+///
+/// This is true for the plain fixture and for the collection fixture. The
+/// `ostree` command wrote both golden summaries.
 #[test]
 fn no_caller_metadata_keeps_the_golden_bytes() {
     for fixture in ["summary", "summary-collection"] {
@@ -529,11 +556,13 @@ fn no_caller_metadata_keeps_the_golden_bytes() {
     }
 }
 
-/// In a collection repository a caller key is refused before anything is
-/// written. The tool copies the caller keys into the `ostree-metadata` anchor
-/// commit, which the port does not reproduce, so the port refuses rather than
-/// write another anchor. The summary, its signature, and the anchor ref stay
-/// as they stood.
+/// In a collection repository, a regeneration refuses a caller key before it
+/// writes.
+///
+/// The `ostree` command copies the caller keys into the `ostree-metadata`
+/// anchor commit. ostrya does not reproduce this copy, so it refuses the key
+/// and writes no anchor that differs from the anchor of the `ostree` command.
+/// The summary, its signature, and the anchor ref do not change.
 #[test]
 fn caller_metadata_in_a_collection_repository_is_refused() {
     let (_tmp, repo_dir) = writable_fixture("summary-collection", "summary-added-collection");
@@ -568,7 +597,7 @@ fn caller_metadata_in_a_collection_repository_is_refused() {
     });
 }
 
-/// A signer that refuses to sign, for the batch refusal test.
+/// A signer that refuses to sign, for the test of a failed batch.
 struct RefusingSigner;
 
 impl ostrya::Signer for RefusingSigner {
@@ -585,9 +614,11 @@ impl ostrya::Signer for RefusingSigner {
     }
 }
 
-/// One batch of signers writes the `summary.sig` that one call per signer
-/// writes, in slice order, and the dummy engine's entry keeps the place its
-/// first signature gives it.
+/// One batch of signers writes the same `summary.sig` as one call for each
+/// signer.
+///
+/// The batch signs in slice order. The entry of the dummy engine keeps the
+/// position of its first signature.
 #[test]
 fn sign_summary_all_writes_what_one_call_per_signer_writes() {
     let (_tmp, repo_dir) = writable_fixture("summary", "summary-sign-all");
@@ -613,8 +644,9 @@ fn sign_summary_all_writes_what_one_call_per_signer_writes() {
     });
 }
 
-/// A signer that fails in the middle of a batch leaves `summary.sig` as it
-/// stood: the batch writes the file once, after every signature is made.
+/// If a signer fails in the middle of a batch, `summary.sig` does not change.
+///
+/// The batch writes the file one time, after it makes all signatures.
 #[test]
 fn sign_summary_all_writes_nothing_when_a_signer_fails() {
     let (_tmp, repo_dir) = writable_fixture("summary", "summary-sign-all-fail");
@@ -634,7 +666,7 @@ fn sign_summary_all_writes_nothing_when_a_signer_fails() {
     });
 }
 
-/// A copy of the collection fixture whose config sets `lock-timeout-secs=0`.
+/// Copies the collection fixture and sets `lock-timeout-secs=0` in its config.
 fn collection_fixture_with_no_wait(tag: &str) -> (TmpDir, std::path::PathBuf) {
     let (tmp, repo_dir) = writable_fixture("summary-collection", tag);
     let config = repo_dir.join("config");
@@ -644,7 +676,7 @@ fn collection_fixture_with_no_wait(tag: &str) -> (TmpDir, std::path::PathBuf) {
     (tmp, repo_dir)
 }
 
-/// With no guard held, a regeneration at `lock-timeout-secs=0` takes both
+/// If no guard is held, a regeneration at `lock-timeout-secs=0` takes both
 /// locks at the first attempt and refreshes the anchor.
 #[test]
 fn a_regeneration_with_no_guard_takes_its_locks_at_once() {
@@ -660,8 +692,10 @@ fn a_regeneration_with_no_guard_takes_its_locks_at_once() {
     });
 }
 
-/// A regeneration waits for a held `UpdateGuard`. At `lock-timeout-secs=0` it
-/// fails with `LockTimeout` and writes no summary, no anchor, and no ref.
+/// A regeneration waits for a held `UpdateGuard`.
+///
+/// At `lock-timeout-secs=0`, it fails with `LockTimeout` and writes no
+/// summary, no anchor, and no ref.
 #[test]
 fn a_regeneration_waits_for_a_held_guard() {
     let (_tmp, repo_dir) = collection_fixture_with_no_wait("summary-guard");
@@ -691,8 +725,8 @@ fn a_regeneration_waits_for_a_held_guard() {
     });
 }
 
-/// A caller value the dict cannot hold is refused before any lock, so a held
-/// guard does not delay the refusal.
+/// A regeneration refuses a caller value that the dict cannot hold before it
+/// takes a lock, so a held guard does not delay the refusal.
 #[test]
 fn a_refusal_comes_before_the_locks() {
     let (_tmp, repo_dir) = collection_fixture_with_no_wait("summary-guard-refusal");

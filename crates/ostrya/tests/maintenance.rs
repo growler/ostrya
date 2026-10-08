@@ -1,11 +1,15 @@
-//! Prune, fsck, traversal, and diff integration tests.
+//! Integration tests of prune, fsck, traversal, and diff.
 //!
-//! The reachability, prune, and diff results are cross-checked against the
-//! `ostree` tool: the port and the tool prune identical repositories and must
-//! agree on which objects survive and how many bytes are freed; the port's diff
-//! must reproduce `ostree diff`; and a repository the port prunes or leaves must
-//! pass `ostree fsck`. The fsck tests corrupt and delete objects and confirm the
-//! port detects exactly the injected fault.
+//! The tests compare the reachability, prune, and diff results of ostrya with
+//! the results of the `ostree` command:
+//!
+//! - ostrya and the `ostree` command prune identical repositories. They must
+//!   keep the same objects and free the same number of bytes.
+//! - The diff of ostrya must give the same result as `ostree diff`.
+//! - A repository that ostrya prunes or leaves must pass `ostree fsck`.
+//!
+//! The fsck tests corrupt and delete objects. They check that ostrya finds
+//! exactly the injected fault.
 
 mod common;
 
@@ -22,10 +26,11 @@ use ostrya::{
 use ostrya_rt::block_on;
 
 // ---------------------------------------------------------------------------
-// Tool-driven repository construction helpers.
+// Helpers that build repositories with the `ostree` command.
 // ---------------------------------------------------------------------------
 
-/// Run the `ostree` tool, asserting success and returning trimmed stdout.
+/// Runs the `ostree` command, asserts that it succeeds, and returns the trimmed
+/// standard output.
 fn ostree(args: &[&str]) -> String {
     let output = Command::new("ostree")
         .args(args)
@@ -39,7 +44,8 @@ fn ostree(args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-/// Run the `ostree` tool and return combined stdout+stderr, whatever the exit.
+/// Runs the `ostree` command and returns its standard output and standard error
+/// together, whatever the exit status.
 fn ostree_output(args: &[&str]) -> String {
     let output = Command::new("ostree")
         .args(args)
@@ -50,7 +56,8 @@ fn ostree_output(args: &[&str]) -> String {
     s
 }
 
-/// Write a single-file tree at `dir` with canonical permissions.
+/// Writes a tree of one file at `dir`, with canonical permissions (0644 on the
+/// file, 0755 on the directory).
 fn write_tree(dir: &Path, name: &str, content: &[u8]) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).unwrap();
@@ -59,8 +66,10 @@ fn write_tree(dir: &Path, name: &str, content: &[u8]) {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// Commit `src` onto branch `branch` of the tool repository at `repo`, forcing
-/// owner 0:0 and no xattrs, and return the new commit checksum.
+/// Commits `src` to the branch `branch` of the repository at `repo` with the
+/// `ostree` command, and returns the new commit checksum.
+///
+/// The commit sets the owner to 0:0 and records no xattrs.
 fn tool_commit(repo: &Path, branch: &str, src: &Path) -> Checksum {
     let repo_arg = format!("--repo={}", repo.display());
     let hex = ostree(&[
@@ -79,7 +88,7 @@ fn tool_commit(repo: &Path, branch: &str, src: &Path) -> Checksum {
     Checksum::from_hex(&hex).unwrap()
 }
 
-/// Initialize an archive repository with the tool.
+/// Creates an archive repository at `repo` with the `ostree` command.
 fn tool_init(repo: &Path) {
     ostree(&[
         &format!("--repo={}", repo.display()),
@@ -88,7 +97,7 @@ fn tool_init(repo: &Path) {
     ]);
 }
 
-/// Recursively copy a directory tree, preserving attributes.
+/// Copies a directory tree recursively and keeps its attributes.
 fn copy_tree(from: &Path, to: &Path) {
     let status = Command::new("cp")
         .args(["-a"])
@@ -99,7 +108,7 @@ fn copy_tree(from: &Path, to: &Path) {
     assert!(status.success(), "cp -a {from:?} {to:?} failed");
 }
 
-/// The set of loose objects present on disk, by relative `objects/` path.
+/// Returns the set of loose objects on disk, as paths relative to `objects/`.
 fn disk_object_paths(repo: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
     let objects = repo.join("objects");
@@ -117,9 +126,11 @@ fn disk_object_paths(repo: &Path) -> HashSet<String> {
     out
 }
 
-/// A three-commit branch (`m`: c1 <- c2 <- c3) in a fresh tool repository, with
-/// each commit changing the same top-level file so history holds distinct
-/// objects. Returns the three commit checksums.
+/// Builds the branch `m` of three commits (c1 <- c2 <- c3) in a new repository
+/// with the `ostree` command, and returns the three commit checksums.
+///
+/// Each commit changes the same top-level file, so the history holds distinct
+/// objects.
 fn build_three_commit_repo(base: &Path, repo: &Path) -> [Checksum; 3] {
     tool_init(repo);
     let mut commits = Vec::new();
@@ -174,7 +185,7 @@ fn traverse_commit_honors_depth() {
     block_on(async {
         let handle = Repo::open(&repo).await.unwrap();
 
-        // Unbounded depth reaches every commit in the ancestry.
+        // Depth -1 (no limit) reaches every commit in the ancestry.
         let full = handle.traverse_commit(&c3, -1).await.unwrap();
         for c in [c1, c2, c3] {
             assert!(
@@ -183,19 +194,19 @@ fn traverse_commit_honors_depth() {
             );
         }
 
-        // Depth 0 reaches only the head commit.
+        // Depth 0 reaches the head commit alone.
         let head_only = handle.traverse_commit(&c3, 0).await.unwrap();
         assert!(head_only.contains(&ObjectName::new(c3, ObjectType::Commit)));
         assert!(!head_only.contains(&ObjectName::new(c2, ObjectType::Commit)));
         assert!(!head_only.contains(&ObjectName::new(c1, ObjectType::Commit)));
 
-        // Depth 1 reaches the head and its immediate parent only.
+        // Depth 1 reaches the head and its direct parent alone.
         let one = handle.traverse_commit(&c3, 1).await.unwrap();
         assert!(one.contains(&ObjectName::new(c3, ObjectType::Commit)));
         assert!(one.contains(&ObjectName::new(c2, ObjectType::Commit)));
         assert!(!one.contains(&ObjectName::new(c1, ObjectType::Commit)));
 
-        // A traversal of an absent commit is an error.
+        // A traversal of an absent commit returns an error.
         let bogus = Checksum::from_hex(&"ab".repeat(32)).unwrap();
         assert!(handle.traverse_commit(&bogus, -1).await.is_err());
     });
@@ -206,8 +217,8 @@ fn traverse_reachable_depth_is_order_independent() {
     let tmp = TmpDir::new("maint-traverse-order");
     block_on(async {
         let base = tmp.path();
-        // Linear history c0 <- c1 <- c2 <- c3, built with the library so the
-        // test does not need the tool.
+        // Linear history c0 <- c1 <- c2 <- c3. The library builds it, so the
+        // test does not need the `ostree` command.
         write_tree(&base.join("t0"), "a.txt", b"zero\n");
         write_tree(&base.join("t1"), "a.txt", b"one\n");
         write_tree(&base.join("t2"), "a.txt", b"two\n");
@@ -221,9 +232,9 @@ fn traverse_reachable_depth_is_order_independent() {
         let c2 = library_commit(&repo, base, "t2", Some(c1)).await;
         let c3 = library_commit(&repo, base, "t3", Some(c2)).await;
 
-        // Roots c3 and c2 (c2 is c3's parent) at depth 1. c1 is c2's parent, so
-        // it is within depth 1 of the c2 root and must be reachable no matter
-        // which order the two roots are supplied in.
+        // The roots are c3 and c2 at depth 1, and c2 is the parent of c3. c1
+        // is the parent of c2, so it is within depth 1 of the root c2. It must
+        // be reachable for both orders of the two roots.
         let forward = repo.traverse_reachable([c3, c2], 1).await.unwrap();
         let reverse = repo.traverse_reachable([c2, c3], 1).await.unwrap();
         assert_eq!(
@@ -246,9 +257,12 @@ fn traverse_reachable_depth_is_order_independent() {
 // Prune.
 // ---------------------------------------------------------------------------
 
-/// Parse "Deleted N objects, S bytes freed" or "Would delete: N objects,
-/// freeing S bytes" from tool prune output into `(objects, bytes)`. Only the
-/// deletion line is examined, so the "Total objects:" line is ignored.
+/// Parses the deletion line of the prune output of the `ostree` command into
+/// `(objects, bytes)`.
+///
+/// The deletion line is "Deleted N objects, S bytes freed" or "Would delete: N
+/// objects, freeing S bytes". The function reads that line alone, so it ignores
+/// the "Total objects:" line.
 fn parse_prune_counts(output: &str) -> (usize, u64) {
     let line = output
         .lines()
@@ -277,11 +291,12 @@ fn prune_matches_the_tool_refs_only_depth_zero() {
     let tmp = TmpDir::new("maint-prune");
     let tool_repo = tmp.path().join("tool");
     build_three_commit_repo(tmp.path(), &tool_repo);
-    // An identical copy the port prunes.
+    // An identical copy that ostrya prunes.
     let port_repo = tmp.path().join("port");
     copy_tree(&tool_repo, &port_repo);
 
-    // The tool prunes its copy; capture the reported counts.
+    // The `ostree` command prunes its copy. The test keeps the counts that it
+    // reports.
     let out = ostree_output(&[
         &format!("--repo={}", tool_repo.display()),
         "prune",
@@ -315,7 +330,7 @@ fn prune_matches_the_tool_refs_only_depth_zero() {
         "the surviving object sets are identical"
     );
 
-    // The pruned repository still passes the tool's own fsck.
+    // The pruned repository still passes `ostree fsck`.
     let fsck = ostree_output(&[&format!("--repo={}", port_repo.display()), "fsck"]);
     assert!(
         fsck.contains("no errors found"),
@@ -387,7 +402,8 @@ fn prune_delete_commit_removes_it_and_orphans() {
 
     block_on(async {
         let handle = Repo::open(&repo).await.unwrap();
-        // c1 is an ancestor, not the ref head, so it can be deleted.
+        // c1 is an ancestor of the ref head. No ref names c1, so prune can
+        // delete it.
         let opts = ostrya::PruneOptions {
             delete_commit: Some(c1),
             ..ostrya::PruneOptions::new()
@@ -400,7 +416,7 @@ fn prune_delete_commit_removes_it_and_orphans() {
         );
     });
 
-    // The tool accepts the result.
+    // `ostree fsck` accepts the result.
     let fsck = ostree_output(&[&format!("--repo={}", repo.display()), "fsck"]);
     assert!(
         fsck.contains("no errors found"),
@@ -432,28 +448,29 @@ fn prune_refuses_to_delete_a_referenced_commit() {
 }
 
 // ---------------------------------------------------------------------------
-// The repository lock, across processes.
+// The repository lock between processes.
 // ---------------------------------------------------------------------------
 
-/// The environment variable naming the repository the foreign-lock helper holds.
+/// The environment variable that names the repository of the foreign-lock
+/// helper.
 const FOREIGN_LOCK_REPO: &str = "OSTRYA_FOREIGN_LOCK_REPO";
 
-/// The `lock-timeout-secs` every case below configures, in seconds. It bounds
-/// how long a contended acquisition waits before it fails.
+/// The `lock-timeout-secs` value of each lock test, in seconds. It limits the
+/// time that a contended acquisition waits before it fails.
 const LOCK_TIMEOUT_SECS: u64 = 1;
 
-/// The longest a readiness wait runs before it reports a holder that never
-/// arrived.
+/// The maximum time of a readiness wait. After this time, the wait reports a
+/// holder that never arrived.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// One readiness poll.
+/// The interval of one readiness poll.
 const READY_POLL: Duration = Duration::from_millis(20);
 
-/// A spawned child, killed and reaped when the guard drops.
+/// A spawned child that the guard kills and reaps when it drops.
 ///
-/// A panic skips a reap written at the end of a test, and the child then keeps
-/// its hold on the repository while the test directory is removed under it. The
-/// guard ends the child on every path out of the test.
+/// A panic skips a reap at the end of a test. The child then keeps its hold on
+/// the repository while the test removes the test directory. The guard ends the
+/// child on every path out of the test.
 struct ChildGuard(std::process::Child);
 
 impl Drop for ChildGuard {
@@ -463,9 +480,10 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Append `lock-timeout-secs` to the repository config.
+/// Appends `lock-timeout-secs` to the repository config.
 ///
-/// The config is read once at open, so this runs before the handle exists.
+/// The repository reads its config once at open, so this function runs before
+/// the handle exists.
 fn set_lock_timeout(repo: &Path, secs: u64) {
     let config = repo.join("config");
     let mut text = std::fs::read_to_string(&config).unwrap();
@@ -473,17 +491,18 @@ fn set_lock_timeout(repo: &Path, secs: u64) {
     std::fs::write(&config, text).unwrap();
 }
 
-/// Wait for `marker` to appear, up to [`READY_TIMEOUT`].
+/// Waits up to [`READY_TIMEOUT`] for `marker` to appear.
 fn wait_for_marker(marker: &Path) -> bool {
     wait_until(|| marker.exists())
 }
 
-/// Wait for a staging directory to appear under `<repo>/tmp`, up to
-/// [`READY_TIMEOUT`].
+/// Waits up to [`READY_TIMEOUT`] for a staging directory to appear under
+/// `<repo>/tmp`.
 ///
-/// The `ostree` tool creates one once it holds the repository, so the entry
-/// states that the tool's own lock stands. Observed with ostree 2026.1: a probe
-/// of `<repo>/.lock` reports the lock held at every point the entry exists.
+/// The `ostree` command creates one after it takes the repository, so the entry
+/// shows that the `ostree` command holds its lock. Observed with ostree 2026.1:
+/// a probe of `<repo>/.lock` reports the lock as held at every point where the
+/// entry exists.
 fn wait_for_tool_staging(repo: &Path) -> bool {
     wait_until(|| {
         let Ok(entries) = std::fs::read_dir(repo.join("tmp")) else {
@@ -498,10 +517,11 @@ fn wait_for_tool_staging(repo: &Path) -> bool {
     })
 }
 
-/// The prefix of the staging directory the `ostree` tool creates under `tmp/`.
+/// The prefix of the staging directory that the `ostree` command creates under
+/// `tmp/`.
 const TOOL_STAGING_PREFIX: &str = "staging-";
 
-/// Poll `ready` until it holds or [`READY_TIMEOUT`] elapses.
+/// Polls `ready` until it returns `true` or [`READY_TIMEOUT`] elapses.
 fn wait_until(mut ready: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
@@ -515,15 +535,17 @@ fn wait_until(mut ready: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// The tool's prune waits on the repository lock the port holds, so the two
-/// exclude each other on one repository.
+/// The prune of the `ostree` command waits on the repository lock that ostrya
+/// holds, so the two exclude each other on one repository.
 ///
-/// The port takes the lock exclusive in this process and the tool runs as a
-/// child, which is the arrangement a record lock resolves. The elapsed wall
-/// clock of the tool's run is the evidence that it waited on the lock rather
-/// than failing for another reason. The wording of the tool's diagnostic is
-/// outside the scope of this project, so the rest of the assertion covers the
-/// exit status and the object inventory alone.
+/// This process takes the lock exclusive through ostrya, and the `ostree`
+/// command runs as a child. A record lock resolves this arrangement. The
+/// elapsed wall clock time of the `ostree` run shows that it waited on the
+/// lock, and did not fail for another reason.
+///
+/// The wording of the diagnostic of the `ostree` command is outside the scope
+/// of this project. The other assertions cover the exit status and the object
+/// inventory alone.
 #[test]
 fn the_tool_prune_waits_on_a_lock_the_port_holds() {
     if !ostree_available() {
@@ -575,13 +597,13 @@ fn the_tool_prune_waits_on_a_lock_the_port_holds() {
     );
 }
 
-/// The port's prune waits on the repository the tool holds, which is the other
-/// side of the exclusion between the two.
+/// The prune of ostrya waits on the repository that the `ostree` command holds.
+/// This is the other side of the exclusion between the two.
 ///
-/// The tool commits a tar tree read from its standard input. It takes the
-/// repository lock and creates its staging directory before it reads the first
-/// byte, so a child whose standard input stays open and silent holds the
-/// repository for as long as the test needs.
+/// The `ostree` command commits a tar tree that it reads from its standard
+/// input. It takes the repository lock and creates its staging directory before
+/// it reads the first byte. While its standard input stays open and silent, the
+/// child holds the repository for as long as the test needs.
 #[test]
 fn prune_waits_while_the_tool_holds_the_repository() {
     if !ostree_available() {
@@ -643,13 +665,14 @@ fn prune_waits_while_the_tool_holds_the_repository() {
     );
 }
 
-/// The port's prune waits on a repository lock another process holds, and fails
-/// with [`ostrya::Error::LockTimeout`] once `lock-timeout-secs` elapses.
+/// The prune of ostrya waits on a repository lock that another process holds.
+/// After `lock-timeout-secs`, it fails with [`ostrya::Error::LockTimeout`].
 ///
-/// The holder is this test binary re-executed, taking an `fcntl` exclusive
-/// record lock on `<repo>/.lock`. That is the lock space the library and the
-/// tool share. The helper keeps the lock until its standard input closes, so
-/// the hold covers every assertion here and the guard is what ends it.
+/// The holder is this test binary, run again as a child. It takes an `fcntl`
+/// exclusive record lock on `<repo>/.lock`, the lock space that the library and
+/// the `ostree` command share. The helper keeps the lock until its standard
+/// input closes, so the hold covers every assertion of this test. The guard
+/// ends the hold.
 #[test]
 fn prune_waits_on_a_foreign_lock_holder() {
     let tmp = TmpDir::new("maint-lock-foreign");
@@ -700,13 +723,15 @@ fn prune_waits_on_a_foreign_lock_holder() {
     drop(holder);
 }
 
-/// The file the foreign-lock helper writes once it holds the lock.
+/// The file that the foreign-lock helper writes after it takes the lock.
 const FOREIGN_LOCK_MARKER: &str = ".foreign-held";
 
-/// The lock-holder half of [`prune_waits_on_a_foreign_lock_holder`], run only
-/// when this test binary is re-executed with the environment set. It takes an
-/// `fcntl` exclusive record lock on `<repo>/.lock`, states that it holds it, and
-/// keeps it until its standard input closes.
+/// The lock-holder half of [`prune_waits_on_a_foreign_lock_holder`].
+///
+/// If [`FOREIGN_LOCK_REPO`] is not set, the test returns at once. The parent
+/// test sets it when it runs this test binary again as a child. The helper
+/// takes an `fcntl` exclusive record lock on `<repo>/.lock` and writes
+/// [`FOREIGN_LOCK_MARKER`]. It keeps the lock until its standard input closes.
 #[test]
 #[ignore = "helper process for prune_waits_on_a_foreign_lock_holder"]
 fn foreign_lock_holder_subprocess() {
@@ -727,8 +752,8 @@ fn foreign_lock_holder_subprocess() {
     rustix::fs::fcntl_lock(&fd, FlockOperation::LockExclusive).expect("take the record lock");
     std::fs::write(repo.join(FOREIGN_LOCK_MARKER), b"1").expect("write the readiness marker");
 
-    // The parent holds the write half of this pipe for as long as it needs the
-    // lock, so the read returns when the parent ends the child or exits.
+    // The parent holds the write half of this pipe while it needs the lock.
+    // The read returns when the parent ends the child or exits.
     let mut sink = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut sink);
 }
@@ -737,8 +762,10 @@ fn foreign_lock_holder_subprocess() {
 // fsck.
 // ---------------------------------------------------------------------------
 
-/// Commit the fixture-like source into a fresh library-built archive repo and
-/// return the (repo, commit).
+/// Creates an archive repository with the library, commits a small source tree
+/// to `main`, and returns the repository and the commit.
+///
+/// The tree holds `hello.txt`, `sub/nested.txt`, and the symlink `link`.
 async fn build_library_repo(base: &Path) -> (Repo, Checksum) {
     use ostrya::{CommitModifier, CommitModifierFlags, CommitOptions, MutableTree};
     use std::os::fd::AsFd;
@@ -783,8 +810,10 @@ async fn build_library_repo(base: &Path) -> (Repo, Checksum) {
     (repo, commit)
 }
 
-/// Commit the tree at `base/rel` onto `parent` on branch `main` of `repo`,
-/// forcing canonical permissions and no xattrs, and return the new commit.
+/// Commits the tree at `base/rel` with the parent `parent` to the branch `main`
+/// of `repo`, and returns the new commit.
+///
+/// The commit uses canonical permissions and records no xattrs.
 async fn library_commit(repo: &Repo, base: &Path, rel: &str, parent: Option<Checksum>) -> Checksum {
     use ostrya::{CommitModifier, CommitModifierFlags, CommitOptions, MutableTree};
     use std::os::fd::AsFd;
@@ -824,13 +853,13 @@ fn fsck_passes_on_a_healthy_repo() {
         let report = repo.fsck(&FsckOptions::new()).await.unwrap();
         assert!(report.is_ok(), "healthy fsck: {:?}", report.errors);
         assert_eq!(report.commits_checked, 1);
-        // Every reachable object is examined.
+        // fsck checks every reachable object.
         let reachable = repo.traverse_commit(&commit, -1).await.unwrap();
         assert_eq!(report.objects_checked, reachable.len());
 
-        // Detached commit metadata is outside the count: it raises the loose
-        // count and leaves `objects_checked` where it was
-        // (`docs/format-reference.md`, "CLI output formats", `fsck`).
+        // Detached commit metadata is outside the count. It raises the count of
+        // loose objects and leaves `objects_checked` unchanged. The total that
+        // `ostree fsck` prints also excludes detached commit metadata.
         let detached = tmp
             .path()
             .join("repo/objects")
@@ -844,12 +873,11 @@ fn fsck_passes_on_a_healthy_repo() {
 
 #[test]
 fn fsck_refuses_a_ref_symlink_naming_a_directory() {
-    // fsck and prune seed themselves from the refs, and the ref walk reads a
-    // symlink as an alias rather than descending into it. A link naming a
-    // directory therefore fails the read with EISDIR, which is the tool's own
-    // `Listing refs: Is a directory` refusal; a self-link is the case that
-    // would otherwise recurse without end. See docs/format-reference.md,
-    // "refs".
+    // fsck and prune start from the refs. The ref walk reads a symlink as an
+    // alias and does not descend into it. If a link names a directory, the
+    // read fails with EISDIR. The `ostree` command gives the same refusal,
+    // `Listing refs: Is a directory`. Without this rule, a self-link recurses
+    // without end.
     let tmp = TmpDir::new("maint-fsck-dirlink");
     block_on(async {
         let (repo, _commit) = build_library_repo(tmp.path()).await;
@@ -933,13 +961,14 @@ fn fsck_detects_missing_object_and_marks_partial() {
             "a missing object is reported: {:?}",
             report.errors
         );
-        // The commit is marked partial.
+        // fsck marks the commit partial.
         assert_eq!(
             repo.commit_state(&commit).await.unwrap(),
             ostrya::CommitState::Partial,
             "the commit is marked partial after a missing object"
         );
-        // The marker holds the tool's single state byte.
+        // The marker holds the single state byte that the `ostree` command
+        // writes.
         let marker = repo_dir.join(format!("state/{}.commitpartial", commit.to_hex()));
         assert_eq!(std::fs::read(&marker).unwrap(), vec![0x66]);
     });
@@ -974,9 +1003,9 @@ fn fsck_marks_every_commit_sharing_a_missing_subtree() {
     let tmp = TmpDir::new("maint-fsck-shared");
     block_on(async {
         let base = tmp.path();
-        // Two commits differing at the top level but sharing an identical
-        // `sub/` subtree, so both reference the same `sub/` dirtree and the
-        // same nested content object.
+        // Two commits that differ at the top level and share an identical
+        // `sub/` subtree. Both reference the same `sub/` dirtree and the same
+        // nested content object.
         write_tree(&base.join("one/sub"), "nested.txt", b"nested\n");
         write_tree(&base.join("one"), "a.txt", b"one\n");
         write_tree(&base.join("two/sub"), "nested.txt", b"nested\n");
@@ -989,8 +1018,8 @@ fn fsck_marks_every_commit_sharing_a_missing_subtree() {
         let c1 = library_commit(&repo, base, "one", None).await;
         let c2 = library_commit(&repo, base, "two", Some(c1)).await;
 
-        // The one content object reachable from both commits is the shared
-        // nested.txt; delete it so both commits are incomplete.
+        // The one content object that both commits reach is the shared
+        // nested.txt. The test deletes it, so both commits are incomplete.
         let r1 = repo.traverse_commit(&c1, 0).await.unwrap();
         let r2 = repo.traverse_commit(&c2, 0).await.unwrap();
         let shared = r1
@@ -1026,11 +1055,11 @@ fn fsck_marks_commits_sharing_a_missing_file_via_distinct_dirs() {
     let tmp = TmpDir::new("maint-fsck-shared-file");
     block_on(async {
         let base = tmp.path();
-        // Two commits whose `dir/` differs (so the containing dirtrees differ)
-        // but that share an identical `dir/shared.txt`, so the same content
-        // object is reached through two distinct dirtrees. The missing outcome
-        // must reach the second commit through the content memo, not the
-        // dirtree memo.
+        // Two commits whose `dir/` differs, so the dirtrees that hold it
+        // differ. Both commits hold an identical `dir/shared.txt`, so two
+        // distinct dirtrees reach the same content object. No dirtree is common
+        // to the two commits. fsck must report the missing object once and mark
+        // both commits partial.
         write_tree(&base.join("one/dir"), "shared.txt", b"data\n");
         write_tree(&base.join("one/dir"), "other.txt", b"a\n");
         write_tree(&base.join("two/dir"), "shared.txt", b"data\n");
@@ -1058,7 +1087,7 @@ fn fsck_marks_commits_sharing_a_missing_file_via_distinct_dirs() {
         .unwrap();
 
         let report = repo.fsck(&FsckOptions::new()).await.unwrap();
-        // The shared missing file is reported exactly once.
+        // fsck reports the shared missing file exactly once.
         assert_eq!(
             report
                 .errors
@@ -1082,8 +1111,10 @@ fn fsck_marks_commits_sharing_a_missing_file_via_distinct_dirs() {
     });
 }
 
-/// A two-commit `main` branch in a fresh repository of `mode`, the second
-/// commit parented on the first. Returns the repository and the two commits.
+/// Builds the branch `main` of two commits in a new repository of `mode`, and
+/// returns the repository and the two commits.
+///
+/// The first commit is the parent of the second.
 async fn build_two_commit_repo(base: &Path, mode: RepoMode) -> (Repo, Checksum, Checksum) {
     write_tree(&base.join("one"), "a.txt", b"one\n");
     write_tree(&base.join("two"), "a.txt", b"two\n");
@@ -1095,8 +1126,10 @@ async fn build_two_commit_repo(base: &Path, mode: RepoMode) -> (Repo, Checksum, 
     (repo, c1, c2)
 }
 
-/// Commit the tree at `base/rel` with `metadata` as the commit's metadata dict,
-/// binding no ref, and return the new commit.
+/// Commits the tree at `base/rel` with `metadata` as the metadata dict of the
+/// commit, and returns the new commit.
+///
+/// The function sets no ref to the commit.
 async fn commit_with_metadata(
     repo: &Repo,
     base: &Path,
@@ -1132,8 +1165,10 @@ async fn commit_with_metadata(
     commit
 }
 
-/// A metadata dict carrying an `ostree.ref-binding` and, where `collection` is
-/// given, an `ostree.collection-binding`.
+/// Returns a metadata dict with an `ostree.ref-binding` entry.
+///
+/// If `collection` is `Some`, the dict also holds an
+/// `ostree.collection-binding` entry.
 fn binding_metadata(refs: &[&str], collection: Option<&str>) -> ostrya::Value {
     let names: Vec<String> = refs.iter().map(|r| (*r).to_owned()).collect();
     let mut builder = ostrya::DictBuilder::new();
@@ -1156,7 +1191,8 @@ fn fsck_skips_a_commit_already_marked_partial() {
         assert_eq!(both.commits_partial, 0);
         assert!(both.is_ok());
 
-        // Mark the tip partial by hand, as an interrupted pull leaves it.
+        // The test marks the tip partial by hand. An interrupted pull leaves
+        // the same marker.
         let marker = base.join(format!("repo/state/{}.commitpartial", c2.to_hex()));
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, [0x66]).unwrap();
@@ -1182,8 +1218,8 @@ fn fsck_delete_unlinks_and_marks() {
         let (repo, c1, c2) = build_two_commit_repo(base, RepoMode::Archive).await;
         let repo_dir = base.join("repo");
 
-        // Corrupt both commits' own content object, so the run has two faults
-        // to carry and each commit reaches one.
+        // The test corrupts the content object of each commit. The run then
+        // has two faults to carry, and each commit reaches one.
         let mut corrupted = Vec::new();
         for name in [c1, c2] {
             let reachable = repo.traverse_commit(&name, 0).await.unwrap();
@@ -1199,9 +1235,9 @@ fn fsck_delete_unlinks_and_marks() {
             corrupted.push(object);
         }
 
-        // The walk runs to its end whatever the options carry, so a default
-        // run reports both faults. It unlinks nothing and marks nothing, a
-        // checksum mismatch alone leaving the commit complete.
+        // The walk runs to its end with each set of options, so a default run
+        // reports both faults. It unlinks nothing and marks nothing. A checksum
+        // mismatch alone leaves the commit complete.
         let plain = repo.fsck(&FsckOptions::new()).await.unwrap();
         assert_eq!(
             plain.errors.len(),
@@ -1250,8 +1286,9 @@ fn fsck_delete_unlinks_and_marks() {
 
 #[test]
 fn fsck_add_tombstones_replaces_the_commit() {
-    // `bare` records the source inode's owner, which an unprivileged run
-    // cannot write, so the three modes here are the ones the suite commits in.
+    // `bare` records the owner of the source inode, which an unprivileged run
+    // cannot write. The three modes here are the modes that the suite commits
+    // in.
     for mode in [
         RepoMode::BareUser,
         RepoMode::BareUserOnly,
@@ -1263,8 +1300,8 @@ fn fsck_add_tombstones_replaces_the_commit() {
             let (repo, c1, c2) = build_two_commit_repo(base, mode).await;
             let repo_dir = base.join("repo");
 
-            // Remove the parent commit object, which is the condition the
-            // option acts on.
+            // The test removes the parent commit object. The option acts on
+            // this condition.
             let parent = repo_dir
                 .join("objects")
                 .join(ObjectName::new(c1, ObjectType::Commit).loose_path(mode));
@@ -1305,14 +1342,14 @@ fn fsck_add_tombstones_replaces_the_commit() {
     }
 }
 
-/// The tombstone step writes to the repository, so a walk that found a corrupt
-/// object reaches it under `all` or `delete` alone. An absent object leaves the
-/// walk sound for this purpose and the step runs beside it.
+/// The tombstone step writes to the repository. If the walk found a corrupt
+/// object, the step runs under `all` or `delete` alone. An absent object leaves
+/// the walk sound for this purpose, so the step runs.
 #[test]
 fn fsck_add_tombstones_needs_a_walk_that_found_no_corruption() {
-    // Each arm acts on the repository, so each gets a repository of its own.
-    // `arm` names it, `corrupt` says which fault to plant, and `opts` carries
-    // the switches under test.
+    // Each arm acts on the repository, so each arm gets a repository of its
+    // own. `name` names the arm, `corrupt` selects the fault to plant, and
+    // `opts` holds the switches under test.
     let arm = |name: &str, corrupt: bool, opts: FsckOptions| {
         let tmp = TmpDir::new(name);
         block_on(async {
@@ -1352,8 +1389,8 @@ fn fsck_add_tombstones_needs_a_walk_that_found_no_corruption() {
         ..opts
     };
 
-    // A corrupt object with neither switch: the step is held back and the
-    // child commit object stands.
+    // A corrupt object and neither switch: the step does not run, and the
+    // child commit object stays.
     let (tombstoned, commit, tombstone) =
         arm("maint-fsck-tomb-held", true, tombstones(FsckOptions::new()));
     assert!(tombstoned.is_empty(), "no commit is tombstoned");
@@ -1383,8 +1420,8 @@ fn fsck_add_tombstones_needs_a_walk_that_found_no_corruption() {
         assert!(tombstone, "{name}: the tombstone is written");
     }
 
-    // An absent object is a fault the walk carries on its own, so the step
-    // runs under no switch at all.
+    // An absent object is a fault that the walk carries on its own, so the
+    // step runs with no switch.
     let (tombstoned, commit, tombstone) = arm(
         "maint-fsck-tomb-absent",
         false,
@@ -1438,8 +1475,8 @@ fn fsck_binding_checks_report_each_kind() {
             other => panic!("RefNotBound, got {other:?}"),
         }
 
-        // CollectionMismatch: a mirror ref under an id the commit does not
-        // carry.
+        // CollectionMismatch: a mirror ref under an id that the commit does
+        // not carry.
         let repo = Repo::create(
             &base.join("collection"),
             CreateOptions::new(RepoMode::Archive),
@@ -1466,7 +1503,7 @@ fn fsck_binding_checks_report_each_kind() {
             other => panic!("CollectionMismatch, got {other:?}"),
         }
 
-        // BackRefMissing: a bound name no ref carries.
+        // BackRefMissing: a bound name that no ref carries.
         let repo = Repo::create(&base.join("no-ref"), CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
@@ -1504,8 +1541,8 @@ fn fsck_binding_checks_report_each_kind() {
         }
         assert_ne!(first, second);
 
-        // BackCollectionRefMissing: the collection ref the binding names is
-        // not in the store.
+        // BackCollectionRefMissing: the collection ref that the binding names
+        // is not in the store.
         let repo = Repo::create(
             &base.join("no-collection-ref"),
             CreateOptions::new(RepoMode::Archive),
@@ -1541,8 +1578,8 @@ fn fsck_binding_checks_report_each_kind() {
         .await
         .unwrap();
         // The first commit binds nothing, so the check reaches the second
-        // alone: its plain ref resolves and its collection ref names the
-        // first.
+        // commit alone. Its plain ref resolves, and its collection ref names
+        // the first commit.
         let first = commit_with_metadata(&repo, base, "one", binding_metadata(&[], None)).await;
         let second = commit_with_metadata(
             &repo,
@@ -1572,8 +1609,8 @@ fn fsck_binding_checks_report_each_kind() {
 
 #[test]
 fn fsck_options_and_report_are_send_sync() {
-    // `FsckOptions` carries a boxed `FnMut`, so it is `Send` and not `Sync`,
-    // which is what `CheckoutOptions` is. The report is both.
+    // `FsckOptions` holds a boxed `FnMut`, so it is `Send` and not `Sync`,
+    // the same as `CheckoutOptions`. The report is both.
     fn assert_send<T: Send>() {}
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send::<FsckOptions>();
@@ -1583,7 +1620,7 @@ fn fsck_options_and_report_are_send_sync() {
     assert_send_sync::<ostrya::FsckFailure>();
 }
 
-/// Find one loose object with the given extension under a repository.
+/// Finds one loose object with the extension `ext` under the repository `repo`.
 fn find_object(repo: &Path, ext: &str) -> Option<std::path::PathBuf> {
     for fanout in std::fs::read_dir(repo.join("objects")).unwrap() {
         let fanout = fanout.unwrap().path();
@@ -1604,7 +1641,7 @@ fn find_object(repo: &Path, ext: &str) -> Option<std::path::PathBuf> {
 // diff.
 // ---------------------------------------------------------------------------
 
-/// Parse `ostree diff` output into a set of `(code, path)` pairs.
+/// Parses the output of `ostree diff` into a set of `(code, path)` pairs.
 fn parse_tool_diff(output: &str) -> HashSet<(char, String)> {
     output
         .lines()
@@ -1620,7 +1657,7 @@ fn parse_tool_diff(output: &str) -> HashSet<(char, String)> {
         .collect()
 }
 
-/// The port's diff as `(code, path)` pairs.
+/// Returns the diff of ostrya as a set of `(code, path)` pairs.
 fn port_diff_set(entries: &[DiffEntry]) -> HashSet<(char, String)> {
     entries
         .iter()
@@ -1646,8 +1683,8 @@ fn diff_matches_the_tool() {
     let repo = base.join("repo");
     tool_init(&repo);
 
-    // First tree: a modifiable file, a directory to be removed, a directory
-    // whose metadata will change, and a name that will change type.
+    // First tree: a file to modify, a directory to remove, a directory whose
+    // metadata changes, and a name that changes type.
     let t1 = base.join("t1");
     write_tree(&t1, "keep.txt", b"one\n");
     write_tree(&t1.join("gone"), "x.txt", b"g\n");
@@ -1658,8 +1695,8 @@ fn diff_matches_the_tool() {
         std::fs::set_permissions(t1.join("meta"), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    // Second tree: keep.txt modified, gone/ removed, added/ new, meta/ mode
-    // changed, thing now a directory.
+    // Second tree: keep.txt modified, gone/ removed, added/ new, meta/ with a
+    // changed mode, and thing now a directory.
     let t2 = base.join("t2");
     write_tree(&t2, "keep.txt", b"two\n");
     write_tree(&t2.join("meta"), "f.txt", b"m\n");
@@ -1693,13 +1730,16 @@ fn diff_matches_the_tool() {
     );
 }
 
-/// The order the walk reports: the three groups modified, removed, then added,
-/// and within one group the order the walk found the entries. At each pair of
-/// directories of one name the first side's entries come in that side's own
-/// order -- the files in stored order, then the subdirectories in stored order
-/// -- with the descent into a pair of directories standing where it is found,
-/// and the second side's entries follow in its own order
-/// (`docs/format-reference.md`, "CLI output formats", `diff`).
+/// The diff reports its entries in the walk order, which is the order that
+/// `ostree diff` prints.
+///
+/// - The report has three groups in this order: modified, removed, added.
+/// - In one group, the entries come in the order that the walk found them.
+/// - At each pair of directories of one name, the entries of the first side
+///   come first, in the order of that side. This order is the files in
+///   stored order, then the subdirectories in stored order.
+/// - The descent into a pair of directories stands where the walk finds it.
+/// - The entries of the second side follow, in the order of that side.
 #[test]
 fn diff_print_order_is_the_walk_order() {
     let tmp = TmpDir::new("maint-diff-order");

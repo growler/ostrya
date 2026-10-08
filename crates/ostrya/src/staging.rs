@@ -1,45 +1,24 @@
 //! Per-transaction staging directories under `<repo>/tmp`.
 //!
-//! A transaction stages objects in `tmp/staging-<boot-id>-XXXXXX`, created fresh
-//! per transaction and removed when the transaction ends. A sibling file
-//! `staging-<boot-id>-XXXXXX-lock` is held with an exclusive record lock for the
-//! transaction's lifetime, marking the directory as owned by a live
-//! transaction. Encoding the boot id in the name separates directories from the
-//! current boot, whose owner may still be alive, from earlier boots, whose owner
-//! is certainly gone.
+//! The `Transaction` type doc, under `# Staging directory`, states the names,
+//! the locks, and the rules of the reaper that a caller sees.
 //!
-//! On transaction start the reaper reads the top level of `tmp/`. It never
-//! touches `cache`. A `staging-*` directory and its `-lock` sibling follow the
-//! staging rule below. Every other entry is removed once its mtime is older
-//! than `tmp-expiry-secs`, as the tool does: a directory as a whole tree judged
-//! by its own mtime, and a symlink as the link itself. A staging lock file is
-//! exempt from that age test, because the lock of a transaction that lives
-//! past the window is still held.
+//! A process-global map holds the staging directories that this process owns.
+//! The reaper does not touch a directory in this map. The record locks are
+//! process-associated. A lock through a second descriptor to a live sibling
+//! lock does not conflict, and the close of that descriptor releases the hold.
 //!
-//! The staging rule removes leftover staging directories whose owner has died.
-//! It takes each sibling lock non-blockingly; a directory whose lock it can
-//! take, with no live holder, is removed. A directory with no lock
-//! file is removed only once it is older than `tmp-expiry-secs`, since it may be
-//! mid-creation in another process. A process-global map of the staging
-//! directories this process currently owns keeps the reaper from touching them:
-//! the record locks are process-associated, so a second descriptor to a live
-//! sibling lock would neither conflict nor survive being closed. A directory
-//! enters that map before it is created and leaves it after it is removed, so
-//! every directory a same-process reaper can list is already in the map.
+//! A directory enters the map before its creation and leaves the map after its
+//! removal. As a result, each directory that a reaper of the same process can
+//! list is in the map.
 //!
-//! Each entry of that map holds a descriptor for the `tmp/` directory the
-//! staging directory lives in, so [`reap_owned`] removes every one of them with
-//! no live [`StagingDir`] in hand. A process that ends without running
-//! destructors reaches it through
-//! [`reap_process_staging`](crate::reap_process_staging).
-//!
-//! A ref write and a detached-metadata write create a [`TempEntry`] at the
-//! top level of `tmp/`, named `.ostrya-ref-<pid>-<n>-XXXXXX` or
-//! `.ostrya-meta-<pid>-<n>-XXXXXX`, and rename it over its target. The reaper
-//! takes such an entry by the age test, as any other entry. With a very small
-//! or negative `tmp-expiry-secs`, a reaper can unlink the entry before its
-//! rename. The write then fails with `ENOENT`, and the ref or the object stays
-//! unchanged.
+//! Each entry of the map holds a descriptor of the `tmp/` directory that holds
+//! the staging directory. With these descriptors, [`reap_owned`] removes each
+//! owned directory without a live [`StagingDir`]. A process that ends without
+//! its destructors calls it through
+//! [`reap_process_staging`](crate::reap_process_staging). A ref write, a
+//! detached-metadata write, and a tombstone write create a [`TempEntry`] at
+//! the top level of `tmp/`.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -53,41 +32,46 @@ use rustix::io::Errno;
 
 use crate::perm;
 
-/// The mode staging directories are requested with, matching the tool. The
-/// process umask reduces it. In a `bare-user-shared` repository an `fchmod`
-/// after the create restores [`perm::SHARED_DIR_MODE`].
+/// The requested mode of a staging directory, the same mode that the `ostree`
+/// command requests. The process umask reduces it. In a `bare-user-shared`
+/// repository, an `fchmod` after the creation sets [`perm::SHARED_DIR_MODE`].
 const STAGING_DIR_MODE: u32 = 0o775;
 
-/// The mode a staging lock file is requested with, matching the tool. In a
-/// `bare-user-shared` repository an `fchmod` after the create raises it to
-/// [`perm::SHARED_LOCK_MODE`], so the reaper of another member of the
-/// repository group opens the file `O_RDWR` and tests the owner.
+/// The requested mode of a staging lock file, the same mode that the `ostree`
+/// command requests. In a `bare-user-shared` repository, an `fchmod` after the
+/// creation raises it to [`perm::SHARED_LOCK_MODE`]. Then the reaper of another
+/// member of the repository group can open the file `O_RDWR` and take the lock
+/// to check for a live owner.
 const STAGING_LOCK_MODE: u32 = 0o600;
 
-/// The character set of the random staging-name suffix (mkdtemp's alphabet).
+/// The character set of the random suffix of a staging name (the alphabet of
+/// `mkdtemp`).
 const SUFFIX_ALPHABET: &[u8; 62] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
-/// The length of the random staging-name suffix.
+/// The length of the random suffix of a staging name.
 const SUFFIX_LEN: usize = 6;
 
-/// The number of unique-name attempts before giving up.
+/// The maximum number of attempts to find a unique name.
 const MKDTEMP_ATTEMPTS: u32 = 128;
 
-/// The staging directories this process currently owns, each name mapped to a
-/// descriptor for the `tmp/` directory it lives in.
+/// Returns the map of the staging directories that this process owns.
+///
+/// The map keys each name to a descriptor of the `tmp/` directory that holds
+/// the staging directory.
 fn active() -> &'static Mutex<HashMap<String, OwnedFd>> {
     static ACTIVE: OnceLock<Mutex<HashMap<String, OwnedFd>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Remove the staging directories this process owns, together with their
-/// sibling lock files.
+/// Removes the staging directories that this process owns and their sibling
+/// lock files.
 ///
-/// A [`StagingDir`] removes its own directory when it drops, so this is for a
-/// process that ends without running destructors: it leaves `tmp/` as an
-/// unwound return would. Every owned directory is removed, so a transaction
-/// that continues afterward finds its staged objects gone.
+/// A [`StagingDir`] removes its own directory when it drops. This function is
+/// for a process that ends without its destructors. After the call, `tmp/` is
+/// in the state that a return with an unwind leaves. It removes each owned
+/// directory, so a transaction that continues after the call finds its staged
+/// objects gone.
 pub(crate) fn reap_owned() {
     let owned = std::mem::take(&mut *active().lock().unwrap());
     for (name, tmp_fd) in owned {
@@ -95,19 +79,24 @@ pub(crate) fn reap_owned() {
     }
 }
 
-/// Remove the staging directory `name` under `tmp_fd` and its sibling lock
-/// file. Absent entries are already in the wanted state, and a removal that
-/// fails leaves the entry for the next reaper.
+/// Removes the staging directory `name` under `tmp_fd` and its sibling lock
+/// file.
+///
+/// An absent entry is already in the wanted state. If a removal fails, the
+/// entry stays for the next reaper.
 fn remove_staging(tmp_fd: BorrowedFd<'_>, name: &str) {
     let _ = remove_tree_at(tmp_fd, name);
     let lock_name = format!("{name}-lock");
     let _ = rustix::fs::unlinkat(tmp_fd, lock_name.as_str(), AtFlags::empty());
 }
 
-/// Open the `tmp/` directory of the repository rooted at `repo_fd`, and
-/// create it where it is absent. A created `tmp/` takes [`STAGING_DIR_MODE`]
-/// reduced by the umask, and in a `bare-user-shared` repository it is forced
-/// to [`perm::SHARED_DIR_MODE`]. A `tmp/` that is a symlink is followed.
+/// Opens the `tmp/` directory of the repository at `repo_fd`, and creates it
+/// if it is absent.
+///
+/// A new `tmp/` gets [`STAGING_DIR_MODE`], reduced by the umask. In a
+/// `bare-user-shared` repository, this function forces the mode of a new
+/// `tmp/` to [`perm::SHARED_DIR_MODE`]. If `tmp/` is a symlink, the open
+/// follows it.
 pub(crate) fn open_tmp_dir(repo_fd: BorrowedFd<'_>, repo_mode: RepoMode) -> io::Result<OwnedFd> {
     match rustix::fs::mkdirat(repo_fd, "tmp", Mode::from_raw_mode(STAGING_DIR_MODE)) {
         Ok(()) => perm::force_created_dir(repo_fd, "tmp", repo_mode)?,
@@ -131,10 +120,11 @@ pub(crate) const META_TEMP_PREFIX: &str = ".ostrya-meta-";
 
 /// A temp entry in `tmp/` that a write renames over its target.
 ///
-/// The name is `<prefix><pid>-<counter>-XXXXXX`, where `XXXXXX` is a random
-/// suffix, so a process in another PID namespace that has the same pid and
-/// counter draws a different name. When the value drops before
-/// [`rename_into`](TempEntry::rename_into) succeeds, the entry is unlinked.
+/// The name is `<prefix><pid>-<counter>-XXXXXX`. `XXXXXX` is a random suffix,
+/// so a process in another PID namespace with the same pid and counter draws a
+/// different name. If the value drops before
+/// [`rename_into`](TempEntry::rename_into) succeeds, the drop unlinks the
+/// entry.
 pub(crate) struct TempEntry<'a> {
     tmp_fd: BorrowedFd<'a>,
     /// The name of the entry under `tmp_fd`. It is empty after the rename.
@@ -142,8 +132,11 @@ pub(crate) struct TempEntry<'a> {
 }
 
 impl<'a> TempEntry<'a> {
-    /// Create a regular file with the permission bits `mode`, reduced by the
-    /// umask, and return the entry and the descriptor open for writing.
+    /// Creates a regular file with the permission bits `mode` and opens it for
+    /// writing.
+    ///
+    /// The umask reduces `mode`. The function returns the entry and the
+    /// descriptor.
     pub(crate) fn create_file(
         tmp_fd: BorrowedFd<'a>,
         prefix: &str,
@@ -159,7 +152,7 @@ impl<'a> TempEntry<'a> {
         })
     }
 
-    /// Create a symlink whose body is `link`.
+    /// Creates a symlink with the target `link`.
     pub(crate) fn create_symlink(
         tmp_fd: BorrowedFd<'a>,
         prefix: &str,
@@ -171,8 +164,9 @@ impl<'a> TempEntry<'a> {
         Ok(entry)
     }
 
-    /// Run `make` with a fresh name, and draw a new name where the name is
-    /// taken, up to [`MKDTEMP_ATTEMPTS`] times.
+    /// Runs `make` with a new name, and draws a new name if the name is taken.
+    ///
+    /// It makes at most [`MKDTEMP_ATTEMPTS`] attempts.
     fn create<T>(
         tmp_fd: BorrowedFd<'a>,
         prefix: &str,
@@ -197,8 +191,9 @@ impl<'a> TempEntry<'a> {
         ))
     }
 
-    /// Rename the entry over `dest` under `dir_fd`. A rename that fails
-    /// leaves the entry to the drop, which unlinks it.
+    /// Renames the entry over `dest` under `dir_fd`.
+    ///
+    /// If the rename fails, the entry stays for the drop, which unlinks it.
     pub(crate) fn rename_into(mut self, dir_fd: BorrowedFd<'_>, dest: &str) -> io::Result<()> {
         rustix::fs::renameat(self.tmp_fd, self.name.as_str(), dir_fd, dest)?;
         self.name.clear();
@@ -214,26 +209,28 @@ impl Drop for TempEntry<'_> {
     }
 }
 
-/// A transaction's staging area: the directory, its held sibling lock, and the
-/// `tmp/` descriptor they live under.
+/// The staging area of a transaction: the directory, its held sibling lock,
+/// and the descriptor of the `tmp/` directory that holds them.
 #[derive(Debug)]
 pub(crate) struct StagingDir {
     tmp_fd: OwnedFd,
-    /// The staging directory descriptor. Objects are ingested into this
-    /// directory by the write path and renamed out of it into `objects/` at
-    /// commit.
+    /// The descriptor of the staging directory. The write path ingests objects
+    /// into this directory. The transaction commit renames them from it into
+    /// `objects/`.
     dir_fd: OwnedFd,
-    /// The sibling lock descriptor, held for the transaction's lifetime to mark
-    /// the directory as owned. Kept only for its lock; never read.
+    /// The descriptor of the sibling lock. The value holds it while the
+    /// transaction lives, as the mark of an owned directory. Only its lock has
+    /// a function, and nothing reads it.
     #[allow(dead_code)]
     lock_fd: OwnedFd,
     name: String,
 }
 
 impl StagingDir {
-    /// Create a fresh staging directory under the repository rooted at
-    /// `repo_fd`, reaping stale leftovers first. Runs synchronous filesystem
-    /// calls and is meant to be offloaded to the blocking pool.
+    /// Creates a new staging directory under the repository at `repo_fd`.
+    ///
+    /// It removes the stale leftovers first. Its calls to the file system are
+    /// synchronous, so the caller must run it on the blocking pool.
     pub(crate) fn create(
         repo_fd: BorrowedFd<'_>,
         expiry_secs: i64,
@@ -245,7 +242,7 @@ impl StagingDir {
 
         let prefix = format!("staging-{}-", boot_id()?);
         // `mkdtemp` claims the name in `active` before the directory exists, so
-        // a concurrent same-process reaper never sees it unclaimed.
+        // a concurrent reaper of this process never finds it without a claim.
         let (name, dir_fd) = mkdtemp(tmp_fd.as_fd(), &prefix, repo_mode)?;
 
         let lock_name = format!("{name}-lock");
@@ -266,14 +263,16 @@ impl StagingDir {
         })
     }
 
-    /// The staging directory descriptor. Objects are ingested here and renamed
-    /// into `objects/` at commit.
+    /// Returns the descriptor of the staging directory.
+    ///
+    /// The write path ingests objects here. The transaction commit renames them
+    /// into `objects/`.
     pub(crate) fn dir_fd(&self) -> BorrowedFd<'_> {
         self.dir_fd.as_fd()
     }
 
-    /// The descriptor of the repository's `tmp/` directory, which holds the
-    /// staging directory.
+    /// Returns the descriptor of the `tmp/` directory of the repository, which
+    /// holds the staging directory.
     pub(crate) fn tmp_fd(&self) -> BorrowedFd<'_> {
         self.tmp_fd.as_fd()
     }
@@ -282,32 +281,36 @@ impl StagingDir {
 impl Drop for StagingDir {
     fn drop(&mut self) {
         remove_staging(self.tmp_fd.as_fd(), &self.name);
-        // Release the in-process claim only after the directory and its lock
-        // sibling are gone, so a concurrent same-process reaper never sees the
-        // directory unprotected while its lock still exists.
+        // Release the claim in `active` only after the directory and its
+        // sibling lock are gone. Otherwise a concurrent reaper of this process
+        // can find the directory without protection while its lock still
+        // exists.
         active().lock().unwrap().remove(&self.name);
-        // The descriptor fields close after this body, releasing the sibling
-        // lock and the directory handle.
+        // The descriptor fields close after this body. Their close releases the
+        // sibling lock and the directory handle.
     }
 }
 
-/// Create the sibling lock file and hold it exclusively. A fresh lock file is
-/// uncontended, so the attempt does not block.
+/// Creates the sibling lock file and takes an exclusive lock on it.
 ///
-/// The name is the sibling of the directory [`mkdtemp`] has just created, so
-/// this open normally makes the file. A removal unlinks a staging directory
-/// before its sibling lock, so a process that ends between the two leaves a
-/// lock file whose directory is gone, and a later staging directory that draws
-/// the same name finds that file. `O_EXCL` separates the two cases: a lock file
-/// this call makes is forced to [`perm::SHARED_LOCK_MODE`] in a
-/// `bare-user-shared` repository, and a file that already stands keeps the mode
-/// and the group it has, which another member of the group may own. The second
-/// open carries `O_CREAT`, because a reaper in another process removes such a
-/// leftover and the name is free again by the time this call reaches it.
+/// A new lock file has no other holder, so the attempt does not block.
 ///
-/// The second open never reaches a lock file this process holds: [`mkdtemp`]
-/// skips a name in `active` and its `mkdirat` fails on a directory that stands,
-/// so the name belongs to no live [`StagingDir`] of this process.
+/// The name is the sibling of the directory that [`mkdtemp`] created just
+/// before, so this open usually creates the file. A removal unlinks a staging
+/// directory before its sibling lock. If a process ends between the two steps,
+/// it leaves a lock file without its directory. A later staging directory that
+/// draws the same name finds that file.
+///
+/// `O_EXCL` separates the two cases. In a `bare-user-shared` repository, this
+/// function forces a lock file that it creates to [`perm::SHARED_LOCK_MODE`].
+/// A file that already exists keeps its mode and its group, because another
+/// member of the group can own it. The second open has `O_CREAT`, because a
+/// reaper in another process can remove the leftover before the second open.
+///
+/// The second open never reaches a lock file that this process holds.
+/// [`mkdtemp`] skips a name in `active`, and its `mkdirat` fails on a directory
+/// that exists. As a result, the name belongs to no live [`StagingDir`] of this
+/// process.
 fn acquire_staging_lock(
     tmp_fd: BorrowedFd<'_>,
     lock_name: &str,
@@ -321,8 +324,8 @@ fn acquire_staging_lock(
     ) {
         Ok(fd) => {
             if let Err(e) = perm::force_created_mode(&fd, repo_mode, perm::SHARED_LOCK_MODE) {
-                // The open created the lock file; remove it so a failed force
-                // leaves no orphaned sibling behind.
+                // The open created the lock file. Remove it, so that a failed
+                // force leaves no orphan sibling.
                 drop(fd);
                 let _ = rustix::fs::unlinkat(tmp_fd, lock_name, AtFlags::empty());
                 return Err(e);
@@ -338,15 +341,15 @@ fn acquire_staging_lock(
         Err(e) => return Err(e.into()),
     };
     if let Err(e) = rustix::fs::fcntl_lock(&lock_fd, FlockOperation::NonBlockingLockExclusive) {
-        // The caller removes the staging directory; remove its sibling lock too
-        // so a failed acquire leaves no orphan behind.
+        // The caller removes the staging directory. Remove its sibling lock
+        // too, so that a failed acquire leaves no orphan.
         let _ = rustix::fs::unlinkat(tmp_fd, lock_name, AtFlags::empty());
         return Err(e.into());
     }
     Ok(lock_fd)
 }
 
-/// The current boot id, read once and cached for the process.
+/// Returns the current boot id, read once and cached for the process.
 fn boot_id() -> io::Result<&'static str> {
     static BOOT_ID: OnceLock<String> = OnceLock::new();
     if let Some(id) = BOOT_ID.get() {
@@ -360,17 +363,19 @@ fn boot_id() -> io::Result<&'static str> {
     Ok(BOOT_ID.get_or_init(|| id))
 }
 
-/// Create a uniquely named directory `prefix + suffix` under `tmp_fd`, retrying
-/// on a name collision. The returned name is claimed in `active`, which the
-/// caller releases when the staging directory ends.
+/// Creates a directory with the unique name `prefix + suffix` under `tmp_fd`.
 ///
-/// The claim precedes the `mkdirat` that publishes the name, so every directory
-/// a same-process reaper can list is already claimed. The claim is the only
-/// barrier that holds within one process: the record locks are
-/// process-associated, so a reaper reaching the sibling lock of a live directory
-/// takes it without conflict and removes the directory. The claim carries its
-/// own duplicate of `tmp_fd`, which is what [`reap_owned`] removes the
-/// directory through.
+/// On a name collision, it draws a new suffix. The returned name has a claim
+/// in `active`. The caller releases the claim when the staging directory ends.
+///
+/// The claim comes before the `mkdirat` that publishes the name, so each
+/// directory that a reaper of this process can list already has a claim. In
+/// one process, the claim is the only barrier that holds. The record locks are
+/// process-associated, so a reaper of this process takes the sibling lock of a
+/// live directory without conflict and removes the directory.
+///
+/// The claim holds its own duplicate of `tmp_fd`. [`reap_owned`] removes the
+/// directory through this duplicate.
 fn mkdtemp(
     tmp_fd: BorrowedFd<'_>,
     prefix: &str,
@@ -379,8 +384,8 @@ fn mkdtemp(
     for _ in 0..MKDTEMP_ATTEMPTS {
         let name = format!("{prefix}{}", random_suffix());
         let claim = tmp_fd.try_clone_to_owned()?;
-        // A name another live transaction in this process owns is left to its
-        // owner: releasing that claim here would strip its protection.
+        // Leave a name that another live transaction of this process owns to
+        // its owner. A release of that claim here removes its protection.
         {
             let mut active = active().lock().unwrap();
             if active.contains_key(&name) {
@@ -427,9 +432,10 @@ fn mkdtemp(
     ))
 }
 
-/// A six-character `[A-Za-z0-9]` suffix, seeded from the time, pid, and a
-/// per-process counter. The name only needs to be unique on the host, so a
-/// collision simply retries.
+/// Returns a six-character `[A-Za-z0-9]` suffix from a seed of the time, the
+/// pid, and a per-process counter.
+///
+/// The name must be unique on the host only. A collision causes a new attempt.
 fn random_suffix() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -452,17 +458,18 @@ fn random_suffix() -> String {
     suffix
 }
 
-/// Remove the leftover entries at the top level of `tmp/`.
+/// Removes the leftover entries at the top level of `tmp/`.
 ///
-/// A `staging-*` directory goes through [`reap_one`], and its `-lock` sibling
-/// is left to that directory's reap. `cache` is never touched. Every other
-/// entry, a [`TempEntry`] in flight included, is removed through [`reap_aged`]
-/// once it is past `expiry_secs`.
+/// [`reap_one`] gets each `staging-*` directory, and the reap of that directory
+/// also gets its `-lock` sibling. A `-lock` file with no directory stays. This
+/// function never touches `cache`. [`reap_aged`] removes each other entry, a
+/// [`TempEntry`] in progress included, if it is older than `expiry_secs`.
 fn reap_stale(tmp_fd: BorrowedFd<'_>, expiry_secs: i64) {
     let Ok(entries) = Dir::read_from(tmp_fd) else {
         return;
     };
-    // Collect names first so removals do not disturb the directory read.
+    // Collect the names first, so that the removals do not change the
+    // directory during the read.
     let mut staging: Vec<String> = Vec::new();
     let mut other: Vec<CString> = Vec::new();
     for entry in entries {
@@ -492,7 +499,8 @@ fn reap_stale(tmp_fd: BorrowedFd<'_>, expiry_secs: i64) {
     }
 }
 
-/// Whether `entry` under `dir` is a directory, not following a symlink.
+/// Returns `true` if `entry` under `dir` is a directory. A symlink is never
+/// followed.
 fn is_dir_entry(dir: BorrowedFd<'_>, entry: &rustix::fs::DirEntry) -> bool {
     match entry.file_type() {
         FileType::Directory => true,
@@ -502,9 +510,11 @@ fn is_dir_entry(dir: BorrowedFd<'_>, entry: &rustix::fs::DirEntry) -> bool {
     }
 }
 
-/// Remove the entry `name` under `tmp_fd` once its mtime is past
-/// `expiry_secs`: a directory as a whole tree, any other entry, a symlink
-/// included, with one `unlinkat`. A symlink is never followed.
+/// Removes the entry `name` under `tmp_fd` if its mtime is older than
+/// `expiry_secs`.
+///
+/// It removes a directory as a whole tree. It removes each other entry, a
+/// symlink included, with one `unlinkat`. It never follows a symlink.
 fn reap_aged(tmp_fd: BorrowedFd<'_>, name: &CStr, expiry_secs: i64) {
     let Ok(stat) = rustix::fs::statat(tmp_fd, name, AtFlags::SYMLINK_NOFOLLOW) else {
         return;
@@ -519,11 +529,11 @@ fn reap_aged(tmp_fd: BorrowedFd<'_>, name: &CStr, expiry_secs: i64) {
     }
 }
 
-/// Reap one candidate staging directory if its owner is gone.
+/// Removes one candidate staging directory if its owner is gone.
 fn reap_one(tmp_fd: BorrowedFd<'_>, name: &str, expiry_secs: i64) {
-    // Never touch a directory this process owns: its sibling lock is held on
-    // another descriptor, and even opening and closing that lock file would drop
-    // the hold under the process-associated record-lock semantics.
+    // Never touch a directory that this process owns. Another descriptor holds
+    // its sibling lock. The record locks are process-associated, so one open
+    // and one close of that lock file release the hold.
     if active().lock().unwrap().contains_key(name) {
         return;
     }
@@ -535,15 +545,17 @@ fn reap_one(tmp_fd: BorrowedFd<'_>, name: &str, expiry_secs: i64) {
         Mode::empty(),
     ) {
         Ok(lock_fd) => {
-            // Taking the lock means no live owner in any process.
+            // If this call gets the lock, the directory has no live owner in
+            // any process.
             if rustix::fs::fcntl_lock(&lock_fd, FlockOperation::NonBlockingLockExclusive).is_ok() {
                 let _ = remove_tree_at(tmp_fd, name);
                 let _ = rustix::fs::unlinkat(tmp_fd, lock_name.as_str(), AtFlags::empty());
             }
         }
         Err(Errno::NOENT) => {
-            // No lock file: mid-creation elsewhere or an orphan. Reap only once
-            // it is past the expiry window.
+            // No lock file exists. Another process is in the middle of the
+            // creation, or the directory is an orphan. Remove it only if it is
+            // older than the expiry window.
             if older_than(tmp_fd, name, expiry_secs) {
                 let _ = remove_tree_at(tmp_fd, name);
             }
@@ -552,12 +564,14 @@ fn reap_one(tmp_fd: BorrowedFd<'_>, name: &str, expiry_secs: i64) {
     }
 }
 
-/// Whether the entry `name` under `tmp_fd` is older than `expiry_secs`.
+/// Returns `true` if the entry `name` under `tmp_fd` is older than
+/// `expiry_secs`.
 ///
-/// The age test matches the tool: an entry is expired once its age in whole
-/// seconds exceeds `expiry_secs`. At `expiry_secs = 0` an entry created in the
-/// current second (age 0) is kept and only entries at least a second old are
-/// reaped, so a directory still being created is not removed by age.
+/// The age test is the same as the age test of the `ostree` command. An entry
+/// expires when its age in whole seconds is more than `expiry_secs`. At
+/// `expiry_secs = 0`, an entry from the current second (age 0) stays, and only
+/// entries of one second or more go. As a result, the age test does not remove
+/// a directory in the middle of its creation.
 fn older_than(tmp_fd: BorrowedFd<'_>, name: &str, expiry_secs: i64) -> bool {
     let Ok(stat) = rustix::fs::statat(tmp_fd, name, AtFlags::SYMLINK_NOFOLLOW) else {
         return false;
@@ -565,8 +579,8 @@ fn older_than(tmp_fd: BorrowedFd<'_>, name: &str, expiry_secs: i64) -> bool {
     expired(stat.st_mtime, expiry_secs)
 }
 
-/// Whether an entry with mtime `mtime` is older than `expiry_secs`, strict on
-/// whole seconds.
+/// Returns `true` if an entry with the mtime `mtime` is older than
+/// `expiry_secs`, by a strict test on whole seconds.
 fn expired(mtime: i64, expiry_secs: i64) -> bool {
     let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
         return false;
@@ -574,7 +588,7 @@ fn expired(mtime: i64, expiry_secs: i64) -> bool {
     (now.as_secs() as i64 - mtime) > expiry_secs
 }
 
-/// Remove the directory `name` under `parent` and everything below it.
+/// Removes the directory `name` under `parent` and all of its contents.
 fn remove_tree_at<P: rustix::path::Arg + Copy>(parent: BorrowedFd<'_>, name: P) -> io::Result<()> {
     match rustix::fs::openat(
         parent,
@@ -592,7 +606,7 @@ fn remove_tree_at<P: rustix::path::Arg + Copy>(parent: BorrowedFd<'_>, name: P) 
     }
 }
 
-/// Remove every entry within the directory `dir`, recursing into
+/// Removes each entry in the directory `dir`, and recurses into the
 /// subdirectories.
 fn clear_dir(dir: BorrowedFd<'_>) -> io::Result<()> {
     let mut children: Vec<(CString, bool)> = Vec::new();

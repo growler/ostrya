@@ -1,5 +1,5 @@
-//! The fast-forward walk of a ref update: whether the current commit of a ref
-//! is in the parent chain of the new commit.
+//! The fast-forward walk of a ref update. The walk checks if the current
+//! commit of a ref is in the parent chain of the new commit.
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::AsFd;
@@ -12,23 +12,27 @@ use crate::object::{MAX_METADATA_SIZE, read_meta_object};
 use crate::transaction::Transaction;
 
 /// The parent of each commit that a walk can read without a read of the
-/// repository: every commit of the session, and each stored commit a walk
-/// read. `None` is a commit with no parent.
+/// repository.
+///
+/// The map holds each commit of the session and each stored commit that a
+/// walk read. A `None` value is a commit with no parent.
 pub(super) type Parents = HashMap<Checksum, Option<Checksum>>;
 
-/// The fast-forward walks of the ref updates of one `Commit`, which share the
-/// parent map. Two updates with the same new commit and the same tip share
-/// one walk.
+/// The fast-forward walks of the ref updates of one `Commit`.
+///
+/// The walks share the parent map. Two updates with the same new commit and
+/// the same tip share one walk.
 pub(super) struct Walks {
     parents: Parents,
     chains: Vec<Chain>,
-    /// The chain of each walk, by its new commit and the commit it looked
-    /// for first.
+    /// The chain of each walk, keyed by its new commit and the commit that it
+    /// looked for first.
     index: HashMap<(Checksum, Checksum), usize>,
 }
 
 impl Walks {
-    /// Walks that read `parents` before the repository.
+    /// Creates the walks of one `Commit`, which read `parents` before the
+    /// repository.
     pub(super) fn new(parents: Parents) -> Walks {
         Walks {
             parents,
@@ -37,8 +41,10 @@ impl Walks {
         }
     }
 
-    /// The chain of the walk from `new` to `target`, walked on the first call
-    /// for the pair. Gives its index for [`reaches`](Walks::reaches).
+    /// Returns the index of the chain of the walk from `new` to `target`.
+    ///
+    /// The first call for the pair walks the chain.
+    /// [`reaches`](Walks::reaches) takes the index.
     pub(super) async fn chain(
         &mut self,
         txn: &Transaction,
@@ -55,7 +61,8 @@ impl Walks {
         Ok(i)
     }
 
-    /// Whether `current` is in the chain `chain`, as [`Chain::reaches`] tells.
+    /// Returns `true` if `current` is in the chain `chain`, as
+    /// [`Chain::reaches`] states.
     pub(super) async fn reaches(
         &mut self,
         txn: &Transaction,
@@ -71,7 +78,7 @@ impl Walks {
 
 /// The part of the parent chain of one new commit that a walk read.
 struct Chain {
-    /// Each commit the walk passed, the new commit included.
+    /// Each commit that the walk passed, also the new commit.
     seen: HashSet<Checksum>,
     /// Where the walk stopped.
     end: End,
@@ -80,7 +87,7 @@ struct Chain {
 /// Where a walk of the parent chain stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum End {
-    /// At the commit the walk looked for.
+    /// At the commit that the walk looked for.
     Target(Checksum),
     /// At a commit that neither the session nor the repository holds.
     Absent(Checksum),
@@ -89,10 +96,12 @@ enum End {
 }
 
 impl Chain {
-    /// Walk the parent chain of `new` until `target`, a commit that neither
-    /// the session nor the repository holds, or a commit with no parent. The
-    /// walk reads `parents` before the repository, and it adds each stored
-    /// commit it reads to the map.
+    /// Walks the parent chain of `new` to `target`, to an absent commit, or to
+    /// a commit with no parent.
+    ///
+    /// An absent commit is a commit that neither the session nor the
+    /// repository holds. The walk reads `parents` before the repository. It
+    /// adds each stored commit that it reads to the map.
     async fn walk(
         txn: &Transaction,
         parents: &mut Parents,
@@ -107,12 +116,14 @@ impl Chain {
         Ok(chain)
     }
 
-    /// Whether `current` is in the parent chain of the new commit, or is the
-    /// new commit. Where the part of the chain read so far does not hold
-    /// `current`, the walk goes on from the commit it stopped at: past the
-    /// target of an earlier walk, because the ref moved since, or at a commit
-    /// that was absent, because the repository can hold it now. A chain that
-    /// reached a commit with no parent is complete.
+    /// Returns `true` if `current` is in the parent chain of the new commit,
+    /// or is the new commit.
+    ///
+    /// If the part of the chain that the walk read does not hold `current`,
+    /// the walk goes on from the commit where it stopped. This can be the
+    /// target of an earlier walk, because the ref moved after that walk. It
+    /// can also be a commit that was absent, because the repository can hold
+    /// it now. A chain that reached a commit with no parent is complete.
     async fn reaches(
         &mut self,
         txn: &Transaction,
@@ -131,8 +142,8 @@ impl Chain {
         Ok(self.seen.contains(&current))
     }
 
-    /// Walk from `from` until `target`, an absent commit, or a root commit,
-    /// and record each commit passed.
+    /// Walks from `from` to `target`, to an absent commit, or to a root
+    /// commit, and records each commit that it passes.
     async fn extend(
         &mut self,
         txn: &Transaction,
@@ -171,10 +182,13 @@ impl Chain {
     }
 }
 
-/// The parent of `commit`, read and parsed from `objects/` on the blocking
-/// pool: `None` for a commit the repository does not hold. Every commit of
-/// the session is in the parent map before a walk, so the walk reads only
-/// stored commits, and one that does not parse fails on the server side.
+/// Returns the parent of `commit`, which the call reads from `objects/` and
+/// parses on the blocking pool.
+///
+/// The outer `None` is a commit that the repository does not hold. Each
+/// commit of the session is in the parent map before a walk, so the walk
+/// reads only stored commits. A stored commit that does not parse is a
+/// failure of the server side.
 async fn stored_parent(txn: &Transaction, commit: Checksum) -> Result<Option<Option<Checksum>>> {
     let repo = txn.repo();
     let path = loose_path(&commit, ObjectType::Commit, repo.mode());
@@ -198,7 +212,7 @@ mod tests {
     use crate::{CreateOptions, Repo, RepoMode};
     use ostrya_rt::block_on;
 
-    /// A throwaway directory removed on drop.
+    /// A temporary directory that is removed on drop.
     struct Scratch(std::path::PathBuf);
 
     impl Scratch {
@@ -224,7 +238,7 @@ mod tests {
         Checksum::from_bytes(sha2::Sha256::digest(bytes).into())
     }
 
-    /// The bytes and the checksum of a commit with `parent`.
+    /// Returns the checksum and the bytes of a commit with `parent`.
     fn commit(parent: Option<Checksum>, subject: &str) -> (Checksum, Vec<u8>) {
         let bytes = Commit {
             metadata: ostrya_core::Value::Array(Vec::new()),
@@ -241,7 +255,7 @@ mod tests {
         (sha(&bytes), bytes)
     }
 
-    /// Store `bytes` as the commit `checksum` through a transaction of its own.
+    /// Stores `bytes` as the commit `checksum` in a transaction of its own.
     async fn store(repo: &Repo, checksum: Checksum, bytes: Vec<u8>) {
         let txn = repo.transaction().await.unwrap();
         txn.stage_metadata(checksum, ObjectType::Commit, bytes)
@@ -250,8 +264,8 @@ mod tests {
         txn.commit().await.unwrap();
     }
 
-    /// A walk that stopped at its target goes on past it when the ref moved
-    /// to an older commit, and a chain that reached the root is complete.
+    /// A walk that stopped at its target goes on past it if the ref moved to
+    /// an older commit. A chain that reached the root is complete.
     #[test]
     fn a_walk_goes_on_past_its_target() {
         let scratch = Scratch::new("target");
@@ -301,8 +315,8 @@ mod tests {
         });
     }
 
-    /// A walk that stopped at a commit the repository did not hold goes on
-    /// from it once the repository holds it.
+    /// A walk that stopped at a commit that the repository did not hold goes
+    /// on from it after the repository holds it.
     #[test]
     fn a_walk_goes_on_from_a_commit_that_became_present() {
         let scratch = Scratch::new("absent");

@@ -1,6 +1,8 @@
-//! The test driver of the receive side: a client of `Repo::receive` over two
-//! in-process pipes, with the frame codec of `ostrya::push::proto`, and the
-//! helpers the receive tests share.
+//! The test driver of the receive side and the helpers that the receive tests
+//! share.
+//!
+//! The driver is a client of `Repo::receive` over two in-process pipes. It
+//! uses the frame codec of `ostrya::push::proto`.
 
 use std::future::Future;
 use std::path::Path;
@@ -38,8 +40,8 @@ pub struct Client {
 }
 
 impl Client {
-    /// Send one message. A write error is returned, because the server can
-    /// already be gone.
+    /// Sends one message and returns a write error to the caller, because the
+    /// server can already be gone.
     pub async fn send(&mut self, msg: &Message) -> push::Result<()> {
         self.writer.write_message(msg).await?;
         self.writer.flush().await
@@ -70,8 +72,8 @@ impl Client {
         }
     }
 
-    /// Send one object: its header, its bytes in pieces of 40 KiB, and the end
-    /// chunk.
+    /// Sends one object: its header, its bytes in pieces of 40 KiB, and the
+    /// end chunk.
     pub async fn object(
         &mut self,
         ty: ObjectType,
@@ -100,15 +102,15 @@ impl Client {
         }
     }
 
-    /// Send `Commit` with `updates`.
+    /// Sends a `Commit` message with `updates` and `force`.
     pub async fn commit(&mut self, updates: Vec<RefUpdate>, force: bool) -> push::Result<()> {
         self.send(&Message::Commit(CommitRequest { updates, force }))
             .await
     }
 
-    /// Read the reply to `Commit`: the outcomes of `CommitReply`, or the
-    /// `Error` that ended the session. Either is the last message of the
-    /// session.
+    /// Reads the reply to `Commit`: the outcomes of `CommitReply`, or the
+    /// `Error` that ended the session. Each of the two is the last message of
+    /// the session.
     pub async fn commit_reply(&mut self) -> Result<Vec<RefOutcome>, ErrorMessage> {
         let reply = match self.recv().await {
             Some(Message::CommitReply(refs)) => Ok(refs),
@@ -119,8 +121,8 @@ impl Client {
         reply
     }
 
-    /// Read until the `Error` message, which is the last message of the
-    /// session.
+    /// Reads messages until the `Error` message, which is the last message of
+    /// the session.
     pub async fn error(&mut self) -> ErrorMessage {
         loop {
             match self.recv().await {
@@ -135,7 +137,7 @@ impl Client {
     }
 }
 
-/// Run a session of `repo` under `policy` against the client `script`.
+/// Runs a session of `repo` under `policy` against the client `script`.
 pub fn session<F, Fut, T>(
     repo: &Repo,
     policy: &ReceivePolicy,
@@ -152,7 +154,8 @@ where
     ))
 }
 
-/// A client and the input and output of the server end of its session.
+/// Returns a client and the input and output of the server end of its
+/// session.
 pub fn connect() -> (Client, PipeReader, PipeWriter) {
     let (client_out, server_in) = pipe(PIPE_CAP);
     let (server_out, client_in) = pipe(PIPE_CAP);
@@ -163,7 +166,7 @@ pub fn connect() -> (Client, PipeReader, PipeWriter) {
     (client, server_in, server_out)
 }
 
-/// Write one object to `w`: its header, its bytes in pieces of 40 KiB, and
+/// Writes one object to `w`: its header, its bytes in pieces of 40 KiB, and
 /// the end chunk.
 pub async fn write_object<W>(w: &mut FrameWriter<W>, o: &Obj) -> push::Result<()>
 where
@@ -180,8 +183,8 @@ where
     w.end_object().await
 }
 
-/// The body of one `objects` request of a `ReceiveService`: each object,
-/// then `ObjectsEnd`.
+/// Returns the body of one `objects` request of a `ReceiveService`: each
+/// object, then `ObjectsEnd`.
 pub fn body(objects: &[Obj]) -> Vec<u8> {
     block_on(async {
         let mut w = FrameWriter::new(Vec::new());
@@ -193,7 +196,7 @@ pub fn body(objects: &[Obj]) -> Vec<u8> {
     })
 }
 
-/// The wire code a failed session returned to its caller.
+/// Returns the wire code that a failed session returned to its caller.
 pub fn returned_code(result: &ostrya::Result<ostrya::ReceiveReport>) -> Option<ErrorCode> {
     match result {
         Err(Error::Push(e)) => e.code(),
@@ -219,15 +222,17 @@ pub fn header(uid: u32, gid: u32, mode: u32) -> FileHeader {
     }
 }
 
-/// A content object in the `raw` encoding, and its checksum.
+/// Returns the checksum and the bytes of a content object in the `raw`
+/// encoding.
 pub fn raw_object(header: &FileHeader, payload: &[u8]) -> (Checksum, Vec<u8>) {
     let mut bytes = frame(&header.serialize().unwrap()).unwrap();
     bytes.extend_from_slice(payload);
     (sha(&bytes), bytes)
 }
 
-/// A content object in the `deflate` encoding, and its checksum. A symlink
-/// carries no payload, so its object is the framed header alone.
+/// Returns the checksum and the bytes of a content object in the `deflate`
+/// encoding. A symlink carries no payload, so its object is the framed header
+/// alone.
 pub fn deflate_object(header: &FileHeader, payload: &[u8]) -> (Checksum, Vec<u8>) {
     let (checksum, _) = raw_object(header, payload);
     let mut bytes = frame(&header.serialize_archive(payload.len() as u64).unwrap()).unwrap();
@@ -244,7 +249,7 @@ pub fn deflate_object(header: &FileHeader, payload: &[u8]) -> (Checksum, Vec<u8>
     (checksum, bytes)
 }
 
-/// One object a client sends.
+/// One object that a client sends.
 #[derive(Clone)]
 pub struct Obj {
     pub ty: ObjectType,
@@ -253,9 +258,9 @@ pub struct Obj {
     pub bytes: Vec<u8>,
 }
 
-/// Every object of the fixture commit, content objects in `encoding`. The
-/// `deflate` form of a content object is the `.filez` file of the archive
-/// fixture, and the `raw` form is its header and payload.
+/// Returns every object of the fixture commit, with the content objects in
+/// `encoding`. The `deflate` form of a content object is the `.filez` file of
+/// the archive fixture. The `raw` form is its header and payload.
 pub fn fixture_objects(encoding: Encoding) -> Vec<Obj> {
     let root = fixture_repo("archive");
     let repo = block_on(Repo::open(&root)).unwrap();
@@ -303,8 +308,8 @@ pub fn fixture_objects(encoding: Encoding) -> Vec<Obj> {
 // Repositories.
 // ---------------------------------------------------------------------------
 
-/// A new repository of `mode` at `<tmp>/repo`, with `core` appended to its
-/// config.
+/// Creates a repository of `mode` at `<tmp>/repo`, appends `core` to its
+/// config, and opens it.
 pub fn new_repo(tmp: &TmpDir, mode: RepoMode, core: &str) -> Repo {
     let root = tmp.path().join("repo");
     block_on(Repo::create(&root, CreateOptions::new(mode))).unwrap();
@@ -321,7 +326,7 @@ pub fn is_root() -> bool {
     rustix::process::geteuid().is_root()
 }
 
-/// The staging entries left under `tmp/`.
+/// Returns the names of the staging entries left under `tmp/`.
 pub fn staging_entries(root: &Path) -> Vec<String> {
     std::fs::read_dir(root.join("tmp"))
         .unwrap()
@@ -331,8 +336,9 @@ pub fn staging_entries(root: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Wait until no staging directory is left under `root`. A session that
-/// ends with no commit removes its staging directory in the background.
+/// Waits for at most 30 seconds until no staging entry is left under
+/// `root/tmp`. A session that ends with no commit removes its staging
+/// directory in the background.
 pub fn assert_staging_removed(root: &Path) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
@@ -348,9 +354,11 @@ pub fn assert_staging_removed(root: &Path) {
     }
 }
 
-/// Assert that the session published nothing: the files under `objects/`,
-/// the detached metadata included, are `before`, no ref is written, and no
-/// staging entry is left.
+/// Asserts that the session published nothing:
+///
+/// - The files under `objects/`, detached metadata included, are `before`.
+/// - No ref file exists under `refs/`.
+/// - No staging entry is left under `tmp/`.
 pub fn assert_nothing_published(repo: &Repo, before: &[(String, Vec<u8>)]) {
     assert_eq!(
         file_inventory(repo.path(), "objects"),
@@ -371,9 +379,9 @@ pub fn assert_nothing_published(repo: &Repo, before: &[(String, Vec<u8>)]) {
 // GnuPG.
 // ---------------------------------------------------------------------------
 
-/// A private GnuPG home holding one fresh, passphrase-free signing key.
-/// Dropping it stops the GnuPG daemons of the home and removes their socket
-/// directory.
+/// A private GnuPG home that holds one new signing key with no passphrase.
+/// A drop of the value stops the GnuPG daemons of the home and removes their
+/// socket directory.
 #[cfg(feature = "verify-gpg")]
 pub struct GnupgHome {
     pub dir: std::path::PathBuf,
@@ -397,7 +405,8 @@ impl GnupgHome {
         }
     }
 
-    /// The public certificates of the home, as `gpg --export` writes them.
+    /// Returns the public certificates of the home, as `gpg --export` writes
+    /// them.
     pub fn export(&self) -> Vec<u8> {
         let out = std::process::Command::new("gpg")
             .arg("--homedir")

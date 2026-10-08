@@ -1,12 +1,19 @@
-//! Commit-assembly, refs, and detached-metadata integration tests.
+//! Integration tests of the commit path, of refs, and of detached metadata.
 //!
-//! These replay the fixture source tree through the write path and check
-//! the commit object byte-for-byte against the tool's fixtures: the sizes-free
-//! commit across archive, bare-user, and bare-user-shared (the commit object is
-//! mode-independent), the archive `--generate-sizes` commit, the ref files the
-//! tool resolves, detached-metadata round-trips, immediate ref writes,
-//! concurrent commits, tool acceptance of a port-built repository, and a
-//! bare-user-only commit of a non-canonical tree against the tool's own objects.
+//! The tests write the fixture source tree through the write path. Then they
+//! compare the commit object byte for byte with the fixtures of the `ostree`
+//! command. The tests cover:
+//!
+//! - the commit without `ostree.sizes` in archive, bare-user, and
+//!   bare-user-shared (the commit object is the same in each mode)
+//! - the archive commit of `--generate-sizes`
+//! - the ref files that the `ostree` command resolves
+//! - round trips of detached metadata
+//! - immediate ref writes
+//! - concurrent commits
+//! - a repository that ostrya writes and the `ostree` command accepts
+//! - a bare-user-only commit of a non-canonical tree, compared with the
+//!   objects of the `ostree` command
 
 mod common;
 
@@ -33,9 +40,10 @@ fn csum(hex: &str) -> Checksum {
     Checksum::from_hex(hex).unwrap()
 }
 
-/// The `ostree.ref-binding` metadata dict the tool writes for a branch commit:
-/// a single `as` entry naming the branch. Reproducing the fixture commit
-/// byte-for-byte requires supplying it in the tool's key order.
+/// The `ostree.ref-binding` metadata dict that the `ostree` command writes for
+/// a branch commit: one `as` entry that names the branch. A byte-identical
+/// copy of the fixture commit needs this dict in the key order of the `ostree`
+/// command.
 fn ref_binding(refs: &[&str]) -> Value {
     let names = refs.iter().map(|r| Value::Str((*r).to_owned())).collect();
     Value::Array(vec![Value::Tuple(vec![
@@ -55,7 +63,7 @@ fn fixture_commit_options() -> CommitOptions {
     }
 }
 
-/// Build the fixture source tree (hello/empty/nested/link) under `base/src`.
+/// Builds the fixture source tree (hello/empty/nested/link) under `base/src`.
 fn build_fixture_source(base: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let set_mode = |p: &Path, m: u32| {
@@ -74,9 +82,10 @@ fn build_fixture_source(base: &Path) {
     set_mode(&src, 0o755);
 }
 
-/// Ingest `base/src` into a fresh root tree, forcing owner 0:0 with canonical
-/// permissions so it matches the tool's owner-0:0 fixture. Returns the staged
-/// root. Adds `GENERATE_SIZES` when requested.
+/// Ingests `base/src` into a new root tree with owner 0:0 and canonical
+/// permissions, so the tree matches the owner-0:0 fixture of the `ostree`
+/// command. Returns the staged root. If `generate_sizes` is `true`, the ingest
+/// also sets `GENERATE_SIZES`.
 async fn ingest_fixture(txn: &Transaction, base: &Path, generate_sizes: bool) -> ostrya::RepoTree {
     let mut flags = CommitModifierFlags::CANONICAL_PERMISSIONS | CommitModifierFlags::SKIP_XATTRS;
     if generate_sizes {
@@ -96,16 +105,16 @@ async fn ingest_fixture(txn: &Transaction, base: &Path, generate_sizes: bool) ->
     txn.write_mtree(&mut mtree).await.unwrap()
 }
 
-/// The on-disk bytes of a loose object in a repository rooted at `root`.
+/// Returns the on-disk bytes of a loose object in the repository at `root`.
 fn object_bytes(root: &Path, hex: &str, ty: ObjectType, mode: RepoMode) -> Vec<u8> {
     std::fs::read(root.join("objects").join(loose_path(&csum(hex), ty, mode))).unwrap()
 }
 
 #[test]
 fn commit_object_is_byte_identical_across_modes() {
-    // The commit object is mode-independent, so replaying the fixture input
-    // through 7a-7d in each mode reproduces the archive fixture's commit bytes,
-    // its checksum, and a ref the port resolves.
+    // The commit object does not depend on the mode. In each mode, the fixture
+    // input reproduces the commit bytes and the checksum of the archive fixture,
+    // and a ref that ostrya resolves.
     let fixture_commit = object_bytes(
         &fixture_repo("archive"),
         COMMIT,
@@ -157,7 +166,7 @@ fn commit_object_is_byte_identical_across_modes() {
                 "{mode:?} commit object is byte-identical to the fixture"
             );
 
-            // The ref file resolves, in this handle and a freshly opened one.
+            // The ref file resolves in this handle and in a newly opened handle.
             assert_eq!(
                 repo.resolve_rev("test/main", false).await.unwrap(),
                 Some(csum(COMMIT)),
@@ -174,9 +183,9 @@ fn commit_object_is_byte_identical_across_modes() {
 
 #[test]
 fn generate_sizes_commit_matches_the_fixture() {
-    // An archive commit with GENERATE_SIZES reproduces the sizes fixture's
-    // commit bytes and checksum: ostree.sizes covers every object (content and
-    // metadata) and is appended after the caller's ref-binding.
+    // An archive commit with GENERATE_SIZES reproduces the commit bytes and the
+    // checksum of the sizes fixture. `ostree.sizes` covers every object (content
+    // and metadata), and the commit appends it after the ref binding of the caller.
     let fixture_commit = object_bytes(
         &fixture_repo("sizes"),
         SIZES_COMMIT,
@@ -217,8 +226,8 @@ fn generate_sizes_commit_matches_the_fixture() {
 
 #[test]
 fn generate_sizes_is_a_noop_outside_archive() {
-    // In bare-user the size-generation request never marks the transaction, so
-    // the commit is byte-identical with and without it.
+    // In bare-user, the request for sizes never marks the transaction, so the
+    // commit is byte-identical with and without it.
     let commit_with = |generate_sizes: bool| {
         let tmp = TmpDir::new("commit-sizes-bare");
         let base = tmp.path();
@@ -243,15 +252,15 @@ fn generate_sizes_is_a_noop_outside_archive() {
         commit_with(false),
         "GENERATE_SIZES is a no-op in bare-user, so the commit is unchanged"
     );
-    // And it equals the mode-independent fixture commit (no sizes key).
+    // The commit is also equal to the fixture commit, which has no sizes key.
     assert_eq!(commit_with(true), csum(COMMIT));
 }
 
 #[test]
 fn set_generate_sizes_settles_the_key_in_both_directions() {
-    // `set_generate_sizes` answers for the whole transaction: `true` reaches the
-    // key where no ingest asked for it, and `false` turns it off again after an
-    // ingest under GENERATE_SIZES did.
+    // `set_generate_sizes` sets the key for the whole transaction. `true` adds the
+    // key when no ingest requested it. `false` removes the key after an ingest
+    // under GENERATE_SIZES requested it.
     let commit_with = |ingest: bool, request: Option<bool>| {
         let tmp = TmpDir::new("commit-sizes-request");
         let base = tmp.path();
@@ -292,8 +301,8 @@ fn set_generate_sizes_settles_the_key_in_both_directions() {
 
 #[test]
 fn detached_metadata_round_trips() {
-    // Writing an a{sv} and reading it back yields the same value; writing None
-    // yields the zero-length "no metadata" file, read back as None.
+    // A write of an a{sv} and a read give back the same value. A write of None
+    // gives the zero-length "no metadata" file, which reads back as None.
     let tmp = TmpDir::new("commit-detached");
     let root_dir = tmp.path().join("repo");
     let commit = csum(COMMIT);
@@ -325,7 +334,7 @@ fn detached_metadata_round_trips() {
             "detached metadata round-trips"
         );
 
-        // A None write is the documented zero-length file, read back as None.
+        // A None write gives the zero-length file, which reads back as None.
         repo.write_commit_detached_metadata(&commit, None)
             .await
             .unwrap();
@@ -363,7 +372,7 @@ fn set_ref_immediate_writes_and_removes() {
             repo.resolve_rev("branch/one", false).await.unwrap(),
             Some(commit)
         );
-        // The ref file is the 65-byte hex-plus-newline form.
+        // The ref file has 65 bytes: 64 hex characters and a newline.
         let ref_path = root_dir.join("refs/heads/branch/one");
         assert_eq!(std::fs::metadata(&ref_path).unwrap().len(), 65);
 
@@ -375,11 +384,11 @@ fn set_ref_immediate_writes_and_removes() {
 
 #[test]
 fn ref_writes_run_under_both_fsync_settings() {
-    // Every ref mutation syncs the directory holding the ref when `[core] fsync`
-    // is set: the write after its rename, the alias write after its rename, and
-    // the removal after its unlink. The sync is not observable from outside the
-    // process, so this pins the paths it opens -- a parent named wrong fails the
-    // open -- and that both settings reach every form.
+    // If `[core] fsync` is set, each ref change syncs the directory that holds
+    // the ref. A ref write and an alias write sync it after the rename, and a
+    // removal syncs it after the unlink. The sync is not visible outside the process.
+    // This test pins the paths that the sync opens, because a wrong parent fails
+    // the open. It also checks that both settings reach each form.
     for fsync in [true, false] {
         let tag = if fsync {
             "commit-fsync"
@@ -400,8 +409,8 @@ fn ref_writes_run_under_both_fsync_settings() {
             std::fs::write(&config, text).unwrap();
             let repo = Repo::open(&root_dir).await.unwrap();
 
-            // A nested local ref, a remote ref, and a collection ref, whose
-            // parents sit one, two, and two levels below `refs/`.
+            // A nested local ref, a remote ref, and a collection ref. Their parents are
+            // one, two, and two levels under `refs/`.
             repo.set_ref_immediate("branch/one", Some(&a))
                 .await
                 .unwrap();
@@ -442,7 +451,7 @@ fn ref_writes_run_under_both_fsync_settings() {
                 None
             );
 
-            // A transaction's ref write takes the same path.
+            // A ref write of a transaction takes the same path.
             let txn = repo.transaction().await.unwrap();
             txn.set_ref("branch/four", Some(&b));
             txn.commit().await.unwrap();
@@ -456,11 +465,11 @@ fn ref_writes_run_under_both_fsync_settings() {
 
 #[test]
 fn set_ref_over_alias_replaces_symlink() {
-    // Observed with the tool (2026.1): writing a ref whose file is a relative
-    // symlink alias replaces the symlink with a regular ref file and leaves the
-    // alias target unchanged, both when committing onto the alias and via
-    // `ostree refs --create --force`. See docs/format-reference.md. The port's
-    // rename-over-target write reproduces this; this test pins the behavior.
+    // Observed with the `ostree` command (2026.1): a ref write to a relative
+    // symlink alias replaces the symlink with a regular ref file.
+    // The alias target does not change. This occurs for a commit onto the alias
+    // and for `ostree refs --create --force`. The rename-over-target write of
+    // ostrya gives the same result, and this test pins it.
     let tmp = TmpDir::new("commit-alias");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
@@ -469,15 +478,15 @@ fn set_ref_over_alias_replaces_symlink() {
         let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
-        // A concrete ref test/bar -> A, then an alias test/foo -> bar, mirroring
-        // the tool's relative-symlink alias.
+        // A concrete ref test/bar -> A, then an alias test/foo -> bar. The alias is a
+        // relative symlink, as the `ostree` command writes it.
         repo.set_ref_immediate("test/bar", Some(&a)).await.unwrap();
         let heads = root_dir.join("refs/heads/test");
         std::os::unix::fs::symlink("bar", heads.join("foo")).unwrap();
         // The read path follows the alias to A.
         assert_eq!(repo.resolve_rev("test/foo", false).await.unwrap(), Some(a));
 
-        // Writing B onto the alias replaces the symlink with a regular file.
+        // A write of B onto the alias replaces the symlink with a regular file.
         repo.set_ref_immediate("test/foo", Some(&b)).await.unwrap();
         let foo_meta = std::fs::symlink_metadata(heads.join("foo")).unwrap();
         assert!(
@@ -486,7 +495,7 @@ fn set_ref_over_alias_replaces_symlink() {
         );
         assert_eq!(repo.resolve_rev("test/foo", false).await.unwrap(), Some(b));
 
-        // The alias target is untouched: test/bar still points at A.
+        // The alias target does not change: test/bar still points at A.
         let bar_meta = std::fs::symlink_metadata(heads.join("bar")).unwrap();
         assert!(bar_meta.file_type().is_file());
         assert_eq!(repo.resolve_rev("test/bar", false).await.unwrap(), Some(a));
@@ -495,10 +504,10 @@ fn set_ref_over_alias_replaces_symlink() {
 
 #[test]
 fn check_refs_path_reports_a_path_through_a_ref_file() {
-    // The probe a listing runs over the path its PREFIX names: `ENOTDIR` where a
-    // component above the last is not a directory, and `Ok` for a ref file, a
-    // directory, and a path naming nothing, since a prefix matching no ref
-    // enumerates nothing. See docs/format-reference.md, "refs".
+    // The probe that a listing runs over the path that its PREFIX names. The
+    // probe returns `ENOTDIR` if a component before the last one is not a
+    // directory. It returns `Ok` for a ref file, a directory, and a path that
+    // names nothing, because a prefix that matches no ref lists nothing.
     let tmp = TmpDir::new("commit-refs-path");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
@@ -531,8 +540,11 @@ fn check_refs_path_reports_a_path_through_a_ref_file() {
                 .unwrap_or_else(|err| panic!("`{path}` was refused: {err}"));
         }
 
-        // Through a ref file: the last component under one, an inner component
-        // under one, through an alias symlink naming one, and the remote form.
+        // Paths through a ref file:
+        // - the last component under a ref file
+        // - an inner component under a ref file
+        // - a path through an alias symlink to a ref file
+        // - the remote form
         for path in [
             "heads/plain/x",
             "heads/plain/x/y",
@@ -550,10 +562,10 @@ fn check_refs_path_reports_a_path_through_a_ref_file() {
 
 #[test]
 fn resolve_rev_reads_a_checksum_in_lowercase_hex_alone() {
-    // A 64-character revision is a checksum in lowercase hex alone; an uppercase
-    // or mixed-case name of that length is a refspec. Ref file content keeps the
-    // lenient reader, so a file holding an uppercase checksum resolves.
-    // See docs/format-reference.md, "Revision syntax".
+    // A revision of 64 characters is a checksum only if it is in lowercase hex.
+    // An uppercase or mixed-case name of that length is a refspec. The content of
+    // a ref file keeps the lenient reader, so a file that holds an uppercase
+    // checksum resolves.
     let tmp = TmpDir::new("commit-rev-case");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
@@ -564,10 +576,10 @@ fn resolve_rev_reads_a_checksum_in_lowercase_hex_alone() {
             .unwrap();
         repo.set_ref_immediate("plain", Some(&a)).await.unwrap();
 
-        // The lowercase form resolves to itself, whether or not the store holds
-        // the commit.
+        // The lowercase form resolves to itself, also if the object store does not
+        // hold the commit.
         assert_eq!(repo.resolve_rev(COMMIT, false).await.unwrap(), Some(a));
-        // The uppercase and mixed forms are ref names, and no ref carries them.
+        // The uppercase and mixed forms are ref names, and no ref has these names.
         let mixed = format!("{}{}", &upper[..1], &COMMIT[1..]);
         for rev in [upper.as_str(), mixed.as_str()] {
             assert_eq!(repo.resolve_rev(rev, true).await.unwrap(), None);
@@ -578,12 +590,12 @@ fn resolve_rev_reads_a_checksum_in_lowercase_hex_alone() {
             );
         }
 
-        // A ref carrying such a name resolves through the ref file.
+        // A ref with such a name resolves through the ref file.
         repo.set_ref_immediate(&upper, Some(&a)).await.unwrap();
         assert_eq!(repo.resolve_rev(&upper, false).await.unwrap(), Some(a));
 
-        // Ref file content is read by the lenient parser, the one case an
-        // uppercase checksum still resolves.
+        // The lenient parser reads the content of a ref file. This is the one case
+        // where an uppercase checksum resolves.
         std::fs::write(
             root_dir.join("refs/heads/uc"),
             format!("{upper}\n").as_bytes(),
@@ -595,12 +607,11 @@ fn resolve_rev_reads_a_checksum_in_lowercase_hex_alone() {
 
 #[test]
 fn list_refs_refuses_a_symlink_naming_a_directory() {
-    // A symlink under refs/ is an alias, whatever it points at, so the listing
-    // reads it as a ref rather than descending into it. A link naming a
-    // directory therefore fails the read with EISDIR, which is the tool's own
-    // `Listing refs: Is a directory` refusal. A self-link is the case that
-    // would otherwise recurse without end. Both links are reachable only by
-    // out-of-band mutation; see docs/format-reference.md, "refs".
+    // A symlink under refs/ is an alias, whatever its target, so the listing
+    // reads it as a ref and does not descend into it. As a result, a link to a
+    // directory fails the read with EISDIR. This is the `Listing refs: Is a
+    // directory` refusal of the `ostree` command. Without this rule, a self-link
+    // recurses without end. Only an out-of-band change can create these links.
     let tmp = TmpDir::new("commit-refs-dirlink");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
@@ -614,7 +625,7 @@ fn list_refs_refuses_a_symlink_naming_a_directory() {
         assert_eq!(repo.list_refs(None).await.unwrap().len(), 1);
 
         let heads = root_dir.join("refs/heads");
-        // A link to the directory holding it: following it has no end.
+        // A link to the directory that holds it: a walk that follows it has no end.
         std::os::unix::fs::symlink(".", heads.join("selfdir")).unwrap();
         let err = repo.list_refs(None).await.unwrap_err();
         assert!(
@@ -631,7 +642,7 @@ fn list_refs_refuses_a_symlink_naming_a_directory() {
             "a link naming a directory is refused, got {err}"
         );
 
-        // An alias naming a ref file is still read through the link.
+        // The listing still reads an alias to a ref file through the link.
         std::fs::remove_file(heads.join("dal")).unwrap();
         std::os::unix::fs::symlink("deep/nest/ing", heads.join("al")).unwrap();
         let refs = repo.list_refs(None).await.unwrap();
@@ -642,7 +653,7 @@ fn list_refs_refuses_a_symlink_naming_a_directory() {
     });
 }
 
-/// Assert that `result` failed with the OS error `errno`.
+/// Asserts that `result` failed with the OS error `errno`.
 fn assert_errno(result: ostrya::Result<()>, errno: rustix::io::Errno, what: &str) {
     assert!(
         matches!(&result, Err(ostrya::Error::Io(e)) if e.raw_os_error() == Some(errno.raw_os_error())),
@@ -650,7 +661,7 @@ fn assert_errno(result: ostrya::Result<()>, errno: rustix::io::Errno, what: &str
     );
 }
 
-/// The names in the directory `dir`, sorted, or none where `dir` is absent.
+/// Returns the sorted names in the directory `dir`, or none if `dir` is absent.
 fn dir_names(dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -665,8 +676,8 @@ fn dir_names(dir: &Path) -> Vec<String> {
 #[test]
 fn ref_writes_place_no_temp_beside_the_target() {
     // A ref write, an alias write, and a detached-metadata write create their
-    // temp entry in `tmp/`. With `tmp/` replaced by a regular file, each write
-    // fails before it touches `refs/` or `objects/`.
+    // temp entry in `tmp/`. If `tmp/` is a regular file, each write fails before
+    // it touches `refs/` or `objects/`.
     let tmp = TmpDir::new("commit-temp-in-tmp");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
@@ -719,8 +730,8 @@ fn ref_writes_place_no_temp_beside_the_target() {
 
 #[test]
 fn ref_writes_create_a_missing_tmp() {
-    // A ref, alias, or detached-metadata write in a repository with no `tmp/`
-    // creates it, and leaves it empty. A ref removal does not create it.
+    // If a repository has no `tmp/`, a ref, alias, or detached-metadata write
+    // creates it and leaves it empty. A ref removal does not create it.
     let tmp = TmpDir::new("commit-missing-tmp");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
@@ -766,8 +777,10 @@ fn ref_writes_create_a_missing_tmp() {
 
 #[test]
 fn a_ref_name_of_name_max_bytes_is_written() {
-    // The temp entry carries its own name in `tmp/`, so a ref leaf of 255
-    // bytes, the longest file name, is written and listed.
+    // The temp entry in `tmp/` has a name of its own,
+    // `.ostrya-ref-<pid>-<n>-XXXXXX`, which does not contain the ref name. As a
+    // result, a ref leaf of 255 bytes (the longest file name) can be written and
+    // listed.
     let tmp = TmpDir::new("commit-name-max");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
@@ -792,17 +805,18 @@ fn a_ref_name_of_name_max_bytes_is_written() {
 
 #[test]
 fn writes_fail_with_exdev_when_tmp_is_on_another_filesystem() {
-    // `tmp/` on another filesystem makes the rename of each temp entry fail
-    // with EXDEV. The write fails, the temp entry is removed, and the target
-    // stays as it was.
+    // If `tmp/` is on another file system, the rename of each temp entry fails
+    // with EXDEV. The write fails, ostrya removes the temp entry, and the target
+    // does not change.
     let tmp = TmpDir::new("commit-tmp-xdev");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
     let b = csum(CONTENT);
 
-    // A second filesystem is needed, and `/dev/shm` is one where the host
-    // gives it. Whether it is a second filesystem is read after the first
-    // write succeeds, so a host that has one cannot pass by skipping.
+    // The test needs a second file system. `/dev/shm` is one if the host has it.
+    // The test checks the device of `/dev/shm` only if the first write
+    // succeeds. A host with a second file system then fails the test, and it
+    // cannot pass by a skip.
     let other = Path::new("/dev/shm").join(format!("ostrya-tmp-xdev-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&other);
     if std::fs::create_dir_all(&other).is_err() {
@@ -862,8 +876,9 @@ fn writes_fail_with_exdev_when_tmp_is_on_another_filesystem() {
 
 #[test]
 fn two_transactions_commit_concurrently() {
-    // A repository holds concurrent transactions in one process: two
-    // transactions publish their objects and refs independently, both intact.
+    // A repository holds concurrent transactions in one process. Two
+    // transactions publish their objects and refs independently, and both stay
+    // intact.
     let tmp = TmpDir::new("commit-concurrent");
     let root_dir = tmp.path().join("repo");
     let repo = block_on(Repo::create(
@@ -940,12 +955,12 @@ fn bare_user_only_commit_matches_the_tool() {
         );
         return;
     }
-    // bare-user-only records what it can store -- no ownership, no xattrs, and
-    // permission bits reduced to `perm & 0o755` -- for content objects and
-    // directory metadata alike, and the identities follow from those headers. A
-    // tree whose ownership, modes, and xattrs are all outside what the mode
-    // stores therefore produces the tool's own object names, and the tool's fsck
-    // accepts the result.
+    // bare-user-only records only what it can store: no ownership, no xattrs, and
+    // permission bits reduced to `perm & 0o755`. This applies to content objects
+    // and to directory metadata, and the object names follow from these headers.
+    // As a result, a tree with ownership, modes, and xattrs outside what the mode
+    // stores produces the object names of the `ostree` command. The fsck of the
+    // `ostree` command accepts the result.
     let tmp = TmpDir::new("commit-buo-tool");
     let base = tmp.path();
     build_noncanonical_source(base);
@@ -982,8 +997,8 @@ fn bare_user_only_commit_matches_the_tool() {
         base.join("src").to_str().unwrap(),
     ]);
 
-    // The commit object carries the tool's own metadata, so the comparison is
-    // over the objects the tree itself produces.
+    // The commit object holds the metadata of the `ostree` command, so the test
+    // compares only the objects that the tree produces.
     assert_eq!(
         tree_object_names(&tool_root),
         tree_object_names(&port_root),
@@ -995,10 +1010,11 @@ fn bare_user_only_commit_matches_the_tool() {
     run_ostree(&[&port_arg, "ls", "-R", "test/main"]);
 }
 
-/// Build a source tree under `base/src` whose ownership, modes, and xattrs are
-/// all outside what `bare-user-only` stores: a world-writable file carrying an
-/// xattr, a setuid file, a world-writable directory, and a symlink. The process
-/// owns every entry, so a commit reads a non-zero uid and gid for each.
+/// Builds a source tree under `base/src` with ownership, modes, and xattrs
+/// that `bare-user-only` does not store. The tree holds a world-writable file
+/// with an xattr, a setuid file, a world-writable directory, and a symlink.
+/// The process owns each entry, so a commit reads a non-zero uid and gid for
+/// each.
 fn build_noncanonical_source(base: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let set_mode = |p: &Path, m: u32| {
@@ -1024,8 +1040,9 @@ fn build_noncanonical_source(base: &Path) {
     set_mode(&src, 0o755);
 }
 
-/// The loose-object names of the dirtree, dirmeta, and content objects in a
-/// repository, as `<fanout>/<rest>` strings. Commit objects are excluded.
+/// Returns the loose-object names of the dirtree, dirmeta, and content
+/// objects in a repository, as `<fanout>/<rest>` strings. The set excludes
+/// commit objects.
 fn tree_object_names(root: &Path) -> HashSet<String> {
     let objects = root.join("objects");
     let mut out = HashSet::new();
@@ -1067,13 +1084,15 @@ fn tool_accepts_a_port_created_commit() {
     });
 
     let repo_arg = format!("--repo={}", root_dir.display());
-    // fsck, show, and a recursive listing all accept the port's repository.
+    // The `ostree` commands `fsck`, `show`, and `ls -R` accept the repository of
+    // ostrya.
     run_ostree(&[&repo_arg, "fsck"]);
     run_ostree(&[&repo_arg, "show", "test/main"]);
     run_ostree(&[&repo_arg, "ls", "-R", "test/main"]);
 
     // A checkout reproduces the committed tree. `-U` (user mode) skips the
-    // ownership restore, which would need root for the objects' 0:0 owner.
+    // restore of ownership, because that restore needs root for the 0:0 owner of
+    // the objects.
     let out = base.join("checkout");
     run_ostree(&[
         &repo_arg,
@@ -1098,11 +1117,10 @@ fn tool_accepts_a_port_created_commit() {
 
 #[test]
 fn multi_commit_sizes_are_scoped_to_each_root() {
-    // Two distinct trees committed in one transaction with GENERATE_SIZES. Each
-    // commit's ostree.sizes must list exactly the objects reachable from its own
-    // root, not the union of everything the transaction staged. Under the old
-    // whole-transaction scope the second commit's key would also carry the first
-    // commit's objects.
+    // Two different trees committed in one transaction with GENERATE_SIZES. The
+    // `ostree.sizes` key of each commit must list exactly the objects that its
+    // own root reaches. The key of the second commit must not hold the objects
+    // that only the first commit reaches.
     let tmp = TmpDir::new("commit-multi-sizes");
     let base = tmp.path();
     build_flat_source(&base.join("srcA"), "a.txt", b"alpha payload\n");
@@ -1149,8 +1167,8 @@ fn multi_commit_sizes_are_scoped_to_each_root() {
             "commit B's ostree.sizes covers exactly B's reachable objects"
         );
 
-        // The keys do not leak across commits: objects unique to one tree never
-        // appear in the other's sizes.
+        // The keys do not leak across commits: an object unique to one tree never
+        // appears in the sizes of the other tree.
         let a_only: HashSet<Checksum> = reachable_a.difference(&reachable_b).copied().collect();
         let b_only: HashSet<Checksum> = reachable_b.difference(&reachable_a).copied().collect();
         assert!(
@@ -1170,11 +1188,12 @@ fn multi_commit_sizes_are_scoped_to_each_root() {
 
 #[test]
 fn multi_commit_sizes_match_separate_tool_commits() {
-    // The reachable scope is cross-checked against the tool: committing each tree
-    // alone into its own repository yields the same set of sized-object checksums
-    // the port's multi-commit transaction records for that tree. Object
-    // checksums are content-addressed and compression-independent, so the sets
-    // compare directly.
+    // A cross-check of the reachable scope with the `ostree` command. The
+    // `ostree` command commits each tree alone into its own repository. Each set
+    // of sized-object checksums is equal to the set that the multi-commit
+    // transaction of ostrya records for that tree. Object checksums are
+    // content-addressed and do not depend on compression, so the sets compare
+    // directly.
     if !ostree_available() {
         eprintln!("skipping multi_commit_sizes_match_separate_tool_commits: no ostree tool");
         return;
@@ -1221,12 +1240,11 @@ fn multi_commit_sizes_match_separate_tool_commits() {
 
 #[test]
 fn incremental_commit_sizes_cover_deduplicated_objects() {
-    // An incremental commit into an existing archive repository. v2 shares
-    // hello.txt (an unchanged leaf) and the whole keep/ subtree (an unchanged,
-    // deduplicated dirtree) with v1, and changes change/x.txt. Every object
-    // reachable from v2 -- including the objects that deduplicated against
-    // objects/ -- must appear in v2's ostree.sizes, not only the objects v2
-    // freshly staged.
+    // An incremental commit into an archive repository that exists. v2 shares
+    // hello.txt (an unchanged leaf) and the full keep/ subtree (an unchanged,
+    // deduplicated dirtree) with v1. v2 changes change/x.txt. Every object that
+    // v2 reaches must appear in the `ostree.sizes` key of v2. This includes the
+    // objects that v2 staged and the objects that deduplicated against objects/.
     let tmp = TmpDir::new("commit-incremental-sizes");
     let base = tmp.path();
     build_incremental_source(&base.join("v1"), b"first revision\n");
@@ -1248,8 +1266,8 @@ fn incremental_commit_sizes_cover_deduplicated_objects() {
         txn.set_ref("inc/main", Some(&commit_v1));
         txn.commit().await.unwrap();
 
-        // v2 in a fresh transaction: the shared objects now deduplicate against
-        // objects/ instead of being freshly staged.
+        // v2 in a new transaction: the shared objects deduplicate against objects/,
+        // and the transaction does not stage them again.
         let txn = repo.transaction().await.unwrap();
         let root_v2 = ingest_flat(&txn, base, "v2").await;
         let commit_v2 = txn
@@ -1278,12 +1296,15 @@ fn incremental_commit_sizes_cover_deduplicated_objects() {
 
 #[test]
 fn incremental_commit_sizes_match_a_tool_incremental_commit() {
-    // Cross-check the incremental scope against the tool: the port and the tool
-    // each commit v1 then v2 into their own archive repository, and the port's
-    // decoded v2 ostree.sizes entries equal the tool's -- same objects, and the
-    // same recovered compressed and unpacked sizes and object types. Object
-    // checksums are content-addressed and the port's compression matches the
-    // tool's, so the loose objects and their entries compare directly.
+    // A cross-check of the incremental scope with the `ostree` command. ostrya
+    // and the `ostree` command each commit v1 and then v2 into their own archive
+    // repository. The decoded `ostree.sizes` entries of v2 are the same for
+    // both. They have the same objects, the same recovered compressed and
+    // unpacked sizes, and the same object types.
+    //
+    // Object checksums are content-addressed, and ostrya compresses to the same
+    // bytes as the `ostree` command, so the loose objects and their entries
+    // compare directly.
     if !ostree_available() {
         eprintln!(
             "skipping incremental_commit_sizes_match_a_tool_incremental_commit: no ostree tool"
@@ -1331,10 +1352,10 @@ fn incremental_commit_sizes_match_a_tool_incremental_commit() {
     );
 }
 
-/// A three-entry source tree used by the incremental tests: a shared top-level
-/// file `hello.txt`, an unchanged subtree `keep/`, and a `change/x.txt` whose
-/// content is `x`. Permissions are already canonical (file `0o644`, directory
-/// `0o755`).
+/// Builds a source tree with three entries for the incremental tests. The
+/// entries are a shared top-level file `hello.txt`, an unchanged subtree
+/// `keep/`, and `change/x.txt` with the content `x`. The permissions are already canonical
+/// (file `0o644`, directory `0o755`).
 fn build_incremental_source(dir: &Path, x: &[u8]) {
     use std::os::unix::fs::PermissionsExt;
     let set_mode = |p: &Path, m: u32| {
@@ -1357,8 +1378,9 @@ fn build_incremental_source(dir: &Path, x: &[u8]) {
     }
 }
 
-/// Commit `v1` then `v2` into one fresh archive repository with the tool under
-/// `--generate-sizes`, then decode the second commit's `ostree.sizes` entries.
+/// Commits `v1` and then `v2` into one new archive repository with the
+/// `ostree` command under `--generate-sizes`. Returns the decoded
+/// `ostree.sizes` entries of the second commit.
 fn tool_incremental_v2_sizes(
     repo_dir: &Path,
     v1: &Path,
@@ -1390,8 +1412,8 @@ fn tool_incremental_v2_sizes(
     })
 }
 
-/// Commit options for the multi-commit test: `ostree.sizes` is the sole
-/// metadata entry, over a fixed timestamp.
+/// Returns the commit options of the multi-commit test: `ostree.sizes` is the
+/// only metadata entry, and the timestamp is fixed.
 fn multi_commit_options() -> CommitOptions {
     CommitOptions {
         subject: Some("multi".to_owned()),
@@ -1400,9 +1422,10 @@ fn multi_commit_options() -> CommitOptions {
     }
 }
 
-/// A single-file source directory with already-canonical permissions (file
-/// `0o644`, directory `0o755`), so the port's `CANONICAL_PERMISSIONS` ingest and
-/// an owner-0:0 tool commit produce identical objects.
+/// Builds a source directory with one file and canonical permissions (file
+/// `0o644`, directory `0o755`). With these permissions, the
+/// `CANONICAL_PERMISSIONS` ingest of ostrya and an owner-0:0 commit of the
+/// `ostree` command produce the same objects.
 fn build_flat_source(dir: &Path, name: &str, content: &[u8]) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).unwrap();
@@ -1412,8 +1435,8 @@ fn build_flat_source(dir: &Path, name: &str, content: &[u8]) {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// Ingest `base/sub` into a fresh root under `GENERATE_SIZES`, forcing owner
-/// 0:0 with canonical permissions. Returns the staged root.
+/// Ingests `base/sub` into a new root under `GENERATE_SIZES` with owner 0:0
+/// and canonical permissions. Returns the staged root.
 async fn ingest_flat(txn: &Transaction, base: &Path, sub: &str) -> RepoTree {
     let flags = CommitModifierFlags::CANONICAL_PERMISSIONS
         | CommitModifierFlags::SKIP_XATTRS
@@ -1427,10 +1450,10 @@ async fn ingest_flat(txn: &Transaction, base: &Path, sub: &str) -> RepoTree {
     txn.write_mtree(&mut mtree).await.unwrap()
 }
 
-/// The decoded `ostree.sizes` entries of a commit, keyed by object checksum.
-/// Carries the full record (compressed size, unpacked size, object type), so a
-/// comparison against the tool checks the recovered sizes, not only which
-/// objects are listed.
+/// Returns the decoded `ostree.sizes` entries of a commit, keyed by object
+/// checksum. Each entry holds the full record (compressed size, unpacked
+/// size, object type), so a comparison with the `ostree` command checks the
+/// recovered sizes and the listed objects.
 async fn decode_sizes_entries(
     repo: &Repo,
     commit: &Checksum,
@@ -1468,7 +1491,7 @@ async fn decode_sizes_entries(
     panic!("commit {} has no ostree.sizes key", commit.to_hex());
 }
 
-/// The set of object checksums listed in a commit's `ostree.sizes` key.
+/// Returns the set of object checksums in the `ostree.sizes` key of a commit.
 async fn decode_sizes_checksums(repo: &Repo, commit: &Checksum) -> HashSet<Checksum> {
     decode_sizes_entries(repo, commit)
         .await
@@ -1476,9 +1499,9 @@ async fn decode_sizes_checksums(repo: &Repo, commit: &Checksum) -> HashSet<Check
         .collect()
 }
 
-/// The set of object checksums reachable from a commit's root, walked through
-/// the public read API: each directory's dirmeta and dirtree, and every file
-/// entry.
+/// Returns the set of object checksums that the root of a commit reaches. The
+/// walk uses the public read API: the dirmeta and dirtree of each directory,
+/// and each file entry.
 async fn walk_reachable(repo: &Repo, rev: &str) -> HashSet<Checksum> {
     let (root, _) = repo.read_commit(rev).await.unwrap();
     let mut set = HashSet::new();
@@ -1498,9 +1521,9 @@ async fn walk_reachable(repo: &Repo, rev: &str) -> HashSet<Checksum> {
     set
 }
 
-/// Commit `src` alone into a fresh archive repository with the tool under
-/// `--generate-sizes`, then decode the sized-object checksum set from the
-/// resulting commit.
+/// Commits `src` alone into a new archive repository with the `ostree`
+/// command under `--generate-sizes`. Returns the set of sized-object
+/// checksums of that commit.
 fn tool_commit_sizes(repo_dir: &Path, src: &Path, branch: &str) -> HashSet<Checksum> {
     let repo_arg = format!("--repo={}", repo_dir.display());
     run_ostree(&[&repo_arg, "init", "--mode=archive-z2"]);

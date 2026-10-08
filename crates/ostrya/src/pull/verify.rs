@@ -1,23 +1,12 @@
-//! The signature checks a pull makes.
+//! The signature verification of a pull.
 //!
-//! Two independent policies, one for the commits a pull fetches and one for the
-//! remote's summary, each built once per pull from the remote's configuration
-//! and the pull's own overrides. The policy, its two axes, and the keys a
-//! remote's section names are in the crate's `verify` module, which the receive
-//! path shares.
+//! A pull holds two independent policies: one for the commits that it fetches
+//! and one for the summary of the remote. The pull builds each policy once,
+//! from the config of the remote and the overrides of the pull.
 //!
-//! A local pull makes no check unless one is asked for, and an HTTP pull reads
-//! the remote's configuration, which is what the tool does with `pull-local` and
-//! `pull` respectively. Either way the keys come from a remote's configuration
-//! section, so a check without a remote name is refused rather than made against
-//! an empty trusted set.
-//!
-//! Where the checks run: the summary is checked as soon as it and its signature
-//! are here, before either is read, and a commit is checked in the step that
-//! fetched it, before its bytes are staged and before its tree is asked for.
-//! Every commit a pull carries is checked, the parents a depth pull follows
-//! included, and so is one this repository already holds, since the pull is what
-//! states the policy rather than the stored object.
+//! The crate module `verify` holds the policy, its two axes, and the keys that
+//! the section of a remote names. The receive path shares that module.
+//! [`PullVerify`] states the rules that a caller sees.
 
 use ostrya_core::{Checksum, Value};
 
@@ -28,31 +17,31 @@ use crate::verify::{Found, KeySource, Policy, Verifiers, build_policy, examine};
 
 use super::PullVerify;
 
-/// What a pull's options leave to the caller's convention when they state no
-/// policy of their own.
+/// The source of the policy when the options of a pull state no policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Defaults {
-    /// Read the remote's configuration, which is what [`Repo::pull`] does.
+    /// Read the config of the remote. [`Repo::pull`] uses this source.
     Config,
-    /// Check nothing, which is what [`Repo::pull_local`] does.
+    /// Verify nothing. [`Repo::pull_local`] uses this source.
     Off,
 }
 
-/// The checks one pull makes.
+/// The signature verification of one pull.
 pub(crate) struct Verification {
-    /// The policy every commit the pull carries is held to.
+    /// The policy for each commit that the pull carries.
     commit: Policy,
-    /// The policy the remote's summary is held to.
+    /// The policy for the summary of the remote.
     summary: Policy,
 }
 
 impl Verification {
-    /// The checks a pull of `remote` makes, from that remote's configuration in
-    /// `repo` and the overrides in `verify`.
+    /// Builds the verification of a pull of `remote` from its config in `repo`
+    /// and the overrides in `verify`.
     ///
-    /// `remote` is the name whose configuration section supplies the policy and
-    /// the keys. A local pull that names none and asks for a check is refused
-    /// here, before anything is imported.
+    /// The config section of `remote` supplies the policy and the keys. If a
+    /// local pull names no remote and asks for a verification, this function
+    /// fails with [`Error::Pull`]. The failure comes before the pull imports
+    /// an object.
     pub(crate) async fn build(
         repo: &Repo,
         remote: Option<&str>,
@@ -64,8 +53,8 @@ impl Verification {
 
         let gpg_commit = switch(verify.gpg, || match &section {
             Some(section) if configured => section.gpg_verify(),
-            // A remote an HTTP pull names but the configuration does not
-            // describe takes the same default a described one does.
+            // If an HTTP pull names a remote that the config does not
+            // describe, the remote takes the default of a described remote.
             None if configured => Ok(true),
             _ => Ok(false),
         })?;
@@ -111,18 +100,20 @@ impl Verification {
         Ok(Verification { commit, summary })
     }
 
-    /// Whether this pull checks the commits it carries.
+    /// Returns `true` if this pull verifies the commits that it carries.
     pub(crate) fn checks_commits(&self) -> bool {
         self.commit.applies()
     }
 
-    /// Whether this pull checks the remote's summary.
+    /// Returns `true` if this pull verifies the summary of the remote.
     pub(crate) fn checks_summary(&self) -> bool {
         self.summary.applies()
     }
 
-    /// Hold one commit to the commit policy. `detached` is the commit's
-    /// detached metadata, which is where its signatures live.
+    /// Verifies one commit against the commit policy.
+    ///
+    /// `detached` is the detached metadata of the commit, which holds its
+    /// signatures.
     pub(crate) async fn check_commit(
         &self,
         checksum: &Checksum,
@@ -137,11 +128,12 @@ impl Verification {
             .await
     }
 
-    /// Hold the remote's summary to the summary policy.
+    /// Verifies the summary of the remote against the summary policy.
     ///
-    /// A policy that applies needs both files: a source publishing no summary,
-    /// and one publishing a summary with no `summary.sig`, are each refused by
-    /// name, which is what the tool reports for the same two cases.
+    /// A policy that applies needs both files. If the source publishes no
+    /// summary, or a summary with no `summary.sig`, this function fails with
+    /// [`Error::Signature`]. The message names the missing file. The `ostree`
+    /// command reports the same two cases.
     pub(crate) async fn check_summary(
         &self,
         summary: Option<&[u8]>,
@@ -166,15 +158,22 @@ impl Verification {
             .await
     }
 
-    /// Hold a fetched static delta to the commit policy's sign-api axis, over
-    /// the raw superblock bytes the signatures cover.
+    /// Verifies a fetched static delta against the sign-api axis of the commit
+    /// policy.
     ///
-    /// A delta is signed by the sign api alone, so the GPG axis plays no part.
-    /// A delta carrying no signature the axis can read is accepted: what the
-    /// delta produces is named by the superblock, the superblock is named by the
-    /// advertisement, and the commit it delivers is held to the commit policy
-    /// like any other, so a stripped signature buys nothing. A delta that does
-    /// carry one has to have it from a trusted key.
+    /// The signatures cover the raw bytes of the superblock. Only the sign api
+    /// signs a delta, so the GPG axis has no part.
+    ///
+    /// A delta with no signature that the axis can read passes. The removal of
+    /// a signature does not let a pull accept other bytes:
+    ///
+    /// - The superblock names what the delta produces.
+    /// - The advertisement names the superblock.
+    /// - The commit policy applies to the delivered commit, as to each other
+    ///   commit.
+    ///
+    /// If a delta carries signatures and no signature is from a trusted key,
+    /// this function fails with [`Error::Signature`].
     pub(crate) async fn check_delta(
         &self,
         name: &str,
@@ -193,7 +192,7 @@ impl Verification {
     }
 }
 
-/// Resolve one boolean switch: the pull's override, or the configuration.
+/// Resolves one boolean switch: the override of the pull, or else the config.
 fn switch(override_: Option<bool>, configured: impl FnOnce() -> Result<bool>) -> Result<bool> {
     match override_ {
         Some(value) => Ok(value),
@@ -201,8 +200,9 @@ fn switch(override_: Option<bool>, configured: impl FnOnce() -> Result<bool>) ->
     }
 }
 
-/// Resolve one sign-api switch: the pull's override, where `true` selects every
-/// engine this build has, or the configuration.
+/// Resolves one sign-api switch: the override of the pull, or else the config.
+///
+/// An override of `true` selects each engine of this build.
 fn engines(
     override_: Option<bool>,
     configured: impl FnOnce() -> Result<SignVerify>,
@@ -218,7 +218,8 @@ fn engines(
 mod tests {
     use super::*;
 
-    /// An override wins over the configuration, and an absent one reads it.
+    /// An override takes precedence over the config. With no override, the
+    /// config applies.
     #[test]
     fn switches_resolve_the_override_first() {
         assert!(switch(Some(true), || Ok(false)).unwrap());

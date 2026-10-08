@@ -1,5 +1,5 @@
-//! Import ./rootfs into a repository, labeling every path from a
-//! compiled-in policy table.
+//! Imports `./rootfs` into the new repository `./repo`, and gives each path
+//! an SELinux label from a compiled-in policy table.
 
 use std::os::fd::AsFd;
 use std::path::Path;
@@ -8,8 +8,9 @@ use ostrya::{
     CommitModifier, CommitModifierFlags, CreateOptions, MutableTree, Repo, RepoMode, Result,
 };
 
-/// Path-prefix to SELinux label, first match wins. Prefixes match whole
-/// path components.
+/// The SELinux label of each path prefix.
+///
+/// The first match applies. A prefix matches whole path components only.
 static LABELS: &[(&str, &str)] = &[
     ("/etc/shadow", "system_u:object_r:shadow_t:s0"),
     ("/etc", "system_u:object_r:etc_t:s0"),
@@ -19,8 +20,9 @@ static LABELS: &[(&str, &str)] = &[
     ("/", "system_u:object_r:usr_t:s0"), // catch-all: keeps ERROR_ON_UNLABELED quiet
 ];
 
-/// The label for a walk path ("/", "/etc", "/etc/passwd", ...), in the
-/// NUL-terminated form the xattr value is stored in.
+/// Returns the label of a walk path, such as `/`, `/etc`, or `/etc/passwd`.
+///
+/// The label has a NUL terminator, because the stored xattr value has one.
 fn label_for(path: &Path) -> Option<Vec<u8>> {
     let path = path.to_str()?;
     LABELS.iter().find_map(|(prefix, label)| {
@@ -42,7 +44,7 @@ fn main() -> Result<()> {
         let repo = Repo::create(Path::new("repo"), CreateOptions::new(RepoMode::BareUser)).await?;
         let txn = repo.transaction().await?;
 
-        // A hole in LABELS becomes a hard error instead of an unlabeled path.
+        // If `LABELS` has no label for a path, the import fails with an error.
         let mut modifier = CommitModifier::new(
             CommitModifierFlags::SELINUX_LABEL_V1 | CommitModifierFlags::ERROR_ON_UNLABELED,
         );

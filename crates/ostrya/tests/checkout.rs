@@ -1,12 +1,24 @@
-//! Checkout-path integration tests.
+//! Integration tests for checkout.
 //!
-//! These check the port's [`Repo::checkout_at`] against the `ostree` tool's
-//! checkout (mode, ownership, content, symlink targets, and hardlinking) for
-//! `bare` + faithful, `bare-user` + unprivileged, and `archive` + faithful; a
-//! commit -> checkout -> re-ingest round-trip that must reproduce the commit
-//! checksum; the reflink/force-copy path; Docker-style whiteouts; the overwrite
-//! modes; subpath resolution; and the include/prune filter. Tool cross-checks
-//! are skipped when the `ostree` tool is unavailable.
+//! These tests compare [`Repo::checkout_at`] of ostrya with the checkout of the
+//! `ostree` command. They compare the mode, the ownership, the content, the
+//! symlink targets, and the hardlinks for these pairs:
+//!
+//! - `bare` with a faithful checkout
+//! - `bare-user` with an unprivileged checkout
+//! - `archive` with a faithful checkout
+//!
+//! Other tests cover:
+//!
+//! - a commit -> checkout -> re-ingest round-trip that must give the same
+//!   commit checksum
+//! - the reflink and force-copy path
+//! - Docker-style whiteouts
+//! - the overwrite modes
+//! - subpath resolution
+//! - the include and prune filter
+//!
+//! If the `ostree` command is not available, the comparison tests skip.
 
 mod common;
 
@@ -30,7 +42,7 @@ use ostrya_rt::block_on;
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 
-/// A fixed timestamp so a commit -> checkout -> re-commit round-trip is
+/// A fixed timestamp that makes a commit -> checkout -> re-commit round-trip
 /// deterministic.
 const FIXED_TS: u64 = 1_700_000_000;
 
@@ -48,9 +60,9 @@ fn run_ostree(args: &[&str]) {
     );
 }
 
-/// The invoking process's uid/gid, recovered from a freshly created file so the
-/// tests need no `getuid` binding. Ownership committed and restored as this
-/// owner stays within the caller's privilege.
+/// Returns the uid and gid of the process, read from a new file, so the tests
+/// need no `getuid` binding. If a commit records this owner and a checkout
+/// restores it, no step needs more privilege than the caller has.
 fn self_owner(base: &Path) -> (u32, u32) {
     let probe = base.join(".probe");
     std::fs::write(&probe, b"").unwrap();
@@ -60,7 +72,7 @@ fn self_owner(base: &Path) -> (u32, u32) {
     owner
 }
 
-/// Build a source tree with assorted file types and modes under `dir`.
+/// Builds a source tree with different file types and modes under `dir`.
 fn build_source(dir: &Path) {
     std::fs::create_dir_all(dir.join("subdir")).unwrap();
     std::fs::write(dir.join("hello.txt"), b"hello ostree\n").unwrap();
@@ -82,10 +94,13 @@ fn set_mode(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-/// One entry's comparable metadata: type, mode, ownership, and content or
-/// target. Link count and xattrs are excluded (the tool differs from the port
-/// on the uncompressed-cache link count, and the test crate carries no xattr
-/// syscall binding; xattr application is checked by the round-trip test).
+/// The metadata of one entry that the tests compare: the type, the mode, the
+/// ownership, and the content or the target.
+///
+/// The comparison excludes the link count and the xattrs. The `ostree` command
+/// and ostrya give different link counts for the uncompressed cache.
+/// `collect_tree` reads no xattr. The round-trip test and the tests that call
+/// `xattr_of` check the xattrs.
 #[derive(Debug, PartialEq, Eq)]
 enum EntryMeta {
     File {
@@ -104,7 +119,7 @@ enum EntryMeta {
     },
 }
 
-/// Collect the metadata of every entry beneath `root`, keyed by relative path.
+/// Collects the metadata of each entry under `root`, keyed by relative path.
 fn collect_tree(root: &Path) -> BTreeMap<String, EntryMeta> {
     let mut map = BTreeMap::new();
     collect_into(root, root, &mut map);
@@ -156,13 +171,13 @@ fn collect_into(root: &Path, dir: &Path, map: &mut BTreeMap<String, EntryMeta>) 
     }
 }
 
-/// The `(dev, ino)` of a file, via `symlink_metadata` (no-follow).
+/// Returns the `(dev, ino)` of a file, from `symlink_metadata` (no-follow).
 fn dev_ino(path: &Path) -> (u64, u64) {
     let meta = std::fs::symlink_metadata(path).unwrap();
     (meta.dev(), meta.ino())
 }
 
-/// The `(dev, ino)` of a loose content object.
+/// Returns the `(dev, ino)` of a loose content object.
 fn object_dev_ino(repo_root: &Path, checksum: &Checksum, mode: RepoMode) -> (u64, u64) {
     let path = repo_root
         .join("objects")
@@ -170,7 +185,7 @@ fn object_dev_ino(repo_root: &Path, checksum: &Checksum, mode: RepoMode) -> (u64
     dev_ino(&path)
 }
 
-/// Resolve a file entry's content checksum within a commit tree.
+/// Returns the content checksum of a file entry in a commit tree.
 async fn file_checksum(repo: &Repo, rev: &str, name: &str) -> Checksum {
     let (tree, _) = repo.read_commit(rev).await.unwrap();
     match tree.lookup(Path::new(name)).await.unwrap() {
@@ -179,8 +194,9 @@ async fn file_checksum(repo: &Repo, rev: &str, name: &str) -> Checksum {
     }
 }
 
-/// Cross-check the port's checkout of a tool-committed tree against the tool's
-/// own checkout, for a given repository mode and checkout mode.
+/// Compares the checkout of ostrya with the checkout of the `ostree` command.
+/// The `ostree` command commits the tree. The comparison uses one repository
+/// mode and one checkout mode.
 fn cross_check(repo_mode: &str, port_mode: CheckoutMode, user_flag: bool) {
     if !ostree_available() {
         eprintln!("skipping checkout cross-check for {repo_mode}: the ostree tool is unavailable");
@@ -205,7 +221,7 @@ fn cross_check(repo_mode: &str, port_mode: CheckoutMode, user_flag: bool) {
         src.to_str().unwrap(),
     ]);
 
-    // The tool's reference checkout.
+    // The reference checkout of the `ostree` command.
     let co_tool = base.join("co-tool");
     let mut tool_args = vec![repo_arg.as_str(), "checkout"];
     if user_flag {
@@ -215,7 +231,7 @@ fn cross_check(repo_mode: &str, port_mode: CheckoutMode, user_flag: bool) {
     tool_args.push(co_tool.to_str().unwrap());
     run_ostree(&tool_args);
 
-    // The port's checkout.
+    // The checkout of ostrya.
     let co_port = base.join("co-port");
     let (storage_mode, hello) = block_on(async {
         let repo = Repo::open(&repo_dir).await.unwrap();
@@ -229,21 +245,22 @@ fn cross_check(repo_mode: &str, port_mode: CheckoutMode, user_flag: bool) {
         (repo.mode(), hello)
     });
 
-    // The two trees agree on type, mode, ownership, content, and targets.
+    // The two trees have the same types, modes, ownership, content, and
+    // targets.
     assert_eq!(
         collect_tree(&co_tool),
         collect_tree(&co_port),
         "port checkout of a {repo_mode} repo diverges from the tool"
     );
 
-    // The destination roots agree too (the root receives the tree root's
-    // dirmeta).
+    // The two destination roots also agree. The root gets the dirmeta of the
+    // tree root.
     let tool_root = std::fs::metadata(&co_tool).unwrap();
     let port_root = std::fs::metadata(&co_port).unwrap();
     assert_eq!(tool_root.mode() & 0o7777, port_root.mode() & 0o7777);
 
-    // The hardlinking outcome the mode dictates: the destination file shares the
-    // object inode exactly when a hardlink checkout is expected.
+    // The modes decide the hardlink result. The destination file shares the
+    // inode of the object if and only if the modes give a hardlink checkout.
     let dest = dev_ino(&co_port.join("hello.txt"));
     let object = object_dev_ino(&repo_dir, &hello, storage_mode);
     let expect_hardlink = matches!(
@@ -265,7 +282,7 @@ fn cross_check(repo_mode: &str, port_mode: CheckoutMode, user_flag: bool) {
     }
 }
 
-// --- tool cross-checks ---------------------------------------------------
+// --- comparisons with the `ostree` command --------------------------------
 
 #[test]
 fn bare_none_matches_tool() {
@@ -282,9 +299,9 @@ fn archive_none_matches_tool() {
     cross_check("archive-z2", CheckoutMode::None, false);
 }
 
-// bare-user-only carries no ownership and its objects hold the canonical mode
-// on the inode, so both a faithful and an unprivileged checkout hardlink the
-// object and produce the same tree the tool does.
+// Because bare-user-only stores no ownership and keeps the canonical mode on
+// the object inode, a faithful and an unprivileged checkout both hardlink the
+// object. Both give the same tree as the `ostree` command.
 #[test]
 fn bare_user_only_none_matches_tool() {
     cross_check("bare-user-only", CheckoutMode::None, false);
@@ -295,9 +312,9 @@ fn bare_user_only_user_matches_tool() {
     cross_check("bare-user-only", CheckoutMode::User, true);
 }
 
-/// bare-user-only forces user semantics, so a faithful (None) and an
-/// unprivileged (User) checkout produce identical trees, and each hardlinks the
-/// object into place. This holds without the tool, so it runs unconditionally.
+/// bare-user-only forces user semantics. A faithful (None) and an unprivileged
+/// (User) checkout give identical trees, and each hardlinks the object into
+/// place. This test does not need the `ostree` command, so it always runs.
 #[test]
 fn bare_user_only_faithful_equals_unprivileged() {
     let tmp = TmpDir::new("co-buo-equiv");
@@ -343,9 +360,9 @@ fn bare_user_only_faithful_equals_unprivileged() {
     });
 }
 
-/// force_copy suppresses the hardlink bare-user-only would otherwise use: the
-/// destination is a fresh inode with byte-identical content and the canonical
-/// mode (& 0o777) applied by the copy path.
+/// `force_copy` stops the hardlink that bare-user-only uses without it. The
+/// destination is a new inode with byte-identical content. The copy path
+/// applies the canonical mode (& 0o777).
 #[test]
 fn bare_user_only_force_copy_makes_an_independent_copy() {
     let tmp = TmpDir::new("co-buo-copy");
@@ -398,7 +415,7 @@ fn commit_checkout_roundtrip_is_stable() {
             .await
             .unwrap();
 
-        // Commit the source tree preserving its ownership and modes.
+        // Commit the source tree with its ownership and modes.
         let commit1 = {
             let txn = repo.transaction().await.unwrap();
             let mut mtree = MutableTree::new();
@@ -425,7 +442,7 @@ fn commit_checkout_roundtrip_is_stable() {
             .await
             .unwrap();
 
-        // Re-ingest the checkout: the same tree yields the same commit.
+        // Re-ingest the checkout. The same tree gives the same commit.
         let commit2 = {
             let txn = repo.transaction().await.unwrap();
             let mut mtree = MutableTree::new();
@@ -460,12 +477,15 @@ fn roundtrip_options() -> CommitOptions {
     }
 }
 
-/// bare-user-shared is a development-only mode the ostree tool does not provide,
-/// so it has no tool cross-check. A commit -> checkout -> re-commit round-trip
-/// that reproduces the commit checksum exercises the copy path (bare-user-shared
-/// never hardlinks) and the `user.ostreemeta`-derived metadata: the re-commit
-/// matches only if the checkout reproduced each entry's logical mode, ownership,
-/// and content.
+/// bare-user-shared is a development-only mode that the `ostree` command does
+/// not have, so there is no comparison with the `ostree` command. A commit ->
+/// checkout -> re-commit round-trip that gives the same commit checksum covers:
+///
+/// - the copy path, because bare-user-shared never hardlinks
+/// - the metadata from `user.ostreemeta`
+///
+/// The re-commit matches only if the checkout restored the logical mode, the
+/// ownership, and the content of each entry.
 #[test]
 fn bare_user_shared_roundtrip_is_stable() {
     let tmp = TmpDir::new("co-bus-roundtrip");
@@ -494,8 +514,8 @@ fn bare_user_shared_roundtrip_is_stable() {
     });
 }
 
-/// Commit subtree `sub` of `base` with a fixed timestamp, so re-committing the
-/// same tree reproduces the commit checksum.
+/// Commits subtree `sub` of `base` with a fixed timestamp, so a second commit
+/// of the same tree gives the same commit checksum.
 async fn commit_tree_stable(repo: &Repo, base: &Path, sub: &str) -> Checksum {
     let txn = repo.transaction().await.unwrap();
     let mut mtree = MutableTree::new();
@@ -514,11 +534,14 @@ async fn commit_tree_stable(repo: &Repo, base: &Path, sub: &str) -> Checksum {
 
 #[test]
 fn checkout_applies_logical_xattrs() {
-    // A bare-user repo copies (not hardlinks) under a faithful checkout, so this
-    // exercises the copy path's xattr application: a file committed with a
-    // `user.demo` xattr, checked out, and re-ingested, must reproduce its
-    // content checksum -- which is only possible if the xattr was applied to the
-    // destination inode and read back.
+    // Under a faithful checkout, a bare-user repository copies each file and
+    // makes no hardlink. This test covers the xattr application of the copy
+    // path.
+    //
+    // A file with a `user.demo` xattr goes through commit, checkout, and
+    // re-ingest. The re-ingest must give the same content checksum. This is
+    // possible only if the checkout applied the xattr to the destination inode
+    // and the re-ingest read it back.
     let tmp = TmpDir::new("co-xattr");
     let base = tmp.path();
     let repo_dir = base.join("repo");
@@ -570,8 +593,8 @@ fn checkout_applies_logical_xattrs() {
             .await
             .unwrap();
 
-        // Re-ingest the checked-out file: its content object identity, which
-        // covers the xattr set, must match the original.
+        // Re-ingest the checked-out file. Its content object identity covers
+        // the xattr set and must match the original.
         let txn = repo.transaction().await.unwrap();
         let mut mtree = MutableTree::new();
         let dfd = std::fs::File::open(base).unwrap();
@@ -593,11 +616,13 @@ fn checkout_applies_logical_xattrs() {
 
 #[test]
 fn checkout_applies_xattrs_to_read_only_entries() {
-    // A file and a directory whose logical modes carry no owner-write bit, each
-    // with a `user.*` xattr. The kernel checks a `user.*` xattr against the
-    // inode's write permission, so the xattrs are applied before the mode. The
-    // repository is archive, which stores the logical metadata in the object
-    // header and so holds entries of any mode.
+    // A file and a directory, each with a `user.*` xattr. Their logical modes
+    // have no owner-write bit. The kernel checks a `user.*` xattr against the
+    // write permission of the inode, so the checkout applies the xattrs before
+    // the mode.
+    //
+    // The repository is archive. Archive stores the logical metadata in the
+    // object header, so it holds entries of any mode.
     let tmp = TmpDir::new("co-readonly");
     let base = tmp.path();
     let repo_dir = base.join("repo");
@@ -654,19 +679,22 @@ fn checkout_applies_xattrs_to_read_only_entries() {
         assert_eq!(xattr_of(&dir, "user.dir"), b"d", "directory xattr");
         assert_eq!(xattr_of(&file, "user.demo"), b"value", "file xattr");
 
-        // The checked-out directory is read-only, which its own cleanup needs
-        // reversed.
+        // The checked-out directory is read-only. Its cleanup needs write
+        // permission, so the test resets the mode.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     });
 }
 
-/// A faithful checkout that writes a regular file keeps its logical
-/// `security.capability` value, for an owner that is the writer and for a
-/// foreign owner with a set-user-ID mode and a `user.*` xattr. The kernel
-/// removes `security.capability` when the owner of a regular file changes, so
-/// the checkout sets the xattrs after the owner. An archive repository always
-/// writes the file, and a bare repository writes it under `force_copy`.
-/// Setting the xattr and changing the owner need root.
+/// A faithful checkout that writes a regular file keeps the logical
+/// `security.capability` value of the file. The test covers two owners:
+///
+/// - an owner that is the writer
+/// - a foreign owner, with a set-user-ID mode and a `user.*` xattr
+///
+/// Because the kernel removes `security.capability` when the owner of a regular
+/// file changes, the checkout sets the xattrs after the owner. An archive
+/// repository always writes the file. A bare repository writes it under
+/// `force_copy`. The xattr and the change of owner need root.
 #[test]
 fn a_faithful_checkout_keeps_a_file_capability_as_root() {
     if !rustix::process::geteuid().is_root() {
@@ -684,7 +712,8 @@ fn a_faithful_checkout_keeps_a_file_capability_as_root() {
     let base = tmp.path();
     let (uid, gid) = self_owner(base);
     let cap_xattr = (b"security.capability\0".to_vec(), cap.clone());
-    // Each file: the name, the logical metadata, and whether it has user.demo.
+    // Each file: the name, the logical metadata, and `true` if it has
+    // `user.demo`.
     let files = [
         (
             "cap.bin",
@@ -782,10 +811,10 @@ fn a_faithful_checkout_keeps_a_file_capability_as_root() {
 }
 
 /// A [`User`](CheckoutMode::User) checkout writes a regular file at
-/// `mode & 0o1777`: the setuid and setgid bits go, the sticky bit stays. A
-/// directory keeps all three. This is the tool's own rule for the file it writes
-/// (`docs/format-reference.md`, "Checkout"), and `force_copy` is what makes the
-/// checkout write every file rather than hardlink some of them.
+/// `mode & 0o1777`: the setuid and setgid bits go, and the sticky bit stays. A
+/// directory keeps all three bits. The `ostree` command applies the same rule
+/// to the files that it writes. `force_copy` makes the checkout write each file
+/// with no hardlink.
 #[test]
 fn a_user_mode_checkout_keeps_the_sticky_bit_of_a_written_file() {
     let tmp = TmpDir::new("co-user-bits");
@@ -794,8 +823,8 @@ fn a_user_mode_checkout_keeps_the_sticky_bit_of_a_written_file() {
     std::fs::create_dir_all(&src).unwrap();
 
     let files = [0o1644u32, 0o1755, 0o2755, 0o4755, 0o6755, 0o7755];
-    // A source directory the walk must descend into keeps its owner execute bit,
-    // so the directory cases are the searchable renderings of the same bits.
+    // A source directory that the walk must enter keeps its owner execute bit,
+    // so the directory cases are the searchable forms of the same bits.
     let dirs = [0o1755u32, 0o2755, 0o4755, 0o6755, 0o7755, 0o1777];
     for mode in files {
         let file = src.join(format!("f{mode:04o}"));
@@ -808,8 +837,8 @@ fn a_user_mode_checkout_keeps_the_sticky_bit_of_a_written_file() {
         set_mode(&dir, mode);
     }
 
-    // Every mode this rule reduces, in the mode the reduction keeps: the sticky
-    // bit and the permission bits survive, setuid and setgid do not.
+    // The mode that the rule keeps for each file mode: the sticky bit and the
+    // permission bits stay, and the setuid and setgid bits go.
     let expected = |mode: u32| mode & 0o1777;
 
     for repo_mode in [RepoMode::Archive, RepoMode::Bare, RepoMode::BareUser] {
@@ -847,12 +876,12 @@ fn a_user_mode_checkout_keeps_the_sticky_bit_of_a_written_file() {
     }
 }
 
-/// The permission bits of a checked-out path.
+/// Returns the permission bits of a checked-out path.
 fn mode_of(path: &Path) -> u32 {
     std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
 }
 
-/// The value of a checked-out path's named xattr.
+/// Returns the value of the named xattr of a checked-out path.
 fn xattr_of(path: &Path, name: &str) -> Vec<u8> {
     let mut buf = [0u8; 256];
     let n = rustix::fs::getxattr(path, name, &mut buf)
@@ -864,10 +893,10 @@ fn xattr_of(path: &Path, name: &str) -> Vec<u8> {
 
 #[test]
 fn force_copy_makes_an_independent_copy() {
-    // A bare repo hardlinks under a faithful checkout; force_copy suppresses the
-    // hardlink, so the destination is a fresh inode with byte-identical content.
-    // The copy path attempts a FICLONE reflink and falls back cleanly to a byte
-    // copy where the filesystem refuses it; either way the result is correct.
+    // A bare repository hardlinks under a faithful checkout. `force_copy` stops
+    // the hardlink, so the destination is a new inode with byte-identical
+    // content. The copy path tries a FICLONE reflink, and does a byte copy if
+    // the file system refuses the reflink. Both results are correct.
     let tmp = TmpDir::new("co-forcecopy");
     let base = tmp.path();
     let src = base.join("src");
@@ -1016,9 +1045,9 @@ fn whiteouts_processed_and_literal() {
     });
 }
 
-/// Create `name` under `dir` and `depth` nested directories below it, with one
-/// file at the bottom. The nesting is built through a moving directory
-/// descriptor, so no path longer than one component is ever formed.
+/// Creates `name` under `dir`, `depth` nested directories under it, and one
+/// file at the bottom. A moving directory descriptor builds the nesting, so the
+/// function never forms a path longer than one component.
 fn build_deep_dir(dir: &Path, name: &str, depth: usize) {
     use rustix::fs::{Mode, OFlags};
     std::fs::create_dir_all(dir.join(name)).unwrap();
@@ -1042,13 +1071,14 @@ fn build_deep_dir(dir: &Path, name: &str, depth: usize) {
     .unwrap();
 }
 
-/// A removal reaches a destination subtree of any depth. Both the per-name
-/// removal and the opaque clear take the same walk, which holds one directory
-/// descriptor and keeps its levels on the heap, so neither the process
-/// descriptor limit nor the thread stack bounds the depth it removes.
+/// A removal reaches a destination subtree of any depth. The per-name removal
+/// and the opaque clear use the same walk. The walk holds one directory
+/// descriptor and keeps its levels on the heap. As a result, neither the
+/// descriptor limit of the process nor the thread stack limits its depth.
 #[test]
 fn whiteouts_remove_a_deep_destination_subtree() {
-    /// Deep enough that a walk recursing on the native stack ends the process.
+    /// A depth at which a walk that recurses on the native stack ends the
+    /// process.
     const DEPTH: usize = 4000;
 
     let tmp = TmpDir::new("co-wh-deep");
@@ -1102,11 +1132,12 @@ fn whiteouts_remove_a_deep_destination_subtree() {
     });
 }
 
-/// The whiteout markers act on a regular-file entry alone. A symlink or a
-/// directory carrying a marker name is materialized verbatim and removes
-/// nothing, and the opaque marker's clear is decided by the name across the
-/// file-entry list, so a symlink so named clears the directory and is then
-/// materialized.
+/// The whiteout markers act on a regular-file entry only. A symlink or a
+/// directory with a marker name is materialized verbatim and removes nothing.
+///
+/// The clear of the opaque marker depends only on the name in the file-entry
+/// list, so a symlink with that name also clears the directory. The checkout
+/// then materializes the symlink.
 #[test]
 fn whiteout_markers_act_on_regular_files_only() {
     let tmp = TmpDir::new("co-wh-types");
@@ -1123,7 +1154,7 @@ fn whiteout_markers_act_on_regular_files_only() {
     std::fs::write(types.join(".ostree-wh.adir/c"), b"c\n").unwrap();
     std::fs::write(types.join("keep"), b"k\n").unwrap();
 
-    // A layer whose opaque marker is a symlink, which needs a tree of its own.
+    // A layer whose opaque marker is a symlink. It needs a tree of its own.
     let opq = base.join("opq");
     std::fs::create_dir_all(&opq).unwrap();
     symlink("nowhere", opq.join(".wh..wh..opq")).unwrap();
@@ -1137,7 +1168,7 @@ fn whiteout_markers_act_on_regular_files_only() {
         let opq_commit = commit_tree(&repo, base, "opq").await;
         let base_fd = std::fs::File::open(base).unwrap();
 
-        // The destination holds an entry at every marker's target name.
+        // The destination holds an entry at the target name of each marker.
         let dest = base.join("dest");
         std::fs::create_dir_all(dest.join("dirmarker")).unwrap();
         std::fs::write(dest.join("dirmarker/pre"), b"pre\n").unwrap();
@@ -1176,8 +1207,8 @@ fn whiteout_markers_act_on_regular_files_only() {
         assert!(dest.join(".wh.dirmarker/child").exists());
         assert!(dest.join(".ostree-wh.adir/c").exists());
 
-        // The opaque marker as a symlink: the directory is cleared and the
-        // symlink is then materialized.
+        // The opaque marker as a symlink: the checkout clears the directory and
+        // then materializes the symlink.
         let opq_dest = base.join("opq-dest");
         std::fs::create_dir_all(&opq_dest).unwrap();
         std::fs::write(opq_dest.join("pre"), b"pre\n").unwrap();
@@ -1203,11 +1234,12 @@ fn whiteout_markers_act_on_regular_files_only() {
     });
 }
 
-/// Outside [`CheckoutMode::User`] the whiteout device takes the marker's
-/// extended attributes, and the `user.` namespace is not permitted on a device
-/// node, so a marker carrying one ends the checkout. The attributes are applied
-/// ahead of the mode, so the device stands where it was created at the mode
-/// `mknod` gave it, which is the tool's own outcome for the same commit.
+/// Outside [`CheckoutMode::User`], the whiteout device gets the extended
+/// attributes of the marker. The `user.` namespace is not permitted on a device
+/// node, so a marker with such an attribute ends the checkout. The checkout
+/// applies the attributes before the mode, so the device stays at the mode
+/// that `mknod` gave it. The `ostree` command gives the same result for the
+/// same commit.
 #[test]
 fn passthrough_whiteout_xattrs_reach_the_device() {
     let tmp = TmpDir::new("co-wh-xattr");
@@ -1237,7 +1269,7 @@ fn passthrough_whiteout_xattrs_reach_the_device() {
         let repo = Repo::create(&repo_dir, CreateOptions::new(RepoMode::BareUser))
             .await
             .unwrap();
-        // The attributes have to reach the commit, so this one keeps them.
+        // The attributes must reach the commit, so this commit keeps them.
         let commit = {
             let txn = repo.transaction().await.unwrap();
             let mut mtree = MutableTree::new();
@@ -1255,8 +1287,9 @@ fn passthrough_whiteout_xattrs_reach_the_device() {
         };
         let base_fd = std::fs::File::open(base).unwrap();
 
-        // Under `User` the attributes are not applied, so the checkout finishes
-        // and the device carries the marker's bits less the umask.
+        // Under `User`, the checkout does not apply the attributes. The
+        // checkout completes, and the device has the bits of the marker minus
+        // the umask.
         let mut opts = CheckoutOptions::new(CheckoutMode::User);
         opts.process_passthrough_whiteouts = true;
         repo.checkout_at(&mut opts, base_fd.as_fd(), Path::new("user"), &commit)
@@ -1276,8 +1309,8 @@ fn passthrough_whiteout_xattrs_reach_the_device() {
             "the umask masks no setuid bit, so `mknod` keeps it",
         );
 
-        // Outside it the attribute is applied and refused, and the device is
-        // left at the recorded mode.
+        // Outside `User`, the checkout applies the attribute and the kernel
+        // refuses it. The device stays at the recorded mode.
         let mut opts = CheckoutOptions::new(CheckoutMode::None);
         opts.process_passthrough_whiteouts = true;
         let err = repo
@@ -1299,7 +1332,7 @@ fn passthrough_whiteout_xattrs_reach_the_device() {
             "xdev carries no bit the marker does not record",
         );
 
-        // The tool reaches the same status and leaves the same device.
+        // The `ostree` command gets the same status and leaves the same device.
         if !ostree_available() {
             return;
         }
@@ -1328,16 +1361,16 @@ fn passthrough_whiteout_xattrs_reach_the_device() {
     });
 }
 
-/// A marker naming no entry is refused, each refusal gated by its own switch
-/// and by the entry's type.
+/// A marker that names no entry is refused. The switch of the marker and the
+/// type of the entry control each refusal.
 #[test]
 fn whiteout_empty_names_are_refused() {
     let tmp = TmpDir::new("co-wh-empty");
     let base = tmp.path();
     let repo_dir = base.join("repo");
 
-    // One tree per marker, so a run under one switch alone states that switch's
-    // own refusal and the other marker's materialization.
+    // One tree for each marker, so a run under one switch alone shows the
+    // refusal of that switch and the materialization of the other marker.
     let wh = base.join("wh");
     std::fs::create_dir_all(&wh).unwrap();
     std::fs::write(wh.join(".wh."), b"a\n").unwrap();
@@ -1384,7 +1417,7 @@ fn whiteout_empty_names_are_refused() {
                 }
             }
 
-            // A symlink so named is materialized under every switch.
+            // A symlink with a marker name is materialized under each switch.
             let name = format!("links-{case}");
             let mut opts = CheckoutOptions::new(CheckoutMode::User);
             opts.process_whiteouts = whiteouts;
@@ -1406,9 +1439,9 @@ fn whiteout_empty_names_are_refused() {
     });
 }
 
-/// A passthrough marker becomes a character device 0:0 at the marker's target
-/// name, carrying the marker's permission bits, and is not materialized under
-/// its own name.
+/// A passthrough marker becomes a character device 0:0 at the target name of
+/// the marker, with the permission bits of the marker. The checkout does not
+/// materialize the marker under its own name.
 #[test]
 fn passthrough_whiteouts_write_char_devices() {
     let tmp = TmpDir::new("co-wh-passthrough");
@@ -1435,11 +1468,11 @@ fn passthrough_whiteouts_write_char_devices() {
         let commit = commit_tree(&repo, base, "src").await;
         let base_fd = std::fs::File::open(base).unwrap();
 
-        // The permission bits reach `mknod`, where the process umask reduces
-        // them, so the absolute mode claim is made under `CheckoutMode::None`,
-        // which applies the recorded mode after the device is created. Under
-        // `CheckoutMode::User` the bits the device carries are those the
-        // marker records less whatever the umask takes.
+        // The permission bits go to `mknod`, and the process umask reduces
+        // them there. `CheckoutMode::None` applies the recorded mode after it
+        // creates the device, so the test checks the exact mode under it. Under
+        // `CheckoutMode::User`, the device has the bits that the marker records
+        // minus the bits that the umask removes.
         for (case, mode) in [
             ("user", CheckoutMode::User),
             ("faithful", CheckoutMode::None),
@@ -1480,7 +1513,7 @@ fn passthrough_whiteouts_write_char_devices() {
             assert_eq!(std::fs::read(dest.join("keep")).unwrap(), b"k\n");
         }
 
-        // With the switch off the marker is an ordinary file.
+        // If the switch is off, the marker is an ordinary file.
         let mut opts = CheckoutOptions::new(CheckoutMode::User);
         repo.checkout_at(&mut opts, base_fd.as_fd(), Path::new("literal"), &commit)
             .await
@@ -1492,9 +1525,9 @@ fn passthrough_whiteouts_write_char_devices() {
         );
         assert!(!literal.join("m644").exists());
 
-        // The destination disposition per overwrite mode: `UnionFiles` replaces
-        // an existing entry and refuses a directory, and `AddFiles` and
-        // `UnionIdentical` keep an existing entry of any type with no
+        // The result at the destination for each overwrite mode. `UnionFiles`
+        // replaces an existing entry and refuses a directory. `AddFiles` and
+        // `UnionIdentical` keep an existing entry of any type and do no
         // comparison.
         for (overwrite, replaced, dir_refused) in [
             (ostrya::OverwriteMode::UnionFiles, true, true),
@@ -1565,7 +1598,8 @@ fn overwrite_modes() {
         let commit_b = commit_tree(&repo, base, "b").await;
         let base_fd = std::fs::File::open(base).unwrap();
 
-        // UnionFiles: overwrite existing files, keep others, add new.
+        // UnionFiles: replaces existing files, keeps the others, and adds new
+        // files.
         checkout_none(&repo, base_fd.as_fd(), "union", &commit_a).await;
         let mut opts = CheckoutOptions::new(CheckoutMode::None);
         opts.overwrite = ostrya::OverwriteMode::UnionFiles;
@@ -1578,7 +1612,7 @@ fn overwrite_modes() {
         assert_eq!(std::fs::read(union.join("aonly.txt")).unwrap(), b"A\n");
         assert_eq!(std::fs::read(union.join("bonly.txt")).unwrap(), b"B\n");
 
-        // AddFiles: keep existing, only add new.
+        // AddFiles: keeps existing files and adds only new files.
         checkout_none(&repo, base_fd.as_fd(), "add", &commit_a).await;
         let mut opts = CheckoutOptions::new(CheckoutMode::None);
         opts.overwrite = ostrya::OverwriteMode::AddFiles;
@@ -1606,8 +1640,8 @@ fn overwrite_modes() {
             "union-identical over a differing file is a conflict, got {err:?}"
         );
 
-        // UnionIdentical over an identical tree succeeds (the objects are the
-        // same inodes the base checkout hardlinked).
+        // UnionIdentical over an identical tree succeeds. The objects are the
+        // same inodes that the base checkout hardlinked.
         let mut opts = CheckoutOptions::new(CheckoutMode::None);
         opts.overwrite = ostrya::OverwriteMode::UnionIdentical;
         opts.require_hardlinks = true;
@@ -1617,13 +1651,14 @@ fn overwrite_modes() {
     });
 }
 
-/// union-identical establishes identity by the object inode, so the tool takes
-/// it only together with `--require-hardlinks`. The library reads that as a
-/// requirement over the options alone: the pair is refused before any I/O, and
-/// which repository mode and checkout mode can hardlink is carried by the
-/// per-entry `require_hardlinks` refusal. A tree holding no entry that needs a
-/// copy is therefore written whole in a mode that copies, which is the tool's
-/// own outcome.
+/// union-identical decides identity by the object inode, so the `ostree`
+/// command accepts the option only with `--require-hardlinks`. ostrya checks
+/// this rule on the options alone, before any I/O.
+///
+/// The per-entry `require_hardlinks` refusal decides which repository mode and
+/// checkout mode can hardlink. If a tree has no entry that needs a copy, a
+/// checkout in a mode that copies writes the whole tree. The `ostree` command
+/// gives the same result.
 #[test]
 fn union_identical_requires_require_hardlinks() {
     let tmp = TmpDir::new("co-ui-guard");
@@ -1642,7 +1677,7 @@ fn union_identical_requires_require_hardlinks() {
         let dir_commit = commit_tree(&repo, base, "dirs").await;
         let base_fd = std::fs::File::open(base).unwrap();
 
-        // Without `require_hardlinks` the option is refused before any I/O.
+        // Without `require_hardlinks`, the option is refused before any I/O.
         let mut opts = CheckoutOptions::new(CheckoutMode::None);
         opts.overwrite = ostrya::OverwriteMode::UnionIdentical;
         let err = repo
@@ -1657,8 +1692,8 @@ fn union_identical_requires_require_hardlinks() {
             "the destination is not created when union-identical is refused"
         );
 
-        // With it, a tree carrying a regular file is refused at that entry,
-        // `archive` giving a copy of it.
+        // With it, a tree with a regular file is refused at that entry, because
+        // `archive` gives a copy of it.
         let mut opts = CheckoutOptions::new(CheckoutMode::None);
         opts.overwrite = ostrya::OverwriteMode::UnionIdentical;
         opts.require_hardlinks = true;
@@ -1671,7 +1706,7 @@ fn union_identical_requires_require_hardlinks() {
         );
 
         // A tree of directories alone reaches no such entry, so the same
-        // options write it whole.
+        // options write it in full.
         let mut opts = CheckoutOptions::new(CheckoutMode::None);
         opts.overwrite = ostrya::OverwriteMode::UnionIdentical;
         opts.require_hardlinks = true;
@@ -1710,12 +1745,17 @@ fn union_identical_requires_require_hardlinks() {
     });
 }
 
-/// The per-entry `require_hardlinks` refusal, over the shapes the tool's own
-/// table separates: a directory and a zero-length regular file are written in
-/// every mode, a regular file of non-zero length is refused wherever the
-/// repository mode and the checkout mode give a copy, and a symlink follows a
-/// table of its own (`format-reference.md`, "Checkout"). A refusal part-way
-/// through a walk leaves the entries already written.
+/// The per-entry `require_hardlinks` refusal, on the shapes that the table of
+/// the `ostree` command separates:
+///
+/// - A directory and a zero-length regular file are written in each mode.
+/// - A regular file of non-zero length is refused in each pair of repository
+///   mode and checkout mode that gives a copy.
+/// - A symlink has a table of its own: `archive` refuses it in both checkout
+///   modes, and `bare` refuses it under a user checkout.
+///
+/// A refusal in the middle of a walk keeps the entries that the walk already
+/// wrote.
 #[test]
 fn require_hardlinks_refuses_at_the_entry() {
     let tmp = TmpDir::new("co-require-entry");
@@ -1745,7 +1785,7 @@ fn require_hardlinks_refuses_at_the_entry() {
             )
             .await
             .unwrap();
-            // Each shape is committed once per repository mode; the two
+            // Each shape gets one commit in each repository mode. The two
             // checkout modes read the same four commits.
             let shapes: [(&str, Checksum); 4] = [
                 ("t_dir", commit_tree(&repo, base, "t_dir").await),
@@ -1788,8 +1828,8 @@ fn require_hardlinks_refuses_at_the_entry() {
                     }
                 }
 
-                // The switch off refuses nothing: the same shapes are written
-                // in the same cells with `require_hardlinks` clear.
+                // With the switch off, nothing is refused: the same shapes are
+                // written in the same cells with `require_hardlinks` clear.
                 for (tree, commit) in &shapes {
                     let dest = format!("free-{mode_name}-{}-{tree}", u8::from(user));
                     let mut opts = CheckoutOptions::new(checkout_mode);
@@ -1803,9 +1843,9 @@ fn require_hardlinks_refuses_at_the_entry() {
             }
         }
 
-        // The refusal is raised where the entry is materialized, so the entries
-        // the walk already wrote stay. `bare` under a user checkout takes the
-        // zero-length file and refuses the symlink beside it.
+        // The refusal occurs where the entry is materialized, so the entries
+        // that the walk already wrote stay. `bare` under a user checkout writes
+        // the zero-length file and refuses the symlink next to it.
         let repo = Repo::open(&base.join("repo-bare")).await.unwrap();
         let commit = commit_tree(&repo, base, "t_order").await;
         let mut opts = CheckoutOptions::new(CheckoutMode::User);
@@ -1824,7 +1864,7 @@ fn require_hardlinks_refuses_at_the_entry() {
 
 // --- union-identical: what the option calls identical ---------------------
 
-/// A source tree holding one regular file `f` of `content` at `perm`.
+/// Builds a source tree with one regular file `f` of `content` at `perm`.
 fn build_one_file(dir: &Path, content: &[u8], perm: u32) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("f"), content).unwrap();
@@ -1832,8 +1872,8 @@ fn build_one_file(dir: &Path, content: &[u8], perm: u32) {
     set_mode(dir, 0o755);
 }
 
-/// The permission bits of the one loose content object a fixture repository
-/// holds.
+/// Returns the permission bits of the one loose content object in a fixture
+/// repository.
 fn only_loose_object_perm(repo_dir: &Path) -> u32 {
     let mut found = Vec::new();
     for shard in std::fs::read_dir(repo_dir.join("objects")).unwrap() {
@@ -1856,7 +1896,7 @@ fn only_loose_object_perm(repo_dir: &Path) -> u32 {
         & 0o7777
 }
 
-/// Check `commit` out over `dest` under [`OverwriteMode::UnionIdentical`].
+/// Checks out `commit` over `dest` under [`OverwriteMode::UnionIdentical`].
 async fn union_identical_checkout(
     repo: &Repo,
     mode: CheckoutMode,
@@ -1871,10 +1911,10 @@ async fn union_identical_checkout(
         .await
 }
 
-/// A destination file the checkout would put there, built by hand so it carries
-/// its own inode, is kept: the file-object checksum computed from it equals the
-/// object's and its permission bits equal the loose object inode's, which is the
-/// rule `format-reference.md`, "Checkout" records.
+/// The checkout keeps a destination file that is equal to the file that it
+/// writes. The test makes the file by hand, so the file has its own inode. The
+/// file-object checksum of the file equals the checksum of the object. The
+/// permission bits of the file equal those of the loose object inode.
 #[test]
 fn union_identical_keeps_a_byte_identical_copy() {
     let tmp = TmpDir::new("co-ui-identical");
@@ -1905,8 +1945,8 @@ fn union_identical_keeps_a_byte_identical_copy() {
     });
 }
 
-/// The permission bits are part of the comparison: the same content at another
-/// mode is not what the checkout would put there.
+/// The comparison includes the permission bits: the same content at a
+/// different mode is not equal to the file that the checkout writes.
 #[test]
 fn union_identical_refuses_a_differing_mode() {
     let tmp = TmpDir::new("co-ui-mode");
@@ -1944,8 +1984,8 @@ fn union_identical_refuses_a_differing_mode() {
     });
 }
 
-/// The extended-attribute set is part of the comparison: one attribute the
-/// object does not carry makes the entry differ.
+/// The comparison includes the extended-attribute set: one attribute that the
+/// object does not have makes the entry differ.
 #[test]
 fn union_identical_refuses_an_extra_xattr() {
     let tmp = TmpDir::new("co-ui-xattr");
@@ -1970,8 +2010,8 @@ fn union_identical_refuses_an_extra_xattr() {
             rustix::fs::XattrFlags::empty(),
         );
         if set.is_err() {
-            // The filesystem under the temporary directory carries no user
-            // extended attributes, so the case has nothing to state here.
+            // The file system under the temporary directory has no user
+            // extended attributes, so this case has nothing to check here.
             eprintln!("skipped: the temporary filesystem takes no user xattr");
             return;
         }
@@ -1986,8 +2026,8 @@ fn union_identical_refuses_an_extra_xattr() {
     });
 }
 
-/// The modification time is outside the comparison: a destination stamped in the
-/// past is still what the checkout would put there.
+/// The comparison excludes the modification time: a destination with a past
+/// timestamp is still equal to the file that the checkout writes.
 #[test]
 fn union_identical_ignores_the_modification_time() {
     let tmp = TmpDir::new("co-ui-mtime");
@@ -2071,12 +2111,14 @@ fn union_identical_compares_a_symlink_by_target() {
     });
 }
 
-/// The second conjunct of the identity rule: the destination's permission bits
-/// are compared against the loose object inode's, not against the object's
-/// logical mode. A `bare-user` object whose logical mode carries a bit the inode
-/// rule `(logical_perm & 0o775) | 0o400` drops is identical to no destination at
-/// all, where the same object in `bare` is identical to a destination of its own
-/// mode.
+/// The second condition of the identity rule: the checkout compares the
+/// permission bits of the destination with those of the loose object inode.
+/// The logical mode of the object is not part of this comparison.
+///
+/// The `bare-user` inode rule `(logical_perm & 0o775) | 0o400` drops some bits.
+/// If the logical mode of a `bare-user` object has such a bit, no destination
+/// is identical to the object. In `bare`, the same object is identical to a
+/// destination at its own mode.
 #[test]
 fn union_identical_refuses_a_mode_the_loose_inode_cannot_carry() {
     let tmp = TmpDir::new("co-ui-inode-mode");
@@ -2087,7 +2129,7 @@ fn union_identical_refuses_a_mode_the_loose_inode_cannot_carry() {
         let base_fd = std::fs::File::open(base).unwrap();
 
         // `bare-user` stores the object inode at 0775 for a logical 0777, so no
-        // destination mode satisfies both conjuncts.
+        // destination mode satisfies both conditions.
         let repo = Repo::create(
             &base.join("repo-bare-user"),
             CreateOptions::new(RepoMode::BareUser),
@@ -2143,17 +2185,18 @@ fn union_identical_refuses_a_mode_the_loose_inode_cannot_carry() {
 
 // --- type conflict -------------------------------------------------------
 
-/// A destination name held by a file when the commit carries a directory of
-/// that name is a conflict in every mode: the checkout errors rather than
-/// replacing the entry, and the file is left in place. (The `ostree` tool errors
-/// here too, with `opendir(<name>): Not a directory`.)
+/// A file at a destination name where the commit has a directory is a conflict
+/// in each mode. The checkout returns an error, and the file stays in place.
+/// The `ostree` command also fails here, with
+/// `opendir(<name>): Not a directory`.
 #[test]
 fn file_where_commit_has_directory_is_a_conflict() {
     let tmp = TmpDir::new("co-typeconflict");
     let base = tmp.path();
     let repo_dir = base.join("repo");
 
-    // A tree whose `clash` is a regular file, plus a file to survive the merge.
+    // A tree whose `clash` is a regular file, and a file that stays after the
+    // merge.
     let cf = base.join("cf");
     std::fs::create_dir_all(&cf).unwrap();
     std::fs::write(cf.join("clash"), b"i am a file\n").unwrap();
@@ -2172,8 +2215,8 @@ fn file_where_commit_has_directory_is_a_conflict() {
         let commit_dir = commit_tree(&repo, base, "cd").await;
         let base_fd = std::fs::File::open(base).unwrap();
 
-        // The union modes reach the conflict at a nested child: the top-level
-        // destination is reused, then `clash` collides.
+        // The union modes reach the conflict at a nested child: the checkout
+        // uses the top-level destination again, and then `clash` collides.
         for mode in [
             ostrya::OverwriteMode::UnionFiles,
             ostrya::OverwriteMode::AddFiles,
@@ -2204,8 +2247,9 @@ fn file_where_commit_has_directory_is_a_conflict() {
             assert_eq!(std::fs::read(&clash).unwrap(), b"i am a file\n");
         }
 
-        // Default (None) reaches the same guard at the destination root: a plain
-        // file where the checkout would otherwise create the root directory.
+        // The default mode (None) reaches the same guard at the destination
+        // root: a plain file is where the checkout must create the root
+        // directory.
         std::fs::write(base.join("none_clash"), b"i am a file\n").unwrap();
         let mut opts = CheckoutOptions::new(CheckoutMode::None);
         let err = repo
@@ -2224,11 +2268,12 @@ fn file_where_commit_has_directory_is_a_conflict() {
     });
 }
 
-/// A destination directory when the commit carries a file of that name is a
-/// conflict under union-files and union-identical (the directory is left in
-/// place), while add-files keeps the directory and writes nothing for that name.
-/// (Matches `ostree` 2026.1: union-files errors with `renameat(...): Is a
-/// directory`, union-identical errors, add-files keeps the directory.)
+/// A directory at a destination name where the commit has a file is a conflict
+/// under union-files and union-identical, and the directory stays in place.
+/// Under add-files, the checkout keeps the directory and writes nothing for
+/// that name. This agrees with `ostree` 2026.1: union-files fails with
+/// `renameat(...): Is a directory`, union-identical fails, and add-files keeps
+/// the directory.
 #[test]
 fn directory_where_commit_has_file_follows_the_tool() {
     let tmp = TmpDir::new("co-dirfile");
@@ -2254,7 +2299,7 @@ fn directory_where_commit_has_file_follows_the_tool() {
         let commit_file = commit_tree(&repo, base, "cf").await;
         let base_fd = std::fs::File::open(base).unwrap();
 
-        // union-files and union-identical: a conflict; the directory stays.
+        // union-files and union-identical: a conflict. The directory stays.
         for mode in [
             ostrya::OverwriteMode::UnionFiles,
             ostrya::OverwriteMode::UnionIdentical,
@@ -2315,7 +2360,7 @@ fn subpath_directory_and_file() {
         let base_fd = std::fs::File::open(base).unwrap();
 
         // A subpath to a directory: the subtree becomes the destination root,
-        // and the root takes the subdir's dirmeta (mode 0750).
+        // and the root gets the dirmeta of the subdir (mode 0750).
         let mut opts = CheckoutOptions::new(CheckoutMode::None);
         opts.subpath = Some(PathBuf::from("subdir"));
         repo.checkout_at(&mut opts, base_fd.as_fd(), Path::new("sub"), &commit)
@@ -2349,8 +2394,8 @@ fn subpath_directory_and_file() {
             .await;
         assert!(matches!(err, Err(ostrya::Error::SubpathNotFound(_))));
 
-        // A subpath running through an entry that is not a directory carries
-        // the other refusal, which is the split `--allow-noent` acts on.
+        // A subpath through an entry that is not a directory gives the other
+        // refusal. `--allow-noent` acts on the split between the two refusals.
         let mut opts = CheckoutOptions::new(CheckoutMode::None);
         opts.subpath = Some(PathBuf::from("hello.txt/deeper"));
         let err = repo
@@ -2358,9 +2403,9 @@ fn subpath_directory_and_file() {
             .await;
         assert!(matches!(err, Err(ostrya::Error::SubpathNotADirectory(_))));
 
-        // A `..` followed by a name the directory before the `..` holds as a
-        // file. No directory holds an entry named `..`, so the walk stops at
-        // the `..` and the value carries the absent-subpath refusal.
+        // A `..` followed by a name that the directory before the `..` holds as
+        // a file. No directory holds an entry named `..`, so the walk stops at
+        // the `..` and the value gets the absent-subpath refusal.
         let mut opts = CheckoutOptions::new(CheckoutMode::None);
         opts.subpath = Some(PathBuf::from("subdir/../nested.txt/x"));
         let err = repo
@@ -2409,8 +2454,8 @@ fn filter_prunes_a_subtree() {
     });
 }
 
-/// A filter that records every `(path, mode)` it is offered and answers the
-/// verdict `skip` gives for the path.
+/// Returns a filter that records each `(path, mode)` that it gets and returns
+/// the verdict of `skip` for the path.
 fn recording_filter(
     calls: &Arc<Mutex<Vec<(String, u32)>>>,
     skip: fn(&str) -> bool,
@@ -2428,8 +2473,8 @@ fn recording_filter(
     })
 }
 
-/// The checkout root is offered to the filter as `/`, carrying the root
-/// dirmeta's own mode, and every entry below it is offered under its own path.
+/// The filter gets the checkout root as `/`, with the mode of the root
+/// dirmeta. The filter gets each entry under the root at its own path.
 #[test]
 fn checkout_filter_sees_the_destination_root() {
     let tmp = TmpDir::new("co-filter-root");
@@ -2472,9 +2517,8 @@ fn checkout_filter_sees_the_destination_root() {
     });
 }
 
-/// A `Skip` on the root writes nothing and creates no destination, and over an
-/// existing destination under a union mode it leaves that destination as it
-/// stands.
+/// A `Skip` on the root writes nothing and creates no destination. Under a
+/// union mode, it leaves an existing destination unchanged.
 #[test]
 fn checkout_filter_skipping_the_root_creates_no_destination() {
     let tmp = TmpDir::new("co-filter-root-skip");
@@ -2524,9 +2568,10 @@ fn checkout_filter_skipping_the_root_creates_no_destination() {
     });
 }
 
-/// The filter decides a file entry ahead of the whiteout verdict, so a `Skip`
-/// on a marker's own path performs no removal and writes no device. The opaque
-/// marker's clear is the directory walk's own pre-pass and is not filtered.
+/// The filter decides a file entry before the whiteout decision, so a `Skip` on
+/// the path of a marker removes nothing and writes no device. The clear of the
+/// opaque marker is a pre-pass of the directory walk, and the filter does not
+/// apply to it.
 #[test]
 fn checkout_filter_runs_ahead_of_the_whiteout_decision() {
     let tmp = TmpDir::new("co-filter-whiteout");
@@ -2540,7 +2585,7 @@ fn checkout_filter_runs_ahead_of_the_whiteout_decision() {
     std::fs::write(layer.join("sub/child.txt"), b"child\n").unwrap();
     let repo_dir = base.join("repo");
 
-    /// Build the destination each arm runs over.
+    /// Builds the destination that each arm runs over.
     fn prestate(dest: &Path) {
         std::fs::create_dir_all(dest.join("sub")).unwrap();
         std::fs::write(dest.join("gone.txt"), b"old\n").unwrap();
@@ -2577,7 +2622,7 @@ fn checkout_filter_runs_ahead_of_the_whiteout_decision() {
             "the passthrough marker wrote a character device"
         );
 
-        // The filtered arm: each marker's own path is pruned.
+        // The filtered arm: the filter prunes the path of each marker.
         let filtered = base.join("filtered");
         prestate(&filtered);
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -2621,7 +2666,8 @@ fn checkout_filter_runs_ahead_of_the_whiteout_decision() {
     });
 }
 
-/// The single object a file subpath names is written without a filter call.
+/// The checkout writes the single object that a file subpath names with no
+/// filter call.
 #[test]
 fn checkout_filter_does_not_reach_a_file_subpath_target() {
     let tmp = TmpDir::new("co-filter-file-subpath");
@@ -2705,8 +2751,9 @@ fn checkout_rejects_a_partial_commit() {
         let commit = commit_tree(&repo, base, "src").await;
         let base_fd = std::fs::File::open(base).unwrap();
 
-        // A `.commitpartial` marker makes the commit report as partial. Checkout
-        // rejects it up front instead of failing on the first missing object.
+        // A `.commitpartial` marker makes the commit report as partial. The
+        // checkout refuses the commit at the start, before it reaches a missing
+        // object.
         std::fs::create_dir_all(repo_dir.join("state")).unwrap();
         std::fs::write(
             repo_dir.join(format!("state/{}.commitpartial", commit.to_hex())),
@@ -2731,8 +2778,9 @@ fn checkout_rejects_a_partial_commit() {
 
 // --- shared commit helper ------------------------------------------------
 
-/// Commit the subtree `sub` of `base` into `repo`, returning the commit
-/// checksum. Ownership and modes are preserved; xattrs are skipped.
+/// Commits the subtree `sub` of `base` into `repo` and returns the commit
+/// checksum. The commit keeps the ownership and the modes, and skips the
+/// xattrs.
 async fn commit_tree(repo: &Repo, base: &Path, sub: &str) -> Checksum {
     let txn = repo.transaction().await.unwrap();
     let mut mtree = MutableTree::new();
@@ -2750,7 +2798,7 @@ async fn commit_tree(repo: &Repo, base: &Path, sub: &str) -> Checksum {
     commit
 }
 
-/// Faithfully check `commit` out to `dest` under `base_fd`.
+/// Checks out `commit` to `dest` under `base_fd` with a faithful checkout.
 async fn checkout_none(
     repo: &Repo,
     base_fd: std::os::fd::BorrowedFd<'_>,
@@ -2763,7 +2811,7 @@ async fn checkout_none(
         .unwrap();
 }
 
-/// The public checkout types move across threads.
+/// A compile-time check that the public checkout types move across threads.
 const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<CheckoutOptions>();

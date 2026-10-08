@@ -1,20 +1,9 @@
 //! The address a pull from a remote reads, and the options each transport
 //! takes.
 //!
-//! The address comes from [`PullOptions::url`], then from the remote key
-//! `pull-url`, then from the remote key `url`. A value that starts with
-//! `ssh://`, or that holds no `://`, is an ssh address, parsed by
-//! [`PushRemote::parse`]. Any other value goes to the HTTP fetcher as
-//! written, so the fetcher gives its own refusal of a scheme it does not
-//! fetch. An ssh address in `url` is refused: the tool reads `url` too, and
-//! it does not pull over ssh.
-//!
-//! A pull over ssh takes its ssh command and its send command from the
-//! remote keys `ssh-command` and `send-command`, each only where the caller
-//! leaves the field of [`PullOptions::connect`] `None`, as a push takes them.
-//! It refuses a field of [`PullOptions`] that applies to HTTP alone, and it
-//! reads no remote key of HTTP alone: `contenturl`, `metalink`, `proxy`, and
-//! the `tls-*` keys.
+//! `Repo::pull` states the rules of the address and of the options of each
+//! transport. A pull refuses an ssh address in `url` because the `ostree`
+//! command reads `url` too, and it does not pull over ssh.
 
 use crate::config::Remote;
 use crate::error::{Error, Result};
@@ -22,7 +11,7 @@ use crate::push::{self, PullConnectOptions, PushRemote};
 
 use super::PullOptions;
 
-/// Where a pull reads the remote.
+/// The address where a pull reads the remote.
 #[derive(Debug)]
 pub(super) enum PullAddress {
     /// The base URL of an HTTP remote, as written.
@@ -31,20 +20,25 @@ pub(super) enum PullAddress {
     Ssh(SshAddress),
 }
 
-/// An ssh address, parsed, and as written.
+/// An ssh address in its parsed form and in its written form.
 #[derive(Debug)]
 pub(super) struct SshAddress {
     pub(super) remote: PushRemote,
     pub(super) written: String,
 }
 
-/// The address of a pull of `remote`, whose section of the config is
-/// `section`, with `url` as the address of the caller.
+/// Returns the address of a pull of `remote`, with `section` as its config
+/// section and `url` as the address of the caller.
 ///
-/// A malformed ssh address in `url` or in `pull-url` is
-/// [`Error::InvalidInput`] with the text of the parser. A remote with no
-/// section and no `url` of the caller, a section with neither `pull-url` nor
-/// `url`, and an ssh address in `url` are [`Error::Pull`].
+/// # Errors
+///
+/// - [`Error::InvalidInput`] with the text of the parser if the ssh address
+///   of the caller or of `pull-url` is malformed.
+/// - [`Error::Pull`] if there is no section and the caller gives no `url`.
+/// - [`Error::Pull`] if the section has neither `pull-url` nor `url`.
+/// - [`Error::Pull`] if the key `url` holds an ssh address.
+/// - [`Error::Core`] if `pull-url` or `url` holds a malformed escape
+///   sequence.
 pub(super) fn resolve_pull_address(
     section: Option<&Remote<'_>>,
     remote: &str,
@@ -70,11 +64,18 @@ pub(super) fn resolve_pull_address(
     }
 }
 
-/// `connect` with the remote keys of `section` in the fields it leaves
-/// `None`: `ssh-command` fills
-/// [`remote_ssh_command`](PullConnectOptions::remote_ssh_command), and
-/// `send-command` fills [`send_command`](PullConnectOptions::send_command).
-/// No section leaves `connect` as it is.
+/// Returns `connect` with the remote keys of `section` in the fields that it
+/// leaves `None`.
+///
+/// The key `ssh-command` fills
+/// [`remote_ssh_command`](PullConnectOptions::remote_ssh_command), and the key
+/// `send-command` fills [`send_command`](PullConnectOptions::send_command). If
+/// `section` is `None`, the function returns `connect` with no change.
+///
+/// # Errors
+///
+/// - [`Error::Core`] if `ssh-command` or `send-command` holds a malformed
+///   escape sequence.
 pub(super) fn fill_pull_connect(
     section: Option<&Remote<'_>>,
     mut connect: PullConnectOptions,
@@ -91,9 +92,16 @@ pub(super) fn fill_pull_connect(
     Ok(connect)
 }
 
-/// Refuse a field of `opts` that applies to a pull over HTTP alone, for a
-/// pull from the ssh address `address`. A retry count of 0 is accepted: a
-/// pull over ssh never sends a request again.
+/// Checks that `opts` sets no field of an HTTP pull alone, for a pull from
+/// the ssh address `address`.
+///
+/// The function accepts a retry count of 0, because a pull over ssh never
+/// sends a request again.
+///
+/// # Errors
+///
+/// - [`Error::InvalidInput`] if `opts` sets a field of an HTTP pull alone.
+///   The message names the option of the first field that is set.
 pub(super) fn refuse_http_fields(opts: &PullOptions, address: &SshAddress) -> Result<()> {
     // Each name is the option of `ostrya pull` that sets the field.
     let set = [
@@ -117,19 +125,26 @@ pub(super) fn refuse_http_fields(opts: &PullOptions, address: &SshAddress) -> Re
     }
 }
 
-/// Whether `value` is read as an ssh address: it starts with `ssh://`, or it
-/// holds no `://`.
+/// Returns `true` if a pull reads `value` as an ssh address: it starts with
+/// `ssh://`, or it holds no `://`.
 fn is_ssh(value: &str) -> bool {
     value.starts_with("ssh://") || !value.contains("://")
 }
 
-/// Whether `value`, which [`is_ssh`] holds for, is an ssh address in `url`:
-/// an `ssh://` value, or a value that the parser accepts.
+/// Returns `true` if `value` in the key `url` is an ssh address.
+///
+/// The caller gives a `value` for which [`is_ssh`] returns `true`. The value is
+/// an ssh address if it starts with `ssh://` or if the parser accepts it.
 fn is_ssh_address(value: &str) -> bool {
     value.starts_with("ssh://") || PushRemote::parse(value).is_ok()
 }
 
-/// The address `value` of the caller or of `pull-url`.
+/// Parses the address `value` of the caller or of `pull-url`.
+///
+/// # Errors
+///
+/// - [`Error::InvalidInput`] with the text of the parser if `value` is a
+///   malformed ssh address.
 fn parse_address(value: &str) -> Result<PullAddress> {
     if !is_ssh(value) {
         return Ok(PullAddress::Http(value.to_owned()));
@@ -199,8 +214,8 @@ mod tests {
         }
     }
 
-    /// The address of the caller wins over `pull-url`, and `pull-url` wins
-    /// over `url`.
+    /// The address of the caller has precedence over `pull-url`, and
+    /// `pull-url` has precedence over `url`.
     #[test]
     fn the_address_of_the_caller_then_pull_url_then_url() {
         assert_eq!(
@@ -217,7 +232,7 @@ mod tests {
             ssh(resolve("http-pull-url", Some("u@h:x"))).written,
             "u@h:x"
         );
-        // A dead ssh `url` is not read when `pull-url` is set.
+        // If `pull-url` is set, the pull does not read a dead ssh `url`.
         assert_eq!(
             http(resolve("http-pull-url", None)),
             "http://pull.ex.com/repo"
@@ -239,7 +254,7 @@ mod tests {
         );
     }
 
-    /// A malformed ssh address of the caller or in `pull-url` is
+    /// A malformed ssh address of the caller or in `pull-url` gives
     /// `InvalidInput` with the text of the parser.
     #[test]
     fn a_malformed_ssh_address_is_invalid_input() {
@@ -258,8 +273,8 @@ mod tests {
         }
     }
 
-    /// An ssh address in `url` is refused, in the `ssh://` form and in the
-    /// scp form. A `url` that is no ssh address goes to the fetcher.
+    /// The pull refuses an ssh address in `url`, in the `ssh://` form and in
+    /// the scp form. A `url` that is not an ssh address goes to the fetcher.
     #[test]
     fn an_ssh_address_in_url_is_refused() {
         for (name, value) in [
@@ -280,8 +295,8 @@ mod tests {
         assert_eq!(http(resolve("path-url", None)), "/srv/repo");
     }
 
-    /// No section with no address of the caller, and a section with neither
-    /// key, are refused.
+    /// The pull refuses a remote with no section and no address of the
+    /// caller. It also refuses a section with neither key.
     #[test]
     fn a_remote_with_no_address_is_refused() {
         match resolve("absent", None) {
@@ -298,8 +313,9 @@ mod tests {
         );
     }
 
-    /// The keys fill the fields left `None`, and a field the caller set wins
-    /// over its key. No section changes nothing.
+    /// The keys fill the fields that the caller leaves `None`. A field that
+    /// the caller sets has precedence over its key. With no section, the
+    /// fields do not change.
     #[test]
     fn the_keys_fill_the_fields_left_none() {
         let config = config();
@@ -334,8 +350,8 @@ mod tests {
         assert_eq!(empty.remote_ssh_command, None);
     }
 
-    /// Each field of HTTP alone is refused with an ssh address, by the name
-    /// of its option. A retry count of 0 is accepted.
+    /// For an ssh address, the check refuses each field of an HTTP pull alone
+    /// and names its option. It accepts a retry count of 0.
     #[test]
     fn the_fields_of_http_alone_are_refused() {
         let addr = ssh(resolve("none", Some("u@h:x")));

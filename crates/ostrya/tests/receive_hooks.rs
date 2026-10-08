@@ -1,7 +1,11 @@
-//! The hooks of a receive session: `before_update` before the update lock,
-//! the detached-metadata entries of the host and their merge, the checks of
-//! the plan, the refusals of the hook, the drop of the carried value, and
-//! `after_update` after the update lock is released.
+//! Tests of the hooks of a receive session:
+//!
+//! - `before_update`, which runs before the update lock
+//! - the detached-metadata entries of the host, and their merge
+//! - the checks of the plan
+//! - the refusals of the hook
+//! - the drop of the carried value
+//! - `after_update`, which runs after the release of the update lock
 
 #![cfg(feature = "receive")]
 
@@ -137,9 +141,10 @@ impl Drop for DropCount {
     }
 }
 
-/// A carried value that takes an update guard of `repo` when it drops, on
-/// another thread, and records the result in `seen`. With
-/// `lock-timeout-secs=0` a held update lock fails the take at once.
+/// A carried value that takes an update guard of `repo` on another thread
+/// when it drops, and records the result in `seen`. With
+/// `lock-timeout-secs=0`, the take fails at once while another holder has the
+/// update lock.
 struct LockProbe {
     repo: Repo,
     seen: Arc<Mutex<Vec<Result<(), String>>>>,
@@ -185,9 +190,9 @@ fn main_update() -> RefUpdate {
     }
 }
 
-/// Run one session of `repo` with `hooks`: one object stream of `objects`,
-/// then `Commit` with `updates`. The service is returned for the steps after
-/// the commit.
+/// Runs one session of `repo` with `hooks`: one object stream of `objects`,
+/// then `Commit` with `updates`. Returns the service for the steps after the
+/// commit, and the result of the commit.
 fn run(
     repo: &Repo,
     hooks: Option<Arc<Hook>>,
@@ -223,7 +228,8 @@ fn run_with(
     (service, result)
 }
 
-/// Push the fixture commit to `test/main` with `hooks`.
+/// Pushes the fixture commit and the objects `extra` to `test/main` with
+/// `hooks`.
 fn push(repo: &Repo, hooks: Option<Arc<Hook>>, extra: &[Obj]) -> ostrya::Result<ReceiveReport> {
     let mut objects = fixture_objects(Encoding::Raw);
     objects.extend_from_slice(extra);
@@ -240,8 +246,9 @@ fn nested_variants(depth: usize) -> Value {
     (0..depth).fold(text("x"), |value, _| Value::variant(Type::Variant, value))
 }
 
-/// A variant of a type of `depth` nested maybe types around a byte, with the
-/// value `nothing`: a shallow value of a type nested over the limit.
+/// A variant whose type is `depth` nested maybe types around a byte, with
+/// the value `nothing`. The value is shallow, and its type can nest over the
+/// depth limit.
 fn deep_maybe(depth: usize) -> Value {
     let ty = (0..depth).fold(Type::Byte, |ty, _| Type::Maybe(Box::new(ty)));
     Value::variant(ty, Value::Maybe(None))
@@ -285,7 +292,7 @@ fn commitmeta_path(repo: &Repo) -> PathBuf {
     ))
 }
 
-/// Write `bytes` as the stored detached metadata of the fixture commit.
+/// Writes `bytes` as the stored detached metadata of the fixture commit.
 fn plant_stored(repo: &Repo, bytes: Vec<u8>) {
     let path = commitmeta_path(repo);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -318,8 +325,8 @@ fn keys(dict: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Each step of `service` after the commit is `protocol`: the session was
-/// aborted.
+/// Asserts that the session of `service` is aborted. A `have` step after the
+/// commit fails as `protocol`, with the message "the session was aborted".
 fn assert_aborted(service: &ReceiveService, case: &str) {
     match block_on(service.have(Vec::new())) {
         Err(Error::Push(push::Error::Protocol(message))) => {
@@ -332,14 +339,14 @@ fn assert_aborted(service: &ReceiveService, case: &str) {
     }
 }
 
-/// The commit `test/main` names, where the ref is present.
+/// The commit that `test/main` names, if the ref is present.
 fn main_ref(repo: &Repo) -> Option<String> {
     std::fs::read_to_string(repo.path().join("refs/heads/test/main"))
         .ok()
         .map(|text| text.trim().to_owned())
 }
 
-/// The commit `test/after` names, where the ref is present.
+/// The commit that `test/after` names, if the ref is present.
 fn after_ref(repo: &Repo) -> Option<String> {
     std::fs::read_to_string(repo.path().join("refs/heads/test/after"))
         .ok()
@@ -358,11 +365,15 @@ fn one_entry_plan(drops: &Arc<AtomicUsize>) -> UpdatePlan {
     }
 }
 
-/// A hook that gives [`one_entry_plan`], and whose `after_update` asserts
-/// that `test/main` is written and that the carried value is the
-/// [`DropCount`] of `drops`, not dropped yet. It then writes `test/after`
-/// with `Repo::set_ref_immediate` while it holds the carried value, and
-/// drops the carried value.
+/// A hook that gives [`one_entry_plan`]. Its `after_update` does these
+/// steps:
+///
+/// 1. It asserts that `test/main` and the report name the fixture commit.
+/// 2. It asserts that the carried value is the [`DropCount`] of `drops`, and
+///    that the count of drops is 0.
+/// 3. While it holds the carried value, it writes `test/after` with
+///    `Repo::set_ref_immediate`.
+/// 4. It drops the carried value and returns the result of the write.
 fn writing_after(repo: &Repo, drops: &Arc<AtomicUsize>) -> Arc<Hook> {
     let plan_drops = drops.clone();
     let drops = drops.clone();
@@ -393,7 +404,7 @@ fn writing_after(repo: &Repo, drops: &Arc<AtomicUsize>) -> Arc<Hook> {
 // The entries of the host.
 // ---------------------------------------------------------------------------
 
-/// The entries of the host are stored with the ref, and a commit with no
+/// The session stores the entries of the host with the ref. A commit with no
 /// client dict gets a new dict.
 #[test]
 fn the_entries_are_stored_with_the_ref() {
@@ -421,9 +432,9 @@ fn the_entries_are_stored_with_the_ref() {
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
-/// The detached metadata is written before the refs: with the ref directory
-/// read-only, the commit fails at the ref write, and the `.commitmeta` file
-/// holds the entries of the host.
+/// The session writes the detached metadata before the refs. If the ref
+/// directory is read-only, the commit fails at the ref write, and the
+/// `.commitmeta` file holds the entries of the host.
 #[test]
 fn the_entries_are_written_before_the_refs() {
     use std::os::unix::fs::PermissionsExt;
@@ -484,11 +495,11 @@ fn a_host_entry_wins_over_the_client() {
     );
 }
 
-/// A host entry with `keep_existing` keeps the value the stored dict holds
-/// under its key, and is written where the stored dict has no such key. An
-/// entry without it replaces the stored value. The client value of a key of
-/// the host is dropped. A commit with no client dict reads its stored dict
-/// for the merge.
+/// A host entry with `keep_existing` keeps the value that the stored dict
+/// holds under its key. If the stored dict has no such key, the session
+/// writes the entry. An entry without `keep_existing` replaces the stored
+/// value. The session drops the client value of a key of the host. A commit
+/// with no client dict reads its stored dict for the merge.
 #[test]
 fn keep_existing_keeps_a_stored_value() {
     for with_client in [true, false] {
@@ -531,11 +542,11 @@ fn keep_existing_keeps_a_stored_value() {
     }
 }
 
-/// A stored dict that the plan read and no edit took is the stored dict of
-/// the host merge. The client dict that the exclude filter empties makes the
-/// plan read the stored dict and add no edit. `keep_existing` keeps the
-/// stored value, an entry without it replaces the stored value, and the
-/// other stored entries stay.
+/// The host merge takes a stored dict that the edit plan of the session read
+/// and that no edit took. The exclude filter empties the client dict, so the
+/// edit plan reads the stored dict and adds no edit. `keep_existing` keeps the
+/// stored value. An entry without `keep_existing` replaces the stored value,
+/// and the other stored entries stay.
 #[test]
 fn the_host_merge_takes_a_stored_dict_the_plan_read() {
     let tmp = TmpDir::new("hooks-leftover");
@@ -601,9 +612,12 @@ fn an_empty_plan_writes_no_detached_metadata() {
 // Refusals.
 // ---------------------------------------------------------------------------
 
-/// Each plan the checks refuse is `internal`, as `Error::InvalidInput`: no
-/// ref is written, no detached metadata is written, the staging directory is
-/// removed, the session ends, and the hook ran once.
+/// Each plan that the checks refuse fails as `internal`, with
+/// `Error::InvalidInput`. For each plan, the test checks these results:
+///
+/// - The session writes no ref and no detached metadata.
+/// - The session removes the staging directory and ends.
+/// - The hook runs once.
 #[test]
 fn a_refused_plan_is_internal_and_writes_nothing() {
     let random = Checksum::from_bytes([0x5a; 32]);
@@ -713,7 +727,7 @@ fn a_refused_plan_is_internal_and_writes_nothing() {
         let hook = Hook::giving(metadata, &drops);
         let updates = vec![
             main_update(),
-            // A delete of a ref the client expects at `old`.
+            // A delete of a ref that the client expects at `old`.
             RefUpdate {
                 name: "test/other".into(),
                 expected: Expected::Commit(old),
@@ -742,8 +756,8 @@ fn a_refused_plan_is_internal_and_writes_nothing() {
     }
 }
 
-/// A plan that names the commit of a delete-only push is refused: the
-/// commit is not the new commit of an update.
+/// The checks refuse a plan that names the commit of a delete-only push,
+/// because that commit is not the new commit of an update.
 #[test]
 fn a_delete_only_push_refuses_entries() {
     let tmp = TmpDir::new("hooks-delete");
@@ -772,10 +786,10 @@ fn a_delete_only_push_refuses_entries() {
     assert!(!commitmeta_path(&repo).exists());
 }
 
-/// `HookRefusal::denied` is `ref-denied` and `HookRefusal::internal` is
-/// `internal`, each with its message. No ref is written, the staging
-/// directory is removed, and the session ends. A message longer than 4096
-/// bytes is cut at a character boundary.
+/// `HookRefusal::denied` fails as `ref-denied` and `HookRefusal::internal`
+/// fails as `internal`, each with its message. The session writes no ref,
+/// removes the staging directory, and ends. If a message is longer than 4096
+/// bytes, the session cuts it at a character boundary.
 #[test]
 fn a_hook_refusal_keeps_its_code() {
     let long = format!("a{}", "\u{e9}".repeat(3000));
@@ -820,9 +834,9 @@ fn a_hook_refusal_keeps_its_code() {
     }
 }
 
-/// A merged dict over the size limit is `limit-exceeded` before the update
-/// lock: another process holds the update lock with `lock-timeout-secs=0`,
-/// and the commit does not get the timeout.
+/// A merged dict over the size limit fails as `limit-exceeded` before the
+/// update lock. Another process holds the update lock with
+/// `lock-timeout-secs=0`, and the commit does not get the timeout.
 #[test]
 fn a_merged_dict_over_the_limit_is_refused_before_the_lock() {
     let tmp = TmpDir::new("hooks-over-limit");
@@ -833,7 +847,7 @@ fn a_merged_dict_over_the_limit_is_refused_before_the_lock() {
     let mut objects = fixture_objects(Encoding::Raw);
     objects.push(client);
     let drops = Arc::new(AtomicUsize::new(0));
-    // The hook gives its plan once, so the large entry is not copied.
+    // The hook gives its plan once, so the test does not copy the large entry.
     let plan = Mutex::new(Some(vec![(
         fixture_commit(),
         vec![entry("k", big(), false)],
@@ -900,9 +914,9 @@ fn the_carried_value_drops_once_on_a_ref_mismatch() {
     assert!(!commitmeta_path(&repo).exists());
 }
 
-/// The carried value drops after the update lock is released: on success,
-/// and when a ref check under the lock fails. The probe first sees a held
-/// update lock as held.
+/// The carried value drops after the release of the update lock, on success
+/// and when a ref check under the lock fails. First, the test checks that the
+/// probe sees a held update lock as held.
 #[test]
 fn the_carried_value_drops_after_the_update_lock_is_released() {
     let tmp = TmpDir::new("hooks-lock-free");
@@ -988,11 +1002,11 @@ fn missing_objects_do_not_call_the_hook() {
 // `after_update`.
 // ---------------------------------------------------------------------------
 
-/// `after_update` runs after the update lock is released, with the refs
-/// written and the carried value of the plan. With `lock-timeout-secs=0`,
-/// `Repo::set_ref_immediate` fails at once while an update guard is held,
-/// and in the hook it writes its ref. The hook gets the report that the
-/// commit returns.
+/// `after_update` runs after the release of the update lock, when the refs
+/// are written. With `lock-timeout-secs=0`, `Repo::set_ref_immediate` fails
+/// at once while another holder has an update guard. In the hook, the same
+/// call writes its ref. The hook gets the carried value of the plan and the
+/// report that the commit returns.
 #[test]
 fn after_update_runs_with_the_update_lock_free() {
     let tmp = TmpDir::new("hooks-after-free");
@@ -1019,8 +1033,8 @@ fn after_update_runs_with_the_update_lock_free() {
 
 /// [`after_update_runs_with_the_update_lock_free`] with
 /// `lock-timeout-secs=-1`, where a held lock makes the write in the hook wait
-/// with no end. The commit runs on a thread, and the test fails when the
-/// commit does not end in 30 s.
+/// with no end. The commit runs on a thread. If the commit does not end in
+/// 30 s, the test fails.
 #[test]
 fn after_update_does_not_wait_with_no_lock_timeout() {
     let (sender, receiver) = mpsc::channel();
@@ -1049,10 +1063,10 @@ fn after_update_does_not_wait_with_no_lock_timeout() {
     assert_eq!(written.as_deref(), Some(COMMIT));
 }
 
-/// An error of `after_update` is `internal` with its message. The refs and
-/// the detached metadata stay written, the staging directory is removed, and
-/// the session ends as aborted. A message longer than 4096 bytes is cut at a
-/// character boundary.
+/// An error of `after_update` fails the commit as `internal`, with its
+/// message. The refs and the detached metadata stay written. The session
+/// removes the staging directory and ends as aborted. If a message is longer
+/// than 4096 bytes, the session cuts it at a character boundary.
 #[test]
 fn an_after_update_error_is_internal_with_the_refs_written() {
     let long = format!("a{}", "\u{e9}".repeat(3000));
@@ -1099,10 +1113,10 @@ fn an_after_update_error_is_internal_with_the_refs_written() {
     }
 }
 
-/// `after_update` does not run when the commit fails after `before_update`:
-/// on a ref mismatch, and when another process holds the update lock with
-/// `lock-timeout-secs=0`. The carried value drops once, and no ref is
-/// written.
+/// If the commit fails after `before_update`, `after_update` does not run.
+/// The test makes two failures: a ref mismatch, and an update lock that
+/// another process holds with `lock-timeout-secs=0`. In both cases, the
+/// carried value drops once, and the session writes no ref.
 #[test]
 fn after_update_does_not_run_when_the_commit_fails_after_before_update() {
     for mismatch in [true, false] {
@@ -1145,8 +1159,8 @@ fn after_update_does_not_run_when_the_commit_fails_after_before_update() {
     }
 }
 
-/// `after_update` runs also when no ref changes: a second session pushes the
-/// commit that the ref names already.
+/// `after_update` also runs when no ref changes. A second session pushes the
+/// commit that the ref already names.
 #[test]
 fn after_update_runs_when_no_ref_changes() {
     let tmp = TmpDir::new("hooks-after-same");
@@ -1169,8 +1183,8 @@ fn after_update_runs_when_no_ref_changes() {
     assert_eq!(main_ref(&repo).as_deref(), Some(COMMIT));
 }
 
-/// Open a transaction of `repo` that holds the repository lock exclusive,
-/// and abort it.
+/// Opens a transaction of `repo` that holds the repository lock exclusive,
+/// and aborts it.
 async fn take_exclusive(repo: &Repo) -> ostrya::Result<()> {
     repo.transaction_with_lock(LockKind::Exclusive)
         .await?
@@ -1180,8 +1194,8 @@ async fn take_exclusive(repo: &Repo) -> ostrya::Result<()> {
 
 /// `after_update` runs with the repository lock free. With
 /// `lock-timeout-secs=0`, a transaction that takes the repository lock
-/// exclusive fails at once while another transaction holds it shared, and
-/// in the hook it opens.
+/// exclusive fails at once while another transaction holds the lock shared.
+/// In the hook, the same transaction opens.
 #[test]
 fn after_update_runs_with_the_repository_lock_free() {
     let tmp = TmpDir::new("hooks-after-repo-lock");
@@ -1216,10 +1230,10 @@ fn after_update_runs_with_the_repository_lock_free() {
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
-/// The transaction commit is not atomic. With the directory of the second
-/// ref read-only, the commit deletes the first ref and then fails at the
-/// delete of the second. The commit returns the error of the write, the
-/// session ends as aborted, `after_update` does not run, and the carried
+/// The transaction commit is not atomic. If the directory of the second ref
+/// is read-only, the commit deletes the first ref and then fails at the
+/// delete of the second. The commit returns the error of the write, and the
+/// session ends as aborted. `after_update` does not run, and the carried
 /// value drops once.
 #[test]
 fn after_update_does_not_run_when_the_transaction_commit_fails() {

@@ -1,26 +1,9 @@
-//! Filesystem ingest: walking an on-disk tree into a [`MutableTree`].
+//! The file system ingest of a transaction.
 //!
-//! [`Transaction::write_dfd_to_mtree`] walks the directory tree rooted at a
-//! path relative to a directory fd, ingesting its contents through the object
-//! writers (in [`crate::write`]) and recording them in a
-//! [`MutableTree`](crate::MutableTree). A [`CommitModifier`] shapes the walk:
-//! canonical permissions, declared ownership, an include/prune filter, a
-//! mode-replacing callback, an xattr-replacing callback, an SELinux label hook,
-//! a devino cache, and source consumption.
-//!
-//! The walk reads each directory in one offloaded blocking pass (fd-relative
-//! `Dir` iteration, `statat` per entry, xattr reads, `readlinkat`), then
-//! ingests the entries: regular-file payloads stream through
-//! [`write_content`](crate::Transaction::write_content) over an
-//! `rt::FileReader`, symlinks and per-directory metadata go through the
-//! metadata writers. The per-entry namespace syscalls that open, unlink, and
-//! recurse are issued inline, keeping the offload at per-directory
-//! granularity.
-//!
-//! [`Transaction::overlay_tree_to_mtree`] ingests a committed tree the same
-//! way, so a tree already in the repository composes with a filesystem walk
-//! under one modifier. Without a modifier it copies the committed checksums
-//! and reads only the dirtrees along the paths it merges.
+//! This module reads a tree on disk, or a committed tree, into a
+//! `MutableTree`. The docs of `Transaction::write_dfd_to_mtree` and
+//! `Transaction::overlay_tree_to_mtree` hold the behavior that a caller sees.
+//! The object writers are in `write.rs`.
 
 use std::future::Future;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -48,16 +31,111 @@ const S_IFLNK: u32 = 0o120000;
 /// The canonical permission mask (`perm & 0o755`).
 const CANONICAL_PERM_MASK: u32 = 0o755;
 
+/// Methods that read a directory on disk into a mutable tree.
 impl Transaction {
-    /// Walk the on-disk tree at `path` relative to `dfd` and ingest it into
-    /// `mtree`, shaped by `modifier`.
+    /// Walks the directory at `path` under `dfd` and adds its tree to `mtree`.
     ///
-    /// The walk-root directory's own metadata becomes `mtree`'s dirmeta; its
-    /// entries are ingested recursively. Regular-file contents stream through
-    /// the object store, symlinks and directory metadata are written as
-    /// objects, and each directory's dirtree is assembled later by
-    /// [`write_mtree`](Transaction::write_mtree). A modifier filter that skips
-    /// a directory prunes its whole subtree.
+    /// The metadata of the walk root becomes the dirmeta of `mtree`. The walk
+    /// adds each entry below the root to `mtree`:
+    ///
+    /// - The payload of a regular file streams into a content object.
+    /// - A symlink and the metadata of each directory become objects.
+    /// - A directory merges with a directory of the same name in `mtree`.
+    /// - A regular file or a symlink replaces a file of the same name in
+    ///   `mtree`.
+    ///
+    /// [`write_mtree`](Transaction::write_mtree) writes the dirtree of each
+    /// directory later. If `path` is empty or `.`, the walk root is `dfd`
+    /// itself. The walk does not follow a symlink at the last component of
+    /// `path`.
+    ///
+    /// # Modifier
+    ///
+    /// Without a modifier, each entry records the ownership, the mode, and the
+    /// xattrs that it has on disk. A [`CommitModifier`] applies its steps to
+    /// each entry in this order:
+    ///
+    /// 1. The [`CANONICAL_PERMISSIONS`](CommitModifierFlags::CANONICAL_PERMISSIONS)
+    ///    reduction: owner 0:0, no xattrs, and `perm & 0o755` on a regular
+    ///    file or a directory. A symlink keeps its mode.
+    /// 2. [`SKIP_XATTRS`](CommitModifierFlags::SKIP_XATTRS): the walk reads no
+    ///    xattrs from the disk, and the entry has no xattrs.
+    /// 3. The declared ownership (`owner_uid` and `owner_gid`).
+    /// 4. The filter. It gets the metadata of steps 1 to 3. If it returns
+    ///    [`FilterResult::Skip`] for a directory, the walk skips the whole
+    ///    subtree.
+    /// 5. The mode callback.
+    /// 6. The `CANONICAL_PERMISSIONS` reduction again, on the mode that the
+    ///    callback returns. The file type stays the type that the walk found.
+    ///    A symlink keeps its mode.
+    /// 7. The xattr callback.
+    /// 8. The SELinux label callback. The walk drops the `security.selinux`
+    ///    xattr of the entry, then adds the label that the callback returns.
+    ///    If the callback returns no label, the entry has no label.
+    ///
+    /// Steps 5 to 8 run only for an entry that the filter keeps. The walk root
+    /// goes through each step except the filter.
+    ///
+    /// If the modifier holds a [`DevInoCache`](crate::DevInoCache), the walk
+    /// looks up each regular file and symlink in it, and never a directory.
+    /// The walk does not read a source file that the cache knows. Without
+    /// [`DEVINO_CANONICAL`](CommitModifierFlags::DEVINO_CANONICAL), a hit
+    /// takes its metadata from the stored object. For this reason, a
+    /// `user.ostreemeta` xattr on a file of a `bare-user` checkout does not
+    /// enter the commit.
+    ///
+    /// # Consume
+    ///
+    /// Under [`CONSUME`](CommitModifierFlags::CONSUME), the walk removes each
+    /// source entry after it records the entry. It also removes each entry
+    /// that the filter skips, with its whole subtree. Then the call removes the
+    /// walk root.
+    ///
+    /// The test for the walk root is on the bytes of `path`. If `path` is
+    /// exactly `.`, the call keeps the root. For each other spelling, `./`
+    /// included, the call tries to remove the root and ignores a failure.
+    ///
+    /// # File system access
+    ///
+    /// The walk reads each directory in one pass on the blocking pool. The pass
+    /// reads the entry list, the `statat` of each entry, the xattrs, and the
+    /// symlink targets. The walk reads the xattrs of a symlink from the link itself. The
+    /// calls that open and remove entries run on the calling task.
+    /// The walk holds at most two directory descriptors at a time, at any
+    /// depth of the source.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`,
+    ///   or if an entry is not a directory, a regular file, or a symlink.
+    /// - [`Error::Unsupported`] if `[ex-integrity] fsverity` is `yes` and the
+    ///   fs-verity seal of an object fails.
+    /// - [`Error::InvalidFormat`] if an entry name or a symlink target is not
+    ///   valid UTF-8.
+    /// - [`Error::InvalidFormat`] if the label callback returns no label and
+    ///   [`ERROR_ON_UNLABELED`](CommitModifierFlags::ERROR_ON_UNLABELED) is
+    ///   set.
+    /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
+    ///   `[ex-integrity] composefs` in the repository config is malformed.
+    /// - [`Error::InvalidFormat`] if the stored object of a devino-cache hit
+    ///   does not have the form of the repository mode.
+    /// - [`Error::ConsumeUnlink`] if `CONSUME` is set and the removal of a
+    ///   source entry fails.
+    /// - [`Error::ReplaceDirWithFile`] if a regular file or a symlink has the
+    ///   name of a directory in `mtree`.
+    /// - [`Error::ReplaceFileWithDir`] if a directory has the name of a file
+    ///   in `mtree`.
+    /// - [`Error::InsufficientFreeSpace`] if an object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::ObjectNotFound`] if a devino-cache hit or a lazy
+    ///   subdirectory of `mtree` names an object that the repository does not
+    ///   hold.
+    /// - [`Error::Core`] if a stored object does not parse, or if the xattr
+    ///   set with a label is not valid.
+    /// - [`Error::Core`] if a `[core]` or `[archive]` value in the repository
+    ///   config is malformed.
+    /// - [`Error::Io`] if a file system operation fails, for example if the
+    ///   walk root is not a directory.
     pub async fn write_dfd_to_mtree(
         &self,
         dfd: BorrowedFd<'_>,
@@ -80,9 +158,9 @@ impl Transaction {
         }
 
         let root_fd = open_walk_root(dfd, path)?;
-        // The walk root is asked for no parent descriptor: the directory above
-        // it can be unreadable or outside the tree the caller named, and a
-        // failure to open it would fail a commit that otherwise works.
+        // The walk root asks for no parent descriptor. The directory above it
+        // can be unreadable or outside the tree that the caller names. A
+        // failure to open it then fails a commit that works otherwise.
         walk_dir(self, root_fd, mtree, modifier, "/".to_owned(), None, false).await?;
 
         if flags.contains(CommitModifierFlags::CONSUME) {
@@ -92,21 +170,61 @@ impl Transaction {
     }
 }
 
+/// Methods that read a committed tree into a mutable tree.
 impl Transaction {
-    /// Overlay the committed tree named by `dirtree` and `dirmeta` onto
-    /// `mtree`, shaped by `modifier`.
+    /// Merges the committed tree of `dirtree` and `dirmeta` into `mtree`.
     ///
-    /// The composition rule is the one [`write_dfd_to_mtree`](Transaction::write_dfd_to_mtree)
-    /// follows: directories merge, this tree's directory metadata replaces
-    /// what the destination held, and this tree's files replace files of the
-    /// same name. A name that is a directory on one side and a file on the
-    /// other is an error.
+    /// The merge obeys the rules of
+    /// [`write_dfd_to_mtree`](Transaction::write_dfd_to_mtree), so a committed
+    /// tree and a walk of the file system can build one tree under one
+    /// modifier. `dirmeta` becomes the dirmeta of `mtree`. A directory merges
+    /// with a directory of the same name, and a file replaces a file of the
+    /// same name.
     ///
-    /// With no modifier the committed checksums are reused as they are, and a
-    /// subdirectory the destination does not hold is recorded without being
-    /// read. With a modifier every entry is read, its metadata is shaped, and
-    /// a content object whose shaped metadata differs from the stored one is
-    /// written again from the stored payload.
+    /// If `modifier` is `None`, the merge records the committed checksums
+    /// unchanged. It reads only the dirtrees on the paths where `mtree`
+    /// already holds a directory. It records each other subdirectory with no
+    /// read.
+    ///
+    /// If `modifier` is set, the merge reads each entry and applies the steps
+    /// of the modifier to its metadata, in the order that
+    /// [`write_dfd_to_mtree`](Transaction::write_dfd_to_mtree) states. If the
+    /// result differs from the stored metadata, the merge writes a new object
+    /// from the stored payload. Otherwise it records the stored checksum. The
+    /// merge does not use `CONSUME`, `GENERATE_SIZES`, `DEVINO_CANONICAL`, or
+    /// the devino cache.
+    ///
+    /// The transaction can write `ostree.sizes` in an `archive` repository
+    /// after a call to [`begin_tree_source`](Transaction::begin_tree_source).
+    /// Then each object of the committed tree enters the scope of that key,
+    /// also an object that the merge does not write.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if `dirtree`, `dirmeta`, or an object that
+    ///   the merge reads is not in the repository.
+    /// - [`Error::ReplaceDirWithFile`] if a file of the committed tree has the
+    ///   name of a directory in `mtree`.
+    /// - [`Error::ReplaceFileWithDir`] if a directory of the committed tree has
+    ///   the name of a file in `mtree`.
+    /// - [`Error::InvalidFormat`] if the label callback returns no label and
+    ///   [`ERROR_ON_UNLABELED`](CommitModifierFlags::ERROR_ON_UNLABELED) is
+    ///   set.
+    /// - [`Error::InvalidFormat`] if a stored file object does not have the
+    ///   form of the repository mode.
+    /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
+    ///   `[ex-integrity] composefs` in the repository config is malformed.
+    /// - [`Error::Unsupported`] if the merge writes an object and the
+    ///   repository mode is `bare-split-xattrs`.
+    /// - [`Error::Unsupported`] if `[ex-integrity] fsverity` is `yes` and the
+    ///   fs-verity seal of an object fails.
+    /// - [`Error::InsufficientFreeSpace`] if an object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] if a stored object does not parse, or if the xattr
+    ///   set with a label is not valid.
+    /// - [`Error::Core`] if a `[core]` or `[archive]` value in the repository
+    ///   config is malformed.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn overlay_tree_to_mtree(
         &self,
         dirtree: &ostrya_core::Checksum,
@@ -114,8 +232,8 @@ impl Transaction {
         mtree: &mut MutableTree,
         modifier: Option<&mut CommitModifier>,
     ) -> Result<()> {
-        // A committed source contributes its objects to `ostree.sizes` even
-        // where the overlay reuses the stored checksums and writes nothing.
+        // A committed source adds its objects to `ostree.sizes`, also where
+        // the overlay records the stored checksums and writes nothing.
         if self.size_scoped() && self.generate_sizes() && self.repo().mode().is_archive() {
             note_tree_scope(self, *dirtree, *dirmeta).await?;
         }
@@ -123,9 +241,11 @@ impl Transaction {
     }
 }
 
-/// Record every object of a committed tree in the transaction's `ostree.sizes`
-/// scope. The commit narrows the scope to the objects its root reaches, so a
-/// part of the tree a later source replaces leaves the key again.
+/// Records each object of a committed tree in the `ostree.sizes` scope of the
+/// transaction.
+///
+/// The commit limits the scope to the objects that its root reaches. A part
+/// of the tree that a later source replaces leaves the key again.
 async fn note_tree_scope(
     txn: &Transaction,
     dirtree: ostrya_core::Checksum,
@@ -150,8 +270,8 @@ async fn note_tree_scope(
     Ok(())
 }
 
-/// Overlay one committed directory onto `node`. See
-/// [`Transaction::overlay_tree_to_mtree`].
+/// Merges one committed directory into `node`, as
+/// [`Transaction::overlay_tree_to_mtree`] states.
 fn overlay_dir<'a>(
     txn: &'a Transaction,
     dirtree: ostrya_core::Checksum,
@@ -167,8 +287,8 @@ fn overlay_dir<'a>(
             .map_or(CommitModifierFlags::empty(), |m| m.flags);
         let owner = Owner::of(modifier.as_deref());
 
-        // The directory's own metadata reaches the callbacks the way the
-        // filesystem walk's root does: adjusted, then finalized, never
+        // The metadata of the directory goes to the callbacks as the walk root
+        // of a file system walk does: adjusted, then finalized, and never
         // filtered.
         let written = if modifier.is_none() {
             dirmeta
@@ -213,9 +333,9 @@ fn overlay_dir<'a>(
                     continue;
                 }
             }
-            // A subdirectory the destination does not hold and no modifier
-            // shapes is recorded unread; anything else is merged entry by
-            // entry.
+            // If the destination does not hold the subdirectory and no
+            // modifier is set, the merge records it unread. Each other
+            // subdirectory merges entry by entry.
             if modifier.is_none()
                 && matches!(node.child_kind(&name), crate::mtree::ChildKind::Absent)
             {
@@ -237,10 +357,14 @@ fn overlay_dir<'a>(
     })
 }
 
-/// Shape one committed file or symlink for an overlay: `None` where the
-/// modifier's filter skips it, the stored checksum where the shaped metadata
-/// equals the stored metadata, and a fresh object written from the stored
-/// payload otherwise.
+/// Applies the modifier to one committed file or symlink of an overlay.
+///
+/// The result is one of these:
+///
+/// - `None` if the filter of the modifier skips the entry.
+/// - The stored checksum if the shaped metadata equals the stored metadata.
+/// - The checksum of a new object, written from the stored payload, in each
+///   other case.
 async fn overlay_file(
     txn: &Transaction,
     mut modifier: Option<&mut CommitModifier>,
@@ -283,7 +407,7 @@ async fn overlay_file(
     Ok(Some(written))
 }
 
-/// One directory entry captured during a blocking snapshot.
+/// One directory entry that a blocking snapshot reads.
 struct EntryInfo {
     name: String,
     kind: EntryKind,
@@ -293,20 +417,20 @@ struct EntryInfo {
     gid: u32,
     /// The full `st_mode`, including the file-type bits.
     mode: u32,
-    /// The `st_size` the walk read, which bounds the read-ahead of a regular
+    /// The `st_size` that the walk read. It limits the read-ahead of a regular
     /// file.
     size: u64,
     xattrs: Xattrs,
 }
 
-/// What kind of object an entry ingests to.
+/// The kind of object that an entry becomes.
 enum EntryKind {
     Dir,
     Regular,
     Symlink(String),
 }
 
-/// A directory's own metadata plus its entries, captured in one blocking pass.
+/// The metadata of a directory and its entries, read in one blocking pass.
 struct DirSnapshot {
     uid: u32,
     gid: u32,
@@ -315,25 +439,28 @@ struct DirSnapshot {
     entries: Vec<EntryInfo>,
 }
 
-/// The boxed future for the recursive post-order walk; async recursion needs
-/// indirection, so each level returns a boxed future.
+/// The boxed future of the recursive post-order walk.
+///
+/// Async recursion needs indirection, so each level returns a boxed future.
 type WalkFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
-/// The boxed future for one level of the filesystem walk. Its result carries
-/// the parent directory's descriptor where the caller asked for it, and `None`
-/// where it did not.
+/// The boxed future of one level of the file system walk.
+///
+/// If the caller asks for the descriptor of the parent directory, the result
+/// holds it. Otherwise the result is `None`.
 type WalkDirFuture<'a> = Pin<Box<dyn Future<Output = Result<Option<OwnedFd>>> + Send + 'a>>;
 
-/// Ingest one directory: write its dirmeta onto `node`, then ingest each entry.
+/// Ingests one directory: writes its dirmeta onto `node`, then ingests each
+/// entry.
 ///
-/// `dir_meta` carries this directory's fully adjusted metadata, computed once by
-/// the parent so the user callbacks fire once per directory. It is `None` only
-/// for the walk root, which has no parent and is adjusted here.
+/// `dir_meta` holds the fully adjusted metadata of this directory. The parent
+/// computes it once, so the user callbacks run once for each directory. It is
+/// `None` only for the walk root, which has no parent. The function adjusts
+/// the metadata of the walk root itself.
 ///
-/// `needs_parent` states whether the caller wants its own directory back. Where
-/// it is set, `dir_fd` is released and the descriptor of the directory above,
-/// opened through `..`, is returned in its place. This is what keeps the walk
-/// to at most two directory descriptors whatever the depth of the source.
+/// If `needs_parent` is set, the function closes `dir_fd` and returns the
+/// descriptor of the directory above, opened through `..`. This keeps the walk
+/// to at most two directory descriptors at any depth of the source.
 fn walk_dir<'a>(
     txn: &'a Transaction,
     dir_fd: OwnedFd,
@@ -351,14 +478,16 @@ fn walk_dir<'a>(
         let owner = Owner::of(modifier.as_deref());
         let skip_xattrs = flags.contains(CommitModifierFlags::SKIP_XATTRS);
 
-        // The heavy per-directory work runs on the blocking pool in one pass.
+        // The large work of each directory runs on the blocking pool in one
+        // pass.
         let snap = {
             let dir = dir_fd.as_fd().try_clone_to_owned()?;
             ostrya_rt::unblock(move || snapshot_dir(dir.as_fd(), skip_xattrs)).await?
         };
 
-        // This directory's own metadata becomes `node`'s dirmeta. The walk root
-        // is adjusted here; a nested directory reuses what its parent computed.
+        // The metadata of this directory becomes the dirmeta of `node`. The
+        // walk root is adjusted here. A nested directory uses the metadata
+        // that its parent computed.
         let dir_meta = match dir_meta {
             Some(m) => m,
             None => {
@@ -381,11 +510,11 @@ fn walk_dir<'a>(
             let cb_path = join_path(&path, &entry.name);
             let is_symlink = matches!(entry.kind, EntryKind::Symlink(_));
 
-            // Under DEVINO_CANONICAL a cache hit is the entry's whole identity:
-            // the filter and every callback are skipped for it and the file is
-            // neither opened nor read. A directory is never one end of a
-            // hardlink pair with an object, so only the two content kinds are
-            // offered to the cache.
+            // Under DEVINO_CANONICAL, a cache hit is the whole identity of the
+            // entry. The walk skips the filter and each callback for it, and
+            // does not open or read the file. A directory is never one end of
+            // a hardlink pair with an object. The walk looks up only the two
+            // content kinds in the cache.
             if !matches!(entry.kind, EntryKind::Dir)
                 && let Some(checksum) =
                     canonical_devino_hit(txn, modifier.as_deref(), entry.dev, entry.ino)
@@ -397,9 +526,9 @@ fn walk_dir<'a>(
                 continue;
             }
 
-            // Canonical permissions are cheap and deterministic and feed the
-            // filter; the user callbacks run only for entries that survive the
-            // filter.
+            // The canonical permissions cost little and are deterministic, and
+            // the filter gets them. The user callbacks run only for the entries
+            // that the filter keeps.
             let base = FileMeta {
                 uid: entry.uid,
                 gid: entry.gid,
@@ -413,10 +542,10 @@ fn walk_dir<'a>(
                 && filter(Path::new(&cb_path), &filter_meta) == FilterResult::Skip
             {
                 txn.note_filtered();
-                // A consuming walk empties the source whatever the filter kept
-                // out of the commit, so a skipped entry is removed too. Leaving
-                // it would strand the source half-deleted and fail the removal
-                // of the directory that holds it.
+                // A consuming walk empties the source, also the entries that
+                // the filter keeps out of the commit. If a skipped entry
+                // stays, the source stays half removed, and the removal of its
+                // directory fails.
                 if consume {
                     remove_tree(
                         dir_fd.as_fd(),
@@ -427,10 +556,10 @@ fn walk_dir<'a>(
                 continue;
             }
 
-            // Without the flag a cache hit still spares the read: the stored
-            // object supplies the metadata the modifier shapes, and the object
-            // is rewritten from the stored payload only where the shaped
-            // metadata differs from it.
+            // Without the flag, a cache hit also prevents the read. The stored
+            // object supplies the metadata that the modifier shapes. The walk
+            // writes the object again from the stored payload only if the
+            // shaped metadata differs from it.
             if !matches!(entry.kind, EntryKind::Dir)
                 && let Some(cached) = devino_lookup(modifier.as_deref(), entry.dev, entry.ino)
             {
@@ -486,10 +615,10 @@ fn walk_dir<'a>(
                         Mode::empty(),
                     )?;
                     let child = node.ensure_dir(&entry.name).await?;
-                    // This level's descriptor is released before the descent
-                    // and comes back reopened through `..`, so the walk holds
-                    // at most two directory descriptors at any instant,
-                    // whatever the depth below it.
+                    // The walk closes the descriptor of this level before the
+                    // descent and gets it back, opened again through `..`.
+                    // The walk holds at most two directory descriptors at a
+                    // time, at any depth below it.
                     drop(dir_fd);
                     let parent = walk_dir(
                         txn,
@@ -518,7 +647,7 @@ fn walk_dir<'a>(
     })
 }
 
-/// The devino-cache checksum for `(dev, ino)`, when a cache is attached.
+/// Returns the devino-cache checksum of `(dev, ino)`, if a cache is attached.
 fn devino_lookup(
     modifier: Option<&CommitModifier>,
     dev: u64,
@@ -527,9 +656,10 @@ fn devino_lookup(
     modifier?.devino_cache.as_ref()?.get(dev, ino)
 }
 
-/// A devino-cache checksum for `(dev, ino)`, when the cache is present and
-/// [`DEVINO_CANONICAL`](CommitModifierFlags::DEVINO_CANONICAL) is set. A hit is
-/// counted in the transaction statistics.
+/// Returns the devino-cache checksum of `(dev, ino)`, if the cache is present
+/// and [`DEVINO_CANONICAL`](CommitModifierFlags::DEVINO_CANONICAL) is set.
+///
+/// The statistics of the transaction count a hit.
 fn canonical_devino_hit(
     txn: &Transaction,
     modifier: Option<&CommitModifier>,
@@ -545,15 +675,17 @@ fn canonical_devino_hit(
     Some(checksum)
 }
 
-/// Commit the entry a devino-cache hit resolved, with the modifier applied over
-/// the stored object's own metadata.
+/// Commits the entry of a devino-cache hit, with the modifier applied to the
+/// metadata of the stored object.
 ///
-/// The stored metadata replaces what the source entry carries, so a checkout
-/// artifact the object store puts on the file -- a `bare-user` object's
-/// `user.ostreemeta` xattr, say -- never enters the commit. Where the shaped
-/// metadata equals the stored metadata the object is reused and the hit is
-/// counted; otherwise a new object is written from the stored payload, which
-/// still spares reading the source entry.
+/// The stored metadata replaces the metadata of the source entry. A checkout
+/// artifact that the object store puts on the file never enters the commit.
+/// An example is the `user.ostreemeta` xattr of a `bare-user` object.
+///
+/// If the shaped metadata equals the stored metadata, the function returns the
+/// cached checksum and counts the hit. Otherwise it writes a new object from
+/// the stored payload. The function does not read the source entry in either
+/// case.
 async fn commit_cached_entry(
     txn: &Transaction,
     modifier: Option<&mut CommitModifier>,
@@ -583,37 +715,47 @@ async fn commit_cached_entry(
     }
 }
 
-/// Whether two metadata sets record the same object header.
+/// Returns `true` if two metadata sets record the same object header.
 fn meta_eq(a: &FileMeta, b: &FileMeta) -> bool {
     a.uid == b.uid && a.gid == b.gid && a.mode == b.mode && a.xattrs == b.xattrs
 }
 
-/// Apply the cheap, deterministic metadata adjustments a modifier states: the
+/// Applies the metadata adjustments of a modifier that cost little and are
+/// deterministic.
+///
+/// The order is the
 /// [`CANONICAL_PERMISSIONS`](CommitModifierFlags::CANONICAL_PERMISSIONS)
-/// reduction, the [`SKIP_XATTRS`](CommitModifierFlags::SKIP_XATTRS) drop, then
-/// the declared ownership. Runs no user callbacks. A walk without a modifier
-/// carries the empty flag set and no declared ownership, making this a no-op.
+/// reduction, the [`SKIP_XATTRS`](CommitModifierFlags::SKIP_XATTRS) drop, and
+/// then the declared ownership. The function runs no user callbacks. A walk
+/// without a modifier has the empty flag set and no declared ownership, so the
+/// function changes nothing for it.
 ///
-/// Under `CANONICAL_PERMISSIONS` the owner becomes 0:0, the xattr set is
-/// emptied, and a regular file's or directory's permission bits become
-/// `perm & 0o755`; a symlink's mode is fixed by the object model, so only
-/// regular-file and directory bits are canonicalized. `SKIP_XATTRS` empties the
-/// xattr set and leaves the mode and the ownership as they stand. Either flag
-/// empties the set here, ahead of the callbacks, so a callback that supplies
-/// xattrs or an SELinux label still lands them.
+/// Under `CANONICAL_PERMISSIONS`, the owner becomes 0:0 and the xattr set
+/// becomes empty. The permission bits of a regular file or a directory become
+/// `perm & 0o755`. The object model fixes the mode of a symlink, so the
+/// reduction does not change it.
 ///
-/// The xattr drop stands at this one site, so it reaches every source the
-/// modifier shapes: the filesystem walk arrives with the set already empty, and
-/// an overlay of a committed tree and a devino-cache hit arrive with the set the
-/// stored object carries. The tar importer restores the archive's own set after
-/// this call, which is where `TarImportOptions::skip_xattrs` drops it instead.
+/// `SKIP_XATTRS` empties the xattr set and keeps the mode and the ownership.
+/// Each of the two flags empties the set here, before the callbacks, so a
+/// callback that supplies xattrs or an SELinux label still adds them.
 ///
-/// The mode this states is what the filter and the mode callback are shown. The
-/// mode the entry records is the one `canonical_mode` states over the
-/// callback's own result, the reduction standing last in the modifier order.
+/// The xattr drop is at this one site, so it applies to each source that the
+/// modifier shapes:
 ///
-/// The declared ownership is applied last, so a modifier that states both an
-/// id and the canonical flag records the id.
+/// - The file system walk. Its set is already empty.
+/// - An overlay of a committed tree, with the set of the stored object.
+/// - A devino-cache hit, with the set of the stored object.
+///
+/// The tar importer sets the xattr set of the archive again after this call.
+/// For this reason, `TarImportOptions::skip_xattrs` drops the set in the tar
+/// importer.
+///
+/// The filter and the mode callback get the mode that this function returns.
+/// The entry records the mode that `canonical_mode` returns for the result of
+/// the callback, because the reduction is the last step of the modifier order.
+///
+/// The declared ownership comes last in this function. If a modifier states an
+/// id and the canonical flag, the entry records the id.
 pub(crate) fn adjust_meta(
     flags: CommitModifierFlags,
     owner: Owner,
@@ -635,14 +777,15 @@ pub(crate) fn adjust_meta(
     meta
 }
 
-/// The canonical permission reduction of one entry's mode: the file type the
-/// walk found it with, and `perm & 0o755`. A symlink's mode is fixed by the
-/// object model and is returned as it stands.
+/// Returns the canonical permission reduction of the mode of one entry.
 ///
-/// The type comes from `entry_type` rather than from `mode`, so a mode callback
-/// that names a file type of its own -- what a `--statoverride` value carrying
-/// bits inside the file-type field does -- leaves the entry the kind the walk
-/// found. See `format-reference.md`, "CLI output formats", `commit`.
+/// The result is the file type that the walk found, and `perm & 0o755`. The
+/// object model fixes the mode of a symlink, so the function returns it
+/// unchanged.
+///
+/// The type comes from `entry_type`. A mode callback can name a file type of
+/// its own, as a `--statoverride` value with bits in the file-type field does.
+/// The entry then stays the kind that the walk found.
 fn canonical_mode(entry_type: u32, mode: u32) -> u32 {
     if entry_type == S_IFLNK {
         mode
@@ -651,16 +794,18 @@ fn canonical_mode(entry_type: u32, mode: u32) -> u32 {
     }
 }
 
-/// Apply the mode callback, the canonical permission reduction, the xattr
-/// callback, and the SELinux label hook, in that order. Runs the user
-/// callbacks, so it is invoked once per committed entry: after the filter, and
-/// over the stored metadata for an entry a devino-cache hit resolved.
+/// Applies the mode callback, the canonical permission reduction, the xattr
+/// callback, and the SELinux label hook, in that order.
 ///
-/// The reduction stands after the mode callback because that is the order the
-/// tool applies: `--mode-ro-executables`, then `--statoverride`, then
-/// `--canonical-permissions`, with the CLI carrying the first two in the mode
-/// callback. Both of the first two are cheap to state as an AND mask or an OR,
-/// and only `--statoverride` breaks commutativity with the reduction.
+/// The function runs the user callbacks, so it runs once for each committed
+/// entry. It runs after the filter. For a devino-cache hit, it runs on the
+/// stored metadata.
+///
+/// The reduction comes after the mode callback because the `ostree` command
+/// applies this order: `--mode-ro-executables`, then `--statoverride`, then
+/// `--canonical-permissions`. The CLI puts the first two in the mode callback.
+/// Each of the first two is an AND mask or an OR. Only `--statoverride` gives
+/// a different result if the reduction comes first.
 fn apply_callbacks(m: &mut CommitModifier, path: &Path, mut meta: FileMeta) -> Result<FileMeta> {
     let entry_type = meta.mode & S_IFMT;
     if let Some(callback) = &mut m.mode_callback {
@@ -676,7 +821,8 @@ fn apply_callbacks(m: &mut CommitModifier, path: &Path, mut meta: FileMeta) -> R
     }
 
     if let Some(callback) = &mut m.label_callback {
-        // Drop any pre-existing label so the callback's is never double-counted.
+        // Drop a label that the entry holds, so the label of the callback
+        // counts only once.
         meta.xattrs = without_selinux(&meta.xattrs)?;
         match callback(path, &meta) {
             Some(label) => meta.xattrs = with_selinux(&meta.xattrs, label)?,
@@ -693,8 +839,9 @@ fn apply_callbacks(m: &mut CommitModifier, path: &Path, mut meta: FileMeta) -> R
     Ok(meta)
 }
 
-/// Run the modifier's user callbacks over `meta`, returning it unchanged when no
-/// modifier is attached.
+/// Runs the user callbacks of the modifier on `meta`.
+///
+/// If no modifier is attached, the function returns `meta` unchanged.
 pub(crate) fn finalize_meta(
     modifier: Option<&mut CommitModifier>,
     path: &Path,
@@ -706,7 +853,7 @@ pub(crate) fn finalize_meta(
     }
 }
 
-/// Build a directory-metadata object from an adjusted entry's metadata.
+/// Returns the directory-metadata object for the adjusted metadata of an entry.
 pub(crate) fn to_dirmeta(meta: &FileMeta) -> DirMeta {
     DirMeta {
         uid: meta.uid,
@@ -716,9 +863,11 @@ pub(crate) fn to_dirmeta(meta: &FileMeta) -> DirMeta {
     }
 }
 
-/// Capture a directory's own metadata and all of its entries in one blocking
-/// pass. Each entry's own xattrs are read here unless `skip_xattrs`; a
-/// symlink's xattrs are read no-follow, the link itself rather than its target.
+/// Reads the metadata of a directory and all of its entries in one blocking
+/// pass.
+///
+/// If `skip_xattrs` is not set, the function reads the xattrs of each entry.
+/// It reads the xattrs of a symlink with no-follow, from the link itself.
 fn snapshot_dir(dir: BorrowedFd<'_>, skip_xattrs: bool) -> Result<DirSnapshot> {
     let stat = rustix::fs::fstat(dir)?;
     let dir_xattrs = if skip_xattrs {
@@ -786,9 +935,11 @@ fn snapshot_dir(dir: BorrowedFd<'_>, skip_xattrs: bool) -> Result<DirSnapshot> {
     })
 }
 
-/// Read an entry's own xattrs, no-follow. A regular file or directory is opened
-/// and read from its fd; a symlink cannot be opened for an fd, so its own xattrs
-/// are read through the path-based no-follow reader.
+/// Reads the xattrs of an entry, no-follow.
+///
+/// The function opens a regular file or a directory and reads from its fd. A
+/// symlink cannot give an fd, so the function reads its xattrs with the
+/// path-based no-follow reader.
 fn read_entry_xattrs(dir: BorrowedFd<'_>, name: &str, kind: &EntryKind) -> Result<Xattrs> {
     let oflags = match kind {
         EntryKind::Regular => OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -799,9 +950,10 @@ fn read_entry_xattrs(dir: BorrowedFd<'_>, name: &str, kind: &EntryKind) -> Resul
     crate::object::read_all_xattrs(fd.as_fd())
 }
 
-/// Open the walk root relative to `dfd`. An empty path or `.` opens `dfd`
-/// itself; any other path is opened no-follow so a symlink at the root is not
-/// traversed.
+/// Opens the walk root relative to `dfd`.
+///
+/// An empty path or `.` opens `dfd` itself. The function opens each other path
+/// no-follow, so it does not follow a symlink at the root.
 fn open_walk_root(dfd: BorrowedFd<'_>, path: &Path) -> Result<OwnedFd> {
     let name = if path.as_os_str().is_empty() {
         Path::new(".")
@@ -816,18 +968,19 @@ fn open_walk_root(dfd: BorrowedFd<'_>, path: &Path) -> Result<OwnedFd> {
     )?)
 }
 
-/// Remove the walk-root directory after a consuming walk.
+/// Removes the walk-root directory after a consuming walk.
 ///
-/// The test is on the bytes the path carries, so the root is spared where the
-/// path is exactly `.` and is removed under every other spelling, `./`
-/// included. This is the rule `docs/format-reference.md`, "CLI output
-/// formats", `commit` records for `--consume`.
+/// The test is on the bytes of the path. If the path is exactly `.`, the
+/// function keeps the root. It removes the root for each other spelling, `./`
+/// included. This is the rule of `ostree commit --consume`.
 ///
-/// The CLI opens each source itself and removes its own walk root, so this
-/// runs only for a caller that comes through the library API. A removal that
-/// fails is ignored: a root already gone leaves nothing to remove, an empty
-/// path names `dfd` itself, and the kernel refuses a path whose last component
-/// is `.`.
+/// The CLI opens each source and removes its own walk root, so this function
+/// runs only for a caller of the library API. The function ignores a failed
+/// removal for these reasons:
+///
+/// - If the root is already removed, nothing is left to remove.
+/// - An empty path names `dfd` itself.
+/// - The kernel refuses a path whose last component is `.`.
 fn remove_walk_root(dfd: BorrowedFd<'_>, path: &Path) {
     if path.as_os_str().as_bytes() == b"." {
         return;
@@ -835,9 +988,11 @@ fn remove_walk_root(dfd: BorrowedFd<'_>, path: &Path) {
     let _ = rustix::fs::unlinkat(dfd, path, AtFlags::REMOVEDIR);
 }
 
-/// Unlink an entry from a directory: a file, or a directory with `AT_REMOVEDIR`.
+/// Unlinks an entry from a directory: a file, or a directory with
+/// `AT_REMOVEDIR`.
 ///
-/// A removal that fails names the entry, which is how the tool reports it.
+/// The error of a failed removal names the entry, as the `ostree` command
+/// reports it.
 fn unlink(dir: BorrowedFd<'_>, name: &str, is_dir: bool) -> Result<()> {
     let flags = if is_dir {
         AtFlags::REMOVEDIR
@@ -847,23 +1002,27 @@ fn unlink(dir: BorrowedFd<'_>, name: &str, is_dir: bool) -> Result<()> {
     rustix::fs::unlinkat(dir, name, flags).map_err(|err| unlink_error(name, err))
 }
 
-/// Remove `name` under `dir` and everything below it. A consuming walk uses it
-/// for an entry the filter kept out of the commit, whose children were never
-/// visited and so were never removed one by one.
+/// Removes `name` under `dir` and all entries below it.
 ///
-/// The removal is a loop over an explicit stack of levels, and one descriptor
-/// stands open at a time: descending replaces the level's descriptor with the
-/// child's, and ascending replaces it with the one `..` opens, which names the
-/// parent while the emptied level is still linked where it was opened. Depth
-/// costs a name and an entry list on the heap, so a subtree deeper than the
-/// process descriptor limit is removed whole.
+/// A consuming walk uses it for an entry that the filter keeps out of the
+/// commit. The walk does not visit the children of such an entry, so it does
+/// not remove them one by one.
+///
+/// The removal is a loop over an explicit stack of levels. One descriptor is
+/// open at a time. A descent replaces the descriptor of the level with the
+/// descriptor of the child. An ascent replaces it with the descriptor that
+/// `..` opens. `..` names the parent because the emptied level is still linked
+/// where it was opened.
+///
+/// Each level costs a name and an entry list on the heap. The function can
+/// remove a subtree that is deeper than the descriptor limit of the process.
 fn remove_tree(dir: BorrowedFd<'_>, name: &str, is_dir: bool) -> Result<()> {
     if !is_dir {
         return unlink(dir, name, false);
     }
     let mut level = open_dir(dir, name).map_err(|err| unlink_error(name, err))?;
-    // One entry per level on the path from `name` down to the level in hand:
-    // the level's own name, and what is left to remove within it.
+    // One entry for each level from `name` to the current level: the name of
+    // the level, and the entries left to remove in it.
     let mut levels = vec![(name.to_owned(), read_level(level.as_fd(), name)?)];
 
     while let Some((_, entries)) = levels.last_mut() {
@@ -890,7 +1049,7 @@ fn remove_tree(dir: BorrowedFd<'_>, name: &str, is_dir: bool) -> Result<()> {
     Ok(())
 }
 
-/// Open `name` under `dir` as a directory, no-follow.
+/// Opens `name` under `dir` as a directory, no-follow.
 fn open_dir(dir: BorrowedFd<'_>, name: &str) -> std::result::Result<OwnedFd, Errno> {
     rustix::fs::openat(
         dir,
@@ -900,8 +1059,10 @@ fn open_dir(dir: BorrowedFd<'_>, name: &str) -> std::result::Result<OwnedFd, Err
     )
 }
 
-/// The entries of one directory level, each with whether it is a directory.
-/// `name` is the level's own name, which a failure to read it reports.
+/// Returns the entries of one directory level, each with a flag that is `true`
+/// for a directory.
+///
+/// `name` is the name of the level. The error of a failed read names it.
 fn read_level(level: BorrowedFd<'_>, name: &str) -> Result<Vec<(String, bool)>> {
     let mut entries = Vec::new();
     for entry in Dir::read_from(level).map_err(|err| unlink_error(name, err))? {
@@ -922,8 +1083,8 @@ fn read_level(level: BorrowedFd<'_>, name: &str) -> Result<Vec<(String, bool)>> 
     Ok(entries)
 }
 
-/// The error a failed removal reports: the entry's own name and the reason,
-/// spelled the way the tool spells it.
+/// Returns the error of a failed removal: the name of the entry and the
+/// reason, in the words of the `ostree` command.
 fn unlink_error(name: &str, err: Errno) -> Error {
     let reason = std::io::Error::from(err).to_string();
     let reason = match reason.find(" (os error ") {
@@ -936,7 +1097,7 @@ fn unlink_error(name: &str, err: Errno) -> Error {
     }
 }
 
-/// Join a walk path and an entry name into the modifier callback path.
+/// Joins a walk path and an entry name into the path for a modifier callback.
 pub(crate) fn join_path(parent: &str, name: &str) -> String {
     if parent == "/" {
         format!("/{name}")
@@ -951,7 +1112,7 @@ mod tests {
     use crate::{CreateOptions, Repo};
     use ostrya_rt::block_on;
 
-    /// A throwaway directory removed on drop.
+    /// A temporary directory that the drop removes.
     struct Scratch(std::path::PathBuf);
 
     impl Scratch {
@@ -973,7 +1134,7 @@ mod tests {
         }
     }
 
-    /// `GENERATE_SIZES` marks the transaction so commit assembly can emit
+    /// `GENERATE_SIZES` marks the transaction, so the commit can write
     /// `ostree.sizes`.
     #[test]
     fn generate_sizes_flag_marks_the_transaction() {
@@ -1005,8 +1166,9 @@ mod tests {
             assert!(txn.generate_sizes(), "GENERATE_SIZES marks the transaction");
             txn.abort().await.unwrap();
 
-            // Outside archive mode GENERATE_SIZES is a silent no-op: the flag is
-            // left unset, so commit assembly emits no empty `ostree.sizes`.
+            // Outside archive mode, GENERATE_SIZES does nothing and gives no
+            // message. The mark stays unset, so the commit writes no empty
+            // `ostree.sizes`.
             let repo = Repo::create(
                 &scratch.0.join("repo-bare"),
                 CreateOptions::new(RepoMode::BareUser),

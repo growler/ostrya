@@ -1,77 +1,13 @@
-//! Path-addressed tree construction over a transaction.
+//! Construction of a tree by path inside a transaction.
 //!
-//! A [`StagingTree`] builds a directory tree by path rather than by hand-walking
-//! a [`MutableTree`]. It borrows the transaction it stages
-//! into, so `close`, [`write_mtree`](crate::Transaction::write_mtree), commit is
-//! the only ordering that compiles. It is a port extension with no `ostree` tool
-//! counterpart and no on-disk format impact: every file, symlink, and directory
-//! it records flows through the 7a object writers and produces an ordinary 7b
-//! tree.
+//! A [`StagingTree`] builds a directory tree by path, over a [`MutableTree`].
+//! Each file, symlink, and directory goes through the object writers of the
+//! [`Transaction`], so the result is an ordinary tree.
 //!
-//! Concurrency. The tree sits behind a synchronous mutex held only across the
-//! brief map operations that read or mutate its structure. File writes stream
-//! outside that lock, so many [`write_file`](StagingTree::write_file) streams
-//! progress concurrently through one shared `&StagingTree`; each records its
-//! entry under the lock only at [`finish`](StagedFileWriter::finish). The async
-//! parts -- hydrating a lazily-loaded committed subdirectory, loading a symlink
-//! object during resolution, streaming payloads -- run between lock acquisitions,
-//! never across one. [`close`](StagingTree::close) hands back the assembled
-//! [`MutableTree`] and fails while any file writer is still
-//! outstanding, counted on the tree. A [`merge_at`](StagingTree::merge_at) that
-//! drops a directory, a [`remove`](StagingTree::remove) that takes an entry out,
-//! a [`clear_dir`](StagingTree::clear_dir) that reaches a directory, and a
-//! [`rename`](StagingTree::rename) are refused the same way while any file
-//! writer is outstanding, wherever in the tree it sits: a writer records its
-//! entry at [`finish`](StagedFileWriter::finish) under the component path it
-//! captured, and an entry dropped in between would leave that path stale.
-//!
-//! Path semantics. Intermediate path components resolve through symlinks; the
-//! final component never follows for a write. A relative symlink target resolves
-//! from the symlink's parent, an absolute target from the tree root, `..` clamps
-//! at the root, chains are capped, and a dangling target is an error. A write's
-//! parent directory must exist unless an implied dirmeta is set
-//! ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)), in which case
-//! the write creates its missing ancestors as directories carrying that
-//! dirmeta, and a [`merge_at`](StagingTree::merge_at) creates its whole base
-//! the same way; resolution for a read never creates a directory.
-//! [`make_dir_all`](StagingTree::make_dir_all) refuses a symlink at the last
-//! component of its path, since that component is the directory the call
-//! creates, and follows one at every component it crosses before that. Reads
-//! ([`read_file`](StagingTree::read_file), [`read_dir`](StagingTree::read_dir),
-//! [`lookup`](StagingTree::lookup)) take a `follow_symlinks` flag governing the
-//! final component. The [`merge_at`](StagingTree::merge_at) flag of that name
-//! governs the left-side entry names the merge reaches; the base's own final
-//! component follows either way. A path with no components -- `.`, `/`, and
-//! the empty path -- names the tree root, which
-//! [`ensure_dir`](StagingTree::ensure_dir) stamps and
-//! [`merge_at`](StagingTree::merge_at) merges into. Objects load from the
-//! transaction's staged set before `objects/`, so content staged in the
-//! current transaction is visible before it publishes.
-//!
-//! Refusals. Each condition carries its own [`Error`] variant naming the path
-//! resolution stopped at, so a caller branches on the variant:
-//! [`PathNotFound`](Error::PathNotFound),
-//! [`NotADirectory`](Error::NotADirectory),
-//! [`DanglingSymlink`](Error::DanglingSymlink),
-//! [`SymlinkLoop`](Error::SymlinkLoop), and
-//! [`EntryExists`](Error::EntryExists).
-//! [`Staging`](Error::Staging) carries what none of those names. Every typed
-//! refusal the staging tree raises reports one path form: the resolved literal
-//! component path, unrooted, with the tree root spelled `.`. A path that
-//! crosses a symlink reports the target's components, so a write under
-//! `opt -> usr/opt` reports `usr/opt`. An absent component reached while a
-//! symlink's target components are still queued reports
-//! [`DanglingSymlink`](Error::DanglingSymlink) for the innermost such symlink;
-//! once a target is spent, an absent component reports
-//! [`PathNotFound`](Error::PathNotFound). A `Staging` condition raised before
-//! resolution begins -- a path with no final component, a path ending in `..`,
-//! a path component that is not UTF-8 -- reports the path as the caller gave
-//! it, because no resolved form exists. A symlink target that is not UTF-8
-//! names no path. A directory in the way of a write reports
-//! [`ReplaceDirWithFile`](Error::ReplaceDirWithFile), whichever moment the
-//! directory appeared at; that variant names the entry rather than the
-//! resolved path, because the mutable-tree layer raises it, and it is the one
-//! carve-out from the path form.
+//! - [`Transaction::staging_tree`] creates a staging tree.
+//! - [`StagedFileWriter`] streams one regular file into the tree.
+//! - [`MergeOptions`] and [`RootDirmeta`] control a merge.
+//! - [`StagingEntry`] and [`StagingLookup`] tell what the tree holds at a path.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -91,8 +27,8 @@ use crate::mtree::{ChildKind, ChildRef, MutableTree};
 use crate::transaction::Transaction;
 use crate::write::{ContentWriter, FileMeta};
 
-/// The maximum number of symlinks a single path resolution follows before it is
-/// treated as a loop.
+/// The maximum number of symlinks that one path resolution follows. The next
+/// symlink is a loop.
 const MAX_SYMLINK_DEPTH: usize = 40;
 
 /// One meaningful path component: a name, or a parent-directory hop.
@@ -104,12 +40,13 @@ enum Comp {
 
 /// Where a path resolution ended.
 enum WalkEnd {
-    /// A directory at the given literal component path (all loaded directories).
+    /// A directory at the given literal component path. Each directory on the
+    /// path is loaded.
     Dir(Vec<String>),
     /// A file or symlink leaf, with the literal component path of its parent,
-    /// its entry name, and its content checksum. The parent path and the name
-    /// are what a refusal names, so a message reports where resolution actually
-    /// ended rather than the path the caller passed.
+    /// its entry name, and its content checksum. A refusal names the parent
+    /// path and the name, so a message reports the place where resolution
+    /// ended.
     Leaf {
         parent: Vec<String>,
         name: String,
@@ -117,48 +54,61 @@ enum WalkEnd {
     },
 }
 
-/// The dirmeta policy for one directory in a merge: the merge root
-/// ([`root_dirmeta`](MergeOptions::root_dirmeta)) or a directory a followed
-/// left-side symlink lands in
-/// ([`symlink_target_dirmeta`](MergeOptions::symlink_target_dirmeta)). Every
-/// other directory the merge reaches reconciles under either setting.
+/// The dirmeta policy for one directory of a merge.
+///
+/// The policy applies to the merge root
+/// ([`root_dirmeta`](MergeOptions::root_dirmeta)) and to a directory that a
+/// followed left-side symlink lands in
+/// ([`symlink_target_dirmeta`](MergeOptions::symlink_target_dirmeta)). Each
+/// other directory that the merge reaches reconciles under both settings.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum RootDirmeta {
-    /// Reconcile the directory like any other directory in the merge: an equal
-    /// dirmeta is silent, and a differing one is a conflict without
-    /// `allow_overwrite` and is taken from the right side with it.
+    /// The same reconciliation as each other directory of the merge.
+    ///
+    /// An equal dirmeta makes no change. A differing dirmeta is a conflict
+    /// without `allow_overwrite`. With `allow_overwrite`, the directory takes
+    /// the dirmeta of the right side.
     #[default]
     Reconcile,
-    /// Keep the left side's dirmeta for the directory, whatever the right side
-    /// carries for it. A left directory that carries none keeps none, and a
-    /// tree that holds a directory with no dirmeta cannot be written. Under
-    /// [`Reconcile`](RootDirmeta::Reconcile) such a directory takes the
-    /// dirmeta the right side carries for it, when the right side carries
+    /// The dirmeta of the left side, whatever the right side carries.
+    ///
+    /// A left directory with no dirmeta keeps none.
+    /// [`write_mtree`](crate::Transaction::write_mtree) refuses a tree that
+    /// holds a directory with no dirmeta. Under
+    /// [`Reconcile`](RootDirmeta::Reconcile), such a directory takes the
+    /// dirmeta that the right side carries for it, if the right side carries
     /// one.
     KeepLeft,
 }
 
-/// Options for [`StagingTree::merge`] and [`StagingTree::merge_at`].
+/// The options of [`StagingTree::merge`] and [`StagingTree::merge_at`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MergeOptions {
-    /// Take the right side's version on a conflict instead of failing.
+    /// Lets the right side win a conflict.
+    ///
+    /// If `false`, a conflict fails the merge with [`Error::MergeConflict`].
     pub allow_overwrite: bool,
-    /// Follow left-side symlinks during the merge: a right-side directory over a
-    /// left-side symlink merges into the symlink's target directory.
+    /// Follows left-side symlinks during the merge.
+    ///
+    /// A right-side directory over a left-side symlink then merges into the
+    /// target directory of the symlink.
     pub follow_symlinks: bool,
-    /// How the merge treats the merge root's own dirmeta. Governs the root
-    /// alone.
+    /// The dirmeta policy of the merge root alone.
     pub root_dirmeta: RootDirmeta,
-    /// How the merge treats the dirmeta of a directory reached by following a
-    /// left-side symlink (`follow_symlinks`). Applies at every such landing
-    /// the recursive merge reaches, independent of `root_dirmeta`, which
-    /// governs the merge root alone, a [`merge_at`](StagingTree::merge_at)
-    /// base that is itself a symlink included.
+    /// The dirmeta policy of each directory that a followed left-side symlink
+    /// lands in.
+    ///
+    /// The policy applies at each such landing that the recursive merge
+    /// reaches, and it does not depend on `root_dirmeta`. A
+    /// [`merge_at`](StagingTree::merge_at) base that is a symlink is the merge
+    /// root, so `root_dirmeta` applies to it.
     pub symlink_target_dirmeta: RootDirmeta,
 }
 
-/// One entry in a [`read_dir`](StagingTree::read_dir) listing. A directory under
-/// construction has no committed checksum, so it carries only its name.
+/// One entry of a [`read_dir`](StagingTree::read_dir) listing.
+///
+/// A directory in construction has no checksum yet, so a
+/// [`Dir`](StagingEntry::Dir) entry carries its name alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StagingEntry {
     /// A file or symlink, named by its content checksum.
@@ -168,21 +118,25 @@ pub enum StagingEntry {
         /// The content object checksum.
         checksum: Checksum,
     },
-    /// A subdirectory; no checksum until it is written.
+    /// A subdirectory.
+    ///
+    /// It has no checksum until
+    /// [`write_mtree`](crate::Transaction::write_mtree) writes it.
     Dir {
         /// The entry name.
         name: String,
     },
 }
 
-/// What [`lookup`](StagingTree::lookup) found at a path.
+/// The result of a [`lookup`](StagingTree::lookup) at a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StagingLookup {
-    /// No entry: a component along the path is absent.
+    /// No entry, because a component on the path is absent.
     Absent,
-    /// A regular file or symlink, named by its content checksum. The kind is
-    /// not recorded in the tree, so telling them apart means loading the
-    /// object; [`read_file`](StagingTree::read_file) does that.
+    /// A regular file or symlink, named by its content checksum.
+    ///
+    /// The tree does not record the kind, so only a load of the object tells
+    /// the two apart. [`read_file`](StagingTree::read_file) loads it.
     File {
         /// The content object checksum.
         checksum: Checksum,
@@ -191,37 +145,176 @@ pub enum StagingLookup {
     Dir,
 }
 
-/// Path-addressed construction over a transaction.
+/// A tree of a transaction that is built by path.
 ///
-/// Constructed with [`Transaction::staging_tree`] or
-/// [`Transaction::staging_tree_from_mutable_tree`]. `&StagingTree` is
-/// `Send + Sync`, so file writes may run concurrently.
+/// [`Transaction::staging_tree`] and
+/// [`Transaction::staging_tree_from_mutable_tree`] create a staging tree. It
+/// borrows the transaction, so the order [`close`](StagingTree::close),
+/// [`write_mtree`](crate::Transaction::write_mtree), and
+/// [`commit`](crate::Transaction::commit) is the only order that compiles.
 ///
-/// The tree and the outstanding-writer count are `Arc`-shared with the
-/// [`StagedFileWriter`]s handed out by [`write_file`](StagingTree::write_file),
-/// so a writer does not borrow the tree: [`close`](StagingTree::close) can be
-/// called with a writer still live and fails on the count rather than being
-/// rejected at compile time.
+/// The staging tree is an ostrya extension, with no equivalent in the
+/// `ostree` command. It does not change the on-disk format. Each file,
+/// symlink, and directory goes through the object writers of the
+/// transaction, and the result is an ordinary tree.
+///
+/// # Concurrency
+///
+/// `&StagingTree` is `Send + Sync`. A synchronous mutex guards the tree. An
+/// operation holds the mutex only for the short map operations that read or
+/// change the structure of the tree. These async steps run between two
+/// acquisitions of the mutex, and never hold it:
+///
+/// - the load of a committed subdirectory that is not loaded yet
+/// - the load of a symlink object during path resolution
+/// - the stream of a file payload
+///
+/// Many [`write_file`](StagingTree::write_file) streams can run at the same
+/// time through one shared `&StagingTree`. A file write streams outside the
+/// mutex. Each writer records its entry under the mutex, at
+/// [`finish`](StagedFileWriter::finish) only.
+///
+/// The tree counts its outstanding writers. Each [`StagedFileWriter`] shares
+/// the tree and the count through `Arc`, so a writer does not borrow the
+/// tree. A call to [`close`](StagingTree::close) with a live writer compiles,
+/// and fails at run time on the count.
+///
+/// While any file writer is outstanding, at any place in the tree, these
+/// operations fail with [`Staging`](Error::Staging):
+///
+/// - a [`merge_at`](StagingTree::merge_at) that drops a directory
+/// - a [`remove`](StagingTree::remove) that takes an entry out
+/// - a [`clear_dir`](StagingTree::clear_dir) that reaches a directory
+/// - a [`rename`](StagingTree::rename)
+///
+/// A writer records its entry under the component path that it captured
+/// when it started. If an entry on that path is dropped before
+/// [`finish`](StagedFileWriter::finish), the path becomes stale.
+///
+/// # Paths
+///
+/// - Each intermediate component resolves through symlinks. A write never
+///   follows a symlink at the final component.
+/// - A relative symlink target resolves from the parent of the symlink. An
+///   absolute target resolves from the tree root.
+/// - A `..` at the tree root stays at the root.
+/// - One resolution follows at most 40 symlinks. The next one gives
+///   [`SymlinkLoop`](Error::SymlinkLoop).
+/// - A dangling symlink target is an error.
+/// - A path with no components (`.`, `/`, and the empty path) names the tree
+///   root. [`ensure_dir`](StagingTree::ensure_dir) stamps the root, and
+///   [`merge_at`](StagingTree::merge_at) merges into it.
+///
+/// The parent directory of a write must exist. If an implied dirmeta is set
+/// ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)), the write
+/// creates its missing ancestors as directories with that dirmeta. A
+/// [`merge_at`](StagingTree::merge_at) creates its whole base in the same way.
+/// Path resolution for a read never creates a directory.
+///
+/// [`make_dir_all`](StagingTree::make_dir_all) refuses a symlink at the last
+/// component of its path, because that component is the directory that the
+/// call creates. It follows a symlink at each earlier component.
+///
+/// The reads [`read_file`](StagingTree::read_file),
+/// [`read_dir`](StagingTree::read_dir), and [`lookup`](StagingTree::lookup)
+/// take a `follow_symlinks` flag for the final component. The
+/// [`follow_symlinks`](MergeOptions::follow_symlinks) option of a merge
+/// controls the left-side entry names that the merge reaches. The final
+/// component of the merge base follows in both settings.
+///
+/// Objects load from the staged set of the transaction before `objects/`, so
+/// content that the current transaction stages is visible before the
+/// transaction publishes it.
+///
+/// # Error paths
+///
+/// Each refusal has its own [`Error`] variant, so a caller can branch on the
+/// variant:
+///
+/// - [`PathNotFound`](Error::PathNotFound)
+/// - [`NotADirectory`](Error::NotADirectory)
+/// - [`DanglingSymlink`](Error::DanglingSymlink)
+/// - [`SymlinkLoop`](Error::SymlinkLoop)
+/// - [`EntryExists`](Error::EntryExists)
+///
+/// [`Staging`](Error::Staging) carries each condition that these variants do
+/// not name.
+///
+/// Each typed refusal of the staging tree reports one path form: the resolved
+/// literal component path, with no leading `/`. The tree root is spelled `.`.
+///
+/// - A path that crosses a symlink reports the components of the target. A
+///   write under `opt -> usr/opt` reports `usr/opt`.
+/// - If a component is absent while components of a symlink target are still
+///   queued, the error is [`DanglingSymlink`](Error::DanglingSymlink) for the
+///   innermost such symlink. After the target is spent, an absent component
+///   gives [`PathNotFound`](Error::PathNotFound).
+/// - A [`Staging`](Error::Staging) condition before resolution starts reports
+///   the path as the caller gave it, because no resolved form exists. These
+///   conditions are a path with no final component, a path that ends in `..`,
+///   and a path component that is not UTF-8.
+/// - A symlink target that is not UTF-8 names no path.
+/// - A directory in the way of a write gives
+///   [`ReplaceDirWithFile`](Error::ReplaceDirWithFile), at whichever moment
+///   the directory appeared. This variant names the entry alone, because the
+///   mutable-tree layer raises it. It is the one exception to the path form.
+///
+/// # Examples
+///
+/// Write one file by path, then write the tree and commit it.
+///
+/// ```no_run
+/// # async fn run() -> ostrya::Result<()> {
+/// use std::path::Path;
+///
+/// use ostrya::{CommitOptions, DirMeta, FileMeta, Repo, Xattrs};
+///
+/// let repo = Repo::open("/srv/repo".as_ref()).await?;
+/// let txn = repo.transaction().await?;
+/// let dir = DirMeta { uid: 0, gid: 0, mode: 0o40755, xattrs: Xattrs::empty() };
+/// let st = txn.staging_tree(None).await?.with_implied_dirmeta(dir.clone());
+/// st.ensure_dir(Path::new("."), &dir).await?;
+/// let file = FileMeta::regular(0, 0, 0o644);
+/// st.write_file_content(Path::new("etc/hostname"), &file, b"example\n").await?;
+/// let mut tree = st.close()?;
+/// let root = txn.write_mtree(&mut tree).await?;
+/// let commit = txn.write_commit(CommitOptions::default(), &root).await?;
+/// txn.set_ref("exampleos/stable", Some(&commit));
+/// txn.commit().await?;
+/// # Ok(()) }
+/// ```
 pub struct StagingTree<'txn> {
     txn: &'txn Transaction,
     tree: Arc<Mutex<MutableTree>>,
-    /// Outstanding [`StagedFileWriter`] count; [`close`](StagingTree::close)
-    /// and a [`merge_at`](StagingTree::merge_at) that drops a directory both
-    /// fail while it is nonzero.
+    /// The count of outstanding [`StagedFileWriter`]s.
+    /// [`close`](StagingTree::close) and a [`merge_at`](StagingTree::merge_at)
+    /// that drops a directory fail while it is not zero.
     /// [`write_file`](StagingTree::write_file) increments it under the tree
-    /// lock and the merge check reads it under the same lock, so a
-    /// registration and a directory drop cannot miss each other.
+    /// lock, and the merge check reads it under the same lock. A registration
+    /// and a directory drop cannot miss each other.
     writers: Arc<AtomicUsize>,
-    /// The dirmeta applied to ancestors a write creates; `None` keeps a
+    /// The dirmeta of the ancestors that a write creates. `None` keeps a
     /// missing parent an error.
     implied_dirmeta: Option<DirMeta>,
 }
 
+/// Methods that create a staging tree.
 impl Transaction {
-    /// A staging tree over this transaction, empty or lazily hydrated from a
-    /// commit's root. Hydrating reads the commit's root dirtree, so this departs
-    /// from the synchronous API sketch (which is explicitly not final code) the
-    /// same way [`MutableTree::ensure_dir`](crate::MutableTree::ensure_dir) does.
+    /// Creates a staging tree over this transaction, empty or from a commit.
+    ///
+    /// With a `source` commit, the call reads the root dirtree of the commit,
+    /// and the tree loads each subdirectory when an operation first reaches
+    /// it. With `None`, the tree is empty and its root has no dirmeta.
+    /// [`write_mtree`](Transaction::write_mtree) refuses a root with no
+    /// dirmeta, so [`ensure_dir`](StagingTree::ensure_dir) on the path `.`
+    /// sets one.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if the root dirtree of `source` is not in
+    ///   the repository.
+    /// - [`Error::Core`] if the root dirtree is malformed.
+    /// - [`Error::Io`] if the read of the root dirtree fails.
     pub async fn staging_tree(&self, source: Option<&Commit>) -> Result<StagingTree<'_>> {
         let tree = match source {
             None => MutableTree::new(),
@@ -232,7 +325,8 @@ impl Transaction {
         Ok(StagingTree::from_tree(self, tree))
     }
 
-    /// A staging tree over this transaction wrapping an existing mutable tree.
+    /// Creates a staging tree over this transaction from an existing mutable
+    /// tree.
     pub fn staging_tree_from_mutable_tree(&self, source: MutableTree) -> StagingTree<'_> {
         StagingTree::from_tree(self, source)
     }
@@ -248,39 +342,52 @@ impl<'txn> StagingTree<'txn> {
         }
     }
 
-    /// The dirmeta applied to ancestors a write creates. Set once, at
-    /// construction; consuming the tree keeps the type free of interior
-    /// mutability. Left unset, a missing parent stays an error.
+    /// Returns this tree with `meta` as the dirmeta of the ancestors that writes create.
     ///
-    /// The policy applies to [`write_file`](StagingTree::write_file),
-    /// [`write_file_content`](StagingTree::write_file_content),
-    /// [`symlink`](StagingTree::symlink), [`hardlink`](StagingTree::hardlink),
-    /// [`place_object`](StagingTree::place_object),
-    /// [`ensure_dir`](StagingTree::ensure_dir), and the destination side of a
-    /// [`rename`](StagingTree::rename): ancestors the operation
-    /// creates take the policy dirmeta, and the leaf takes whatever the
-    /// operation itself supplies. A [`merge_at`](StagingTree::merge_at) base
-    /// is created under the same policy, its own final component included,
-    /// since the base names a directory rather than a leaf. Path resolution
-    /// for a read, a [`lookup`](StagingTree::lookup), a
-    /// [`remove`](StagingTree::remove), a
-    /// [`clear_dir`](StagingTree::clear_dir), the source side of a
-    /// [`hardlink`](StagingTree::hardlink), or the `from` side of a
-    /// [`rename`](StagingTree::rename) never creates a directory and never
-    /// stages a dirmeta object. [`make_dir`](StagingTree::make_dir) and
+    /// The dirmeta is set once, at construction. The method consumes the tree, so
+    /// the type needs no interior mutability. If no implied dirmeta is set, a
+    /// missing parent is an error.
+    ///
+    /// These operations create missing ancestors with this dirmeta:
+    ///
+    /// - [`write_file`](StagingTree::write_file)
+    /// - [`write_file_content`](StagingTree::write_file_content)
+    /// - [`symlink`](StagingTree::symlink)
+    /// - the destination side of a [`hardlink`](StagingTree::hardlink)
+    /// - [`place_object`](StagingTree::place_object)
+    /// - [`ensure_dir`](StagingTree::ensure_dir)
+    /// - the destination side of a [`rename`](StagingTree::rename)
+    ///
+    /// The leaf takes the metadata that the operation itself supplies. A
+    /// [`merge_at`](StagingTree::merge_at) base is created under the same policy,
+    /// its own final component included, because the base names a directory.
+    ///
+    /// These steps never create a directory and never stage a dirmeta object:
+    ///
+    /// - path resolution for a read
+    /// - a [`lookup`](StagingTree::lookup)
+    /// - a [`remove`](StagingTree::remove)
+    /// - a [`clear_dir`](StagingTree::clear_dir)
+    /// - the source side of a [`hardlink`](StagingTree::hardlink)
+    /// - the `from` side of a [`rename`](StagingTree::rename)
+    ///
+    /// [`make_dir`](StagingTree::make_dir) and
     /// [`make_dir_all`](StagingTree::make_dir_all) keep their own rules.
     ///
-    /// Ancestors created before a refused leaf stay in the tree, and a
-    /// component a later `..` steps back out of is created like any other
+    /// Ancestors that a call creates before a refused leaf stay in the tree. A
+    /// component that a later `..` steps back out of is created like any other
     /// ancestor.
     pub fn with_implied_dirmeta(mut self, meta: DirMeta) -> StagingTree<'txn> {
         self.implied_dirmeta = Some(meta);
         self
     }
 
-    /// Hand the assembled tree to the caller, for
-    /// [`write_mtree`](crate::Transaction::write_mtree). Fails while any
-    /// [`write_file`](StagingTree::write_file) writer is still outstanding.
+    /// Returns the assembled tree, for [`write_mtree`](crate::Transaction::write_mtree).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Staging`] if a writer from [`write_file`](StagingTree::write_file)
+    ///   is still outstanding.
     pub fn close(self) -> Result<MutableTree> {
         let outstanding = self.writers.load(Ordering::Acquire);
         if outstanding != 0 {
@@ -288,43 +395,65 @@ impl<'txn> StagingTree<'txn> {
                 "cannot close the staging tree: {outstanding} file writer(s) still outstanding"
             )));
         }
-        // The counter is authoritative: at zero, every writer has recorded its
+        // The counter is authoritative. At zero, each writer recorded its
         // entry (finish takes the tree lock before it decrements) or was
-        // abandoned. A finishing writer may still hold a tree Arc clone for the
-        // moment between its decrement and its drop, so take the tree out through
-        // the mutex rather than requiring sole Arc ownership. The Acquire load
-        // above pairs with the AcqRel decrement in finish, so that writer's
-        // replace_file is visible here. mem::take leaves an empty tree behind
-        // that is never observed, since the counter guarantees no writer records
-        // again.
+        // dropped. A finishing writer can still hold a clone of the tree Arc
+        // between its decrement and its drop. So the tree comes out through
+        // the mutex, and sole Arc ownership is not necessary. The Acquire load
+        // above pairs with the AcqRel decrement in finish, so the replace_file
+        // of that writer is visible here. mem::take leaves an empty tree
+        // behind. Nothing reads it, because the counter guarantees that no
+        // writer records again.
         let mut guard = self.tree.lock().unwrap();
         Ok(std::mem::take(&mut *guard))
     }
 
     // --- write operations ---
 
-    /// A streaming writer for one regular-file payload at `path`. The parent
-    /// directory must exist (intermediate components resolve through symlinks)
-    /// unless an implied dirmeta is set
-    /// ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)); the final
-    /// component never follows a symlink. Replaces an existing file or
-    /// symlink; a directory at `path` is refused with
-    /// [`ReplaceDirWithFile`](Error::ReplaceDirWithFile). A parent directory
-    /// dropped between path resolution and the writer's registration is
-    /// refused with [`Staging`](Error::Staging): the writer is not counted yet
-    /// in that window, so the writer guard holds off no concurrent operation,
-    /// and the registration re-check is what catches it.
+    /// Returns a streaming writer for one regular-file payload at `path`.
+    ///
+    /// The parent directory must exist, unless an implied dirmeta is set
+    /// ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)). Intermediate
+    /// components resolve through symlinks, and the final component never follows a
+    /// symlink. At [`finish`](StagedFileWriter::finish), the file replaces an
+    /// existing file or symlink at `path`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ReplaceDirWithFile`] if a directory is at `path`.
+    /// - [`Error::Staging`] if a concurrent operation drops the parent directory
+    ///   between path resolution and the registration of the writer. The writer is
+    ///   not counted in that window, so the writer guard holds off no concurrent
+    ///   operation. The check at registration finds the drop.
+    /// - [`Error::PathNotFound`], [`Error::NotADirectory`], [`Error::DanglingSymlink`],
+    ///   or [`Error::SymlinkLoop`] if the path does not resolve.
+    ///   [`StagingTree`](StagingTree#error-paths) states the path that each one
+    ///   names.
+    /// - [`Error::Staging`] if `path` has no final component, ends in `..`, or has
+    ///   a component that is not UTF-8.
+    /// - [`Error::Core`] if the mode in `meta` is not a regular-file mode or a
+    ///   symlink mode.
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`, or
+    ///   if `[ex-integrity] fsverity` is `yes` and the fs-verity seal of a staged
+    ///   dirmeta object fails.
+    /// - [`Error::ObjectNotFound`] if a symlink object or a committed dirtree that
+    ///   the walk loads is not in the repository.
+    /// - [`Error::InsufficientFreeSpace`] if a staged dirmeta object needs more
+    ///   space than the free-space budget of the transaction holds.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if a `[core]`, `[archive]`, or
+    ///   `[ex-integrity]` value in the repository config is malformed.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_file(&self, path: &Path, meta: &FileMeta) -> Result<StagedFileWriter<'txn>> {
         let (parent, name) = self.resolve_write_parent(path).await?;
         self.check_writable_leaf(&parent, &name)?;
         let writer = self.txn.content_writer(None, meta).await?;
         {
-            // Register under the tree lock, re-checking the parent: every
+            // Register under the tree lock, and check the parent again. Each
             // merge arm that drops a directory reads a zero count under this
-            // same lock before it drops, so a writer registered against a
+            // same lock before it drops. So a writer registered against a
             // parent that still exists keeps its captured path valid for its
-            // whole life, and a parent a concurrent merge already dropped is
-            // refused here rather than surfacing at finish.
+            // whole life. A parent that a concurrent merge already dropped
+            // fails here, before finish.
             let tree = self.tree.lock().unwrap();
             if tree.dir_at(&parent).is_none() {
                 return Err(Error::Staging(dir_gone(&parent)));
@@ -340,9 +469,34 @@ impl<'txn> StagingTree<'txn> {
         })
     }
 
-    /// Write a regular file at `path` whose content the caller already holds.
-    /// Replaces an existing file or symlink; a directory at `path` is refused
-    /// with [`ReplaceDirWithFile`](Error::ReplaceDirWithFile).
+    /// Writes a regular file at `path` from content that the caller holds.
+    ///
+    /// The file replaces an existing file or symlink at `path`. The path rules of
+    /// [`write_file`](StagingTree::write_file) apply.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ReplaceDirWithFile`] if a directory is at `path`.
+    /// - [`Error::PathNotFound`], [`Error::NotADirectory`], [`Error::DanglingSymlink`],
+    ///   or [`Error::SymlinkLoop`] if the path does not resolve.
+    ///   [`StagingTree`](StagingTree#error-paths) states the path that each one
+    ///   names.
+    /// - [`Error::Staging`] if `path` has no final component, ends in `..`, or has
+    ///   a component that is not UTF-8.
+    /// - [`Error::Core`] if the mode in `meta` is not a regular-file mode or a
+    ///   symlink mode.
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`, or
+    ///   if `[ex-integrity] fsverity` is `yes` and the fs-verity seal of the
+    ///   object fails.
+    /// - [`Error::ObjectNotFound`] if a symlink object or a committed dirtree that
+    ///   the walk loads is not in the repository.
+    /// - [`Error::Staging`] if a concurrent operation removes a directory on the
+    ///   path while the call uses it.
+    /// - [`Error::InsufficientFreeSpace`] if a staged object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if a `[core]`, `[archive]`, or
+    ///   `[ex-integrity]` value in the repository config is malformed.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_file_content(
         &self,
         path: &Path,
@@ -355,8 +509,32 @@ impl<'txn> StagingTree<'txn> {
         self.with_dir_mut(&parent, |dir| dir.replace_file(&name, checksum))
     }
 
-    /// Create the directory `path`, whose parent must exist. Fails on any
-    /// existing entry.
+    /// Creates the directory `path`, whose parent must exist.
+    ///
+    /// The call never creates a parent, also when an implied dirmeta is set.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::EntryExists`] if an entry of any kind is at `path`.
+    /// - [`Error::PathNotFound`], [`Error::NotADirectory`], [`Error::DanglingSymlink`],
+    ///   or [`Error::SymlinkLoop`] if the path does not resolve.
+    ///   [`StagingTree`](StagingTree#error-paths) states the path that each one
+    ///   names.
+    /// - [`Error::Staging`] if `path` has no final component, ends in `..`, or has
+    ///   a component that is not UTF-8.
+    /// - [`Error::Core`] if `meta` does not hold a directory mode.
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`, or
+    ///   if `[ex-integrity] fsverity` is `yes` and the fs-verity seal of a staged
+    ///   object fails.
+    /// - [`Error::ObjectNotFound`] if a symlink object or a committed dirtree that
+    ///   the walk loads is not in the repository.
+    /// - [`Error::Staging`] if a concurrent operation removes a directory on the
+    ///   path while the call uses it.
+    /// - [`Error::InsufficientFreeSpace`] if a staged object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if a `[core]`, `[archive]`, or
+    ///   `[ex-integrity]` value in the repository config is malformed.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn make_dir(&self, path: &Path, meta: &DirMeta) -> Result<()> {
         let (parent, name) = self.resolve_parent(path).await?;
         if !matches!(self.peek(&parent, &name)?, ChildKind::Absent) {
@@ -372,50 +550,79 @@ impl<'txn> StagingTree<'txn> {
         })
     }
 
-    /// Create `path` and any missing ancestors, applying `meta` to the
-    /// directories it creates and leaving existing ones untouched.
+    /// Creates `path` and its missing ancestors, with `meta` on each new directory.
     ///
-    /// A symlink at the last component of `path` is refused with
-    /// [`EntryExists`](Error::EntryExists), because that component is the
-    /// directory the call creates. A base root filesystem can ship `/var` or
-    /// `/usr/etc` as a symlink onto another directory. The refusal reports that
-    /// alias to the caller, which then decides where the content belongs. The
-    /// refusal holds whatever the symlink points at, and it comes before the
-    /// target resolves, so a dangling symlink at that component is
-    /// [`EntryExists`](Error::EntryExists) as well. A regular file at the same
-    /// component is [`NotADirectory`](Error::NotADirectory). `mkdir -p` accepts
-    /// a symlink to a directory there and exits zero.
+    /// The call does not change an existing directory.
     ///
-    /// A symlink at an earlier component resolves to its target directory, and
-    /// the components after it are created under that target. A `..` hop after
-    /// a symlink makes that symlink an earlier component, so
-    /// `make_dir_all("var/lock/..")` follows a `var/lock` alias, pops to the
-    /// target's parent, and creates nothing at the alias.
+    /// # Symlinks
     ///
-    /// The directories the walk creates before a refusal stay in the tree. A
-    /// directory a later `..` steps back out of is created like any other
+    /// A symlink at the last component of `path` gives
+    /// [`EntryExists`](Error::EntryExists), because that component is the directory
+    /// that the call creates. A base root file system can ship `/var` or
+    /// `/usr/etc` as a symlink to another directory. The refusal reports that alias
+    /// to the caller, and the caller decides where the content goes.
+    ///
+    /// The refusal comes before the target resolves, and it does not depend on the
+    /// target. A dangling symlink at that component also gives
+    /// [`EntryExists`](Error::EntryExists). A regular file at that component gives
+    /// [`NotADirectory`](Error::NotADirectory). `mkdir -p` accepts a symlink to a
+    /// directory there and exits with status zero.
+    ///
+    /// A symlink at an earlier component resolves to its target directory, and the
+    /// call creates the next components under that target. A `..` after a symlink
+    /// makes that symlink an earlier component. For example,
+    /// `make_dir_all("var/lock/..")`
+    /// follows a `var/lock` alias, goes up to the parent of the target, and creates
+    /// nothing at the alias.
+    ///
+    /// # Partial results
+    ///
+    /// The directories that the walk creates before a refusal stay in the tree. A
+    /// directory that a later `..` steps back out of is created like any other
     /// ancestor. The implied-dirmeta policy follows the same rule
     /// ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::EntryExists`] if a symlink is at the last component of `path`.
+    /// - [`Error::NotADirectory`] if a file is at a component of `path`, or if a
+    ///   symlink on the path resolves to a file.
+    /// - [`Error::DanglingSymlink`] or [`Error::SymlinkLoop`] if a symlink on the
+    ///   path does not resolve.
+    /// - [`Error::Staging`] if a component of `path` is not UTF-8.
+    /// - [`Error::Core`] if `meta` does not hold a directory mode.
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`, or
+    ///   if `[ex-integrity] fsverity` is `yes` and the fs-verity seal of a staged
+    ///   object fails.
+    /// - [`Error::ObjectNotFound`] if a symlink object or a committed dirtree that
+    ///   the walk loads is not in the repository.
+    /// - [`Error::Staging`] if a concurrent operation removes a directory on the
+    ///   path while the call uses it.
+    /// - [`Error::InsufficientFreeSpace`] if a staged object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if a `[core]`, `[archive]`, or
+    ///   `[ex-integrity]` value in the repository config is malformed.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn make_dir_all(&self, path: &Path, meta: &DirMeta) -> Result<()> {
         self.walk_creating(components_of(path)?, meta, true).await?;
         Ok(())
     }
 
-    /// Walk `comps` from the tree root, creating each absent component as a
-    /// directory carrying `meta` and following symlinks to directories.
-    /// Returns the literal component path the walk reached.
+    /// Walks `comps` from the tree root and returns the literal component
+    /// path that the walk reached. The walk creates each absent component as
+    /// a directory with `meta`, and follows symlinks to directories.
     ///
     /// With `refuse_final_symlink`, a symlink at the last element of `comps` is
     /// [`EntryExists`](Error::EntryExists). Without it, the walk follows that
-    /// symlink to its target directory. Every earlier element follows such a
-    /// symlink under either setting, and a last element that is a `Comp::Parent`
-    /// hop pops the resolved path and ends the walk, so a `comps` ending in
-    /// `..` has no element the flag applies to.
+    /// symlink to its target directory. Each earlier element follows such a
+    /// symlink under both settings. A last element that is a `Comp::Parent`
+    /// hop pops the resolved path and ends the walk. The flag applies to no
+    /// element of a `comps` that ends in `..`.
     /// [`make_dir_all`](StagingTree::make_dir_all) sets it, because that
-    /// element is the directory the call creates. The two resolution walks
-    /// clear it, because for them the last element of `comps` is a parent
-    /// directory that must follow a symlink: the parent of
-    /// a write under an implied dirmeta
+    /// element is the directory that the call creates. The two resolution
+    /// walks clear it. For them, the last element of `comps` is a parent
+    /// directory that must follow a symlink. These are the parent of a write under an
+    /// implied dirmeta
     /// ([`resolve_write_parent`](StagingTree::resolve_write_parent)) and the
     /// base of a [`merge_at`](StagingTree::merge_at)
     /// ([`resolve_merge_base`](StagingTree::resolve_merge_base)).
@@ -456,8 +663,9 @@ impl<'txn> StagingTree<'txn> {
                     };
                     self.with_dir_mut(&cur, |dir| {
                         match dir.child_kind(&name) {
-                            // A concurrent op may have created it; only create if
-                            // still absent, and reject a non-directory in the way.
+                            // A concurrent op can have created it. Create it
+                            // only if it is still absent, and reject a
+                            // non-directory in the way.
                             ChildKind::Absent => dir.insert_empty_dir(&name, Some(dm)),
                             ChildKind::File(_) => {
                                 return Err(Error::NotADirectory {
@@ -472,24 +680,24 @@ impl<'txn> StagingTree<'txn> {
                     cur.push(name);
                 }
                 ChildKind::File(checksum) => {
-                    // Follow a symlink to a directory; a regular file is an error.
+                    // Follow a symlink to a directory. A regular file is an error.
                     let obj = self.txn.load_file_staged_first(&checksum).await?;
                     match obj.kind {
                         FileKind::Symlink { target } => {
                             // The caller that creates the last component takes
                             // a symlink there as an entry already present. The
-                            // check precedes the target walk, so what the
-                            // symlink points at leaves the refusal the same.
+                            // check comes before the target walk, so the
+                            // refusal does not depend on the symlink target.
                             if refuse_final_symlink && is_final {
                                 return Err(entry_exists(&cur, &name));
                             }
-                            // An absent component the target walk reaches
-                            // belongs to this symlink: the walk consumes the
+                            // An absent component that the target walk reaches
+                            // belongs to this symlink. The walk consumes the
                             // target alone, so its `PathNotFound` is never one
-                            // of the caller's own components. An inner
-                            // symlink's own dangling report passes through, so
-                            // the innermost open symlink is the one named,
-                            // matching `walk_from`.
+                            // of the components of the caller. The dangling
+                            // report of an inner symlink passes through, so
+                            // the error names the innermost open symlink, the
+                            // same as `walk_from`.
                             let link = join(&cur, &name);
                             cur = match self.resolve_symlink_dir(&cur, &target).await {
                                 Ok(dir) => dir,
@@ -511,32 +719,54 @@ impl<'txn> StagingTree<'txn> {
         Ok(cur)
     }
 
-    /// Create the directory at `path`, or reuse an existing one and stamp
-    /// `meta` onto it. A file or symlink at `path` is
-    /// [`NotADirectory`](Error::NotADirectory). The dirmeta object is staged
-    /// only when the directory is created or its recorded dirmeta differs, so
-    /// an unchanged call materializes no object. A lazily-loaded committed
-    /// directory is never hydrated: its recorded dirmeta is compared, and a
-    /// differing one is rewritten in place, because the child's contents do
-    /// not change.
+    /// Creates the directory at `path`, or sets `meta` on an existing one.
     ///
-    /// A `path` with no components -- `.`, `/`, and the empty path -- names
-    /// the tree root, which takes the same comparison and the same stamp. No
-    /// parent directory holds the root, so the root is a directory in every
-    /// call. [`close`](StagingTree::close) hands back a tree whose root
-    /// carries the stamped dirmeta, and
-    /// [`write_mtree`](crate::Transaction::write_mtree) records it as the
-    /// root dirmeta of the tree it returns.
+    /// A file or symlink at `path` gives [`NotADirectory`](Error::NotADirectory).
+    /// The call stages the dirmeta object only for a new directory or for a
+    /// differing recorded dirmeta. A call with no change stages no object.
+    ///
+    /// The call never loads a committed directory that is not loaded yet. It
+    /// compares the recorded dirmeta, and it rewrites a differing one in place,
+    /// because the content of the directory does not change.
+    ///
+    /// A `path` with no components (`.`, `/`, and the empty path) names the tree
+    /// root, which takes the same comparison and the same stamp. No parent directory
+    /// holds the root, so the root is a directory in every call.
+    /// [`close`](StagingTree::close) returns a tree whose root has the stamped
+    /// dirmeta, and [`write_mtree`](crate::Transaction::write_mtree) records it as
+    /// the root dirmeta of the tree that it returns.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotADirectory`] if a file or a symlink is at `path`.
+    /// - [`Error::PathNotFound`], [`Error::NotADirectory`], [`Error::DanglingSymlink`],
+    ///   or [`Error::SymlinkLoop`] if the path does not resolve.
+    ///   [`StagingTree`](StagingTree#error-paths) states the path that each one
+    ///   names.
+    /// - [`Error::Staging`] if `path` ends in `..` or has a component that is not
+    ///   UTF-8.
+    /// - [`Error::Core`] if `meta` does not hold a directory mode.
+    /// - [`Error::Unsupported`] if the call stages a dirmeta object in a
+    ///   `bare-split-xattrs` repository, or if its fs-verity seal fails under
+    ///   `[ex-integrity] fsverity` = `yes`.
+    /// - [`Error::ObjectNotFound`] if a symlink object or a committed dirtree that
+    ///   the walk loads is not in the repository.
+    /// - [`Error::Staging`] if a concurrent operation removes a directory on the
+    ///   path while the call uses it.
+    /// - [`Error::InsufficientFreeSpace`] if a staged object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if a `[core]`, `[archive]`, or
+    ///   `[ex-integrity]` value in the repository config is malformed.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn ensure_dir(&self, path: &Path, meta: &DirMeta) -> Result<()> {
         if components_of(path)?.is_empty() {
-            // The tree root, which no parent directory holds: the comparison
-            // reads the root's own recorded dirmeta and the stamp sets it
-            // there. Staging is async and runs outside the lock, and the root
-            // is a directory in every acquisition, so the mutating
-            // acquisition repeats no decision: it stamps what the comparison
-            // read. Two stamps of differing dirmetas leave the last one
-            // recorded, the last-writer-wins rule a raced staging write
-            // follows.
+            // The tree root, which no parent directory holds. The comparison
+            // reads the recorded dirmeta of the root, and the stamp sets it
+            // there. Staging is async and runs outside the lock. The root is a
+            // directory in every acquisition, so the mutating acquisition
+            // repeats no decision: it stamps what the comparison read. Of two
+            // stamps with differing dirmetas, the last one stays recorded.
+            // This is the last-writer-wins rule of a raced staging write.
             let new_dirmeta = self.txn.dirmeta_checksum(meta)?;
             if self.with_dir(&[], |dir| dir.metadata_checksum())? == Some(new_dirmeta) {
                 return Ok(());
@@ -567,9 +797,9 @@ impl<'txn> StagingTree<'txn> {
             return Ok(());
         }
         // Staging is async and runs outside the lock, so the mutating
-        // acquisition repeats the decision: still absent inserts, a directory
-        // takes the new dirmeta, and a file that appeared in the way is
-        // rejected.
+        // acquisition repeats the decision. An entry that is still absent is
+        // inserted, a directory takes the new dirmeta, and a file that
+        // appeared in the way is rejected.
         let dirmeta = self.stage_dirmeta(meta).await?;
         self.with_dir_mut(&parent, |dir| match dir.child_kind(&name) {
             ChildKind::Absent => {
@@ -583,10 +813,34 @@ impl<'txn> StagingTree<'txn> {
         })
     }
 
-    /// Create a symlink at `path` pointing at `target`. The mode is fixed by the
-    /// object model, so only `meta`'s owner and xattrs are used. Replaces an
-    /// existing file or symlink; a directory at `path` is refused with
-    /// [`ReplaceDirWithFile`](Error::ReplaceDirWithFile).
+    /// Creates a symlink at `path` that points at `target`.
+    ///
+    /// The object model fixes the mode of a symlink, so the call uses only the owner
+    /// and the xattrs of `meta`. The symlink replaces an existing file or symlink at
+    /// `path`. The path rules of [`write_file`](StagingTree::write_file) apply.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ReplaceDirWithFile`] if a directory is at `path`.
+    /// - [`Error::Staging`] if `target` is not UTF-8.
+    /// - [`Error::PathNotFound`], [`Error::NotADirectory`], [`Error::DanglingSymlink`],
+    ///   or [`Error::SymlinkLoop`] if the path does not resolve.
+    ///   [`StagingTree`](StagingTree#error-paths) states the path that each one
+    ///   names.
+    /// - [`Error::Staging`] if `path` has no final component, ends in `..`, or has
+    ///   a component that is not UTF-8.
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`, or
+    ///   if `[ex-integrity] fsverity` is `yes` and the fs-verity seal of a staged
+    ///   object fails.
+    /// - [`Error::ObjectNotFound`] if a symlink object or a committed dirtree that
+    ///   the walk loads is not in the repository.
+    /// - [`Error::Staging`] if a concurrent operation removes a directory on the
+    ///   path while the call uses it.
+    /// - [`Error::InsufficientFreeSpace`] if a staged object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if a `[core]`, `[archive]`, or
+    ///   `[ex-integrity]` value in the repository config is malformed.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn symlink(&self, path: &Path, target: &Path, meta: &FileMeta) -> Result<()> {
         let (parent, name) = self.resolve_write_parent(path).await?;
         self.check_writable_leaf(&parent, &name)?;
@@ -597,12 +851,36 @@ impl<'txn> StagingTree<'txn> {
         self.with_dir_mut(&parent, |dir| dir.replace_file(&name, checksum))
     }
 
-    /// Record a second tree entry at `path` for the content object found at
-    /// `target`. The object carries all metadata, so none is taken. The final
-    /// component of `target` is not followed, so a symlink is hardlinked as the
-    /// symlink object. Replaces an existing file or symlink at `path`; a
-    /// directory there is refused with
-    /// [`ReplaceDirWithFile`](Error::ReplaceDirWithFile).
+    /// Records a second tree entry at `path` for the content object at `target`.
+    ///
+    /// The object carries all the metadata, so the call takes none. The call does not
+    /// follow the final component of `target`, so a symlink is hardlinked as the
+    /// symlink object. The new entry replaces an existing file or symlink at
+    /// `path`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ReplaceDirWithFile`] if a directory is at `path`.
+    /// - [`Error::Staging`] if `target` names a directory.
+    /// - [`Error::PathNotFound`], [`Error::NotADirectory`], [`Error::DanglingSymlink`],
+    ///   or [`Error::SymlinkLoop`] if `target` or the parent of `path` does not
+    ///   resolve. [`StagingTree`](StagingTree#error-paths) states the path that each
+    ///   one names.
+    /// - [`Error::Staging`] if `path` has no final component, ends in `..`, or has
+    ///   a component that is not UTF-8.
+    /// - [`Error::Staging`] if a component of `target` is not UTF-8.
+    /// - [`Error::Unsupported`] if the call stages a dirmeta object in a
+    ///   `bare-split-xattrs` repository, or if its fs-verity seal fails under
+    ///   `[ex-integrity] fsverity` = `yes`.
+    /// - [`Error::ObjectNotFound`] if a symlink object or a committed dirtree that
+    ///   the walk loads is not in the repository.
+    /// - [`Error::Staging`] if a concurrent operation removes a directory on the
+    ///   path while the call uses it.
+    /// - [`Error::InsufficientFreeSpace`] if a staged object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if a `[core]`, `[archive]`, or
+    ///   `[ex-integrity]` value in the repository config is malformed.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn hardlink(&self, path: &Path, target: &Path) -> Result<()> {
         let checksum = match self
             .walk_from(Vec::new(), components_of(target)?, false)
@@ -621,14 +899,37 @@ impl<'txn> StagingTree<'txn> {
         self.with_dir_mut(&parent, |dir| dir.replace_file(&name, checksum))
     }
 
-    /// Record `checksum` as the file entry at `path`. An identical checksum
-    /// already there is silent; a differing entry or a directory is
-    /// [`MergeConflict`](Error::MergeConflict). The rule is decided and applied
-    /// under one lock acquisition, so concurrent placements of differing
-    /// checksums at one path resolve to one recorded winner and a conflict for
-    /// each losing call, never a silent overwrite. The object's presence in
-    /// the store is not checked, the same as
+    /// Records `checksum` as the file entry at `path`.
+    ///
+    /// The same checksum at `path` makes no change. The call decides and applies
+    /// this rule under one lock acquisition. If concurrent calls place differing
+    /// checksums at one path, one of them is recorded and each other call gets a
+    /// conflict. No call overwrites another call without an error. The call does not
+    /// check that the object is in the store, the same as
     /// [`write_mtree`](crate::Transaction::write_mtree).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::MergeConflict`] if a differing file entry or a directory is at
+    ///   `path`.
+    /// - [`Error::PathNotFound`], [`Error::NotADirectory`], [`Error::DanglingSymlink`],
+    ///   or [`Error::SymlinkLoop`] if the path does not resolve.
+    ///   [`StagingTree`](StagingTree#error-paths) states the path that each one
+    ///   names.
+    /// - [`Error::Staging`] if `path` has no final component, ends in `..`, or has
+    ///   a component that is not UTF-8.
+    /// - [`Error::Unsupported`] if the call stages a dirmeta object in a
+    ///   `bare-split-xattrs` repository, or if its fs-verity seal fails under
+    ///   `[ex-integrity] fsverity` = `yes`.
+    /// - [`Error::ObjectNotFound`] if a symlink object or a committed dirtree that
+    ///   the walk loads is not in the repository.
+    /// - [`Error::Staging`] if a concurrent operation removes a directory on the
+    ///   path while the call uses it.
+    /// - [`Error::InsufficientFreeSpace`] if a staged object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if a `[core]`, `[archive]`, or
+    ///   `[ex-integrity]` value in the repository config is malformed.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn place_object(&self, path: &Path, checksum: &Checksum) -> Result<()> {
         let (parent, name) = self.resolve_write_parent(path).await?;
         self.with_dir_mut(&parent, |dir| match dir.child_kind(&name) {
@@ -645,15 +946,30 @@ impl<'txn> StagingTree<'txn> {
         })
     }
 
-    /// Remove the entry at `path`, subtree and all. The final component is
-    /// never followed, so removing a symlink removes the symlink. With
-    /// `allow_noent`, an absent entry, an absent ancestor, and a dangling
-    /// intermediate symlink are all `Ok`; without it, an absent entry is
-    /// [`PathNotFound`](Error::PathNotFound) and the other two stay the
-    /// errors the walk types. A call that takes an entry out is refused with
-    /// [`Staging`](Error::Staging) while any
-    /// [`write_file`](StagingTree::write_file) writer is outstanding, wherever
-    /// in the tree it sits; a call that removes nothing is not.
+    /// Removes the entry at `path`, with its whole subtree.
+    ///
+    /// The call never follows the final component, so the removal of a symlink
+    /// removes the symlink. With `allow_noent`, the call returns `Ok` for an
+    /// absent entry, an absent ancestor, and a dangling intermediate symlink.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::PathNotFound`] if no entry is at `path` and `allow_noent` is
+    ///   `false`.
+    /// - [`Error::Staging`] if the call takes an entry out while any writer from
+    ///   [`write_file`](StagingTree::write_file) is outstanding, at any place in
+    ///   the tree. A call that removes nothing does not check the writers.
+    /// - [`Error::PathNotFound`] or [`Error::DanglingSymlink`] if an ancestor does
+    ///   not resolve and `allow_noent` is `false`.
+    /// - [`Error::NotADirectory`] or [`Error::SymlinkLoop`] if an ancestor does
+    ///   not resolve, also with `allow_noent`.
+    /// - [`Error::Staging`] if `path` has no final component, ends in `..`, or has
+    ///   a component that is not UTF-8.
+    /// - [`Error::ObjectNotFound`] if a symlink object or a committed dirtree that
+    ///   the walk loads is not in the repository.
+    /// - [`Error::Staging`] if a concurrent operation removes a directory on the
+    ///   path while the call uses it.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn remove(&self, path: &Path, allow_noent: bool) -> Result<()> {
         let (parent, name) = match self.resolve_parent(path).await {
             Ok(resolved) => resolved,
@@ -663,10 +979,10 @@ impl<'txn> StagingTree<'txn> {
             Err(e) => return Err(e),
         };
         // The absent-entry outcome is decided under the same acquisition that
-        // removes the entry, so an entry appearing in between cannot be
-        // missed; the mutable-tree refusal is never the answer a caller sees.
-        // A call that removes nothing consults no writer guard, matching the
-        // merge arms, which ask only where they are about to drop.
+        // removes the entry, so the call cannot miss an entry that appears in
+        // between. A caller never sees the mutable-tree refusal. A call that
+        // removes nothing reads no writer guard. The merge arms do the same:
+        // they read the guard only where they are about to drop.
         self.with_dir_mut(&parent, |dir| match dir.child_kind(&name) {
             ChildKind::Absent if allow_noent => Ok(()),
             ChildKind::Absent => Err(Error::PathNotFound {
@@ -679,20 +995,39 @@ impl<'txn> StagingTree<'txn> {
         })
     }
 
-    /// Remove every entry under `path`, keeping the directory and its
-    /// dirmeta. The final component is never followed, so a file at `path`,
-    /// and a symlink there even where it points at a directory, is
-    /// [`NotADirectory`](Error::NotADirectory). `path` names a directory
-    /// below the root, so the root itself cannot be cleared. With
-    /// `allow_noent`, an absent directory -- an absent ancestor and a
-    /// dangling intermediate symlink included -- is `Ok`. A lazily-loaded
-    /// committed directory is never hydrated: its entry is replaced by an
-    /// empty loaded directory keeping the recorded dirmeta checksum, so no
-    /// dirtree is read. A call that reaches a directory is refused with
-    /// [`Staging`](Error::Staging) while any
-    /// [`write_file`](StagingTree::write_file) writer is outstanding,
-    /// wherever in the tree it sits, whether or not that directory holds
-    /// entries; a call over an absent directory under `allow_noent` is not.
+    /// Removes each entry under `path`, and keeps the directory and its dirmeta.
+    ///
+    /// The call never follows the final component. A file at `path` gives
+    /// [`NotADirectory`](Error::NotADirectory), and a symlink there gives the same
+    /// error, also a symlink to a directory. `path` names a directory below the
+    /// root, so the call cannot clear the root itself. With `allow_noent`, an
+    /// absent directory gives `Ok`, also for an absent ancestor and a dangling
+    /// intermediate symlink.
+    ///
+    /// The call never loads a committed directory that is not loaded yet. It
+    /// replaces the entry with an empty loaded directory that keeps the recorded
+    /// dirmeta checksum, so it reads no dirtree.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotADirectory`] if a file or a symlink is at `path`.
+    /// - [`Error::PathNotFound`] if no entry is at `path` and `allow_noent` is
+    ///   `false`.
+    /// - [`Error::Staging`] if the call reaches a directory while any writer from
+    ///   [`write_file`](StagingTree::write_file) is outstanding, at any place in
+    ///   the tree. This applies also to an empty directory. A call over an absent
+    ///   directory under `allow_noent` does not check the writers.
+    /// - [`Error::Staging`] if `path` has no final component (the tree root),
+    ///   ends in `..`, or has a component that is not UTF-8.
+    /// - [`Error::PathNotFound`] or [`Error::DanglingSymlink`] if an ancestor does
+    ///   not resolve and `allow_noent` is `false`.
+    /// - [`Error::NotADirectory`] or [`Error::SymlinkLoop`] if an ancestor does
+    ///   not resolve, also with `allow_noent`.
+    /// - [`Error::ObjectNotFound`] if a symlink object or a committed dirtree that
+    ///   the walk loads is not in the repository.
+    /// - [`Error::Staging`] if a concurrent operation removes a directory on the
+    ///   path while the call uses it.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn clear_dir(&self, path: &Path, allow_noent: bool) -> Result<()> {
         let (parent, name) = match self.resolve_parent(path).await {
             Ok(resolved) => resolved,
@@ -731,35 +1066,59 @@ impl<'txn> StagingTree<'txn> {
         })
     }
 
-    /// Move the entry at `from` to `to`, subtree and dirmeta included.
-    /// Neither final component is followed, so renaming a symlink moves the
-    /// symlink. An existing entry at `to` is
-    /// [`EntryExists`](Error::EntryExists), and a destination at or under
-    /// the moved entry is refused with [`Staging`](Error::Staging), because
-    /// the move would detach the directory that must receive it. A missing
-    /// destination parent is created under an implied dirmeta
-    /// ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)) and is
-    /// an error without one; the `from` side never creates a directory. The
-    /// moved node is carried as it is, so a lazily-loaded committed
-    /// directory stays lazy and no dirtree is read for the moved subtree.
-    /// The call is refused with [`Staging`](Error::Staging) while any
-    /// [`write_file`](StagingTree::write_file) writer is outstanding,
-    /// wherever in the tree it sits.
+    /// Moves the entry at `from` to `to`, with its subtree and its dirmeta.
     ///
-    /// The destination is resolved before any refusal is decided, so a
-    /// refused call keeps the ancestors the policy created for it, the rule
-    /// every write follows. Where the destination is under the moved entry,
-    /// those ancestors sit inside that entry, and a lazily-loaded source is
-    /// hydrated to reach them; the refusal reports whatever that resolution
-    /// raises.
+    /// The call follows neither final component, so the rename of a symlink moves
+    /// the symlink. If an implied dirmeta is set
+    /// ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)), a missing
+    /// destination parent is created. If no implied dirmeta is set, a missing
+    /// destination parent is an error. The `from` side never creates a directory.
+    ///
+    /// The call moves the node as it is. A committed directory that is not loaded
+    /// yet stays that way, and the call reads no dirtree for the moved subtree.
+    ///
+    /// The destination resolves before the call decides on a refusal, so a refused
+    /// call keeps the ancestors that the implied-dirmeta policy created for it. Each
+    /// write follows this rule. If the destination is under the moved entry,
+    /// those ancestors are inside that entry. The call then loads a committed source
+    /// directory to reach them, and the refusal reports any error of that
+    /// resolution.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::EntryExists`] if an entry is at `to`.
+    /// - [`Error::Staging`] if `to` is at or under the moved entry, because the
+    ///   move detaches the directory that must receive the entry.
+    /// - [`Error::Staging`] if any writer from
+    ///   [`write_file`](StagingTree::write_file) is outstanding, at any place in
+    ///   the tree.
+    /// - [`Error::PathNotFound`] if no entry is at `from`.
+    /// - [`Error::PathNotFound`], [`Error::NotADirectory`], [`Error::DanglingSymlink`],
+    ///   or [`Error::SymlinkLoop`] if the path does not resolve.
+    ///   [`StagingTree`](StagingTree#error-paths) states the path that each one
+    ///   names.
+    /// - [`Error::Staging`] if `from` or `to` has no final component, ends in
+    ///   `..`, or has a component that is not UTF-8.
+    /// - [`Error::Unsupported`] if the call stages a dirmeta object in a
+    ///   `bare-split-xattrs` repository, or if its fs-verity seal fails under
+    ///   `[ex-integrity] fsverity` = `yes`.
+    /// - [`Error::ObjectNotFound`] if a symlink object or a committed dirtree that
+    ///   the walk loads is not in the repository.
+    /// - [`Error::Staging`] if a concurrent operation removes a directory on the
+    ///   path while the call uses it.
+    /// - [`Error::InsufficientFreeSpace`] if a staged object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if a `[core]`, `[archive]`, or
+    ///   `[ex-integrity]` value in the repository config is malformed.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         let (from_parent, from_name) = self.resolve_parent(from).await?;
         let (to_parent, to_name) = self.resolve_write_parent(to).await?;
         let mut from_path = from_parent.clone();
         from_path.push(from_name.clone());
         // Both sides are resolved literal component paths, so the prefix
-        // comparison is exact: a destination parent at or under the moved
-        // entry would be detached by the take and could never receive it.
+        // comparison is exact. The take detaches a destination parent at or
+        // under the moved entry, and that parent cannot receive the entry.
         if to_parent.starts_with(&from_path) {
             return Err(Error::Staging(format!(
                 "cannot rename {} to {}: the destination is under the moved entry",
@@ -767,10 +1126,10 @@ impl<'txn> StagingTree<'txn> {
                 join(&to_parent, &to_name)
             )));
         }
-        // Decide and move under one lock acquisition: the destination and
-        // the source are re-read and the writer guard is consulted where
-        // the entry is about to move, so no concurrent operation slots in
-        // between the checks and the two mutations.
+        // Decide and move under one lock acquisition. The destination and
+        // the source are read again, and the writer guard is read where the
+        // entry is about to move. So no concurrent operation gets in between
+        // the checks and the two mutations.
         let mut tree = self.tree.lock().unwrap();
         let to_dir = tree
             .dir_at(&to_parent)
@@ -794,8 +1153,8 @@ impl<'txn> StagingTree<'txn> {
         let entry = from_dir
             .take_child(&from_name)
             .expect("an entry present under the same lock acquisition");
-        // The entry is out of the tree here, so a failed insertion would drop
-        // it. Neither of the two refusals can fire: the name comes from a
+        // The entry is out of the tree here, so a failed insertion drops it.
+        // Neither of the two refusals can occur. The name comes from a
         // `Component::Normal`, which `validate_name` accepts, and the
         // destination was read absent under this same acquisition.
         tree.dir_at_mut(&to_parent)
@@ -807,12 +1166,24 @@ impl<'txn> StagingTree<'txn> {
 
     // --- reads (staged-first) ---
 
-    /// Resolve `path` and report what sits there. Intermediate components
-    /// follow symlinks; the final component follows only with
-    /// `follow_symlinks`. An absent component anywhere along the path is
-    /// [`StagingLookup::Absent`], so probing a path whose ancestors do not
-    /// exist is not an error. A non-directory intermediate component and a
-    /// dangling symlink stay the errors the walk types for them.
+    /// Returns the kind of entry at `path`.
+    ///
+    /// Intermediate components follow symlinks. The final component follows a
+    /// symlink only with `follow_symlinks`. An absent component at any place on the
+    /// path gives [`StagingLookup::Absent`], so a probe of a path with absent
+    /// ancestors is not an error.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotADirectory`] if an intermediate component is not a directory.
+    /// - [`Error::DanglingSymlink`] or [`Error::SymlinkLoop`] if a symlink on the
+    ///   path does not resolve.
+    /// - [`Error::Staging`] if a component of `path` is not UTF-8.
+    /// - [`Error::ObjectNotFound`] if a symlink object or a committed dirtree that
+    ///   the walk loads is not in the repository.
+    /// - [`Error::Staging`] if a concurrent operation removes a directory on the
+    ///   path while the call uses it.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn lookup(&self, path: &Path, follow_symlinks: bool) -> Result<StagingLookup> {
         match self
             .walk_from(Vec::new(), components_of(path)?, follow_symlinks)
@@ -825,9 +1196,25 @@ impl<'txn> StagingTree<'txn> {
         }
     }
 
-    /// Read the file object at `path`, resolving through the staged tree and
-    /// loading its bytes from the transaction's staged set before `objects/`.
-    /// With `follow_symlinks`, a final symlink is resolved to its target.
+    /// Returns the file object at `path`.
+    ///
+    /// The path resolves through the staging tree. The bytes load from the staged
+    /// set of the transaction before `objects/`. With `follow_symlinks`, a symlink
+    /// at the final component resolves to its target.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Staging`] if `path` names a directory.
+    /// - [`Error::PathNotFound`], [`Error::NotADirectory`], [`Error::DanglingSymlink`],
+    ///   or [`Error::SymlinkLoop`] if the path does not resolve.
+    ///   [`StagingTree`](StagingTree#error-paths) states the path that each one
+    ///   names.
+    /// - [`Error::Staging`] if a component of `path` is not UTF-8.
+    /// - [`Error::ObjectNotFound`] if the file object, a symlink object, or a
+    ///   committed dirtree that the walk loads is not in the repository.
+    /// - [`Error::Staging`] if a concurrent operation removes a directory on the
+    ///   path while the call uses it.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn read_file(&self, path: &Path, follow_symlinks: bool) -> Result<FileObject> {
         match self
             .walk_from(Vec::new(), components_of(path)?, follow_symlinks)
@@ -841,9 +1228,26 @@ impl<'txn> StagingTree<'txn> {
         }
     }
 
-    /// List the entries of the directory at `path`, files first then
-    /// subdirectories, each group name-sorted. With `follow_symlinks`, a final
-    /// symlink is resolved to its target directory.
+    /// Returns the entries of the directory at `path`.
+    ///
+    /// The files come first, then the subdirectories. Each group is sorted by name.
+    /// With `follow_symlinks`, a symlink at the final component resolves to its
+    /// target directory.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotADirectory`] if a file or a symlink that the call does not
+    ///   follow is at `path`.
+    /// - [`Error::PathNotFound`], [`Error::NotADirectory`], [`Error::DanglingSymlink`],
+    ///   or [`Error::SymlinkLoop`] if the path does not resolve.
+    ///   [`StagingTree`](StagingTree#error-paths) states the path that each one
+    ///   names.
+    /// - [`Error::Staging`] if a component of `path` is not UTF-8.
+    /// - [`Error::ObjectNotFound`] if a symlink object or a committed dirtree that
+    ///   the walk loads is not in the repository.
+    /// - [`Error::Staging`] if a concurrent operation removes a directory on the
+    ///   path while the call uses it.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn read_dir(&self, path: &Path, follow_symlinks: bool) -> Result<Vec<StagingEntry>> {
         let dir_path = match self
             .walk_from(Vec::new(), components_of(path)?, follow_symlinks)
@@ -875,59 +1279,106 @@ impl<'txn> StagingTree<'txn> {
         })
     }
 
-    /// Merge `other` into this tree at its root, which is
-    /// [`merge_at`](StagingTree::merge_at) with a base of `.`.
+    /// Merges `other` into the root of this tree.
+    ///
+    /// The call is [`merge_at`](StagingTree::merge_at) with the base `.`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`merge_at`](StagingTree::merge_at).
     pub async fn merge(&self, other: &MutableTree, opts: MergeOptions) -> Result<()> {
         self.merge_at(Path::new("."), other, opts).await
     }
 
-    /// Merge `other` into the directory at `base` per `opts`. Equal entries
-    /// merge silently; differing files, file-versus-directory clashes, and
-    /// differing directory metadata are conflicts without `allow_overwrite` and
-    /// take the right side with it. With `follow_symlinks`, a right-side
-    /// directory over a left-side symlink merges into the symlink's target
-    /// directory; right-side files and symlinks replace the left entry and
-    /// never write through. A merge that fails keeps the entries it applied
-    /// before the failure.
+    /// Merges `other` into the directory at `base`, as `opts` sets.
     ///
-    /// `root_dirmeta` governs the merge root alone: under
-    /// [`Reconcile`](RootDirmeta::Reconcile) the directory at `base`
-    /// reconciles its own dirmeta against the right root's, and under
-    /// [`KeepLeft`](RootDirmeta::KeepLeft) it keeps the dirmeta it has.
-    /// `symlink_target_dirmeta` governs the directory a followed left-side
-    /// symlink lands in, at every such landing the merge reaches: under
-    /// [`KeepLeft`](RootDirmeta::KeepLeft) the target keeps its own dirmeta,
-    /// and under [`Reconcile`](RootDirmeta::Reconcile) it reconciles against
-    /// the dirmeta the right side carries for the symlink's name. `base`
-    /// resolves through symlinks before the merge starts, so a `base` that is
-    /// itself a symlink is the merge root and takes `root_dirmeta`. Every
-    /// other directory reconciles under either setting. Under
-    /// [`KeepLeft`](RootDirmeta::KeepLeft) a landing that carries no dirmeta
-    /// keeps none, and a tree that holds a directory with no dirmeta cannot be
-    /// written.
+    /// An equal entry makes no change. These differences are conflicts without
+    /// `allow_overwrite`, and the right side wins them with it:
     ///
-    /// A missing `base` is created under an implied dirmeta
-    /// ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)) and is
-    /// the error the walk types without one. `base` resolves through
-    /// symlinks, its final component included, so a file there and a symlink
-    /// to a file are both [`NotADirectory`](Error::NotADirectory). A `base`
-    /// with no components -- `.`, `/`, and the empty path -- names the tree
-    /// root.
+    /// - differing files
+    /// - a file against a directory
+    /// - differing directory metadata
     ///
-    /// A merge that drops a directory is refused with
-    /// [`Staging`](Error::Staging) while any
-    /// [`write_file`](StagingTree::write_file) writer is outstanding, wherever
-    /// in the tree it sits, and leaves that directory and its subtree in
-    /// place. Two cases drop one: an overwrite that replaces a directory with
-    /// a file, and a right-side directory arriving at a name that a
-    /// concurrent operation turned into a directory after the merge read it.
-    /// The second case is a conflict without `allow_overwrite`, the answer the
-    /// same clash gets when the merge reads the directory itself.
+    /// A merge that fails keeps the entries that it applied before the failure.
     ///
-    /// A leaf a concurrent operation puts at a name the merge already read is
-    /// taken whatever `allow_overwrite` says, the last-writer-wins rule the
-    /// other staging writes follow on a raced name. Only a raced directory is
-    /// re-read, because dropping one loses a subtree.
+    /// # Symlinks
+    ///
+    /// With `follow_symlinks`, a right-side directory over a left-side symlink
+    /// merges into the target directory of the symlink. A right-side file or
+    /// symlink replaces the left entry and never writes through it.
+    ///
+    /// # Directory metadata
+    ///
+    /// [`root_dirmeta`](MergeOptions::root_dirmeta) controls the merge root alone.
+    /// Under [`Reconcile`](RootDirmeta::Reconcile), the directory at `base`
+    /// reconciles its own dirmeta against the dirmeta of the right root. Under
+    /// [`KeepLeft`](RootDirmeta::KeepLeft), it keeps the dirmeta that it has.
+    ///
+    /// [`symlink_target_dirmeta`](MergeOptions::symlink_target_dirmeta) controls
+    /// each directory that a followed left-side symlink lands in. Under
+    /// [`KeepLeft`](RootDirmeta::KeepLeft), the target keeps its own dirmeta. Under
+    /// [`Reconcile`](RootDirmeta::Reconcile), it reconciles against the dirmeta that
+    /// the right side carries for the name of the symlink.
+    ///
+    /// [`RootDirmeta`] states the rules for each other directory and for a
+    /// directory with no dirmeta.
+    ///
+    /// # Base
+    ///
+    /// If an implied dirmeta is set
+    /// ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)), a missing
+    /// `base` is created with it. If no implied dirmeta is set, a missing `base` is
+    /// an error of the walk. `base` resolves through symlinks before the merge
+    /// starts, its final component included. If `base` is a symlink, its target
+    /// directory is the merge root and takes `root_dirmeta`. A file at `base` and
+    /// a symlink to a file there both give [`NotADirectory`](Error::NotADirectory).
+    ///
+    /// # Concurrency
+    ///
+    /// While any writer from [`write_file`](StagingTree::write_file) is
+    /// outstanding, at any place in the tree, a merge that drops a directory fails.
+    /// That directory and its subtree stay in place. Two cases drop a directory:
+    ///
+    /// - an overwrite that replaces a directory with a file
+    /// - a right-side directory that arrives at a name where a concurrent operation
+    ///   put a directory after the merge read the name
+    ///
+    /// Without `allow_overwrite`, each of these cases is a conflict, and the merge
+    /// drops no directory.
+    ///
+    /// If a concurrent operation puts a leaf at a name that the merge already read,
+    /// the merge overwrites the leaf, whatever `allow_overwrite` says. The other
+    /// staging writes follow the same last-writer-wins rule on a raced name. The
+    /// merge reads a name again only for a raced directory, because the drop of a
+    /// directory loses a subtree.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::MergeConflict`] for a conflict without `allow_overwrite`.
+    /// - [`Error::Staging`] if the merge drops a directory while any writer from
+    ///   [`write_file`](StagingTree::write_file) is outstanding.
+    /// - [`Error::NotADirectory`] if `base`, a component on its path, or the target
+    ///   of a followed left-side symlink is a file or a symlink to a file.
+    /// - [`Error::PathNotFound`], [`Error::DanglingSymlink`], or
+    ///   [`Error::SymlinkLoop`] if `base` or a followed left-side symlink does not
+    ///   resolve. [`StagingTree`](StagingTree#error-paths) states the path that each
+    ///   one names.
+    /// - [`Error::ReplaceDirWithFile`] if a concurrent operation puts a directory at
+    ///   a name where the merge records a file.
+    /// - [`Error::Staging`] if a component of `base` is not UTF-8.
+    /// - [`Error::Unsupported`] if the call stages a dirmeta object in a
+    ///   `bare-split-xattrs` repository, or if its fs-verity seal fails under
+    ///   `[ex-integrity] fsverity` = `yes`.
+    /// - [`Error::ObjectNotFound`] if a symlink object or a dirtree that the
+    ///   merge loads on either side is not in the repository.
+    /// - [`Error::Core`] if a dirtree that the merge loads is malformed.
+    /// - [`Error::Staging`] if a concurrent operation removes a directory that the
+    ///   merge uses.
+    /// - [`Error::InsufficientFreeSpace`] if a staged object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if a `[core]`, `[archive]`, or
+    ///   `[ex-integrity]` value in the repository config is malformed.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn merge_at(
         &self,
         base: &Path,
@@ -947,26 +1398,29 @@ impl<'txn> StagingTree<'txn> {
 
     // --- internal helpers ---
 
-    /// Stage a directory-metadata object and return its checksum.
+    /// Stages a directory-metadata object and returns its checksum.
     async fn stage_dirmeta(&self, meta: &DirMeta) -> Result<Checksum> {
         self.txn.write_dirmeta(meta).await
     }
 
-    /// Refuse a structural change -- dropping a directory, removing an
-    /// entry, clearing a directory's children, moving an entry -- while any
-    /// file writer is live. A writer records its entry at
-    /// [`finish`](StagedFileWriter::finish) under the component path it
-    /// captured, and a directory dropped in between would leave that path
-    /// stale, or pointing at a different directory created there later. A
-    /// removed file entry cannot stale a captured path; it is refused
+    /// Refuses a structural change while any file writer is live.
+    ///
+    /// A structural change is a directory drop, an entry removal, a clear of
+    /// the children of a directory, or an entry move. A writer records its entry at
+    /// [`finish`](StagedFileWriter::finish) under the component path that it
+    /// captured. A directory dropped in between makes that path stale, or
+    /// makes it point at a different directory created there later. A removed
+    /// file entry cannot make a captured path stale. The guard refuses it
     /// because the guard is the whole-tree form, which reads a count and no
-    /// paths. `action` spells the refused change and the path it targets. Call
+    /// paths.
+    ///
+    /// `action` spells the refused change and the path that it targets. Call
     /// this under the tree lock, where
     /// [`write_file`](StagingTree::write_file) registers its writers, so the
-    /// count read here cannot race a registration. Deregistration cannot be
-    /// missed either: [`finish`](StagedFileWriter::finish) records its entry
-    /// under this same lock before it decrements, so a zero count read here
-    /// means every departed writer has already recorded.
+    /// count read here cannot race a registration. The check also sees each
+    /// deregistration: [`finish`](StagedFileWriter::finish) records its entry
+    /// under this same lock before it decrements. So a zero count read here
+    /// means that each departed writer recorded its entry. The comment in
     /// [`close`](StagingTree::close) states the full argument.
     fn check_no_live_writers(&self, action: &str) -> Result<()> {
         let outstanding = self.writers.load(Ordering::Acquire);
@@ -978,8 +1432,8 @@ impl<'txn> StagingTree<'txn> {
         Ok(())
     }
 
-    /// Fail if a write to a leaf at `parent/name` would clobber a directory. A
-    /// file or symlink is replaced; an absent entry is created.
+    /// Fails if a write to a leaf at `parent/name` replaces a directory. The
+    /// write replaces a file or symlink, and creates an absent entry.
     fn check_writable_leaf(&self, parent: &[String], name: &str) -> Result<()> {
         match self.peek(parent, name)? {
             ChildKind::Dir | ChildKind::LazyDir { .. } => {
@@ -989,14 +1443,14 @@ impl<'txn> StagingTree<'txn> {
         }
     }
 
-    /// Resolve a merge base to its literal component path. With an implied
-    /// dirmeta set, absent components are created as directories carrying it;
-    /// without one, an absent component is the error the walk types. Both
-    /// walks follow symlinks to directories, the final component included,
-    /// both report a file in the way as
-    /// [`NotADirectory`](Error::NotADirectory), and both report an absent
-    /// component inside a symlink target as
-    /// [`DanglingSymlink`](Error::DanglingSymlink).
+    /// Resolves a merge base to its literal component path.
+    ///
+    /// With an implied dirmeta set, absent components become directories with
+    /// that dirmeta. Without one, an absent component is the error that the
+    /// walk types. Both walks follow symlinks to directories, the final
+    /// component included. Both report a file in the way as
+    /// [`NotADirectory`](Error::NotADirectory), and an absent component inside
+    /// a symlink target as [`DanglingSymlink`](Error::DanglingSymlink).
     async fn resolve_merge_base(&self, base: &Path) -> Result<Vec<String>> {
         let comps = components_of(base)?;
         let Some(meta) = &self.implied_dirmeta else {
@@ -1010,16 +1464,20 @@ impl<'txn> StagingTree<'txn> {
         self.walk_creating(comps, meta, false).await
     }
 
-    /// Put a fresh empty directory carrying `dirmeta` at `parent/name` for a
-    /// merge. The entry is re-read inside the mutating acquisition, because
-    /// the merge read it in an earlier one: a directory a concurrent operation
-    /// put there since would be dropped with its subtree. That branch takes
-    /// the two answers a directory clash takes anywhere in the merge, in the
-    /// order the merge asks them: a conflict without `allow_overwrite`, and
-    /// the writer guard with it. A file the re-read finds is taken whatever
-    /// `allow_overwrite` says: the re-read exists to keep a subtree, and a
-    /// raced leaf follows the last-writer-wins rule the merge's other arms
-    /// follow on a name they already read.
+    /// Puts a fresh empty directory with `dirmeta` at `parent/name` for a
+    /// merge.
+    ///
+    /// The merge read the entry in an earlier acquisition, so the mutating
+    /// acquisition reads it again. Otherwise a directory that a concurrent
+    /// operation put there since then is dropped with its subtree. That branch
+    /// gives the two answers of a directory clash at each place in the merge.
+    /// The order is the order of the merge: a conflict without
+    /// `allow_overwrite`, and the writer guard with it.
+    ///
+    /// A file that the second read finds is overwritten, whatever
+    /// `allow_overwrite` says. The second read exists to keep a subtree. A
+    /// raced leaf follows the last-writer-wins rule that the other arms of the
+    /// merge follow on a name that they already read.
     fn insert_merged_dir(
         &self,
         parent: &[String],
@@ -1048,9 +1506,9 @@ impl<'txn> StagingTree<'txn> {
         })
     }
 
-    /// Resolve a path's parent directory for a write. With an implied dirmeta
-    /// set, absent ancestors are created as directories carrying it; without
-    /// one, an absent ancestor is the error the walk types.
+    /// Resolves the parent directory of a path for a write. With an implied
+    /// dirmeta set, absent ancestors become directories with that dirmeta.
+    /// Without one, an absent ancestor is the error that the walk types.
     async fn resolve_write_parent(&self, path: &Path) -> Result<(Vec<String>, String)> {
         let Some(meta) = &self.implied_dirmeta else {
             return self.resolve_parent(path).await;
@@ -1060,8 +1518,9 @@ impl<'txn> StagingTree<'txn> {
         Ok((parent, name))
     }
 
-    /// Resolve a path's parent directory (following symlinks on intermediate
-    /// components) and return its literal component path plus the final name.
+    /// Resolves the parent directory of a path, and returns its literal
+    /// component path and the final name. Intermediate components follow
+    /// symlinks.
     async fn resolve_parent(&self, path: &Path) -> Result<(Vec<String>, String)> {
         let (init, name) = split_final(path)?;
         let parent = match self.walk_from(Vec::new(), init, true).await? {
@@ -1077,7 +1536,8 @@ impl<'txn> StagingTree<'txn> {
         Ok((parent, name))
     }
 
-    /// Resolve a symlink `target` found in directory `base` to a directory.
+    /// Resolves a symlink `target` found in the directory `base` to a
+    /// directory.
     async fn resolve_symlink_dir(&self, base: &[String], target: &str) -> Result<Vec<String>> {
         let (absolute, comps) = split_target(target)?;
         let start = if absolute { Vec::new() } else { base.to_vec() };
@@ -1091,9 +1551,9 @@ impl<'txn> StagingTree<'txn> {
         }
     }
 
-    /// Walk `comps` from the loaded directory `start`, resolving symlinks. With
-    /// `follow_final`, a final symlink is followed too. Returns the directory or
-    /// leaf the path names.
+    /// Walks `comps` from the loaded directory `start` through symlinks, and
+    /// returns the directory or the leaf that the path names. With
+    /// `follow_final`, the walk also follows a final symlink.
     async fn walk_from(
         &self,
         start: Vec<String>,
@@ -1103,15 +1563,15 @@ impl<'txn> StagingTree<'txn> {
         let mut cur = start;
         let mut pending: VecDeque<Comp> = comps.into();
         let mut symlink_depth = 0usize;
-        // Each entry is a symlink whose target components are still being
-        // consumed: its path, its target, and the pending length the walk returns
-        // to once the target is spent. A failure belongs to the innermost open
-        // entry.
+        // Each entry is a symlink whose target components the walk still
+        // consumes. An entry holds its path, its target, and the pending length
+        // to return to after the target is spent. A failure belongs to the
+        // innermost open entry.
         let mut open_symlinks: Vec<(String, String, usize)> = Vec::new();
 
         while let Some(comp) = pending.pop_front() {
-            // Drop every symlink whose target is spent: the walk is back on the
-            // caller's own components, so an absent entry is not a dangling
+            // Drop each symlink whose target is spent. The walk is back on the
+            // components of the caller, so an absent entry is not a dangling
             // target.
             while open_symlinks
                 .last()
@@ -1163,8 +1623,9 @@ impl<'txn> StagingTree<'txn> {
                             }
                             let (absolute, target_comps) = split_target(&target)?;
                             // The mark is the count of the components queued
-                            // behind this target: the caller's own, plus any
-                            // outer symlink's target remainder.
+                            // behind this target: the components of the
+                            // caller, plus the target remainder of any outer
+                            // symlink.
                             let mark = pending.len();
                             open_symlinks.push((join(&cur, &name), target.clone(), mark));
                             if absolute {
@@ -1193,9 +1654,9 @@ impl<'txn> StagingTree<'txn> {
         Ok(WalkEnd::Dir(cur))
     }
 
-    /// Ensure the child `name` under the loaded directory `path` is a loaded
-    /// directory, hydrating a lazily-loaded committed subdirectory. Errors if
-    /// the child is absent or is not a directory.
+    /// Makes sure that the child `name` under the loaded directory `path` is
+    /// a loaded directory. The call loads a committed subdirectory that is
+    /// not loaded yet. It fails if the child is absent or is not a directory.
     async fn ensure_child_dir(&self, path: &[String], name: &str) -> Result<()> {
         loop {
             let (kind, repo) = {
@@ -1221,7 +1682,7 @@ impl<'txn> StagingTree<'txn> {
                     {
                         dir.install_hydrated_child(name, loaded);
                     }
-                    // Loop to re-read; the child is a loaded directory now.
+                    // Loop to read again. The child is a loaded directory now.
                 }
                 ChildKind::File(_) => {
                     return Err(Error::NotADirectory {
@@ -1237,7 +1698,8 @@ impl<'txn> StagingTree<'txn> {
         }
     }
 
-    /// The kind of `name` under the loaded directory `path`, under the lock.
+    /// Returns the kind of `name` under the loaded directory `path`, under the
+    /// lock.
     fn peek(&self, path: &[String], name: &str) -> Result<ChildKind> {
         let tree = self.tree.lock().unwrap();
         let dir = tree
@@ -1246,7 +1708,7 @@ impl<'txn> StagingTree<'txn> {
         Ok(dir.child_kind(name))
     }
 
-    /// Run `f` against the loaded directory at `path` under the lock.
+    /// Runs `f` against the loaded directory at `path` under the lock.
     fn with_dir<R>(&self, path: &[String], f: impl FnOnce(&MutableTree) -> R) -> Result<R> {
         let tree = self.tree.lock().unwrap();
         let dir = tree
@@ -1255,7 +1717,7 @@ impl<'txn> StagingTree<'txn> {
         Ok(f(dir))
     }
 
-    /// Run `f` against the mutable loaded directory at `path` under the lock.
+    /// Runs `f` against the mutable loaded directory at `path` under the lock.
     fn with_dir_mut<R>(
         &self,
         path: &[String],
@@ -1269,10 +1731,11 @@ impl<'txn> StagingTree<'txn> {
     }
 }
 
-/// A read-only directory view for the right side of a merge: an in-memory
-/// mutable tree node, or a committed subtree loaded through the transaction on
-/// demand. A committed subtree resolves staged-first, so a dirtree staged in
-/// the current transaction is visible before it publishes, matching the left.
+/// A read-only directory view for the right side of a merge. It is an
+/// in-memory mutable tree node, or a committed subtree that loads through the
+/// transaction on demand. A committed subtree resolves staged-first, so a
+/// dirtree staged in the current transaction is visible before it publishes.
+/// The left side follows the same rule.
 enum RightDir<'a> {
     Mutable(&'a MutableTree),
     Committed {
@@ -1283,7 +1746,7 @@ enum RightDir<'a> {
 }
 
 impl<'a> RightDir<'a> {
-    /// This directory's dirmeta checksum, if it has one.
+    /// Returns the dirmeta checksum of this directory, if it has one.
     fn dirmeta(&self) -> Option<Checksum> {
         match self {
             RightDir::Mutable(tree) => tree.metadata_checksum(),
@@ -1291,10 +1754,10 @@ impl<'a> RightDir<'a> {
         }
     }
 
-    /// This directory's files and subdirectories. A committed directory is read
-    /// through `txn` (staged-first); an in-memory node is read directly. The
-    /// `txn` supplies the transaction a lazy child's committed view resolves
-    /// through.
+    /// Returns the files and the subdirectories of this directory. A
+    /// committed directory is read through `txn` (staged-first). An in-memory
+    /// node is read directly. `txn` is the transaction that the committed
+    /// view of a lazy child resolves through.
     async fn entries(
         &self,
         txn: &'a Transaction,
@@ -1346,14 +1809,17 @@ impl<'a> RightDir<'a> {
     }
 }
 
-/// The boxed future for the recursive merge; async recursion needs indirection.
+/// The boxed future for the recursive merge. Async recursion needs
+/// indirection.
 type MergeFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
-/// Merge the right-side directory `right` into the left staging tree at
-/// `left_path`. `root_dirmeta` is the policy for `left_path`'s own metadata.
-/// The merge root takes [`MergeOptions::root_dirmeta`], the directory a
+/// Merges the right-side directory `right` into the left staging tree at
+/// `left_path`.
+///
+/// `root_dirmeta` is the policy for the metadata of `left_path` itself. The
+/// merge root takes [`MergeOptions::root_dirmeta`]. The directory that a
 /// followed left-side symlink lands in takes
-/// [`MergeOptions::symlink_target_dirmeta`], and every other descendant
+/// [`MergeOptions::symlink_target_dirmeta`]. Each other descendant
 /// reconciles, so the recursion passes [`RootDirmeta::Reconcile`] for it.
 fn merge_into<'a>(
     st: &'a StagingTree<'_>,
@@ -1363,11 +1829,11 @@ fn merge_into<'a>(
     root_dirmeta: RootDirmeta,
 ) -> MergeFuture<'a> {
     Box::pin(async move {
-        // Reconcile this directory's own metadata. A right dirmeta that is unset
-        // makes no change; one that equals the left is silent; a differing one is
-        // a conflict without `allow_overwrite`, and is taken with it. Under
-        // `KeepLeft` this directory skips the step and keeps the dirmeta it
-        // has.
+        // Reconcile the metadata of this directory. A right dirmeta that is
+        // unset makes no change, and one that equals the left makes no change.
+        // A differing one is a conflict without `allow_overwrite`, and the
+        // directory takes it with `allow_overwrite`. Under `KeepLeft` this
+        // directory skips the step and keeps the dirmeta that it has.
         if matches!(root_dirmeta, RootDirmeta::Reconcile)
             && let Some(right_dm) = right.dirmeta()
         {
@@ -1488,12 +1954,14 @@ fn merge_into<'a>(
     })
 }
 
-/// A streaming writer for one regular-file payload recorded into a staging tree
-/// at [`finish`](StagedFileWriter::finish). It shares the tree and writer count
-/// with its [`StagingTree`] through `Arc`, so it does not borrow the tree.
-/// Implements [`futures_io::AsyncWrite`] unconditionally and the tokio
-/// `AsyncWrite` under the `tokio` feature. Dropping it without `finish` removes
-/// the staged temporary and releases its writer slot.
+/// A streaming writer for one regular-file payload of a staging tree.
+///
+/// [`finish`](StagedFileWriter::finish) records the file in the tree. The writer
+/// shares the tree and the writer count with its [`StagingTree`] through `Arc`,
+/// so it does not borrow the tree. It implements `futures_io::AsyncWrite`
+/// always, and the tokio `AsyncWrite` under the `tokio` feature. If the writer
+/// is dropped without `finish`, it removes the staged temporary file and
+/// releases its writer slot.
 pub struct StagedFileWriter<'txn> {
     tree: Arc<Mutex<MutableTree>>,
     writers: Arc<AtomicUsize>,
@@ -1503,9 +1971,21 @@ pub struct StagedFileWriter<'txn> {
 }
 
 impl StagedFileWriter<'_> {
-    /// Complete the content object and record it at the path. Releases the
-    /// writer slot on every path. A directory at the path is refused with
-    /// [`ReplaceDirWithFile`](Error::ReplaceDirWithFile).
+    /// Completes the content object and records it at the path of the writer.
+    ///
+    /// The call releases the writer slot on every return.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ReplaceDirWithFile`] if a directory is at the path.
+    /// - [`Error::Staging`] if a concurrent operation removed the parent directory.
+    /// - [`Error::Unsupported`] if `[ex-integrity] fsverity` is `yes` and the
+    ///   fs-verity seal of the object fails.
+    /// - [`Error::InsufficientFreeSpace`] if a staged object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if a `[core]`, `[archive]`, or
+    ///   `[ex-integrity]` value in the repository config is malformed.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn finish(mut self) -> Result<()> {
         let writer = self.writer.take().expect("writer present until finish");
         let outcome = match writer.finish().await {
@@ -1525,9 +2005,9 @@ impl StagedFileWriter<'_> {
 
 impl Drop for StagedFileWriter<'_> {
     fn drop(&mut self) {
-        // An abandoned writer (dropped without `finish`) still releases its slot,
-        // so `close` is never wedged; the content writer removes its staged
-        // temporary as it drops.
+        // An abandoned writer (dropped without `finish`) still releases its
+        // slot, so it never makes `close` fail. The content writer removes its
+        // staged temporary file when it drops.
         if self.writer.is_some() {
             self.writers.fetch_sub(1, Ordering::AcqRel);
         }
@@ -1577,10 +2057,10 @@ impl ostrya_rt::tokio_io::AsyncWrite for StagedFileWriter<'_> {
     }
 }
 
-/// The meaningful components of a path: names and parent-directory hops, with the
-/// root, current-directory, and prefix components dropped. A non-UTF-8 component
-/// is rejected, since the tree is `String`-keyed and a lossy conversion would
-/// silently address the wrong name.
+/// Returns the meaningful components of a path: names and parent-directory
+/// hops. The root, current-directory, and prefix components are dropped. A
+/// non-UTF-8 component is rejected, because the tree is `String`-keyed and a
+/// lossy conversion addresses the wrong name with no error.
 fn components_of(path: &Path) -> Result<Vec<Comp>> {
     path.components()
         .filter_map(|c| match c {
@@ -1600,9 +2080,10 @@ fn components_of(path: &Path) -> Result<Vec<Comp>> {
         .collect()
 }
 
-/// Split a path into its parent components and its final name. A path with no
-/// final component and a path ending in `..` are refused before resolution
-/// begins, so both report the path as the caller gave it.
+/// Splits a path into its parent components and its final name. The call
+/// refuses a path with no final component and a path that ends in `..`. The
+/// refusal comes before resolution, so it reports the path as the caller gave
+/// it.
 fn split_final(path: &Path) -> Result<(Vec<Comp>, String)> {
     let mut comps = components_of(path)?;
     let name = match comps.pop() {
@@ -1620,8 +2101,9 @@ fn split_final(path: &Path) -> Result<(Vec<Comp>, String)> {
     Ok((comps, name))
 }
 
-/// Split a symlink target into an absolute flag and its meaningful components.
-/// The target is already validated UTF-8, so component decoding never fails.
+/// Splits a symlink target into an absolute flag and its meaningful
+/// components. The target is UTF-8 already, so the decode of a component
+/// never fails.
 fn split_target(target: &str) -> Result<(bool, Vec<Comp>)> {
     Ok((target.starts_with('/'), components_of(Path::new(target))?))
 }
@@ -1657,7 +2139,7 @@ fn entry_exists(parent: &[String], name: &str) -> Error {
     }
 }
 
-/// The new staging-tree types move freely across tasks and threads.
+/// The staging-tree types move freely across tasks and threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<StagingTree<'static>>();

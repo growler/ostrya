@@ -1,4 +1,4 @@
-//! The trusted keys a receive rule holds a commit to.
+//! The trusted keys that a receive rule verifies a commit against.
 
 use std::sync::Arc;
 
@@ -13,36 +13,85 @@ use crate::verify::{KeySource, Policy, Verifiers, build_policy};
 /// The detached-metadata key of the dummy engine.
 const DUMMY_METADATA_KEY: &str = "ostree.sign.dummy";
 
-/// A built set of trusted keys and the axes it requires.
+/// A set of trusted keys and the signature axes that it requires.
 ///
-/// The two axes are ANDed: a set with a GPG axis and a sign-api axis needs a
-/// valid signature on each. The sign-api engines are ORed: one valid signature
-/// from one of them is enough. The set holds its verifiers, so a commit is
-/// checked with no read of a key source.
+/// A set with a GPG axis and a sign-api axis needs a valid signature on each
+/// axis. On the sign-api axis, one valid signature from one engine is enough.
+/// The set holds its verifiers, so the verification of a commit reads no key
+/// source.
+///
+/// [`ReceiveVerify::Keys`](crate::receive::ReceiveVerify::Keys) holds a set
+/// for a receive rule.
+///
+/// # Trust groups
+///
+/// A trust group, `[ex-ostrya trust "NAME"]`, uses the key names of a remote
+/// section:
+///
+/// - `gpgkeypath` for the GPG axis
+/// - `verification-<engine>-key` and `verification-<engine>-file` for the
+///   sign-api axis
+///
+/// `gpg-verify` and `sign-verify` turn on the axes. In a trust group,
+/// `gpg-verify` has the default `false`.
+///
+/// A trust group trusts these keys alone. It reads no system key store, no
+/// revoked set, no per-remote keyring, and no global trusted directory. A
+/// server verifies a commit against the keys that the group names, and
+/// against no other key.
 pub struct TrustedKeys {
     /// The built axes.
     policy: Policy,
 }
 
 impl TrustedKeys {
-    /// The keys a pull from `remote` trusts for a commit, from the
-    /// `[remote "NAME"]` section of the repository config: `gpg-verify` (default
-    /// true), `gpgkeypath`, the repository keyring `<repo>/NAME.trustedkeys.gpg`,
-    /// the system keyring `/etc/ostree/remotes.d/NAME.trustedkeys.gpg`, the
-    /// global GPG trusted directory, `sign-verify`, the `verification-*` keys,
-    /// and the system sign-api key store minus its revoked set.
+    /// Creates the trusted keys that a pull from `remote` uses for a commit.
     ///
-    /// A remote the config does not describe, and one whose section turns on
-    /// no axis, is refused as [`Error::InvalidFormat`]. The key sources are
-    /// read as a pull reads them, with the errors a pull gives.
+    /// The keys come from the `[remote "NAME"]` section of the repository
+    /// config. The call reads each key source as a pull reads it (see
+    /// [`PullVerify`](crate::PullVerify)):
+    ///
+    /// - `gpg-verify`, with the default `true`
+    /// - `gpgkeypath`
+    /// - the repository keyring `<repo>/NAME.trustedkeys.gpg`
+    /// - the system keyring `/etc/ostree/remotes.d/NAME.trustedkeys.gpg`
+    /// - the global GPG trusted directory
+    /// - `sign-verify` and the `verification-*` keys
+    /// - the system sign-api key store, minus its revoked set
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if the config has no section for `remote`.
+    /// - [`Error::InvalidFormat`] if the section turns on no axis: it sets
+    ///   `gpg-verify=false` and no `sign-verify`.
+    /// - [`Error::Core`] if `gpg-verify` is not a boolean, if a value holds a
+    ///   malformed escape sequence, or if a sign-api key is not valid base64.
+    /// - [`Error::Signature`] if `sign-verify` names an engine that has no
+    ///   trusted key, or if `sign-verify=true` finds no engine with a trusted
+    ///   key.
+    /// - [`Error::Signature`] if a keyring or a key file cannot be read, or if
+    ///   its content is not valid for its engine.
+    /// - [`Error::Unsupported`] if `sign-verify` names an engine that this
+    ///   build does not verify with.
+    /// - [`Error::Unsupported`] if the remote asks for GPG verification and the
+    ///   build has no `verify-gpg` feature.
+    /// - [`Error::Io`] if a directory of keys cannot be listed.
     pub async fn for_remote(repo: &Repo, remote: &str) -> Result<TrustedKeys> {
         TrustedKeys::for_remote_in(repo, repo.config().keyfile(), remote, true).await
     }
 
-    /// Trusted keys with a sign-api axis over `sign`, one verifier for each
-    /// engine. An empty `sign` is refused as [`Error::InvalidFormat`]: it
-    /// trusts no key. A verifier of the dummy engine is refused the same way:
-    /// its signature is its key, so it proves nothing about who signed.
+    /// Creates trusted keys with a sign-api axis over `sign`.
+    ///
+    /// `sign` holds one verifier for each engine. The call refuses a verifier
+    /// of the dummy engine, because its signature is its key and proves
+    /// nothing about the signer.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if `sign` is empty, because an empty set
+    ///   trusts no key.
+    /// - [`Error::InvalidFormat`] if `sign` holds a verifier of the dummy
+    ///   engine.
     pub fn new(sign: Vec<Arc<dyn Verifier>>) -> Result<TrustedKeys> {
         if sign.is_empty() {
             return Err(Error::InvalidFormat(
@@ -55,10 +104,14 @@ impl TrustedKeys {
         })
     }
 
-    /// Trusted keys with a GPG axis over `gpg`, and a sign-api axis over `sign`
-    /// where `sign` is not empty. A verifier of the dummy engine in `sign` is
-    /// refused as [`Error::InvalidFormat`], as [`new`](TrustedKeys::new)
-    /// refuses it.
+    /// Creates trusted keys with a GPG axis over `gpg`.
+    ///
+    /// If `sign` is not empty, the set also gets a sign-api axis over `sign`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFormat`] if `sign` holds a verifier of the dummy engine,
+    /// as [`new`](TrustedKeys::new) refuses it.
     #[cfg(feature = "verify-gpg")]
     pub fn with_gpg(
         gpg: crate::gpg::GpgVerifier,
@@ -71,9 +124,10 @@ impl TrustedKeys {
         })
     }
 
-    /// The pull trust of the `[remote "NAME"]` section of `keyfile`. The
-    /// repository keyring of the remote takes part where `repo_keyring` is
-    /// true.
+    /// Creates the pull trust of the `[remote "NAME"]` section of `keyfile`.
+    ///
+    /// If `repo_keyring` is `true`, the repository keyring of the remote is
+    /// part of the trust.
     pub(crate) async fn for_remote_in(
         repo: &Repo,
         keyfile: &KeyFile,
@@ -102,9 +156,11 @@ impl TrustedKeys {
         Ok(TrustedKeys { policy })
     }
 
-    /// The keys of the trust group `name`, whose key-file group is `group`.
-    /// The group has passed the checks of the policy reader, so it turns on
-    /// one axis at least, and each key it holds is one an axis reads.
+    /// Creates the keys of the trust group `name` from the key-file group
+    /// `group`.
+    ///
+    /// The policy reader checks the group first. As a result, the group turns
+    /// on at least one axis, and an axis reads each key that the group holds.
     pub(crate) async fn for_trust_group(
         repo: &Repo,
         keyfile: &KeyFile,
@@ -122,9 +178,11 @@ impl TrustedKeys {
         Ok(TrustedKeys { policy })
     }
 
-    /// Hold `payload` to every axis of this set. `detached` is the
-    /// detached-metadata dict the signatures live in, absent when the payload
-    /// carries none. `subject` names the payload in a message.
+    /// Verifies `payload` against every axis of this set.
+    ///
+    /// `detached` is the detached-metadata dict that holds the signatures. It
+    /// is `None` if the payload has no detached metadata. `subject` names the
+    /// payload in a message.
     pub(crate) async fn check(
         &self,
         subject: &str,
@@ -135,7 +193,7 @@ impl TrustedKeys {
     }
 }
 
-/// Refuse a verifier of the dummy engine in `sign`.
+/// Refuses a verifier of the dummy engine in `sign`.
 fn refuse_dummy(sign: &[Arc<dyn Verifier>]) -> Result<()> {
     if sign.iter().any(|v| v.metadata_key() == DUMMY_METADATA_KEY) {
         return Err(Error::InvalidFormat(
@@ -175,8 +233,8 @@ mod tests {
 
     const PAYLOAD: &[u8] = b"the commit bytes";
 
-    /// A scratch directory holding an archive repository at `repo`, removed
-    /// when the guard drops.
+    /// A scratch directory with an archive repository at `repo`. The guard
+    /// removes the directory when it drops.
     struct Scratch {
         dir: std::path::PathBuf,
     }
@@ -207,7 +265,7 @@ mod tests {
         }
     }
 
-    /// A detached-metadata dict holding `blob` under `key`.
+    /// A detached-metadata dict that holds `blob` under `key`.
     fn dict_with(key: &str, blob: Vec<u8>) -> Value {
         let mut dict = Value::Array(Vec::new());
         append_signature(&mut dict, key, blob).unwrap();
@@ -221,9 +279,9 @@ mod tests {
         dict_with(signer.metadata_key(), blob)
     }
 
-    /// A trust group holds a commit to the key it names: a signature from it
-    /// passes, and a commit with no signature and a signature from another
-    /// key are each refused.
+    /// A trust group verifies a commit against the key that it names. A
+    /// signature from this key passes. A commit with no signature fails, and a
+    /// signature from another key fails.
     #[test]
     fn a_trust_group_checks_a_commit() {
         let scratch = Scratch::new("group");
@@ -255,8 +313,8 @@ mod tests {
         );
     }
 
-    /// A trust group engine with no key is refused, and the system key store
-    /// does not stand in for one.
+    /// A trust group refuses an engine with no key. The system key store does
+    /// not supply a key for the engine.
     #[test]
     fn a_trust_group_engine_needs_a_key() {
         let scratch = Scratch::new("nokey");
@@ -274,8 +332,9 @@ mod tests {
         );
     }
 
-    /// The pull trust of a remote reads the section's keys, and a remote that
-    /// turns on no check, or that the file does not describe, is refused.
+    /// The pull trust of a remote reads the keys of its section. The build
+    /// refuses a remote that turns on no check, and a remote that the file
+    /// does not describe.
     #[test]
     fn the_pull_trust_of_a_remote() {
         let scratch = Scratch::new("remote");
@@ -300,7 +359,8 @@ mod tests {
         }
     }
 
-    /// Explicit keys: an empty set is refused.
+    /// `TrustedKeys::new` refuses an empty set, and a set with one verifier
+    /// verifies a signature from its key.
     #[test]
     fn explicit_keys_need_a_verifier() {
         let err = TrustedKeys::new(Vec::new()).unwrap_err();
@@ -315,7 +375,7 @@ mod tests {
             .unwrap();
     }
 
-    /// Explicit keys: a dummy verifier is refused, alone and next to a real
+    /// `TrustedKeys::new` refuses a dummy verifier, alone and next to a real
     /// engine.
     #[test]
     fn explicit_keys_refuse_the_dummy_engine() {
@@ -336,8 +396,10 @@ mod tests {
         }
     }
 
-    /// Whether `gpg` answers. A test that needs it skips where it does not,
-    /// unless `OSTRYA_REQUIRE_GNUPG` is set, where the absence fails the test.
+    /// Returns `true` if `gpg` answers.
+    ///
+    /// If `gpg` does not answer, a test that needs it skips. If
+    /// `OSTRYA_REQUIRE_GNUPG` is set, the absence of `gpg` fails the test.
     #[cfg(feature = "verify-gpg")]
     fn gpg_or_skip() -> bool {
         if crate::gpg::tests::gpg_available() {
@@ -351,8 +413,8 @@ mod tests {
         false
     }
 
-    /// The pull trust of a remote takes the repository keyring of the remote
-    /// where the source asks for it, and not otherwise.
+    /// The pull trust of a remote includes the repository keyring of the
+    /// remote only if the source asks for it.
     #[cfg(feature = "verify-gpg")]
     #[test]
     fn the_repository_keyring_takes_part_on_request() {
@@ -385,9 +447,9 @@ mod tests {
         assert!(matches!(err, Error::Signature(_)), "{err}");
     }
 
-    /// A `remote:` rule read from the repository config trusts the repository
-    /// keyring of the remote, and the same rule read from a policy file does
-    /// not.
+    /// A `remote:` rule from the repository config trusts the repository
+    /// keyring of the remote. The same rule from a policy file does not trust
+    /// that keyring.
     #[cfg(feature = "verify-gpg")]
     #[test]
     fn a_policy_file_leaves_out_the_repository_keyring() {
@@ -432,9 +494,9 @@ mod tests {
     #[cfg(feature = "verify-gpg")]
     const FIXTURE_ENV: &str = "OSTRYA_TRUST_TEST_FIXTURES";
 
-    /// The global GPG trusted directory, which `OSTREE_GPG_HOME` names, takes
-    /// part in the pull trust of a remote and not in a trust group. The
-    /// environment is set for a child process, so no test of this process
+    /// The global GPG trusted directory, which `OSTREE_GPG_HOME` names, is part
+    /// of the pull trust of a remote. It is not part of a trust group. The test
+    /// sets the environment for a child process, so no test of this process
     /// reads the directory.
     #[cfg(feature = "verify-gpg")]
     #[test]
@@ -474,7 +536,7 @@ mod tests {
     }
 
     /// The half of [`the_global_gpg_directory_reaches_remotes_alone`] that
-    /// builds the trusted keys, run only when this test binary is re-executed
+    /// builds the trusted keys. It runs only if this test binary runs again
     /// with the environment set.
     #[cfg(feature = "verify-gpg")]
     #[test]

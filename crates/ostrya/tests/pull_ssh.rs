@@ -1,10 +1,10 @@
-//! The pull through the ssh source: `Repo::pull_over_stream` as the client,
-//! over two bounded in-process pipes, against `Repo::send` as the server.
+//! Tests of the pull through the ssh source. `Repo::pull_over_stream` is the
+//! client and `Repo::send` is the server, over two bounded in-process pipes.
 //!
 //! The oracle of each pull is the HTTP pull of the same remote into a second
-//! destination of the same mode: the refs, the objects, the markers, and the
-//! fetch statistics agree. The pipes are smaller than a large body, so the
-//! server waits for the client to read.
+//! destination of the same mode. The refs, the objects, the markers, and the
+//! fetch statistics of the two destinations agree. The pipes are smaller than
+//! a large body, so the server waits for the client to read.
 
 mod common;
 #[path = "common/pull.rs"]
@@ -33,7 +33,7 @@ const PIPE_CAP: usize = 64 * 1024;
 /// The time bound of each pull.
 const LIMIT: Duration = Duration::from_secs(120);
 
-/// Run `fut`, and fail the test when it takes longer than [`LIMIT`].
+/// Runs `fut` and fails the test if `fut` takes longer than [`LIMIT`].
 async fn within<T>(what: &str, fut: impl Future<Output = T>) -> T {
     future::or(fut, async {
         ostrya_rt::Timer::after(LIMIT).await;
@@ -42,15 +42,16 @@ async fn within<T>(what: &str, fut: impl Future<Output = T>) -> T {
     .await
 }
 
-/// A destination repository of `mode` at `path`, whose config names `origin`
-/// at `url` with no signature check.
+/// A destination repository of `mode` at `path`, whose config names the
+/// remote `origin` at `url`, with `gpg-verify=false`. If `url` is `None`, the
+/// remote has no `url` key.
 async fn dest_at(path: &Path, mode: RepoMode, url: Option<&str>) -> Repo {
     let keys = url.map(|url| format!("url={url}\n")).unwrap_or_default();
     dest_with_keys(path, mode, &keys).await
 }
 
-/// A destination repository of `mode` at `path`, whose config names `origin`
-/// with the keys `keys` and no signature check.
+/// A destination repository of `mode` at `path`, whose config names the
+/// remote `origin` with the keys `keys` and `gpg-verify=false`.
 async fn dest_with_keys(path: &Path, mode: RepoMode, keys: &str) -> Repo {
     drop(Repo::create(path, CreateOptions::new(mode)).await.unwrap());
     let config = path.join("config");
@@ -62,9 +63,9 @@ async fn dest_with_keys(path: &Path, mode: RepoMode, keys: &str) -> Repo {
     Repo::open(path).await.unwrap()
 }
 
-/// Pull from `remote` into `dest` through the ssh source, with `Repo::send`
-/// serving `remote`. Gives the result of the pull and the result of the
-/// server.
+/// Pulls from `remote` into `dest` through the ssh source, with `Repo::send`
+/// as the server of `remote`. Returns the result of the pull and the result
+/// of the server.
 async fn pull_ssh(
     dest: &Repo,
     remote: &Repo,
@@ -103,11 +104,13 @@ fn fetch_counts(stats: &PullStats) -> (u32, u32, u32, u32, u32, u64, u64) {
     )
 }
 
-/// Pull from the archive repository at `remote_path` over HTTP and through
-/// the ssh source, each into a new destination of `mode` under `dir`, with
-/// the options `opts` gives, and assert that both give the same refs,
-/// objects, markers, and fetch statistics, and that a complete pull passes
-/// fsck. Gives the statistics.
+/// Pulls from the archive repository at `remote_path` over HTTP and through
+/// the ssh source, each into a new destination of `mode` under `dir`.
+///
+/// Both pulls take the options that `opts` gives. The function asserts that
+/// both pulls give the same refs, objects, markers, and fetch statistics. If
+/// the pull is complete, it also asserts that the ssh destination passes
+/// fsck. Returns the statistics of the pull through the ssh source.
 async fn pull_both(
     dir: &Path,
     tag: &str,
@@ -175,9 +178,13 @@ async fn summarize(repo: &Repo) {
     .unwrap();
 }
 
-/// The ssh source gives what the HTTP pull gives: the whole tree into an
-/// archive and a bare-user destination, the history under `depth`, the
-/// commit alone, and the subpaths.
+/// The ssh source pulls the same data as the HTTP pull in each of these
+/// cases:
+///
+/// - the whole tree, into an archive and into a bare-user destination
+/// - the history under `depth`
+/// - the commit alone
+/// - the subpaths
 #[test]
 fn the_ssh_source_pulls_what_the_http_pull_pulls() {
     block_on(async {
@@ -231,8 +238,8 @@ fn the_ssh_source_pulls_what_the_http_pull_pulls() {
     });
 }
 
-/// A from-scratch static delta of an archive remote is taken over ssh as
-/// over HTTP, with its parts fetched as files.
+/// The ssh source takes a from-scratch static delta of an archive remote as
+/// the HTTP pull does. It fetches the parts of the delta as files.
 #[test]
 fn the_ssh_source_takes_a_static_delta() {
     block_on(async {
@@ -266,9 +273,9 @@ fn the_ssh_source_takes_a_static_delta() {
     });
 }
 
-/// An object larger than the buffers of the pipes, with small objects after
-/// it in the pipeline, arrives whole, and the transferred count equals that
-/// of the HTTP pull.
+/// An object larger than the buffers of the pipes arrives whole, also with
+/// small objects after it in the pipeline. The count of transferred bytes
+/// equals the count of the HTTP pull.
 #[test]
 fn a_large_object_with_small_objects_behind_it_arrives() {
     block_on(async {
@@ -306,8 +313,8 @@ fn a_large_object_with_small_objects_behind_it_arrives() {
     });
 }
 
-/// A content object the remote does not hold fails the pull with the object
-/// that is not found, and no ref is written.
+/// If the remote does not hold a content object, the pull fails with
+/// `Error::ObjectNotFound` for that object. The pull writes no ref.
 #[test]
 fn a_missing_object_fails_the_pull_and_writes_no_ref() {
     block_on(async {
@@ -323,8 +330,9 @@ fn a_missing_object_fails_the_pull_and_writes_no_ref() {
             }
             other => panic!("{other:?}"),
         }
-        // The server stopped: it read the end of its input, or it failed to
-        // write a reply that was queued when the client failed.
+        // The test ignores the result of the server. The server reads the end
+        // of its input, or it fails to write a reply that it queued before the
+        // client failed.
         let _ = served;
         assert!(
             dest.list_refs(Some("refs/remotes"))
@@ -336,9 +344,10 @@ fn a_missing_object_fails_the_pull_and_writes_no_ref() {
     });
 }
 
-/// An `Error` of the server fails the pull with its code, and the session
-/// ends: the server returns, and no ref is written. The server cannot load a
-/// `bare-user` object whose `user.ostreemeta` does not parse.
+/// An `Error` of the server fails the pull with the code of that error and
+/// ends the session. The server returns, and the pull writes no ref. The
+/// server fails because it cannot load a `bare-user` object whose
+/// `user.ostreemeta` does not parse.
 #[test]
 fn an_error_of_the_server_fails_the_pull_and_ends_the_session() {
     block_on(async {
@@ -380,9 +389,9 @@ fn an_error_of_the_server_fails_the_pull_and_ends_the_session() {
     });
 }
 
-/// A body that the client drops before its end, here a content object whose
-/// mode the pull refuses after the head of the object, fails the pull with
-/// that refusal and ends the session.
+/// If the client drops a body before its end, the pull fails with the cause
+/// of the drop, and the session ends. Here the body is a content object, and
+/// the pull refuses its mode after it reads the head of the object.
 #[test]
 fn a_dropped_body_fails_the_pull_and_ends_the_session() {
     block_on(async {
@@ -423,8 +432,8 @@ fn a_dropped_body_fails_the_pull_and_ends_the_session() {
         .await;
         let err = pulled.unwrap_err();
         assert!(err.to_string().contains("invalid mode"), "{err}");
-        // The server stopped: it read the end of its input, or it failed to
-        // write to a client that dropped its side.
+        // The test ignores the result of the server. The server reads the end
+        // of its input, or it fails to write to a client that dropped its side.
         let _ = served;
         assert!(
             dest.list_refs(Some("refs/remotes"))
@@ -435,9 +444,9 @@ fn a_dropped_body_fails_the_pull_and_ends_the_session() {
     });
 }
 
-/// A stated length above the cap of the client ends the session before the
-/// client reads the body: a ref file of a remote with no summary is capped
-/// at 1 KiB.
+/// If a stated length is more than the cap of the client, the session ends
+/// before the client reads the body. The client caps a ref file of a remote
+/// with no summary at 1 KiB.
 #[test]
 fn a_stated_length_above_the_cap_ends_the_session() {
     block_on(async {
@@ -466,9 +475,9 @@ fn a_stated_length_above_the_cap_ends_the_session() {
     });
 }
 
-/// A pull over a pair of streams refuses a url and the ssh fields of the
-/// connect options, and an HTTP pull refuses the ssh command and the send
-/// command, each before any byte is written.
+/// A pull over a pair of streams refuses a `url` and the ssh fields of the
+/// connect options. An HTTP pull refuses the ssh command and the send
+/// command. Each refusal occurs before the pull writes a byte.
 #[test]
 fn the_fields_of_the_other_transport_are_refused() {
     block_on(async {
@@ -522,7 +531,7 @@ fn the_fields_of_the_other_transport_are_refused() {
                 other => panic!("{other:?}"),
             }
         }
-        // The remote ssh command is not read by an HTTP pull.
+        // An HTTP pull does not read the remote ssh command.
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         dest.pull(
             "origin",
@@ -540,8 +549,8 @@ fn the_fields_of_the_other_transport_are_refused() {
     });
 }
 
-/// A stand-in ssh command that writes its arguments after the program, one
-/// to a line, to `record`, and exits 0 without serving a session.
+/// A stand-in ssh command. It writes the arguments that the pull adds, one to
+/// a line, to `record`, and exits 0. It serves no session.
 fn recording_ssh(record: &Path) -> ostrya::push::PullConnectOptions {
     ostrya::push::PullConnectOptions {
         ssh_command: Some(vec![
@@ -555,16 +564,16 @@ fn recording_ssh(record: &Path) -> ostrya::push::PullConnectOptions {
     }
 }
 
-/// The arguments the stand-in of [`recording_ssh`] got, or `None` when it
-/// did not run.
+/// The arguments that the stand-in of [`recording_ssh`] got. `None` if the
+/// stand-in did not run.
 fn recorded(record: &Path) -> Option<Vec<String>> {
     let text = std::fs::read_to_string(record).ok()?;
     Some(text.lines().map(str::to_owned).collect())
 }
 
-/// The ssh command and the send command of the caller win over the remote
-/// keys, and the key of a field the caller leaves `None` fills it, also for
-/// an address of the caller.
+/// The ssh command and the send command of the caller take priority over the
+/// remote keys. If the caller leaves a field `None`, the remote key fills it.
+/// This rule also applies to an address that the caller gives.
 #[test]
 fn the_commands_of_the_caller_win_over_the_remote_keys() {
     block_on(async {
@@ -631,8 +640,8 @@ fn the_commands_of_the_caller_win_over_the_remote_keys() {
     });
 }
 
-/// An ssh address in `url` is refused in the `ssh://` form and in the scp
-/// form, and the ssh client does not start.
+/// A pull refuses an ssh address in the `url` key, in the `ssh://` form and
+/// in the scp form. The ssh client does not start.
 #[test]
 fn an_ssh_address_in_url_is_refused() {
     block_on(async {
@@ -668,8 +677,9 @@ fn an_ssh_address_in_url_is_refused() {
     });
 }
 
-/// Each option of HTTP alone is refused with an ssh address before the ssh
-/// client starts. A retry count of 0 is accepted, and the ssh client starts.
+/// If the address is an ssh address, a pull refuses each option of HTTP
+/// alone before the ssh client starts. The pull accepts a retry count of 0,
+/// and the ssh client starts.
 #[test]
 fn the_options_of_http_alone_are_refused_before_the_ssh_client_starts() {
     block_on(async {
@@ -743,7 +753,7 @@ fn the_options_of_http_alone_are_refused_before_the_ssh_client_starts() {
     });
 }
 
-/// A pull over ssh reads no remote key of HTTP alone: TLS keys that an HTTP
+/// A pull over ssh reads no remote key of HTTP alone. TLS keys that an HTTP
 /// pull refuses do not stop it, and the ssh client starts.
 #[test]
 fn a_pull_over_ssh_reads_no_tls_key() {
@@ -789,8 +799,9 @@ fn a_pull_over_ssh_reads_no_tls_key() {
 }
 
 /// A pull over ssh resolves its signature policy before the ssh client
-/// starts, so a policy that cannot be built stops the pull with no ssh
-/// client. The refusal of an option of HTTP alone comes before the policy.
+/// starts. If the pull cannot build the policy, the pull stops, and the ssh
+/// client does not start. The refusal of an option of HTTP alone comes
+/// before the policy.
 #[test]
 fn a_refused_policy_stops_the_pull_before_the_ssh_client_starts() {
     block_on(async {
@@ -847,8 +858,8 @@ fn a_refused_policy_stops_the_pull_before_the_ssh_client_starts() {
     });
 }
 
-/// A pull through the ssh source that writes no ref completes every commit
-/// it pulls and writes no ref.
+/// With `no_ref_writes`, a pull through the ssh source completes each commit
+/// that it pulls and writes no ref.
 #[test]
 fn the_ssh_source_with_no_ref_writes_writes_no_ref() {
     block_on(async {
@@ -886,9 +897,9 @@ fn the_ssh_source_with_no_ref_writes_writes_no_ref() {
     });
 }
 
-/// The ssh pull refuses a collection id: the pull over a pair of streams
-/// before it writes to the server, and the pull from an ssh address before
-/// the ssh client starts. Neither publishes anything.
+/// A pull over ssh refuses a collection id. The pull over a pair of streams
+/// refuses it before it writes to the server. The pull from an ssh address
+/// refuses it before the ssh client starts. Neither pull publishes anything.
 #[test]
 fn the_ssh_pull_refuses_a_collection_id() {
     block_on(async {

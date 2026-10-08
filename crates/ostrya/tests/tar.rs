@@ -1,11 +1,14 @@
-//! Tar import/export integration tests.
+//! Integration tests for tar import and export.
 //!
-//! The gate is interoperability and round-trip stability, not byte-identity
-//! with `ostree export` (the tool writes old-GNU-magic headers; smol-tar writes
-//! POSIX ustar/pax). `imports_tool_export_into_matching_tree` proves the tool ->
-//! port direction against a checked-in `export.tar`; the round-trip test proves
-//! the port reproduces a tree, including xattrs, through its own export and
-//! import.
+//! The tests check interoperability and round-trip stability. The archive
+//! bytes of ostrya differ from the output of `ostree export`. The `ostree`
+//! command writes headers with the old GNU magic. The `smol-tar` crate writes
+//! POSIX ustar and pax headers.
+//!
+//! `imports_tool_export_into_matching_tree` checks the direction from the
+//! `ostree` command to ostrya with the checked-in `export.tar`. The round-trip
+//! test checks that ostrya reproduces a tree, with its xattrs, through its own
+//! export and import.
 
 mod common;
 
@@ -29,16 +32,19 @@ fn csum(hex: &str) -> Checksum {
     Checksum::from_hex(hex).unwrap()
 }
 
-/// Compile-time pin: the import futures are `Send`, callbacks included.
+/// Returns `value` unchanged. The bound checks at compile time that the type
+/// is `Send`. The tests pass the import futures, with their callbacks, through
+/// it.
 fn assert_send<T: Send>(value: T) -> T {
     value
 }
 
-/// The body-reader type used when building test archives with [`TarWriter`].
+/// The type of the body reader in the test archives that [`TarWriter`] builds.
 type TestBody = Cursor<Vec<u8>>;
 
-/// Importing the tool's `ostree export` reproduces the fixture commit's root
-/// dirtree and dirmeta exactly, proving tool -> port tree fidelity.
+/// An import of the archive that `ostree export` wrote gives the root dirtree
+/// and the root dirmeta of the fixture commit. This test checks the tree
+/// fidelity from the `ostree` command to ostrya.
 #[test]
 fn imports_tool_export_into_matching_tree() {
     let Ok(tar_bytes) = std::fs::read(fixture_root().join("export.tar")) else {
@@ -65,9 +71,9 @@ fn imports_tool_export_into_matching_tree() {
     });
 }
 
-/// A port export followed by a port import reproduces the source tree, including
-/// the `user.demo` xattr, which only survives if it travels as a SCHILY record
-/// and rebuilds the same content object.
+/// An export and an import by ostrya reproduce the source tree with the
+/// `user.demo` xattr. The xattr survives only if it travels as a SCHILY record
+/// and the import rebuilds the same content object.
 #[test]
 fn export_import_roundtrip_preserves_xattr_tree() {
     let tmp = TmpDir::new("tar-roundtrip");
@@ -108,8 +114,8 @@ fn export_import_roundtrip_preserves_xattr_tree() {
     });
 }
 
-/// Two byte-identical files import to one content object and export coalesces
-/// the repeat into a hardlink to the first.
+/// Two byte-identical files import to one content object. The export writes the
+/// second file as a hardlink to the first file.
 #[test]
 fn identical_files_dedup_to_hardlink() {
     let tmp = TmpDir::new("tar-dedup");
@@ -166,7 +172,7 @@ fn identical_files_dedup_to_hardlink() {
         }
         assert_eq!(a.unwrap(), b.unwrap(), "identical imports share one object");
 
-        // Export coalesces the repeat into a hardlink.
+        // The export writes the repeated file as a hardlink.
         let mut out = Cursor::new(Vec::new());
         repo.export_tar(&commit, TarExportOptions::new(), &mut out)
             .await
@@ -219,8 +225,8 @@ fn etc_migration_remaps_top_level_etc() {
         .unwrap();
         let commit = {
             let txn = repo.transaction().await.unwrap();
-            // The archive names neither a root member nor `usr/`, so the
-            // remapped member needs both of its parents synthesized.
+            // The archive has no root member and no `usr/` member, so the
+            // import must synthesize both parents of the remapped member.
             let mut opts = TarImportOptions::new().with_etc_migration(true);
             opts.autocreate_parents = true;
             let mut mtree = repo
@@ -252,9 +258,9 @@ fn etc_migration_remaps_top_level_etc() {
 }
 
 /// The import futures are `Send` with a rename hook, parent synthesis, and a
-/// modifier that carries callbacks. The member names no parent, so the
-/// renamed path needs both of its parents synthesized. The filter and the
-/// mode callback of the modifier each run at least once.
+/// modifier with callbacks. The archive has no parent member, so the import
+/// must synthesize both parents of the renamed path. The filter and the mode
+/// callback of the modifier each run at least once.
 #[test]
 fn import_futures_are_send() {
     let tmp = TmpDir::new("tar-send");
@@ -271,7 +277,8 @@ fn import_futures_are_send() {
         .unwrap();
         let txn = repo.transaction().await.unwrap();
 
-        // The pin needs only the type of the future, so it is not awaited.
+        // The pin needs only the type of the future, so the test does not
+        // await it.
         let opts = TarImportOptions {
             rename: Some(Box::new(|name| Ok(name.to_owned()))),
             autocreate_parents: true,
@@ -327,9 +334,10 @@ fn import_futures_are_send() {
     });
 }
 
-/// The port's export is read by GNU tar and re-imported by the `ostree` tool
-/// into a tree identical to the fixture -- the port -> tool interoperability
-/// direction. Skipped where the tool is unavailable.
+/// GNU tar reads the export of ostrya. The `ostree` command imports it again
+/// into a tree that is identical to the fixture. This test checks the direction
+/// from ostrya to the `ostree` command. If the command is not available, the
+/// test skips.
 #[test]
 fn tool_reimports_port_export() {
     if !ostree_available() {
@@ -348,7 +356,7 @@ fn tool_reimports_port_export() {
         std::fs::write(&tar_path, sink.into_inner()).unwrap();
     });
 
-    // GNU tar reads the port's archive.
+    // GNU tar reads the archive of ostrya.
     let listing = Command::new("tar")
         .arg("-tf")
         .arg(&tar_path)
@@ -364,7 +372,7 @@ fn tool_reimports_port_export() {
         "unexpected tar listing: {names}"
     );
 
-    // The tool re-imports it into an identical tree.
+    // The `ostree` command imports the archive into an identical tree.
     let repo2 = tmp.path().join("repo2");
     let repo2_arg = format!("--repo={}", repo2.display());
     assert!(
@@ -402,7 +410,8 @@ fn tool_reimports_port_export() {
     });
 }
 
-/// Device and FIFO members cannot enter an ostree tree and are rejected.
+/// The import refuses device and FIFO members, because an ostree tree cannot
+/// hold them.
 #[test]
 fn import_rejects_unsupported_nodes() {
     block_on(async {
@@ -427,9 +436,10 @@ fn import_rejects_unsupported_nodes() {
     });
 }
 
-/// A member whose pathname holds a byte that is not valid UTF-8 is refused. The
-/// port stores pathnames as text, so the reader's decode failure comes back as
-/// [`ostrya::Error::TarPathname`], whose message is the line the CLI prints.
+/// The import refuses a member with a pathname that is not valid UTF-8. This
+/// crate stores pathnames as text. The decode failure of the reader returns as
+/// [`ostrya::Error::TarPathname`]. The message of this error is the line that
+/// the CLI prints.
 #[test]
 fn import_rejects_a_pathname_that_is_not_utf8() {
     let tmp = TmpDir::new("tar-pathname");
@@ -454,9 +464,9 @@ fn import_rejects_a_pathname_that_is_not_utf8() {
     });
 }
 
-/// An archive holding a `./` root member and one regular file whose name holds
-/// the byte `0xFF`. [`TarWriter`] takes each pathname as text, so the two
-/// header blocks are written directly.
+/// Returns an archive with a `./` root member and one regular file with the
+/// byte `0xFF` in its name. [`TarWriter`] takes each pathname as text, so this
+/// function writes the two header blocks directly.
 fn invalid_pathname_tar() -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(&ustar_header(b"./", 0o755, b'5', 0));
@@ -464,14 +474,15 @@ fn invalid_pathname_tar() -> Vec<u8> {
     out.extend_from_slice(&ustar_header(b"./b\xFFd.txt", 0o644, b'0', body.len()));
     out.extend_from_slice(body);
     out.resize(out.len().next_multiple_of(512), 0);
-    // Two zero blocks end the stream, and the whole is padded to a tar record.
+    // Two zero blocks end the stream. Then the function pads the archive to the
+    // size of a tar record.
     out.resize(out.len() + 1024, 0);
     out.resize(out.len().next_multiple_of(10240), 0);
     out
 }
 
-/// One 512-byte ustar header block. The name is taken as bytes, so a pathname
-/// that is not valid UTF-8 can be stated.
+/// Returns one 512-byte ustar header block. The function takes the name as
+/// bytes, so the name can hold bytes that are not valid UTF-8.
 fn ustar_header(name: &[u8], mode: u32, typeflag: u8, size: usize) -> [u8; 512] {
     let mut h = [0u8; 512];
     let put = |h: &mut [u8; 512], at: usize, bytes: &[u8]| {
@@ -483,7 +494,8 @@ fn ustar_header(name: &[u8], mode: u32, typeflag: u8, size: usize) -> [u8; 512] 
     put(&mut h, 116, b"0000000\0");
     put(&mut h, 124, format!("{size:011o}\0").as_bytes());
     put(&mut h, 136, b"00000000000\0");
-    // The checksum field is summed as eight spaces and written afterwards.
+    // The sum counts the checksum field as eight spaces. The function writes
+    // the field after the sum.
     put(&mut h, 148, b"        ");
     h[156] = typeflag;
     put(&mut h, 257, b"ustar\0");
@@ -493,7 +505,7 @@ fn ustar_header(name: &[u8], mode: u32, typeflag: u8, size: usize) -> [u8; 512] 
     h
 }
 
-/// Build a one-member archive from a metadata-only entry.
+/// Builds a one-member archive from a metadata-only entry.
 async fn single_entry_tar(entry: TarEntry<'static, TestBody>) -> Vec<u8> {
     let mut sink = Cursor::new(Vec::new());
     {

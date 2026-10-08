@@ -1,305 +1,427 @@
-//! The library error type.
+//! The error type of this crate.
 //!
-//! One `Error` enum for the whole crate, deriving `Display` and
-//! `std::error::Error` via `thiserror`. The enum is `#[non_exhaustive]`, so a
-//! release can add a variant without a breaking change. The signing engines
-//! and the fetcher have their own error types, [`ostrya_sign::Error`] and
-//! [`fetch::Error`](crate::fetch::Error), which convert into this one.
+//! [`Error`](enum@Error) is the error of each fallible operation of the
+//! crate. [`Result`] is the result type with that error.
 
 use ostrya_core::{Checksum, ObjectType};
 use thiserror::Error;
 
-/// Result alias used throughout the `ostrya` crate.
+/// The result type of this crate, with [`Error`](enum@Error) as the error.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The single error type for the library.
+/// The error of each fallible operation of this crate.
+///
+/// The enum is `#[non_exhaustive]`, so a release can add a variant without a
+/// breaking change. The signing engines and the fetcher have their own error
+/// types, [`ostrya_sign::Error`] and [`fetch::Error`](crate::fetch::Error).
+/// Each of the two converts into this type.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// An underlying I/O error.
+    /// An I/O error.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
-    /// An error from the core format-primitive layer (checksums, keyfile
-    /// parsing, object model).
+    /// An error from the format primitives: checksums, key files, and objects.
     #[error(transparent)]
     Core(#[from] ostrya_core::Error),
-    /// A referenced object is not present in the store.
+    /// An object that is not in the object store.
     #[error("object not found: {ty:?} {checksum}")]
     ObjectNotFound {
-        /// The object identity that was looked up.
+        /// The checksum of the object that the lookup asked for.
         checksum: Checksum,
-        /// The object type that was looked up.
+        /// The type of the object that the lookup asked for.
         ty: ObjectType,
     },
-    /// A refspec did not resolve to a commit.
+    /// A refspec that does not resolve to a commit.
     #[error("ref not found: {0}")]
     RefNotFound(String),
-    /// The configuration has no `[remote "<name>"]` group for the remote. The
-    /// payload is the remote name.
+    /// A remote with no `[remote "<name>"]` group in the configuration.
+    ///
+    /// The payload is the name of the remote.
     #[error("remote not found: {0}")]
     RemoteNotFound(String),
-    /// The configuration already has a `[remote "<name>"]` group for the
-    /// remote. The payload is the remote name.
+    /// A remote that already has a `[remote "<name>"]` group in the
+    /// configuration.
+    ///
+    /// The payload is the name of the remote.
     #[error("remote already exists: {0}")]
     RemoteExists(String),
-    /// A refspec does not name a path inside the `refs/` tree: an empty name,
-    /// an empty, `.`, or `..` component, a remote or collection element holding
-    /// a `/`, or an interior NUL. The payload is the refspec as given, spelled
-    /// `<remote>:<name>` or `<collection-id>:<name>` where one is present.
+    /// A refspec that does not name a path in the `refs/` tree.
+    ///
+    /// The causes are:
+    ///
+    /// - an empty name
+    /// - an empty, `.`, or `..` component
+    /// - a remote element or a collection element that holds a `/`
+    /// - an interior NUL
+    ///
+    /// The payload is the refspec as the caller gave it. If the refspec has a
+    /// remote or a collection, the payload has the form `<remote>:<name>` or
+    /// `<collection-id>:<name>`.
     #[error("invalid refspec: {0}")]
     InvalidRefspec(String),
-    /// An abbreviated checksum prefixes more than one of the commit objects
-    /// present, so it names no single commit. The payload is the revision as
-    /// given.
+    /// An abbreviated checksum that is the prefix of two or more commit
+    /// objects.
+    ///
+    /// Such a checksum names no single commit. The payload is the revision as
+    /// the caller gave it.
     #[error("refspec not unique: {0}")]
     AmbiguousRefspec(String),
-    /// A revision's `^` ancestry suffix asked for the parent of a root commit.
+    /// A `^` suffix of a revision that asks for the parent of a root commit.
+    ///
+    /// The payload is the checksum of the root commit.
     #[error("commit {0} has no parent")]
     NoParentCommit(Checksum),
-    /// On-disk data did not match the expected format.
+    /// Data that does not match its expected format.
     #[error("invalid format: {0}")]
     InvalidFormat(String),
-    /// A requested operation or repository feature is not supported.
+    /// An operation or a repository feature that this crate does not support.
     ///
     /// A [`fetch::Error::Unsupported`](crate::fetch::Error::Unsupported)
     /// converts to this variant.
     #[error("unsupported: {0}")]
     Unsupported(String),
-    /// An argument of the caller is outside the values the operation
-    /// accepts, for example a pull depth below -1.
+    /// An argument outside the values that the operation accepts.
+    ///
+    /// An example is a pull depth less than `-1`.
     #[error("invalid input: {0}")]
     InvalidInput(String),
-    /// Acquiring the repository lock or the update lock timed out under
-    /// contention. The message names the repository lock in both cases.
+    /// A wait for the repository lock or the update lock that passed its
+    /// limit.
+    ///
+    /// The limit of the wait is the value of `[core] lock-timeout-secs`. With
+    /// the value `-1`, a wait has no limit and does not give this error. The
+    /// message names the repository lock for both locks.
+    /// [`LockKind`](crate::LockKind) states the rules of the repository lock,
+    /// and [`UpdateGuard`](crate::UpdateGuard) states the rules of the update
+    /// lock.
     #[error("timed out acquiring repository lock after {secs}s")]
     LockTimeout {
-        /// The configured lock-acquisition timeout, in seconds.
+        /// The limit of the wait, in seconds.
         secs: i64,
     },
-    /// A written object's computed checksum did not match the caller's
-    /// expected value.
+    /// Data whose computed checksum is not the expected checksum.
+    ///
+    /// The expected checksum is the checksum that the caller of a write gives
+    /// for the object. In a pull, it is also the advertised checksum of a
+    /// static-delta superblock.
     #[error("checksum mismatch: expected {expected}, computed {actual}")]
     ChecksumMismatch {
-        /// The checksum the caller asserted the object would have.
+        /// The checksum that the caller or the advertisement gave.
         expected: Checksum,
-        /// The checksum the write path actually computed.
+        /// The checksum that this crate computed.
         actual: Checksum,
     },
-    /// Staging an object would drop free space below the configured
-    /// `min-free-space-percent` / `min-free-space-size` reserve.
+    /// A staged object that makes the free space less than the reserve.
+    ///
+    /// The keys `min-free-space-percent` and `min-free-space-size` of
+    /// `[core]` set the reserve.
     #[error("insufficient free space: short by {shortfall} bytes")]
     InsufficientFreeSpace {
-        /// How many more bytes of free space the write would have needed.
+        /// The number of bytes of free space that the write needed in
+        /// addition.
         shortfall: u64,
     },
-    /// An in-memory tree could not be built or serialized: an invalid entry
-    /// name, a file/directory name collision, a directory missing its dirmeta
-    /// checksum, or removing an absent entry.
+    /// A failure to build or serialize an in-memory tree.
+    ///
+    /// The causes are:
+    ///
+    /// - an invalid entry name
+    /// - a file name and a directory name that are the same
+    /// - a directory with no dirmeta checksum
+    /// - the removal of an absent entry
+    /// - a committed subdirectory that is not loaded, with no repository to
+    ///   read it from
     #[error("mutable tree: {0}")]
     MutableTree(String),
-    /// An overlayfs upperdir uses a feature the merge cannot honor because the
-    /// entry is not self-contained (`overlay.metacopy` or `overlay.redirect`);
-    /// the overlay must be mounted with that feature disabled.
+    /// An overlayfs feature in an upper directory that the merge cannot carry.
+    ///
+    /// An entry with `overlay.metacopy` or `overlay.redirect` is not
+    /// self-contained. The merge needs an overlay that has the feature off:
+    /// `metacopy=off` and `redirect_dir=off`.
     #[error("unsupported overlay feature: {0}")]
     UnsupportedOverlayFeature(String),
-    /// A path names a component that is not present.
+    /// A path with a component that is not present.
     #[error("path not found: {path}")]
     PathNotFound {
-        /// The path of the component that is absent. A caller that holds one
-        /// name and no path, `MutableTree::subtree` among them, puts the bare
-        /// entry name here.
+        /// The path of the absent component.
+        ///
+        /// If a caller has one name and no path, the field holds the bare
+        /// entry name. [`MutableTree::subtree`](crate::MutableTree::subtree)
+        /// is such a caller.
         path: String,
     },
-    /// A path component that had to be a directory is a file, or a symlink
-    /// resolved to one.
+    /// A path component that must be a directory and is a file.
+    ///
+    /// A symlink that resolves to a file also gives this error.
     #[error("not a directory: {path}")]
     NotADirectory {
-        /// The path of the component that is not a directory. A caller that
-        /// holds one name and no path, `MutableTree::subtree` among them, puts
-        /// the bare entry name here.
+        /// The path of the component that is not a directory.
+        ///
+        /// If a caller has one name and no path, the field holds the bare
+        /// entry name. [`MutableTree::subtree`](crate::MutableTree::subtree)
+        /// is such a caller.
         path: String,
     },
-    /// A symlink's target does not resolve.
+    /// A symlink whose target does not resolve.
     #[error("dangling symlink: {path} -> {target}")]
     DanglingSymlink {
         /// The path of the symlink.
         path: String,
-        /// The target it names.
+        /// The target that the symlink names.
         target: String,
     },
-    /// A path resolution followed more symlinks than the depth cap allows.
+    /// A path resolution that followed more symlinks than the depth cap.
+    ///
+    /// The cap is 40 symlinks.
     #[error("symlink chain too deep (possible loop): {path}")]
     SymlinkLoop {
-        /// The path of the symlink the walk gave up on.
+        /// The path of the symlink where the resolution stopped.
         path: String,
     },
-    /// An operation that requires a fresh entry found one already there.
+    /// An entry at a path where an operation must create a new entry.
     #[error("entry already exists: {path}")]
     EntryExists {
-        /// The path the entry occupies.
+        /// The path of the entry.
         path: String,
     },
-    /// A staging-tree operation could not proceed for a condition none of the
-    /// variants above names: an outstanding file writer blocking
-    /// [`StagingTree::close`](crate::StagingTree::close), a read that wanted a
-    /// file where a directory sits, a hardlink whose source resolves to a
-    /// directory, a directory that a concurrent operation removed while the
-    /// operation held its path, a path with no final component or one ending
-    /// in `..`, a non-UTF-8 path component or symlink target, or a hydration
-    /// with no repository handle to read through.
+    /// A failure of a staging-tree operation that no other variant names.
+    ///
+    /// The causes are:
+    ///
+    /// - an outstanding file writer that blocks the operation, for example
+    ///   [`StagingTree::close`](crate::StagingTree::close)
+    /// - a read of a file at a path that holds a directory
+    /// - a hardlink whose source resolves to a directory
+    /// - a directory that a concurrent operation removed while the operation
+    ///   held its path
+    /// - a path with no final component, or a path that ends in `..`
+    /// - a path component or a symlink target that is not valid UTF-8
+    /// - a rename whose destination is under the moved entry
+    /// - a load of a committed directory with no repository handle to read it
     #[error("staging tree: {0}")]
     Staging(String),
-    /// A staging-tree merge hit a conflict the [`MergeOptions`](crate::MergeOptions)
-    /// did not permit: differing files, a file-versus-directory clash, or
-    /// differing directory metadata, without `allow_overwrite`.
+    /// A conflict of a staging-tree merge that the merge options do not permit.
+    ///
+    /// The conflicts are differing files, a file and a directory at one path,
+    /// and differing directory metadata. Each one is a conflict only if
+    /// [`allow_overwrite`](crate::MergeOptions::allow_overwrite) of the
+    /// [`MergeOptions`](crate::MergeOptions) is off.
     #[error("merge conflict: {0}")]
     MergeConflict(String),
-    /// A checkout could not proceed: a collision under
-    /// [`OverwriteMode::None`](crate::OverwriteMode::None), a
-    /// [`UnionIdentical`](crate::OverwriteMode::UnionIdentical) mismatch, or an
-    /// unsupported combination of options.
+    /// A checkout that cannot proceed.
+    ///
+    /// The causes are:
+    ///
+    /// - a collision under [`OverwriteMode::None`](crate::OverwriteMode::None)
+    /// - a mismatch under
+    ///   [`UnionIdentical`](crate::OverwriteMode::UnionIdentical)
+    /// - a combination of options that a checkout does not accept
+    /// - a partial commit
+    /// - a whiteout that names no entry
+    /// - a destination name that is not valid UTF-8
+    /// - a failure to set an extended attribute
     #[error("checkout: {0}")]
     Checkout(String),
-    /// A checkout's [`subpath`](crate::CheckoutOptions::subpath) names no entry
-    /// in the commit tree. The payload is the value as the caller spelled it.
+    /// A checkout [`subpath`](crate::CheckoutOptions::subpath) that names no
+    /// entry in the commit tree.
+    ///
+    /// The payload is the value as the caller wrote it.
     #[error("checkout: subpath not found: {}", .0.display())]
     SubpathNotFound(std::path::PathBuf),
-    /// A checkout's [`subpath`](crate::CheckoutOptions::subpath) runs through an
-    /// entry that is not a directory. The payload is the value as the caller
-    /// spelled it.
+    /// A checkout [`subpath`](crate::CheckoutOptions::subpath) that passes
+    /// through an entry that is not a directory.
+    ///
+    /// The payload is the value as the caller wrote it.
     #[error("checkout: subpath is not a directory: {}", .0.display())]
     SubpathNotADirectory(std::path::PathBuf),
-    /// A checkout under
-    /// [`require_hardlinks`](crate::CheckoutOptions::require_hardlinks) reached
-    /// an entry the repository mode and the checkout mode in force give a copy.
-    /// The payload is the entry's own name.
+    /// An entry that a checkout under
+    /// [`require_hardlinks`](crate::CheckoutOptions::require_hardlinks) must
+    /// copy.
+    ///
+    /// The repository mode and the checkout mode give a copy of the entry.
+    /// The payload is the name of the entry.
     #[error(
         "checkout: {0}: require-hardlinks is set and this repository mode and \
          checkout mode give a copy of this entry"
     )]
     RequireHardlinks(String),
+    /// A hardlink checkout into a directory on another file system.
+    ///
     /// A checkout under
-    /// [`require_hardlinks`](crate::CheckoutOptions::require_hardlinks) reached
-    /// a destination directory on another filesystem than the repository, where
-    /// no entry can be hardlinked. The destination root reaches this and so
-    /// does every directory below it. A single file or symlink target takes no
-    /// such check and reaches this where its own link crosses a filesystem. The
-    /// payload is each side's device number.
+    /// [`require_hardlinks`](crate::CheckoutOptions::require_hardlinks) cannot
+    /// hardlink an entry into a directory on a file system other than the file
+    /// system of the repository. The destination root gives this error, and
+    /// so does each directory under it. A checkout of a
+    /// single file or symlink does no such directory check. It gives this
+    /// error if the link of that entry crosses a file system.
+    ///
+    /// The fields hold the device number of each side.
     #[error(
         "checkout: require-hardlinks: the destination is on another filesystem \
          than the repository (repository={src} destination={dst})"
     )]
     HardlinkAcrossDevices {
-        /// The device number of the repository's object store.
+        /// The device number of the object store of the repository.
         src: u64,
         /// The device number of the destination.
         dst: u64,
     },
-    /// A tar import or export could not proceed: an entry type ostree cannot
-    /// store (a device node or FIFO), a path with a `..` component, a hardlink
-    /// with no target in the archive, or a non-UTF-8 xattr name.
+    /// A tar import or export that cannot proceed.
+    ///
+    /// The causes are:
+    ///
+    /// - an entry type that a repository cannot store: a device node or a
+    ///   FIFO
+    /// - an empty path, or a path with a `..` component
+    /// - a hardlink with no target in the archive
+    /// - an xattr name that is not valid UTF-8
+    /// - an export subpath that is absent or is not a directory
     #[error("tar: {0}")]
     Tar(String),
-    /// A tar member's pathname is not valid UTF-8. The port stores pathnames as
-    /// text, so such a member has no name to be imported under.
+    /// A tar member whose pathname is not valid UTF-8.
+    ///
+    /// This crate stores pathnames as text, so such a member has no name to
+    /// import it under.
     #[error("Archive entry pathname is not valid UTF-8")]
     TarPathname,
-    /// A consuming walk could not remove one entry of its source. The payload
-    /// is the entry's own name and the reason the removal failed.
+    /// A failure to remove an entry of the source under
+    /// [`CONSUME`](crate::CommitModifierFlags::CONSUME).
+    ///
+    /// The fields hold the name of the entry and the reason of the failure.
     #[error("unlinkat({name}): {reason}")]
     ConsumeUnlink {
-        /// The name of the entry that could not be removed.
+        /// The name of the entry.
         name: String,
-        /// Why the removal failed.
+        /// The reason of the failure, as the text of the OS error.
         reason: String,
     },
-    /// A tree source names a file at a path an earlier source made a
-    /// directory. The payload is the entry's own name.
+    /// A file from a tree source at a path where an earlier source put a
+    /// directory.
+    ///
+    /// The payload is the name of the entry.
     #[error("Can't replace directory with file: {0}")]
     ReplaceDirWithFile(String),
-    /// A tree source names a directory at a path an earlier source made a
-    /// file. The payload is the entry's own name.
+    /// A directory from a tree source at a path where an earlier source put a
+    /// file.
+    ///
+    /// The payload is the name of the entry.
     #[error("Can't replace file with directory: {0}")]
     ReplaceFileWithDir(String),
-    /// A tar member names a parent directory the tree does not hold and
+    /// A tar member whose parent directory is not in the tree.
+    ///
+    /// A tar import gives this error if
     /// [`TarImportOptions::autocreate_parents`](crate::TarImportOptions::autocreate_parents)
-    /// is off. The payload is the name of the first ancestor that is absent.
+    /// is off. The payload is the name of the first absent ancestor.
     #[error("No such file or directory: {0}")]
     TarMissingParent(String),
-    /// A signing engine rejected its key material or a signature blob: a
-    /// wrong-length key, a public key that is not a valid curve point, or a
-    /// malformed secret key.
+    /// A failure of a signing engine, a key source, or a signature
+    /// verification.
+    ///
+    /// A signing engine gives this error for these inputs:
+    ///
+    /// - a key of the wrong length
+    /// - a public key that is not a valid curve point
+    /// - a malformed secret key
+    /// - a signature blob that the engine refuses
     ///
     /// An [`ostrya_sign::Error::Signature`] converts to this variant with the
-    /// same message, and so does a variant of `ostrya_sign::Error` that this
-    /// conversion does not name. The library also builds this variant itself:
-    /// the verification policy of a pull, the keyring readers, and the
-    /// signature check of a static delta.
+    /// same message. Each variant of `ostrya_sign::Error` that the conversion
+    /// does not name also converts to this variant.
+    ///
+    /// This crate also builds this variant in these places:
+    ///
+    /// - the verification policy of a pull
+    /// - the readers of keyrings and key files
+    /// - the GPG key import and the `gpg` program that it runs
+    /// - the signature verification of a static delta
     #[error("signature: {0}")]
     Signature(String),
-    /// A pull refused an object or a commit: a commit whose
-    /// `ostree.ref-binding` does not name the ref it is being pulled under, or
-    /// a content object whose mode the destination repository may not store.
+    /// A pull that cannot proceed, or that refuses an object or a commit.
+    ///
+    /// The causes are:
+    ///
+    /// - a remote that is not in the configuration, or that has no `url` and
+    ///   no `pull-url`
+    /// - a pull of all refs with no configured branches, or in mirror mode
+    ///   with no summary on the remote
+    /// - a commit whose `ostree.ref-binding` does not name the ref of the pull
+    /// - a commit that is older than the commit that its ref holds
+    /// - a content object whose mode the destination repository cannot store
+    /// - a required static delta that is absent, or a delta whose superblock
+    ///   does not produce its target
+    /// - a subpath that is not an absolute path, or too many subpaths
+    /// - a signature verification with no remote to take the keys from
+    /// - a client certificate with no client key, or a client key with no
+    ///   client certificate
     #[error("pull: {0}")]
     Pull(String),
-    /// A fetch could not be set up or carried out: an unusable mirror URL,
-    /// header, or TLS configuration, or a transport failure that outlived its
-    /// retries.
+    /// A failure to set up or to carry out a fetch.
+    ///
+    /// The causes include a mirror URL, a header, or a TLS configuration that
+    /// the fetcher cannot use. They also include a transport failure that
+    /// outlived the retries.
     ///
     /// A [`fetch::Error::Fetch`](crate::fetch::Error::Fetch) converts to this
-    /// variant with the same message, and so does a variant of
-    /// `fetch::Error` that this conversion does not name. The pull also builds
-    /// this variant itself.
+    /// variant with the same message. Each variant of `fetch::Error` that the
+    /// conversion does not name also converts to this variant. A pull also
+    /// builds this variant.
     #[error("fetch: {0}")]
     Fetch(String),
-    /// Every mirror answered the request with an unsuccessful HTTP status. A
-    /// 404 here means the object is absent from the remote, which pull treats
-    /// as a normal answer for optional objects.
+    /// An unsuccessful HTTP status that ended a fetch.
     ///
-    /// One mirror's answer is reported: the first status received that is not
-    /// retried, from whichever round it came, unless the rounds ran out with a
-    /// retryable status outstanding, in which case the last mirror to give one.
+    /// A 404 means that the remote does not hold the object. A pull accepts a
+    /// 404 as a normal answer for an optional object.
+    ///
+    /// A fetch with mirrors and rounds reports the first definitive failure
+    /// that it received. If it received no definitive failure, it reports the
+    /// first retryable failure. If the reported failure is a status, it is
+    /// this variant.
     ///
     /// A [`fetch::Error::HttpStatus`](crate::fetch::Error::HttpStatus) converts
     /// to this variant.
     #[error("http status {status} for {url}")]
     HttpStatus {
-        /// The status that mirror returned.
+        /// The status of the response.
         status: u16,
-        /// The URL requested of it.
+        /// The URL of the hop that answered with the status.
         url: String,
     },
-    /// A redirect chain reached the limit
-    /// [`max_redirects`](crate::FetcherOptions::max_redirects) sets, and the
-    /// response at the end of it named another URL to follow. One attempt
-    /// against one destination counts its own hops, so a repeated round counts
-    /// again from the destination the route named.
+    /// A redirect chain that reached the limit of
+    /// [`max_redirects`](crate::FetcherOptions::max_redirects).
+    ///
+    /// The response at the end of the chain named another URL to follow. Each
+    /// attempt against one destination counts its own hops, so a repeated
+    /// round counts again from the destination that the route named.
     ///
     /// A [`fetch::Error::RedirectLimit`](crate::fetch::Error::RedirectLimit)
     /// converts to this variant.
     #[error("redirect from {url} exceeds the {hops}-redirect limit")]
     RedirectLimit {
-        /// The last hop the attempt reached, which is the URL whose `Location`
-        /// the limit stopped it from following.
+        /// The URL of the last hop, whose `Location` the limit did not follow.
         url: String,
-        /// How many redirects the attempt followed, which is the limit it was
-        /// given.
+        /// The number of redirects that the attempt followed, which is the
+        /// limit.
         hops: u32,
     },
-    /// A response declared more bytes than the caller's cap allows. A body that
-    /// outgrows the cap while streaming fails the read with the same
-    /// [`FileTooLarge`](std::io::ErrorKind::FileTooLarge) kind, under a
-    /// message payload that downcasts to no library error.
+    /// A response that declared more bytes than the cap of the caller.
+    ///
+    /// If a body grows past the cap while it streams, the read fails with the
+    /// same [`FileTooLarge`](std::io::ErrorKind::FileTooLarge) kind. The
+    /// payload of that I/O error is a message, and it does not downcast to an
+    /// error of this crate.
     ///
     /// A [`fetch::Error::FetchTooLarge`](crate::fetch::Error::FetchTooLarge)
     /// converts to this variant.
     #[error("fetched object exceeds the {limit}-byte cap")]
     FetchTooLarge {
-        /// The cap the caller set on the request.
+        /// The cap that the caller set on the request.
         limit: u64,
     },
-    /// A response declared a coding, in `Content-Encoding` or in
-    /// `Transfer-Encoding`, so its body holds bytes other than the ones the
+    /// A response that declared a coding in `Content-Encoding` or
+    /// `Transfer-Encoding`.
+    ///
+    /// The body of such a response holds bytes other than the bytes that the
     /// remote stores.
     ///
     /// A [`fetch::Error::ContentEncoded`](crate::fetch::Error::ContentEncoded)
@@ -308,52 +430,59 @@ pub enum Error {
     ContentEncoded {
         /// The URL that answered.
         url: String,
-        /// The coding the response declared.
+        /// The coding that the response declared.
         encoding: String,
     },
-    /// An upload failed after the fetcher handed its request to the
-    /// connection. The server can have received the whole request and acted
-    /// on it, so the outcome is unknown, and the fetcher does not send the
-    /// request again.
+    /// An upload that failed after the fetcher gave its request to the
+    /// connection.
+    ///
+    /// The server can have received the whole request and acted on it, so the
+    /// outcome is unknown. The fetcher does not send the request again.
     ///
     /// A
     /// [`fetch::Error::UploadInterrupted`](crate::fetch::Error::UploadInterrupted)
     /// converts to this variant.
     #[error("upload to {url} interrupted: {message}")]
     UploadInterrupted {
-        /// The URL the request was sent to.
+        /// The URL that the request was sent to.
         url: String,
-        /// What ended the upload.
+        /// The text that names what ended the upload.
         message: String,
     },
-    /// A metadata key named in
+    /// A GC-root metadata key whose value is not a list of commit checksums.
+    ///
     /// [`gc_root_metadata_keys`](crate::PruneOptions::gc_root_metadata_keys)
-    /// holds a value that is not a list of commit checksums: its variant type
-    /// is not `aay`, or one element is not a 32-byte checksum.
+    /// names the keys. A value gives this error if its variant type is not
+    /// `aay`, or if an element is not a 32-byte checksum.
     #[error("gc-root metadata key {metadata_key} on commit {commit}: {reason}")]
     InvalidGcRoot {
-        /// The commit the metadata key was read from.
+        /// The commit that holds the metadata key.
         commit: Checksum,
-        /// The metadata key name, as configured.
+        /// The name of the metadata key, as configured.
         metadata_key: String,
-        /// What the value holds instead.
+        /// The text that names the defect of the value.
         reason: String,
     },
-    /// A session of the wire protocol of [`push`](crate::push) failed: the
-    /// error the server side sent to the peer with its wire code, an `Abort`
-    /// of the client ([`Aborted`](crate::push::Error::Aborted)), or an error
-    /// of the session stream. On the client side it also carries a push
-    /// request the client refuses
-    /// ([`InvalidInput`](crate::push::Error::InvalidInput)). The variant is
-    /// in every build.
+    /// A failure of a session of the wire protocol of [`push`](crate::push).
+    ///
+    /// The causes are:
+    ///
+    /// - an error that the server side sent to the peer with its wire code
+    /// - an `Abort` from the client ([`Aborted`](crate::push::Error::Aborted))
+    /// - an error of the session stream
+    /// - on the client side, a push request that the client refuses
+    ///   ([`InvalidInput`](crate::push::Error::InvalidInput))
+    ///
+    /// The variant is in every build.
     #[error(transparent)]
     Push(#[from] crate::push::Error),
-    /// The repository holds no static delta from `from` to `to`: nothing
-    /// resolves at its `deltas/<fanout>/<rest>` path. The message names the
-    /// delta the way the tool names it.
+    /// A static delta from `from` to `to` that the repository does not hold.
+    ///
+    /// No file resolves at its `deltas/<fanout>/<rest>` path. The message
+    /// names the delta as the `ostree` command names it.
     #[error("Can't find delta {}", crate::delta::delta_hex_name(.from.as_ref(), .to))]
     StaticDeltaNotFound {
-        /// The source commit, `None` for a delta from scratch.
+        /// The source commit, or `None` for a delta from scratch.
         from: Option<Checksum>,
         /// The target commit.
         to: Checksum,
@@ -367,9 +496,10 @@ impl From<rustix::io::Errno> for Error {
 }
 
 impl From<ostrya_sign::Error> for Error {
-    /// Map a signing-engine error onto the variant of the same name. A variant
-    /// this conversion does not name maps to [`Error::Signature`] with the
-    /// message of the error.
+    /// Maps a signing-engine error to the variant of the same name.
+    ///
+    /// A variant that this conversion does not name maps to
+    /// [`Error::Signature`] with the message of the error.
     fn from(err: ostrya_sign::Error) -> Error {
         match err {
             ostrya_sign::Error::Signature(message) => Error::Signature(message),
@@ -381,9 +511,11 @@ impl From<ostrya_sign::Error> for Error {
 }
 
 impl From<crate::fetch::Error> for Error {
-    /// Map a fetcher error onto the variant of the same name, with the same
-    /// fields and so the same message. A variant this conversion does not name
-    /// maps to [`Error::Fetch`] with the message of the error.
+    /// Maps a fetcher error to the variant of the same name.
+    ///
+    /// The variant gets the same fields, so the message stays the same. A
+    /// variant that this conversion does not name maps to [`Error::Fetch`]
+    /// with the message of the error.
     fn from(err: crate::fetch::Error) -> Error {
         use crate::fetch::Error as F;
 
@@ -401,25 +533,29 @@ impl From<crate::fetch::Error> for Error {
 }
 
 impl From<Error> for std::io::Error {
-    /// Map a library error onto the closest `std::io::ErrorKind`, keeping the
-    /// error itself as the payload so its `Display` and its source chain
-    /// survive. An [`Error::Io`] is handed back unchanged.
+    /// Maps an error of this crate to the closest [`std::io::ErrorKind`].
     ///
-    /// A kind is given only where the standard set names the condition. A
-    /// symlink loop falls to [`Other`](std::io::ErrorKind::Other), since
-    /// `ErrorKind::FilesystemLoop` is unstable.
+    /// The I/O error holds the error as its payload, so its `Display` and its
+    /// source chain stay. An [`Error::Io`] comes back unchanged.
     ///
-    /// Three fetch failures the standard set names carry their own kind. An
-    /// [`Error::HttpStatus`] of 404 maps to
-    /// [`NotFound`](std::io::ErrorKind::NotFound), which is how a remote
-    /// states an object is absent; a 401 and a 403 map to
-    /// [`PermissionDenied`](std::io::ErrorKind::PermissionDenied); every other
-    /// status falls to [`Other`](std::io::ErrorKind::Other). An
-    /// [`Error::FetchTooLarge`] maps to
-    /// [`FileTooLarge`](std::io::ErrorKind::FileTooLarge). A body that
-    /// outgrows the cap while streaming fails its read with that same kind,
-    /// and its payload is a message, so only the converted error downcasts
-    /// back to a library error.
+    /// A variant gets a specific kind only if the standard set names the
+    /// condition. A symlink loop maps to [`Other`](std::io::ErrorKind::Other),
+    /// because `ErrorKind::FilesystemLoop` is unstable.
+    ///
+    /// Three fetch failures get their own kind:
+    ///
+    /// - An [`Error::HttpStatus`] of 404 maps to
+    ///   [`NotFound`](std::io::ErrorKind::NotFound). A remote uses a 404 to
+    ///   state that an object is absent.
+    /// - A 401 and a 403 map to
+    ///   [`PermissionDenied`](std::io::ErrorKind::PermissionDenied). Each
+    ///   other status maps to [`Other`](std::io::ErrorKind::Other).
+    /// - An [`Error::FetchTooLarge`] maps to
+    ///   [`FileTooLarge`](std::io::ErrorKind::FileTooLarge).
+    ///
+    /// If a body grows past the cap while it streams, its read fails with the
+    /// same `FileTooLarge` kind. The payload of that error is a message, so
+    /// only the converted error downcasts to an error of this crate.
     fn from(err: Error) -> std::io::Error {
         use std::io::ErrorKind;
 

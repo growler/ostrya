@@ -3,8 +3,8 @@
 //!
 //! A test client drives the session over two in-process pipes with the frame
 //! codec of `ostrya::push::proto`. It sends the objects of the golden fixture
-//! commit, which binds the ref `test/main`, or of commits the tests build over
-//! the fixture tree.
+//! commit, which binds the ref `test/main`, or of commits that the tests build
+//! over the fixture tree.
 
 #![cfg(feature = "receive")]
 
@@ -168,8 +168,8 @@ fn update(name: &str, expected: Expected, new: Option<Checksum>) -> RefUpdate {
     }
 }
 
-/// What one push session gives: the result the server returned, and the reply
-/// the client read.
+/// The output of one push session: the result that the server returned, and
+/// the reply that the client read.
 type Pushed = (
     ostrya::Result<ReceiveReport>,
     Result<Vec<RefOutcome>, ErrorMessage>,
@@ -189,7 +189,8 @@ fn push(
     push_named(repo, policy, &names, objects, meta, updates, force)
 }
 
-/// [`push`], with the refs of `Hello` given apart from the updates.
+/// Runs one [`push`] with refs in `Hello` that the caller gives apart from the
+/// updates.
 fn push_named(
     repo: &Repo,
     policy: &ReceivePolicy,
@@ -231,7 +232,7 @@ async fn script(
     c.commit_reply().await
 }
 
-/// Assert that a push succeeded, and give its report.
+/// Asserts that a push succeeded and returns its report.
 fn committed(pushed: Pushed) -> ReceiveReport {
     let (result, reply) = pushed;
     let report = result.unwrap_or_else(|e| panic!("the push failed: {e}"));
@@ -243,8 +244,8 @@ fn committed(pushed: Pushed) -> ReceiveReport {
     report
 }
 
-/// Assert that a push failed with `code`, on the wire and to the caller, and
-/// give the `Error` message.
+/// Asserts that a push failed with `code`, on the wire and to the caller, and
+/// returns the `Error` message.
 fn refused(pushed: Pushed, code: ErrorCode) -> ErrorMessage {
     let (result, reply) = pushed;
     let error = reply.expect_err("the push is refused");
@@ -267,7 +268,7 @@ fn snapshot(repo: &Repo) -> Snapshot {
     )
 }
 
-/// Assert that a failed session published nothing, wrote no ref, and left no
+/// Asserts that a failed session published nothing, wrote no ref, and left no
 /// staging entry.
 fn assert_unchanged(repo: &Repo, before: &Snapshot) {
     let after = snapshot(repo);
@@ -389,9 +390,10 @@ fn the_fixture_commit_lands_in_each_mode() {
     }
 }
 
-/// With `[ex-integrity] fsverity=yes` each regular-file object the session
-/// writes is sealed, for `raw` content, for `deflate` content the server
-/// inflates, and for `deflate` content an archive server stores as it is.
+/// Under `[ex-integrity] fsverity=yes`, the session seals each regular-file
+/// object that it writes. This includes `raw` content, `deflate` content that
+/// the server inflates, and `deflate` content that an archive server stores as
+/// it is.
 #[test]
 fn fsverity_yes_seals_every_object_the_session_writes() {
     let probe = TmpDir::new("recv-verity-probe");
@@ -492,9 +494,9 @@ fn two_sessions_from_absent_give_one_success_and_one_ref_mismatch() {
     );
 }
 
-/// A commit the repository holds with a partial marker loses the marker when a
-/// session sends the objects it lacks and names it again. An update to the
-/// current commit writes no ref.
+/// The repository holds a commit with a partial marker. If a session sends the
+/// missing objects and names the commit again, the session removes the marker.
+/// An update to the current commit writes no ref.
 #[test]
 fn a_partial_commit_pushed_again_loses_its_marker() {
     let tmp = TmpDir::new("recv-partial");
@@ -538,8 +540,8 @@ fn a_partial_commit_pushed_again_loses_its_marker() {
     assert!(fsck.is_ok(), "{fsck:?}");
 }
 
-/// A partial marker that cannot be removed is a warning of the report, and the
-/// refs stay written.
+/// If the session cannot remove a partial marker, the report holds a warning,
+/// and the refs stay written.
 #[test]
 fn a_marker_that_stays_is_a_warning() {
     let tmp = TmpDir::new("recv-marker-warning");
@@ -567,7 +569,7 @@ fn a_marker_that_stays_is_a_warning() {
     );
 }
 
-/// A `CommitReply` the client does not read is a warning of the report, and
+/// If the client does not read `CommitReply`, the report holds a warning, and
 /// the call returns `Ok`.
 #[test]
 fn a_reply_the_client_does_not_read_is_a_warning() {
@@ -603,8 +605,8 @@ fn a_reply_the_client_does_not_read_is_a_warning() {
     );
 }
 
-/// A second client signature joins the signature the repository holds for the
-/// commit, and the stored one stays first.
+/// A second client signature joins the signature that the repository holds for
+/// the commit, and the stored one stays first.
 #[test]
 fn a_second_client_signature_joins_the_stored_one() {
     let tmp = TmpDir::new("recv-join");
@@ -719,8 +721,11 @@ fn a_remote_rule_writes_refs_remotes_and_binds_the_name() {
 // The checks before the lock.
 // ---------------------------------------------------------------------------
 
-/// A `Commit` with no update is `protocol`, and so is an update of a ref that
-/// `Hello` did not name, and a second update of one ref.
+/// Each of these is `protocol`:
+///
+/// - a `Commit` with no update
+/// - an update of a ref that `Hello` did not name
+/// - a second update of one ref
 #[test]
 fn a_commit_outside_the_named_refs_is_protocol() {
     let tmp = TmpDir::new("recv-protocol");
@@ -745,8 +750,8 @@ fn a_commit_outside_the_named_refs_is_protocol() {
     }
 }
 
-/// A ref name that `validate_refspec` refuses is `invalid-ref`, also where
-/// `Hello` did not name it.
+/// A ref name that `validate_refspec` refuses is `invalid-ref`, also if `Hello`
+/// did not name it.
 #[test]
 fn an_invalid_name_at_commit_is_invalid_ref() {
     let tmp = TmpDir::new("recv-invalid");
@@ -768,11 +773,11 @@ fn an_invalid_name_at_commit_is_invalid_ref() {
     assert_unchanged(&repo, &before);
 }
 
-/// A ref name of 64 lowercase hex characters, which a revision reads as a
-/// commit checksum, passes `Hello`. An update that writes a commit to it is
-/// `invalid-ref` at `Commit`, also where `Hello` did not name it. With a
-/// `REMOTE:` part the name passes the check, and the binding check of the
-/// fixture commit refuses it.
+/// A ref name of 64 lowercase hex characters passes `Hello`. A revision reads
+/// such a name as a commit checksum. An update that writes a commit to it is
+/// `invalid-ref` at `Commit`, also if `Hello` did not name it. If the name has
+/// a `REMOTE:` part, it passes the check, and the binding check of the fixture
+/// commit refuses it.
 #[test]
 fn a_write_to_a_checksum_shaped_name_is_invalid_ref_at_commit() {
     let tmp = TmpDir::new("recv-hex-commit");
@@ -812,7 +817,7 @@ fn a_write_to_a_checksum_shaped_name_is_invalid_ref_at_commit() {
 }
 
 /// A delete of a ref of 64 lowercase hex characters passes the check of the
-/// name, and a rule that allows the delete removes the ref.
+/// name. A rule that allows the delete removes the ref.
 #[test]
 fn a_delete_of_a_checksum_shaped_name_removes_the_ref() {
     let tmp = TmpDir::new("recv-hex-delete");
@@ -918,10 +923,11 @@ fn detached_metadata_the_merge_refuses_is_protocol_at_ingest() {
     }
 }
 
-/// Detached metadata for a commit that the repository holds, and that the
-/// session neither stages nor names as a new ref value, is `protocol`, so a
-/// session cannot edit the detached metadata of a commit that its rules do
-/// not cover. Nothing is written, and the stored dict stays.
+/// The repository holds a commit, and the session neither stages it nor names
+/// it as a new ref value. Detached metadata for this commit is `protocol`.
+/// With this check, a session cannot edit the detached metadata of a commit
+/// that its rules do not cover. The session writes nothing, and the stored
+/// dict stays.
 #[test]
 fn detached_metadata_for_a_commit_outside_the_session_is_protocol() {
     let tmp = TmpDir::new("recv-meta-outside");
@@ -972,7 +978,7 @@ fn detached_metadata_for_a_commit_outside_the_session_is_protocol() {
     assert!(!commit_meta_path(&repo, &protected.checksum).exists());
 }
 
-/// Write `bytes` into `objects/` as the object `checksum` of type `ty`, as a
+/// Writes `bytes` into `objects/` as the object `checksum` of type `ty`, as a
 /// corrupt store holds it.
 fn plant_object(repo: &Repo, ty: ObjectType, checksum: &Checksum, bytes: &[u8]) {
     let path = repo
@@ -983,9 +989,9 @@ fn plant_object(repo: &Repo, ty: ObjectType, checksum: &Checksum, bytes: &[u8]) 
     std::fs::write(path, bytes).unwrap();
 }
 
-/// A commit or a dirtree that does not parse is `protocol` where the session
-/// staged it and `internal` where the repository holds it. Nothing is
-/// published either way.
+/// A commit or a dirtree that does not parse is `protocol` if the session
+/// staged it, and `internal` if the repository holds it. In both cases, the
+/// session publishes nothing.
 #[test]
 fn an_object_that_does_not_parse_is_protocol_when_staged_and_internal_when_stored() {
     let garbage = b"not a gvariant object".to_vec();
@@ -1059,9 +1065,12 @@ fn an_object_that_does_not_parse_is_protocol_when_staged_and_internal_when_store
     }
 }
 
-/// A rule with `accept=false` refuses its refs, a remote ref that no rule
-/// covers is refused, the collection anchor ref of a repository with a
-/// collection id is refused, and so is a ref that is an alias.
+/// Each of these refs is `ref-denied`:
+///
+/// - a ref under a rule with `accept=false`
+/// - a remote ref that no rule covers
+/// - the collection anchor ref of a repository with a collection id
+/// - a ref that is an alias
 #[test]
 fn ref_denied_covers_each_refused_ref() {
     // An unbound commit, so the binding check passes each name.
@@ -1107,8 +1116,9 @@ fn ref_denied_covers_each_refused_ref() {
     }
 }
 
-/// An object the trees reach that the session did not send is
-/// `missing-objects`, and so is a new commit the session did not send.
+/// An object that the trees reach and that the session did not send is
+/// `missing-objects`. A new commit that the session did not send is
+/// `missing-objects` too.
 #[test]
 fn missing_objects_lists_what_was_not_sent() {
     let tmp = TmpDir::new("recv-missing");
@@ -1189,8 +1199,8 @@ fn a_foreign_ref_binding_is_binding_mismatch() {
 }
 
 /// A commit whose `ostree.collection-binding` is not the collection id of the
-/// repository is `binding-mismatch`. The same binding passes where the
-/// repository has that id.
+/// repository is `binding-mismatch`. If the repository has that id, the same
+/// binding passes.
 #[test]
 fn a_foreign_collection_binding_is_binding_mismatch() {
     let mut metadata = DictBuilder::new();
@@ -1228,8 +1238,9 @@ fn a_foreign_collection_binding_is_binding_mismatch() {
     ));
 }
 
-/// A commit that carries no signature a rule trusts is `signature-required`.
-/// The check reads the incoming signatures and the stored ones.
+/// A commit that carries no signature that a rule trusts is
+/// `signature-required`. The check reads the incoming signatures and the
+/// stored ones.
 #[test]
 fn an_unsigned_commit_is_signature_required() {
     let policy = ReceivePolicy {
@@ -1261,7 +1272,7 @@ fn an_unsigned_commit_is_signature_required() {
         ErrorCode::SignatureRequired,
     );
     assert_unchanged(&repo, &before);
-    // A signature from a key the rule does not trust.
+    // A signature from a key that the rule does not trust.
     let untrusted = signed_dict(payload, &[OTHER_SECRET_B64]);
     refused(
         push(
@@ -1321,8 +1332,8 @@ fn an_unsigned_commit_is_signature_required() {
 }
 
 /// A commit that is the new value of two refs under two rules must pass the
-/// signature check of both. It gets a signature from each key of the `sign`
-/// lists of both rules, each key once, and a second push adds none.
+/// signature check of both rules. The session signs it once with each key of
+/// the `sign` lists of both rules. A second push adds no signature.
 #[test]
 fn a_commit_under_two_rules_passes_both_and_gets_each_key_once() {
     let commit = build_commit(None, "unbound", no_metadata());
@@ -1472,8 +1483,8 @@ fn two_key_groups_with_one_key_file_sign_once() {
 // The checks under the lock.
 // ---------------------------------------------------------------------------
 
-/// A ref that is not in the state the update expects is `ref-mismatch`, with
-/// the current state in the detail.
+/// A ref that is not in the state that the update expects is `ref-mismatch`.
+/// The detail holds the current state.
 #[test]
 fn an_expected_state_that_differs_is_ref_mismatch() {
     let tmp = TmpDir::new("recv-mismatch");
@@ -1520,9 +1531,10 @@ fn an_expected_state_that_differs_is_ref_mismatch() {
 }
 
 /// An update whose new commit does not descend from the current one is
-/// `non-fast-forward`, unless the client sends `force` and the rule allows
-/// it. A chain that reaches a commit the repository does not hold proves no
-/// fast-forward. A child of the current commit is a fast-forward.
+/// `non-fast-forward`. If the client sends `force` and the rule allows it, the
+/// update passes. A chain that reaches a commit that the repository does not
+/// hold proves no fast-forward. A child of the current commit is a
+/// fast-forward.
 #[test]
 fn a_non_ancestor_is_non_fast_forward() {
     let unrelated = build_commit(None, "unrelated", no_metadata());
@@ -1571,7 +1583,7 @@ fn a_non_ancestor_is_non_fast_forward() {
             ),
             ErrorCode::NonFastForward,
         );
-        // Forced under a rule that allows it.
+        // A forced update under a rule that allows it.
         let report = committed(push(
             &repo,
             &policy_with("main", allow.clone()),
@@ -1608,8 +1620,8 @@ fn write_ref(repo: &Repo, name: &str, commit: &Checksum) {
     .unwrap();
 }
 
-/// A delete the rule does not allow is `delete-denied`. A rule that allows it
-/// deletes the ref, and a delete of an absent ref changes nothing.
+/// A delete that the rule does not allow is `delete-denied`. A rule that allows
+/// it deletes the ref. A delete of an absent ref changes nothing.
 #[test]
 fn a_delete_the_rule_refuses_is_delete_denied() {
     let tmp = TmpDir::new("recv-delete");
@@ -1668,8 +1680,12 @@ fn a_delete_the_rule_refuses_is_delete_denied() {
 }
 
 /// A ref path that a ref write cannot replace is `ref-denied` under the lock,
-/// before anything is written: a path below a ref file, a path that names a
-/// directory of refs, and two updates of which one writes below the other.
+/// before the session writes anything. The cases are:
+///
+/// - a path below a ref file
+/// - a path that names a directory of refs
+/// - two updates, of which one writes below the other
+///
 /// The other updates of the message write nothing either.
 #[test]
 fn a_ref_path_that_a_write_cannot_replace_is_ref_denied() {
@@ -1745,7 +1761,7 @@ fn a_held_update_lock_is_internal() {
 }
 
 /// An `UpdateGuard` that another process holds makes the session wait at
-/// `Commit`. The session completes once the holder releases the guard.
+/// `Commit`. The session completes after the holder releases the guard.
 #[test]
 fn a_session_waits_for_a_guard_of_another_process() {
     let tmp = TmpDir::new("recv-guard-wait");
@@ -1754,7 +1770,8 @@ fn a_session_waits_for_a_guard_of_another_process() {
     let releasing = repo.path().join(GUARD_RELEASING_MARKER);
     let root = repo.path().to_path_buf();
     // The releasing marker proves the order. The release waits only until the
-    // session made its staging directory, so the session runs before it.
+    // session makes its staging directory, so the session starts before the
+    // release.
     let release = std::thread::spawn(move || {
         let started = std::time::Instant::now();
         while staging_entries(&root).is_empty() {
@@ -1801,7 +1818,7 @@ fn summary_policy() -> ReceivePolicy {
 
 /// In a repository with a collection id and `lock-timeout-secs=0`, a session
 /// that regenerates the summary and a later `regenerate_summary` both
-/// complete: neither waits for a lock it holds itself.
+/// complete. Neither waits for a lock that it holds itself.
 #[test]
 fn a_session_and_a_regeneration_complete_with_no_self_wait() {
     let tmp = TmpDir::new("recv-no-self-wait");
@@ -1849,11 +1866,13 @@ fn anchor_chain(repo: &Repo) -> Vec<Checksum> {
     chain
 }
 
-/// A session and two `regenerate_summary` calls that wait for one guard in a
-/// repository with a collection id all complete once the guard goes, and
-/// the three anchor commits chain: each one's parent is the anchor before
-/// it. Each writer reads the parent of its anchor under the update lock, so
-/// a writer that read it before its wait would chain onto an anchor another
+/// In a repository with a collection id, a session and two
+/// `regenerate_summary` calls wait for one guard. All three complete after the
+/// guard goes, and the three anchor commits chain. The parent of each anchor
+/// is the anchor before it.
+///
+/// Each writer reads the parent of its anchor under the update lock. A writer
+/// that reads the parent before its wait can chain onto an anchor that another
 /// writer replaced.
 #[test]
 fn a_session_and_concurrent_regenerations_chain_their_anchors() {
@@ -1875,8 +1894,8 @@ fn a_session_and_concurrent_regenerations_chain_their_anchors() {
     let holder = guard_holder(repo.path());
     let root = repo.path().to_path_buf();
     // The session and each regeneration make their staging directory before
-    // they wait for the update lock. The settle time covers the step between
-    // that and the wait.
+    // they wait for the update lock. The settle time covers the step from the
+    // staging directory to the wait.
     let release = std::thread::spawn(move || {
         let started = std::time::Instant::now();
         while staging_entries(&root).len() < 3 {
@@ -1913,7 +1932,8 @@ fn a_session_and_concurrent_regenerations_chain_their_anchors() {
 }
 
 /// Detached metadata that the repository stores and that does not parse fails
-/// the merge on the server side: `internal`, with nothing published.
+/// the merge on the server side. The error is `internal`, and the session
+/// publishes nothing.
 #[test]
 fn a_corrupt_stored_commitmeta_is_internal() {
     let tmp = TmpDir::new("recv-corrupt-meta");
@@ -1944,9 +1964,9 @@ fn a_corrupt_stored_commitmeta_is_internal() {
 // Server signatures, the anchor commit, and the summary.
 // ---------------------------------------------------------------------------
 
-/// A GPG signature carries the time it was made, so a second signature of one
-/// key over one commit has other bytes. Two pushes of one commit under a rule
-/// with a GPG server key leave one signature of that key.
+/// A GPG signature holds the time of its creation, so a second signature of
+/// one key over one commit has other bytes. Two pushes of one commit under a
+/// rule with a GPG server key leave one signature of that key.
 #[cfg(feature = "sign-gpg")]
 #[test]
 fn two_pushes_with_a_gpg_server_key_leave_one_server_signature() {
@@ -1997,10 +2017,10 @@ fn two_pushes_with_a_gpg_server_key_leave_one_server_signature() {
     assert!(outcome.valid, "the server signature verifies");
 }
 
-/// With `update_summary` the session regenerates the summary under its lock
-/// and signs the bytes it built with each summary key. A policy with no
-/// summary key removes `summary.sig`, and an update that changes no ref does
-/// not regenerate the summary.
+/// If `update_summary` is `true`, the session regenerates the summary under
+/// its lock. It signs the bytes that it built with each summary key. A policy
+/// with no summary key removes `summary.sig`. An update that changes no ref
+/// does not regenerate the summary.
 #[test]
 fn summary_is_regenerated_and_signed_from_the_built_bytes() {
     let tmp = TmpDir::new("recv-summary");
@@ -2076,8 +2096,8 @@ fn summary_is_regenerated_and_signed_from_the_built_bytes() {
     assert!(!repo.path().join("summary.sig").exists());
 }
 
-/// A summary write that fails after the commit is a warning of the report.
-/// The refs stay written and the client gets `CommitReply`.
+/// If a summary write fails after the commit, the report holds a warning. The
+/// refs stay written, and the client gets `CommitReply`.
 #[test]
 fn a_summary_failure_is_reported_and_the_refs_stay() {
     let tmp = TmpDir::new("recv-summary-failure");
@@ -2114,8 +2134,9 @@ fn a_summary_failure_is_reported_and_the_refs_stay() {
 }
 
 /// In a repository with a collection id, the session writes the refreshed
-/// anchor commit on `ostree-metadata` in its own transaction, with the anchor
-/// before it as parent, and the summary lists it.
+/// anchor commit on `ostree-metadata` in its own transaction. The parent of
+/// the new anchor is the anchor before it, and the summary lists the new
+/// anchor.
 #[test]
 fn a_collection_repo_writes_the_anchor_in_the_session() {
     let tmp = TmpDir::new("recv-anchor");
@@ -2171,9 +2192,9 @@ fn a_collection_repo_writes_the_anchor_in_the_session() {
     }
 }
 
-/// An anchor commit the session cannot write, here because
-/// `refs/heads/ostree-metadata` holds no checksum, fails the session with
-/// `internal` before the commit, and nothing is published.
+/// If the session cannot write an anchor commit, the session fails with
+/// `internal` before the commit and publishes nothing. In this test,
+/// `refs/heads/ostree-metadata` holds no checksum.
 #[test]
 fn an_anchor_failure_is_internal() {
     let tmp = TmpDir::new("recv-anchor-failure");

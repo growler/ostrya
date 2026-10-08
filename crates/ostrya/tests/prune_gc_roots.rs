@@ -1,8 +1,10 @@
-//! Prune under metadata GC roots and the optional parent edge.
+//! Integration tests of a prune with metadata GC roots and with the optional
+//! parent edge.
 //!
-//! Both options are port extensions with no counterpart in the `ostree` tool, so
-//! these repositories are built and pruned with the port alone. The tool-checked
-//! prune behavior lives in `maintenance.rs`.
+//! Both options are ostrya extensions, and the `ostree` command has no
+//! counterpart. The tests build and prune these repositories with ostrya alone.
+//! The prune tests that compare with the `ostree` command are in
+//! `maintenance.rs`.
 
 mod common;
 
@@ -18,17 +20,19 @@ use ostrya_rt::block_on;
 /// A fixed timestamp, so the commits are reproducible.
 const FIXED_TS: u64 = 1_700_000_000;
 
-/// The metadata key these tests configure as a GC root.
+/// The metadata key that these tests configure as a GC root.
 const GC_ROOTS: &str = "test.gc-roots";
 
-/// Write a one-file tree at `dir`, its content naming it.
+/// Writes a tree with one file at `base/<name>`. The content of the file names
+/// the tree.
 fn write_tree(base: &Path, name: &str) {
     let dir = base.join(name);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("payload.txt"), format!("{name}\n")).unwrap();
 }
 
-/// An `a{sv}` holding one key whose value is an `aay` of commit checksums.
+/// Returns an `a{sv}` with one key, whose value is an `aay` of commit
+/// checksums.
 fn checksum_list(key: &str, commits: &[Checksum]) -> Value {
     let elements = commits
         .iter()
@@ -37,7 +41,8 @@ fn checksum_list(key: &str, commits: &[Checksum]) -> Value {
     dict(key, Type::parse("aay").unwrap(), Value::Array(elements))
 }
 
-/// An `a{sv}` holding one key of the caller's type and value.
+/// Returns an `a{sv}` with one key, with the type and the value that the caller
+/// gives.
 fn dict(key: &str, ty: Type, value: Value) -> Value {
     Value::Array(vec![Value::Tuple(vec![
         Value::Str(key.to_owned()),
@@ -45,8 +50,9 @@ fn dict(key: &str, ty: Type, value: Value) -> Value {
     ])])
 }
 
-/// Commit the tree `base/<name>` into `repo`, with the given parent, metadata,
-/// and, where `branch` names one, a ref pointing at the result.
+/// Commits the tree `base/<name>` into `repo` with the given parent and
+/// metadata. If `branch` names a ref, the function also sets that ref to the
+/// result.
 async fn commit(
     repo: &Repo,
     base: &Path,
@@ -89,7 +95,7 @@ async fn commit(
     commit
 }
 
-/// A repository under `base/repo` with the trees `base/<name>` written.
+/// Writes the trees `base/<name>` and creates a repository under `base/repo`.
 async fn repo_with_trees(base: &Path, names: &[&str]) -> Repo {
     for name in names {
         write_tree(base, name);
@@ -99,13 +105,13 @@ async fn repo_with_trees(base: &Path, names: &[&str]) -> Repo {
         .unwrap()
 }
 
-/// The options these tests prune with: refs alone, no parent edge, and the one
-/// metadata key configured.
+/// Returns the prune options of these tests: refs only, no parent edge, and the
+/// one configured metadata key.
 fn gc_root_options() -> PruneOptions {
     PruneOptions::gc_roots([GC_ROOTS])
 }
 
-/// Whether the repository still holds `commit` as an object.
+/// Returns `true` if the repository still holds `commit` as an object.
 async fn holds(repo: &Repo, commit: &Checksum) -> bool {
     repo.has_object(ObjectType::Commit, commit).await.unwrap()
 }
@@ -115,7 +121,7 @@ fn a_metadata_key_in_commit_metadata_keeps_its_target() {
     let tmp = TmpDir::new("gc-roots-commit-meta");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["kept", "head"]).await;
-        // `kept` is named by no ref. The ref head names it through the metadata key.
+        // No ref names `kept`. The ref head names it through the metadata key.
         let kept = commit(&repo, tmp.path(), "kept", None, None, None).await;
         let head = commit(
             &repo,
@@ -150,7 +156,8 @@ fn a_commit_no_metadata_key_names_is_pruned() {
         let orphan = commit(&repo, tmp.path(), "orphan", None, None, None).await;
         let head = commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
 
-        // The same options, with nothing naming the orphan: it goes.
+        // The options are the same. Nothing names the orphan, so the prune
+        // removes it.
         repo.prune(&gc_root_options()).await.unwrap();
         assert!(holds(&repo, &head).await, "the ref's own commit survives");
         assert!(
@@ -185,8 +192,8 @@ fn metadata_key_edges_are_followed_recursively() {
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["deep", "middle", "head"]).await;
         let deep = commit(&repo, tmp.path(), "deep", None, None, None).await;
-        // The middle commit names the deep one through its detached metadata, so
-        // the recursion crosses both metadata sources.
+        // The middle commit names the deep commit through its detached metadata,
+        // so the recursion crosses both metadata sources.
         let middle = commit(&repo, tmp.path(), "middle", None, None, None).await;
         repo.write_commit_detached_metadata(&middle, Some(&checksum_list(GC_ROOTS, &[deep])))
             .await
@@ -290,9 +297,9 @@ fn a_metadata_key_edge_seeds_the_full_depth() {
     let tmp = TmpDir::new("gc-roots-depth");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["base", "tip", "head"]).await;
-        // A two-commit chain the ref does not name, reached by one metadata-key edge
-        // at its tip. Depth counts parent hops, and the edge seeds the walk's
-        // own depth, so the chain is kept whole.
+        // A chain of two commits that the ref does not name. One metadata-key
+        // edge at its tip reaches it. The depth counts parent hops, and the edge
+        // seeds the depth of the walk, so the prune keeps the full chain.
         let base = commit(&repo, tmp.path(), "base", None, None, None).await;
         let tip = commit(&repo, tmp.path(), "tip", Some(base), None, None).await;
         commit(
@@ -406,8 +413,8 @@ fn a_metadata_key_naming_an_absent_commit_is_tolerated() {
         )
         .await;
 
-        // A dangling metadata-key edge is a dangling reference like any other: the
-        // walk keeps its name and descends into nothing.
+        // A dangling metadata-key edge is a dangling reference like all others.
+        // The walk keeps its name and descends into nothing.
         repo.prune(&gc_root_options()).await.unwrap();
         assert!(holds(&repo, &head).await, "the ref's commit survives");
         assert!(
@@ -422,8 +429,9 @@ fn a_refused_prune_keeps_the_commit_it_was_told_to_delete() {
     let tmp = TmpDir::new("gc-roots-refused-delete");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "spare"]).await;
-        // The ref's commit holds a metadata key the walk cannot read, so the prune
-        // is refused. The spare commit is unreferenced, so it is deletable.
+        // The commit of the ref holds a metadata key that the walk cannot read,
+        // so the prune is refused. No ref names the spare commit, so a prune can
+        // delete it.
         commit(
             &repo,
             tmp.path(),
@@ -514,7 +522,7 @@ fn a_dry_run_keeps_the_commit_it_was_told_to_delete() {
     });
 }
 
-/// The root dirtree checksum of a stored commit.
+/// Returns the checksum of the root dirtree of a stored commit.
 async fn commit_root(repo: &Repo, commit: &Checksum) -> Checksum {
     repo.load_commit(commit).await.unwrap().0.root_dirtree
 }

@@ -1,44 +1,15 @@
 //! Tar import and export.
 //!
-//! [`Repo::export_tar`] writes a commit's tree as a tar stream, and
-//! [`Repo::import_tar`] reads a filesystem tar into a [`MutableTree`] over a
-//! transaction. The stream is a plain filesystem tar, not an object-embedding
-//! format: member names are relative paths, ownership is numeric, every
-//! timestamp is the commit timestamp with a zero nanosecond part, extended
-//! attributes travel as `SCHILY.xattr.*` PAX records, and files that share a
-//! content object are coalesced into tar hardlinks.
+//! - [`Repo::export_tar`] writes the tree of a commit as a file system tar
+//!   stream. [`TarExportOptions`] holds its options.
+//! - [`Repo::import_tar`] reads a file system tar stream into a new
+//!   [`MutableTree`]. [`TarImportOptions`] holds its options.
+//! - [`Repo::import_tar_into`] reads a tar stream into a tree that can hold
+//!   the entries of an earlier source, and applies a [`CommitModifier`].
 //!
-//! Export walks the commit tree depth-first with each directory's entries in
-//! name order. The root directory is the member `./`; every other member is a
-//! bare relative path, and directories carry a trailing slash. The first file
-//! seen for a given content object is written in full; a later file with the
-//! same object identity -- identical ownership, mode, xattrs, and content, since
-//! all of those feed the object checksum -- is written as a hardlink to it.
-//! Symlinks are written as symlink members and never coalesced.
-//! [`TarExportOptions::subpath`] makes one directory of the tree the archive
-//! root, [`TarExportOptions::prefix`] puts a prefix in front of every member
-//! name, and [`TarExportOptions::skip_xattrs`] emits no xattr records.
-//!
-//! Import builds a [`MutableTree`]: regular files stream into content objects,
-//! symlinks and directory metadata become their objects, and hardlink members
-//! are resolved after the walk against the paths already ingested. Each member
-//! is placed under a directory the tree already holds, so an archive naming a
-//! member before its parent is refused unless
-//! [`TarImportOptions::autocreate_parents`] permits synthesizing the parent.
-//! With [`TarImportOptions::etc_to_usr_etc`], a top-level `etc` component is
-//! rewritten to `usr/etc`. [`TarImportOptions::owner_uid`] and
-//! [`TarImportOptions::owner_gid`] replace the ownership every member records,
-//! a synthesized parent directory included, and
-//! [`TarImportOptions::skip_xattrs`] records no extended attributes at all.
-//! [`TarImportOptions::rename`] rewrites each member's pathname before the
-//! member is placed. Device and FIFO members are rejected, since an ostree tree
-//! stores only regular files, symlinks, and directories.
-//! [`Repo::import_tar_into`] reads into a tree an earlier source already
-//! filled, and shapes each member with a
-//! [`CommitModifier`]. The tree is serialized and
-//! committed by the caller through
-//! [`Transaction::write_mtree`](crate::Transaction::write_mtree) and
-//! [`Transaction::write_commit`](crate::Transaction::write_commit).
+//! The caller writes the imported tree with
+//! [`Transaction::write_mtree`](crate::Transaction::write_mtree) and commits it
+//! with [`Transaction::write_commit`](crate::Transaction::write_commit).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -63,77 +34,100 @@ use crate::repo::Repo;
 use crate::transaction::{FileMeta, Transaction};
 use crate::tree::{RepoTree, TreeEntry};
 
-/// The `S_IFDIR` file-type bits a directory's `st_mode` carries.
+/// The `S_IFDIR` file-type bits in the `st_mode` of a directory.
 const S_IFDIR: u32 = 0o040000;
-/// The `S_IFLNK` file-type bits a symlink's `st_mode` carries.
+/// The `S_IFLNK` file-type bits in the `st_mode` of a symlink.
 const S_IFLNK: u32 = 0o120000;
-/// The permission bits kept in a tar header's octal mode field.
+/// The permission bits that the octal mode field of a tar header keeps.
 const PERM_MASK: u32 = 0o7777;
 
-/// A boxed, runtime-neutral payload reader. Uniform across entry kinds so one
-/// [`TarWriter`] instance serves the whole stream; `Pin<Box<..>>` is `Unpin`,
-/// which the writer requires of the body reader.
+/// A boxed payload reader that does not depend on the runtime. One type
+/// serves all entry kinds, so one [`TarWriter`] instance serves the whole
+/// stream. `Pin<Box<..>>` is `Unpin`, which the writer requires of the body
+/// reader.
 type BodyReader = Pin<Box<dyn AsyncRead + Send>>;
 
-/// Options for [`Repo::export_tar`].
+/// The options of [`Repo::export_tar`].
 #[derive(Debug, Default, Clone)]
 pub struct TarExportOptions {
-    /// A path within the commit tree whose directory becomes the archive root,
-    /// in place of the commit root. A path with no name component names the
-    /// whole tree. A path that carries a name component and a `..` component
-    /// names nothing, since no directory holds a `..` entry. A path naming a
-    /// file or a symlink, and a path naming nothing, are both refused with
-    /// [`Error::Tar`].
+    /// The directory of the commit tree that becomes the archive root.
+    ///
+    /// If it is `None`, the archive root is the commit root. A path with no
+    /// name component names the whole tree. A path with a name component and
+    /// a `..` component names nothing, because no directory holds a `..`
+    /// entry. If the path names a file, a symlink, or nothing, the export
+    /// fails with [`Error::Tar`].
     pub subpath: Option<PathBuf>,
-    /// A prefix over every member pathname. The root member's name is the
-    /// prefix with one `/` appended where it does not end in one; every other
-    /// member's name is the prefix joined to the member's own relative path
-    /// with no separator between them, so a prefix that is to act as a
-    /// directory ends in `/`. A hardlink's link name carries the prefix; a
-    /// symlink's target is the stored target and carries none. An empty prefix
-    /// and an absent one leave the `./` root and the bare relative names.
+    /// A prefix for each member pathname.
+    ///
+    /// The name of the root member is the prefix with one `/` added, if the
+    /// prefix does not end in `/`. The name of each other member is the prefix
+    /// followed by the relative path of the member, with no separator.
+    /// Because of this, a prefix that acts as a directory must end in `/`.
+    ///
+    /// The link name of a hardlink carries the prefix. The target of a symlink
+    /// is the stored target and carries no prefix. If the prefix is empty or
+    /// `None`, the root member is `./` and each other member has its bare
+    /// relative name.
     pub prefix: Option<String>,
-    /// Emit no `SCHILY.xattr.*` records, whatever extended attributes the tree
-    /// carries.
+    /// If `true`, the export writes no `SCHILY.xattr.*` records, whatever
+    /// extended attributes the tree holds.
     pub skip_xattrs: bool,
 }
 
 impl TarExportOptions {
-    /// Default export options.
+    /// Creates the default export options.
     pub fn new() -> TarExportOptions {
         TarExportOptions::default()
     }
 }
 
-/// A rename hook over member pathnames. It receives the normalized member name
-/// (see [`Repo::import_tar_into`]) and returns the name the member is imported
-/// under.
+/// A hook that renames the member pathnames of an import.
+///
+/// The hook receives the normalized member name and returns the name that the
+/// import uses for the member. [`Repo::import_tar_into`] states the
+/// normalization. If the hook returns an error, the import fails with that
+/// error.
 pub type TarRename = Box<dyn FnMut(&str) -> Result<String> + Send>;
 
-/// Options for [`Repo::import_tar`].
+/// The options of [`Repo::import_tar`] and [`Repo::import_tar_into`].
 #[derive(Default)]
 pub struct TarImportOptions {
-    /// Rewrite a top-level `etc` component to `usr/etc`, matching the ostree
-    /// convention that composes configuration into `/usr`. Off by default.
+    /// If `true`, the import rewrites a top-level `etc` component to
+    /// `usr/etc`.
+    ///
+    /// This matches the ostree convention that composes the configuration
+    /// into `/usr`. The default is `false`.
     pub etc_to_usr_etc: bool,
-    /// The owner uid every imported entry records, in place of the uid its tar
-    /// header carries. Applies to the default metadata of a directory the
-    /// archive never names as well.
+    /// The owner uid that each imported entry records, if set.
+    ///
+    /// It replaces the uid in the tar header. It also applies to the default
+    /// metadata of a directory that the archive does not name.
     pub owner_uid: Option<u32>,
-    /// The owner gid every imported entry records, on the same terms as
-    /// [`owner_uid`](TarImportOptions::owner_uid).
+    /// The owner gid that each imported entry records, if set.
+    ///
+    /// It follows the rules of [`owner_uid`](TarImportOptions::owner_uid).
     pub owner_gid: Option<u32>,
-    /// Record no extended attributes, whatever `SCHILY.xattr.*` records the
-    /// archive carries.
+    /// If `true`, the import records no extended attributes.
+    ///
+    /// The import ignores each `SCHILY.xattr.*` record of the archive.
     pub skip_xattrs: bool,
-    /// Create a parent directory the archive never names, in place of
-    /// refusing the member that needs it. A synthesized directory records
-    /// mode `0755`, empty extended attributes, and the ownership of the
-    /// member whose import created it; a synthesized root with no such
-    /// member records `0:0`.
+    /// If `true`, the import creates each parent directory that the archive
+    /// does not name.
+    ///
+    /// If `true`, the import also sets the root metadata at its end.
+    /// [`Repo::import_tar_into`] states the rule. If `false`, a member that
+    /// needs such a parent fails the import with [`Error::TarMissingParent`].
+    ///
+    /// A created directory records mode `0755` and empty extended attributes.
+    /// Its owner is the uid and gid in the tar header of the member whose
+    /// import created it, after [`owner_uid`](TarImportOptions::owner_uid)
+    /// and [`owner_gid`](TarImportOptions::owner_gid). A directory that a
+    /// hardlink member creates records `0:0`, or `owner_uid` and `owner_gid`
+    /// if they are set.
     pub autocreate_parents: bool,
-    /// Rewrite each member's pathname before it is imported. See
-    /// [`TarRename`].
+    /// A hook that rewrites the pathname of each member before the import
+    /// uses it.
     pub rename: Option<TarRename>,
 }
 
@@ -151,31 +145,33 @@ impl std::fmt::Debug for TarImportOptions {
 }
 
 impl TarImportOptions {
-    /// Default import options.
+    /// Creates the default import options.
     pub fn new() -> TarImportOptions {
         TarImportOptions::default()
     }
 
-    /// Set whether a top-level `etc` component is imported as `usr/etc`.
+    /// Sets [`etc_to_usr_etc`](TarImportOptions::etc_to_usr_etc) to `on`.
     pub fn with_etc_migration(mut self, on: bool) -> TarImportOptions {
         self.etc_to_usr_etc = on;
         self
     }
 
-    /// The uid an entry records: the declared one, else the one given.
+    /// Returns the uid that an entry records: the declared one, else the one
+    /// given.
     fn uid(&self, from_header: u32) -> u32 {
         self.owner_uid.unwrap_or(from_header)
     }
 
-    /// The gid an entry records: the declared one, else the one given.
+    /// Returns the gid that an entry records: the declared one, else the one
+    /// given.
     fn gid(&self, from_header: u32) -> u32 {
         self.owner_gid.unwrap_or(from_header)
     }
 }
 
-/// One ordered entry to emit during export. Metadata is captured during the
-/// walk; a regular file's payload is opened only when the entry is written, so
-/// the export holds at most one content fd at a time.
+/// One entry of the export, in output order. The walk captures the metadata.
+/// The export opens the payload of a regular file only when it writes the
+/// entry. It holds at most one content fd at a time.
 enum Item {
     Dir {
         path: String,
@@ -197,9 +193,50 @@ enum Item {
     },
 }
 
+/// Methods that export and import tar streams.
 impl Repo {
-    /// Write a commit's tree to `out` as a tar stream. See the module docs for
-    /// the member naming, hardlink coalescing, and metadata conventions.
+    /// Writes the tree of a commit to `out` as a tar stream.
+    ///
+    /// [`TarExportOptions`] selects the archive root, the name prefix, and the
+    /// xattr records.
+    ///
+    /// # Stream format
+    ///
+    /// The stream is a file system tar. It holds the files of the tree and no
+    /// ostree objects:
+    ///
+    /// - Member names are relative paths. The root directory is the member
+    ///   `./`. The name of each directory member ends in `/`.
+    /// - Ownership is numeric.
+    /// - Each timestamp is the commit timestamp, with a zero nanosecond part.
+    /// - Extended attributes are `SCHILY.xattr.*` PAX records.
+    ///
+    /// The export walks the tree depth-first. In each directory, it writes the
+    /// entries in name order, with files and subdirectories in one sequence.
+    /// A directory member comes just before its contents.
+    ///
+    /// The first regular file of a content object goes into the stream in
+    /// full. Each later regular file of the same object is a hardlink to the
+    /// first one. Two files have the same object if they have the same
+    /// ownership, mode, xattrs, and content, because all of these go into the
+    /// object checksum. The export writes each symlink as its own symlink
+    /// member.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Tar`] if [`subpath`](TarExportOptions::subpath) names a
+    ///   file, a symlink, or nothing.
+    /// - [`Error::Tar`] if an xattr name in the tree is not valid UTF-8.
+    /// - [`Error::ObjectNotFound`] if the commit or an object that it reaches
+    ///   is not in the object store.
+    /// - [`Error::Core`] if a commit, dirtree, or dirmeta object does not
+    ///   parse.
+    /// - [`Error::InvalidFormat`] if a file object does not have the form of
+    ///   the repository mode.
+    /// - [`Error::Io`] if an xattr name holds a byte that is not graphic
+    ///   ASCII, or holds `=`.
+    /// - [`Error::Io`] if a write to `out` fails, or if a read of the object
+    ///   store fails.
     pub async fn export_tar(
         &self,
         commit: &Checksum,
@@ -264,9 +301,25 @@ impl Repo {
         Ok(())
     }
 
-    /// Read a filesystem tar from `input` into a fresh [`MutableTree`] over
-    /// `txn`. A convenience over [`import_tar_into`](Repo::import_tar_into)
-    /// with no destination tree and no modifier.
+    /// Reads a file system tar stream from `input` into a new [`MutableTree`].
+    ///
+    /// The import stages its objects in `txn`. The call is
+    /// [`import_tar_into`](Repo::import_tar_into) with an empty destination
+    /// tree and no modifier.
+    ///
+    /// # Members
+    ///
+    /// - A regular file member streams into a content object.
+    /// - A symlink member becomes a content object.
+    /// - A directory member becomes a dirmeta object.
+    /// - A hardlink member gets the content object of its target. The import
+    ///   resolves hardlinks after it reads the last member.
+    /// - A device node or FIFO member fails the import, because an ostree tree
+    ///   stores only regular files, symlinks, and directories.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`import_tar_into`](Repo::import_tar_into).
     pub async fn import_tar(
         &self,
         txn: &Transaction,
@@ -279,31 +332,95 @@ impl Repo {
         Ok(mtree)
     }
 
-    /// Read a filesystem tar from `input` into `mtree` over `txn`, staging one
-    /// content object per regular file and symlink and one metadata object per
-    /// directory. The tree is ready for
-    /// [`write_mtree`](Transaction::write_mtree); the caller commits it.
+    /// Reads a file system tar stream from `input` into `mtree`.
     ///
-    /// Each member is placed under the directory its pathname names, which
-    /// must already be in the tree: an archive that names a member before its
-    /// parent directory is refused with [`Error::TarMissingParent`] unless
-    /// [`autocreate_parents`](TarImportOptions::autocreate_parents) is set. The
-    /// tree's own root is one such parent, so an archive that names no root
-    /// member leaves `mtree` without root metadata where the destination
-    /// supplied none.
+    /// The import stages one content object for each regular file and
+    /// symlink, and one dirmeta object for each directory, in `txn`. `mtree`
+    /// can hold the entries of an earlier source. [`Repo::import_tar`] lists
+    /// what each member kind becomes. After the import, the caller writes the
+    /// tree with [`write_mtree`](Transaction::write_mtree) and commits it.
     ///
-    /// The pathname a member is placed under, and the name
-    /// [`rename`](TarImportOptions::rename) receives, drops one leading `./`
-    /// and one leading `/`, keeps a directory's trailing `/`, and is the empty
-    /// string for the archive's own root member.
+    /// # Parent directories
     ///
-    /// `modifier` shapes every member the way it shapes a filesystem walk, with
-    /// one difference:
+    /// Each member goes under the directory that its pathname names. This
+    /// directory must already be in the tree, so an archive must name a parent
+    /// directory before its members. If the parent is not in the tree and
+    /// [`autocreate_parents`](TarImportOptions::autocreate_parents) is off,
+    /// the import fails with [`Error::TarMissingParent`]. If
+    /// `autocreate_parents` is on, the import creates the parent.
+    ///
+    /// A root member of the archive sets the root metadata of `mtree`. If
+    /// `autocreate_parents` is off, the archive names no root member, and
+    /// `mtree` has no root metadata, `mtree` has no root metadata after the
+    /// import.
+    ///
+    /// If `autocreate_parents` is on, the import sets the root metadata after
+    /// the last member, with mode `0755` and empty extended attributes:
+    ///
+    /// - If the import created a parent, the root gets the owner of the last
+    ///   parent that it created. This replaces each earlier root metadata,
+    ///   also the metadata that a root member set.
+    /// - If the import created no parent and `mtree` has no root metadata, the
+    ///   root gets the owner `0:0`.
+    ///   [`owner_uid`](TarImportOptions::owner_uid) and
+    ///   [`owner_gid`](TarImportOptions::owner_gid) replace these values if
+    ///   they are set.
+    ///
+    /// # Pathnames
+    ///
+    /// The import normalizes the pathname of each member. It removes one
+    /// leading `./` and one leading `/`. The name of a directory keeps its
+    /// trailing `/`. The root member of the archive gets the empty string.
+    ///
+    /// The [`rename`](TarImportOptions::rename) hook receives this normalized
+    /// name. The member goes under the name that the hook returns. The link
+    /// target of a hardlink member goes through the same normalization and the
+    /// same hook.
+    ///
+    /// # Modifier
+    ///
+    /// `modifier` shapes each member as it shapes a walk of a file system,
+    /// with one difference.
     /// [`CANONICAL_PERMISSIONS`](crate::CommitModifierFlags::CANONICAL_PERMISSIONS)
-    /// records the ownership and the mode it states and keeps the extended
-    /// attributes the archive carries, which
-    /// [`skip_xattrs`](TarImportOptions::skip_xattrs) drops instead. A
-    /// synthesized parent directory takes no part in the modifier.
+    /// records the ownership and the mode that it states, and keeps the
+    /// extended attributes of the archive. The option that drops them is
+    /// [`skip_xattrs`](TarImportOptions::skip_xattrs). A parent directory that
+    /// the import creates does not go through the modifier.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::TarPathname`] if the pathname of a member is not valid
+    ///   UTF-8.
+    /// - [`Error::Tar`] if the archive holds a device node or a FIFO member.
+    /// - [`Error::Tar`] if a pathname has a `..` component.
+    /// - [`Error::Tar`] if a regular file, symlink, or hardlink member has an
+    ///   empty pathname.
+    /// - [`Error::Tar`] if the target of a hardlink is not a regular file or
+    ///   symlink member that the import placed, or an earlier hardlink member.
+    ///   The import does not place a member that the filter of the modifier
+    ///   skips.
+    /// - [`Error::TarMissingParent`] if a parent directory of a member is not
+    ///   in the tree and
+    ///   [`autocreate_parents`](TarImportOptions::autocreate_parents) is off.
+    /// - [`Error::ReplaceFileWithDir`] if a member needs a directory at a path
+    ///   where the tree holds a file.
+    /// - [`Error::ReplaceDirWithFile`] if a regular file, symlink, or hardlink
+    ///   member names a path where the tree holds a directory.
+    /// - [`Error::Core`] if two `SCHILY.xattr.*` records of a member have the
+    ///   same name, or if a record name is empty or holds a NUL byte.
+    /// - An error from a callback of the modifier. For example,
+    ///   [`Error::InvalidFormat`] if the modifier sets
+    ///   [`ERROR_ON_UNLABELED`](crate::CommitModifierFlags::ERROR_ON_UNLABELED)
+    ///   and its label callback gives no label for a member.
+    /// - An error from the staging write of an object, as
+    ///   [`Transaction::write_content`] lists. For example,
+    ///   [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
+    /// - An error from the load of a committed subdirectory of `mtree`. For
+    ///   example, [`Error::ObjectNotFound`] if its dirtree is not in the
+    ///   object store.
+    /// - [`Error::Io`] if a read from `input` fails, or if a member header is
+    ///   malformed.
+    /// - The error that the [`rename`](TarImportOptions::rename) hook returns.
     pub async fn import_tar_into(
         &self,
         txn: &Transaction,
@@ -318,13 +435,12 @@ impl Repo {
             .map_or(CommitModifierFlags::empty(), |m| m.flags);
         let owner = Owner::of(modifier.as_deref());
 
-        // Files and symlinks by path, for resolving hardlink targets, and the
-        // hardlink members themselves, whose targets are resolved once the
-        // walk is over.
+        // The files and symlinks by path, to resolve hardlink targets. Also the
+        // hardlink members, whose targets the import resolves after the walk.
         let mut file_index: HashMap<Vec<String>, Checksum> = HashMap::new();
         let mut hardlinks: Vec<(Vec<String>, Vec<String>)> = Vec::new();
-        // The ownership the last synthesized parent directory recorded. The
-        // root's own metadata takes it too.
+        // The ownership that the last synthesized parent directory recorded.
+        // The metadata of the root takes it too.
         let mut synthesized: Option<(u32, u32)> = None;
 
         while let Some(entry) = reader.next().await {
@@ -401,11 +517,11 @@ impl Repo {
                 TarEntry::Symlink(link) => {
                     let comps = member_path(link.path(), false, &mut opts)?;
                     require_leaf(&comps, "symlink")?;
-                    // The header's own permission bits, under the file type the
-                    // member kind states. The file type makes the mode callback
-                    // and the canonical reduction see a symlink, and lets the
-                    // permission bits a `--statoverride` entry states reach the
-                    // content object's header.
+                    // The permission bits of the header, under the file type
+                    // of the member kind. With this file type, the mode
+                    // callback and the canonical reduction see a symlink. It
+                    // also lets the permission bits of a `--statoverride` entry
+                    // reach the header of the content object.
                     let base = FileMeta {
                         uid: opts.uid(link.uid()),
                         gid: opts.gid(link.gid()),
@@ -442,8 +558,8 @@ impl Repo {
                 TarEntry::Link(link) => {
                     let comps = member_path(link.path(), false, &mut opts)?;
                     require_leaf(&comps, "hardlink")?;
-                    // The target names another member, so it is read through
-                    // the same rename hook the member names went through.
+                    // The target names another member, so it goes through the
+                    // same rename hook as the member names.
                     let target = member_path(link.link(), false, &mut opts)?;
                     let raw = (opts.uid(0), opts.gid(0));
                     let parents = &comps[..comps.len() - 1];
@@ -475,9 +591,9 @@ impl Repo {
             }
         }
 
-        // Resolve hardlinks against the already-ingested paths. GNU tar points a
-        // hardlink at the first, real occurrence of the content, so the target
-        // is always a member seen earlier in the walk.
+        // Resolve hardlinks against the paths that the walk placed. GNU tar
+        // points a hardlink at the first, real occurrence of the content, so
+        // the target is always a member earlier in the walk.
         for (link, target) in hardlinks {
             let checksum = file_index.get(&target).copied().ok_or_else(|| {
                 Error::Tar(format!(
@@ -496,9 +612,9 @@ impl Repo {
             file_index.insert(link, checksum);
         }
 
-        // The root's own metadata: what the last synthesized parent recorded,
-        // else `0755 0:0` where the archive named no root and nothing else
-        // supplied one.
+        // The metadata of the root: what the last synthesized parent recorded.
+        // If the archive named no root and nothing else supplied one, the
+        // root gets `0755 0:0`.
         if opts.autocreate_parents
             && let Some((uid, gid)) = synthesized.or_else(|| {
                 mtree
@@ -521,13 +637,13 @@ impl Repo {
     }
 }
 
-/// Shape one member's metadata: the deterministic adjustments, then the
-/// modifier's filter, then its callbacks. `None` where the filter skipped the
-/// member.
+/// Shapes the metadata of one member: the deterministic adjustments, then the
+/// filter of the modifier, then its callbacks. Returns `None` if the filter
+/// skips the member.
 ///
-/// Canonical permissions keep the extended attributes the archive carries,
-/// which is where the tar importer parts from the filesystem walk;
-/// [`TarImportOptions::skip_xattrs`] is what drops them.
+/// Canonical permissions keep the extended attributes of the archive. Here
+/// the tar import differs from the walk of a file system.
+/// [`TarImportOptions::skip_xattrs`] drops them.
 fn shape(
     txn: &Transaction,
     mut modifier: Option<&mut CommitModifier>,
@@ -556,8 +672,8 @@ fn shape(
     )?))
 }
 
-/// The modifier callback path of a member: `/` for the archive's root member,
-/// and a leading-slash path with no trailing slash for every other.
+/// Returns the modifier callback path of a member: `/` for the root member of
+/// the archive, else a path with a leading `/` and no trailing `/`.
 fn callback_path(comps: &[String]) -> String {
     if comps.is_empty() {
         "/".to_owned()
@@ -566,10 +682,10 @@ fn callback_path(comps: &[String]) -> String {
     }
 }
 
-/// Navigate to the directory node named by `ancestors`. Every component must
+/// Returns the directory node that `ancestors` names. Each component must
 /// already be in the tree, or
 /// [`autocreate_parents`](TarImportOptions::autocreate_parents) must permit
-/// synthesizing it.
+/// its creation.
 async fn descend<'a>(
     txn: &Transaction,
     root: &'a mut MutableTree,
@@ -604,9 +720,9 @@ async fn descend<'a>(
     Ok(node)
 }
 
-/// Record a directory member's own metadata, creating the node it names under
-/// parents [`descend`] resolves. The archive's root member sets the tree root's
-/// metadata.
+/// Records the metadata of a directory member. It creates the node that the
+/// member names, under the parents that [`descend`] resolves. The root member
+/// of the archive sets the metadata of the tree root.
 async fn place_dir(
     txn: &Transaction,
     root: &mut MutableTree,
@@ -633,8 +749,8 @@ async fn place_dir(
     Ok(())
 }
 
-/// Record a content object at the member's path, resolving its parents the way
-/// [`descend`] does.
+/// Records a content object at the path of the member. It resolves the
+/// parents as [`descend`] does.
 async fn place(
     txn: &Transaction,
     root: &mut MutableTree,
@@ -660,10 +776,10 @@ async fn place(
     Ok(())
 }
 
-/// Walk `tree` depth-first, appending ordered [`Item`]s. Within a directory the
-/// files and subdirectories are interleaved in name order; a subdirectory's
-/// entry is emitted just before its contents. `seen` maps a content object to
-/// the first path that carried it, so a repeat becomes a hardlink.
+/// Walks `tree` depth-first and appends ordered [`Item`]s. In a directory, the
+/// files and subdirectories share one name order. A subdirectory entry comes
+/// just before its contents. `seen` maps a content object to the first path
+/// that carried it, so a repeat becomes a hardlink.
 fn collect<'a>(
     repo: &'a Repo,
     tree: RepoTree,
@@ -716,18 +832,20 @@ fn collect<'a>(
     })
 }
 
-/// The failure a tar member's header states. The reader reports a pathname that
-/// is not valid UTF-8 as an `InvalidData` i/o error; the port stores pathnames
-/// as text, so it reports that case the way the tool reports it.
+/// Converts a read error of a tar member header to an [`Error`]. The reader
+/// reports a pathname that is not valid UTF-8 as an `InvalidData` I/O error.
+/// ostrya stores pathnames as text, so it reports this case as the `ostree`
+/// command does.
 fn read_error(err: std::io::Error) -> Error {
-    // The refusal is recognized by the dependency's message text: smol-tar
-    // 0.1.7, the registry version the workspace resolves, spells it `utf8 in
-    // file path`, and `Cargo.lock` records that version. A change to that
-    // text upstream leaves the failure an `Error::Io`;
+    // The match uses the message text of the dependency. smol-tar 0.1.7, the
+    // registry version that the workspace resolves, spells it `utf8 in file
+    // path`, and `Cargo.lock` records that version. If that text changes
+    // upstream, the failure stays an `Error::Io`.
     // `import_rejects_a_pathname_that_is_not_utf8` in
     // `crates/ostrya/tests/tar.rs` asserts `Error::TarPathname` and fails
     // when the text moves. `commit_tar_pathname_not_utf8_is_refused` in the
-    // CLI tests holds the same case against the tool where it is installed.
+    // CLI tests holds the same case against the `ostree` command, if it is
+    // installed.
     if err.kind() == std::io::ErrorKind::InvalidData
         && err.to_string().contains("utf8 in file path")
     {
@@ -736,7 +854,7 @@ fn read_error(err: std::io::Error) -> Error {
     Error::Io(err)
 }
 
-/// The name of a directory entry regardless of kind.
+/// Returns the name of a directory entry of either kind.
 fn entry_name(entry: &TreeEntry) -> &str {
     match entry {
         TreeEntry::File { name, .. } => name,
@@ -744,10 +862,12 @@ fn entry_name(entry: &TreeEntry) -> &str {
     }
 }
 
-/// The path components a member is imported under: the normalized name (one
-/// leading `./` and one leading `/` dropped, a directory keeping its trailing
-/// `/`, the archive's own root member being the empty string), put through the
-/// rename hook, then split.
+/// Returns the path components that a member is imported under.
+///
+/// The function normalizes the name. It drops one leading `./` and one
+/// leading `/`. A directory keeps its trailing `/`, and the root member of the
+/// archive is the empty string. The rename hook gets this name, and
+/// [`normalize`] splits the result.
 fn member_path(raw: &str, is_dir: bool, opts: &mut TarImportOptions) -> Result<Vec<String>> {
     let stripped = raw.strip_prefix("./").unwrap_or(raw);
     let stripped = stripped.strip_prefix('/').unwrap_or(stripped);
@@ -765,9 +885,9 @@ fn member_path(raw: &str, is_dir: bool, opts: &mut TarImportOptions) -> Result<V
     normalize(&name, opts)
 }
 
-/// Split a tar member name into path components, dropping empty and `.`
-/// components and the root, and rejecting `..`. With `etc_to_usr_etc`, a leading
-/// `etc` component becomes `usr/etc`.
+/// Splits a tar member name into path components. It drops empty components,
+/// `.` components, and the root, and it refuses `..`. If `etc_to_usr_etc` is
+/// set, a leading `etc` component becomes `usr/etc`.
 fn normalize(raw: &str, opts: &TarImportOptions) -> Result<Vec<String>> {
     let mut comps = Vec::new();
     for part in raw.split('/') {
@@ -789,8 +909,8 @@ fn normalize(raw: &str, opts: &TarImportOptions) -> Result<Vec<String>> {
     Ok(comps)
 }
 
-/// Reject an entry whose normalized path is empty (it would name the tree root
-/// as a file).
+/// Refuses an entry whose normalized path is empty, because that path names
+/// the tree root as a file.
 fn require_leaf(comps: &[String], kind: &str) -> Result<()> {
     if comps.is_empty() {
         return Err(Error::Tar(format!("{kind} entry has an empty path")));
@@ -798,17 +918,18 @@ fn require_leaf(comps: &[String], kind: &str) -> Result<()> {
     Ok(())
 }
 
-/// Render path components as a slash-joined string for diagnostics.
+/// Joins path components with `/` for an error message.
 fn join(comps: &[String]) -> String {
     comps.join("/")
 }
 
-/// The dirtree and dirmeta the archive's root member stands for: the commit
-/// root, or the directory a subpath names inside it. A subpath with no name
-/// component names the whole tree, matching
-/// [`CheckoutOptions::subpath`](crate::CheckoutOptions::subpath). A subpath
-/// naming a file or a symlink has no tree to walk, and one naming nothing at
-/// all has no node, so both are refused.
+/// Returns the dirtree and dirmeta of the root member of the archive: the
+/// commit root, or the directory that a subpath names in it.
+///
+/// A subpath with no name component names the whole tree, as
+/// [`CheckoutOptions::subpath`](crate::CheckoutOptions::subpath) does. A
+/// subpath that names a file or a symlink has no tree to walk. A subpath that
+/// names nothing has no node. The function refuses both.
 async fn export_root(
     repo: &Repo,
     commit: &Commit,
@@ -834,8 +955,8 @@ async fn export_root(
     }
 }
 
-/// The archive root's member name and the prefix every other member's name
-/// carries, for the [`prefix`](TarExportOptions::prefix) option.
+/// Returns the member name of the archive root and the prefix of each other
+/// member name, for the [`prefix`](TarExportOptions::prefix) option.
 fn prefix_parts(prefix: Option<&str>) -> (String, String) {
     match prefix.filter(|p| !p.is_empty()) {
         None => ("./".to_owned(), String::new()),
@@ -844,8 +965,8 @@ fn prefix_parts(prefix: Option<&str>) -> (String, String) {
     }
 }
 
-/// The PAX attributes an exported entry carries: its extended attributes, or
-/// none where [`skip_xattrs`](TarExportOptions::skip_xattrs) is set.
+/// Returns the PAX attributes of an exported entry: its extended attributes,
+/// or none if [`skip_xattrs`](TarExportOptions::skip_xattrs) is set.
 fn export_attrs(xattrs: &Xattrs, opts: &TarExportOptions) -> Result<AttrList> {
     if opts.skip_xattrs {
         return Ok(AttrList::new());
@@ -853,9 +974,9 @@ fn export_attrs(xattrs: &Xattrs, opts: &TarExportOptions) -> Result<AttrList> {
     xattrs_to_attrs(xattrs)
 }
 
-/// Convert an ostrya xattr set to tar PAX attributes: drop the stored
-/// terminating NUL from each name (smol-tar prepends `SCHILY.xattr.` and
-/// requires a graphic-ASCII name), keeping values byte-for-byte.
+/// Converts an ostrya xattr set to tar PAX attributes. It drops the stored
+/// terminating NUL from each name and keeps each value byte for byte.
+/// smol-tar prepends `SCHILY.xattr.` and requires a graphic-ASCII name.
 fn xattrs_to_attrs(xattrs: &Xattrs) -> Result<AttrList> {
     let mut attrs = AttrList::new();
     for (name, value) in xattrs.iter() {
@@ -867,8 +988,9 @@ fn xattrs_to_attrs(xattrs: &Xattrs) -> Result<AttrList> {
     Ok(attrs)
 }
 
-/// Convert tar PAX attributes to a canonical ostrya xattr set, appending the
-/// terminating NUL each stored name carries. [`Xattrs::new`] sorts and validates.
+/// Converts tar PAX attributes to a canonical ostrya xattr set. It appends the
+/// terminating NUL that each stored name carries. [`Xattrs::new`] sorts and
+/// checks the set.
 fn attrs_to_xattrs(attrs: &AttrList, opts: &TarImportOptions) -> Result<Xattrs> {
     if opts.skip_xattrs || attrs.is_empty() {
         return Ok(Xattrs::empty());
@@ -882,9 +1004,9 @@ fn attrs_to_xattrs(attrs: &AttrList, opts: &TarImportOptions) -> Result<Xattrs> 
     Ok(Xattrs::new(pairs)?)
 }
 
-/// The tar option types move freely across tasks and threads.
-/// [`TarImportOptions`] holds a callback field, which is called through `&mut`
-/// and so is `Send` alone, the way [`CommitModifier`] is.
+/// A compile-time check that the tar option types can move across tasks and
+/// threads. [`TarImportOptions`] holds a callback field that is called through
+/// `&mut`, so the type is `Send` only, as [`CommitModifier`] is.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     fn assert_send<T: Send>() {}

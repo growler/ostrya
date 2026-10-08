@@ -1,13 +1,7 @@
 //! The refspecs of a push.
 //!
-//! A refspec is `SRC[:DST]`, split at its last `:`. `SRC` is a revision of
-//! the local repository, and `DST` is the ref of the server that takes the
-//! commit `SRC` names. An empty `SRC` before a `DST` (`:DST`) deletes the ref
-//! `DST` of the server. The split is at the last `:`, so `SRC` can name a
-//! remote ref, as in `origin:main:DST`. `DST` holds no `:`, so a push names
-//! no remote ref of the server. `DST` holds no `^` either. A `DST` that takes
-//! a commit is not 64 lowercase hex characters, which a revision reads as a
-//! commit checksum. A delete can name such a `DST`.
+//! `RepoPushOptions::refspecs` states the syntax of a refspec, `SRC[:DST]`,
+//! split at its last `:`.
 
 use std::collections::HashSet;
 
@@ -23,7 +17,7 @@ use crate::repo::Repo;
 pub(crate) struct PushTarget {
     /// The ref of the server.
     pub(crate) dst: String,
-    /// The local commit the ref takes, or `None` to delete the ref.
+    /// The local commit that the ref takes, or `None` for a delete of the ref.
     pub(crate) commit: Option<Checksum>,
 }
 
@@ -32,19 +26,27 @@ pub(crate) struct PushTarget {
 struct Refspec<'a> {
     /// The local revision, or `None` for a delete.
     src: Option<&'a str>,
-    /// The ref of the server, when the refspec names one.
+    /// The ref of the server, if the refspec names one.
     dst: Option<&'a str>,
 }
 
-/// Split `spec` at its last `:`.
+/// Splits `spec` at its last `:`.
 ///
-/// The split refuses an empty refspec, `:`, an empty `DST`, and a `SRC` with
-/// a `^` suffix and no `DST`. Each of these is [`Error::Push`] with
-/// [`InvalidInput`](crate::push::Error::InvalidInput). A `DST` that
-/// [`validate_refspec`] refuses, a `DST` that holds a `^`, and a `DST` that
-/// [`is_checksum_shaped`](ostrya_core::is_checksum_shaped) marks after a
-/// non-empty `SRC` are [`Error::InvalidRefspec`] with the `DST`. A delete
-/// (`:DST`) of a checksum-shaped `DST` passes.
+/// These forms give [`Error::Push`] with
+/// [`InvalidInput`](crate::push::Error::InvalidInput):
+///
+/// - An empty refspec.
+/// - The refspec `:` and each other refspec with an empty `DST`.
+/// - A `SRC` with a `^` suffix and no `DST`.
+///
+/// These forms of `DST` give [`Error::InvalidRefspec`] with the `DST`:
+///
+/// - A `DST` that [`validate_refspec`] refuses.
+/// - A `DST` that holds a `^`.
+/// - A `DST` that [`is_checksum_shaped`](ostrya_core::is_checksum_shaped)
+///   marks, after a non-empty `SRC`.
+///
+/// A delete (`:DST`) of a checksum-shaped `DST` passes.
 fn split(spec: &str) -> Result<Refspec<'_>> {
     if spec.is_empty() {
         return Err(invalid("a refspec is empty"));
@@ -76,19 +78,26 @@ fn split(spec: &str) -> Result<Refspec<'_>> {
 }
 
 impl Repo {
-    /// The ref updates of the push `refspecs`, in the order of the refspecs.
+    /// Returns the ref updates of the push `refspecs`, in the order of the
+    /// refspecs.
     ///
-    /// Each `SRC` resolves as [`resolve_rev`](Repo::resolve_rev) resolves it,
-    /// with its errors. `DST` defaults to `SRC` when `SRC` resolves as a ref
-    /// with no `^` suffix. A `SRC` that resolves as a full or an abbreviated
-    /// checksum, and a `SRC` with a `^` suffix, need a `DST`.
+    /// Each `SRC` resolves as [`resolve_rev`](Repo::resolve_rev) resolves it.
+    /// If `SRC` resolves as a ref with no `^` suffix, `DST` defaults to
+    /// `SRC`. A `SRC` that resolves as a full or an abbreviated
+    /// checksum needs a `DST`. A `SRC` with a `^` suffix also needs a `DST`.
     ///
-    /// A refspec that [`split`] refuses gives the error of [`split`]. An
-    /// empty list, a checksum `SRC` with no `DST`, and a `DST` named twice
-    /// are [`Error::Push`] with
-    /// [`InvalidInput`](crate::push::Error::InvalidInput). The split of every
-    /// refspec, and the check of the `DST` names that the refspecs spell,
-    /// come before any resolution.
+    /// The split of each refspec comes before any resolution. The check of
+    /// the `DST` names that the refspecs spell also comes before any
+    /// resolution.
+    ///
+    /// # Errors
+    ///
+    /// - The error of [`split`] if it refuses a refspec.
+    /// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+    ///   for an empty list, a checksum `SRC` with no `DST`, and a `DST` that
+    ///   two refspecs name.
+    /// - [`Error::RefNotFound`] with the `SRC` if `SRC` resolves to no commit.
+    /// - The errors of [`resolve_rev`](Repo::resolve_rev) for a `SRC`.
     pub(crate) async fn push_targets(&self, refspecs: &[String]) -> Result<Vec<PushTarget>> {
         if refspecs.is_empty() {
             return Err(invalid("a push needs at least one refspec"));
@@ -141,7 +150,7 @@ impl Repo {
     }
 }
 
-/// The refusal of a `DST` that two refspecs name.
+/// Returns the error for a `DST` that two refspecs name.
 fn named_twice(dst: &str) -> Error {
     invalid(format!("the destination '{dst}' is named twice"))
 }
@@ -234,8 +243,8 @@ mod tests {
         let parts = split("origin:main").unwrap();
         assert_eq!(parts.src, Some("origin"));
         assert_eq!(parts.dst, Some("main"));
-        // So `origin:main^` is the source `origin` and the destination
-        // `main^`, which is refused.
+        // The refspec `origin:main^` is the source `origin` and the
+        // destination `main^`. The split refuses this destination.
         assert_invalid_refspec(split("origin:main^"), "main^");
     }
 
@@ -357,8 +366,8 @@ mod tests {
             let scratch = Scratch::new("hex-ref");
             let repo = scratch.create(RepoMode::BareUser).await;
             let commit = commit_tree(&repo, &scratch, "main", None, b"one").await;
-            // A name of lowercase hex that the one commit checksum does not
-            // start with.
+            // A name of lowercase hex that is not a prefix of the checksum
+            // of the one commit.
             let name = if commit.to_hex().starts_with('a') {
                 "bbbb"
             } else {
@@ -401,13 +410,14 @@ mod tests {
                 repo.push_targets(&refspecs(&["absent", "main:"])).await,
                 "names no destination",
             );
-            // So does a destination that two refspecs spell.
+            // A destination that two refspecs spell also gives an error
+            // before any resolution.
             assert_invalid(
                 repo.push_targets(&refspecs(&["absent:x", "main:x"])).await,
                 "'x' is named twice",
             );
-            // A destination that defaults to its source is checked when the
-            // source resolves as a ref.
+            // The check of a destination that defaults to its source comes
+            // when the source resolves as a ref.
             assert_invalid(
                 repo.push_targets(&refspecs(&["main", "main"])).await,
                 "'main' is named twice",
@@ -442,8 +452,8 @@ mod tests {
         ostrya_rt::block_on(async {
             let scratch = Scratch::new("ambiguous");
             let repo = scratch.create(RepoMode::BareUser).await;
-            // Seventeen commits hold two whose checksums start with one hex
-            // digit.
+            // Of 17 commits, at least two have checksums that start with the
+            // same hex digit.
             let mut firsts = HashSet::new();
             let mut shared = None;
             for i in 0..17u8 {

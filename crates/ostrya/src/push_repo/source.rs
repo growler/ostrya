@@ -13,25 +13,28 @@ use crate::repo::Repo;
 
 /// The [`ObjectSource`] over a local repository.
 ///
-/// A metadata object is [`ObjectData::Encoded`] in `raw`, read whole: the
-/// format caps its size. The session can send a file object of an `archive`
-/// repository in `deflate`. Such an object is [`ObjectData::Encoded`] in
-/// `deflate`: a stream over the stored `.filez` file, byte for byte. Every
-/// other file object is [`ObjectData::Content`], with the file header and a
-/// stream over its payload, and the session encodes it. No file content is
-/// held in memory, and the source keeps no reader between calls.
+/// A metadata object is [`ObjectData::Encoded`] in `raw`. The source reads it
+/// whole, because the format caps its size.
 ///
-/// [`content_size`](ObjectSource::content_size) reads the metadata of each
-/// file object in one pass on the blocking pool, and no payload byte.
+/// If the encoding is `deflate` and the repository is in `archive` mode, a file
+/// object is [`ObjectData::Encoded`] in `deflate`. Its reader is a stream over
+/// the stored `.filez` file, byte for byte. Every other file object is
+/// [`ObjectData::Content`], with the file header and a stream over its payload.
+/// The session encodes it.
 ///
-/// The detached metadata of a commit comes with the filter applied.
+/// The source holds no file content in memory and keeps no reader between
+/// calls. [`content_size`](ObjectSource::content_size) reads the metadata of
+/// each file object in one pass on the blocking pool. It reads no payload byte.
+///
+/// The source applies the filter to the detached metadata of a commit.
 pub(crate) struct RepoSource {
     repo: Repo,
     filter: DetachedMetadataFilter,
 }
 
 impl RepoSource {
-    /// The source over `repo`, whose detached metadata passes `filter`.
+    /// Creates the source over `repo`. The detached metadata passes through
+    /// `filter`.
     pub(crate) fn new(repo: Repo, filter: DetachedMetadataFilter) -> RepoSource {
         RepoSource { repo, filter }
     }
@@ -65,10 +68,10 @@ impl RepoSource {
         })
     }
 
-    /// The content bytes of the file objects of `names` sent in `encoding`,
-    /// in one pass on the blocking pool. The pass mirrors [`load`]: a stored
-    /// `.filez` counts its size, and each other object the size of its
-    /// payload.
+    /// Returns the number of content bytes of the file objects of `names` in
+    /// `encoding`. The count runs in one pass on the blocking pool. The pass
+    /// mirrors [`load`]: a stored `.filez` counts its size, and each other
+    /// object counts the size of its payload.
     ///
     /// [`load`]: RepoSource::load
     async fn content_total(&self, names: &[ObjectName], encoding: Encoding) -> Result<u64> {
@@ -82,12 +85,13 @@ impl RepoSource {
         ostrya_rt::unblock(move || repo.content_size_blocking(&checksums, stored)).await
     }
 
-    /// A stream over the stored `.filez` file of the file object `checksum`.
+    /// Opens a stream over the stored `.filez` file of the file object
+    /// `checksum`.
     async fn stored_filez(&self, checksum: &Checksum) -> Result<ObjectData> {
         let path = loose_path(checksum, ObjectType::File, self.repo.mode());
         let repo = self.repo.clone();
-        // The size bounds the read-ahead, and the `fstat` runs on the
-        // pool thread of the open.
+        // The size bounds the read-ahead. The `fstat` runs on the pool
+        // thread of the open.
         let opened = ostrya_rt::unblock(move || {
             let file = object::open_content_file(repo.objects_fd(), &path, 0)?;
             let len = file.metadata()?.len();
@@ -110,8 +114,8 @@ impl RepoSource {
         })
     }
 
-    /// The detached metadata of `commit` that the filter allows, or `None`
-    /// when the commit has none or the filter allows no property.
+    /// Returns the detached metadata of `commit` that the filter allows. If the
+    /// commit has none or the filter allows no property, returns `None`.
     async fn detached(&self, commit: &Checksum) -> Result<Option<Value>> {
         let bytes = match self
             .repo
@@ -177,7 +181,8 @@ impl ObjectSource for RepoSource {
     }
 }
 
-/// The source moves freely across tasks and threads.
+/// Pins at compile time that the source and its filter are `Send` and `Sync`,
+/// so they can move across tasks and threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<RepoSource>();
@@ -194,8 +199,8 @@ mod tests {
     use super::super::test_repo::{Scratch, commit_tree};
     use super::*;
 
-    /// A repository of `mode` with one commit on `main`, as the scratch
-    /// directory, the repository, and the commit.
+    /// Creates a repository of `mode` with one commit on `main`. Returns the
+    /// scratch directory, the repository, and the commit.
     async fn fixture(label: &str, mode: RepoMode) -> (Scratch, Repo, Checksum) {
         let scratch = Scratch::new(label);
         let repo = scratch.create(mode).await;
@@ -203,7 +208,7 @@ mod tests {
         (scratch, repo, commit)
     }
 
-    /// The file objects of `commit`, as the regular file and the symlink.
+    /// Returns the file objects of `commit`: the regular file and the symlink.
     async fn file_objects(repo: &Repo, commit: &Checksum) -> (ObjectName, ObjectName) {
         let mut regular = None;
         let mut symlink = None;
@@ -265,7 +270,7 @@ mod tests {
 
             let got = source(&repo).objects(&commit).await.unwrap();
             assert_eq!(got.len(), 5, "{got:?}");
-            // The parent commit is no object of the commit.
+            // The list does not hold the parent commit.
             assert_eq!(got.into_iter().collect::<HashSet<_>>(), expected);
         });
     }
@@ -279,7 +284,7 @@ mod tests {
             let meta: Vec<_> = names.iter().filter(|n| n.ty != ObjectType::File).collect();
             assert_eq!(meta.len(), 3, "a commit, a dirtree, and a dirmeta");
             for name in meta {
-                // The encoding the session asks for does not change a
+                // The encoding that the session asks for does not change a
                 // metadata object.
                 for encoding in [Encoding::Raw, Encoding::Deflate] {
                     match src.open(name, encoding).await.unwrap() {
@@ -390,7 +395,8 @@ mod tests {
         });
     }
 
-    /// Every absent object of a repository of `mode` is `ObjectNotFound`.
+    /// Checks that each absent object of a repository of `mode` gives
+    /// `ObjectNotFound`.
     async fn check_missing_object(label: &str, mode: RepoMode) {
         let (_scratch, repo, _) = fixture(label, mode).await;
         let src = source(&repo);
@@ -455,9 +461,9 @@ mod tests {
         });
     }
 
-    /// The content size of the file objects is the number of bytes their
-    /// readers give, in each mode and each encoding: `raw` is also the
-    /// encoding of a session whose server does not list `deflate`.
+    /// In each mode and each encoding, the content size of the file objects is
+    /// the number of bytes that their readers give. `raw` is also the encoding
+    /// of a session with a server that does not list `deflate`.
     #[test]
     fn the_content_size_is_the_bytes_the_readers_give() {
         ostrya_rt::block_on(async {
@@ -496,8 +502,8 @@ mod tests {
         });
     }
 
-    /// The size pass and the load reach the object the same way when its
-    /// fan-out directory is a symlink: both succeed with the same bytes, or
+    /// If the fan-out directory of an object is a symlink, the size pass and the
+    /// load reach the object the same way. Both succeed with the same bytes, or
     /// both fail.
     #[test]
     fn the_content_size_and_the_load_agree_on_a_symlinked_fan_out() {

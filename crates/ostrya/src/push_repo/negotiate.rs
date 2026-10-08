@@ -19,36 +19,60 @@ use crate::push::{
 use crate::read::CommitState;
 use crate::repo::Repo;
 
-/// What [`Repo::push`] and [`Repo::push_over_stream`] push, and how.
+/// The options of [`Repo::push`] and [`Repo::push_over_stream`].
 ///
-/// The struct carries no `#[non_exhaustive]`: build it with
+/// The struct is not `#[non_exhaustive]`. A caller can build it with
 /// `..Default::default()`.
 #[derive(Debug, Clone, Default)]
 pub struct RepoPushOptions {
-    /// The refspecs, each `SRC[:DST]`, split at the last `:`. `SRC` is a
-    /// revision of the local repository and `DST` the ref of the server that
-    /// takes its commit. `:DST` deletes the ref `DST` of the server. `DST`
-    /// defaults to `SRC` when `SRC` is a ref with no `^` suffix.
+    /// The refspecs, each `SRC[:DST]`, split at the last `:`.
+    ///
+    /// `SRC` is a revision of the local repository, as
+    /// [`resolve_rev`](Repo::resolve_rev) reads it. `DST` is the ref of the
+    /// server that takes the commit of `SRC`. `:DST` deletes the ref `DST` of
+    /// the server. If `SRC` is a ref with no `^` suffix, `DST` defaults to
+    /// `SRC`.
+    ///
+    /// A `SRC` with a `^` suffix needs a `DST`. A `SRC` that resolves as a
+    /// full or an abbreviated checksum also needs a `DST`. Because the split
+    /// is at the last `:`, `SRC` can name a remote ref, as in
+    /// `origin:main:DST`.
+    ///
+    /// `DST` holds no `:`, so a push names no remote ref of the server.
+    /// `DST` holds no `^`. A revision reads 64 lowercase hex characters as a
+    /// commit checksum, so a `DST` that takes a commit is not 64 lowercase hex
+    /// characters. A delete can name such a `DST`.
     pub refspecs: Vec<String>,
-    /// The parent commits the push reads for each source commit. `None`
-    /// sends the parent chain back to the server tip of the ref, the tip
-    /// excluded. `Some(0)` reads each source commit alone, `Some(n)` reads
-    /// `n` parents more, and `Some(-1)` reads the whole chain that the local
-    /// repository holds. A value below `-1` is refused.
+    /// The depth of the parent chain that the push reads for each source
+    /// commit.
+    ///
+    /// - `None`: the push sends the parent chain back to the server tip of
+    ///   the ref, the tip excluded. If the chain does not hold the tip, the
+    ///   push sends the source commit alone.
+    /// - `Some(0)`: the push reads each source commit alone.
+    /// - `Some(n)`: the push reads `n` more parents.
+    /// - `Some(-1)`: the push reads the whole chain that the local repository
+    ///   holds.
+    ///
+    /// The push refuses a value less than `-1`.
     pub depth: Option<i32>,
-    /// The encoding of the content objects.
+    /// The encoding of the content objects that the push sends.
     pub compression: Compression,
-    /// Update each ref whatever its state on the server, and ask the server
-    /// to allow an update that is not a fast-forward.
+    /// The switch that updates each ref whatever its state on the server.
+    ///
+    /// If `true`, each ref update expects any state. The push also asks the
+    /// server to allow an update that is not a fast-forward.
     pub force: bool,
-    /// How [`Repo::push`] reaches the remote. A field set here wins over the
-    /// keys of the remote section. [`Repo::push_over_stream`] does not read
-    /// it.
+    /// The connect options of [`Repo::push`].
+    ///
+    /// A field that is set here wins over the matching key of the remote
+    /// section. [`Repo::push_over_stream`] does not read this field.
     pub connect: ConnectOptions,
-    /// The filter the detached metadata of each commit passes before the
-    /// push sends it. Unset, the push sends every key.
+    /// The filter of the detached metadata of each commit that the push sends.
+    ///
+    /// If the filter is unset, the push sends every key.
     pub detached_metadata_filter: DetachedMetadataFilter,
-    /// A handle the session also counts its progress into.
+    /// A progress handle that receives the counters of the session.
     pub progress: Option<PushProgress>,
 }
 
@@ -63,7 +87,7 @@ enum Local {
     Absent,
 }
 
-/// The parts of a parsed commit that the push reads.
+/// Returns the parts of a parsed commit that the push reads.
 fn link_of(commit: &Commit) -> CommitLink {
     CommitLink {
         parent: commit.parent,
@@ -93,28 +117,55 @@ struct Plan {
     commits: HashMap<Checksum, Local>,
 }
 
+/// Methods that push commits to a remote.
 impl Repo {
-    /// Push the commits that `opts.refspecs` name to `remote`, and update the
-    /// refs of the server in one transaction.
+    /// Pushes the commits of `opts.refspecs` to `remote` and updates the
+    /// server refs.
     ///
-    /// `remote` is a configured remote name or an address, and
-    /// [`resolve_push_remote`] reads it with the config of this repository
-    /// and `opts.connect`. The push then makes the transport ready with
-    /// [`PushSession::prepare`], which refuses the connect options that do
-    /// not apply and reads the token file and the TLS files of an HTTP
-    /// push. These checks come before the checks and the commit walk of
-    /// [`push_over_stream`](Repo::push_over_stream), so a refusal of the
-    /// remote or of its options takes no lock and reads no refspec. The push
-    /// then runs those checks and the walk, opens the session with
-    /// [`PreparedSession::open`](crate::push::PreparedSession::open), and
-    /// runs the rest of the work of `push_over_stream`.
+    /// The server updates all the refs in one transaction. `remote` is a
+    /// configured remote name or an address. [`resolve_push_remote`] reads it
+    /// with the config of this repository and `opts.connect`.
     ///
-    /// Under the tokio backend, the call must run within a runtime that has
-    /// the IO driver and the time driver enabled. These are `enable_io` and
-    /// `enable_time` of the runtime builder, or `enable_all`. The ssh child
-    /// process and its pipes, and the connections of an HTTP session, need
-    /// the IO driver, and the time limits of the session need the time
+    /// The push makes the transport ready with [`PushSession::prepare`]. The
+    /// prepare step refuses the connect options that do not apply. For an
+    /// HTTP push, it reads the token file and the TLS files.
+    ///
+    /// These steps come before the checks and the commit walk of
+    /// [`push_over_stream`](Repo::push_over_stream). If the push refuses the
+    /// remote or its options, it takes no lock and reads no refspec. After
+    /// these steps, the push runs the checks and the walk. It opens the
+    /// session with [`PreparedSession::open`](crate::push::PreparedSession::open)
+    /// and does the rest of the work of `push_over_stream`.
+    ///
+    /// # Tokio runtime
+    ///
+    /// Under the tokio backend, the call must run in a runtime that has the
+    /// IO driver and the time driver enabled. The runtime builder enables
+    /// them with `enable_io` and `enable_time`, or with `enable_all`. The
+    /// ssh child process, its pipes, and the connections of an HTTP session
+    /// need the IO driver. The time limits of the session need the time
     /// driver.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+    ///   if `remote` names no configured remote, or if the remote has no push
+    ///   address.
+    /// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+    ///   if an `https://` remote sets `tls-permissive=true`.
+    /// - [`Error::Push`] with the error of
+    ///   [`PushRemote::parse`](crate::push::PushRemote::parse) if the address
+    ///   does not parse.
+    /// - [`Error::Core`] if a key of the remote section holds a malformed
+    ///   escape sequence, or if `tls-permissive` is not a boolean.
+    /// - [`Error::Push`] with the error of [`PushSession::prepare`] if a
+    ///   connect option does not apply, or if a token file or a TLS file
+    ///   cannot be read. If the HTTP client cannot be built, the push also
+    ///   gives this error.
+    /// - [`Error::Push`] with the error of
+    ///   [`PreparedSession::open`](crate::push::PreparedSession::open) if the
+    ///   session does not open.
+    /// - Each error of [`push_over_stream`](Repo::push_over_stream).
     pub async fn push(&self, remote: &str, mut opts: RepoPushOptions) -> Result<PushOutcome> {
         let connect = std::mem::take(&mut opts.connect);
         let (address, connect) = resolve_push_remote(Some(self.config()), remote, connect)?;
@@ -124,77 +175,120 @@ impl Repo {
         plan.run(session, &opts).await
     }
 
-    /// Push the commits that `opts.refspecs` name over a pair of byte
-    /// streams, and update the refs of the server in one transaction.
+    /// Pushes the commits of `opts.refspecs` over a pair of byte streams.
     ///
-    /// `input` comes from the server, and `output` goes to it. The call does
-    /// not read `opts.connect`.
+    /// The server updates all the refs in one transaction. `input` comes from
+    /// the server, and `output` goes to it. The call does not read
+    /// `opts.connect`.
     ///
-    /// The push holds the lock of the local repository shared for the whole
-    /// call. So a prune of the local repository waits for the push. Before it
-    /// writes a byte, the push refuses:
+    /// The push checks the depth, the refspecs, and the source commits
+    /// before it writes a byte. After the depth check, it takes the repository
+    /// lock as [`LockKind::Shared`] and holds it to the end of the call. A
+    /// prune of the local repository waits for the push.
     ///
-    /// - a `depth` below `-1`, as [`Error::Push`] with
-    ///   [`InvalidInput`](crate::push::Error::InvalidInput);
-    /// - each refspec that the reader of refspecs refuses, as [`Error::Push`]
-    ///   with [`InvalidInput`](crate::push::Error::InvalidInput) or as the
-    ///   error of the resolution of `SRC`;
-    /// - a `DST` that [`validate_refspec`](crate::validate_refspec) refuses,
-    ///   a `DST` that holds a `^`, and a `DST` of 64 lowercase hex characters
-    ///   that takes a commit, as [`Error::InvalidRefspec`] with the `DST`. A
-    ///   revision reads a `DST` of 64 lowercase hex characters as a commit
-    ///   checksum. A delete (`:DST`) of such a `DST` passes;
-    /// - a source commit that the local repository marks partial, as
-    ///   [`Error::Push`] with
-    ///   [`InvalidInput`](crate::push::Error::InvalidInput);
-    /// - a source commit whose `ostree.ref-binding` is a list that does not
-    ///   hold its `DST`, as [`Error::Push`] with
-    ///   [`BindingMismatch`](crate::push::Error::BindingMismatch). A commit
-    ///   with no binding, or with an empty list, passes.
+    /// # Commit walk
     ///
-    /// The push then reads commit objects alone. With `depth` `None`, it
-    /// reads the parent chain of each source commit to the root. With
-    /// `Some(n)`, it reads `n` parents, and with `Some(-1)` the whole chain.
+    /// After the checks, the push reads only commit objects:
+    ///
+    /// - If `depth` is `None`, it reads the parent chain of each source
+    ///   commit to the root.
+    /// - If `depth` is `Some(n)`, it reads `n` parents.
+    /// - If `depth` is `Some(-1)`, it reads the whole chain.
+    ///
     /// Each chain stops at the first commit that the local repository does
     /// not hold. It also stops at the first commit that the local repository
-    /// marks partial. With `Some(n)`, the chain stops before that commit.
-    /// With `None`, that commit is the last commit of the chain, and the push
-    /// does not walk its tree.
+    /// marks partial. If `depth` is `Some`, the chain stops before that
+    /// commit. If `depth` is `None`, that commit is the last commit of the
+    /// chain, and the push does not walk its tree.
     ///
-    /// The session opens with the `DST` of each refspec, in order. The push
-    /// then checks the `ostree.collection-binding` of each source commit.
-    /// When the server has a collection id and a binding differs from it, the
-    /// push sends no object. It ends the session with `Abort` and fails with
-    /// [`Error::Push`] with
-    /// [`BindingMismatch`](crate::push::Error::BindingMismatch).
+    /// # Negotiation
     ///
-    /// With `depth` `None`, each chain is cut at the server tip of its `DST`,
-    /// the tip excluded. A chain that does not hold the tip keeps the source
-    /// commit alone. So does a chain whose `DST` the server does not hold.
-    /// The server then decides whether the update is a fast-forward.
+    /// The session opens with the `DST` of each refspec, in order. Then the
+    /// push checks the `ostree.collection-binding` of each source commit. If
+    /// the server has a collection id and a binding differs from it, the push
+    /// sends no object. It ends the session with `Abort`.
     ///
-    /// The negotiation runs commits first. The first `Have` round offers the
-    /// commits. The push then walks the tree of each source commit, also
-    /// when the server holds that commit. It walks the tree of each history
-    /// commit that the server lacks, and not the tree of a history commit
-    /// that the server holds. A dirtree or a dirmeta that the local
-    /// repository lacks ends the session with `Abort`. The push then fails
-    /// with [`Error::ObjectNotFound`]. The second `Have` round offers the
-    /// tree objects. The push sends the objects that the server lacks. It
-    /// also sends the detached metadata of each commit that it sends and of
-    /// each source commit, after
-    /// [`detached_metadata_filter`](RepoPushOptions::detached_metadata_filter).
+    /// If `depth` is `None`, the push cuts each chain at the server tip of
+    /// its `DST`, the tip excluded. If the chain does not hold the tip, the
+    /// push keeps the source commit alone. It also keeps the source commit
+    /// alone if the server does not hold the `DST`. The server then decides
+    /// if the update is a fast-forward.
+    ///
+    /// The negotiation offers the commits first, in the first `Have` round.
+    /// Then the push walks the tree of each source commit, also when the
+    /// server holds that commit. It also walks the tree of each history
+    /// commit that the server lacks. It does not walk the tree of a history
+    /// commit that the server holds.
+    ///
+    /// If the local repository lacks a dirtree or a dirmeta, the push ends
+    /// the session with `Abort`. The second `Have` round offers the tree
+    /// objects. The push sends the objects that the server lacks.
+    ///
+    /// The push also sends the detached metadata of each commit that it sends
+    /// and of each source commit. The metadata passes
+    /// [`detached_metadata_filter`](RepoPushOptions::detached_metadata_filter)
+    /// first.
+    ///
+    /// # Ref updates
     ///
     /// Each ref update expects the state that the server reported when the
-    /// session opened: the commit of the ref, or no ref. With `force`, each
-    /// update expects any state. A refspec `:DST` is an update with no new
-    /// commit. A push whose refspecs are all deletes offers and sends no
-    /// object.
+    /// session opened: the commit of the ref, or no ref. If `force` is
+    /// `true`, each update expects any state. A refspec `:DST` is an update
+    /// with no new commit. If all the refspecs are deletes, the push offers
+    /// and sends no object.
     ///
-    /// A failure of the push after the session opened and before `Commit`
-    /// ends the session and returns that failure. The push writes `Abort`
-    /// when the stream is still usable. A refusal of the server is
-    /// [`Error::Push`] with the error of the server.
+    /// # Failure
+    ///
+    /// If the push fails after the session opened and before `Commit`, it
+    /// ends the session and returns that failure. It writes `Abort` if the
+    /// stream is still usable.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+    ///   if `depth` is less than `-1`.
+    /// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+    ///   if `refspecs` is empty, or if a refspec is empty, is `:`, or names an
+    ///   empty `DST`.
+    /// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+    ///   if a `SRC` with a `^` suffix or a checksum `SRC` has no `DST`, or if
+    ///   two refspecs name the same `DST`.
+    /// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+    ///   if the local repository marks a source commit partial.
+    /// - [`Error::InvalidRefspec`] with the `DST` if
+    ///   [`validate_refspec`](crate::validate_refspec) refuses a `DST`, or if
+    ///   a `DST` holds a `^`. A `DST` of 64 lowercase hex characters that takes
+    ///   a commit also gives this error. A delete (`:DST`) of such a `DST`
+    ///   passes.
+    /// - [`Error::RefNotFound`], [`Error::AmbiguousRefspec`],
+    ///   [`Error::NoParentCommit`], or another error of
+    ///   [`resolve_rev`](Repo::resolve_rev) if a `SRC` does not resolve.
+    /// - [`Error::Push`] with
+    ///   [`BindingMismatch`](crate::push::Error::BindingMismatch) if the
+    ///   `ostree.ref-binding` of a source commit is a list that does not hold
+    ///   its `DST`. A commit with no binding, or with an empty list, passes.
+    /// - [`Error::Push`] with
+    ///   [`BindingMismatch`](crate::push::Error::BindingMismatch) if the
+    ///   `ostree.collection-binding` of a source commit differs from the
+    ///   collection id of the server.
+    /// - [`Error::ObjectNotFound`] if the local repository lacks a source
+    ///   commit, or a dirtree or a dirmeta of a tree that the push walks.
+    /// - [`Error::LockTimeout`] if the wait for the lock passes
+    ///   `[core] lock-timeout-secs`.
+    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is less than
+    ///   `-1`.
+    /// - [`Error::Core`] if `[core] locking` is not a boolean or
+    ///   `[core] lock-timeout-secs` is not an integer, or if a commit or a
+    ///   dirtree object does not parse.
+    /// - [`Error::Io`] if a read from the file system fails, or if a metadata
+    ///   object is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::Push`] with the error of the server if the server refuses
+    ///   the session, an object, or a ref update.
+    /// - [`Error::Push`] with the error of the session if the stream or the
+    ///   protocol fails. If the reply to `Commit` is lost, the error is
+    ///   [`CommitOutcomeUnknown`](crate::push::Error::CommitOutcomeUnknown).
+    /// - [`Error::Push`] with [`Source`](crate::push::Error::Source) if a
+    ///   read of the local repository fails while the session sends objects.
     pub async fn push_over_stream<R, W>(
         &self,
         input: R,
@@ -211,8 +305,8 @@ impl Repo {
         plan.run(session, &opts).await
     }
 
-    /// The refusals and the commit walk of a push, under the repository lock
-    /// held shared.
+    /// Runs the refusals and the commit walk of a push, under the repository
+    /// lock held shared.
     async fn plan_push(&self, opts: &RepoPushOptions) -> Result<Plan> {
         if let Some(depth) = opts.depth
             && depth < -1
@@ -300,8 +394,10 @@ impl Repo {
         })
     }
 
-    /// The history commit `checksum`, read once. One blocking call reads
-    /// the object and the partial marker, and parses the link of the commit.
+    /// Returns the local state of the history commit `checksum`, read once.
+    ///
+    /// One blocking call reads the object and the partial marker, and parses
+    /// the link of the commit.
     async fn history_commit(
         &self,
         checksum: &Checksum,
@@ -329,7 +425,7 @@ impl Repo {
     }
 }
 
-/// The options of the session of a push.
+/// Returns the options of the session of a push.
 fn session_options(opts: &RepoPushOptions) -> SessionOptions {
     SessionOptions {
         progress: opts.progress.clone(),
@@ -337,9 +433,11 @@ fn session_options(opts: &RepoPushOptions) -> SessionOptions {
     }
 }
 
-/// Refuse a commit whose `ostree.ref-binding` is a list that does not hold
-/// `dst`, the `REMOTE:` part of a remote ref left out. A commit with no
-/// binding, or with an empty list, passes, as on the server.
+/// Refuses a commit whose `ostree.ref-binding` is a list that does not hold
+/// `dst`.
+///
+/// The check compares `dst` without the `REMOTE:` part of a remote ref. A
+/// commit with no binding, or with an empty list, passes, as on the server.
 pub(super) fn check_ref_binding(checksum: &Checksum, commit: &Commit, dst: &str) -> Result<()> {
     let bindings = commit.ref_bindings();
     let bare = dst.split_once(':').map_or(dst, |(_, bare)| bare);
@@ -352,8 +450,10 @@ pub(super) fn check_ref_binding(checksum: &Checksum, commit: &Commit, dst: &str)
 }
 
 impl Plan {
-    /// Run the push over `session`. A failure before `Commit` ends the
-    /// session, with `Abort` when the stream is still usable.
+    /// Runs the push over `session`.
+    ///
+    /// If the push fails before `Commit`, the run ends the session. It writes
+    /// `Abort` if the stream is still usable.
     async fn run(mut self, session: PushSession, opts: &RepoPushOptions) -> Result<PushOutcome> {
         match self.negotiate(&session, opts).await {
             Ok(updates) => Ok(session.commit(&updates, opts.force).await?),
@@ -364,8 +464,10 @@ impl Plan {
         }
     }
 
-    /// The checks after `HelloReply`, the two `Have` rounds, and the upload.
-    /// The result is the ref updates of `Commit`.
+    /// Runs the checks after `HelloReply`, the two `Have` rounds, and the
+    /// upload.
+    ///
+    /// Returns the ref updates of `Commit`.
     async fn negotiate(
         &mut self,
         session: &PushSession,
@@ -384,8 +486,8 @@ impl Plan {
             }
         }
 
-        // The commits to offer: each source commit and its chain, cut at the
-        // server tip when no depth is set.
+        // The commits to offer: each source commit and its chain. If no depth
+        // is set, the chain is cut at the server tip.
         let chains = std::mem::take(&mut self.chains);
         let mut offered: HashSet<Checksum> = HashSet::new();
         let mut names = Vec::new();

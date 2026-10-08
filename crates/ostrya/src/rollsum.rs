@@ -1,78 +1,91 @@
-//! Content-defined chunking and the copy plan a rollsum delta is built from.
+//! Content-defined chunking and the copy plan of a rollsum delta.
 //!
-//! A static delta expresses a modified object as a sequence of runs: runs the
-//! receiver copies out of the source object it already has, and runs the delta
-//! carries as payload. Finding those runs is what this module does. Both
-//! objects are cut into content-defined chunks by a rolling hash, the source's
-//! chunks are indexed by content digest, and the target's chunks are matched
-//! against that index. Chunk boundaries follow content rather than position, so
-//! an insertion or deletion shifts only the chunks it touches and every chunk
-//! after the edit still matches.
+//! A static delta writes a changed object as a sequence of runs. The receiver
+//! copies a copy run out of the source object that it already holds. The delta
+//! carries a payload run as data. This module finds those runs.
 //!
-//! The chunker's parameters are this port's own: they decide how large the
-//! resulting delta is, not whether it is valid, and the receiver never sees
-//! them. What the receiver sees is the operation stream the plan turns into
-//! (`format-reference.md`, "Static delta wire format"): a copy run becomes an
-//! `r`/`w`/`R` group naming the source object, and a payload run becomes a `w`
-//! reading the part's own data source. Runs are therefore emitted in target
-//! order and cover the target exactly once.
+//! A rolling hash cuts both objects into content-defined chunks. An index maps
+//! the content digest of each source chunk to its offsets. The planner looks
+//! up each target chunk in that index. The content sets the chunk boundaries,
+//! so an insertion or a deletion moves only the chunks that it touches. Each
+//! chunk after the edit still matches.
+//!
+//! The chunk parameters belong to ostrya alone. They set the size of the
+//! delta. A delta is valid with any values of these parameters. The receiver
+//! never sees them. The receiver sees the operation stream that the plan
+//! becomes:
+//!
+//! - A copy run becomes an `r`/`w`/`R` group that names the source object.
+//! - A payload run becomes a `w` that reads the data source of the part.
+//!
+//! The plan emits the runs in target order, and the runs cover the target
+//! exactly once, because the operation stream needs this order.
 
 use std::collections::HashMap;
 
-/// The rolling-hash window. Every byte in the window contributes to the hash,
-/// so a match resynchronizes within one window of an edit.
+/// The size of the rolling-hash window, in bytes.
+///
+/// Each byte in the window is part of the hash, so a match resynchronizes
+/// within one window of an edit.
 const WINDOW: usize = 64;
 
-/// A chunk boundary falls where the low [`MASK_BITS`] bits of the rolling hash
-/// are all set, giving an average chunk of `2^MASK_BITS` bytes.
+/// The number of low hash bits that mark a chunk boundary.
+///
+/// A chunk boundary falls where the low `MASK_BITS` bits of the rolling hash
+/// are all set. The average chunk is `2^MASK_BITS` bytes.
 const MASK_BITS: u32 = 13;
 const MASK: u32 = (1 << MASK_BITS) - 1;
 
-/// The smallest chunk a boundary may close, so a run of boundary-triggering
-/// bytes cannot produce a long tail of tiny chunks.
+/// The smallest chunk that a boundary can close, in bytes.
+///
+/// Without this limit, a run of bytes that trigger boundaries can cut a long
+/// tail of tiny chunks.
 const MIN_CHUNK: usize = 2 * 1024;
 
-/// The largest chunk emitted; a stretch of content with no boundary is cut
-/// here, bounding the work a single mismatch can cost. It is also the size below
-/// which an object is too few chunks for a failed match to say anything about
-/// how related the two objects are, which is what bounds the bsdiff attempt in
-/// [`crate::deltagen`].
+/// The largest chunk, in bytes.
+///
+/// If a stretch of content has no boundary, the chunker cuts it at this size.
+/// This limit bounds the work that one mismatch costs. An object smaller than
+/// this size has too few chunks for a failed match to show how related the two
+/// objects are. `deltagen` uses this size as the bound of its bsdiff attempt.
 pub(crate) const MAX_CHUNK: usize = 64 * 1024;
 
-/// One run of a copy plan: bytes of the target that either come from the source
-/// object or are carried in the delta.
+/// One run of a copy plan.
+///
+/// A run is a range of target bytes. The bytes come from the source object or
+/// from the payload of the delta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Run {
-    /// Copy `length` bytes from `source_offset` in the source object.
+    /// A copy of `length` bytes at `source_offset` in the source object.
     Copy { source_offset: u64, length: u64 },
-    /// Take `length` bytes at `target_offset` from the target's own content.
+    /// The `length` bytes at `target_offset` in the target, carried as payload.
     Payload { target_offset: u64, length: u64 },
 }
 
-/// A copy plan: the runs that reconstruct the target, in target order.
+/// A copy plan: the runs that rebuild the target, in target order.
 #[derive(Debug, Default)]
 pub(crate) struct Plan {
     pub(crate) runs: Vec<Run>,
-    /// The number of target bytes covered by [`Run::Copy`] runs.
+    /// The number of target bytes that `Run::Copy` runs cover.
     pub(crate) copied: u64,
 }
 
-/// Plan the reconstruction of `target` from `source`.
+/// Returns the plan that rebuilds `target` from `source`.
 ///
-/// Chunks of `target` found in `source` become copy runs and the rest becomes
-/// payload runs; adjacent runs of the same kind that are also contiguous in
-/// their source are merged, so a target that differs from its source in one
-/// place yields one copy run, one payload run, and one copy run rather than one
-/// run per chunk.
+/// A chunk of `target` that occurs in `source` becomes a copy run. Each other
+/// chunk becomes a payload run. The plan merges two adjacent runs of the same
+/// kind if they are also contiguous in their source. A target that differs
+/// from its source in one place gives a small number of runs. Typically these
+/// are one copy run, one payload run, and one copy run.
 pub(crate) fn plan(source: &[u8], target: &[u8]) -> Plan {
     let index = index_source(source);
 
     let mut plan = Plan::default();
     for (offset, len) in chunks(target) {
         let chunk = &target[offset..offset + len];
-        // The offset that continues the run in progress. Repetitive content
-        // gives many chunks one digest, so trying this candidate first is what
-        // merges the runs and what stops the scan at its first comparison.
+        // The source offset that continues the current run. Repetitive content
+        // gives many chunks one digest. The scan tries this candidate first, so
+        // the runs merge and the scan stops at its first comparison.
         let contiguous = match plan.runs.last() {
             Some(&Run::Copy {
                 source_offset,
@@ -80,11 +93,11 @@ pub(crate) fn plan(source: &[u8], target: &[u8]) -> Plan {
             }) => Some((source_offset + length) as usize),
             _ => None,
         };
-        // Either path confirms the match by comparing the bytes, so a digest
-        // collision costs one comparison and never produces a wrong run. A copy
-        // run needs no source chunk boundary at its start, so the contiguous
-        // candidate is decided by that comparison alone and neither the digest
-        // nor the index is computed when it wins.
+        // Both paths compare the bytes before they accept a match. A digest
+        // collision costs one comparison and never gives a wrong run. A copy
+        // run needs no source chunk boundary at its start. The byte comparison
+        // alone decides the contiguous candidate. If that candidate wins, the
+        // code computes no digest and does no index lookup.
         let hit = contiguous
             .filter(|off| source[*off..].starts_with(chunk))
             .or_else(|| {
@@ -104,8 +117,10 @@ pub(crate) fn plan(source: &[u8], target: &[u8]) -> Plan {
 }
 
 impl Plan {
-    /// Append a copy run, extending the previous run when it copies the
-    /// immediately preceding source bytes.
+    /// Appends a copy run and adds its length to `copied`.
+    ///
+    /// If the previous run is a copy run that ends at `source_offset`, the
+    /// method extends that run.
     fn push_copy(&mut self, source_offset: u64, length: u64) {
         self.copied += length;
         if let Some(Run::Copy {
@@ -123,8 +138,11 @@ impl Plan {
         });
     }
 
-    /// Append a payload run, extending the previous run when it ends where this
-    /// one begins (which consecutive payload chunks always do).
+    /// Appends a payload run.
+    ///
+    /// If the previous run is a payload run that ends at `target_offset`, the
+    /// method extends that run. Consecutive payload chunks always meet this
+    /// condition.
     fn push_payload(&mut self, target_offset: u64, length: u64) {
         if let Some(Run::Payload {
             target_offset: prev_off,
@@ -142,9 +160,10 @@ impl Plan {
     }
 }
 
-/// Index the source's chunks by content digest, mapping each digest to the
-/// offsets of the chunks that carry it. The index holds one entry per chunk
-/// rather than per byte, so it costs a fraction of the object's size.
+/// Returns an index that maps each chunk digest of `source` to its offsets.
+///
+/// The index holds one entry for each chunk, so its size is a fraction of the
+/// object size.
 fn index_source(source: &[u8]) -> HashMap<u64, Vec<usize>> {
     let mut index: HashMap<u64, Vec<usize>> = HashMap::new();
     for (offset, len) in chunks(source) {
@@ -156,7 +175,7 @@ fn index_source(source: &[u8]) -> HashMap<u64, Vec<usize>> {
     index
 }
 
-/// A 64-bit FNV-1a digest of a chunk's bytes.
+/// Returns the 64-bit FNV-1a digest of the bytes of a chunk.
 fn digest_of(chunk: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for &byte in chunk {
@@ -166,9 +185,9 @@ fn digest_of(chunk: &[u8]) -> u64 {
     hash
 }
 
-/// Cut `data` into content-defined chunks, yielding each chunk's offset and
-/// length. The final chunk ends at the end of the data whether or not a
-/// boundary falls there.
+/// Returns the offset and the length of each content-defined chunk of `data`.
+///
+/// The last chunk ends at the end of `data`, with or without a boundary there.
 fn chunks(data: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
     let mut start = 0usize;
     std::iter::from_fn(move || {
@@ -182,8 +201,13 @@ fn chunks(data: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
     })
 }
 
-/// The length of the chunk beginning at the start of `data`: up to the first
-/// boundary at or past [`MIN_CHUNK`], else [`MAX_CHUNK`], else the rest.
+/// Returns the length of the chunk at the start of `data`.
+///
+/// The chunk ends at the first of these positions:
+///
+/// - the first boundary at or after `MIN_CHUNK` bytes
+/// - `MAX_CHUNK` bytes
+/// - the end of `data`
 fn chunk_len(data: &[u8]) -> usize {
     let mut roll = Rollsum::default();
     let limit = data.len().min(MAX_CHUNK);
@@ -196,9 +220,11 @@ fn chunk_len(data: &[u8]) -> usize {
     limit
 }
 
-/// A rolling sum over the trailing [`WINDOW`] bytes: two accumulators, the
-/// first the sum of the window's bytes and the second the sum of the first,
-/// which makes the hash position-sensitive within the window.
+/// A rolling sum over the last `WINDOW` bytes.
+///
+/// The sum has two accumulators. `a` is the sum of the bytes in the window.
+/// `b` is the sum of the values of `a`, so the hash depends on the position of
+/// each byte in the window.
 struct Rollsum {
     a: u32,
     b: u32,
@@ -216,7 +242,8 @@ impl Default for Rollsum {
 }
 
 impl Rollsum {
-    /// Add the byte at position `pos`, dropping the byte that leaves the window.
+    /// Adds the byte at position `pos` and drops the byte that leaves the
+    /// window.
     fn push(&mut self, byte: u8, pos: usize) {
         let slot = pos % WINDOW;
         let dropped = self.window[slot];
@@ -231,7 +258,7 @@ impl Rollsum {
             .wrapping_sub(WINDOW as u32 * u32::from(dropped));
     }
 
-    /// Whether the hash marks a chunk boundary.
+    /// Returns `true` if the hash marks a chunk boundary.
     fn at_boundary(&self) -> bool {
         self.b & MASK == MASK
     }
@@ -241,7 +268,8 @@ impl Rollsum {
 mod tests {
     use super::*;
 
-    /// Deterministic pseudo-random bytes; a fixed seed keeps the tests stable.
+    /// Returns deterministic pseudo-random bytes. A fixed seed keeps the tests
+    /// stable.
     fn data(len: usize, seed: u64) -> Vec<u8> {
         let mut x = seed | 1;
         (0..len)
@@ -254,8 +282,8 @@ mod tests {
             .collect()
     }
 
-    /// Apply a plan against the source and the target's own bytes; the result
-    /// must be the target. This is the property the operation stream relies on.
+    /// Applies a plan to the source and to the bytes of the target. The result
+    /// must be the target. The operation stream depends on this property.
     fn reconstruct(plan: &Plan, source: &[u8], target: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         for run in &plan.runs {
@@ -315,8 +343,8 @@ mod tests {
 
         let plan = plan(&source, &target);
         assert_eq!(reconstruct(&plan, &source, &target), target);
-        // Most of the object is copied, and the edit costs a bounded number of
-        // runs rather than one per chunk.
+        // The plan copies most of the object. The plan has at most 5 runs, so
+        // the edit costs a bounded number of runs.
         assert!(plan.copied > 300_000, "copied only {}", plan.copied);
         assert!(plan.runs.len() <= 5, "runs: {:?}", plan.runs);
     }
@@ -335,10 +363,10 @@ mod tests {
 
     #[test]
     fn repetitive_content_plans_one_copy_run() {
-        // All-zero content never triggers a boundary, so every chunk is
-        // MAX_CHUNK long and they all carry the same digest. The candidate that
-        // continues the previous run has to win for the runs to merge, and for
-        // the candidate scan to stop at its first comparison.
+        // All-zero content never gives a boundary, so each chunk is
+        // `MAX_CHUNK` bytes long. All chunks have the same digest. The runs
+        // merge only if the candidate that continues the previous run wins.
+        // That win also stops the candidate scan at its first comparison.
         let bytes = vec![0u8; 16 * MAX_CHUNK];
         let plan = plan(&bytes, &bytes);
         assert_eq!(reconstruct(&plan, &bytes, &bytes), bytes);
@@ -354,11 +382,11 @@ mod tests {
 
     #[test]
     fn a_contiguous_continuation_copies_without_a_digest_match() {
-        // A target that ends inside a source chunk cuts its last chunk short, so
-        // that chunk carries a digest the index does not hold. The offset that
-        // continues the run in progress holds those bytes, and the byte
-        // comparison alone is what makes them a copy: a copy run does not have
-        // to begin on a source chunk boundary.
+        // The target ends inside a source chunk, so its last chunk is short.
+        // The index does not hold the digest of that chunk. The offset that
+        // continues the current run holds those bytes. The byte comparison
+        // alone makes them a copy, because a copy run needs no source chunk
+        // boundary at its start.
         let source = data(300_000, 41);
         let target = &source[..source.len() - 1];
 
@@ -382,8 +410,9 @@ mod tests {
 
     #[test]
     fn a_zero_padded_tail_survives_an_edit_before_it() {
-        // A binary with a zero-padded tail: the edit resynchronizes in the
-        // random part and the repetitive tail still plans as copies.
+        // A binary with a zero-padded tail. The edit is in the random part,
+        // and the match resynchronizes after it. The plan still copies the
+        // repetitive tail.
         let mut source = data(200_000, 37);
         source.resize(200_000 + 8 * MAX_CHUNK, 0);
         let mut target = source.clone();

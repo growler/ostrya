@@ -1,10 +1,14 @@
-//! Transaction and locking integration tests.
+//! Integration tests of transactions and of the repository lock.
 //!
-//! These exercise the transaction lifecycle against real repositories: staging
-//! directory allocation and teardown, reaping of stale staging directories,
-//! concurrent transactions in one process, drop-based auto-abort, and
-//! cross-process lock contention (the last driven by re-executing this test
-//! binary as a lock holder).
+//! The tests run transactions on real repositories. They cover:
+//!
+//! - the creation and the removal of the staging directory
+//! - the reap of stale staging directories and of aged `tmp/` entries
+//! - concurrent transactions in one process
+//! - the automatic abort of a transaction that is dropped
+//! - lock contention between two processes (this test binary runs again as
+//!   the lock holder)
+//! - the public `Transaction::write_dirmeta` and `loose_path`
 
 mod common;
 
@@ -21,7 +25,7 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// The staging directory names present under `<repo>/tmp`.
+/// Returns the names of the staging directories under `<repo>/tmp`.
 fn staging_dirs(repo: &Path) -> Vec<String> {
     let tmp = repo.join("tmp");
     let mut dirs = Vec::new();
@@ -135,9 +139,10 @@ fn concurrent_shared_transactions_get_distinct_staging_dirs() {
 fn concurrent_transactions_keep_their_staging_dirs() {
     let (_dir, repo_path) = new_repo("txn-stress");
 
-    // tmp-expiry-secs=0 makes the reaper treat a lockless staging directory as
-    // immediately expired, the setting under which a concurrently starting
-    // transaction was able to reap a live transaction's directory.
+    // With `tmp-expiry-secs=0`, the reaper treats a staging directory without
+    // a lock as expired at once. If the staging creation has a race, this
+    // setting lets a transaction that starts at the same time reap the staging
+    // directory of a live transaction.
     let config = repo_path.join("config");
     let mut text = std::fs::read_to_string(&config).unwrap();
     text.push_str("tmp-expiry-secs=0\n");
@@ -149,10 +154,10 @@ fn concurrent_transactions_keep_their_staging_dirs() {
     let repo = block_on(Repo::open(&repo_path)).unwrap();
 
     for round in 0..ROUNDS {
-        // `start` releases all workers into `transaction()` together so their
-        // staging creation overlaps. `created` gates the count until every
-        // transaction is live; `release` holds them live until the count is
-        // taken.
+        // `start` releases all workers into `transaction()` at the same time,
+        // so the creation of their staging directories overlaps. `created`
+        // holds the count until every transaction is live. `release` keeps the
+        // transactions live until the count is done.
         let start = Arc::new(Barrier::new(WORKERS));
         let created = Arc::new(Barrier::new(WORKERS + 1));
         let release = Arc::new(Barrier::new(WORKERS + 1));
@@ -194,9 +199,9 @@ fn a_transaction_reaps_a_stale_staging_dir() {
     let (_dir, repo_path) = new_repo("txn-reap");
     let tmp = repo_path.join("tmp");
 
-    // Fabricate a leftover staging directory with an unheld sibling lock, as a
-    // crashed transaction would leave behind. It is non-empty, so reaping it
-    // exercises the recursive removal.
+    // Make a leftover staging directory with a sibling lock that no process
+    // holds. A transaction that crashes leaves this pair. The directory is not
+    // empty, so its reap tests the recursive removal.
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
     let stale = format!("staging-{}-STALE0", boot.trim());
     let stale_dir = tmp.join(&stale);
@@ -217,8 +222,8 @@ fn a_transaction_reaps_a_stale_staging_dir() {
     });
 }
 
-/// Set the mtime of `path` to `epoch` seconds, on a symlink itself and not on
-/// its target.
+/// Sets the mtime of `path` to `epoch` seconds. On a symlink, it sets the mtime
+/// of the link itself (`touch -h`).
 fn stamp(path: &Path, epoch: i64) {
     let status = Command::new("touch")
         .arg("-h")
@@ -230,7 +235,7 @@ fn stamp(path: &Path, epoch: i64) {
     assert!(status.success(), "touch could not stamp {}", path.display());
 }
 
-/// The sorted names of the top-level entries of `dir`.
+/// Returns the sorted names of the top-level entries of `dir`.
 fn listing(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -240,7 +245,8 @@ fn listing(dir: &Path) -> Vec<String> {
     names
 }
 
-/// 2020-01-01T00:00:00Z, far past the default `tmp-expiry-secs`.
+/// The time 2020-01-01T00:00:00Z. Its age is much more than the default
+/// `tmp-expiry-secs`.
 const OLD: i64 = 1_577_836_800;
 
 #[test]
@@ -252,12 +258,12 @@ fn a_transaction_reaps_aged_tmp_entries() {
     std::fs::write(outside.join("keep"), b"k").unwrap();
     stamp(&outside, OLD);
 
-    // Entries past the expiry window, each of which the reap removes.
+    // Entries older than the expiry window. The reap removes each of them.
     std::fs::write(tmp.join("oldfile"), b"o").unwrap();
     stamp(&tmp.join("oldfile"), OLD);
     std::fs::write(tmp.join(".tmp-old"), b"o").unwrap();
     stamp(&tmp.join(".tmp-old"), OLD);
-    // The temp entries of a ref write and of a detached-metadata write.
+    // The temporary entries of a ref write and of a detached-metadata write.
     for name in [".ostrya-ref-1-1-aBc123", ".ostrya-meta-1-1-aBc123"] {
         std::fs::write(tmp.join(name), b"o").unwrap();
         stamp(&tmp.join(name), OLD);
@@ -270,16 +276,16 @@ fn a_transaction_reaps_aged_tmp_entries() {
         .unwrap();
     assert!(fifo.success(), "mkfifo failed");
     stamp(&tmp.join("oldfifo"), OLD);
-    // A directory is judged by its own mtime alone: a fresh child inside an
-    // old directory does not keep it.
+    // The reap checks a directory by its own mtime alone. A new child in an
+    // old directory does not keep the directory.
     std::fs::create_dir_all(tmp.join("olddir/sub")).unwrap();
     std::fs::write(tmp.join("olddir/sub/fresh"), b"n").unwrap();
     stamp(&tmp.join("olddir"), OLD);
-    // A symlink is removed as the link, and its target stays.
+    // The reap removes a symlink as a link. The target of the link stays.
     std::os::unix::fs::symlink(&outside, tmp.join("oldlink")).unwrap();
     stamp(&tmp.join("oldlink"), OLD);
 
-    // Entries the reap keeps.
+    // Entries that the reap keeps.
     std::fs::write(tmp.join("newfile"), b"n").unwrap();
     std::fs::write(tmp.join(".ostrya-ref-2-2-aBc123"), b"n").unwrap();
     std::fs::write(tmp.join(".ostrya-meta-2-2-aBc123"), b"n").unwrap();
@@ -289,14 +295,15 @@ fn a_transaction_reaps_aged_tmp_entries() {
     std::fs::write(tmp.join("cache/oldentry"), b"o").unwrap();
     stamp(&tmp.join("cache/oldentry"), OLD);
     stamp(&tmp.join("cache"), OLD);
-    // A staging lock file is exempt from the age test.
+    // The age check does not apply to a staging lock file.
     std::fs::write(tmp.join("staging-orphan-lock"), b"").unwrap();
     stamp(&tmp.join("staging-orphan-lock"), OLD);
 
     block_on(async {
         let repo = Repo::open(&repo_path).await.unwrap();
         let txn = repo.transaction().await.unwrap();
-        // The live transaction's own staging pair is not part of the claim.
+        // The assertion ignores the staging directory and the lock of the
+        // live transaction.
         let own: Vec<String> = staging_dirs(&repo_path)
             .into_iter()
             .flat_map(|n| [format!("{n}-lock"), n])
@@ -386,13 +393,14 @@ fn an_aged_lock_of_a_live_transaction_is_kept() {
 fn cross_process_lock_contention() {
     let (_dir, repo_path) = new_repo("txn-xproc");
 
-    // Shorten the lock timeout so the contended acquire fails within a second.
+    // Set a lock timeout of one second, so the contended acquire fails after
+    // one second.
     let config = repo_path.join("config");
     let mut text = std::fs::read_to_string(&config).unwrap();
     text.push_str("lock-timeout-secs=1\n");
     std::fs::write(&config, text).unwrap();
 
-    // Re-execute this test binary as an exclusive-lock holder.
+    // Run this test binary again as the holder of the exclusive lock.
     let held_marker = repo_path.join(".held");
     let _ = std::fs::remove_file(&held_marker);
     let mut holder = Command::new(std::env::current_exe().unwrap())
@@ -420,7 +428,8 @@ fn cross_process_lock_contention() {
     }
     assert!(ready, "the holder never acquired the lock");
 
-    // While the holder has the exclusive lock, our shared acquire must time out.
+    // While the holder has the exclusive lock, the shared acquire of this
+    // process must time out.
     let contended = block_on(async {
         let repo = Repo::open(&repo_path).await.unwrap();
         repo.transaction().await
@@ -431,7 +440,7 @@ fn cross_process_lock_contention() {
         "the contended acquire should report a lock timeout"
     );
 
-    // Once the holder releases, acquisition succeeds.
+    // After the holder releases the lock, the acquire succeeds.
     holder.wait().expect("holder exits");
     let after = block_on(async {
         let repo = Repo::open(&repo_path).await.unwrap();
@@ -444,9 +453,12 @@ fn cross_process_lock_contention() {
     );
 }
 
-/// The lock-holder half of [`cross_process_lock_contention`], run only when this
-/// test binary is re-executed with the environment set. It takes the exclusive
-/// repository lock, signals readiness, holds it briefly, then releases.
+/// Holds the repository lock for [`cross_process_lock_contention`].
+///
+/// The test runs only when this test binary runs again with `OSTRYA_HOLD_REPO`
+/// set. It takes the exclusive repository lock and writes the readiness marker
+/// `.held`. Then it holds the lock for `OSTRYA_HOLD_MS` milliseconds (3000 by
+/// default) and releases it.
 #[test]
 #[ignore = "helper process for cross_process_lock_contention"]
 fn lock_holder_subprocess() {
@@ -470,22 +482,26 @@ fn lock_holder_subprocess() {
     });
 }
 
-/// `Transaction::write_dirmeta` and `loose_path` reach a consumer through the
-/// `ostrya` crate alone, and the pair locates the object a dirmeta write leaves
-/// in `objects/`.
+/// Checks that `Transaction::write_dirmeta` and `loose_path` are public.
 ///
-/// The two modes name one directory by two checksums: `bare` records the
-/// ownership, the mode, and the xattrs `meta` states, and `bare-user-only`
-/// records the canonical form of the same directory. The object's identity
-/// covers the form the mode records, which is what this method holds for a
-/// caller assembling a tree.
+/// A consumer reaches the pair through the `ostrya` crate alone. The pair
+/// locates the object that a dirmeta write leaves in `objects/`.
+///
+/// The two modes name one directory by two checksums. `bare` records the
+/// ownership, the mode, and the xattrs that `meta` states. `bare-user-only`
+/// records the canonical form of the same directory. The identity of the
+/// object covers the form that the mode records, and the method returns this
+/// identity to a caller that assembles a tree.
 #[test]
 fn write_dirmeta_and_loose_path_are_public() {
     let dir = TmpDir::new("public-dirmeta");
 
-    // A directory whose every canonicalized field carries something to lose:
-    // a non-zero owner, an xattr, and permission bits outside the 0o755 a
-    // `bare-user-only` repository keeps.
+    // In this directory, each field that the canonical form changes holds a
+    // value that the canonical form drops:
+    // - an owner that is not zero
+    // - an xattr
+    // - permission bits outside the 0o755 that a `bare-user-only` repository
+    //   keeps
     let meta = DirMeta {
         uid: 1000,
         gid: 1000,
@@ -532,8 +548,8 @@ fn write_dirmeta_and_loose_path_are_public() {
         "the two modes record the directory under different identities"
     );
 
-    // The `bare-user-only` write of the stated form reaches the identity of the
-    // canonical form, which is the checksum the mode records.
+    // A `bare-user-only` write of the stated form gets the identity of the
+    // canonical form. This identity is the checksum that the mode records.
     let repo_path = dir.path().join("repo-canonical");
     let recorded = block_on(async {
         Repo::create(&repo_path, CreateOptions::new(RepoMode::BareUserOnly))

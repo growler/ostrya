@@ -1,35 +1,39 @@
-//! The concurrency driver an HTTP pull runs its work on.
+//! The concurrency driver of a pull from a remote.
 //!
-//! A pull holds a fixed number of slots, each a future that fetches one object
-//! and stores it. The loop that owns them refills every free slot from the plan
-//! and then waits for whichever slot finishes first, so the plan and the
-//! seen-sets are touched by one task and need no lock.
+//! A pull holds a fixed number of slots. Each slot is a future that fetches one
+//! object and stores it. The loop that owns the slots fills each free slot from
+//! the plan. Then it waits for the first slot that finishes.
 //!
-//! [`Slots`] is that set. It is not an executor: nothing is spawned, and the
-//! futures it holds borrow the repository, the transaction, and the fetcher, so
-//! they need no `'static` bound and no `Arc`. Every pending slot registers the
-//! caller's waker, so any socket or blocking-pool wakeup re-polls the loop.
+//! One task reads and writes the plan and the seen-sets, so they need no lock.
 //!
-//! Cancellation follows from that ownership: an error returned from the loop
-//! drops `Slots`, which drops every future still in flight, which closes their
-//! connections and releases their permits. Nothing outlives the call.
+//! [`Slots`] is that set of slots. It spawns no task. Its futures borrow the
+//! repository, the transaction, and the fetcher, so they need no `'static`
+//! bound and no `Arc`. Each pending slot registers the waker of the caller, so
+//! a wakeup from a socket or from the blocking pool polls the loop again.
+//!
+//! Cancellation comes from this ownership. If the loop returns an error, it
+//! drops `Slots` and each future that is still in flight. A dropped future
+//! closes its connections and releases its permits. No future lives after the
+//! call.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-/// One slot: a boxed future producing a step's outcome.
+/// One slot: a boxed future that produces the outcome of one step.
 type Slot<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// A bounded set of in-flight futures, polled together.
+/// A bounded set of futures in flight that one call polls together.
 pub(crate) struct Slots<'a, T> {
     slots: Vec<Slot<'a, T>>,
     limit: usize,
 }
 
 impl<'a, T> Slots<'a, T> {
-    /// A set holding at most `limit` futures at a time. A limit of zero is
-    /// raised to one, since a set that admits nothing never makes progress.
+    /// Creates a set that holds at most `limit` futures at a time.
+    ///
+    /// A limit of zero becomes one, because a set that admits no future never
+    /// makes progress.
     pub(crate) fn new(limit: usize) -> Slots<'a, T> {
         let limit = limit.max(1);
         Slots {
@@ -38,43 +42,49 @@ impl<'a, T> Slots<'a, T> {
         }
     }
 
-    /// Whether another future fits.
+    /// Returns `true` if one more future fits in the set.
     pub(crate) fn has_room(&self) -> bool {
         self.slots.len() < self.limit
     }
 
-    /// Take a future into a free slot. The caller checks [`has_room`](Slots::has_room)
-    /// first; pushing past the limit only grows the set.
+    /// Puts a future into a free slot.
+    ///
+    /// The caller checks [`has_room`](Slots::has_room) first. If the set is
+    /// full, `push` adds the future and the set grows past the limit.
     pub(crate) fn push(&mut self, future: impl Future<Output = T> + Send + 'a) {
         self.slots.push(Box::pin(future));
     }
 
-    /// How many futures are in flight.
+    /// Returns the number of futures in flight.
     #[cfg(test)]
     fn len(&self) -> usize {
         self.slots.len()
     }
 
-    /// Wait for the first slot to finish and remove it, or `None` when the set
-    /// is empty.
+    /// Waits for the first slot to finish, removes it, and returns its output.
     ///
-    /// The order is the poll order, not the completion order: when several
-    /// slots are ready at once the earliest in the set is taken and the rest
-    /// stay ready for the next call.
+    /// If the set is empty, it returns `None` at once.
+    ///
+    /// The order is the poll order. If more than one slot is ready, the call
+    /// takes the first ready slot in the set. The other ready slots stay ready
+    /// for the next call.
     pub(crate) async fn next_ready(&mut self) -> Option<T> {
         if self.slots.is_empty() {
             return None;
         }
         let (index, output) = PollAll(&mut self.slots).await;
-        // The last slot moves into the hole, which reorders the set. Nothing
-        // reads a slot by position between calls, so the order is free.
+        // The last slot moves into the empty position, so the order of the set
+        // changes. No code reads a slot by its position between calls, so any
+        // order is correct.
         drop(self.slots.swap_remove(index));
         Some(output)
     }
 }
 
-/// Polls every slot in turn and resolves to the first that is ready, with its
+/// A future that resolves to the output of the first ready slot and its
 /// position in the set.
+///
+/// It polls each slot in turn, in the order of the set.
 struct PollAll<'s, 'a, T>(&'s mut Vec<Slot<'a, T>>);
 
 impl<T> Future for PollAll<'_, '_, T> {
@@ -86,8 +96,8 @@ impl<T> Future for PollAll<'_, '_, T> {
                 return Poll::Ready((index, output));
             }
         }
-        // Every slot that answered `Pending` registered this waker, so any one
-        // of them making progress re-polls the whole set.
+        // Each slot that returned `Pending` registered this waker, so progress
+        // in any one slot polls the whole set again.
         Poll::Pending
     }
 }
@@ -100,8 +110,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A future that resolves once the shared gate reaches its release value,
-    /// which lets a test decide the order slots finish in.
+    /// A future that resolves when the shared gate reaches its release value.
+    /// A test uses it to set the order in which the slots finish.
     struct Gated {
         gate: Arc<AtomicUsize>,
         release: usize,
@@ -120,8 +130,9 @@ mod tests {
         }
     }
 
-    /// The loop shape a pull runs: refill every free slot from the work list,
-    /// then take whichever finishes first, until both are empty.
+    /// The loop of a pull fills each free slot from the work list. Then it takes
+    /// the first slot that finishes. It stops when the list and the set are
+    /// both empty.
     #[test]
     fn slots_refill_from_the_plan_up_to_the_limit() {
         block_on(async {
@@ -142,15 +153,16 @@ mod tests {
                 };
                 done.push(output);
             }
-            // Every item ran, and no more than the limit was ever in flight.
+            // Each item ran, and the number of futures in flight never passed
+            // the limit.
             done.sort_unstable();
             assert_eq!(done, (0..7).collect::<Vec<_>>());
             assert_eq!(high_water, 3);
         });
     }
 
-    /// A slot that is ready is taken while the others stay pending, so the loop
-    /// is driven by completion and not by the order work was pushed.
+    /// The set returns a ready slot while the other slots stay pending, so the
+    /// completion order drives the loop. The push order has no effect on it.
     #[test]
     fn the_first_ready_slot_is_the_one_returned() {
         block_on(async {
@@ -173,14 +185,14 @@ mod tests {
         });
     }
 
-    /// A pull that fails returns from the loop, which drops the set and with it
-    /// every future still in flight -- the connections they hold and the permits
-    /// they took go with them.
+    /// If a pull fails, it returns from the loop and drops the set. This drops
+    /// each future that is still in flight, with the connections and the
+    /// permits that the future holds.
     #[test]
     fn an_error_drops_every_slot_still_in_flight() {
         block_on(async {
-            // A future that records its drop, standing in for one holding a
-            // response body and a fetcher permit.
+            // A future that records its drop. It takes the place of a future
+            // that holds a response body and a fetcher permit.
             struct Tracked<'a> {
                 dropped: &'a AtomicUsize,
             }
@@ -207,7 +219,7 @@ mod tests {
                 }
                 slots.push(async { Err("object not found") });
                 let outcome = slots.next_ready().await;
-                // The three pending slots are still held here.
+                // The set still holds the three pending slots here.
                 assert_eq!(dropped.load(Ordering::SeqCst), 0);
                 assert_eq!(slots.len(), 3);
                 outcome
@@ -217,8 +229,8 @@ mod tests {
         });
     }
 
-    /// An empty set resolves at once rather than waiting for a slot that will
-    /// never be pushed, which is what ends the loop.
+    /// An empty set resolves at once and gives no output. This result ends the
+    /// loop of a pull.
     #[test]
     fn an_empty_set_is_ready_immediately() {
         block_on(async {

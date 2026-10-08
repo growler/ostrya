@@ -1,10 +1,10 @@
-//! The order in which a prune removes what it dooms, and the leftovers of an
-//! interrupted run that the next run removes.
+//! Integration tests of the deletion order of a prune, and of the leftovers of
+//! an interrupted run.
 //!
-//! A run that stops part way through its deletions must leave no commit object
-//! whose tree it already started to remove. The next run also removes each
-//! static delta whose target commit is absent and each `.commitpartial` marker
-//! whose commit is absent.
+//! If a run stops part way through its deletions, it must leave no commit
+//! object whose tree it already started to remove. The next run also removes
+//! each static delta whose target commit is absent, and each `.commitpartial`
+//! marker whose commit is absent.
 
 mod common;
 
@@ -18,14 +18,15 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// The number of unreferenced commits the sweep-order test dooms.
+/// The number of unreferenced commits that the prune of the sweep-order test
+/// removes.
 const DOOMED_COMMITS: usize = 20;
-/// The number of fanout directories the sweep-order test makes read-only. More
-/// than one makes the first failure fall early in the sweep.
+/// The number of fanout directories that the sweep-order test makes read-only.
+/// With more than one, the first failure comes early in the sweep.
 const BLOCKED_FANOUTS: usize = 5;
 
-/// Commit a one-file tree whose content names `name`, with a ref `branch` where
-/// one is given.
+/// Commits a tree with one file whose content names `name`. If `branch` is
+/// given, the function also sets the ref `branch` to the commit.
 async fn commit(
     repo: &Repo,
     base: &Path,
@@ -69,8 +70,8 @@ async fn commit(
     commit
 }
 
-/// Sets each directory back to mode 0755 when dropped, so the scratch
-/// directory can be removed after a failed assertion too.
+/// Sets each directory back to mode 0755 on drop, so that the removal of the
+/// scratch directory also works after a failed assertion.
 struct RestoreWritable(Vec<PathBuf>);
 
 impl Drop for RestoreWritable {
@@ -82,7 +83,8 @@ impl Drop for RestoreWritable {
     }
 }
 
-/// The two-hex fanout directory name of an object.
+/// Returns the fanout directory name of an object: the first two hex digits of
+/// its checksum.
 fn fanout(name: &ObjectName) -> String {
     name.checksum.to_hex()[..2].to_owned()
 }
@@ -120,9 +122,10 @@ fn an_interrupted_sweep_leaves_no_commit_whose_tree_it_removed() {
             .collect();
         assert_eq!(doomed_commits.len(), DOOMED_COMMITS);
 
-        // Pick file objects of the doomed commits in fanout directories that
-        // hold no doomed commit and no doomed detached metadata, so the
-        // blocked unlinks touch the content of a commit and never a commit.
+        // Select the file objects of the doomed commits that are in fanout
+        // directories with no doomed commit and no doomed detached metadata.
+        // The blocked unlinks then touch the content of a commit, and never a
+        // commit.
         let commit_fanouts: HashSet<String> = doomed
             .iter()
             .filter(|o| matches!(o.ty, ObjectType::Commit | ObjectType::CommitMeta))
@@ -178,17 +181,22 @@ fn an_interrupted_sweep_leaves_no_commit_whose_tree_it_removed() {
     });
 }
 
-/// The path of a commit's `.commitpartial` marker.
+/// Returns the path of the `.commitpartial` marker of a commit.
 fn marker(base: &Path, commit: &Checksum) -> PathBuf {
     base.join("repo/state")
         .join(format!("{}.commitpartial", commit.to_hex()))
 }
 
-/// An `archive` repository with a ref `main` at `c2` over `c1`, a delta
-/// `c1-c2` whose target is present, and a delta `c2-x` whose target `x` the
-/// test then removes by hand, the way an interrupted run leaves it. `x` also
-/// has a `.commitpartial` marker, and so does `c2`. Returns the repository,
-/// `c1`, `c2`, and `x`.
+/// Creates an `archive` repository with the leftovers of an interrupted run.
+/// The repository holds:
+///
+/// - a ref `main` at `c2`, with the parent `c1`
+/// - a delta `c1-c2`, with its target present
+/// - a delta `c2-x`, with its target `x` removed by hand, as an interrupted run
+///   leaves it
+/// - a `.commitpartial` marker for `x`, and one for `c2`
+///
+/// Returns the repository, `c1`, `c2`, and `x`.
 async fn leftovers(base: &Path) -> (Repo, Checksum, Checksum, Checksum) {
     let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Archive))
         .await
@@ -287,7 +295,7 @@ fn a_prune_skips_a_delta_name_that_does_not_decode() {
         .await
         .expect("a prune that removes a commit skips the name too");
         assert!(!repo.has_object(ObjectType::Commit, &x).await.unwrap());
-        // The fanout of the removed delta stays in place, empty.
+        // The fanout directory of the removed delta stays in place, empty.
         let deltas_left: Vec<_> = base
             .join("repo/deltas")
             .read_dir()
@@ -337,8 +345,8 @@ fn the_sweep_removes_the_markers_after_the_commits_and_their_content() {
             std::fs::write(marker(base, &o.checksum), b"").unwrap();
         }
 
-        // A read-only `state/` fails the first marker unlink. Every commit and
-        // every content object is gone by then.
+        // A read-only `state/` makes the first marker unlink fail. At that
+        // point, all commits and all content objects are already gone.
         {
             let _restore = RestoreWritable(vec![state.clone()]);
             std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -368,7 +376,7 @@ fn the_sweep_removes_the_markers_after_the_commits_and_their_content() {
             assert!(marker(base, &o.checksum).exists());
         }
 
-        // The next run removes the markers the failed run left.
+        // The next run removes the markers that the failed run left.
         repo.prune(&PruneOptions::default()).await.unwrap();
         for o in doomed.iter().filter(|o| o.ty == ObjectType::Commit) {
             assert!(!marker(base, &o.checksum).exists());

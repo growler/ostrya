@@ -1,37 +1,13 @@
-//! The commit signature policy the pull and the receive path share.
+//! The commit signature policy that the pull and the receive path share.
 //!
-//! A policy holds up to two axes, and each axis present has to find a valid
-//! signature:
+//! A policy holds up to two axes: GPG and the sign api. Each axis that a
+//! policy holds must find a valid signature. `PullVerify` states the keys of
+//! each axis for a pull. `TrustedKeys` states the keys of a trust group.
 //!
-//! - GPG. A pull turns it on with `gpg-verify` (default true) and
-//!   `gpg-verify-summary` (default false). The trusted set is the remote's: the
-//!   repository's `<remote>.trustedkeys.gpg`,
-//!   `/etc/ostree/remotes.d/<remote>.trustedkeys.gpg`, the global trusted
-//!   directory, and the keyrings `gpgkeypath` names.
-//! - The sign api. A pull turns it on with `sign-verify` and
-//!   `sign-verify-summary` (both default off). Each value is a boolean or a
-//!   list of engine names; `true` selects every engine this build has. An
-//!   engine's keys are its `verification-<engine>-key` and
-//!   `verification-<engine>-file` entries plus the system key store, minus the
-//!   store's revoked set.
-//!
-//! The axes are independent: a policy that asks for both gets both. Within the
-//! sign-api axis one engine reporting a valid signature is enough, so
-//! `sign-verify=ed25519;spki` accepts a commit signed by either. This is what
-//! the tool was observed to do.
-//!
-//! [`KeySource`] names where the keys come from. A pull reads them from a
-//! remote's configuration section. The receive path reads them from a remote
-//! section in the same way, for a rule that takes the pull trust of a remote,
-//! or from a trust group, `[ex-ostrya trust "NAME"]`, which takes the key names
-//! of a remote section: `gpgkeypath` for the GPG axis, and
-//! `verification-<engine>-key` and `verification-<engine>-file` for the sign
-//! api. A trust group trusts these keys alone. It reads no system key store,
-//! no revoked set, no per-remote keyring, and no global trusted directory, so
-//! the keys a server holds commits to are the keys the group names.
-//!
-//! The pull's own rules, where the checks run and what a pull without a remote
-//! may ask for, are in the `pull::verify` module.
+//! [`KeySource`] names the origin of the keys: the configuration section of a
+//! remote, or a trust group of the receive path. `PullVerify` states the rules
+//! of the pull: when the verification runs, and what a pull without a remote
+//! can ask for.
 
 #[cfg(feature = "verify-gpg")]
 use std::os::fd::{AsFd, BorrowedFd};
@@ -52,44 +28,49 @@ use crate::sign::{
     signatures_for,
 };
 
-/// The sign-api engines `sign-verify=true` selects: every engine this build
-/// has. The dummy engine is not one of them -- its signature is its key, so
-/// accepting it under a policy that names no engine would be a check in name
-/// only. The same holds for a configuration that names it by hand: `dummy`
-/// resolves to no verifier here and fails the pull as any other unknown name
-/// does. The tool has that engine and takes `sign-verify=ed25519;dummy`.
+/// The sign-api engines that `sign-verify=true` selects: every engine of this
+/// build.
+///
+/// The list does not hold the dummy engine, because its signature is its key.
+/// Any writer can make a dummy signature, so a dummy verification proves
+/// nothing. If a configuration names `dummy` by hand, `dummy` resolves to no
+/// verifier here. The pull then fails as for any other unknown name.
+///
+/// The `ostree` command has the dummy engine and accepts
+/// `sign-verify=ed25519;dummy`.
 pub(crate) const ALL_ENGINES: &[&str] = &[
     "ed25519",
     #[cfg(feature = "sign-spki")]
     "spki",
 ];
 
-/// One target's checks. Each axis present here has to find a valid signature.
+/// The signature policy of one target. Each axis of the policy must find a
+/// valid signature.
 ///
-/// A verifier is held behind an [`Arc`], so the two targets of one pull share
-/// the verifiers they both ask for.
+/// The policy holds each verifier in an [`Arc`], so the two targets of one pull
+/// share the verifiers that both ask for.
 #[derive(Default)]
 pub(crate) struct Policy {
-    /// The GPG axis, present when it applies.
+    /// The GPG axis, if it applies.
     gpg: Option<Arc<dyn Verifier>>,
-    /// The sign-api axis, present when it applies, holding one verifier per
-    /// engine named. Any one of them reporting a valid signature satisfies it.
+    /// The sign-api axis, if it applies, with one verifier for each engine that
+    /// the policy names. A valid signature from any one verifier satisfies it.
     sign: Option<Vec<Arc<dyn Verifier>>>,
 }
 
 impl Policy {
-    /// Whether this policy checks anything.
+    /// Returns `true` if this policy holds at least one axis.
     pub(crate) fn applies(&self) -> bool {
         self.gpg.is_some() || self.sign.is_some()
     }
 
-    /// The verifiers of the sign-api axis, `None` where the axis does not
-    /// apply.
+    /// Returns the verifiers of the sign-api axis, or `None` if the axis does
+    /// not apply.
     pub(crate) fn sign_axis(&self) -> Option<&[Arc<dyn Verifier>]> {
         self.sign.as_deref()
     }
 
-    /// A policy over the axes given, each present where it applies.
+    /// Creates a policy from the given axes, each present if it applies.
     #[cfg(feature = "receive")]
     pub(crate) fn from_axes(
         gpg: Option<Arc<dyn Verifier>>,
@@ -98,15 +79,17 @@ impl Policy {
         Policy { gpg, sign }
     }
 
-    /// Whether the GPG axis applies.
+    /// Returns `true` if the GPG axis applies.
     #[cfg(feature = "receive")]
     pub(crate) fn gpg_axis(&self) -> bool {
         self.gpg.is_some()
     }
 
-    /// Hold `payload` to every axis of this policy. `signatures` is the
-    /// detached-metadata dict the signatures live in, absent when the payload
-    /// carries none at all. `subject` names the payload in a message.
+    /// Verifies the signatures over `payload` on every axis of this policy.
+    ///
+    /// `signatures` is the detached-metadata dict that holds the signatures. It
+    /// is `None` if the payload carries no signatures. `subject` names the
+    /// payload in an error message.
     pub(crate) async fn check(
         &self,
         subject: &str,
@@ -130,23 +113,25 @@ impl Policy {
     }
 }
 
-/// What holding a payload to one axis found.
+/// The result of the verification of a payload on one axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Found {
     /// One of the verifiers accepted a signature.
     Valid,
-    /// Signatures the axis reads were there, and no verifier accepted one.
+    /// The payload carries signatures that the axis reads, and no verifier
+    /// accepted one.
     Untrusted,
-    /// The payload carries no signature any verifier of the axis reads.
+    /// The payload carries no signature that a verifier of the axis reads.
     Nothing,
 }
 
-/// Hold `payload` to one axis: whether any of `verifiers` reports a valid
-/// signature over it, and whether there was one to report on at all.
+/// Verifies `payload` on one axis and reports what it found.
 ///
-/// The callers tell the last two apart, as the tool tells them apart: a payload
-/// carrying no signature the axis can read is a refusal for a commit or a
-/// summary and is what an unsigned delta carries.
+/// The result tells if any of `verifiers` reports a valid signature over the
+/// payload, and if a signature was there to verify. The callers keep the last
+/// two cases apart, as the `ostree` command does. For a commit or a summary,
+/// [`Found::Nothing`] is a refusal. An unsigned static delta gives
+/// [`Found::Nothing`], and the delta check accepts it.
 pub(crate) async fn examine(
     verifiers: &[Arc<dyn Verifier>],
     payload: &[u8],
@@ -169,8 +154,8 @@ pub(crate) async fn examine(
     Ok(found)
 }
 
-/// Hold `payload` to one axis, refusing both a payload no key of the axis
-/// signed and one carrying no signature at all.
+/// Verifies `payload` on one axis, and refuses it if no key of the axis signed
+/// it or if it carries no signature.
 async fn check_axis(
     subject: &str,
     axis: &str,
@@ -189,25 +174,25 @@ async fn check_axis(
     }
 }
 
-/// Where a policy's trusted keys come from.
+/// The origin of the trusted keys of a policy.
 pub(crate) enum KeySource<'a> {
-    /// A remote's configuration section, as a pull reads it. `section` is
-    /// `None` for a remote the configuration does not describe.
+    /// The configuration section of a remote, as a pull reads it. `section` is
+    /// `None` for a remote that the configuration does not describe.
     Remote {
-        /// The remote's name, which names its keyrings.
+        /// The name of the remote, which names its keyrings.
         name: &'a str,
-        /// The remote's configuration section.
+        /// The configuration section of the remote.
         section: Option<&'a Remote<'a>>,
-        /// Whether the repository's own `<remote>.trustedkeys.gpg` adds to the
-        /// GPG trusted set.
+        /// If `true`, the `<remote>.trustedkeys.gpg` file of the repository
+        /// adds to the GPG trusted set.
         #[cfg_attr(not(feature = "verify-gpg"), allow(dead_code))]
         repo_keyring: bool,
     },
-    /// A trust group, `[ex-ostrya trust "NAME"]`, read through the accessors
-    /// of a remote section.
+    /// A trust group, `[ex-ostrya trust "NAME"]`. The accessors of a remote
+    /// section read it.
     #[cfg(feature = "receive")]
     Trust {
-        /// The group's name, which a refusal names.
+        /// The name of the group, which a refusal names.
         name: &'a str,
         /// The group, read as a remote section.
         section: &'a Remote<'a>,
@@ -215,7 +200,7 @@ pub(crate) enum KeySource<'a> {
 }
 
 impl KeySource<'_> {
-    /// The inline trusted key for one sign-api engine.
+    /// Returns the inline trusted key for one sign-api engine.
     fn verification_key(&self, engine: &str) -> Result<Option<String>> {
         match self {
             KeySource::Remote { section, .. } => match section {
@@ -227,7 +212,7 @@ impl KeySource<'_> {
         }
     }
 
-    /// The path to a file of trusted keys for one sign-api engine.
+    /// Returns the path of a file of trusted keys for one sign-api engine.
     fn verification_file(&self, engine: &str) -> Result<Option<String>> {
         match self {
             KeySource::Remote { section, .. } => match section {
@@ -239,8 +224,8 @@ impl KeySource<'_> {
         }
     }
 
-    /// Whether the system key store, and its revoked set, add to the keys
-    /// this source names.
+    /// Returns `true` if the system key store and its revoked set add to the
+    /// keys that this source names.
     fn system_store(&self) -> bool {
         match self {
             KeySource::Remote { .. } => true,
@@ -250,23 +235,23 @@ impl KeySource<'_> {
     }
 }
 
-/// The verifiers one policy build makes, each from one read of its key
+/// The verifiers that one policy build makes, each from one read of its key
 /// sources.
 ///
-/// Both targets of a pull take their keys from the same remote, so a verifier
-/// the commit policy and the summary policy both ask for is built once and held
-/// by both.
+/// Both targets of a pull take their keys from the same remote. If the commit
+/// policy and the summary policy ask for the same verifier, the build makes it
+/// once and both policies hold it.
 #[derive(Default)]
 pub(crate) struct Verifiers {
     /// The GPG verifier, built for the first target that asks for it.
     gpg: Option<Arc<dyn Verifier>>,
-    /// One entry per sign-api engine asked for, `None` where no source holds a
-    /// key for that engine.
+    /// One entry for each sign-api engine that a target asks for. An entry is
+    /// `None` if no source holds a key for that engine.
     sign: Vec<(String, Option<Arc<dyn Verifier>>)>,
 }
 
 impl Verifiers {
-    /// The GPG verifier for `source`, from one read of its keyrings.
+    /// Returns the GPG verifier for `source`, from one read of its keyrings.
     async fn gpg(&mut self, repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Verifier>> {
         match &self.gpg {
             Some(verifier) => Ok(Arc::clone(verifier)),
@@ -278,8 +263,10 @@ impl Verifiers {
         }
     }
 
-    /// The verifier for one sign-api engine, from one read of its key sources.
-    /// `None` is an engine with no key to check with.
+    /// Returns the verifier for one sign-api engine, from one read of its key
+    /// sources.
+    ///
+    /// `None` means that the engine has no key to verify with.
     async fn sign(
         &mut self,
         engine: &str,
@@ -294,8 +281,10 @@ impl Verifiers {
     }
 }
 
-/// Build one target's policy from the two resolved switches, taking each
-/// verifier from `cache` so the other target's policy shares it.
+/// Builds the policy of one target from the two resolved switches.
+///
+/// Each verifier comes from `cache`, so the policy of the other target shares
+/// it.
 pub(crate) async fn build_policy(
     repo: &Repo,
     source: &KeySource<'_>,
@@ -307,11 +296,12 @@ pub(crate) async fn build_policy(
     if gpg {
         policy.gpg = Some(cache.gpg(repo, source).await?);
     }
-    // An engine the configuration names by hand has to have a key: it was asked
-    // for, and no key would leave a check that refuses everything. Under
-    // `sign-verify=true`, which names every engine this build has, an engine
-    // with no key is passed over instead, and only a policy that ends up with no
-    // engine at all is refused. The tool reports the same two cases separately.
+    // If the configuration names an engine by hand, the engine must have a key.
+    // The configuration asks for it, and an engine with no key refuses every
+    // signature. `sign-verify=true` names every engine of this build. Under it,
+    // the build skips an engine with no key, and refuses only a policy that
+    // ends with no engine. The `ostree` command reports the two cases
+    // separately too.
     let (names, required): (Vec<String>, bool) = match sign {
         SignVerify::Off => (Vec::new(), false),
         SignVerify::All => (
@@ -345,10 +335,13 @@ pub(crate) async fn build_policy(
     Ok(policy)
 }
 
-/// The engine names of a `sign-verify` value, each kept where the value first
-/// names it. `remote add` writes `sign-verify=ed25519,ed25519` for an engine
-/// given twice, and one verifier per name would hold every signature to that
-/// engine's keys as many times as the value names it.
+/// Returns the engine names of a `sign-verify` value, each name once, at the
+/// place where the value first names it.
+///
+/// `ostrya remote add` writes `sign-verify=ed25519,ed25519` for an engine
+/// given twice.
+/// With one verifier for each name, the build verifies each signature against
+/// the keys of that engine as many times as the value names it.
 fn each_engine_once(names: &[String]) -> Vec<String> {
     let mut kept: Vec<String> = Vec::with_capacity(names.len());
     for name in names {
@@ -359,12 +352,17 @@ fn each_engine_once(names: &[String]) -> Vec<String> {
     kept
 }
 
-/// The GPG verifier for a key source.
+/// Builds the GPG verifier for a key source.
 ///
-/// For a remote: the repository's own keyring for it, read through the
-/// repository descriptor where the source asks for it, plus the system trusted
-/// set and whatever `gpgkeypath` names. For a trust group: the keyrings its
-/// `gpgkeypath` names, and nothing else.
+/// For a remote, the trusted set has three parts:
+///
+/// - the keyring of the repository for the remote, read through the repository
+///   descriptor, if the source asks for it
+/// - the system trusted set
+/// - the keyrings that `gpgkeypath` names
+///
+/// For a trust group, the trusted set is the keyrings that its `gpgkeypath`
+/// names, and nothing else.
 #[cfg(feature = "verify-gpg")]
 async fn gpg_verifier(repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Verifier>> {
     let verifier = match source {
@@ -399,8 +397,10 @@ async fn gpg_verifier(repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ver
     Ok(Arc::new(verifier))
 }
 
-/// A build without the GPG engine cannot make the check a GPG axis asks for,
-/// so it refuses rather than pass a commit it did not check.
+/// Returns [`Error::Unsupported`], because a build without the GPG engine
+/// cannot verify a GPG axis.
+///
+/// The build refuses, so it never passes a commit that it did not verify.
 #[cfg(not(feature = "verify-gpg"))]
 async fn gpg_verifier(_repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Verifier>> {
     match source {
@@ -416,20 +416,24 @@ async fn gpg_verifier(_repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ve
     }
 }
 
-/// The engines this build verifies with. A name is resolved to one of these
-/// before any key source is read.
+/// The engines that this build verifies with.
+///
+/// The build resolves a name to one of these engines before it reads a key
+/// source.
 enum Engine {
     Ed25519,
     #[cfg(feature = "sign-spki")]
     Spki,
 }
 
-/// The verifier for one sign-api engine, over the keys `source` names and, for
-/// a remote, the system key store.
+/// Builds the verifier for one sign-api engine from the keys that `source`
+/// names.
 ///
-/// `None` is an engine with no key to check with. What that means is the
-/// policy's to say: a refusal for an engine the policy names by hand, and the
-/// engine passed over for one the policy reached by naming every engine.
+/// For a remote, the keys of the system key store add to these keys.
+///
+/// `None` means that the engine has no key to verify with. The policy decides
+/// the result. It refuses an engine that it names by hand. It skips an engine
+/// that it reached through a value that names every engine.
 async fn sign_verifier(engine: &str, source: &KeySource<'_>) -> Result<Option<Arc<dyn Verifier>>> {
     let kind = match engine {
         "ed25519" => Engine::Ed25519,
@@ -447,14 +451,16 @@ async fn sign_verifier(engine: &str, source: &KeySource<'_>) -> Result<Option<Ar
     build_verifier(kind, keys)
 }
 
-/// Build one engine's verifier over the keys its sources hold, or `None` where
-/// the engine is left with no key.
+/// Builds the verifier of one engine over the keys of its sources, or returns
+/// `None` if the engine has no key left.
 ///
-/// The engine applies the revoked set as it matches keys, each engine by its own
-/// key equality, so the set left after that is what decides. A key the sources
-/// hold and the store revokes leaves the engine with none, and a verifier
-/// holding no key refuses every commit for the signature it carries, which sends
-/// an operator to the signature rather than to the revocation.
+/// The engine applies the revoked set when it matches keys. Each engine uses
+/// its own key equality. The set of keys that is left after this step decides.
+///
+/// If the store revokes the only key that the sources hold, the engine has no
+/// key, and the function returns `None`. A verifier with no key refuses every
+/// commit with an error about the signature of the commit. That error does not
+/// name the cause, the revocation.
 fn build_verifier(kind: Engine, keys: SignKeys) -> Result<Option<Arc<dyn Verifier>>> {
     Ok(match kind {
         Engine::Ed25519 => {
@@ -469,14 +475,17 @@ fn build_verifier(kind: Engine, keys: SignKeys) -> Result<Option<Arc<dyn Verifie
     })
 }
 
-/// The trusted and revoked keys for one engine: the source's inline key and key
-/// file, then, for a remote, the system key store, whose revoked set applies to
+/// Returns the trusted and revoked keys for one engine.
+///
+/// The keys come from the inline key and the key file of the source. For a
+/// remote, the system key store adds its keys, and its revoked set applies to
 /// all of them.
 ///
-/// The configuration is read here, and the paths it names are read on the
-/// blocking pool, so a slow path holds a pool thread and not an executor thread.
+/// This function reads the configuration. The blocking pool reads the paths
+/// that the configuration names, so a slow path holds a pool thread and cannot
+/// hold an executor thread.
 ///
-/// `None` is an engine no source holds a key for.
+/// `None` means that no source holds a key for the engine.
 async fn sign_keys(engine: &str, source: &KeySource<'_>) -> Result<Option<SignKeys>> {
     let inline = source.verification_key(engine)?;
     let path = source.verification_file(engine)?;
@@ -485,8 +494,10 @@ async fn sign_keys(engine: &str, source: &KeySource<'_>) -> Result<Option<SignKe
     ostrya_rt::unblock(move || read_sign_keys(&engine, inline, path, system)).await
 }
 
-/// The blocking half of [`sign_keys`]: decode the inline key, read the key file,
-/// and add the system key store where `system` asks for it.
+/// Runs the blocking half of [`sign_keys`].
+///
+/// The function decodes the inline key and reads the key file. If `system` is
+/// `true`, it adds the keys of the system key store.
 fn read_sign_keys(
     engine: &str,
     inline: Option<String>,
@@ -517,13 +528,12 @@ fn read_sign_keys(
     Ok(Some(keys))
 }
 
-/// Read the repository's `<remote>.trustedkeys.gpg`, up to
-/// [`MAX_KEYRING`](crate::gpg::MAX_KEYRING), or `None` where the repository
-/// holds none.
+/// Reads the `<remote>.trustedkeys.gpg` file of the repository, up to
+/// [`MAX_KEYRING`](crate::gpg::MAX_KEYRING) bytes.
 ///
-/// The name is resolved through the repository descriptor, on the blocking pool,
-/// so a keyring on a slow filesystem holds a pool thread and not an executor
-/// thread.
+/// Returns `None` if the repository holds no such file. The name resolves
+/// through the repository descriptor on the blocking pool. A keyring on a slow
+/// file system holds a pool thread and cannot hold an executor thread.
 #[cfg(feature = "verify-gpg")]
 async fn read_repo_keyring(repo: &Repo, remote: &str) -> Result<Option<Vec<u8>>> {
     let repo_fd = repo.repo_fd().try_clone_to_owned()?;
@@ -531,14 +541,17 @@ async fn read_repo_keyring(repo: &Repo, remote: &str) -> Result<Option<Vec<u8>>>
     ostrya_rt::unblock(move || read_keyring_blocking(repo_fd.as_fd(), &name)).await
 }
 
-/// The blocking half of [`read_repo_keyring`]. The name is resolved against the
-/// repository descriptor and the bytes come through [`read_keyring_fd`], which
-/// is the rule every other keyring source is read under. A symlink at the name
-/// is followed, which the tool was observed to do.
+/// Runs the blocking half of [`read_repo_keyring`].
+///
+/// The name resolves against the repository descriptor. The bytes come through
+/// [`read_keyring_fd`], which applies the same rule to every other keyring
+/// source. If a symlink is at the name, the read follows it. The `ostree`
+/// command was observed to follow it too.
 #[cfg(feature = "verify-gpg")]
 fn read_keyring_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> Result<Option<Vec<u8>>> {
-    // `NONBLOCK` so a fifo answers the open rather than waiting for a writer.
-    // On a regular file the flag has no effect on the read the reader makes.
+    // `NONBLOCK` makes a fifo answer the open at once. Without it, the open
+    // waits for a writer. On a regular file, the flag has no effect on the
+    // read that the reader makes.
     let fd = match rustix::fs::openat(
         repo_fd,
         name,
@@ -556,16 +569,18 @@ fn read_keyring_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> Result<Option<V
     read_keyring_fd(fd, name).map(Some)
 }
 
-/// Read one `verification-<engine>-file`, up to [`MAX_KEY_FILE`], under the rule
-/// [`read_key_source`] states. The path is opened once and read through the
-/// ceiling, so the bytes the ceiling admits are the bytes the keys come from. A
-/// file of another kind, one over the ceiling, and one that cannot be read are
-/// each refused by the file's name, so an operator can find the entry that named
-/// it.
+/// Reads one `verification-<engine>-file`, up to [`MAX_KEY_FILE`] bytes, under
+/// the rule that [`read_key_source`] states.
+///
+/// The function opens the path once and reads it through the ceiling, so the
+/// keys come from the bytes that the ceiling admits. It refuses a file of
+/// another kind, a file over the ceiling, and a file that it cannot read. Each
+/// error names the file, so an operator can find the entry that names it.
 fn read_verification_file(engine: &str, path: &str) -> Result<String> {
     let subject = format!("the '{engine}' key file '{path}'");
-    // `NONBLOCK` so a fifo answers the open rather than waiting for a writer.
-    // On a regular file the flag has no effect on the read below.
+    // `NONBLOCK` makes a fifo answer the open at once. Without it, the open
+    // waits for a writer. On a regular file, the flag has no effect on the
+    // later read.
     let fd = rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
@@ -584,24 +599,24 @@ mod tests {
 
     use super::*;
 
-    /// A remote the configuration does not describe.
+    /// A remote that the configuration does not describe.
     const NO_SECTION: KeySource<'static> = KeySource::Remote {
         name: "origin",
         section: None,
         repo_keyring: true,
     };
 
-    /// `sign-verify=true` names the engines this build has, and never the dummy
-    /// engine, whose signature is its key.
+    /// `sign-verify=true` names the engines of this build. It never names the
+    /// dummy engine, because the dummy signature is its key.
     #[test]
     fn all_engines_excludes_the_dummy_engine() {
         assert!(ALL_ENGINES.contains(&"ed25519"));
         assert!(!ALL_ENGINES.contains(&"dummy"));
     }
 
-    /// An engine no build verifies with is refused by name, and an engine no
-    /// source holds a key for reports that it has none, which is what the
-    /// policy reads to refuse an engine it named by hand.
+    /// `sign_verifier` refuses by name an engine that no build verifies with.
+    /// For an engine that no source holds a key for, it reports no key. The
+    /// policy reads that report to refuse an engine that it names by hand.
     #[test]
     fn unknown_engines_and_empty_key_sets_are_told_apart() {
         ostrya_rt::block_on(async {
@@ -612,8 +627,8 @@ mod tests {
                 err.to_string().contains("not one this build verifies with"),
                 "{err}"
             );
-            // No remote section, so a host with no key store of its own has no
-            // key for the engine at all.
+            // There is no remote section. On a host with no key store of its
+            // own, the engine has no key at all.
             if load_sign_keys("ed25519").unwrap().trusted.is_empty() {
                 assert!(
                     sign_verifier("ed25519", &NO_SECTION)
@@ -625,9 +640,9 @@ mod tests {
         });
     }
 
-    /// A configuration naming the dummy engine is refused by that name. The
-    /// dummy signature is the bytes of the dummy key, so a commit held to it
-    /// would pass a check that read nothing.
+    /// `sign_verifier` refuses a configuration that names the dummy engine, by
+    /// that name. The dummy signature is the bytes of the dummy key. A commit
+    /// verified against it passes a verification that reads no key.
     #[test]
     fn the_dummy_engine_is_refused_by_name() {
         ostrya_rt::block_on(async {
@@ -641,15 +656,17 @@ mod tests {
         });
     }
 
-    /// An engine whose only key the store revokes has no key at all: the set
-    /// left after the revoked set is applied is what decides. The policy then
-    /// reports the engine, by refusing an engine the configuration names by hand
-    /// and by passing over one it reached by naming every engine, rather than
-    /// hold every commit to a verifier that trusts nothing.
+    /// If the store revokes the only key of an engine, the engine has no key at
+    /// all. The set of keys that is left after the revoked set applies decides.
     ///
-    /// The decision is made here because the revoked set comes from the system
-    /// key store, under `/etc/ostree` and `/usr/share/ostree`, which a test
-    /// cannot write to.
+    /// The policy then reports the engine. It refuses an engine that the
+    /// configuration names by hand. It skips an engine that it reached through
+    /// a value that names every engine. No commit goes to a verifier that
+    /// trusts nothing.
+    ///
+    /// The test makes the decision at this level because the revoked set comes
+    /// from the system key store. The store is under `/etc/ostree` and
+    /// `/usr/share/ostree`, and a test cannot write there.
     #[test]
     fn a_revoked_key_leaves_the_engine_without_a_key() {
         const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
@@ -674,9 +691,9 @@ mod tests {
         );
     }
 
-    /// An engine the value names twice, which `remote add` writes for an engine
-    /// given twice, builds one verifier, so each signature is held to that
-    /// engine's keys once.
+    /// An engine that the value names twice builds one verifier, so each
+    /// signature gets one verification against the keys of that engine.
+    /// `ostrya remote add` writes such a value for an engine given twice.
     #[test]
     fn a_repeated_engine_name_builds_one_verifier() {
         use crate::{CreateOptions, RepoMode};
@@ -721,9 +738,9 @@ mod tests {
         assert_eq!(verifiers.len(), 1, "the repeated name holds one verifier");
     }
 
-    /// The two targets of one pull share the verifier they both ask for: an
-    /// engine's key sources are read once and the same verifier is handed out
-    /// again.
+    /// The two targets of one pull share the verifier that both ask for. The
+    /// cache reads the key sources of an engine once and hands out the same
+    /// verifier again.
     #[test]
     fn an_engine_is_read_once_for_both_targets() {
         const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
@@ -751,8 +768,8 @@ mod tests {
         });
     }
 
-    /// A key file over the ceiling is refused by its own name, so its size
-    /// cannot decide an allocation.
+    /// `read_verification_file` refuses a key file over the ceiling by its own
+    /// name, so the size of the file cannot decide an allocation.
     #[test]
     fn an_oversized_key_file_is_refused_by_name() {
         let dir = std::env::temp_dir().join(format!(
@@ -775,9 +792,9 @@ mod tests {
         );
     }
 
-    /// A repository keyring over the ceiling is refused by its own name. Reading
-    /// the part the ceiling admits would hand the pull a trusted set the
-    /// operator never placed there, with nothing said about it.
+    /// `gpg_verifier` refuses a repository keyring over the ceiling by its own
+    /// name. A read of the part that the ceiling admits gives the pull a
+    /// trusted set that the operator never put there. No message reports it.
     #[cfg(feature = "verify-gpg")]
     #[test]
     fn an_oversized_repository_keyring_is_refused_by_name() {
@@ -810,10 +827,11 @@ mod tests {
         );
     }
 
-    /// A fifo at a repository keyring's name is refused by that name. What a
-    /// fifo answers a read with is what its writers sent, so a pull reading one
-    /// would take its trusted set from them. This test returns only because the
-    /// read refuses the kind before it reads.
+    /// `gpg_verifier` refuses a fifo at the name of a repository keyring, by
+    /// that name. A read of a fifo returns what its writers sent, so a pull
+    /// that reads one takes its trusted set from them. The open uses
+    /// `NONBLOCK`, so it does not wait for a writer. The read refuses the file
+    /// kind before it reads a byte.
     #[cfg(feature = "verify-gpg")]
     #[test]
     fn a_fifo_repository_keyring_is_refused_by_name() {
@@ -849,10 +867,11 @@ mod tests {
         );
     }
 
-    /// A fifo at a key file's name is refused by that name. Reading it would
-    /// hold the thread until a writer opens it, and the length it reports is
-    /// not the length of what it carries. This test returns only because the
-    /// read refuses the kind before it reads.
+    /// `read_verification_file` refuses a fifo at the name of a key file, by
+    /// that name. A blocking read of a fifo holds the thread until a writer
+    /// opens it. The length that a fifo reports is not the length of its
+    /// content. The open uses `NONBLOCK`, so it does not wait for a writer. The
+    /// read refuses the file kind before it reads a byte.
     #[test]
     fn a_fifo_key_file_is_refused_by_name() {
         let dir = std::env::temp_dir().join(format!(
@@ -880,9 +899,9 @@ mod tests {
         );
     }
 
-    /// The trust source reads the `verification-*` keys of its group, and the
-    /// remote keys of the same name do not reach it. It reads no system key
-    /// store, where a remote does.
+    /// The trust source reads the `verification-*` keys of its group. The
+    /// remote keys of the same name do not reach it. The trust source reads no
+    /// system key store, and a remote source reads one.
     #[cfg(feature = "receive")]
     #[test]
     fn trust_source_reads_its_own_group() {
@@ -910,8 +929,8 @@ mod tests {
         assert!(NO_SECTION.system_store());
     }
 
-    /// A remote source that leaves the repository keyring out does not open
-    /// `<repo>/<remote>.trustedkeys.gpg`: a keyring there over the ceiling,
+    /// A remote source without the repository keyring does not open
+    /// `<repo>/<remote>.trustedkeys.gpg`. A keyring there over the ceiling,
     /// which the pull refuses, does not reach the build.
     #[cfg(feature = "verify-gpg")]
     #[test]

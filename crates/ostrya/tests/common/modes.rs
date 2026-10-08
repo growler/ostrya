@@ -12,7 +12,7 @@ use ostrya::{
 };
 use ostrya_core::{ContentHasher, FileHeader, Xattrs};
 
-/// The modes the port writes.
+/// The modes that ostrya writes.
 pub const WRITABLE: [RepoMode; 5] = [
     RepoMode::Archive,
     RepoMode::Bare,
@@ -21,8 +21,15 @@ pub const WRITABLE: [RepoMode; 5] = [
     RepoMode::BareUserShared,
 ];
 
-/// A tree with a regular file, an executable, an empty file, a file larger
-/// than one 64 KiB chunk, and a symlink to the first file.
+/// Builds a small tree in `base/src` and returns its path.
+///
+/// The tree has these entries:
+///
+/// - a regular file
+/// - an executable
+/// - an empty file
+/// - a file larger than one 64 KiB chunk
+/// - a symlink to the first file
 pub fn build_tree(base: &Path) -> PathBuf {
     let src = base.join("src");
     fs::create_dir_all(&src).unwrap();
@@ -38,7 +45,8 @@ pub fn build_tree(base: &Path) -> PathBuf {
     src
 }
 
-/// Commit the tree at `src` into `repo` on `main` with a fixed timestamp.
+/// Commits the tree at `src` into `repo` with a fixed timestamp, and sets
+/// `main` to the commit.
 pub async fn commit(repo: &Repo, src: &Path) -> Checksum {
     let txn = repo.transaction().await.unwrap();
     let mut mtree = MutableTree::new();
@@ -64,8 +72,8 @@ pub async fn commit(repo: &Repo, src: &Path) -> Checksum {
     commit
 }
 
-/// A repository of `mode` under `base/<mode>` with the tree of `src` on
-/// `main`.
+/// Creates a repository of `mode` in `base/<mode>`, with the tree of `src`
+/// on `main`.
 pub async fn repo_of(base: &Path, mode: RepoMode, src: &Path) -> (PathBuf, Repo, Checksum) {
     let path = base.join(mode.as_mode_str());
     let repo = Repo::create(&path, CreateOptions::new(mode)).await.unwrap();
@@ -73,7 +81,7 @@ pub async fn repo_of(base: &Path, mode: RepoMode, src: &Path) -> (PathBuf, Repo,
     (path, repo, commit)
 }
 
-/// The file objects of `commit`, by checksum.
+/// Returns the checksums of the file objects of `commit`.
 pub async fn file_objects(repo: &Repo, commit: &Checksum) -> Vec<Checksum> {
     repo.traverse_commit(commit, 0)
         .await
@@ -88,15 +96,20 @@ pub fn object_path(ty: ObjectType, checksum: &Checksum) -> String {
     format!("objects/{}", loose_path(checksum, ty, RepoMode::Archive))
 }
 
-/// The running user's uid and gid.
+/// Returns the uid and the gid that own `dir`.
+///
+/// The tests create `dir`, so these are the uid and the gid of the user that
+/// runs the tests.
 pub fn current_owner(dir: &Path) -> (u32, u32) {
     let md = fs::metadata(dir).unwrap();
     (md.uid(), md.gid())
 }
 
-/// Write one `bare-split-xattrs` file object by hand: the inode carries the
-/// owner and the mode, and a `.file-xattrs-link` hardlink to the shared
-/// `.file-xattrs` object carries the extended attributes.
+/// Writes one `bare-split-xattrs` file object by hand and returns its
+/// checksum.
+///
+/// The inode carries the owner and the mode. A `.file-xattrs-link` hardlink
+/// to the shared `.file-xattrs` object carries the extended attributes.
 pub fn write_split_object(
     root: &Path,
     mode: u32,

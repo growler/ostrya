@@ -1,15 +1,15 @@
 //! The client side of a push from a repository.
 //!
-//! Behind the `push` feature. [`resolve_push_remote`] gives the push address
-//! and the connect options of a configured remote or of an address, and
-//! [`is_push_address`] tells the two apart.
+//! The `push` feature gates this module. [`resolve_push_remote`] returns the
+//! push address and the connect options of a configured remote or of an
+//! address. [`is_push_address`] tells the two apart.
 //! [`Repo::push`](crate::Repo::push) and
 //! [`Repo::push_over_stream`](crate::Repo::push_over_stream) push the commits
 //! of a set of refspecs with the options of [`RepoPushOptions`].
 //! [`Repo::export_stream`](crate::Repo::export_stream) writes the commits of a
 //! set of ref updates as one one-way stream, with the options of
-//! [`ExportStreamOptions`]. The crate-private parts read the refspecs of a
-//! push against the local repository, and give the objects of its commits to
+//! [`ExportStreamOptions`]. The private submodules read the refspecs of a push
+//! against the local repository. They also give the objects of its commits to
 //! a push session.
 
 mod export;
@@ -28,52 +28,69 @@ use crate::config::RepoConfig;
 use crate::error::{Error, Result};
 use crate::push::{ConnectOptions, PushRemote};
 
-/// Whether `remote` is a push address rather than the name of a remote
-/// section: it holds a `:` or a `/`.
+/// Returns `true` if `remote` is a push address: a value with a `:` or a `/`.
 ///
-/// [`resolve_push_remote`] reads no configuration for such a value, so a
-/// caller can leave the local repository unopened.
+/// A value with no `:` and no `/` is the name of a remote section.
+/// [`resolve_push_remote`] reads no configuration for an address, so a caller
+/// does not need to open the local repository.
 pub fn is_push_address(remote: &str) -> bool {
     remote.contains([':', '/'])
 }
 
-/// The push address of `remote`, and `connect` with the push keys of the
-/// remote section added.
+/// Resolves `remote` to a push address and fills `connect` from the config.
 ///
-/// `remote` is an address when [`is_push_address`] holds for it, and it is
-/// parsed with [`PushRemote::parse`]. Otherwise it is the name of a remote
-/// section of `config`. The address of a remote section is its `push-url`. When
-/// `push-url` is absent, a `url` that starts with `http://` or `https://` is
-/// the address. A `url` of another form, for example `file://`, `metalink=`,
-/// or `mirrorlist=`, is no push address. `url` is read only when `push-url`
-/// is absent.
+/// If [`is_push_address`] returns `true` for `remote`, [`PushRemote::parse`]
+/// parses `remote` as the address. The function then reads no configuration
+/// and returns `connect` unchanged. In all other cases, `remote` is the name
+/// of a remote section of `config`.
+///
+/// # Address of a remote section
+///
+/// - The address is the `push-url` key of the section.
+/// - If `push-url` is absent, a `url` that starts with `http://` or
+///   `https://` is the address. The function reads `url` only if `push-url`
+///   is absent.
+/// - A `url` of another form, for example `file://`, `metalink=`, or
+///   `mirrorlist=`, is not a push address.
+///
+/// # Connect options
 ///
 /// The keys of the section fill the fields of `connect` that apply to the
-/// transport of the address, each only when `connect` leaves the field
-/// `None`. A field that `connect` sets wins over its key, and each key is
-/// read on its own.
+/// transport of the address. A key fills a field only if `connect` leaves the
+/// field `None`, so a field that `connect` sets wins over its key. The
+/// function fills each field independently of the other fields.
 ///
 /// - For an ssh address, `ssh-command` fills
 ///   [`ConnectOptions::remote_ssh_command`], and `receive-command` fills
-///   [`ConnectOptions::receive_command`]. The HTTP keys are not read.
+///   [`ConnectOptions::receive_command`]. The function does not read the HTTP
+///   keys.
 /// - For an `http://` or `https://` address, `push-token-file`, `push-user`,
 ///   `tls-ca-path`, `tls-client-cert-path`, and `tls-client-key-path` fill
-///   the fields of the same names, as written: a relative path stays
-///   relative to the current directory of the process, and `~` is not
-///   expanded. The ssh keys are not read.
-/// - For an `https://` address, `tls-permissive=true` is [`Error::Push`] with
-///   [`InvalidInput`](crate::push::Error::InvalidInput): a push verifies the
-///   certificate chain of the server. An `http://` address uses no TLS, so
-///   the key is not read.
+///   the fields of the same names. The function copies each value as written.
+///   A relative path stays relative to the current directory of the process,
+///   and the function does not expand `~`. The function does not read the ssh
+///   keys.
+/// - For an `https://` address, the function refuses `tls-permissive=true`,
+///   because a push verifies the certificate chain of the server. An
+///   `http://` address uses no TLS, so the function does not read the key.
 ///
-/// No key of the section gives
-/// [`ConnectOptions::allow_cleartext_credentials`]: only the caller sets it.
+/// No key of the section sets [`ConnectOptions::allow_cleartext_credentials`].
+/// Only the caller sets this field.
 ///
-/// A name that `config` holds no section for, and a section with no push
-/// address, are [`Error::Push`] with
-/// [`InvalidInput`](crate::push::Error::InvalidInput). A `config` of `None`
-/// holds no section. An address that does not parse is [`Error::Push`] with
-/// the error of [`PushRemote::parse`].
+/// # Errors
+///
+/// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+///   if `config` holds no section for the name. A `config` of `None` holds no
+///   section.
+/// - [`Error::Push`] with `InvalidInput` if the section has no push address:
+///   no `push-url`, and no `url` or a `url` that is not `http://` or
+///   `https://`.
+/// - [`Error::Push`] with `InvalidInput` if the address is `https://` and the
+///   section sets `tls-permissive=true`.
+/// - [`Error::Push`] with the error of [`PushRemote::parse`] if the address
+///   does not parse.
+/// - [`Error::Core`] if a key that the function reads holds a malformed
+///   escape sequence, or if `tls-permissive` is not a boolean.
 pub fn resolve_push_remote(
     config: Option<&RepoConfig>,
     remote: &str,
@@ -136,13 +153,13 @@ pub fn resolve_push_remote(
     Ok((parsed, connect))
 }
 
-/// Whether `address` is an `http://` or an `https://` push address, by the
-/// rule of [`PushRemote::parse`].
+/// Returns `true` if `address` is an `http://` or an `https://` push address,
+/// by the rule of [`PushRemote::parse`].
 fn is_http_address(address: &str) -> bool {
     address.starts_with("http://") || address.starts_with("https://")
 }
 
-/// A push request the client refuses.
+/// Returns the error of a push request that the client refuses.
 pub(crate) fn invalid(msg: impl Into<String>) -> Error {
     Error::Push(crate::push::Error::InvalidInput(msg.into()))
 }
@@ -199,10 +216,10 @@ mod tests {
         RepoConfig::parse(CONFIG).unwrap()
     }
 
-    /// Assert that `a` and `b` hold the same value in each field.
+    /// Asserts that `a` and `b` hold the same value in each field.
     /// `ConnectOptions` implements no `PartialEq`, because the options of its
-    /// HTTP client implement none, so the fields compare through their
-    /// `Debug` text.
+    /// HTTP client implement none. The function compares the `Debug` text of
+    /// the two values.
     fn assert_same(a: &ConnectOptions, b: &ConnectOptions) {
         assert_eq!(format!("{a:?}"), format!("{b:?}"));
     }
@@ -275,7 +292,7 @@ mod tests {
             remote,
             PushRemote::parse("ssh://pusher@ex.com/srv/repo").unwrap()
         );
-        // A push-url stands also when the url is no push address.
+        // The push-url is the address also when the url is not a push address.
         let (remote, _) =
             resolve_push_remote(Some(&cfg), "file-push", ConnectOptions::default()).unwrap();
         assert_eq!(remote, PushRemote::parse("host:srv/repo").unwrap());
@@ -377,7 +394,7 @@ mod tests {
         );
     }
 
-    /// The HTTP fields that the section `http-keys` gives.
+    /// Returns the HTTP fields that the section `http-keys` gives.
     fn http_keys() -> ConnectOptions {
         ConnectOptions {
             push_token_file: Some("/etc/ostrya/token".into()),
@@ -395,8 +412,8 @@ mod tests {
         let (remote, connect) =
             resolve_push_remote(Some(&cfg), "http-keys", ConnectOptions::default()).unwrap();
         assert_eq!(remote, PushRemote::parse("https://ex.com/repo").unwrap());
-        // `ssh-command` and `receive-command` of the section are not read,
-        // so the connect does not refuse them.
+        // The function does not read `ssh-command` and `receive-command` of
+        // the section, so the connect does not refuse them.
         assert_same(&connect, &http_keys());
         // The keys of a section whose `push-url` is HTTP fill the fields too.
         let (remote, connect) =
@@ -480,8 +497,8 @@ mod tests {
                 &format!("remote '{name}' sets tls-permissive=true"),
             );
         }
-        // An `http://` push address uses no TLS, so the key is not read: a
-        // value that is not a boolean is not read either.
+        // An `http://` push address uses no TLS, so the function does not
+        // read the key. A value that is not a boolean causes no error.
         for (name, url) in [
             ("permissive-http", "http://push.ex.com/"),
             ("permissive-bad", "http://ex.com/repo"),

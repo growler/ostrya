@@ -1,16 +1,20 @@
-//! The permission bits a `bare-user-shared` repository forces on the entries
-//! ostrya creates inside it.
+//! The permission bits that a `bare-user-shared` repository forces on the
+//! entries that ostrya creates inside it.
 //!
-//! The guarantee these tests stand for is that a second member of the
-//! repository group can write where the first member wrote. That case needs two
-//! uids and is out of reach of a test that runs under one. The mode assertions
-//! stand in for it: a directory at `02770` and a lock file at `0660` are what
-//! the second uid needs, and the masked results they replace (`0755` at a mask
-//! of `022`, a fixed `0600` for the staging sibling lock) are what denies it.
+//! These tests stand for one guarantee: a second member of the repository
+//! group can write where the first member wrote. A test of that case needs two
+//! uids, and these tests run under one uid. The mode assertions stand in for
+//! the case.
 //!
-//! The process file-creation mask is global to the process while these tests
-//! run on parallel threads, so no test here sets it. The `umask`-independence
-//! proof runs the binary as a child process in the `ostrya-cli` test suite.
+//! - The second uid needs a directory at `02770` and a lock file at `0660`.
+//! - The forced modes replace the masked results, which deny the second uid.
+//!   The masked results are `0755` at a mask of `022`, and a fixed `0600` for
+//!   the staging sibling lock.
+//!
+//! The file-creation mask is global to the process and these tests run on
+//! parallel threads, so no test here sets the mask. The test suite of
+//! `ostrya-cli` proves the independence from `umask`: it runs the binary as a
+//! child process.
 
 mod common;
 
@@ -63,9 +67,9 @@ fn staging_entries(repo_path: &Path) -> (PathBuf, PathBuf) {
     (dir, lock)
 }
 
-/// The mode a directory created with request `0775` takes under the mask this
-/// process runs with. The layout directories request the same bits, so a
-/// repository that applies no forcing lands here.
+/// Returns the mode that a directory gets under the mask of this process, if
+/// the create requests `0775`. The layout directories request the same bits,
+/// so a repository that forces no mode gets this mode.
 fn masked_dir_mode(base: &Path, tag: &str) -> u32 {
     let probe = base.join(format!("probe-dir-{tag}"));
     std::fs::DirBuilder::new()
@@ -75,8 +79,8 @@ fn masked_dir_mode(base: &Path, tag: &str) -> u32 {
     mode_of(&probe)
 }
 
-/// The mode a file created with request `0660` takes under the mask this
-/// process runs with. `.lock` requests the same bits.
+/// Returns the mode that a file gets under the mask of this process, if the
+/// create requests `0660`. `.lock` requests the same bits.
 fn masked_lock_mode(base: &Path, tag: &str) -> u32 {
     let probe = base.join(format!("probe-file-{tag}"));
     std::fs::OpenOptions::new()
@@ -98,7 +102,7 @@ fn shared_repo_forces_the_layout_and_lock_modes() {
         let repo = Repo::create(&repo_path, CreateOptions::new(RepoMode::BareUserShared))
             .await
             .expect("create the repository");
-        // `.lock` is created with the first transaction.
+        // The first transaction creates `.lock`.
         let txn = repo.transaction().await.expect("begin a transaction");
         txn.abort().await.expect("abort the transaction");
     });
@@ -182,8 +186,8 @@ fn shared_repo_forces_the_mode_of_a_tmp_a_ref_write_creates() {
     });
 }
 
-/// The control: a `bare-user` repository keeps the masked modes. This is what
-/// scopes the forcing to the one repository mode.
+/// The control: a `bare-user` repository keeps the masked modes. This test
+/// shows that the forcing applies to the one repository mode.
 #[test]
 fn bare_user_repo_keeps_the_masked_modes() {
     let dir = TmpDir::new("bare-user-control");
@@ -210,8 +214,8 @@ fn bare_user_repo_keeps_the_masked_modes() {
     assert_eq!(mode_of(&repo_path.join(".lock")), expected_lock, ".lock");
 }
 
-/// A staging tree left behind by a dead transaction, with the modes a
-/// `bare-user-shared` repository gives it, is reaped by the next transaction.
+/// The next transaction reaps a staging tree that a dead transaction left
+/// behind, with the modes that a `bare-user-shared` repository gives it.
 #[test]
 fn shared_repo_reaps_a_stale_staging_dir() {
     let dir = TmpDir::new("shared-reap");
@@ -222,8 +226,8 @@ fn shared_repo_reaps_a_stale_staging_dir() {
     ))
     .expect("create the repository");
 
-    // Fabricate a leftover staging directory with an unheld sibling lock, as a
-    // crashed transaction of another group member would leave behind.
+    // Make a leftover staging directory with an unheld sibling lock. A crashed
+    // transaction of another group member leaves this state behind.
     let tmp = repo_path.join("tmp");
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
     let stale = format!("staging-{}-STALE1", boot.trim());

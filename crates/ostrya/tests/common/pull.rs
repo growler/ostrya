@@ -1,13 +1,16 @@
-//! An in-process static file server over a repository directory, and the
-//! builders of the source and destination repositories, for the tests of
-//! the pull from a remote.
+//! An in-process static file server over a repository directory, for the
+//! tests of a pull from a remote. The module also builds the source and
+//! destination repositories of these tests.
 //!
-//! The server records the request paths it saw, the status it answered each
-//! with, how many requests were in flight at once, and how many connections it
-//! accepted.
+//! The server records these values:
 //!
-//! The tests of the pull declare this module with a `path` attribute, so the
-//! other tests do not build the server.
+//! - each request path that it receives
+//! - the status of the answer to each request
+//! - the largest number of requests in flight at the same time
+//! - the number of connections that it accepts
+//!
+//! The pull tests declare this module with a `path` attribute, so the other
+//! tests do not build the server.
 
 #![allow(dead_code)]
 
@@ -47,16 +50,17 @@ pub const UNTRUSTED_CERT_PEM: &[u8] =
 pub const UNTRUSTED_KEY_PEM: &[u8] =
     include_bytes!("../../../../tests/fixtures/tls/server-untrusted.key.pem");
 
-/// A fixed timestamp, so a source repository's commits are reproducible.
+/// A fixed timestamp that makes the commits of a source repository reproducible.
 pub const FIXED_TS: u64 = 1_700_000_000;
 
-/// The `summary.sig` bytes a remote publishes in the mirror tests. A pull copies
-/// the file without reading it, so any bytes serve.
+/// The `summary.sig` bytes that a remote publishes in the mirror tests.
+///
+/// A pull copies the file and does not read it, so any bytes are sufficient.
 pub const SUMMARY_SIG: &[u8] = b"summary signature bytes";
 
-// --- server plumbing -------------------------------------------------------
+// --- HTTP server -----------------------------------------------------------
 
-/// A `futures-io` stream presented to hyper.
+/// A `futures-io` stream that hyper reads and writes.
 pub struct TestIo<S> {
     inner: S,
     scratch: Vec<u8>,
@@ -125,8 +129,10 @@ where
     }
 }
 
-/// A response body of pre-baked chunks, which may declare more than it carries
-/// so the connection is cut mid-response.
+/// A response body of prepared chunks.
+///
+/// If the declared length is more than the length of the chunks, hyper cuts
+/// the connection in the middle of the response.
 pub struct FileBody {
     chunks: Vec<Bytes>,
     declared: u64,
@@ -152,35 +158,40 @@ impl hyper::body::Body for FileBody {
     }
 }
 
-/// What the served repository directory answers with, beyond its own files.
+/// The rules that override the files of the served repository directory.
 #[derive(Default)]
 pub struct Policy {
-    /// Request paths answered 404 whatever the directory holds.
+    /// The request paths that get a 404 answer, whatever the directory holds.
     hidden: HashSet<String>,
-    /// Request paths whose body is replaced by these bytes.
+    /// The request paths, each with the bytes that replace its body.
     tampered: HashMap<String, Vec<u8>>,
-    /// Request paths answered with a body shorter than the length it declares,
-    /// which cuts the connection mid-response.
+    /// The request paths that get a body shorter than its declared length, so
+    /// hyper cuts the connection in the middle of the response.
     truncated: HashSet<String>,
-    /// Request paths cut the same way for as many requests as the count left,
-    /// and served whole after that.
+    /// The request paths that get the same cut body, each with the number of
+    /// cut answers left.
+    ///
+    /// If the count is 0, the server sends the full body.
     truncate_first: HashMap<String, usize>,
 }
 
-/// Which server leaf a TLS [`RepoServer`] presents.
+/// The server leaf certificate that a TLS [`RepoServer`] presents.
 #[derive(Clone, Copy)]
 pub enum Leaf {
-    /// Signed by the fixture authority, valid, covering `localhost` and
+    /// A valid leaf that the fixture authority signed, for `localhost` and
     /// `127.0.0.1`.
     Fixture,
-    /// Signed by the fixture authority and valid, covering neither name.
+    /// A valid leaf that the fixture authority signed, for neither
+    /// `localhost` nor `127.0.0.1`.
     OtherName,
-    /// Covering both names and valid, signed by an authority nothing trusts.
+    /// A valid leaf for `localhost` and `127.0.0.1`, signed by an authority
+    /// that no client trusts.
     Untrusted,
 }
 
 impl Leaf {
-    /// The certificate and the private key, both PEM-encoded.
+    /// Returns the certificate and the private key of the leaf, in PEM
+    /// encoding.
     fn pem(self) -> (&'static [u8], &'static [u8]) {
         match self {
             Leaf::Fixture => (SERVER_CERT_PEM, SERVER_KEY_PEM),
@@ -195,13 +206,13 @@ pub struct RepoServer {
     addr: SocketAddr,
     tls: bool,
     seen: Arc<Mutex<Vec<String>>>,
-    /// Each request path with the status it was answered with, in the order
-    /// the answers were made.
+    /// Each request path with the status of its answer, in the order of the
+    /// answers.
     answered: Arc<Mutex<Vec<(String, u16)>>>,
     policy: Arc<Mutex<Policy>>,
-    /// The most requests the server had in flight at once.
+    /// The largest number of requests in flight at the same time.
     peak: Arc<AtomicUsize>,
-    /// How many connections the server accepted.
+    /// The number of connections that the server accepted.
     connections: Arc<AtomicUsize>,
 }
 
@@ -210,8 +221,10 @@ impl RepoServer {
         RepoServer::start_with_leaf(root, tls, Leaf::Fixture).await
     }
 
-    /// A server presenting `leaf`, which decides which of the server
-    /// certificate checks a TLS client can complete.
+    /// Starts a server that presents `leaf`.
+    ///
+    /// The leaf sets which server certificate checks a TLS client can
+    /// complete.
     pub async fn start_with_leaf(root: &Path, tls: bool, leaf: Leaf) -> RepoServer {
         let root = root.to_path_buf();
         let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
@@ -284,12 +297,13 @@ impl RepoServer {
         format!("{scheme}://localhost:{}", self.addr.port())
     }
 
-    /// The request paths the server saw, in order, without the leading slash.
+    /// Returns the request paths that the server received, in order, without
+    /// the leading slash.
     pub fn seen(&self) -> Vec<String> {
         self.seen.lock().unwrap().clone()
     }
 
-    /// The request paths the server saw, as a set.
+    /// Returns the request paths that the server received, as a set.
     pub fn seen_set(&self) -> HashSet<String> {
         self.seen().into_iter().collect()
     }
@@ -322,7 +336,7 @@ impl RepoServer {
             .insert(path.to_owned());
     }
 
-    /// Cut the next `times` responses for `path`, and serve it whole after.
+    /// Cuts the next `times` responses for `path`, then serves the full body.
     pub fn truncate_times(&self, path: &str, times: usize) {
         self.policy
             .lock()
@@ -331,12 +345,12 @@ impl RepoServer {
             .insert(path.to_owned(), times);
     }
 
-    /// How many requests the server saw for `path`.
+    /// Returns the number of requests that the server received for `path`.
     pub fn requests_for(&self, path: &str) -> usize {
         self.seen().iter().filter(|seen| *seen == path).count()
     }
 
-    /// The statuses the server answered the requests for `path` with, in
+    /// Returns the statuses of the answers to the requests for `path`, in
     /// order.
     pub fn statuses_for(&self, path: &str) -> Vec<u16> {
         self.answered
@@ -363,7 +377,7 @@ pub type ServeState = (
     Arc<AtomicUsize>,
 );
 
-/// Serve one connection out of the repository directory.
+/// Serves one connection from the repository directory.
 pub async fn serve<S>(io: S, h2: bool, state: ServeState)
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -379,8 +393,8 @@ where
             seen.lock().unwrap().push(path.clone());
             let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
             peak.fetch_max(now, Ordering::SeqCst);
-            // A small delay widens the window in which concurrent requests
-            // overlap, so the peak the pull reaches is what the counter sees.
+            // A small delay makes the overlap of concurrent requests longer,
+            // so the counter sees the peak that the pull reaches.
             ostrya_rt::Timer::after(std::time::Duration::from_millis(5)).await;
             let response = answer(&root, &path, &policy);
             answered
@@ -402,7 +416,7 @@ where
     }
 }
 
-/// The response for one request path.
+/// Returns the response for one request path.
 pub fn answer(root: &Path, path: &str, policy: &Mutex<Policy>) -> Response<FileBody> {
     let (hidden, replacement, truncated) = {
         let mut policy = policy.lock().unwrap();
@@ -430,8 +444,8 @@ pub fn answer(root: &Path, path: &str, policy: &Mutex<Policy>) -> Response<FileB
         },
     };
     if truncated {
-        // Declaring more than the body carries makes hyper cut the connection
-        // once the body ends short.
+        // The declared length is more than the body holds, so hyper cuts the
+        // connection when the body ends early.
         return Response::builder()
             .status(StatusCode::OK)
             .body(FileBody {
@@ -459,7 +473,7 @@ pub fn not_found() -> Response<FileBody> {
         .unwrap()
 }
 
-/// The fixture server's rustls configuration.
+/// Returns the rustls configuration of the fixture server.
 pub fn server_config(alpn: &[&str], leaf: Leaf) -> rustls::ServerConfig {
     let provider = Arc::new(rustls_graviola::default_provider());
     let (cert_pem, key_pem) = leaf.pem();
@@ -481,7 +495,8 @@ pub fn server_config(alpn: &[&str], leaf: Leaf) -> rustls::ServerConfig {
 
 // --- repository helpers ----------------------------------------------------
 
-/// Run the `ostree` tool and assert it succeeded.
+/// Runs the `ostree` command, asserts that it succeeds, and returns its
+/// standard output.
 pub fn ostree(args: &[&str]) -> Vec<u8> {
     let out = Command::new("ostree")
         .args(args)
@@ -495,8 +510,10 @@ pub fn ostree(args: &[&str]) -> Vec<u8> {
     out.stdout
 }
 
-/// Build a small source tree under `dir`: two regular files of differing modes,
-/// a symlink, and a nested subdirectory.
+/// Builds a small source tree under `dir`.
+///
+/// The tree holds two regular files with different modes, a symlink, and a
+/// nested subdirectory.
 pub fn build_tree(dir: &Path, marker: &[u8]) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -513,12 +530,16 @@ pub fn build_tree(dir: &Path, marker: &[u8]) {
     std::fs::set_permissions(dir.join("exec.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// `len` bytes of a fixed sequence a compressor cannot shrink.
+/// Returns `len` bytes of a fixed sequence that a compressor cannot make
+/// smaller.
 ///
-/// A content object reaches the wire deflated, so a compressible body would leave
-/// the payload a fraction of the size its header declares and the receive path's
-/// buffers would hold it whole whatever the object's own size is. An xorshift
-/// sequence deflates to stored blocks, so the body is as long as the payload.
+/// A content object goes on the wire in deflated form. If the body compresses
+/// well, the payload on the wire is a small fraction of the size that its
+/// header declares. The buffers of the receive path can then hold the full
+/// payload, whatever the size of the object.
+///
+/// An xorshift sequence deflates to stored blocks, so the body is as long as
+/// the payload.
 pub fn incompressible(len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(len + 8);
     let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -532,8 +553,11 @@ pub fn incompressible(len: usize) -> Vec<u8> {
     out
 }
 
-/// The largest `.filez` object the archive repository at `repo` stores, which is
-/// the longest body a pull from it takes off a connection.
+/// Returns the size of the largest `.filez` object in the archive repository at
+/// `repo`.
+///
+/// This size is the longest body that a pull from the repository reads from a
+/// connection.
 pub fn largest_filez(repo: &Path) -> u64 {
     let mut largest = 0;
     for shard in std::fs::read_dir(repo.join("objects")).unwrap() {
@@ -547,7 +571,8 @@ pub fn largest_filez(repo: &Path) -> u64 {
     largest
 }
 
-/// The `ostree.ref-binding` metadata dict binding a commit to `branch`.
+/// Returns the `ostree.ref-binding` metadata dict that binds a commit to
+/// `branch`.
 pub fn ref_binding(branch: &str) -> Value {
     Value::Array(vec![Value::Tuple(vec![
         Value::Str("ostree.ref-binding".to_owned()),
@@ -558,7 +583,7 @@ pub fn ref_binding(branch: &str) -> Value {
     ])])
 }
 
-/// A small `a{sv}` dict a commit's detached metadata can carry.
+/// Returns a small `a{sv}` dict for the detached metadata of a commit.
 pub fn detached_dict() -> Value {
     Value::Array(vec![Value::Tuple(vec![
         Value::Str("test.detached".to_owned()),
@@ -569,8 +594,11 @@ pub fn detached_dict() -> Value {
     ])])
 }
 
-/// Commit subtree `sub` of `base` into `repo` under `branch`, with a fixed
-/// timestamp and the branch's ref binding.
+/// Commits the subtree `sub` of `base` into `repo` under `branch`.
+///
+/// The commit gets the timestamp `timestamp` and the ref binding of `branch`.
+/// The import uses the modifier flags `SKIP_XATTRS` and
+/// `CANONICAL_PERMISSIONS`. The function sets `branch` to the commit.
 pub async fn commit_tree(
     repo: &Repo,
     base: &Path,
@@ -591,7 +619,8 @@ pub async fn commit_tree(
     .await
 }
 
-/// Commit subtree `sub` as [`commit_tree`] does, under the given modifier flags.
+/// Commits the subtree `sub` as [`commit_tree`] does, with the modifier flags
+/// `flags`.
 #[allow(clippy::too_many_arguments)]
 pub async fn commit_tree_with(
     repo: &Repo,
@@ -628,8 +657,10 @@ pub async fn commit_tree_with(
     commit
 }
 
-/// A remote archive repository under `dir/remote`, holding `test/main` over the
-/// small tree, with a summary.
+/// Builds a remote archive repository under `dir/remote`, with a summary.
+///
+/// The ref `test/main` names a commit of the small tree that `build_tree`
+/// writes.
 pub async fn build_remote(dir: &Path) -> (Repo, Checksum) {
     let src = dir.join("src");
     build_tree(&src, b"hello\n");
@@ -646,9 +677,12 @@ pub async fn build_remote(dir: &Path) -> (Repo, Checksum) {
     (repo, commit)
 }
 
-/// A remote archive repository under `dir/remote` holding one commit named by
-/// both `test/main` and `test/other`, whose `ostree.ref-binding` lists
-/// `test/main` alone, with a summary listing both refs.
+/// Builds a remote archive repository under `dir/remote` with one commit and
+/// two refs.
+///
+/// The refs `test/main` and `test/other` both name the commit. The
+/// `ostree.ref-binding` of the commit lists only `test/main`. The summary lists
+/// both refs.
 pub async fn build_remote_two_refs(dir: &Path) -> (Repo, Checksum) {
     let src = dir.join("src");
     build_tree(&src, b"hello\n");
@@ -668,13 +702,13 @@ pub async fn build_remote_two_refs(dir: &Path) -> (Repo, Checksum) {
     (repo, commit)
 }
 
-/// A destination repository under `dir/dest` whose config names `origin` at
-/// `url`, with the extra `[remote]` keys `extra` supplies.
+/// Creates a destination repository under `dir/dest` with the remote `origin`
+/// at `url`.
 ///
-/// The section turns `gpg-verify` off, since the default is on and these
-/// remotes publish unsigned commits; `extra` is written after it, so a
-/// verification test states its own policy there and the repeated key takes the
-/// last value.
+/// The section of `origin` sets `gpg-verify=false`, because the default is on
+/// and the test remotes publish unsigned commits. The function writes the extra
+/// `[remote]` keys of `extra` after this key. A verification test sets its own
+/// policy in `extra`, and the last value of a repeated key applies.
 pub async fn build_dest(dir: &Path, mode: RepoMode, url: &str, extra: &str) -> Repo {
     let path = dir.join("dest");
     let repo = Repo::create(&path, CreateOptions::new(mode)).await.unwrap();
@@ -688,9 +722,11 @@ pub async fn build_dest(dir: &Path, mode: RepoMode, url: &str, extra: &str) -> R
     Repo::open(&path).await.unwrap()
 }
 
-/// Rewrite the `origin` section of the destination at `dir/dest` and reopen it,
-/// which is how a test states a second policy over a repository that already
-/// holds what an earlier pull landed.
+/// Rewrites the `origin` section of the destination at `dir/dest` and opens
+/// the repository again.
+///
+/// A test sets a second policy with this function on a repository that holds
+/// the result of an earlier pull.
 pub async fn reconfigure_dest(dir: &Path, url: &str, extra: &str) -> Repo {
     let path = dir.join("dest");
     let config = path.join("config");
@@ -704,19 +740,23 @@ pub async fn reconfigure_dest(dir: &Path, url: &str, extra: &str) -> Repo {
     Repo::open(&path).await.unwrap()
 }
 
-/// The loose object path of a content object as an archive remote serves it.
+/// Returns the loose object path of a content object, as an archive remote
+/// serves it.
 pub fn filez_path(checksum: &str) -> String {
     format!("objects/{}/{}.filez", &checksum[..2], &checksum[2..])
 }
 
-/// The loose object path of a metadata object.
+/// Returns the loose object path of a metadata object.
 pub fn meta_path(checksum: &Checksum, ext: &str) -> String {
     let hex = checksum.to_hex();
     format!("objects/{}/{}.{ext}", &hex[..2], &hex[2..])
 }
 
-/// Assert that the repository holds no ref and no object beyond what it started
-/// with, which is what a failed pull leaves behind.
+/// Asserts that the repository holds no local ref under `refs/heads`.
+///
+/// The tests call it after a failed pull. The second assertion filters the same local
+/// refs by the prefix `refs/remotes`, so it adds no check. The function does
+/// not check the remote refs or the objects.
 pub async fn assert_nothing_published(repo: &Repo) {
     assert!(repo.list_refs(None).await.unwrap().is_empty());
     assert!(
@@ -727,8 +767,10 @@ pub async fn assert_nothing_published(repo: &Repo) {
     );
 }
 
-/// Every content object of the tree `build_tree` writes, by checksum, as the
-/// source repository named them.
+/// Returns the checksum of each content object of the tree that `build_tree`
+/// writes, in sorted order.
+///
+/// The checksums are the names of the objects in the source repository.
 pub async fn content_checksums(repo: &Repo, commit: &Checksum) -> Vec<Checksum> {
     let reachable = repo.traverse_commit(commit, -1).await.unwrap();
     let mut out: Vec<Checksum> = reachable

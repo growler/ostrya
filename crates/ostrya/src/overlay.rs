@@ -1,49 +1,13 @@
-//! Overlay changeset import: merging an overlayfs upperdir into a mutable tree.
+//! The overlay merge of a transaction.
 //!
-//! [`Transaction::merge_overlay_dfd_to_mtree`] walks an overlayfs upperdir and
-//! applies it as a changeset onto a [`MutableTree`](crate::MutableTree) holding
-//! the lower layer the overlay was mounted over. It is a port extension with no
-//! `ostree` tool counterpart and no on-disk format impact: the deletions a
-//! changeset expresses apply to the in-memory tree during the walk and never
-//! serialize.
+//! The doc of `Transaction::merge_overlay_dfd_to_mtree` holds the behavior
+//! that a caller sees.
 //!
-//! It is a separate walk rather than filesystem ingest ([`crate::ingest`])
-//! followed by a tree merge because a [`MutableTree`](crate::MutableTree) has no
-//! tombstone representation; a whiteout has to act on the base tree as the walk
-//! reaches it. The walk still reuses the 7c helpers -- canonical permissions,
-//! the filter and callback hooks, dirmeta assembly -- and the 7a object writers.
-//!
-//! Overlay mechanics recognized during the walk:
-//!
-//! - A whiteout (a character device with device number 0:0) removes the
-//!   corresponding path from the base tree.
-//! - An opaque directory (`trusted.overlay.opaque` or `user.overlay.opaque`
-//!   set to `y`) clears the base subtree at that name before the upper entries
-//!   are ingested. Both namespaces are honored: a rootless `userxattr` overlay
-//!   writes `user.*`, while `trusted.*` is invisible to an unprivileged reader.
-//! - A merged (non-opaque) directory takes its dirmeta from the upper inode,
-//!   since overlayfs copies a directory up with its metadata.
-//! - Every xattr whose name starts with `trusted.overlay.` or `user.overlay.`
-//!   is stripped from every ingested file, symlink, and directory, dirmeta
-//!   included; every other xattr is kept, including one whose name only
-//!   contains `overlay`.
-//! - `overlay.metacopy` and `overlay.redirect` entries are hard errors: such an
-//!   entry is not self-contained, so the overlay must be mounted with those
-//!   features disabled.
-//! - A cross-type replacement drops the base entry and applies the upper one:
-//!   an upper file or symlink over a base directory removes the directory, and
-//!   an upper directory over a base file or symlink removes the leaf and creates
-//!   a fresh directory. usrmerge-style migrations move a directory to a symlink,
-//!   and overlayfs records that as a plain non-opaque leaf, since a non-directory
-//!   upper entry shadows a lower entry of any type without a whiteout or opaque
-//!   marker.
-//!
-//! Whiteouts and opaque markers are merge mechanics, not content: the modifier
-//! callbacks never see them, and a filter `Skip` on an upper entry leaves the
-//! base version untouched. The overlay-namespace strip runs before the filter
-//! and the modifier callbacks see an entry's xattr set; a modifier's xattr
-//! callback can still write a stripped name back, since nothing strips it
-//! again afterward.
+//! The merge is a separate walk. A file system ingest and a tree merge after
+//! it cannot do this work, because a `MutableTree` has no tombstone form. A
+//! whiteout must act on the base tree when the walk gets to it. The walk uses
+//! the helpers of `ingest.rs` (canonical permissions, the filter and callback
+//! hooks, the dirmeta assembly) and the object writers of `write.rs`.
 
 use std::future::Future;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -61,21 +25,113 @@ use crate::mtree::MutableTree;
 use crate::transaction::Transaction;
 use crate::write::FileMeta;
 
-/// The two extended-attribute namespace prefixes overlayfs uses for its control
-/// attributes: `trusted.*` for a privileged overlay, `user.*` for a rootless
-/// `userxattr` overlay.
+/// The two xattr namespace prefixes of the overlayfs control attributes.
+///
+/// A privileged overlay uses `trusted.*`, and a rootless `userxattr` overlay
+/// uses `user.*`.
 const OVERLAY_PREFIXES: [&[u8]; 2] = [b"trusted.overlay.", b"user.overlay."];
 
+/// Methods that merge an overlayfs upper directory into a mutable tree.
 impl Transaction {
-    /// Merge the overlayfs upperdir rooted at `dfd` into `mtree`, applying its
-    /// changeset onto the lower layer the tree holds.
+    /// Merges the overlayfs upper directory at `dfd` into `mtree`.
     ///
-    /// `dfd` is the upperdir root; the overlay is expected to be unmounted,
-    /// which is not checked. Whiteouts remove base paths, opaque directories
-    /// clear base subtrees, and every other entry ingests through the object
-    /// writers and replaces or extends the base tree. `modifier` shapes the
-    /// ingested entries exactly as it does a filesystem walk; the whiteouts and
-    /// opaque markers it never sees.
+    /// `dfd` is the root of the upper directory (the `upperdir` of the mount).
+    /// `mtree` holds the lower layer that the overlay was mounted over. The
+    /// merge applies the upper directory to `mtree` as a changeset. The overlay
+    /// must be unmounted, and the call does not check this.
+    ///
+    /// Each upper entry other than a whiteout becomes an object, and the entry
+    /// replaces or extends the base tree. The merge is an ostrya extension
+    /// with no counterpart in the `ostree` command. It changes no on-disk
+    /// format, because a deletion acts on the in-memory tree during the walk.
+    ///
+    /// # Overlay rules
+    ///
+    /// - A whiteout (a character device with device number 0:0) removes its
+    ///   path from the base tree. If the base tree has no entry at the path,
+    ///   the whiteout has no effect.
+    /// - An opaque directory (`trusted.overlay.opaque` or
+    ///   `user.overlay.opaque` set to `y`) clears the base subtree at its name.
+    ///   The merge then reads the upper entries. An opaque root clears the
+    ///   whole base tree.
+    /// - The merge reads both xattr namespaces. A rootless `userxattr` overlay
+    ///   writes `user.*`, and an unprivileged reader cannot see `trusted.*`.
+    /// - A merged (non-opaque) directory takes its dirmeta from the upper
+    ///   inode, because overlayfs copies a directory up with its metadata. The
+    ///   root of the upper directory is a merged directory too.
+    /// - The merge removes each xattr whose name starts with `trusted.overlay.`
+    ///   or `user.overlay.` from each file, symlink, and directory that it
+    ///   records, dirmeta included. It keeps every other xattr, also an xattr
+    ///   whose name contains `overlay` at another position.
+    /// - An entry with an `overlay.metacopy` or `overlay.redirect` xattr is an
+    ///   error, because such an entry is not self-contained. The overlay must
+    ///   be mounted with these features off (`metacopy=off` and
+    ///   `redirect_dir=off`).
+    /// - An upper entry replaces a base entry of a different type. An upper
+    ///   file or symlink over a base directory removes the directory. An upper
+    ///   directory over a base file or symlink removes the leaf and creates a
+    ///   new directory.
+    ///
+    /// A usrmerge migration changes a directory to a symlink. Overlayfs
+    /// records this change as a plain leaf with no whiteout and no opaque
+    /// marker. A non-directory upper entry hides a lower entry of any type.
+    ///
+    /// # Modifier
+    ///
+    /// A [`CommitModifier`] applies to each recorded entry the steps that
+    /// [`write_dfd_to_mtree`](Transaction::write_dfd_to_mtree) lists under
+    /// its `Modifier` heading. The root of the upper directory goes through
+    /// each step except the filter. The merge does not use a
+    /// [`DevInoCache`](crate::DevInoCache) or
+    /// [`CONSUME`](CommitModifierFlags::CONSUME).
+    ///
+    /// Whiteouts and opaque markers are merge mechanics, and the modifier
+    /// does not see them. The other rules for a modifier are these:
+    ///
+    /// - If the filter returns [`FilterResult::Skip`] for an upper entry, the
+    ///   base entry stays as it is. For a directory, the merge skips the whole
+    ///   upper subtree.
+    /// - The merge removes the overlay xattrs before the filter and the
+    ///   callbacks see the xattr set of an entry. The xattr callback can add a
+    ///   removed name again, and the merge does not remove it a second time.
+    /// - Under [`SKIP_XATTRS`](CommitModifierFlags::SKIP_XATTRS), the merge
+    ///   still reads the xattrs of each entry for the overlay rules. The
+    ///   recorded entry has no xattrs.
+    /// - The merge checks for `overlay.metacopy` and `overlay.redirect` before
+    ///   the filter, so an entry that the filter skips can cause the error.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`,
+    ///   or if an upper entry is not a directory, a regular file, a symlink,
+    ///   or a whiteout.
+    /// - [`Error::Unsupported`] if `[ex-integrity] fsverity` is `yes` and the
+    ///   fs-verity seal of an object fails.
+    /// - [`Error::UnsupportedOverlayFeature`] if an upper entry has an
+    ///   `overlay.metacopy` or `overlay.redirect` xattr in one of the two
+    ///   namespaces.
+    /// - [`Error::InvalidFormat`] if an entry name or a symlink target is not
+    ///   valid UTF-8.
+    /// - [`Error::InvalidFormat`] if the label callback returns no label and
+    ///   [`ERROR_ON_UNLABELED`](CommitModifierFlags::ERROR_ON_UNLABELED) is
+    ///   set.
+    /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
+    ///   `[ex-integrity] composefs` in the repository config is malformed.
+    /// - [`Error::InvalidFormat`] if the repository is in `bare` mode and an
+    ///   xattr name of a symlink is not valid UTF-8.
+    /// - [`Error::InsufficientFreeSpace`] if an object needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::ObjectNotFound`] if a lazy subdirectory of `mtree` names a
+    ///   dirtree that the repository does not hold.
+    /// - [`Error::Core`] if the dirtree of a lazy subdirectory does not parse,
+    ///   or if the xattr set with a label is not valid.
+    /// - [`Error::Core`] if the mode callback returns a file type that the
+    ///   object writer refuses for the entry.
+    /// - [`Error::Core`] if a `[core]` or `[archive]` value in the repository
+    ///   config is malformed.
+    /// - [`Error::Core`] if `dfd` is not a directory: the dirmeta writer
+    ///   refuses the file type of the root.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn merge_overlay_dfd_to_mtree(
         &self,
         dfd: BorrowedFd<'_>,
@@ -97,8 +153,9 @@ impl Transaction {
             self.mark_generate_sizes();
         }
 
-        // The upperdir root is a merged directory: its own metadata becomes the
-        // base root's dirmeta, and a root marked opaque clears the whole base.
+        // The root of the upper directory is a merged directory. Its metadata
+        // becomes the dirmeta of the base root. An opaque root clears the whole
+        // base.
         let root_fd = dfd.try_clone_to_owned()?;
         let (uid, gid, dmode, root_xattrs) = {
             let fd = root_fd.as_fd().try_clone_to_owned()?;
@@ -119,7 +176,7 @@ impl Transaction {
     }
 }
 
-/// One directory entry captured from the upperdir in a blocking snapshot.
+/// One entry of an upper directory, read in a blocking snapshot.
 struct OverlayEntry {
     name: String,
     kind: OverlayKind,
@@ -127,36 +184,38 @@ struct OverlayEntry {
     gid: u32,
     /// The full `st_mode`, including the file-type bits.
     mode: u32,
-    /// The `st_size` the snapshot read, which bounds the read-ahead of a
+    /// The `st_size` that the snapshot read. It bounds the read-ahead of a
     /// regular file.
     size: u64,
-    /// The entry's full on-disk xattr set, including any `trusted.overlay.`
-    /// or `user.overlay.` attribute; the merge reads those for its decisions
-    /// and strips them from the ingested object.
+    /// The full xattr set of the entry on disk, with each `trusted.overlay.`
+    /// or `user.overlay.` attribute. The merge reads these attributes for its
+    /// decisions and removes them from the recorded object.
     xattrs: Xattrs,
 }
 
-/// What kind of upperdir entry the merge is looking at.
+/// The kind of an upper directory entry.
 enum OverlayKind {
     Dir,
     Regular,
     Symlink(String),
-    /// A character device with device number 0:0: a deletion marker.
+    /// A character device with device number 0:0, which marks a deletion.
     Whiteout,
 }
 
-/// The boxed future for the recursive walk; async recursion needs indirection,
-/// so each level returns a boxed future.
+/// The boxed future of one level of the recursive walk.
+///
+/// Async recursion needs indirection, so each level returns a boxed future.
 type WalkFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
-/// Merge one upperdir directory into `node`.
+/// Merges one upper directory into `node`.
 ///
-/// `dir_meta` is this directory's fully adjusted metadata, computed by the
-/// caller so the filter and the user callbacks fire once per directory; it is
-/// written as `node`'s dirmeta. The caller has already cleared the node when
-/// this directory is opaque (an opaque child through `remove` + `ensure_dir`,
-/// the opaque root through `clear_children`), so this level only sets the
-/// dirmeta and ingests the entries.
+/// `dir_meta` is the fully adjusted metadata of this directory. The caller
+/// computes it, so the filter and the user callbacks run once for each
+/// directory. The function writes it as the dirmeta of `node`.
+///
+/// If this directory is opaque, the caller clears the node first: an opaque
+/// child through `remove` and `ensure_dir`, and the opaque root through
+/// `clear_children`. This level only sets the dirmeta and records the entries.
 fn merge_dir<'a>(
     txn: &'a Transaction,
     dir_fd: OwnedFd,
@@ -172,13 +231,13 @@ fn merge_dir<'a>(
         let owner = Owner::of(modifier.as_deref());
         let skip_xattrs = flags.contains(CommitModifierFlags::SKIP_XATTRS);
 
-        // This directory's dirmeta comes from the upper inode.
+        // The dirmeta of this directory comes from the upper inode.
         let dirmeta = txn.write_dirmeta(&to_dirmeta(&dir_meta)).await?;
         node.set_metadata_checksum(dirmeta);
 
-        // Read the upper directory in one blocking pass, always with xattrs and
-        // the device number: the merge decisions depend on both regardless of
-        // SKIP_XATTRS, which only governs the ingested content xattr set.
+        // The merge reads the upper directory in one blocking pass, always with
+        // the xattrs and the device number. The merge decisions use both, also under
+        // SKIP_XATTRS. SKIP_XATTRS controls only the xattr set of the content.
         let snap = {
             let dir = dir_fd.as_fd().try_clone_to_owned()?;
             ostrya_rt::unblock(move || snapshot_overlay(dir.as_fd())).await?
@@ -187,14 +246,15 @@ fn merge_dir<'a>(
         for entry in snap {
             let cb_path = join_path(&path, &entry.name);
 
-            // A whiteout is a merge mechanic: no callbacks, it just removes the
-            // base path, whether or not the base has an entry there.
+            // A whiteout is a merge mechanic. It runs no callback and removes
+            // the base path. If the base has no entry there, nothing changes.
             if matches!(entry.kind, OverlayKind::Whiteout) {
                 node.remove(&entry.name, true)?;
                 continue;
             }
 
-            // metacopy and redirect entries are not self-contained.
+            // An entry with `overlay.metacopy` or `overlay.redirect` is not
+            // self-contained.
             if has_overlay_attr(&entry.xattrs, b"metacopy") {
                 return Err(Error::UnsupportedOverlayFeature(format!(
                     "overlay.metacopy on {cb_path}; mount the overlay with metacopy=off"
@@ -215,8 +275,8 @@ fn merge_dir<'a>(
             };
             let filter_meta = adjust_meta(flags, owner, base, is_symlink);
 
-            // A filter Skip leaves the base version in place: the upper change is
-            // not applied, and the base entry (if any) is untouched.
+            // If the filter returns Skip, the base version stays. The merge does
+            // not apply the upper change and does not touch the base entry.
             if let Some(m) = modifier.as_deref_mut()
                 && let Some(filter) = &mut m.filter
                 && filter(Path::new(&cb_path), &filter_meta) == FilterResult::Skip
@@ -237,11 +297,11 @@ fn merge_dir<'a>(
                     )?;
                     let reader = FileReader::with_len_hint(fd.into(), entry.size);
                     let checksum = txn.write_content(None, &meta, reader).await?;
-                    // The leaf wins: drop whatever the base held at this name
-                    // (file, symlink, or directory) before applying the override.
-                    // A non-directory upper entry shadows a lower entry of any
-                    // type, so a directory-to-leaf replacement arrives here as a
-                    // plain entry with no whiteout or opaque marker.
+                    // The leaf replaces the base entry at this name (a file, a
+                    // symlink, or a directory). A non-directory upper entry hides
+                    // a lower entry of any type. For this reason, a replacement
+                    // of a directory with a leaf arrives here as a plain entry
+                    // with no whiteout and no opaque marker.
                     node.remove(&entry.name, true)?;
                     node.replace_file(&entry.name, checksum)?;
                 }
@@ -249,17 +309,17 @@ fn merge_dir<'a>(
                     let meta =
                         finalize_meta(modifier.as_deref_mut(), Path::new(&cb_path), filter_meta)?;
                     let checksum = txn.write_symlink(&target, &meta, None).await?;
-                    // The leaf wins: drop whatever the base held before applying.
+                    // The leaf replaces the base entry at this name.
                     node.remove(&entry.name, true)?;
                     node.replace_file(&entry.name, checksum)?;
                 }
                 OverlayKind::Dir => {
-                    // An opaque directory replaces whatever is at this name with a
-                    // fresh directory holding only the upper entries. A non-opaque
-                    // directory merges over a base directory, but when the base
-                    // holds a file or symlink at the name the directory wins: the
-                    // base leaf is dropped and a fresh directory takes its place,
-                    // since `ensure_dir` cannot merge onto a file entry.
+                    // An opaque directory replaces the entry at this name with a
+                    // new directory that holds only the upper entries. A
+                    // non-opaque directory merges over a base directory. If the
+                    // base holds a file or a symlink at the name, the merge
+                    // removes the base leaf and creates a new directory.
+                    // `ensure_dir` cannot merge onto a file entry.
                     if is_opaque(&entry.xattrs) || node.file_checksum(&entry.name).is_some() {
                         node.remove(&entry.name, true)?;
                     }
@@ -276,22 +336,24 @@ fn merge_dir<'a>(
     })
 }
 
-/// Whether a device number denotes an overlayfs whiteout (major 0, minor 0).
+/// Returns `true` if a device number marks an overlayfs whiteout (0:0).
 fn is_whiteout(rdev: u64) -> bool {
     rustix::fs::major(rdev) == 0 && rustix::fs::minor(rdev) == 0
 }
 
-/// Read a directory's own owner, mode, and full xattr set from its fd.
+/// Reads the owner, the mode, and the full xattr set of a directory.
 fn read_dir_own(dir: BorrowedFd<'_>) -> Result<(u32, u32, u32, Xattrs)> {
     let stat = rustix::fs::fstat(dir)?;
     let xattrs = crate::object::read_all_xattrs(dir)?;
     Ok((stat.st_uid, stat.st_gid, stat.st_mode, xattrs))
 }
 
-/// Capture one upperdir directory's entries in a single blocking pass. Each
-/// entry's own xattrs are always read -- the merge needs the `overlay.*`
-/// attributes and the device number regardless of SKIP_XATTRS. A symlink's
-/// xattrs are read no-follow, the link itself rather than its target.
+/// Reads the entries of one upper directory in one blocking pass.
+///
+/// The function always reads the xattrs and the device number of each entry.
+/// The merge needs the `overlay.*` attributes and the device number also
+/// under SKIP_XATTRS. It reads the xattrs of a symlink with no-follow,
+/// from the link itself.
 fn snapshot_overlay(dir: BorrowedFd<'_>) -> Result<Vec<OverlayEntry>> {
     let mut entries = Vec::new();
     for entry in Dir::read_from(dir)? {
@@ -344,9 +406,10 @@ fn snapshot_overlay(dir: BorrowedFd<'_>) -> Result<Vec<OverlayEntry>> {
     Ok(entries)
 }
 
-/// Read an upperdir entry's own xattrs, no-follow. A regular file or directory
-/// is opened and read from its fd; a symlink is read through the path-based
-/// no-follow reader.
+/// Reads the xattrs of one upper directory entry with no-follow.
+///
+/// The function opens a regular file or a directory and reads from its
+/// descriptor. It reads a symlink through the path-based no-follow reader.
 fn read_entry_xattrs(dir: BorrowedFd<'_>, name: &str, kind: &OverlayKind) -> Result<Xattrs> {
     let oflags = match kind {
         OverlayKind::Regular => OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -358,7 +421,7 @@ fn read_entry_xattrs(dir: BorrowedFd<'_>, name: &str, kind: &OverlayKind) -> Res
     crate::object::read_all_xattrs(fd.as_fd())
 }
 
-/// Open a subdirectory of `parent` no-follow.
+/// Opens the subdirectory `name` of `parent` with no-follow.
 fn open_dir(parent: BorrowedFd<'_>, name: &str) -> Result<OwnedFd> {
     Ok(rustix::fs::openat(
         parent,
@@ -368,9 +431,10 @@ fn open_dir(parent: BorrowedFd<'_>, name: &str) -> Result<OwnedFd> {
     )?)
 }
 
-/// The xattr set an ingested object should carry: the on-disk set with every
-/// `trusted.overlay.` or `user.overlay.` attribute removed, or empty under
-/// SKIP_XATTRS.
+/// Returns the xattr set of a recorded object.
+///
+/// The set is the set on disk without each `trusted.overlay.` or
+/// `user.overlay.` attribute. Under SKIP_XATTRS, the set is empty.
 fn content_xattrs(skip: bool, full: &Xattrs) -> Result<Xattrs> {
     if skip {
         return Ok(Xattrs::empty());
@@ -383,13 +447,15 @@ fn content_xattrs(skip: bool, full: &Xattrs) -> Result<Xattrs> {
     Ok(Xattrs::new(pairs)?)
 }
 
-/// Whether an xattr name is in one of the overlay control namespaces.
+/// Returns `true` if an xattr name is in one of the overlay control namespaces.
 fn is_overlay_name(name: &[u8]) -> bool {
     OVERLAY_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
-/// Whether the xattr set carries `<ns>.overlay.<suffix>` in either namespace.
-/// With `require_y`, the value must be exactly `y` (the opaque marker).
+/// Returns `true` if the xattr set holds `<ns>.overlay.<suffix>`.
+///
+/// `<ns>` is one of the two namespaces. If `require_y` is set, the value must
+/// be exactly `y` (the opaque marker).
 fn overlay_attr_present(xattrs: &Xattrs, suffix: &[u8], require_y: bool) -> bool {
     xattrs.iter().any(|(name, value)| {
         let matches_name = OVERLAY_PREFIXES.iter().any(|p| {
@@ -403,13 +469,14 @@ fn overlay_attr_present(xattrs: &Xattrs, suffix: &[u8], require_y: bool) -> bool
     })
 }
 
-/// Whether a directory is opaque (`overlay.opaque` set to `y`).
+/// Returns `true` if a directory is opaque (`overlay.opaque` set to `y`).
 fn is_opaque(xattrs: &Xattrs) -> bool {
     overlay_attr_present(xattrs, b"opaque", true)
 }
 
-/// Whether an entry carries the named overlay feature attribute (presence
-/// alone, any value).
+/// Returns `true` if an entry has the named overlay feature attribute.
+///
+/// The value of the attribute does not matter.
 fn has_overlay_attr(xattrs: &Xattrs, suffix: &[u8]) -> bool {
     overlay_attr_present(xattrs, suffix, false)
 }

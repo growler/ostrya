@@ -1,13 +1,18 @@
-//! `Repo::send`, the serving side of the pull over ssh: the files of a commit
-//! from a repository of each mode, the replies of paths that are not found,
-//! the pipeline of `Get` frames, the version reply, each error code of the
-//! pull, the abandon of a body that fails after its reply, and the shape of
-//! the writes and the flushes on the output.
+//! Tests of `Repo::send`, the serving side of the pull over ssh. The tests
+//! cover:
+//!
+//! - the files of a commit from a repository of each mode
+//! - the replies to paths that are not found
+//! - the pipeline of `Get` frames and the version reply
+//! - each error code of the pull
+//! - the abandon marker of a body that fails after its reply
+//! - the shape of the writes and the flushes on the output
 //!
 //! A test client drives the session over two in-process pipes with the frame
-//! codec of `ostrya::push::proto`, or gives the session one input buffer and
-//! records its output. A second `ArchiveView` of the same repository is the
-//! oracle of each reply: the session serves what the view serves over HTTP.
+//! codec of `ostrya::push::proto`. Other tests give the session one input
+//! buffer and record its output. A second `ArchiveView` of the same
+//! repository is the oracle of each reply: the session serves what the view
+//! serves over HTTP.
 
 mod common;
 
@@ -62,7 +67,7 @@ const SECRET_B64: &str =
 /// stored, and from another mode it does not find them.
 const DELTA_FILES: [&str; 2] = ["deltas/ab/cdef/superblock", "delta-indexes/ab/cdef.index"];
 
-/// Run `fut`, and fail the test when it takes longer than `limit`.
+/// Runs `fut`. If `fut` takes longer than `limit`, the test fails.
 async fn within<T>(limit: Duration, what: &str, fut: impl Future<Output = T>) -> T {
     future::or(fut, async {
         ostrya_rt::Timer::after(limit).await;
@@ -130,7 +135,7 @@ impl Client {
             .expect("a well-formed frame")
     }
 
-    /// Send `PullHello` of `version` and return the reply.
+    /// Sends `PullHello` of `version` and returns the reply.
     async fn hello(&mut self, version: u32) -> Option<Message> {
         self.send(&Message::PullHello(PullHello {
             version,
@@ -140,7 +145,7 @@ impl Client {
         self.recv().await
     }
 
-    /// Open the session at version 1.
+    /// Opens the session at version 1.
     async fn open(&mut self) {
         let reply = self.hello(1).await;
         assert_eq!(
@@ -149,7 +154,7 @@ impl Client {
         );
     }
 
-    /// Read until the `Error` message, which is the last message of the
+    /// Reads until the `Error` message, which is the last message of the
     /// session.
     async fn error(&mut self) -> ErrorMessage {
         match self.recv().await {
@@ -161,7 +166,7 @@ impl Client {
         }
     }
 
-    /// Write raw bytes, which need not be frames, and end the input.
+    /// Writes raw bytes and ends the input. The bytes do not have to be frames.
     async fn raw(self, bytes: &[u8]) -> FrameReader<PipeReader> {
         let mut out = self.writer.into_inner();
         out.write_all(bytes).await.unwrap();
@@ -170,7 +175,7 @@ impl Client {
     }
 }
 
-/// Read one reply and its body. A stated length equals the sum of the
+/// Reads one reply and its body. A stated length equals the sum of the
 /// chunks.
 async fn read_reply(reader: &mut FrameReader<PipeReader>) -> Reply {
     let (found, len) = match reader.read_message().await.unwrap() {
@@ -194,8 +199,8 @@ async fn read_reply(reader: &mut FrameReader<PipeReader>) -> Reply {
     Reply { found, len, body }
 }
 
-/// Ask for each of `paths` with at most `depth` `Get` frames in flight, and
-/// read the replies while the frames go out. Returns the replies in the
+/// Asks for each of `paths` with at most `depth` `Get` frames in flight, and
+/// reads the replies while the frames go out. Returns the replies in the
 /// order of `paths`, and the most frames that were in flight at once.
 async fn fetch(client: &mut Client, paths: &[String], depth: usize) -> (Vec<Reply>, usize) {
     let in_flight = Cell::new(0usize);
@@ -227,7 +232,7 @@ async fn fetch(client: &mut Client, paths: &[String], depth: usize) -> (Vec<Repl
     (replies, peak.get())
 }
 
-/// Run a session of `repo` against the client `script`, over two pipes of
+/// Runs a session of `repo` against the client `script`, over two pipes of
 /// `cap` bytes.
 fn session<F, Fut, T>(repo: &Repo, cap: usize, script: F) -> (ostrya::Result<()>, T)
 where
@@ -247,7 +252,7 @@ where
     ))
 }
 
-/// The wire code a failed session returned to its caller.
+/// The wire code that a failed session returned to its caller.
 fn returned_code(result: &ostrya::Result<()>) -> Option<ErrorCode> {
     match result {
         Err(Error::Push(e)) => e.code(),
@@ -288,7 +293,7 @@ fn source_tree(base: &Path) -> PathBuf {
     src
 }
 
-/// Sign `commit` with ed25519, write a summary and its signature, and write
+/// Signs `commit` with ed25519, writes a summary and its signature, and writes
 /// the delta files.
 async fn decorate(path: &Path, repo: &Repo, commit: &Checksum) {
     let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
@@ -312,9 +317,9 @@ fn write_delta_files(path: &Path) {
 }
 
 /// A `bare-split-xattrs` repository at `base/bare-split-xattrs` with the
-/// commit of the `bare` repository `bare`. The port does not write this
-/// mode, so the metadata objects and the files at the root are copied, and
-/// each file object is written by hand with the same checksum.
+/// commit of the `bare` repository `bare`. ostrya does not write this mode.
+/// The function copies the metadata objects and the files at the root. It
+/// writes each file object by hand with the same checksum.
 async fn split_repo(base: &Path, bare_path: &Path, bare: &Repo, commit: &Checksum) -> PathBuf {
     let root = base.join(RepoMode::BareSplitXattrs.as_mode_str());
     Repo::create(&root, CreateOptions::new(RepoMode::BareSplitXattrs))
@@ -402,11 +407,16 @@ async fn large_object_repo(base: &Path, mode: RepoMode, len: usize) -> (PathBuf,
 // The files of a commit.
 // ---------------------------------------------------------------------------
 
-/// A client that keeps 8 `Get` frames in flight fetches `config`, the
-/// summary and its signature, the ref, each object of a commit, its detached
-/// metadata, and the delta files, from a repository of each mode the port
-/// reads. Each reply is what a second archive view serves for the path, in
-/// the order of the `Get` frames, and the session ends cleanly.
+/// A client that keeps 8 `Get` frames in flight fetches these paths from a
+/// repository of each mode that ostrya reads:
+///
+/// - `config`, the summary and its signature, and the ref
+/// - each object of a commit and its detached metadata
+/// - the delta files
+///
+/// Each reply is what a second archive view serves for the path. The replies
+/// come in the order of the `Get` frames, and the session ends without an
+/// error.
 #[test]
 fn each_mode_serves_the_files_of_a_commit() {
     let tmp = TmpDir::new("send-modes");
@@ -465,9 +475,9 @@ fn each_mode_serves_the_files_of_a_commit() {
     }
 }
 
-/// A path the view refuses and a path outside the view or with nothing at
-/// it both get the reply of a path that is not found, and the session goes
-/// on.
+/// A path that the view refuses gets the reply of a path that is not found.
+/// A path outside the view, or with nothing at it, gets the same reply. The
+/// session continues after each of these replies.
 #[test]
 fn refused_and_absent_paths_get_the_not_found_reply() {
     let tmp = TmpDir::new("send-not-found");
@@ -535,7 +545,7 @@ fn refused_and_absent_paths_get_the_not_found_reply() {
 }
 
 /// The server replies with the lower of the version of the client and its
-/// own highest version, and goes on at that version.
+/// own highest version, and continues at that version.
 #[test]
 fn a_later_version_gets_the_version_of_the_server() {
     let tmp = TmpDir::new("send-version");
@@ -557,8 +567,8 @@ fn a_later_version_gets_the_version_of_the_server() {
     }
 }
 
-/// An empty input is a clean end: the session writes nothing, flushes
-/// nothing, and does not close its output.
+/// An empty input ends the session without an error. The session writes
+/// nothing, flushes nothing, and does not close its output.
 #[test]
 fn an_empty_input_is_a_clean_end() {
     let tmp = TmpDir::new("send-empty");
@@ -594,8 +604,8 @@ fn version_0_is_version_unsupported() {
     assert_eq!(returned_code(&result), Some(ErrorCode::VersionUnsupported));
 }
 
-/// A `Get` before `PullHello`, a second `PullHello`, a kind of the push, and
-/// a message of the server from the client are `protocol`.
+/// A `Get` before `PullHello`, a second `PullHello`, a message kind of the
+/// push, and a message of the server from the client are `protocol`.
 #[test]
 fn a_message_out_of_order_is_protocol() {
     let tmp = TmpDir::new("send-protocol");
@@ -697,8 +707,8 @@ fn a_frame_over_the_limit_is_limit_exceeded() {
     assert_eq!(returned_code(&result), Some(ErrorCode::LimitExceeded));
 }
 
-/// Ask for `path` after `PullHello`, and expect `Error` with `internal` in
-/// place of the reply. The session returns the error of the view.
+/// Asks for `path` after `PullHello`, and expects `Error` with `internal` and
+/// no `GetReply` before it. The session returns the error of the view.
 fn assert_internal_before_the_reply(repo: &Repo, path: &str) -> Error {
     let path = path.to_owned();
     let (result, error) = session(repo, PIPE_CAP, |mut c| async move {
@@ -713,9 +723,11 @@ fn assert_internal_before_the_reply(repo: &Repo, path: &str) -> Error {
 }
 
 /// A content object that the server cannot read gets `Error` with
-/// `internal` in place of its reply, also when the server runs as root: a
-/// `bare-user` object whose `user.ostreemeta` does not parse, and a
-/// `bare-split-xattrs` object whose extended attributes do not parse.
+/// `internal` and no `GetReply`. This is also true when the server runs as
+/// root. The test uses two objects:
+///
+/// - a `bare-user` object whose `user.ostreemeta` does not parse
+/// - a `bare-split-xattrs` object whose extended attributes do not parse
 #[test]
 fn an_object_that_does_not_load_is_internal_before_its_reply() {
     let tmp = TmpDir::new("send-internal");
@@ -753,8 +765,8 @@ fn an_object_that_does_not_load_is_internal_before_its_reply() {
 }
 
 /// A file that the serving account cannot read (`EACCES`) gets `Error` with
-/// `internal` in place of its reply: a content object and a stored file.
-/// Root reads every file, so the test does not run as root.
+/// `internal` and no `GetReply`. The test uses a content object and a stored
+/// file. Root reads every file, so the test does not run as root.
 #[test]
 fn a_file_the_account_cannot_read_is_internal_before_its_reply() {
     if is_root() {
@@ -784,11 +796,11 @@ fn a_file_the_account_cannot_read_is_internal_before_its_reply() {
 // A body that fails after its reply.
 // ---------------------------------------------------------------------------
 
-/// A content object of 4 MiB, truncated to 2 MiB after the head of its reply
-/// arrives, ends its body with the abandon marker and `Error` with
+/// The test truncates a content object of 4 MiB to 2 MiB after the head of
+/// its reply arrives. The body ends with the abandon marker and `Error` with
 /// `internal`. The pipes hold 64 KiB, so the server waits for the client
-/// before it reads past the buffers on the path, the read-ahead of the file
-/// reader included.
+/// before it reads past the buffers on the path. These buffers include the
+/// read-ahead of the file reader.
 #[test]
 fn a_content_object_truncated_after_its_reply_is_abandoned() {
     let tmp = TmpDir::new("send-truncated");
@@ -904,7 +916,7 @@ fn requests(paths: &[String]) -> Vec<u8> {
     frames(&msgs)
 }
 
-/// Run a session of `repo` over the input `input` and a recording output.
+/// Runs a session of `repo` over the input `input` and a recording output.
 fn record(repo: &Repo, input: Vec<u8>) -> (ostrya::Result<()>, Recorder) {
     let mut out = Recorder::default();
     let result = block_on(within(
@@ -934,10 +946,13 @@ fn frame_len(bytes: &[u8], at: usize) -> usize {
     4 + u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
 }
 
-/// A content object of 4 MiB that does not compress, served from an
-/// `archive` and from a `bare-user` repository: each write to the output is
-/// at most 64 KiB, no write holds a chunk length alone, each chunk but the
-/// last is full, and the session flushes once, after the reply.
+/// The test serves a content object of 4 MiB that does not compress from an
+/// `archive` and from a `bare-user` repository. For each mode:
+///
+/// - each write to the output is at most 64 KiB
+/// - no write holds a chunk length alone
+/// - each chunk but the last is full
+/// - the session flushes once, after the reply
 #[test]
 fn each_write_is_at_most_64_kib_and_holds_no_length_alone() {
     let tmp = TmpDir::new("send-writes");

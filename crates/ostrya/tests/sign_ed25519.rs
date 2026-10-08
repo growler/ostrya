@@ -1,20 +1,25 @@
-//! ed25519 commit-signing integration tests.
+//! Integration tests of ed25519 commit signatures.
 //!
-//! These exercise [`Ed25519Signer`] / [`Ed25519Verifier`] and the sign-api key
-//! store against the `ostree` tool: a signature the port writes verifies under
-//! `ostree sign --verify --sign-type=ed25519`, the port verifies a signature the
-//! tool wrote, the `.commitmeta` bytes are identical (ed25519 is deterministic),
-//! and the `trusted.ed25519[.d]` / `revoked.ed25519[.d]` directory convention
-//! resolves keys the same way in the port and the tool, with a revoked key
-//! rejected.
+//! The tests compare [`Ed25519Signer`], [`Ed25519Verifier`], and the sign-api
+//! key store with the `ostree` command:
 //!
-//! The keypair is a fixed vector produced with `openssl genpkey -algorithm
-//! ed25519` and validated round-trip against the tool. `SECRET_B64` is the
-//! base64 of the 64-byte secret (32-byte seed followed by the 32-byte public
-//! key); `PUBLIC_B64` is the base64 of the 32-byte public key.
+//! - `ostree sign --verify --sign-type=ed25519` verifies a signature that
+//!   ostrya writes.
+//! - ostrya verifies a signature that the `ostree` command writes.
+//! - The `.commitmeta` bytes of the two are identical, because ed25519 is
+//!   deterministic.
+//! - The `trusted.ed25519[.d]` and `revoked.ed25519[.d]` directories give the
+//!   same keys to ostrya and to the `ostree` command. Neither accepts a
+//!   revoked key.
 //!
-//! Each test that drives the tool is skipped where the tool's build carries no
-//! ed25519 engine, since such a build refuses every ed25519 invocation.
+//! The keypair is a fixed test vector. `openssl genpkey -algorithm ed25519`
+//! made it, and a round trip through the `ostree` command checked it.
+//! `SECRET_B64` is the base64 of the 64-byte secret key: the 32-byte seed, then
+//! the 32-byte public key. `PUBLIC_B64` is the base64 of the 32-byte public
+//! key.
+//!
+//! If the build of the `ostree` command has no ed25519 engine, each test that
+//! runs the command is skipped. Such a build refuses each ed25519 command.
 
 mod common;
 
@@ -30,13 +35,13 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// The base64 of the 64-byte ed25519 secret key (seed followed by public key).
+/// The base64 of the 64-byte ed25519 secret key (the seed, then the public key).
 const SECRET_B64: &str =
     "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
 /// The base64 of the matching 32-byte ed25519 public key.
 const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
 
-/// Build a tiny source tree under `base/src`.
+/// Creates a small source tree under `base/src`.
 fn build_source(base: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let src = base.join("src");
@@ -50,8 +55,10 @@ fn build_source(base: &Path) {
     std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// Create an archive repo, ingest `base/src` with canonical permissions and
-/// owner 0:0, and commit it on `test/main`. Returns the repo and commit.
+/// Creates an archive repository and commits `base/src` to `test/main`.
+///
+/// The ingest uses canonical permissions and owner 0:0. The function returns
+/// the repository and the commit checksum.
 async fn build_committed_repo(base: &Path) -> (Repo, Checksum) {
     build_source(base);
     let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Archive))
@@ -83,7 +90,7 @@ async fn build_committed_repo(base: &Path) -> (Repo, Checksum) {
     (repo, commit)
 }
 
-/// The `.commitmeta` bytes for `commit` in the repo under `base`.
+/// Returns the `.commitmeta` bytes of `commit` in the repository under `base`.
 fn commitmeta_bytes(base: &Path, commit: &Checksum) -> Vec<u8> {
     let hex = commit.to_hex();
     let (a, b) = hex.split_at(2);
@@ -95,7 +102,7 @@ fn commitmeta_bytes(base: &Path, commit: &Checksum) -> Vec<u8> {
     .unwrap()
 }
 
-/// The raw 32-byte public key.
+/// Returns the raw 32-byte public key.
 fn public_key() -> Vec<u8> {
     base64::decode(PUBLIC_B64).unwrap()
 }
@@ -135,7 +142,8 @@ fn port_ed25519_signature_is_verified_by_the_tool() {
         String::from_utf8_lossy(&ok.stderr)
     );
 
-    // A different public key must not verify.
+    // The `ostree` command must not verify the signature with a different
+    // public key.
     let wrong = base64::encode(&[0u8; 32]);
     let bad = Command::new("ostree")
         .args([
@@ -166,7 +174,8 @@ fn port_verifies_an_ed25519_signature_the_tool_wrote() {
     block_on(async {
         let (repo, commit) = build_committed_repo(base).await;
 
-        // The tool signs the port-built commit with the ed25519 secret key.
+        // The `ostree` command signs the commit of ostrya with the ed25519
+        // secret key.
         let signed = Command::new("ostree")
             .args([
                 &repo_arg,
@@ -183,8 +192,8 @@ fn port_verifies_an_ed25519_signature_the_tool_wrote() {
             String::from_utf8_lossy(&signed.stderr)
         );
 
-        // The port verifies it with the matching trusted key, and rejects a
-        // verifier that does not trust the key.
+        // ostrya verifies the signature with the matching trusted key. With a
+        // verifier that does not trust the key, the verification fails.
         let verifier = Ed25519Verifier::new([public_key()], Vec::<Vec<u8>>::new()).unwrap();
         let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
         assert!(outcome.valid, "port rejected the tool's ed25519 signature");
@@ -211,9 +220,9 @@ fn delete_by_key_removes_the_ed25519_signature() {
             .await
             .unwrap();
 
-        // A signature made by the matching key is deleted. ed25519 is
-        // deterministic, so the blob to remove is recomputed from the same
-        // key and payload and matched by bytes.
+        // ostrya deletes a signature that the matching key made. ed25519 is
+        // deterministic, so the test signs the same payload with the same key
+        // again. The delete matches the signature blob by its bytes.
         let verifier = Ed25519Verifier::new([public_key()], Vec::<Vec<u8>>::new()).unwrap();
         assert!(
             repo.verify_commit(&commit, &[&verifier])
@@ -254,9 +263,10 @@ fn delete_by_key_removes_the_ed25519_signature() {
         commit
     });
 
-    // The tool no longer verifies the deleted signature. A tool with no
-    // ed25519 engine refuses the invocation whatever the commit holds, which
-    // would satisfy the assertion below without exercising the deletion.
+    // The `ostree` command must not verify the deleted signature. A build of
+    // the command with no ed25519 engine refuses the command for any commit.
+    // That refusal satisfies the assertion and does not test the delete, so
+    // the check runs only with an engine.
     if ostree_supports_ed25519() {
         let out = Command::new("ostree")
             .args([
@@ -282,9 +292,9 @@ fn ed25519_commitmeta_is_byte_identical_to_the_tool() {
         eprintln!("skipping: ostree tool has no ed25519 engine");
         return;
     }
-    // Two repositories hold the identical commit; one is signed by the port and
-    // one by the tool with the same key. ed25519 is deterministic, so the
-    // `.commitmeta` bytes must match.
+    // Two repositories hold the same commit. ostrya signs one, and the
+    // `ostree` command signs the other with the same key. ed25519 is
+    // deterministic, so the `.commitmeta` bytes must be equal.
     let port_tmp = TmpDir::new("ed25519-bytes-port");
     let port_base = port_tmp.path();
     let (port_commit, port_bytes) = block_on(async {
@@ -340,7 +350,8 @@ fn ed25519_trusted_revoked_directory_convention() {
             .await
             .unwrap();
 
-        // Port: the loader resolves the trusted key and verifies.
+        // ostrya: the loader finds the trusted key, and the key verifies the
+        // signature.
         let keys = load_sign_keys_from(&[keys_dir.as_path()], "ed25519").unwrap();
         assert_eq!(keys.trusted.len(), 1);
         assert!(keys.revoked.is_empty());
@@ -356,7 +367,8 @@ fn ed25519_trusted_revoked_directory_convention() {
     });
     let commit_hex = commit.to_hex();
 
-    // Tool: the same directory verifies via --keys-dir.
+    // The `ostree` command: the same directory, given with `--keys-dir`,
+    // verifies the signature.
     let keys_dir_arg = format!("--keys-dir={}", keys_dir.display());
     let tool_ok = Command::new("ostree")
         .args([
@@ -375,7 +387,8 @@ fn ed25519_trusted_revoked_directory_convention() {
         String::from_utf8_lossy(&tool_ok.stderr)
     );
 
-    // Revoke the key in both the port's view and the tool's.
+    // Revoke the key in the shared directory, for ostrya and for the `ostree`
+    // command.
     let revoked_d = keys_dir.join("revoked.ed25519.d");
     std::fs::create_dir_all(&revoked_d).unwrap();
     std::fs::write(revoked_d.join("bad"), format!("{PUBLIC_B64}\n")).unwrap();
@@ -433,11 +446,12 @@ fn ed25519_round_trip_within_the_port() {
 
 #[test]
 fn ed25519_verifier_drops_revoked_from_trusted() {
-    // The verifier trusts the trusted set minus the revoked set, matched by key
-    // bytes; a key in both is dropped.
+    // The verifier trusts each key of the trusted set that is not in the
+    // revoked set. The match compares key bytes. The verifier drops a key that
+    // is in the two sets.
     let key = public_key();
     let both = Ed25519Verifier::new([key.clone()], [key.clone()]).unwrap();
-    // With the only trusted key revoked, nothing verifies.
+    // If the only trusted key is revoked, no signature verifies.
     let tmp = TmpDir::new("ed25519-revoke-unit");
     let base = tmp.path();
     block_on(async {
@@ -454,11 +468,12 @@ fn sign_key_store_reads_files_dirs_and_tolerates_missing() {
     let tmp = TmpDir::new("ed25519-store");
     let root = tmp.path();
 
-    // A missing root yields empty sets, not an error.
+    // If the root does not exist, the load returns empty sets and no error.
     let empty = load_sign_keys_from(&[root], "ed25519").unwrap();
     assert!(empty.trusted.is_empty() && empty.revoked.is_empty());
 
-    // trusted.ed25519 file with two keys, plus a trusted.ed25519.d/ drop-in.
+    // A `trusted.ed25519` file with two keys, and a drop-in file in
+    // `trusted.ed25519.d/`.
     std::fs::write(
         root.join("trusted.ed25519"),
         format!("{PUBLIC_B64}\n{}\n", base64::encode(&[1u8; 32])),
@@ -471,7 +486,7 @@ fn sign_key_store_reads_files_dirs_and_tolerates_missing() {
         format!("{}\n", base64::encode(&[2u8; 32])),
     )
     .unwrap();
-    // A revoked.ed25519 file.
+    // A `revoked.ed25519` file.
     std::fs::write(root.join("revoked.ed25519"), format!("{PUBLIC_B64}\n")).unwrap();
 
     let keys = load_sign_keys_from(&[root], "ed25519").unwrap();
@@ -480,10 +495,13 @@ fn sign_key_store_reads_files_dirs_and_tolerates_missing() {
     assert_eq!(keys.trusted[0], public_key());
 }
 
-/// A fifo at a key store file's name is refused by that name. What a fifo
-/// answers a read with is what its writers sent, so a load reading one would
-/// take its trusted set from them. This test returns only because the read
-/// refuses the kind before it reads.
+/// The key store refuses a fifo at the name of a key file, and the error names
+/// the file.
+///
+/// A read of a fifo returns the data that its writers sent. A load that reads
+/// a fifo takes its trusted set from these writers. The load opens the file
+/// with `O_NONBLOCK` and refuses the file type before it reads, so the test
+/// does not wait for a writer.
 #[test]
 fn sign_key_store_refuses_a_fifo_by_name() {
     let tmp = TmpDir::new("ed25519-store-fifo");
@@ -506,8 +524,11 @@ fn sign_key_store_refuses_a_fifo_by_name() {
     );
 }
 
-/// A key store file over the ceiling is refused by its own name, so its size
-/// cannot decide an allocation.
+/// The key store refuses a key file larger than the ceiling, and the error
+/// names the file.
+///
+/// Because of this refusal, the size of the file cannot set the size of an
+/// allocation.
 #[test]
 fn sign_key_store_refuses_an_oversized_file_by_name() {
     let tmp = TmpDir::new("ed25519-store-size");
@@ -528,11 +549,11 @@ fn sign_key_store_refuses_an_oversized_file_by_name() {
 
 #[test]
 fn ed25519_key_input_length_is_validated() {
-    // A raw ay public key of the right length is accepted; a wrong length is a
-    // signature error, as is a wrong-length secret key.
+    // The verifier accepts a raw `ay` public key of the correct length. A
+    // public key or a secret key of a wrong length gives a signature error.
     assert!(Ed25519Verifier::new([public_key()], Vec::<Vec<u8>>::new()).is_ok());
     assert!(Ed25519Verifier::new([vec![0u8; 31]], Vec::<Vec<u8>>::new()).is_err());
     assert!(Ed25519Signer::from_secret_key(&[0u8; 63]).is_err());
-    // A base64 secret that decodes to the wrong length is rejected too.
+    // The signer refuses a base64 secret key that decodes to a wrong length.
     assert!(Ed25519Signer::from_base64(PUBLIC_B64).is_err());
 }

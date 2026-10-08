@@ -1,11 +1,14 @@
-//! `SOURCE_DATE_EPOCH` timestamp pinning.
+//! The commit timestamp that `SOURCE_DATE_EPOCH` sets.
 //!
-//! This lives in its own test binary with a single test so the environment
-//! write is sound: it runs before any blocking-pool thread is spawned, on the
-//! only thread in the process, so no concurrent `getenv` races the `setenv`.
-//! `SOURCE_DATE_EPOCH` supplies the commit timestamp when
-//! [`CommitOptions::timestamp`](ostrya::CommitOptions) is unset, so a commit
-//! with it set to the fixture epoch reproduces the fixture commit exactly.
+//! If [`CommitOptions::timestamp`](ostrya::CommitOptions) is unset,
+//! `SOURCE_DATE_EPOCH` supplies the commit timestamp. If the variable holds
+//! the fixture epoch, the commit is equal to the fixture commit, byte for
+//! byte.
+//!
+//! This test has a test binary of its own with one test, so the write to the
+//! environment is sound. The write occurs on the only thread of the process,
+//! before the blocking pool starts a thread. As a result, no concurrent
+//! `getenv` can race the `setenv`.
 
 mod common;
 
@@ -49,8 +52,9 @@ fn ref_binding() -> Value {
 
 #[test]
 fn source_date_epoch_pins_the_commit_timestamp() {
-    // Set before any blocking-pool thread exists: the only thread in this
-    // single-test binary, so the write cannot race a concurrent read.
+    // The write occurs before a blocking-pool thread exists. This binary has
+    // one test, so this thread is the only thread, and the write cannot race
+    // a concurrent read.
     unsafe {
         std::env::set_var("SOURCE_DATE_EPOCH", "1700000000");
     }
@@ -79,8 +83,9 @@ fn source_date_epoch_pins_the_commit_timestamp() {
         .unwrap();
         let root = txn.write_mtree(&mut mtree).await.unwrap();
 
-        // No explicit timestamp: SOURCE_DATE_EPOCH supplies the fixture epoch,
-        // so the commit is byte-identical to the fixture (checksum equal).
+        // The options give no timestamp. `SOURCE_DATE_EPOCH` supplies the
+        // fixture epoch, so the commit is equal to the fixture commit, byte for
+        // byte, and the two checksums are equal.
         let commit = txn
             .write_commit(
                 CommitOptions {

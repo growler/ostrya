@@ -1,12 +1,14 @@
 //! The ingest of one object of a push object stream, and the content checks of
 //! the repository mode.
 //!
-//! Each ingest reads the bytes of its object to their end, checks them, and
-//! either stages the object in the session transaction or drops it, where the
-//! repository already holds it or the session already staged it. A metadata
-//! object and a detached metadata object are read whole, under
-//! [`MAX_METADATA_SIZE`]. Content streams through the transaction writers in
-//! bounded chunks.
+//! Each ingest reads the bytes of its object to their end and checks them. If
+//! the repository already holds the object, or the session already staged it,
+//! the ingest drops the object. Otherwise the ingest stages the object in the
+//! session transaction.
+//!
+//! The ingest reads a metadata object and a detached metadata object whole, up
+//! to [`MAX_METADATA_SIZE`] bytes. Content streams through the transaction
+//! writers in bounded chunks.
 
 use std::io;
 use std::pin::Pin;
@@ -29,9 +31,10 @@ use crate::write::{COPY_CHUNK, FileMeta, check_archive_payload};
 
 use super::session::Failure;
 
-/// The extended attributes a `bare` repository refuses unless the policy
-/// allows privileged content. The names are in their stored form, with the
-/// terminating NUL.
+/// The extended attributes that a `bare` repository refuses if the policy does
+/// not allow privileged content.
+///
+/// The names are in their stored form, with the terminating NUL.
 const PRIVILEGED_XATTRS: [&[u8]; 2] = [b"security.capability\0", b"security.selinux\0"];
 
 /// The content checks of the repository mode, fixed when the session opens.
@@ -48,14 +51,19 @@ impl ModeRules {
         }
     }
 
-    /// Whether the privileged-content rule applies: a `bare` repository whose
-    /// policy does not allow privileged content.
+    /// Returns `true` if the privileged-content rule applies.
+    ///
+    /// The rule applies to a `bare` repository whose policy does not allow
+    /// privileged content.
     fn guards_privileged(&self) -> bool {
         self.mode == RepoMode::Bare && !self.allow_privileged
     }
 
-    /// Refuse a content object the repository mode cannot store, or
-    /// privileged content the policy does not allow, with `mode-refused`.
+    /// Refuses content that the repository mode or the policy does not allow.
+    ///
+    /// The function refuses a content object that the repository mode cannot
+    /// store, and privileged content that the policy does not allow. The
+    /// failure is `mode-refused`.
     fn check_content(&self, checksum: &Checksum, meta: &FileMeta) -> Result<(), Failure> {
         if self.guards_privileged() {
             if meta.mode & 0o6000 != 0 {
@@ -76,8 +84,10 @@ impl ModeRules {
         Ok(())
     }
 
-    /// Refuse a dirmeta object with privileged extended attributes the policy
-    /// does not allow, with `mode-refused`.
+    /// Refuses a dirmeta object with privileged extended attributes that the
+    /// policy does not allow.
+    ///
+    /// The failure is `mode-refused`.
     fn check_dirmeta(&self, checksum: &Checksum, bytes: &[u8]) -> Result<(), Failure> {
         if !self.guards_privileged() {
             return Ok(());
@@ -118,17 +128,21 @@ pub(super) fn limit_exceeded(message: String) -> Failure {
     Failure::Wire(push::Error::LimitExceeded(message))
 }
 
-/// The code of a failure of a write path the ingest reuses. A payload that is
-/// malformed -- a corrupt DEFLATE stream, a size that does not match its
-/// header, bytes after the end -- is `protocol`. A digest that does not match
-/// is `checksum-mismatch`. Every other failure is on the server side and is
-/// `internal`. The session reads the settings of the write paths when it
-/// opens, so a malformed setting fails there and not here.
+/// Returns the failure code for an error of a write path that the ingest reuses.
 ///
-/// An I/O error that carries an OS error code comes from the filesystem, so it
+/// - A malformed payload is `protocol`: a corrupt DEFLATE stream, a size that
+///   does not match its header, or bytes after the end.
+/// - A digest that does not match is `checksum-mismatch`.
+/// - Every other failure is on the server side and is `internal`.
+///
+/// The session reads the settings of the write paths when it opens, so a
+/// malformed setting fails when the session opens.
+///
+/// An I/O error that carries an OS error code comes from the file system, so it
 /// is `internal`. An I/O error with no OS error code comes from a decoder over
-/// the object bytes, so it is `protocol`. The errors of the object stream
-/// itself are read from the stream reader before this applies.
+/// the object bytes, so it is `protocol`. The session takes an error of the
+/// object stream itself from the stream reader before this classification
+/// applies.
 fn classify(error: Error) -> Failure {
     match error {
         Error::ChecksumMismatch { .. } => {
@@ -140,7 +154,7 @@ fn classify(error: Error) -> Failure {
     }
 }
 
-/// A reader that counts the bytes it passes.
+/// A reader that counts the bytes that it passes.
 pub(super) struct Counted<R> {
     pub(super) inner: R,
     pub(super) count: u64,
@@ -171,17 +185,23 @@ fn grow(buf: &mut Vec<u8>) {
     }
 }
 
-/// Read a metadata or detached metadata object whole. The first read that
-/// takes it past [`MAX_METADATA_SIZE`] is `limit-exceeded`.
+/// Reads a metadata object or a detached metadata object whole.
 ///
-/// The bytes are read straight into the result. Its capacity doubles as it
-/// fills, up to one byte over the cap: that byte is what shows an object over
-/// the cap. Each read goes into a zeroed window of at most [`COPY_CHUNK`]
-/// bytes past the bytes already read, so the memory the result touches
-/// follows the bytes that arrived, and one read returns at most one window.
-/// `reserve` gets the length of each read that returns bytes, before the next
-/// read starts, and an error from it ends the read. The result is shrunk to
-/// its length.
+/// If a read takes the object past [`MAX_METADATA_SIZE`] bytes, the failure is
+/// `limit-exceeded`.
+///
+/// The function reads the bytes directly into the result. The capacity of the
+/// result doubles as it fills, up to one byte more than the cap. That extra
+/// byte shows that an object is larger than the cap.
+///
+/// Each read goes into a zeroed window of at most [`COPY_CHUNK`] bytes after
+/// the bytes already read. Because of this window, the memory that the result
+/// touches follows the bytes that arrived, and one read returns at most one
+/// window.
+///
+/// Before the next read starts, `reserve` gets the length of each read that
+/// returns bytes. If `reserve` returns an error, the read ends with that
+/// error. The function shrinks the result to its length before it returns.
 pub(super) async fn read_capped<R, F>(
     body: &mut R,
     what: &str,
@@ -220,8 +240,10 @@ where
     }
 }
 
-/// Ingest a dirtree, dirmeta, or commit object. `Ok(true)` when the object was
-/// staged, `Ok(false)` when it was dropped because `held` or because the
+/// Ingests a dirtree, dirmeta, or commit object.
+///
+/// Returns `Ok(true)` if the function staged the object. Returns `Ok(false)`
+/// if it dropped the object because `held` is `true` or because the
 /// repository already holds it.
 ///
 /// `reserve` gets the length of each read, as [`read_capped`] gives it. The
@@ -264,10 +286,13 @@ where
     Ok(stored)
 }
 
-/// Read the framed header of a content object: a big-endian length, four zero
-/// bytes, and the header variant. `archive` selects the archive form, which
-/// also declares the uncompressed payload size. The framed bytes are returned
-/// for the archive form, which an archive repository stores as they arrive.
+/// Reads the framed header of a content object.
+///
+/// The frame is a 4-byte big-endian length, four zero bytes, and the header
+/// variant. If `archive` is `true`, the function reads the archive form, which
+/// also declares the uncompressed payload size. The function returns the
+/// framed bytes for the archive form, because an archive repository stores
+/// these bytes as they arrive.
 async fn read_framed_header<R: AsyncRead + Unpin>(
     body: &mut R,
     checksum: &Checksum,
@@ -291,8 +316,8 @@ async fn read_framed_header<R: AsyncRead + Unpin>(
              {MAX_FILE_HEADER_SIZE} bytes"
         )));
     }
-    // The header grows with the bytes that arrive, not with the length the
-    // framing declares.
+    // The header buffer grows with the bytes that arrive. The length that the
+    // framing declares allocates no memory.
     (&mut *body)
         .take(len)
         .read_to_end(&mut framed)
@@ -325,7 +350,7 @@ fn file_meta(header: &FileHeader) -> FileMeta {
     }
 }
 
-/// A header the content hash cannot take is `protocol`.
+/// Returns a `protocol` failure for a header that the content hash cannot take.
 fn unhashable(checksum: &Checksum, error: ostrya_core::Error) -> Failure {
     protocol(format!("content object {checksum}: {error}"))
 }
@@ -339,9 +364,12 @@ fn check_digest(checksum: &Checksum, actual: Checksum) -> Result<(), Failure> {
     ))))
 }
 
-/// Ingest a content object in the `raw` encoding: the framed header and the
-/// payload. `Ok(true)` when the object was staged, `Ok(false)` when it was
-/// read, checked, and dropped because `held`.
+/// Ingests a content object in the `raw` encoding: the framed header and the
+/// payload.
+///
+/// Returns `Ok(true)` if the function staged the object. If `held` is `true`,
+/// the function reads and checks the object, drops it, and returns
+/// `Ok(false)`.
 pub(super) async fn raw_content<R: AsyncRead + Unpin>(
     txn: &Transaction,
     rules: &ModeRules,
@@ -398,9 +426,12 @@ pub(super) async fn raw_content<R: AsyncRead + Unpin>(
     Ok(true)
 }
 
-/// Ingest a content object in the `deflate` encoding: the bytes of an
-/// archive-mode object. `Ok(true)` when the object was staged, `Ok(false)`
-/// when it was read, checked, and dropped because `held`.
+/// Ingests a content object in the `deflate` encoding: the bytes of an
+/// archive-mode object.
+///
+/// Returns `Ok(true)` if the function staged the object. If `held` is `true`,
+/// the function reads and checks the object, drops it, and returns
+/// `Ok(false)`.
 pub(super) async fn deflate_content<R: AsyncRead + Unpin>(
     txn: &Transaction,
     rules: &ModeRules,
@@ -624,7 +655,8 @@ mod tests {
             got,
             Err(Failure::Wire(push::Error::LimitExceeded(m))) if m == "the session cap"
         ));
-        // Each read that returns bytes is reserved before the next read.
+        // The function reserves each read that returns bytes before the next
+        // read starts.
         assert_eq!(reserved, body.count);
         assert!(body.count < bytes.len() as u64);
     }

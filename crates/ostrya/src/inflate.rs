@@ -1,12 +1,15 @@
-//! Streaming raw-DEFLATE decoding for archive-mode content objects.
+//! A streaming raw-DEFLATE decoder for the content objects of an archive
+//! repository.
 //!
-//! Archive-mode content objects (`.filez`) store their payload raw-DEFLATE
-//! compressed (no zlib or gzip wrapper), recovered by inspecting the bytes the
-//! `ostree` tool writes. [`BufSource`] buffers an `rt::FileReader` into the
-//! `futures-io` [`AsyncBufRead`](futures_io::AsyncBufRead) that
-//! `async-compression`'s DEFLATE decoder consumes, pulling bounded chunks of
-//! input so no whole blob is buffered. The decoder produces bounded chunks of
-//! decompressed payload in-task inside `poll_read`.
+//! An archive-mode content object (`.filez`) stores its payload as raw DEFLATE,
+//! with no zlib or gzip wrapper. The objects that the `ostree` command writes
+//! show this form.
+//!
+//! `BufSource` buffers an `rt::FileReader` as the `futures_io::AsyncBufRead`
+//! that the DEFLATE decoder of `async-compression` reads. It reads the input
+//! in bounded chunks, so it never holds a whole blob in memory. The decoder
+//! makes bounded chunks of decompressed payload in the task, inside
+//! `poll_read`.
 
 use std::io;
 use std::pin::Pin;
@@ -17,14 +20,15 @@ use futures_io::{AsyncBufRead, AsyncRead};
 use ostrya_rt::FileReader;
 use pin_project_lite::pin_project;
 
-/// The input read-ahead buffer size. Input is pulled from the underlying
-/// reader in chunks of at most this size, bounding memory regardless of the
-/// compressed object's size.
+/// The size of the input read-ahead buffer.
+///
+/// The buffer reads the inner reader in chunks of at most this size. This
+/// bounds the memory use for a compressed object of any size.
 const IN_CHUNK: usize = 16 * 1024;
 
 pin_project! {
-    /// A bounded read-ahead buffer presenting an [`AsyncRead`] as an
-    /// [`AsyncBufRead`] for the DEFLATE decoder to consume.
+    /// A bounded read-ahead buffer that gives the DEFLATE decoder an
+    /// `AsyncBufRead` over an `AsyncRead`.
     pub(crate) struct BufSource<R> {
         #[pin]
         inner: R,
@@ -39,8 +43,10 @@ impl<R> BufSource<R> {
         BufSource::with_len_hint(inner, IN_CHUNK as u64)
     }
 
-    /// [`BufSource::new`] over an input of about `len` bytes, with a buffer of
-    /// `len + 1` bytes, held between 1 byte and the input chunk size.
+    /// Creates a `BufSource` for an input of about `len` bytes.
+    ///
+    /// The buffer holds `len + 1` bytes, at least 1 byte and at most
+    /// `IN_CHUNK`.
     pub(crate) fn with_len_hint(inner: R, len: u64) -> BufSource<R> {
         let size = usize::try_from(len.saturating_add(1)).map_or(IN_CHUNK, |n| n.min(IN_CHUNK));
         BufSource {
@@ -83,12 +89,14 @@ impl<R: AsyncRead> AsyncBufRead for BufSource<R> {
     }
 }
 
-/// The archive payload decoder: raw-DEFLATE over a buffered `rt::FileReader`.
+/// The decoder of an archive payload: raw DEFLATE over a buffered
+/// `rt::FileReader`.
 pub(crate) type ArchiveDecoder = DeflateDecoder<BufSource<FileReader>>;
 
-/// Wrap a content-object file (positioned at the raw-DEFLATE payload) in a
-/// streaming decoder. `len` is the length of the stream on disk, which bounds
-/// the input buffer.
+/// Returns a streaming decoder over a content-object file.
+///
+/// The position of `file` must be at the start of the raw-DEFLATE payload.
+/// `len` is the length of the stream on disk, and it bounds the input buffer.
 pub(crate) fn archive_decoder(file: FileReader, len: u64) -> ArchiveDecoder {
     DeflateDecoder::new(BufSource::with_len_hint(file, len))
 }
@@ -100,9 +108,10 @@ mod tests {
     use futures_lite::future::block_on;
     use futures_lite::io::{AsyncReadExt, Cursor};
 
-    /// Compress `data` as raw DEFLATE, then decompress it through the same
-    /// `BufSource` + decoder pipeline the archive read path uses, a few bytes
-    /// at a time.
+    /// Compresses `data` as raw DEFLATE and decompresses it again.
+    ///
+    /// The decompression goes through the `BufSource` and decoder pipeline of
+    /// the archive read path. It reads `read_chunk` bytes at a time.
     fn round_trip(data: &[u8], read_chunk: usize) -> Vec<u8> {
         block_on(async {
             let mut encoder = DeflateEncoder::new(Cursor::new(data.to_vec()));

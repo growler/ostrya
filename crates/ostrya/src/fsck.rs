@@ -1,52 +1,7 @@
-//! Object-integrity and completeness checking.
+//! Checks of the integrity and the completeness of a repository.
 //!
-//! [`Repo::fsck`] runs the four phases the `ostree fsck` tool runs, recovered by
-//! black-box observation and recorded in `docs/format-reference.md`, "CLI output
-//! formats", `fsck`:
-//!
-//! 1. Validate refs. Every ref under `refs/heads` and `refs/remotes` names a
-//!    commit object, which is loaded and checksummed. Under
-//!    [`verify_bindings`](FsckOptions::verify_bindings) the commit must carry
-//!    that ref's name in its `ostree.ref-binding`.
-//! 2. Validate refs in collections. Under
-//!    [`verify_bindings`](FsckOptions::verify_bindings) every
-//!    collection-qualified ref's commit must carry that collection id in its
-//!    `ostree.collection-binding`.
-//! 3. Enumerate commits. Every commit object in the store is listed, and the
-//!    ones already carrying a `state/<commit>.commitpartial` marker are skipped.
-//!    Under [`verify_back_refs`](FsckOptions::verify_back_refs) every name in a
-//!    commit's `ostree.ref-binding` must name a ref that resolves to that
-//!    commit.
-//! 4. Verify content integrity. Every object the verified commits reference is
-//!    examined once:
-//!
-//!    - Integrity: each object's recomputed checksum equals its name. A metadata
-//!      object is hashed over its serialized bytes; a content object is hashed
-//!      over its framed uncompressed header and uncompressed payload, so a
-//!      corrupt `.filez` or a tampered `.file` is caught in every mode.
-//!    - Completeness: every referenced object is present. A referenced object
-//!      that is absent is reported, and every commit that reaches it is marked
-//!      partial by writing its `state/<commit>.commitpartial` marker.
-//!
-//! A run ends early at three conditions. A ref over a commit object the store
-//! does not hold and a dirtree that is absent each leave the run unable to read
-//! what it must read next. A binding check that fails states a fact about the
-//! ref graph rather than about an object, and marks nothing. Every other fault
-//! is recorded and the run goes on, so one run reports every fault it can reach
-//! (`docs/conformance/cli-surface.md`, "fsck").
-//!
-//! One step follows the four phases. Under
-//! [`add_tombstones`](FsckOptions::add_tombstones) every commit object whose
-//! parent commit object is absent is deleted and a `.tombstone-commit` naming
-//! it is written. The step writes to the repository, so it acts after a walk
-//! that found a corrupt object only under [`all`](FsckOptions::all) or
-//! [`delete`](FsckOptions::delete). A walk whose findings are absent objects
-//! alone, and a walk with no finding, reach the step on their own.
-//!
-//! The result is a [`FsckReport`]; a corrupt repository does not fail the call,
-//! it populates [`errors`](FsckReport::errors) and
-//! [`failure`](FsckReport::failure). A caller (or the CLI) turns a non-empty
-//! report into a failure.
+//! [`Repo::fsck`] runs the checks. [`FsckOptions`] selects the optional checks
+//! and the actions on the findings. [`FsckReport`] holds the result.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -69,45 +24,77 @@ use crate::repo::Repo;
 use crate::tombstone::write_tombstone;
 use crate::write::COPY_CHUNK;
 
-/// The single byte the tool writes into a `.commitpartial` marker when fsck
-/// finds a commit incomplete (recovered by observation).
+/// The one byte that the `ostree` command writes into a `.commitpartial`
+/// marker when its fsck finds a commit incomplete (observed).
 const PARTIAL_STATE_BYTE: u8 = 0x66;
 
-/// Options controlling [`Repo::fsck`].
+/// The options of a [`Repo::fsck`] run.
 #[derive(Debug, Clone)]
 pub struct FsckOptions {
-    /// Write a `state/<commit>.commitpartial` marker for any commit that
-    /// reaches an object the run found missing or deleted, matching the tool.
-    /// Enabled by default. Clearing it is a port extension, which the CLI
-    /// spells `--no-mark-partial`.
-    pub mark_partial: bool,
-    /// Unlink every object whose recomputed checksum differs from its name,
-    /// and mark every commit that reaches one partial
-    /// (`ostree fsck --delete`).
-    pub delete: bool,
-    /// Let the [`add_tombstones`](FsckOptions::add_tombstones) phase run on a
-    /// walk that found a corrupt object (`ostree fsck -a`).
+    /// The switch that marks each commit that reaches an absent or a deleted
+    /// object as partial.
     ///
-    /// The object walk runs to its end whatever this field carries. The field
-    /// selects one thing: whether the destructive tombstone phase is allowed
-    /// to act after a walk that found an object whose bytes do not match its
-    /// name. `delete` carries the same permission on its own, and a walk whose
-    /// findings are absent objects alone needs neither.
+    /// The mark is the `state/<commit>.commitpartial` marker of the commit, as
+    /// the `ostree` command writes it. The default is `true`. The value `false`
+    /// is an ostrya extension, which the `ostrya fsck` command spells
+    /// `--no-mark-partial`.
+    pub mark_partial: bool,
+    /// The switch that unlinks each object whose checksum differs from its name.
+    ///
+    /// The option of the `ostree fsck` command is `--delete`.
+    ///
+    /// The run also marks each commit that reaches a deleted object as
+    /// partial. If the bytes of a metadata object do not parse as the type of
+    /// its name, the run reports the object and does not unlink it. Such an
+    /// object marks no commit as partial.
+    ///
+    /// If this field is `false`, a checksum mismatch marks no commit, as with
+    /// the `ostree` command. A commit stays complete while the wrong object is
+    /// present.
+    pub delete: bool,
+    /// The switch that lets the tombstone step run after a walk with a corrupt
+    /// object.
+    ///
+    /// The option of the `ostree fsck` command is `-a`.
+    ///
+    /// The object walk runs to its end with each value of this field. The
+    /// field has one effect: it lets the
+    /// [`add_tombstones`](FsckOptions::add_tombstones) step act after a walk
+    /// that found an object whose bytes do not match its name.
+    /// [`delete`](FsckOptions::delete) gives the same permission. A walk that
+    /// found only absent objects needs neither field.
     pub all: bool,
-    /// Delete every commit object whose parent commit object is absent and
-    /// write a `.tombstone-commit` naming it
-    /// (`ostree fsck --add-tombstones`).
+    /// The switch that deletes each commit whose parent commit is absent.
+    ///
+    /// The option of the `ostree fsck` command is `--add-tombstones`.
+    ///
+    /// The step writes a `.tombstone-commit` object that names each deleted
+    /// commit. [`Repo::fsck`] states when the step runs.
     pub add_tombstones: bool,
-    /// Check that every ref's commit carries that ref in its
-    /// `ostree.ref-binding`, and that every collection ref's commit carries
-    /// the collection id in its `ostree.collection-binding`
-    /// (`ostree fsck --verify-bindings`).
+    /// The switch that checks that the commit of each ref is bound to the ref.
+    ///
+    /// The option of the `ostree fsck` command is `--verify-bindings`.
+    ///
+    /// The `ostree.ref-binding` of the commit of each ref must hold the name
+    /// of the ref. A commit with no `ostree.ref-binding` key passes this
+    /// check, as with the `ostree` command.
+    ///
+    /// The `ostree.collection-binding` of the commit of each collection ref
+    /// must be the collection id of the ref. A commit with no
+    /// `ostree.collection-binding` key passes this check.
     pub verify_bindings: bool,
-    /// Check that every name in a commit's `ostree.ref-binding` names a ref
-    /// that resolves to that commit, and that a commit carrying an
-    /// `ostree.collection-binding` is named by that collection ref
-    /// (`ostree fsck --verify-back-refs`). The check is independent of
-    /// `verify_bindings`; naming one runs one.
+    /// The switch that checks that the ref bindings of each commit resolve to it.
+    ///
+    /// The option of the `ostree fsck` command is `--verify-back-refs`.
+    ///
+    /// The check reads each commit object in the object store. Each name in
+    /// the `ostree.ref-binding` of a commit must name a ref that resolves to
+    /// the commit. A ref under `refs/remotes` counts by its bare name. If the
+    /// commit has an `ostree.collection-binding`, the collection ref with that
+    /// id and that name must also resolve to the commit.
+    ///
+    /// This check and [`verify_bindings`](FsckOptions::verify_bindings) are
+    /// independent. Each field runs its own check only.
     pub verify_back_refs: bool,
 }
 
@@ -125,49 +112,53 @@ impl Default for FsckOptions {
 }
 
 impl FsckOptions {
-    /// The default options: partial-marking enabled, every other check off.
+    /// Creates the default options.
+    ///
+    /// [`mark_partial`](FsckOptions::mark_partial) is `true`, and each other
+    /// field is `false`.
     pub fn new() -> FsckOptions {
         FsckOptions::default()
     }
 }
 
-/// The phases a run passes through, in order.
+/// The phases of a [`Repo::fsck`] run, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FsckPhase {
-    /// Loading and checksumming each ref's commit object.
+    /// The phase that loads the commit of each ref and verifies its checksum.
     ValidateRefs,
-    /// Reading the collection-qualified refs.
+    /// The phase that reads the collection-qualified refs.
     ValidateCollectionRefs,
-    /// Listing the commit objects and separating the ones already partial.
+    /// The phase that lists the commit objects and separates the partial ones.
     EnumerateCommits,
-    /// Walking and verifying the objects the verified commits reference.
+    /// The phase that walks and verifies the objects of the verified commits.
     VerifyObjects,
 }
 
-/// Why one object failed fsck.
+/// The cause of a finding on one object.
 #[derive(Debug, Clone)]
 pub enum FsckErrorKind {
-    /// The object is referenced but absent from the store.
+    /// The object is referenced and absent from the object store.
     Missing,
-    /// The object is present but its recomputed checksum differs from its name.
+    /// The object is present, and its checksum differs from its name.
     ChecksumMismatch {
-        /// The checksum the object's bytes actually hash to.
+        /// The checksum of the bytes of the object.
         actual: Checksum,
     },
-    /// The object is present but could not be parsed or read.
+    /// The object is present, and a read or a parse of it failed.
     Corrupt(String),
 }
 
-/// One fsck finding: the object at fault, why, and which commits reach it.
+/// One finding of a run: the object, the cause, and the commits that reach it.
 #[derive(Debug, Clone)]
 pub struct FsckError {
-    /// The object the finding concerns.
+    /// The object of the finding.
     pub object: ObjectName,
-    /// The nature of the fault.
+    /// The cause of the finding.
     pub kind: FsckErrorKind,
-    /// The verified commits that reach the object, sorted. Empty on a finding
-    /// the ref phase made, which reads a commit object a ref names and reaches
-    /// no commit through it.
+    /// The verified commits that reach the object, sorted.
+    ///
+    /// The list is empty for a finding of the ref phase. That phase reads the
+    /// commit object that a ref names, and it reaches no commit through it.
     pub in_commits: Vec<Checksum>,
 }
 
@@ -187,145 +178,170 @@ impl std::fmt::Display for FsckError {
     }
 }
 
-/// A ref-binding or back-reference finding. One of these ends the run at the
-/// phase that made it.
+/// A failed binding check or back-reference check.
+///
+/// A finding of this type ends the run in the phase that made it.
 #[derive(Debug, Clone)]
 pub struct FsckBindingError {
-    /// The commit the finding concerns.
+    /// The commit of the finding.
     pub commit: Checksum,
-    /// What failed.
+    /// The check that failed.
     pub kind: FsckBindingErrorKind,
 }
 
-/// Which binding check failed.
+/// The binding check that failed.
 #[derive(Debug, Clone)]
 pub enum FsckBindingErrorKind {
-    /// The ref phase: the ref is not named in the commit's
-    /// `ostree.ref-binding`. `bindings` holds what the commit does carry, in
-    /// stored order.
+    /// The `ostree.ref-binding` of the commit does not hold the ref (ref
+    /// phase).
     RefNotBound {
-        /// The ref the commit was reached through, by its bare name.
+        /// The bare name of the ref through which the run reached the commit.
         ref_name: String,
-        /// The names the commit's `ostree.ref-binding` carries.
+        /// The names in the `ostree.ref-binding` of the commit, in stored
+        /// order.
         bindings: Vec<String>,
     },
-    /// The collection phase: the commit's `ostree.collection-binding` is not
-    /// the collection id the ref was found under.
+    /// The `ostree.collection-binding` of the commit is not the collection id
+    /// of the ref.
+    ///
+    /// The collection phase makes this finding.
     CollectionMismatch {
-        /// The id the commit's `ostree.collection-binding` carries.
+        /// The id in the `ostree.collection-binding` of the commit.
         bound: String,
-        /// The collection id the ref was found under.
+        /// The collection id of the ref.
         found_under: String,
     },
-    /// The back-reference check: a bound ref name that names no ref.
+    /// A bound ref name that names no ref (back-reference check).
     BackRefMissing {
         /// The bound name.
         ref_name: String,
     },
-    /// The back-reference check: a bound ref name that names another commit.
+    /// A bound ref name that names another commit (back-reference check).
     BackRefMismatch {
         /// The bound name.
         ref_name: String,
     },
-    /// The back-reference check: a bound collection ref that does not exist.
+    /// A bound collection ref that does not exist (back-reference check).
     BackCollectionRefMissing {
-        /// The commit's `ostree.collection-binding`.
+        /// The `ostree.collection-binding` of the commit.
         collection_id: String,
         /// The bound name.
         ref_name: String,
     },
-    /// The back-reference check: a bound collection ref that names another
-    /// commit.
+    /// A bound collection ref that names another commit (back-reference
+    /// check).
     BackCollectionRefMismatch {
-        /// The commit's `ostree.collection-binding`.
+        /// The `ostree.collection-binding` of the commit.
         collection_id: String,
         /// The bound name.
         ref_name: String,
     },
 }
 
-/// The condition that ended a run before its last phase finished.
+/// The condition that ended a run before the end of its last phase.
 #[derive(Debug, Clone)]
 pub enum FsckFailure {
-    /// A ref names a commit object the store cannot supply.
+    /// A ref names a commit object that the object store does not hold.
     RefTarget {
-        /// The ref, by its bare name: a remote ref carries no remote prefix
-        /// here, matching the tool's own message.
+        /// The name of the ref, as a message gives it.
+        ///
+        /// A remote ref has its bare name, with no remote prefix, as in the
+        /// message of the `ostree` command. A mirror ref has the form
+        /// `(collection, name)`.
         ref_name: String,
-        /// The commit the ref names.
+        /// The commit that the ref names.
         commit: Checksum,
-        /// Whether the run itself removed the object, which `delete` does for
-        /// a ref target whose checksum does not match.
+        /// `true` if the run removed the object itself.
+        ///
+        /// [`delete`](FsckOptions::delete) removes a ref target whose checksum
+        /// does not match.
         removed: bool,
     },
-    /// A dirtree the walk must enumerate is absent, so the subtree beneath it
-    /// cannot be read.
+    /// An absent dirtree that the walk must read.
+    ///
+    /// The run cannot read the subtree of this dirtree.
     MissingDirTree(Checksum),
-    /// A ref-binding or back-reference check failed.
+    /// A failed binding check or back-reference check.
     Binding(FsckBindingError),
 }
 
-/// The outcome of a [`Repo::fsck`] run.
+/// The result of a [`Repo::fsck`] run.
+///
+/// A corrupt repository does not fail the call. The report holds each faulty
+/// object in [`errors`](FsckReport::errors), and the condition that ended the
+/// run in [`failure`](FsckReport::failure). A caller, for example the
+/// `ostrya fsck` command, turns a report with findings into a failure.
 #[derive(Debug, Clone)]
 pub struct FsckReport {
-    /// The last phase the run entered.
+    /// The last phase that the run entered.
     pub reached: FsckPhase,
-    /// The commit objects the run verified: every commit in the store that
-    /// carried no `.commitpartial` marker when the run started.
+    /// The number of commit objects that the run verified.
+    ///
+    /// These are the commits in the object store that had no `.commitpartial`
+    /// marker at the start of the run.
     pub commits_checked: usize,
-    /// The commit objects the run skipped because they were already marked
-    /// partial.
+    /// The number of commit objects that the run skipped as already partial.
     pub commits_partial: usize,
-    /// The distinct objects the verified commits reference, present or absent.
-    /// Detached commit metadata is outside the count.
+    /// The number of distinct objects that the verified commits reference.
+    ///
+    /// The count includes the present objects and the absent objects. It does
+    /// not include detached commit metadata. If the run ended early, the count
+    /// is `0`.
     pub objects_checked: usize,
-    /// The findings, one per faulty object, sorted by object checksum.
+    /// The findings, sorted by object checksum.
+    ///
+    /// A commit object that a ref names can have two findings: one from the
+    /// ref phase and one from the object walk.
     pub errors: Vec<FsckError>,
-    /// The commits this run marked partial, sorted.
+    /// The commits that the run marked as partial, sorted.
     pub marked_partial: Vec<Checksum>,
-    /// The objects this run unlinked under `delete`, sorted.
+    /// The objects that the run unlinked for [`delete`](FsckOptions::delete),
+    /// sorted.
     pub deleted: Vec<ObjectName>,
-    /// The commits this run tombstoned under `add_tombstones`, sorted.
+    /// The commits that the run deleted for
+    /// [`add_tombstones`](FsckOptions::add_tombstones), sorted.
     pub tombstoned: Vec<Checksum>,
-    /// The condition that ended the run early, where one did.
+    /// The condition that ended the run early, if one did.
     pub failure: Option<FsckFailure>,
 }
 
 impl FsckReport {
-    /// Whether the repository passed with no findings: no faulty object, no
-    /// condition that ended the run, and no commit skipped as already partial.
+    /// Returns `true` if the repository passed with no finding.
+    ///
+    /// A pass has no faulty object, no condition that ended the run, and no
+    /// commit that the run skipped as already partial.
     pub fn is_ok(&self) -> bool {
         self.errors.is_empty() && self.failure.is_none() && self.commits_partial == 0
     }
 }
 
-/// The mutable state threaded through one fsck run.
+/// The mutable state of one fsck run.
 #[derive(Default)]
 struct Ctx {
-    /// The findings, in the order they were made.
+    /// The findings, in the order of the run.
     errors: Vec<FsckError>,
-    /// The objects a finding names whose bytes do not parse as the type their
-    /// name gives them. The run reports each and acts on none.
+    /// The objects of findings whose bytes do not parse as the type of their
+    /// name. The run reports each one and acts on none.
     unparsable: HashSet<ObjectName>,
-    /// The commits marked partial by this run.
+    /// The commits that this run marked as partial.
     marked_partial: Vec<Checksum>,
-    /// The objects unlinked by this run.
+    /// The objects that this run unlinked.
     deleted: HashSet<ObjectName>,
-    /// The commits tombstoned by this run.
+    /// The commits that this run tombstoned.
     tombstoned: Vec<Checksum>,
-    /// How many leading entries of `errors` the ref phase made. Those keep an
-    /// empty `in_commits`: the ref phase reaches no commit through the object
-    /// it read.
+    /// The number of leading entries of `errors` that the ref phase made.
+    /// These keep an empty `in_commits`, because the ref phase reaches no
+    /// commit through the object that it read.
     ref_findings: usize,
-    /// The commit objects the run verifies, sorted.
+    /// The commit objects that the run verifies, sorted.
     verified: Vec<Checksum>,
-    /// The commit objects skipped as already partial.
+    /// The number of commit objects skipped as already partial.
     commits_partial: usize,
 }
 
 impl Ctx {
-    /// Record one finding. The commits that reach the object are attributed
-    /// after the walk, so the finding starts with none.
+    /// Records one finding. The run names the commits that reach the object
+    /// after the walk, so the finding starts with no commit.
     fn record(&mut self, object: ObjectName, kind: FsckErrorKind) {
         self.errors.push(FsckError {
             object,
@@ -334,7 +350,7 @@ impl Ctx {
         });
     }
 
-    /// Assemble the report.
+    /// Builds the report.
     fn finish(
         mut self,
         reached: FsckPhase,
@@ -366,9 +382,97 @@ impl Ctx {
     }
 }
 
+/// Methods that check the objects and the refs of a repository.
 impl Repo {
-    /// Verify object integrity and completeness across every commit in the
-    /// store.
+    /// Checks the integrity and the completeness of the commits in a repository.
+    ///
+    /// The run has the four phases of the `ostree fsck` command, in the same
+    /// order. A corrupt repository does not fail the call: the [`FsckReport`]
+    /// holds the findings. [`FsckOptions`] selects the optional checks.
+    ///
+    /// # Phases
+    ///
+    /// 1. Validate refs ([`FsckPhase::ValidateRefs`]). The run loads the
+    ///    commit object that each ref under `refs/heads` and `refs/remotes`
+    ///    names, and verifies its checksum. If
+    ///    [`verify_bindings`](FsckOptions::verify_bindings) is set, the
+    ///    `ostree.ref-binding` of the commit must hold the name of the ref.
+    /// 2. Validate refs in collections
+    ///    ([`FsckPhase::ValidateCollectionRefs`]). The run loads the commit of
+    ///    each mirror ref and verifies its checksum. If `verify_bindings` is
+    ///    set, the `ostree.collection-binding` of the commit of each
+    ///    collection-qualified ref must be the collection id of the ref.
+    /// 3. Enumerate commits ([`FsckPhase::EnumerateCommits`]). The run lists
+    ///    each commit object in the object store. It skips each commit that
+    ///    has a `state/<commit>.commitpartial` marker at the start of the run.
+    ///    If [`verify_back_refs`](FsckOptions::verify_back_refs) is set, each
+    ///    name in the `ostree.ref-binding` of a commit must name a ref that
+    ///    resolves to that commit.
+    /// 4. Verify objects ([`FsckPhase::VerifyObjects`]). The run reads each
+    ///    object that the verified commits reference, once:
+    ///
+    ///    - Integrity: the checksum of each object must equal its name. The
+    ///      hash of a metadata object covers its serialized bytes. The hash of
+    ///      a content object covers its framed uncompressed header and its
+    ///      uncompressed payload. Because of this, the run finds a corrupt
+    ///      `.filez` or a changed `.file` in each repository mode.
+    ///    - Completeness: each referenced object must be present. The run
+    ///      reports each absent object. It marks each commit that reaches the
+    ///      object as partial: it writes the `state/<commit>.commitpartial`
+    ///      marker of the commit.
+    ///
+    /// [`mark_partial`](FsckOptions::mark_partial) and
+    /// [`delete`](FsckOptions::delete) state the actions on a finding.
+    ///
+    /// # Early end
+    ///
+    /// A run ends early at three conditions:
+    ///
+    /// - A ref names a commit object that the object store does not hold
+    ///   ([`FsckFailure::RefTarget`]).
+    /// - A dirtree that the walk must read is absent
+    ///   ([`FsckFailure::MissingDirTree`]).
+    /// - A binding check fails ([`FsckFailure::Binding`]).
+    ///
+    /// After the first two conditions, the run cannot read the next object
+    /// that it must read. A failed binding check states a fact about the refs
+    /// and marks nothing. The run records each other fault and continues, so
+    /// one run reports each fault that it can reach.
+    ///
+    /// [`FsckReport::failure`] holds the condition, and
+    /// [`FsckReport::reached`] holds the phase.
+    ///
+    /// # Tombstones
+    ///
+    /// If [`add_tombstones`](FsckOptions::add_tombstones) is set, one step
+    /// follows the four phases. The step deletes each commit object whose
+    /// parent commit object is absent. It writes a `.tombstone-commit` object
+    /// that names each deleted commit.
+    ///
+    /// The step writes to the repository. After a walk that found a corrupt
+    /// object, the step runs only if [`all`](FsckOptions::all) or
+    /// [`delete`](FsckOptions::delete) is set. After a walk that found only
+    /// absent objects, or no fault, the step runs without `all` and `delete`.
+    /// A run that ends early does not reach the step.
+    ///
+    /// The step reads the parent of each commit against the commit list of
+    /// the start of the run. As a result, one run removes one generation. If
+    /// the run removes the parent of a commit, the next run removes that
+    /// commit.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
+    /// - [`Error::Core`] if a ref file holds no checksum, if the header of a
+    ///   content object does not serialize, or if `[core] fsync` is not a
+    ///   boolean.
+    /// - [`Error::Io`] if a read or a write on the file system fails. These
+    ///   are the listing of the refs and of the objects, the read of a commit
+    ///   that a ref names or of a dirtree, the check for a `.commitpartial`
+    ///   marker, the unlink of an object, and the write of a marker or a
+    ///   tombstone. A commit that a ref names, or a dirtree, larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) also gives this
+    ///   error.
     pub async fn fsck(&self, opts: &FsckOptions) -> Result<FsckReport> {
         let mut ctx = Ctx::default();
         // Every phase that reads a ref reads this one listing.
@@ -414,19 +518,18 @@ impl Repo {
         let objects_checked = order.len();
         self.fsck_verify_objects(&order, &mut ctx).await?;
 
-        // Attribute each finding to the commits that reach it, and act on the
-        // findings: unlink under `delete`, and mark partial. The attribution
-        // reads the dirtrees again, so it runs before anything is unlinked.
+        // Name the commits that reach each finding, and act on the findings:
+        // unlink if `delete` is set, and mark as partial. The naming step
+        // reads the dirtrees again, so it runs before the first unlink.
         if !ctx.errors.is_empty() {
             self.fsck_attribute_findings(&mut ctx).await?;
             self.fsck_apply_findings(opts, &mut ctx).await?;
         }
 
-        // The tombstone phase acts on a repository, so it is held to the
-        // condition the tool holds it to: a walk that reached its end. A
-        // corrupt object ends the tool's walk unless `all` or `delete` carries
-        // it on; an absent object never does
-        // (`docs/conformance/cli-surface.md`, "fsck").
+        // The tombstone step writes to the repository, so it has the
+        // condition of the `ostree` command: a walk that reached its end. A
+        // corrupt object ends the walk of the `ostree` command unless `all` or
+        // `delete` is set. An absent object never ends it.
         let corrupt = ctx
             .errors
             .iter()
@@ -438,12 +541,13 @@ impl Repo {
         Ok(ctx.finish(FsckPhase::VerifyObjects, objects_checked, None))
     }
 
-    /// Read the refs the run needs, once: every ref under `refs/heads` and
-    /// `refs/remotes` by the bare name a message gives it, and every
-    /// collection-qualified ref.
+    /// Reads the refs of the run, once.
     ///
-    /// A remote ref's refspec carries the remote name ahead of a `:`, which the
-    /// tool's own message drops, so the tail alone is kept.
+    /// The result holds each ref under `refs/heads` and `refs/remotes`, by the
+    /// bare name that a message gives it, and each collection-qualified ref.
+    /// The refspec of a remote ref has the remote name before a `:`. The
+    /// message of the `ostree` command drops it, so the function keeps the
+    /// tail only.
     async fn fsck_read_refs(&self) -> Result<(Vec<(String, Checksum)>, Vec<CollectionRefEntry>)> {
         let heads = self.list_refs(None).await?;
         let collection_refs = self.collection_refs_over(&heads).await?;
@@ -458,9 +562,9 @@ impl Repo {
         Ok((targets, collection_refs))
     }
 
-    /// Phase 1: load and checksum the commit each ref under `refs/heads` and
-    /// `refs/remotes` names, and under `verify_bindings` hold each commit to
-    /// the ref it was reached through.
+    /// Runs phase 1: loads and verifies the commit that each ref under
+    /// `refs/heads` and `refs/remotes` names. If `verify_bindings` is set, it
+    /// checks each commit against the ref through which the run reached it.
     async fn fsck_validate_refs(
         &self,
         targets: &[(String, Checksum)],
@@ -487,11 +591,11 @@ impl Repo {
         Ok(None)
     }
 
-    /// Load and checksum the commit object one ref names.
+    /// Loads the commit object that one ref names and verifies its checksum.
     ///
     /// `Err` ends the run. `Ok(None)` records a finding and leaves the commit
-    /// unread; whether the run continues past it is the caller's check.
-    /// `display` is the ref as a message names it.
+    /// unread. The caller decides if the run continues after it. `display` is
+    /// the ref as a message names it.
     async fn fsck_check_ref_target(
         &self,
         display: &str,
@@ -528,12 +632,12 @@ impl Repo {
         Ok(Ok(None))
     }
 
-    /// Phase 2: load and checksum the commit each collection-qualified ref
-    /// names, and under `verify_bindings` hold each commit to the collection id
-    /// the ref was found under.
+    /// Runs phase 2: loads and verifies the commit that each
+    /// collection-qualified ref names. If `verify_bindings` is set, it checks
+    /// each commit against the collection id of the ref.
     ///
-    /// A local ref qualified by the repository's own collection id was already
-    /// read by phase 1, so this phase reads it for its binding alone.
+    /// Phase 1 already read each local ref that the collection id of the
+    /// repository qualifies. This phase reads such a ref for its binding only.
     async fn fsck_validate_collection_refs(
         &self,
         entries: &[CollectionRefEntry],
@@ -573,9 +677,9 @@ impl Repo {
         Ok(None)
     }
 
-    /// Phase 3: separate the commit objects the run verifies from the ones
-    /// already marked partial, and under `verify_back_refs` hold every commit
-    /// in the store to the refs its own bindings name.
+    /// Runs phase 3: separates the commit objects that the run verifies from
+    /// the commits already marked as partial. If `verify_back_refs` is set, it
+    /// checks each commit in the store against the refs that its bindings name.
     async fn fsck_enumerate_commits(
         &self,
         commits: &[Checksum],
@@ -623,11 +727,12 @@ impl Repo {
         Ok(None)
     }
 
-    /// Phase 4, first half: the distinct objects the verified commits
-    /// reference, in the order the walk discovers them. A dirtree that is
-    /// absent ends the run, the subtree beneath it being unreadable; a dirmeta
-    /// or a content object that is absent is in the set and is reported by the
-    /// verification half.
+    /// Runs the first half of phase 4: returns the distinct objects that the
+    /// verified commits reference, in the order of the walk.
+    ///
+    /// An absent dirtree ends the run, because its subtree is unreadable. An
+    /// absent dirmeta or content object is in the set, and the second half
+    /// reports it.
     async fn fsck_collect_objects(
         &self,
         commits: &[Checksum],
@@ -662,12 +767,12 @@ impl Repo {
         Ok(Ok(order))
     }
 
-    /// Phase 4, second half: examine each object in the set once, reporting a
-    /// checksum mismatch, an unreadable object, or an absent one. Every object
-    /// in the set is examined, whatever the findings before it.
+    /// Runs the second half of phase 4: reads each object in the set once.
     ///
-    /// One read buffer serves every content object in the set, so a store of
-    /// many small objects allocates once.
+    /// The function records a checksum mismatch, an unreadable object, or an
+    /// absent object. It reads each object in the set, whatever the findings
+    /// before it. One read buffer serves each content object in the set, so a
+    /// store of many small objects allocates once.
     async fn fsck_verify_objects(&self, order: &[ObjectName], ctx: &mut Ctx) -> Result<()> {
         let mut buf: Vec<u8> = Vec::new();
         for name in order {
@@ -683,11 +788,12 @@ impl Repo {
         Ok(())
     }
 
-    /// Hash one metadata object's bytes and compare with its name.
+    /// Verifies the checksum of the bytes of one metadata object.
     ///
-    /// An object whose checksum does not match is read at its own type as
-    /// well. One whose bytes do not parse there is reported and left alone:
-    /// `delete` does not unlink it and no commit is marked partial over it.
+    /// If the checksum does not match, the function also parses the bytes as
+    /// the type of the object. If the parse fails, the run reports the object
+    /// and does not act on it. `delete` does not unlink it, and no commit is
+    /// marked as partial because of it.
     async fn fsck_hash_metadata(&self, name: ObjectName, ctx: &mut Ctx) -> Result<()> {
         match self.load_object_bytes(name.ty, &name.checksum).await {
             Ok(bytes) => {
@@ -700,16 +806,15 @@ impl Repo {
                 }
             }
             Err(Error::ObjectNotFound { .. }) => ctx.record(name, FsckErrorKind::Missing),
-            // A read failure is reported as corruption rather than ending the
-            // whole check.
+            // The run records a read failure as corruption and continues.
             Err(Error::Io(e)) => ctx.record(name, FsckErrorKind::Corrupt(e.to_string())),
             Err(e) => return Err(e),
         }
         Ok(())
     }
 
-    /// Load a content object, hash its framed header and streamed payload, and
-    /// compare with its name, recording any fault.
+    /// Verifies the checksum of a content object over its framed header and
+    /// its streamed payload, and records each fault.
     async fn fsck_hash_content(
         &self,
         name: ObjectName,
@@ -762,12 +867,12 @@ impl Repo {
         Ok(())
     }
 
-    /// Name the verified commits that reach each faulty object.
+    /// Names the verified commits that reach each faulty object.
     ///
-    /// The walk reads the dirtrees a second time, once per verified commit, so
-    /// it runs before `delete` unlinks anything. A finding the ref phase made
-    /// keeps its empty list: the ref phase reaches no commit through the object
-    /// it read.
+    /// The walk reads the dirtrees a second time, once for each verified
+    /// commit, so it runs before `delete` unlinks an object. A finding of the
+    /// ref phase keeps its empty list, because the ref phase reaches no commit
+    /// through the object that it read.
     async fn fsck_attribute_findings(&self, ctx: &mut Ctx) -> Result<()> {
         let faulty: HashSet<ObjectName> = ctx.errors[ctx.ref_findings..]
             .iter()
@@ -776,9 +881,9 @@ impl Repo {
         if faulty.is_empty() {
             return Ok(());
         }
-        // The walk records the objects it reaches that are faulty and no
-        // other, so the memory one commit costs follows the count of findings
-        // and not the size of its tree.
+        // The walk records only the faulty objects that it reaches, so the
+        // memory of one commit grows with the count of findings. The size of
+        // its tree does not change it.
         let mut found: HashMap<ObjectName, Vec<Checksum>> = HashMap::new();
         for commit in &ctx.verified {
             let mut sink = ReachSink {
@@ -797,7 +902,7 @@ impl Repo {
                     .ok();
             }
         }
-        // `ctx.verified` is sorted, so each list came out sorted.
+        // `ctx.verified` is sorted, so each list is sorted.
         let ref_findings = ctx.ref_findings;
         for error in &mut ctx.errors[ref_findings..] {
             if let Some(commits) = found.remove(&error.object) {
@@ -807,12 +912,13 @@ impl Repo {
         Ok(())
     }
 
-    /// Act on the findings: unlink each faulty object under `delete`, and mark
-    /// every commit that reaches a deleted or an absent object partial.
+    /// Acts on the findings. If `delete` is set, the function unlinks each
+    /// faulty object. It marks each commit that reaches a deleted or an
+    /// absent object as partial.
     ///
-    /// A checksum mismatch alone marks nothing, which is what the tool does: an
-    /// object that is present and wrong leaves its commits complete until the
-    /// object is removed.
+    /// A checksum mismatch alone marks no commit, as with the `ostree`
+    /// command. The commits of an object that is present and wrong stay
+    /// complete until the object is removed.
     async fn fsck_apply_findings(&self, opts: &FsckOptions, ctx: &mut Ctx) -> Result<()> {
         let mut doomed = Vec::new();
         let mut seen: HashSet<Checksum> = HashSet::new();
@@ -846,12 +952,12 @@ impl Repo {
         Ok(())
     }
 
-    /// Delete every commit object whose parent commit object is absent from the
-    /// store, writing a `.tombstone-commit` naming the deleted commit.
+    /// Deletes each commit object whose parent commit object is absent from
+    /// the store, and writes a `.tombstone-commit` that names it.
     ///
-    /// The absence is read against the listing the run took at its start, so
-    /// one run removes one generation: a commit whose parent this same run
-    /// removed is reached by the next run.
+    /// The function reads the absence against the listing of the start of the
+    /// run, so one run removes one generation. If this run removed the parent
+    /// of a commit, the next run removes the commit.
     async fn fsck_add_tombstones(&self, all: &[Checksum], ctx: &mut Ctx) -> Result<()> {
         let present: HashSet<Checksum> = all.iter().copied().collect();
         let fsync = self.config().fsync()?;
@@ -882,7 +988,7 @@ impl Repo {
         Ok(())
     }
 
-    /// Unlink one loose object, treating an already-absent file as success.
+    /// Unlinks one loose object. An absent file counts as a success.
     async fn fsck_unlink_object(&self, name: ObjectName) -> Result<()> {
         let repo = self.clone();
         let path = name.loose_path(repo.mode());
@@ -895,7 +1001,7 @@ impl Repo {
         .await
     }
 
-    /// Write a commit's `state/<commit>.commitpartial` marker.
+    /// Writes the `state/<commit>.commitpartial` marker of a commit.
     async fn mark_commit_partial(&self, commit: &Checksum) -> Result<()> {
         let path = crate::pull::partial_path(commit);
         let repo = self.clone();
@@ -903,11 +1009,12 @@ impl Repo {
     }
 }
 
-/// Whether the ref phase's binding check refuses this commit under this ref.
+/// Returns the failure if the binding check of the ref phase refuses this
+/// commit under this ref.
 ///
-/// A commit carrying no `ostree.ref-binding` key at all predates the convention
-/// and passes, which is what the tool does; one carrying a binding list that
-/// omits the ref fails.
+/// A commit with no `ostree.ref-binding` key is older than the convention and
+/// passes, as with the `ostree` command. A commit with a binding list that
+/// does not hold the ref fails.
 fn check_ref_binding(commit: &Commit, ref_name: &str) -> Option<FsckBindingErrorKind> {
     commit.metadata_value("ostree.ref-binding")?;
     let bindings = commit.ref_bindings();
@@ -920,13 +1027,13 @@ fn check_ref_binding(commit: &Commit, ref_name: &str) -> Option<FsckBindingError
     })
 }
 
-/// Whether the back-reference check refuses this commit.
+/// Returns the failure if the back-reference check refuses this commit.
 ///
-/// Each name in the commit's `ostree.ref-binding` must name a ref that resolves
-/// to the commit, the refs under `refs/remotes` counting by their bare names.
-/// Where the commit carries an `ostree.collection-binding`, the collection ref
-/// `(binding, name)` must exist and resolve to it as well. The names are walked
-/// in stored order and the first failure is the one reported.
+/// Each name in the `ostree.ref-binding` of the commit must name a ref that
+/// resolves to the commit. A ref under `refs/remotes` counts by its bare name.
+/// If the commit has an `ostree.collection-binding`, the collection ref
+/// `(binding, name)` must also exist and resolve to it. The function reads the
+/// names in stored order and returns the first failure.
 fn check_back_refs(
     commit: &Commit,
     checksum: &Checksum,
@@ -970,8 +1077,8 @@ fn check_back_refs(
     None
 }
 
-/// Index `entries` by key, keeping the first value each key carries, which is
-/// the one a linear scan over the same order would find.
+/// Indexes `entries` by key and keeps the first value of each key. A linear
+/// scan in the same order finds the same value.
 fn index_first<K: std::hash::Hash + Eq, V>(entries: impl Iterator<Item = (K, V)>) -> HashMap<K, V> {
     let mut map = HashMap::new();
     for (key, value) in entries {
@@ -980,8 +1087,8 @@ fn index_first<K: std::hash::Hash + Eq, V>(entries: impl Iterator<Item = (K, V)>
     map
 }
 
-/// Whether `bytes` read as the type `ty` names. A metadata object whose
-/// checksum does not match is held to this before the run acts on it.
+/// Returns `true` if `bytes` parse as the type `ty`. The run acts on a
+/// metadata object with a wrong checksum only if this check passes.
 fn parses_as(ty: ObjectType, bytes: &[u8]) -> bool {
     match ty {
         ObjectType::Commit => Commit::parse(bytes).is_ok(),
@@ -993,11 +1100,11 @@ fn parses_as(ty: ObjectType, bytes: &[u8]) -> bool {
 
 /// What one subtree walk does with each object it reaches.
 trait WalkSink {
-    /// Take one object the walk reached.
+    /// Takes one object that the walk reached.
     fn take(&mut self, object: ObjectName);
 }
 
-/// The collecting sink: the distinct objects in discovery order.
+/// The sink that collects the distinct objects in the order of the walk.
 struct CollectSink<'a> {
     order: &'a mut Vec<ObjectName>,
     seen: &'a mut HashSet<ObjectName>,
@@ -1009,10 +1116,11 @@ impl WalkSink for CollectSink<'_> {
     }
 }
 
-/// The attributing sink: the faulty objects one commit reaches, named against
-/// that commit. An object the walk reaches more than once under one commit is
-/// recorded once: the commit is appended only where it is not already the last
-/// name on the object's list.
+/// The sink that names one commit against each faulty object it reaches.
+///
+/// If the walk reaches an object more than once under one commit, the sink
+/// records it once. It appends the commit only if the commit is not already
+/// the last name on the list of the object.
 struct ReachSink<'a> {
     faulty: &'a HashSet<ObjectName>,
     commit: Checksum,
@@ -1031,27 +1139,27 @@ impl WalkSink for ReachSink<'_> {
     }
 }
 
-/// Append one object where the walk has not already taken it.
+/// Appends one object if the walk did not take it before.
 fn push_object(order: &mut Vec<ObjectName>, seen: &mut HashSet<ObjectName>, object: ObjectName) {
     if seen.insert(object) {
         order.push(object);
     }
 }
 
-/// The boxed future type for the recursive subtree walk. Async recursion needs
+/// The boxed future of the recursive subtree walk. Async recursion needs
 /// indirection, so each level returns a boxed future.
 type SubtreeFuture<'a> = Pin<Box<dyn Future<Output = Result<WalkOutcome>> + Send + 'a>>;
 
-/// A subtree walk either reaches every dirtree beneath it or names the first
-/// one that is absent.
+/// The result of a subtree walk: `Ok` if the walk reached each dirtree in the
+/// subtree, or the first absent dirtree.
 type WalkOutcome = std::result::Result<(), Checksum>;
 
-/// Walk a dirtree and everything beneath it, handing every object to `sink`.
+/// Walks a dirtree and its full subtree, and gives each object to `sink`.
 ///
-/// A dirtree already walked in this pass is not descended into again, so a
-/// subtree two directories share is read once. A dirtree that is absent ends
-/// the walk and is named; one that is present but cannot be parsed contributes
-/// itself and no child, the verification pass reporting its checksum.
+/// The walk enters each dirtree once in a pass, so it reads a subtree that two
+/// directories share once. An absent dirtree ends the walk, and the result
+/// names it. A present dirtree that does not parse gives itself and no child.
+/// The verification pass then reports its checksum.
 fn walk_subtree<'a, S: WalkSink + Send>(
     repo: &'a Repo,
     dirtree: Checksum,
@@ -1085,16 +1193,18 @@ fn walk_subtree<'a, S: WalkSink + Send>(
     })
 }
 
-/// Create or truncate a `.commitpartial` marker holding the single state byte
-/// the tool writes.
+/// Creates or truncates a `.commitpartial` marker that holds the one state
+/// byte of the `ostree` command.
 ///
-/// A marker this call creates in a `bare-user-shared` repository is forced to
-/// [`perm::SHARED_FILE_MODE`]. The create attempt therefore carries `O_EXCL`,
-/// which separates the arm that made the file from the arm that found one: a
-/// marker another member of the repository group owns keeps the mode it has and
-/// is truncated in place. The second open carries `O_CREAT` as well, because a
-/// concurrent pull or prune removes the marker of a commit it completes or
-/// deletes, and the name is free again by the time this call reaches it.
+/// In a `bare-user-shared` repository, a marker that this call creates gets
+/// the mode [`perm::SHARED_FILE_MODE`]. For this reason the create attempt
+/// has `O_EXCL`, which separates the arm that made the file from the arm that
+/// found one. A marker that another member of the repository group owns keeps
+/// its mode, and the call truncates it in place.
+///
+/// The second open also has `O_CREAT`. A concurrent pull or prune removes the
+/// marker of a commit that it completes or deletes, and the name can be free
+/// again when this call reaches it.
 fn write_partial_marker(repo_fd: BorrowedFd<'_>, path: &str, repo_mode: RepoMode) -> Result<()> {
     let mode = Mode::from_raw_mode(crate::pull::PARTIAL_MARKER_MODE);
     let fd = match rustix::fs::openat(

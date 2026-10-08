@@ -1,6 +1,6 @@
-//! The completeness walk of the commits of a push session: every object the
-//! tree of each commit reaches is staged in the session or present in the
-//! repository.
+//! The completeness walk of the commits of a push session. The walk checks that
+//! each object that the tree of a commit reaches is staged in the session or
+//! present in the repository.
 
 use std::collections::HashSet;
 use std::os::fd::AsFd;
@@ -19,8 +19,8 @@ use crate::write::flat_name;
 #[derive(Debug, Default)]
 pub(super) struct Missing {
     /// The first missing objects in the order the walk met them, at most
-    /// `MAX_HAVE` of them, so an `Error` frame that lists them fits the frame
-    /// limit.
+    /// `MAX_HAVE` of them. An `Error` frame that lists them then fits the
+    /// frame limit.
     pub(super) listed: Vec<ObjectName>,
     /// The number of missing objects.
     pub(super) total: usize,
@@ -35,20 +35,23 @@ impl Missing {
     }
 }
 
-/// Walk the trees of `roots`, each a root dirtree and its root dirmeta, and
-/// give the objects that neither the session nor the repository holds.
+/// Walks the trees of `roots` and returns the objects that neither the
+/// session nor the repository holds.
 ///
-/// The walk reads a staged dirtree from the staging directory and each other
-/// dirtree from `objects/`, and it goes below every dirtree, also one the
-/// repository holds. It checks each object once, also when several roots
-/// reach it. A dirmeta or a content object that the session staged needs no
-/// check. The other ones are probed in one batch with the read of the next
-/// dirtree, so the walk makes one trip to the blocking pool for each dirtree
-/// and one at the end.
+/// Each root is a root dirtree and its root dirmeta. The walk reads a staged
+/// dirtree from the staging directory and each other dirtree from `objects/`.
+/// It reads each subtree of a dirtree, also of a dirtree that the repository
+/// holds. It checks each object once, also if more than one root reaches it.
 ///
-/// A staged dirtree that does not parse is `protocol`, because the client
-/// sent it. A stored dirtree that does not parse, and an I/O error, fail on
-/// the server side.
+/// A dirmeta or a content object that the session staged needs no check. The
+/// walk probes the other objects in one batch with the read of the next
+/// dirtree. This gives one trip to the blocking pool for each dirtree, and at
+/// most one more trip at the end.
+///
+/// If a staged dirtree does not parse, the walk returns a `protocol` error to
+/// the client (`Failure::Wire`), because the client sent the dirtree. If a
+/// stored dirtree does not parse, or if an I/O error occurs, the failure is on
+/// the server side (`Failure::Internal`).
 pub(super) async fn completeness(
     txn: &Transaction,
     roots: impl IntoIterator<Item = (Checksum, Checksum)>,
@@ -70,7 +73,7 @@ pub(super) async fn completeness(
 
 struct Walk<'a> {
     txn: &'a Transaction,
-    /// Every object the walk has met.
+    /// Every object that the walk met.
     seen: HashSet<ObjectName>,
     /// The dirtrees to read.
     trees: Vec<Checksum>,
@@ -86,8 +89,11 @@ enum TreeSource {
 }
 
 impl Walk<'_> {
-    /// Meet one object: queue a dirtree for its read, and an object the
-    /// session did not stage for its probe. An object met before is skipped.
+    /// Records one object and queues it for a read or a probe.
+    ///
+    /// A dirtree goes in the read queue. Another object goes in the probe
+    /// queue if the session did not stage it. The walk skips an object that it
+    /// met before.
     fn visit(&mut self, name: ObjectName) {
         if !self.seen.insert(name) {
             return;
@@ -125,8 +131,8 @@ impl Walk<'_> {
             });
             let objects = Arc::clone(&objects);
             let staging = Arc::clone(&staging);
-            // The dirtree is parsed on the blocking pool with its read, so a
-            // large one does not hold the async executor.
+            // The blocking pool parses the dirtree with its read, so a large
+            // dirtree does not hold the async executor.
             let (probes, present, read) = ostrya_rt::unblock(move || -> Result<_> {
                 let present = probes
                     .iter()
@@ -218,8 +224,8 @@ mod tests {
     }
 
     /// A tree whose root holds two subdirectories that share one subtree and
-    /// one dirmeta, and a file the session did not send. The walk reports the
-    /// file once, and the shared subtree is read once.
+    /// one dirmeta, and a file that the session did not send. The walk reports
+    /// the file once and reads the shared subtree once.
     #[test]
     fn an_object_reached_twice_is_checked_once() {
         let scratch = Scratch::new("twice");
@@ -309,8 +315,8 @@ mod tests {
         assert_eq!(missing.listed, names[..MAX_HAVE as usize]);
     }
 
-    /// A dirtree the repository does not hold is missing, and the walk does
-    /// not go below it.
+    /// A dirtree that the repository does not hold is missing, and the walk
+    /// does not read its subtrees.
     #[test]
     fn an_absent_dirtree_is_missing() {
         let scratch = Scratch::new("absent-tree");

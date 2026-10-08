@@ -1,206 +1,17 @@
-//! HTTP pull: importing refs and their objects from a remote over HTTP.
+//! The pull from a remote, over HTTP or over ssh.
 //!
-//! [`Repo::pull`] fetches a set of refs, the commits they name, and every object
-//! those commits reach from a remote named in this repository's config, into one
-//! transaction. What the transaction publishes, when the refs are written, and
-//! what the `.commitpartial` markers mean is the local pull's contract
-//! unchanged; what this module adds is where the objects come from and how many
-//! are fetched at once.
+//! [`Repo::pull`], [`Repo::pull_over_stream`], and
+//! [`Repo::remote_fetch_summary`] are the entry points. [`Repo::pull`] holds
+//! the rules of the pull.
 //!
-//! What a pull asks the remote for, in the order it first asks: `summary.sig`,
-//! `summary`, `config`, then the objects. A remote with no summary answers 404
-//! and each requested ref is resolved through `refs/heads/<ref>` instead.
+//! The loop that drives the steps owns the plan, so the plan needs no lock.
+//! The pull spawns no task: the step futures borrow the repository, the
+//! transaction, and the fetcher. The walk of a subpath pull obeys the rules in
+//! `subpath`.
 //!
-//! The remote is an archive repository. A content object is requested as
-//! `objects/<..>.filez` whatever the remote stores on its own disk, since that
-//! is the one form of a content object an HTTP client can read: the framed,
-//! deflated payload behind its header. `config` is fetched to establish that
-//! before the first object is requested, so a non-archive remote is refused with
-//! [`Error::Unsupported`] naming its mode rather than surfacing as a 404 on the
-//! first content object. A remote serving no `config` is treated as archive.
-//!
-//! Concurrency. A pull holds up to
-//! [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches) steps in
-//! flight, each a future that fetches one object and stores it. The plan those
-//! slots are refilled from holds three classes, drained in this order and
-//! carrying the matching fetch priority:
-//!
-//! - the commits: the requested tips, and their parents under
-//!   [`depth`](PullOptions::depth);
-//! - the scan: the dirtree and dirmeta objects the walk is blocked on;
-//! - the content: the file objects, which nothing waits on.
-//!
-//! That drain order is what orders a pull's requests. The fetcher admits as many
-//! requests at once as the pull has slots, and a slot has one fetch outstanding
-//! at a time, so the admission gate a priority is weighed at never queues inside
-//! one pull. The priority a class carries decides the order where a [`Fetcher`]
-//! is shared by more callers than it admits.
-//!
-//! The plan is owned by the loop, so it needs no lock. Nothing is spawned: the
-//! step futures borrow the repository, the transaction, and the fetcher, so a
-//! failure returns from the loop and drops every step still in flight, closing
-//! their connections and releasing their fetcher permits. The transaction reaps
-//! its staging directory and no ref is written.
-//!
-//! A commit object is fetched before the objects it references, since its tree
-//! is unknown until it arrives, and staged where it arrives: the write path
-//! hashes the bytes there and compares the result against the name they were
-//! requested by, so a commit stored under the wrong name fails the pull before
-//! its tree is asked for, and nothing is held in memory past the step. A reader
-//! is covered against a commit whose tree is not yet complete by the commit's
-//! `.commitpartial` marker, which is written when the commit is fetched and
-//! removed after the transaction publishes. A pull that fails removes the
-//! markers it wrote for commits this repository does not hold, so a refused
-//! commit leaves the destination as it stood. An object several commits reach is
-//! fetched once, and the step that fetches a commit makes the ref-binding and
-//! timestamp checks of every requested ref naming it, so two refs at one commit
-//! are both checked. A commit this repository already holds complete has no
-//! object of its tree queued, since what it references is present; its parent is
-//! followed all the same, so a pull extends the history a shallower pull left.
-//!
-//! A commit's `.commitmeta` is requested ahead of the commit object and staged
-//! in the transaction once that object is here, which leaves none behind for a
-//! parent the remote answers 404 for. The transaction writes it at its commit,
-//! after the objects publish and ahead of the ref that names its commit. So a
-//! pull that fails before the ref step of its commit leaves no `.commitmeta`
-//! of its own and no ref, and a `LockTimeout` at the ref step is such a
-//! failure. A pull that fails in the ref step itself, at the install of a
-//! later `.commitmeta` or at a ref write, keeps the `.commitmeta` files the
-//! step installed before the failure. A `--mirror` pull of every ref writes
-//! the summary after the commit, and a failure there leaves the refs and the
-//! `.commitmeta` files of the commit in place.
-//!
-//! Subpaths. [`PullOptions::subpaths`](super::PullOptions::subpaths) holds the
-//! walk of each commit's tree to the parts the values name, by the rules in
-//! `subpath`; a value that is not absolute is refused before the first request.
-//! The plan walks a dirtree when its step is applied, under every position that
-//! has reached it by then, and walks it again from the transaction when a later
-//! position widens that scope. Each commit a subpath pull reaches keeps its
-//! marker, since part of its tree was fetched. Into an `archive` repository a
-//! subpath pull takes no delta and fetches the subpaths loose, unless it
-//! requires static deltas. Otherwise a delta found is applied whole, and the
-//! walk after its last part finds the subpaths present.
-//!
-//! Above one slot the request order is not fixed: which queued object a freed
-//! slot takes depends on which step finished. What is fixed is the set of
-//! requests and the class order between them.
-//!
-//! Writing is throttled separately. A content step takes one of three write
-//! permits once the response head has arrived and holds it for the whole body:
-//! the archive header read, the payload streaming into the object store, and the
-//! read that settles the end of the stream. A fast remote therefore cannot put
-//! more concurrent writers on the destination filesystem than that. The permit is
-//! taken before the body is read, which keeps a step waiting for one off the
-//! fetcher's progress clock: that clock measures silence since a read wanted
-//! bytes, and no read has yet wanted any. The header arrives inside the first
-//! frame in the ordinary case, so what the permit spans beside the payload is
-//! that frame and the byte that ends the stream. A body waiting for a permit
-//! holds what it has received unread, and over HTTP/2 that is flow-control
-//! credit: the fetcher gives a connection one stream window for every request it
-//! admits, so the credit a parked body holds is its own and the metadata stream a
-//! scan is blocked on receives over a window of its own. The ssh source takes no
-//! write permit: its session streams one body at a time, and the stores that
-//! finish after the end of their body are bounded by the depth of the pipeline.
-//!
-//! What a step holds in memory follows the object class it fetches. A content
-//! object streams into the object store through its slot's 128 KiB read buffer
-//! and buffers its header alone, which `MAX_FILE_HEADER_SIZE` caps at 1 MiB; the
-//! read buffer belongs to the slot rather than to the object, so the objects a
-//! slot stores share it whether they come from the remote or from a localcache
-//! repository. What each in-flight object does allocate for itself is the 16 KiB
-//! the decoder reads its compressed input through. A metadata object -- a commit,
-//! a dirtree, a dirmeta, or a `.commitmeta` -- is read whole under the format's
-//! 128 MiB metadata cap, in a buffer sized from the length the remote declares.
-//! A step holds one such buffer, and the step of a commit holds two, its
-//! `.commitmeta` beside the commit, so the metadata a pull holds is at most
-//! twice that cap times the slot count.
-//!
-//! Verification. Every fetched object is stored under the name it was requested
-//! by, and the write path hashes what it stores and compares the result against
-//! that name, so a corrupt or substituted object fails the pull with
-//! [`Error::ChecksumMismatch`] and publishes nothing. There is no flag to skip
-//! it: the write path cannot store an object without naming it, which is why an
-//! HTTP pull ignores [`UNTRUSTED`](PullFlags::UNTRUSTED) -- it verifies either
-//! way.
-//!
-//! The mode checks are the local pull's, made over the header a content object
-//! arrives with: [`BAREUSERONLY_FILES`](PullFlags::BAREUSERONLY_FILES) rejects a
-//! regular file whose mode has bits outside `0775`, and a bare-user-only
-//! destination rejects one whose header is not the canonical form it stores.
-//!
-//! Signatures are a policy of their own, described in
-//! `verify`: the remote's configuration states it and
-//! [`PullVerify`](super::PullVerify) overrides it. The summary is checked as
-//! soon as it and its signature are here, before the refs it resolves or the
-//! deltas it advertises are read; a commit is checked in the step that fetched
-//! it, before its bytes are staged and before its tree is asked for.
-//!
-//! That header also declares what the payload decompresses to, which bounds the
-//! stream on both sides. A payload that outgrows the declaration is refused with
-//! [`Error::InvalidFormat`], so what a corrupt or expanding stream can write
-//! before the checksum comparison at the end of the payload is what the object
-//! declared. A payload that takes more off the connection than a compressed form
-//! of that declaration occupies is refused the same way, which bounds the time and
-//! the bandwidth a stream of empty DEFLATE blocks would otherwise take.
-//!
-//! After the payload, a content step reads its response to the end. One byte
-//! settles it, since nothing follows an object's final DEFLATE block. That read
-//! returns the connection to the pool, so a pull reuses one connection per slot
-//! rather than opening one per object; at one slot that is one connection for the
-//! whole pull, and at the default eight it is up to eight, since HTTP/1.1 carries
-//! one request at a time. Bytes after the payload are refused with
-//! [`Error::InvalidFormat`], and a symlink's stored form is held to the same
-//! rule.
-//!
-//! Retries. A request that fails retryably is repeated up to
-//! [`n_network_retries`](PullOptions::n_network_retries) times, and a body that
-//! fails in transit -- a cut connection, a silent peer, or a transfer below the
-//! low-speed rule -- is fetched again from its first byte, each refetch spending
-//! one repeat of the same count. What the failed read had written stages nothing,
-//! and its temp file is removed before the refetch. A body refused for
-//! what it holds is not fetched again. Every transfer is held to the low-speed
-//! rule of [`low_speed_limit_bytes`](PullOptions::low_speed_limit_bytes) and
-//! [`low_speed_time`](PullOptions::low_speed_time), a rate below 1000 bytes per
-//! second for 30 seconds unless the options say otherwise. An object that exhausts the
-//! count fails its step, and the first failed step ends the pull.
-//!
-//! Sources. A [`localcache_repos`](PullOptions::localcache_repos) repository is
-//! consulted before the network, per object, through the local pull's import
-//! path with its checksum verified.
-//!
-//! The remote is read through a source: the HTTP source over the fetcher, or
-//! the ssh source over a pull session, which [`Repo::pull`] opens over an ssh
-//! client for an ssh address, and [`Repo::pull_over_stream`] over a pair of
-//! streams. The two serve the
-//! same paths under the same caps, and every rule of this module holds for
-//! both, with three differences. The ssh source asks for a ref by its name as
-//! written, with no percent-encoding. It never sends a request again: a
-//! failure ends its session and the pull. And it keeps the requests of
-//! `summary.sig`, `summary`, and `config`, and those of a `.commitmeta` and
-//! its commit, in flight together, in the order the HTTP source sends them one
-//! after another, so a parent commit costs one round trip. The ssh source
-//! ends its session before the transaction commits: it closes the input of
-//! the server and waits for the ssh client.
-//!
-//! Static deltas. A remote that publishes them delivers a commit as one delta
-//! instead of one request per object, which a pull looks for before it asks for
-//! the first object: the delta index for the target commit, then the summary's own
-//! `ostree.static-deltas` map where the remote serves no index. One delta is
-//! taken per tip -- from the commit the ref names in this repository, else from
-//! another commit held here complete, or from scratch where the ref names none --
-//! and the superblock is checked against the digest the advertisement carried.
-//! The target commit rides in that superblock, so no `.commit` is requested; the
-//! objects the delta hands over loose are queued at once, two part fetches run at
-//! a time, and the commit's tree is walked once the last part is applied, so an
-//! object no part delivered is fetched loose.
-//! [`disable_static_deltas`](PullOptions::disable_static_deltas) asks for no
-//! delta, and [`require_static_deltas`](PullOptions::require_static_deltas)
-//! refuses a remote with no summary and a tip for which no advertised delta can
-//! be taken. What a delta costs in memory per part
-//! in flight is one xz decoder and two blobs: the verified part body, which is
-//! hashed against the superblock's entry for it before the decoder runs, and the
-//! payload it decompresses to. Each blob is on the heap while it is small and a
-//! mapped temp file past its heap threshold.
+//! The plan walks a dirtree when it applies the step of the dirtree, under
+//! each position that reached the dirtree by then. If a later position widens
+//! that scope, the plan walks the dirtree again from the transaction.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
@@ -246,88 +57,384 @@ use super::{
     refuse_remote_collection,
 };
 
-/// How many fetches are in flight when the caller names no limit.
+/// The number of fetches in flight if the caller names no limit.
 const DEFAULT_OUTSTANDING: usize = 8;
-/// How many times a round of mirrors is repeated when the caller names no count.
+/// The number of repeats of a round of mirrors if the caller names no count.
 const DEFAULT_RETRIES: u32 = 5;
-/// The rate in bytes per second below which a transfer is abandoned when the
-/// caller names none.
+/// The rate in bytes per second below which the fetcher stops a transfer, if
+/// the caller names no rate.
 const DEFAULT_LOW_SPEED_LIMIT: u32 = 1000;
-/// How long the rate may stay below the limit when the caller names no time.
+/// The time that the rate can stay below the limit, if the caller names no
+/// time.
 const DEFAULT_LOW_SPEED_TIME: Duration = Duration::from_secs(30);
-/// How many fetched content objects stream into the object store at once.
+/// The number of fetched content objects that stream into the object store at
+/// once.
 const WRITE_THROTTLE: usize = 3;
 
-/// The cap on the repository-root files a pull fetches (`summary`,
-/// `summary.sig`, `config`), matching the cap the local summary reader applies.
+/// The cap on the repository-root files that a pull fetches (`summary`,
+/// `summary.sig`, `config`). The local summary reader applies the same cap.
 pub(super) const MAX_ROOT_FILE: u64 = 64 * 1024 * 1024;
 /// The cap on a fetched `refs/heads/<ref>` file, which holds 64 hex characters
 /// and a newline.
 const MAX_REF_FILE: u64 = 1024;
 
-/// The repository config file name at the repository root.
+/// The name of the config file at the repository root.
 pub(super) const CONFIG_FILE: &str = "config";
 
+/// Methods that pull from a remote over HTTP or ssh.
 impl Repo {
-    /// Pull refs and their objects from an HTTP remote, or over ssh from a
-    /// remote whose address is an ssh address.
+    /// Pulls refs and their objects from a remote over HTTP or over ssh.
     ///
-    /// `remote` names a `[remote "<name>"]` section of this repository's config,
-    /// which supplies the address, the TLS material, and the proxy;
-    /// [`url`](PullOptions::url) overrides the address, which lets a caller pull
-    /// from a remote the config does not describe. The address is
-    /// [`url`](PullOptions::url), then the remote key `pull-url`, then the
-    /// remote key `url`. A value that starts with `ssh://`, or that holds no
-    /// `://`, is an ssh address of [`PushRemote::parse`], and a malformed one is
-    /// [`Error::InvalidInput`]. Any other value is the base URL of an HTTP
-    /// remote. An ssh address in `url` is [`Error::Pull`], and so is a section
-    /// with neither key.
+    /// `remote` names a `[remote "<name>"]` section of the config of this
+    /// repository. The section gives the address, the TLS material, and the
+    /// proxy. The pull fetches the objects into one transaction, publishes
+    /// them, and then writes the refs. It returns the statistics of the pull.
+    ///
+    /// The module [`pull`](mod@crate::pull) states the rules of the
+    /// `.commitpartial` markers. It also states the concurrency, the write
+    /// permits, the memory, the connections, and the retries of this pull.
+    ///
+    /// [`pull_local`](Repo::pull_local) states the write order of the detached
+    /// metadata and the mode checks of a content object. These rules apply to
+    /// this pull too.
+    ///
+    /// [`PullOptions`] states which fields each pull reads, and
+    /// [`PullVerify`](crate::PullVerify) holds the signature policy.
+    ///
+    /// # Address
+    ///
+    /// The address is the first of these values that is set:
+    ///
+    /// 1. [`url`](PullOptions::url), which lets a caller pull from a remote
+    ///    that the config does not describe
+    /// 2. the remote key `pull-url`
+    /// 3. the remote key `url`
+    ///
+    /// If the value starts with `ssh://` or holds no `://`, it is an ssh
+    /// address of [`PushRemote::parse`]. Any other value is the base URL of an
+    /// HTTP remote. The fetcher gets that value as written, and it refuses a
+    /// scheme other than `http` and `https`.
+    ///
+    /// The remote key `url` cannot hold an ssh address, because the `ostree`
+    /// command also reads that key and does not pull over ssh.
+    ///
+    /// # Refs
+    ///
+    /// The pull resolves each requested ref against the summary of the remote.
+    /// If the summary does not list the ref, or the remote serves no summary,
+    /// the pull reads `refs/heads/<ref>` of the remote.
+    /// [`refs`](PullOptions::refs) states what an empty list takes.
+    ///
+    /// [`remote`](PullOptions::remote) and [`MIRROR`](PullFlags::MIRROR)
+    /// select the prefix of the written refs.
+    /// [`no_ref_writes`](PullOptions::no_ref_writes) turns the ref writes off.
+    ///
+    /// # Proxy
     ///
     /// An HTTP pull connects through the `http://` proxy URL of the remote key
-    /// `proxy`, for every origin, and ignores `no_proxy`. When the key is
-    /// absent or empty, the pull reads the proxy environment variables. A
-    /// value with white space at its start or end, and a value the fetcher
-    /// cannot connect through, is [`Error::Unsupported`] before the first
-    /// request.
+    /// `proxy`, for every origin, and ignores `no_proxy`. If the key is absent
+    /// or empty, the pull reads the proxy environment variables.
     ///
-    /// A pull over ssh runs the ssh client after the signature policy is
-    /// resolved, with the ssh command and the send command of
-    /// [`connect`](PullOptions::connect). The remote keys `ssh-command` and
-    /// `send-command` fill the fields that `connect` leaves `None`, and the
-    /// precedence of [`PullConnectOptions`] applies. The pull reads no remote
-    /// key of HTTP alone: `contenturl`, `metalink`, `proxy`, and the `tls-*`
-    /// keys. A field of HTTP alone is [`Error::InvalidInput`] before the ssh
-    /// client starts: [`http_headers`](PullOptions::http_headers),
-    /// [`n_network_retries`](PullOptions::n_network_retries) above 0,
-    /// [`low_speed_limit_bytes`](PullOptions::low_speed_limit_bytes), and
-    /// [`low_speed_time`](PullOptions::low_speed_time). The pull keeps the
-    /// rules of [`pull_over_stream`](Repo::pull_over_stream) for its session.
-    /// An HTTP pull reads neither `ssh-command` nor `send-command`.
+    /// # Pull over ssh
+    ///
+    /// For an ssh address, the pull runs the ssh client after it resolves the
+    /// signature policy. [`connect`](PullOptions::connect) states where the
+    /// commands of the client come from. The session obeys the rules of
+    /// [`pull_over_stream`](Repo::pull_over_stream).
+    ///
+    /// A pull over ssh reads no remote key that applies to HTTP alone:
+    /// `contenturl`, `metalink`, `proxy`, and the `tls-*` keys. An HTTP pull
+    /// reads neither `ssh-command` nor `send-command`.
+    ///
+    /// The pull reads the remote through a source: the HTTP source over the
+    /// fetcher, or the ssh source over a pull session.
+    /// [`pull_over_stream`](Repo::pull_over_stream) opens the ssh source over
+    /// a pair of streams. The two sources serve the same paths under the same
+    /// caps. Each rule of this method applies to both sources, with these
+    /// differences:
+    ///
+    /// - The ssh source requests a ref by its name as written, with no
+    ///   percent-encoding.
+    /// - The ssh source never sends a request again. A failure ends its
+    ///   session and the pull.
+    /// - The ssh source keeps the requests of `summary.sig`, `summary`, and
+    ///   `config` in flight together, in the order of the HTTP source. It does
+    ///   the same for a `.commitmeta` and its commit, so a parent commit costs
+    ///   one round trip. The HTTP source sends these requests one at a time.
+    /// - The ssh source ends its session before the transaction commits. It
+    ///   closes the input of the server and waits for the ssh client.
+    ///
+    /// # Requests
+    ///
+    /// The pull first requests `summary.sig`, `summary`, and `config`, in this
+    /// order, and then the objects. A remote with no summary answers 404. The
+    /// HTTP source percent-encodes each byte of a ref name outside the
+    /// unreserved set of RFC 3986, except `/`.
+    ///
+    /// The remote must be an `archive` repository. The pull requests each
+    /// content object as `objects/<..>.filez`, whatever the remote stores on
+    /// its disk. That is the one form of a content object that an HTTP client
+    /// can read: the framed, deflated payload behind its header.
+    ///
+    /// The pull reads `config` before the first object request. If `config`
+    /// states a different mode, the pull fails. If the remote serves no
+    /// `config`, the pull reads the remote as `archive`.
+    ///
+    /// # Commits
+    ///
+    /// The pull fetches a commit object before the objects that it references,
+    /// because its tree is unknown until it arrives. The pull stages the commit
+    /// when it arrives, so the verification of its name fails a wrong commit
+    /// before the request of its tree. Nothing of the commit stays in memory
+    /// after the step.
+    ///
+    /// The step that fetches a commit writes its `.commitpartial` marker. The
+    /// module [`pull`](mod@crate::pull) states the rules of the markers.
+    ///
+    /// The pull fetches each object once, also if several commits reach it.
+    /// The step that fetches a commit makes the ref-binding check and the
+    /// timestamp check of each requested ref that names the commit. So two
+    /// refs at one commit get both checks.
+    ///
+    /// The pull queues no object of the tree of a commit that this repository
+    /// holds complete. It follows the parent of that commit all the same, so a
+    /// pull extends the history that a shallower pull left.
+    ///
+    /// # Detached metadata
+    ///
+    /// The pull requests the `.commitmeta` of a commit before the commit
+    /// object. It stages the `.commitmeta` in the transaction when the commit
+    /// object arrives, so no `.commitmeta` stays for a parent that the remote
+    /// answers 404 for. [`pull_local`](Repo::pull_local) states when the
+    /// transaction writes it and what a failure leaves.
+    ///
+    /// # Verification
+    ///
+    /// The pull stores each fetched object under the name that it requested.
+    /// The write path hashes what it stores and compares the result with that
+    /// name. So a corrupt or substituted object fails the pull, and the pull
+    /// publishes nothing. No flag turns this verification off, so the pull
+    /// ignores [`UNTRUSTED`](PullFlags::UNTRUSTED).
+    ///
+    /// The pull makes the mode checks of
+    /// [`BAREUSERONLY_FILES`](PullFlags::BAREUSERONLY_FILES) and of a
+    /// `bare-user-only` destination over the header of a content object.
+    ///
+    /// The header also declares the size of the decompressed payload. This
+    /// size bounds the stream on both sides:
+    ///
+    /// - A payload larger than the declared size fails the pull. So a corrupt
+    ///   or expanding stream writes at most the declared size before the
+    ///   checksum comparison at the end of the payload.
+    /// - A payload that takes more bytes off the connection than a compressed
+    ///   form of that size fails the pull too. The limit is the declared size,
+    ///   plus one byte for each 1024, plus 64 KiB. This limit bounds the time
+    ///   and the bandwidth of a stream of empty DEFLATE blocks.
+    ///
+    /// # Static deltas
+    ///
+    /// A remote that publishes static deltas delivers a commit as one delta,
+    /// with no request for each object. Before the pull requests the first
+    /// object, it looks for a delta:
+    ///
+    /// 1. If the remote serves a summary that states `indexed-deltas` or
+    ///    omits the key, the pull fetches the delta index of the target
+    ///    commit, `delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index`.
+    /// 2. If the remote serves no index, the pull reads the
+    ///    `ostree.static-deltas` map of the summary.
+    ///
+    /// Both map a delta name to the SHA-256 of the `superblock` of that delta.
+    /// The pull fetches no delta that the map does not name. So a client that
+    /// holds a commit with no published delta from it fetches loose.
+    ///
+    /// If the remote serves no summary, nothing advertises a delta. The pull
+    /// then requests the `superblock` of one delta by name, with no digest to
+    /// verify it against. That delta is `<from>-<to>` if this repository holds
+    /// the commit of the ref complete, and the from-scratch `<to>` otherwise.
+    ///
+    /// The pull takes at most one delta for each target commit. It takes the
+    /// first of these that the map names:
+    ///
+    /// - `<from>-<to>`, where `from` is the commit that the pulled ref names in
+    ///   this repository
+    /// - `<c>-<to>`, for each other commit `c` that this repository holds
+    ///   complete
+    /// - the from-scratch `<to>`, if the ref names no commit
+    ///
+    /// A from-to delta patches against the objects of the source commit, so
+    /// this repository must hold the source commit complete. A ref whose
+    /// commit is absent or partial counts as a ref that names no commit.
+    ///
+    /// If the ref names a commit that this repository holds complete, the pull
+    /// takes no from-scratch delta, which delivers each object of the target
+    /// again. It fetches the missing objects loose. With a map, a ref that
+    /// names the target commit, held here partial, also leaves the
+    /// from-scratch delta alone. The `ostree` command does the same.
+    ///
+    /// The pull looks for no delta to a target commit that this repository
+    /// holds complete. It looks for a delta to a target commit held partial
+    /// as for a commit that it does not hold. A
+    /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull takes no delta.
+    /// [`subpaths`](PullOptions::subpaths) states the delta rules of a
+    /// subpath pull.
+    ///
+    /// If the remote advertised a digest for a superblock, the pull hashes the
+    /// superblock and compares the result with the digest before the parse.
+    /// So a delta swapped under a signed summary fails the pull. The parsed
+    /// superblock must name the pulled commit and the source commit that the
+    /// delta name states.
+    ///
+    /// Before any part request, the pull verifies the signatures of the delta
+    /// over the raw superblock bytes, under the policy of
+    /// [`PullVerify`](crate::PullVerify). Also before any part request, it
+    /// verifies each inline part against the size and the checksum of its
+    /// meta-entry. A superblock that the remote does not hold (a stale
+    /// advertisement) is a 404, and the pull fetches the objects loose.
+    ///
+    /// The superblock holds the target commit, so the pull requests no
+    /// `.commit`. A part that the superblock carries inline needs no request.
+    /// The pull queues the objects that the delta hands over loose at once.
+    /// Two part fetches run at a time, whatever the step count.
+    ///
+    /// The pull takes each part off the connection under the size that its
+    /// meta-entry declares. It verifies the part against the checksum of that
+    /// entry before decompression. So the remote puts at most the size that
+    /// the superblock states onto the staging file system for one part. The
+    /// pull writes each object of a part with its expected checksum asserted.
+    ///
+    /// The pull applies the parts in the order that they arrive. The format
+    /// allows this order: a part patches against the objects of the source
+    /// commit, which are present before the delta applies. A part never
+    /// patches against the output of another part.
+    ///
+    /// After the last part, the pull walks the tree of the commit and fetches
+    /// loose each object that no part delivered. The `ostree` command takes
+    /// the delta and its loose objects as the whole commit. If the delta was
+    /// complete, the walk reads what the delta staged and requests nothing.
+    ///
+    /// Each part in flight costs one xz decoder and two blobs: the verified
+    /// part body and the payload that it decompresses to. Each blob is on the
+    /// heap while it is small. After a blob passes its heap threshold, it is a
+    /// mapped temp file.
+    ///
+    /// [`disable_static_deltas`](PullOptions::disable_static_deltas) and
+    /// [`require_static_deltas`](PullOptions::require_static_deltas) control
+    /// the search.
+    ///
+    /// # Failure
+    ///
+    /// The steps borrow the repository, the transaction, and the fetcher. A
+    /// failure drops each step in flight, which closes its connection and
+    /// releases its fetcher permit. The transaction removes its staging
+    /// directory, and the pull writes no ref.
+    ///
+    /// # Errors
+    ///
+    /// These errors stop the pull before its first request:
+    ///
+    /// - [`Error::InvalidInput`] if [`depth`](PullOptions::depth) is below
+    ///   `-1`, or if an ssh address is malformed.
+    /// - [`Error::InvalidInput`] if a pull over ssh gets a field of HTTP alone:
+    ///   [`http_headers`](PullOptions::http_headers),
+    ///   [`n_network_retries`](PullOptions::n_network_retries) above 0,
+    ///   [`low_speed_limit_bytes`](PullOptions::low_speed_limit_bytes), or
+    ///   [`low_speed_time`](PullOptions::low_speed_time).
+    /// - [`Error::InvalidInput`] if an HTTP pull gets the ssh command or the
+    ///   send command of [`connect`](PullOptions::connect).
+    /// - [`Error::Unsupported`] if
+    ///   [`collection_id`](PullOptions::collection_id) is set. The pull reads
+    ///   no collection ref.
+    /// - [`Error::Unsupported`] if the scheme of the URL is neither `http` nor
+    ///   `https`.
+    /// - [`Error::Unsupported`] if the value of the remote key `proxy` has
+    ///   white space at its start or end. Also if the fetcher refuses the
+    ///   proxy URL or a proxy environment variable.
+    /// - [`Error::Fetch`] if the URL is not a valid absolute URL, if a header
+    ///   is invalid, or if the TLS material does not parse.
+    /// - [`Error::Pull`] if a subpath does not start with `/`.
+    /// - [`Error::Pull`] if the config has no section for `remote` and the
+    ///   caller gives no `url`.
+    /// - [`Error::Pull`] if the section has neither `pull-url` nor `url`, or if
+    ///   `url` holds an ssh address.
+    /// - [`Error::Pull`] if the remote names `tls-client-cert-path` without
+    ///   `tls-client-key-path`, or the reverse.
+    /// - [`Error::Core`] if a key of the remote section holds a malformed
+    ///   escape sequence.
+    /// - [`Error::Io`] if a PEM file that a `tls-*` key names cannot be read.
+    ///
+    /// These errors stop the pull before it fetches an object:
+    ///
+    /// - [`Error::Signature`] if the policy of
+    ///   [`PullVerify`](crate::PullVerify) refuses the summary.
+    /// - [`Error::Unsupported`] if the `config` of the remote states a mode
+    ///   other than `archive`.
+    /// - [`Error::InvalidFormat`] if the `config` of the remote is not valid
+    ///   UTF-8 or has no valid `[core]` group.
+    /// - [`Error::InvalidFormat`] if a `refs/heads/<ref>` file is not valid
+    ///   UTF-8.
+    /// - [`Error::Core`] if the `config` of the remote does not parse as a key
+    ///   file, or if a `refs/heads/<ref>` file holds no checksum.
+    /// - [`Error::InvalidRefspec`] if a requested ref, or a ref of the summary
+    ///   under `MIRROR`, is not a valid ref name.
+    /// - [`Error::RefNotFound`] if neither the summary nor `refs/heads/<ref>`
+    ///   names a requested ref.
+    /// - [`Error::Pull`] if [`refs`](PullOptions::refs) is empty and the remote
+    ///   serves no summary under `MIRROR`, or the remote has no `branches`.
+    /// - [`Error::Pull`] if
+    ///   [`require_static_deltas`](PullOptions::require_static_deltas) is set
+    ///   and the pull finds no delta.
+    /// - [`Error::Pull`] if a superblock names other commits than its delta
+    ///   name.
+    ///
+    /// These errors stop the pull while it fetches:
+    ///
+    /// - [`Error::Signature`] if the policy refuses a commit or a static delta.
+    /// - [`Error::Pull`] if the `ostree.ref-binding` of a commit does not list
+    ///   the ref.
+    /// - [`Error::Pull`] if a tip is older than the
+    ///   [`timestamp_check`](PullOptions::timestamp_check) allows, or if a
+    ///   content object fails a mode check.
+    /// - [`Error::ObjectNotFound`] if the remote does not hold a requested
+    ///   commit or an object of a tree.
+    /// - [`Error::ChecksumMismatch`] if a fetched object does not hash to its
+    ///   name, or a superblock does not hash to its advertised digest.
+    /// - [`Error::Core`] if a fetched commit or the header of a content object
+    ///   does not parse.
+    /// - [`Error::InvalidFormat`] if a content object breaks its framing, or
+    ///   passes its declared size or its compressed limit.
+    /// - [`Error::InvalidFormat`] if a content object inflates to fewer bytes
+    ///   than declared, or has bytes after its end. A malformed static delta
+    ///   has the same error.
+    /// - [`Error::InsufficientFreeSpace`] if a stored object needs more space
+    ///   than the free-space budget of the transaction holds.
+    ///
+    /// These errors can stop the pull at any request or write:
+    ///
+    /// - [`Error::Fetch`], [`Error::HttpStatus`], [`Error::FetchTooLarge`],
+    ///   [`Error::ContentEncoded`], or [`Error::RedirectLimit`] if an HTTP
+    ///   request fails after its retries.
+    /// - [`Error::Push`] if the session of a pull over ssh fails.
+    /// - [`Error::LockTimeout`] if the wait for the repository lock or the
+    ///   update lock passes `[core] lock-timeout-secs`.
+    /// - [`Error::Io`] for an I/O error of the file system.
+    ///
+    /// # Examples
+    ///
+    /// Pull one ref from the remote `origin` of the config:
+    ///
+    /// ```no_run
+    /// # async fn run() -> ostrya::Result<()> {
+    /// let repo = ostrya::Repo::open("/srv/repo".as_ref()).await?;
+    /// let opts = ostrya::PullOptions {
+    ///     refs: vec!["exampleos/stable".to_owned()],
+    ///     ..Default::default()
+    /// };
+    /// let stats = repo.pull("origin", opts).await?;
+    /// println!("{} content objects fetched", stats.content_fetched);
+    /// # Ok(()) }
+    /// ```
     ///
     /// [`PushRemote::parse`]: crate::push::PushRemote::parse
-    /// [`PullConnectOptions`]: crate::push::PullConnectOptions
-    ///
-    /// Every requested ref is resolved against the remote's summary and then
-    /// against `refs/heads/<ref>`; a ref neither yields fails with
-    /// [`Error::RefNotFound`] before anything is fetched. A
-    /// [`depth`](PullOptions::depth) below `-1` fails with
-    /// [`Error::InvalidInput`] before the first request, and a
-    /// [`collection_id`](PullOptions::collection_id) fails with
-    /// [`Error::Unsupported`] before the first request and before the ssh
-    /// client starts: the pull reads no collection ref. An empty
-    /// [`refs`](PullOptions::refs) list takes every ref the summary lists under
-    /// [`MIRROR`](PullFlags::MIRROR), and the remote's configured `branches`
-    /// otherwise; neither being available fails with [`Error::Pull`].
-    ///
-    /// The refs are written after the objects are published, under
-    /// `refs/remotes/<remote>/<ref>` -- or under
-    /// [`PullOptions::remote`](PullOptions::remote) when that names a different
-    /// prefix, and as local refs under [`MIRROR`](PullFlags::MIRROR). A mirror
-    /// pull that took every ref the summary lists also copies the remote's
-    /// summary bytes to this repository's `summary`, and its `summary.sig` bytes
-    /// where the remote holds them. Under
-    /// [`no_ref_writes`](PullOptions::no_ref_writes) the pull writes neither
-    /// the refs nor the summary.
     pub async fn pull(&self, remote: &str, opts: PullOptions) -> Result<PullStats> {
         let started = Instant::now();
         // A subpath the walk cannot read is refused before anything else, so it
@@ -389,33 +496,41 @@ impl Repo {
         .await
     }
 
-    /// Pull refs and their objects from a server of the pull over ssh, over a
-    /// pair of byte streams: `input` from the server and `output` to it, which
-    /// the caller connected to `ostrya send` on the side of the remote
-    /// repository.
+    /// Pulls refs and their objects from `ostrya send` over a pair of streams.
     ///
-    /// `remote` names the remote whose configuration the pull reads, as for
-    /// [`pull`](Repo::pull): the signature policy, the configured `branches`,
-    /// and the prefix the refs are written under. The remote needs no
-    /// section, as for a pull with [`url`](PullOptions::url). The pull keeps
-    /// every rule of [`pull`](Repo::pull): the transaction, the commit walk,
-    /// [`depth`](PullOptions::depth), the subpaths, the verification of
-    /// signatures, the static deltas, and the statistics.
+    /// `input` carries the bytes from the server, and `output` carries the
+    /// bytes to it. The caller connects them to `ostrya send` on the side of
+    /// the remote repository.
     ///
-    /// The session opens after the signature policy is resolved, so a refused
-    /// policy writes nothing to `output`. It keeps at most
+    /// `remote` names the remote whose config the pull reads, as for
+    /// [`pull`](Repo::pull): the signature policy, the `branches` key, and the
+    /// prefix of the written refs. The remote needs no config section, as for a
+    /// pull with [`url`](PullOptions::url).
+    ///
+    /// The pull obeys every rule of [`pull`](Repo::pull): the transaction, the
+    /// commit walk, [`depth`](PullOptions::depth), the subpaths, the
+    /// verification of signatures, the static deltas, and the statistics.
+    ///
+    /// The session opens after the pull resolves the signature policy, so a
+    /// refused policy writes nothing to `output`. The session keeps at most
     /// [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches)
-    /// requests in flight. A request is not sent again: a failure ends the
-    /// session and fails the pull with that failure. An error of the session
-    /// is [`Error::Push`]. Before the transaction commits, the pull closes
-    /// `output` and so ends the session.
+    /// requests in flight. It never sends a request again, and it puts no time
+    /// limit on a read. Before the transaction commits, the pull closes
+    /// `output`, which ends the session.
     ///
-    /// [`url`](PullOptions::url) and the ssh command and the send command of
-    /// [`connect`](PullOptions::connect) are [`Error::InvalidInput`]: the
-    /// caller already connected the streams. A
-    /// [`collection_id`](PullOptions::collection_id) is
-    /// [`Error::Unsupported`] before the session opens, as for
-    /// [`pull`](Repo::pull). The session puts no time limit on a read.
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if `opts` sets [`url`](PullOptions::url), or
+    ///   the ssh command or the send command of
+    ///   [`connect`](PullOptions::connect). The caller already connected the
+    ///   streams.
+    /// - [`Error::Unsupported`] if
+    ///   [`collection_id`](PullOptions::collection_id) is set, before the
+    ///   session opens.
+    /// - [`Error::Push`] if the session fails. A failure ends the session and
+    ///   the pull.
+    /// - The other errors of [`pull`](Repo::pull) that apply to a pull over
+    ///   ssh.
     pub async fn pull_over_stream<R, W>(
         &self,
         remote: &str,
@@ -463,8 +578,8 @@ impl Repo {
         .await
     }
 
-    /// Run a pull from `source` to its end: fetch what the refs reach into a
-    /// transaction, end the source, commit the transaction, and write the
+    /// Runs a pull from `source` to its end: fetches what the refs reach into
+    /// a transaction, ends the source, commits the transaction, and writes the
     /// refs.
     #[allow(clippy::too_many_arguments)]
     async fn pull_from(
@@ -484,8 +599,8 @@ impl Repo {
             Some(opts.remote.as_deref().unwrap_or(remote))
         };
 
-        // The markers the pull writes, held outside the span that writes them so
-        // a failure in that span clears the ones it left behind.
+        // The markers that the pull writes. They stay outside the span that
+        // writes them, so a failure in that span clears the markers it left.
         let mut marked = Vec::new();
         let fetched = self
             .fetch_from(
@@ -499,9 +614,10 @@ impl Repo {
                 &mut marked,
             )
             .await;
-        // The source ends before the transaction commits: the ssh source
-        // closes the input of the server and waits for the ssh client, so a
-        // failure of the session fails the pull before anything publishes.
+        // The source ends before the transaction commits. The ssh source
+        // closes the input of the server and waits for the ssh client. As a
+        // result, a failure of the session fails the pull before anything
+        // publishes.
         let fetched = source.finish(fetched).await;
         let published = match fetched {
             Ok(fetched) => {
@@ -528,38 +644,39 @@ impl Repo {
             }
         };
 
-        // The content a marker guarded is published. A commit-only pull keeps
-        // its markers, since the trees were never fetched, and so does a pull
-        // with subpaths, which fetched part of each tree.
+        // The content that a marker guarded is published. A commit-only pull
+        // keeps its markers, because it fetched no tree. A pull with subpaths
+        // keeps them too, because it fetched part of each tree.
         if !opts.flags.contains(PullFlags::COMMIT_ONLY) && opts.subpaths.is_empty() {
             for commit in &marked {
                 self.remove_partial_marker(commit).await?;
             }
         }
 
-        // A mirror pull of every ref holds the whole of what the remote
-        // publishes, so the remote's summary describes this repository too and
-        // is copied verbatim. A mirror pull of named refs holds part of it and
-        // writes no summary. A pull that writes no ref writes no summary either,
-        // since the summary lists refs the pull did not write.
+        // A mirror pull of every ref holds all that the remote publishes, so
+        // the summary of the remote also describes this repository. The pull
+        // copies it byte for byte. A mirror pull of named refs holds part of
+        // it and writes no summary. A pull that writes no ref writes no
+        // summary, because the summary lists refs that the pull did not write.
         if mirror
             && opts.refs.is_empty()
             && !opts.no_ref_writes
             && let Some(bytes) = summary_bytes
         {
             let fsync = self.config().fsync()? && !opts.disable_fsync;
-            // Both files are written under one hold of the update lock, taken
-            // after the commit released its own, so no other writer of the
-            // summary lands between them. The hold can time out after the
-            // commit wrote the refs and the `.commitmeta` files, and the pull
-            // then fails with those in place and the summary as it stood.
+            // The pull writes both files under one hold of the update lock. It
+            // takes the lock after the transaction commit released its own
+            // hold, so no other writer of the summary lands between the files.
+            // The hold can time out after the transaction commit wrote the
+            // refs and the `.commitmeta` files. The pull then fails with those
+            // files in place and the summary as it was.
             self.write_locked(move |repo| {
                 put_root_file_blocking(repo.repo_fd(), SUMMARY_FILE, &bytes, fsync)?;
-                // The signature covers those bytes, so it is copied with them:
-                // a client pulling from this repository with
-                // `gpg-verify-summary=true` reads the pair. A remote holding no
-                // `summary.sig` leaves this repository's own file as it
-                // stands, which is what the tool does.
+                // The signature covers those bytes, so the pull copies it with
+                // them. A client that pulls from this repository with
+                // `gpg-verify-summary=true` reads the pair. If the remote holds
+                // no `summary.sig`, the file of this repository stays as it
+                // is. The `ostree` command does the same.
                 if let Some(sig) = signature {
                     put_root_file_blocking(repo.repo_fd(), SUMMARY_SIG_FILE, &sig, fsync)?;
                 }
@@ -585,10 +702,10 @@ impl Repo {
         })
     }
 
-    /// Fetch what a pull from `source` reaches into a new transaction: the
-    /// summary and its checks, the refs, the deltas, and then the plan, run
-    /// to completion. The commits whose `.commitpartial` marker the pull
-    /// wrote go into `marked`.
+    /// Fetches what a pull from `source` reaches into a new transaction: the
+    /// summary and its checks, the refs, the deltas, and then the plan, to
+    /// its end. The commits whose `.commitpartial` marker the pull wrote go
+    /// into `marked`.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_from(
         &self,
@@ -602,9 +719,10 @@ impl Repo {
         marked: &mut Vec<Checksum>,
     ) -> Result<FetchedPull> {
         let mut root = source.root_files().await?;
-        // The summary is checked before it is read: the refs it resolves and the
-        // deltas it advertises are what a pull acts on, so a summary the policy
-        // refuses stops the pull before its first object request.
+        // The pull checks the summary before it reads it. The pull acts on the
+        // refs that the summary resolves and the deltas that it advertises.
+        // As a result, a summary that the policy refuses stops the pull before
+        // its first object request.
         verification
             .check_summary(root.summary.as_deref(), root.signature.as_deref())
             .await?;
@@ -617,12 +735,12 @@ impl Repo {
             .remote_targets(remote, opts, summary.as_ref(), source)
             .await?;
         // The transferred count starts after the summary, the config, and the
-        // ref files a pull reads where the remote has no summary, which is the
-        // count the tool reports.
+        // ref files that a pull reads from a remote with no summary. The
+        // `ostree` command reports the same count.
         counters.restart_transferred();
 
-        // The deltas the remote can deliver these commits with, found before the
-        // first object is asked for: a commit a delta carries has no `.commit`
+        // The deltas that can deliver these commits, found before the first
+        // object request. A commit that a delta carries has no `.commit`
         // request of its own.
         let deltas = delta::discover(
             self,
@@ -663,14 +781,45 @@ impl Repo {
         })
     }
 
-    /// The remote's `summary` and `summary.sig` bytes, an absent one as `None`.
+    /// Fetches the `summary` and `summary.sig` files of a remote.
     ///
-    /// The remote is reached the way [`pull`](Repo::pull) reaches it, with no
-    /// override: its `pull-url` or its `url`, and its TLS material and its
-    /// proxy over HTTP. Over ssh, the remote keys `ssh-command` and
-    /// `send-command` give the commands, and the `OSTRYA_SSH_COMMAND`
-    /// environment variable wins over `ssh-command`. The two files are asked
-    /// for together, and the session ends before the call returns.
+    /// Returns the bytes of `summary` and of `summary.sig`, in this order. A
+    /// file that the remote does not serve is `None`. Each file has a cap of
+    /// 64 MiB.
+    ///
+    /// The call reaches the remote as [`pull`](Repo::pull) does, with no
+    /// override. It reads the address from `pull-url` or `url`, and over HTTP
+    /// it uses the TLS material and the proxy of the remote. Over ssh, the
+    /// remote keys `ssh-command` and `send-command` give the commands. The
+    /// `OSTRYA_SSH_COMMAND` environment variable has precedence over
+    /// `ssh-command`.
+    ///
+    /// Over HTTP, the call requests `summary.sig` and then `summary`. Over
+    /// ssh, the two requests are in flight together, and the session ends
+    /// before the call returns.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Pull`] if the config has no section for `remote`, or if the
+    ///   section has neither `pull-url` nor `url`.
+    /// - [`Error::Pull`] if `url` holds an ssh address.
+    /// - [`Error::Pull`] if the remote names only one of
+    ///   `tls-client-cert-path` and `tls-client-key-path`.
+    /// - [`Error::InvalidInput`] if the ssh address is malformed.
+    /// - [`Error::Unsupported`] if the scheme of the URL is neither `http` nor
+    ///   `https`.
+    /// - [`Error::Unsupported`] if the value of the remote key `proxy` has
+    ///   white space at its start or end. Also if the fetcher refuses the
+    ///   proxy URL or a proxy environment variable.
+    /// - [`Error::Core`] if a key of the remote section holds a malformed
+    ///   escape sequence.
+    /// - [`Error::Io`] if a PEM file that a `tls-*` key names cannot be read.
+    /// - [`Error::FetchTooLarge`] if an HTTP response declares a file larger
+    ///   than 64 MiB.
+    /// - [`Error::Fetch`], [`Error::HttpStatus`] other than 404,
+    ///   [`Error::ContentEncoded`], or [`Error::RedirectLimit`] if an HTTP
+    ///   request fails after its retries.
+    /// - [`Error::Push`] if the ssh session fails.
     pub async fn remote_fetch_summary(
         &self,
         remote: &str,
@@ -702,12 +851,14 @@ impl Repo {
         source.finish(read).await
     }
 
-    /// Build the fetcher of `url` for one remote from its config section and
-    /// `opts`, adding the bytes of each body it reads to each counter of
-    /// `received`. The section gives the TLS material and the proxy, and a
-    /// `proxy` value with white space at its start or end is
-    /// [`Error::Unsupported`]. With no section, the fetcher trusts the host
-    /// trust store and reads the proxy environment variables.
+    /// Builds the fetcher of `url` for one remote from its config section and
+    /// `opts`. The fetcher adds the bytes of each body that it reads to each
+    /// counter of `received`.
+    ///
+    /// The section gives the TLS material and the proxy. A `proxy` value with
+    /// white space at its start or end is [`Error::Unsupported`]. With no
+    /// section, the fetcher trusts the host trust store and reads the proxy
+    /// environment variables.
     async fn remote_fetcher(
         &self,
         remote: &str,
@@ -739,8 +890,9 @@ impl Repo {
         .map_err(Error::from)
     }
 
-    /// Resolve what to pull: the requested refs, the remote's summary refs under
-    /// [`MIRROR`](PullFlags::MIRROR), or the remote's configured `branches`.
+    /// Resolves what to pull: the requested refs, the summary refs of the
+    /// remote under [`MIRROR`](PullFlags::MIRROR), or the `branches` key of
+    /// the remote.
     async fn remote_targets(
         &self,
         remote: &str,
@@ -758,9 +910,10 @@ impl Repo {
                         .into(),
                 ));
             };
-            // A summary name becomes a ref this pull writes, so it is held to
-            // the ref store's rule here, before the first object is requested,
-            // rather than when the transaction resolves it at publication.
+            // A summary name becomes a ref that this pull writes. The pull
+            // checks it against the rule of the ref store here, before the
+            // first object request. Without this check, the first check comes
+            // when the transaction resolves the ref at publication.
             for entry in &summary.refs {
                 crate::refs::check_ref_path(&entry.name)?;
             }
@@ -784,9 +937,9 @@ impl Repo {
 
         let mut out = Vec::with_capacity(names.len());
         for name in names {
-            // The name reaches the wire as a request path, so it is held to the
-            // rule the ref store holds it to: a traversal component would ask
-            // the server for a resource the ref does not name.
+            // The name goes on the wire as a request path, so the pull checks
+            // it against the rule of the ref store. A traversal component can
+            // ask the server for a resource that the ref does not name.
             crate::refs::check_ref_path(&name)?;
             let checksum = match summary.and_then(|summary| summary.lookup(&name)) {
                 Some(checksum) => checksum,
@@ -799,11 +952,11 @@ impl Repo {
         Ok(out)
     }
 
-    /// Run the plan to completion, collecting into `marked` the commits whose
-    /// `.commitpartial` marker this pull wrote and has to clear.
+    /// Runs the plan to its end. The commits whose `.commitpartial` marker
+    /// this pull wrote, and must clear, go into `marked`.
     ///
-    /// `marked` is an argument rather than the return value so the caller holds
-    /// what was written when a step fails.
+    /// `marked` is an argument, so the caller holds the written markers when a
+    /// step fails.
     #[allow(clippy::too_many_arguments)]
     async fn drive(
         &self,
@@ -818,10 +971,10 @@ impl Repo {
         progress: &PullCounters,
         marked: &mut Vec<Checksum>,
     ) -> Result<()> {
-        // The refs each requested tip is the tip of. The binding and timestamp
-        // checks are per ref, and the plan fetches one commit once however many
-        // refs name it, so the step that fetches a commit runs the checks of every
-        // ref in its entry here.
+        // The refs of each requested tip. The binding check and the timestamp
+        // check apply to each ref. The plan fetches a commit once, whatever the
+        // number of refs that name it. So the step that fetches a commit runs
+        // the checks of every ref in its entry here.
         let mut tips: HashMap<Checksum, Vec<String>> = HashMap::new();
         for (name, tip) in targets {
             tips.entry(*tip).or_default().push(name.clone());
@@ -851,14 +1004,15 @@ impl Repo {
         }
 
         let mut slots = Slots::new(opts.max_outstanding_fetches.unwrap_or(DEFAULT_OUTSTANDING));
-        // The read buffers a content object passes through, whichever source it
-        // comes from: a localcache import verifies its payload through one, and a
-        // fetched payload streams into the object store through one. A step takes
-        // a buffer where it starts and hands it back with its outcome, so a pull
-        // holds one buffer per slot however many objects it stores. A step that
-        // fails takes its buffer with it, which ends the pull anyway.
+        // The read buffers for content objects, from each source. A localcache
+        // import verifies its payload through one, and a fetched payload
+        // streams into the object store through one. A step takes a buffer at
+        // its start and gives it back with its outcome. So a pull holds one
+        // buffer for each slot, whatever the number of objects it stores. A
+        // step that fails takes its buffer with it, and the failure ends the
+        // pull.
         let mut buffers: Vec<Vec<u8>> = Vec::new();
-        // The units of work handed to a slot, for the progress total.
+        // The units of work given to a slot, for the progress total.
         let mut started: usize = 0;
         loop {
             while slots.has_room()
@@ -880,12 +1034,12 @@ impl Repo {
         Ok(())
     }
 
-    /// Run one unit of work: fetch an object and store it.
+    /// Runs one unit of work: fetches an object and stores it.
     ///
-    /// `read_buf` is the slot's read buffer, returned with the outcome for the
-    /// next step in that slot to reuse. A content object reads through it: the
-    /// payload of one fetched from the remote, and the verification of one taken
-    /// from a localcache repository.
+    /// `read_buf` is the read buffer of the slot. The step returns it with the
+    /// outcome, for the next step in that slot. A content object reads through
+    /// it: the payload of an object from the remote, and the verification of
+    /// an object from a localcache repository.
     async fn step(
         &self,
         ctx: &StepCtx<'_>,
@@ -918,9 +1072,9 @@ impl Repo {
         Ok((step, read_buf))
     }
 
-    /// Fetch one commit: its detached metadata, then the object itself, then the
-    /// checks each requested ref naming it is subject to. The detached metadata is
-    /// written once the commit object is here.
+    /// Fetches one commit: its detached metadata, then the object, then the
+    /// checks of each requested ref that names it. The step stages the
+    /// detached metadata when the commit object is here.
     async fn fetch_commit(
         &self,
         ctx: &StepCtx<'_>,
@@ -932,13 +1086,13 @@ impl Repo {
 
         let present = self.has_object(ObjectType::Commit, &checksum).await?;
         let complete = present && self.commit_state(&checksum).await? == CommitState::Normal;
-        // How the commit object reaches the object store, acted on once the
-        // checks have passed. A commit this repository holds is there already.
+        // How the commit object reaches the object store, after the checks
+        // pass. A commit that this repository holds is there already.
         let mut staging = CommitStaging::Held;
-        // Detached metadata travels with its commit and is fetched ahead of it,
-        // the order the tool was observed to request the pair in. The bytes are
-        // held until the commit object is here, so a commit the remote does not
-        // hold leaves none behind.
+        // Detached metadata goes with its commit, and the pull fetches it
+        // before the commit. The `ostree` command was observed to request the
+        // pair in this order. The pull holds the bytes until the commit object
+        // is here, so a commit that the remote does not hold leaves none.
         let (detached, bytes) = if present {
             let detached = self.fetch_detached_metadata(ctx, &checksum).await?;
             let bytes = self
@@ -946,9 +1100,9 @@ impl Repo {
                 .await?;
             (detached, bytes)
         } else if let Some(src) = cached_source(ctx.sources, name).await? {
-            // A localcache source holds the object, so the bytes are read from
-            // there and the import runs after the checks, the order the fetched
-            // branches take.
+            // A localcache source holds the object. The pull reads the bytes
+            // from there, and the import runs after the checks, in the order of
+            // the fetched branches.
             staging = CommitStaging::Import(src);
             let detached = self.fetch_detached_metadata(ctx, &checksum).await?;
             (
@@ -956,10 +1110,10 @@ impl Repo {
                 src.load_object_bytes(ObjectType::Commit, &checksum).await?,
             )
         } else if let Some(job) = ctx.deltas.get(&checksum) {
-            // A delta carries the target commit inside its superblock, which is
-            // where these bytes come from; the superblock's own parse has already
-            // established that they hash to this checksum, and staging them
-            // establishes it again.
+            // A delta carries the target commit in its superblock, and these
+            // bytes come from there. The parse of the superblock verified that
+            // they hash to this checksum. The write at staging verifies it
+            // again.
             staging = CommitStaging::Write;
             let detached = self.fetch_detached_metadata(ctx, &checksum).await?;
             (detached, job.commit_bytes.clone())
@@ -970,10 +1124,10 @@ impl Repo {
                     staging = CommitStaging::Write;
                     (detached, bytes)
                 }
-                // A parent the remote does not hold ends that chain, the way a
-                // source with truncated history does for a local pull. Its
-                // detached metadata is dropped: this repository holds no commit
-                // for it to belong to.
+                // A parent that the remote does not hold ends that chain, as a
+                // source with truncated history does for a local pull. The pull
+                // drops its detached metadata: this repository holds no commit
+                // for it.
                 (_, None) if item.optional => return Ok(Step::Done),
                 (_, None) => {
                     return Err(Error::ObjectNotFound {
@@ -985,12 +1139,12 @@ impl Repo {
         };
 
         let commit = Commit::parse(&bytes)?;
-        // The signature check runs before the commit is staged and before its
-        // tree is asked for, so a commit the policy refuses costs no object
-        // fetch. It reads the detached metadata this pull puts in place: the
-        // remote's copy where it served one, and this repository's own where it
-        // did not, which is the metadata a later verify of the stored commit
-        // reads.
+        // The signature verification runs before the pull stages the commit
+        // and requests its tree, so a commit that the policy refuses costs no
+        // object fetch. The verification reads the detached metadata that this
+        // pull puts in place. That is the copy of the remote if it served one,
+        // else the copy of this repository. A later verification of the stored
+        // commit reads the same metadata.
         if ctx.verification.checks_commits() {
             let dict = match &detached {
                 Some(bytes) => crate::summary::parse_signature_dict(bytes)?,
@@ -1000,9 +1154,9 @@ impl Repo {
                 .check_commit(&checksum, &bytes, dict.as_ref())
                 .await?;
         }
-        // Every requested ref naming this commit is checked here. The plan fetches
-        // one commit once, so a second ref at the same commit has no step of its
-        // own to be checked in.
+        // The pull checks each requested ref that names this commit here. The
+        // plan fetches a commit once, so a second ref at the same commit has no
+        // step of its own for its checks.
         for ref_name in ctx.tips.get(&checksum).into_iter().flatten() {
             if !ctx.flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS) {
                 check_ref_binding(&checksum, &commit, ref_name)?;
@@ -1011,19 +1165,19 @@ impl Repo {
                 .await?;
         }
 
-        // A commit this repository already holds intact is not marked partial: a
-        // pull that fails elsewhere must not demote it.
+        // The pull writes no partial marker for a commit that this repository
+        // holds complete: a pull that fails elsewhere must not demote it.
         if !complete {
             self.write_partial_marker(&checksum).await?;
         }
-        // The commit is staged where it arrived, behind its own marker and ahead
-        // of its tree. Either path hashes the bytes and compares the result
-        // against the name they were requested by -- the write path for bytes in
-        // hand, the untrusted import for a localcache source's object -- so a
-        // commit stored under the wrong name fails here rather than after its tree
-        // has been fetched, and nothing is held past the step. What covers a
-        // reader against a commit whose tree is not yet complete is the marker,
-        // cleared once the transaction has published.
+        // The pull stages the commit here, after its marker and before its
+        // tree. Each path hashes the bytes and compares the result with the
+        // requested name. The write path does this for bytes in memory, and the
+        // untrusted import for an object of a localcache source. So a commit
+        // stored under a wrong name fails here, before the pull fetches its
+        // tree, and nothing stays after the step. The marker guards a reader
+        // against a commit whose tree is not yet complete. The pull clears the
+        // marker after the transaction publishes.
         match staging {
             CommitStaging::Held => {}
             CommitStaging::Import(src) => {
@@ -1042,26 +1196,28 @@ impl Repo {
                     .await?;
             }
         }
-        // The commit object is here, so its detached metadata is staged now,
-        // and the commit of the transaction writes it ahead of the ref that
-        // names it, which is what a verifier reading the signatures alongside
-        // the commit requires. A commit this repository already holds has the
-        // remote's copy written over its own, which is what re-reading a
-        // mutable file on every pull is for. The filter runs here, after the
-        // checks above read the metadata as the remote holds it, so what a
-        // filter drops is dropped from what is stored and not from what was
-        // verified. A filter that allows no property stages nothing, which
-        // leaves the copy this repository holds as it stands.
+        // The commit object is here, so the pull stages its detached metadata
+        // now. The transaction commit writes it before the ref that names the
+        // commit. A verifier that reads the signatures with the commit needs
+        // this order. For a commit that this repository already holds, the
+        // copy of the remote replaces the copy here. That is the purpose of a
+        // new read of a mutable file on each pull.
+        //
+        // The filter runs here, after the checks read the metadata as the
+        // remote holds it. So a filter drops a property from what the pull
+        // stores, and the verified metadata stays whole. A filter that allows
+        // no property stages nothing, and the copy of this repository stays as
+        // it is.
         if let Some(meta) = detached
             && let Some(meta) = ctx.detached_filter.apply(&checksum, meta)?
         {
             ctx.txn.stage_commit_detached_bytes(&checksum, meta).await?;
         }
-        // Where the commit's objects come from. A commit already complete here
-        // needs none of them: what it references is present. Its parent is a
-        // separate question, since the depth an earlier pull ran at may be
-        // shallower than this one's, so the chain walks on and the parent's own
-        // step decides what it needs.
+        // Where the objects of the commit come from. A commit that is complete
+        // here needs none of them: what it references is present. Its parent
+        // is a different case. The depth of an earlier pull can be smaller
+        // than the depth of this pull. So the chain walks on, and the step of
+        // the parent decides what it needs.
         let tree = vec![
             ObjectName::new(commit.root_dirmeta, ObjectType::DirMeta),
             ObjectName::new(commit.root_dirtree, ObjectType::DirTree),
@@ -1069,9 +1225,10 @@ impl Repo {
         let next = if complete || ctx.flags.contains(PullFlags::COMMIT_ONLY) {
             CommitNext::Nothing
         } else if let Some(job) = ctx.deltas.get(&checksum) {
-            // A delta delivers the tree: its parts, and the objects it names but
-            // hands over loose. The tree walk follows the last part, so what no
-            // part delivered is found there and fetched loose.
+            // A delta delivers the tree: its parts, and the objects that it
+            // names and hands over loose. The tree walk comes after the last
+            // part. It finds each object that no part delivered and fetches it
+            // loose.
             CommitNext::Delta {
                 parts: job.parts(),
                 fallbacks: job.fallbacks(),
@@ -1088,10 +1245,10 @@ impl Repo {
         }))
     }
 
-    /// Read a commit's `.commitmeta` from the first localcache source holding it
-    /// and from the remote otherwise, returning the bytes for the caller to write
-    /// once the commit object is here. A 404 is the commit carrying none, which
-    /// leaves this repository's copy as it stands.
+    /// Reads the `.commitmeta` of a commit from the first localcache source
+    /// that holds it, else from the remote. The caller writes the bytes when
+    /// the commit object is here. A 404 means that the commit has none, and
+    /// the copy of this repository stays as it is.
     async fn fetch_detached_metadata(
         &self,
         ctx: &StepCtx<'_>,
@@ -1103,8 +1260,8 @@ impl Repo {
         self.fetch_remote_detached(ctx, commit).await
     }
 
-    /// Fetch a commit's `.commitmeta` from the remote, `None` where the remote
-    /// serves none.
+    /// Fetches the `.commitmeta` of a commit from the remote, or `None` if the
+    /// remote serves none.
     async fn fetch_remote_detached(
         &self,
         ctx: &StepCtx<'_>,
@@ -1121,14 +1278,14 @@ impl Repo {
         Ok(fetched)
     }
 
-    /// Fetch a commit the remote alone can give, with its detached metadata:
-    /// the `.commitmeta` from the first localcache source holding it and from
-    /// the remote otherwise, then the commit object. `None` in either place
-    /// is a file the remote does not serve.
+    /// Fetches a commit that only the remote can give, with its detached
+    /// metadata. The `.commitmeta` comes from the first localcache source that
+    /// holds it, else from the remote. The commit object comes after it.
+    /// `None` in either place is a file that the remote does not serve.
     ///
-    /// Over ssh the two remote requests are in flight together, in the order
-    /// an HTTP pull sends them, so the pair costs one round trip. Over HTTP
-    /// the commit is requested after the `.commitmeta` arrived.
+    /// Over ssh, the two remote requests are in flight together, in the order
+    /// of an HTTP pull, so the pair costs one round trip. Over HTTP, the pull
+    /// requests the commit after the `.commitmeta` arrives.
     async fn fetch_remote_commit(
         &self,
         ctx: &StepCtx<'_>,
@@ -1154,23 +1311,23 @@ impl Repo {
         }
     }
 
-    /// Fetch one dirtree or dirmeta object and store it. A dirtree also reports
-    /// what it references, which is what the scan walks on from.
+    /// Fetches one dirtree or dirmeta object and stores it. A dirtree also
+    /// reports what it references, for the scan to walk on from.
     async fn fetch_metadata(
         &self,
         ctx: &StepCtx<'_>,
         name: ObjectName,
         read_buf: &mut Vec<u8>,
     ) -> Result<Step> {
-        // An object already here is not fetched again. A dirtree is still read:
-        // what it references may be missing, and the walk is what finds that
-        // out.
+        // The pull does not fetch an object that is here. It still reads a
+        // dirtree: an object that it references can be missing, and the walk
+        // finds that.
         if ctx.txn.is_staged(&name.checksum, name.ty)
             || self.has_object(name.ty, &name.checksum).await?
         {
-            // An object this transaction staged lives in the staging directory
-            // until the transaction publishes, so the read checks the staged set
-            // before `objects/`.
+            // An object that this transaction staged stays in the staging
+            // directory until the transaction publishes. So the read looks in
+            // the staged set before `objects/`.
             return self
                 .walked(name, || ctx.txn.load_dirtree_staged_first(&name.checksum))
                 .await;
@@ -1195,8 +1352,8 @@ impl Repo {
                 checksum: name.checksum,
                 ty: name.ty,
             })?;
-        // The write path hashes the bytes and compares the result against the
-        // name they were requested by, so a substituted object fails here.
+        // The write path hashes the bytes and compares the result with the
+        // requested name, so a substituted object fails here.
         ctx.txn
             .write_metadata(name.ty, Some(&name.checksum), &bytes)
             .await?;
@@ -1207,9 +1364,9 @@ impl Repo {
         }
     }
 
-    /// The step a stored metadata object produces: a dirtree reports itself, for
-    /// the plan to walk on from, and anything else is a leaf, so `load` is called
-    /// only for a dirtree.
+    /// Returns the step of a stored metadata object. A dirtree reports itself,
+    /// for the plan to walk on from. Any other object is a leaf, so the method
+    /// calls `load` only for a dirtree.
     async fn walked<F>(&self, name: ObjectName, load: impl FnOnce() -> F) -> Result<Step>
     where
         F: Future<Output = Result<DirTree>>,
@@ -1220,7 +1377,7 @@ impl Repo {
         Ok(Step::DirTree(name.checksum, load().await?))
     }
 
-    /// Fetch one content object and store it.
+    /// Fetches one content object and stores it.
     async fn fetch_content(
         &self,
         ctx: &StepCtx<'_>,
@@ -1243,15 +1400,15 @@ impl Repo {
             .await?;
             return Ok(Step::Done);
         }
-        // A content object is requested as `.filez` whatever the remote stores
-        // on its own disk: the framed, deflated form is the one an HTTP client
-        // can read.
+        // The pull requests a content object as `.filez`, whatever the remote
+        // stores on its disk. The framed, deflated form is the one form that an
+        // HTTP client can read.
         let path = object_path(&name.checksum, ObjectType::File);
         let fetcher = match ctx.source {
             RemoteSource::Http(fetcher) => fetcher,
             RemoteSource::Ssh(ssh) => {
-                // A `.filez` has no whole read: the header read caps its
-                // header, and the size the header declares caps its payload.
+                // A `.filez` has no whole read. The header read caps its header,
+                // and the size that the header declares caps its payload.
                 let body = ssh
                     .get(&path, u64::MAX)
                     .await?
@@ -1259,11 +1416,11 @@ impl Repo {
                         checksum: name.checksum,
                         ty: name.ty,
                     })?;
-                // No write permit is taken. The session streams one body at a
-                // time, and the stores that finish after the end of their
-                // body are bounded by the depth of the pipeline. A permit
-                // taken here would hold the one reader of the session while
-                // other stores finish.
+                // The ssh source takes no write permit. The session streams one
+                // body at a time, and the depth of the pipeline bounds the
+                // stores that finish after the end of their body. If the step
+                // took a permit here, the permit holds the one reader of the
+                // session while other stores finish.
                 self.store_content(ctx, &name.checksum, body, read_buf)
                     .await
                     .map_err(session_error)?;
@@ -1271,10 +1428,11 @@ impl Repo {
                 return Ok(Step::Done);
             }
         };
-        // A body that fails in transit is fetched again from the start, which
-        // the fetcher's retry count pays for. The write that failed with it
-        // stages nothing, since an object is staged only once its checksum has
-        // been compared, and it removes its temp file as it fails.
+        // If a body fails in transit, the pull fetches it again from the
+        // start, and the retry count of the fetcher pays for it. The write that
+        // failed with it stages nothing, because an object is staged only
+        // after the checksum comparison. The write removes its temp file when
+        // it fails.
         let mut refetch = fetcher.refetching(FetchRequest {
             priority: Priority::Low,
             ..FetchRequest::path(&path)
@@ -1289,12 +1447,12 @@ impl Repo {
                 }
                 Err(e) => return Err(object_not_found(e.into(), name)),
             };
-            // The write permit is taken before the body is read: a step waiting
-            // for one has not yet asked the connection for bytes, so the
-            // fetcher's progress window is not running against it. It covers
-            // the whole body -- the header read and the end-of-stream read
-            // along with the payload -- and is released before a refetch waits
-            // out its delay.
+            // The step takes the write permit before it reads the body. A step
+            // that waits for a permit did not ask the connection for bytes yet,
+            // so the progress window of the fetcher does not run against it.
+            // The permit covers the whole body: the header read, the payload,
+            // and the end-of-stream read. The step releases it before a refetch
+            // waits for its delay.
             let permit = ctx.writes.acquire(Priority::Normal).await;
             let stored = self
                 .store_content(ctx, &name.checksum, body, read_buf)
@@ -1310,10 +1468,10 @@ impl Repo {
         }
     }
 
-    /// Store one fetched content object under the name it was requested by.
+    /// Stores one fetched content object under the requested name.
     ///
-    /// The payload streams through `read_buf`, the slot's buffer, so the objects
-    /// a slot stores share one allocation.
+    /// The payload streams through `read_buf`, the buffer of the slot, so the
+    /// objects that a slot stores share one allocation.
     async fn store_content<R: AsyncRead + Unpin>(
         &self,
         ctx: &StepCtx<'_>,
@@ -1335,8 +1493,8 @@ impl Repo {
             mode,
             xattrs,
         };
-        // The same mode checks a local pull makes, over the metadata the object
-        // arrives with rather than the one a source repository stored.
+        // The mode checks of a local pull, over the metadata in the header that
+        // arrives with the object.
         ctx.checks.check(expected, &meta)?;
         store_filez_payload(
             ctx.txn,
@@ -1351,7 +1509,7 @@ impl Repo {
         .await
     }
 
-    /// Refuse a fetched tip that is older than what it is checked against.
+    /// Refuses a fetched tip that is older than the commit of the check.
     async fn check_timestamp(
         &self,
         ctx: &StepCtx<'_>,
@@ -1365,7 +1523,7 @@ impl Repo {
                 let current = self
                     .resolve_ref_tip(&refspec(ctx.ref_prefix, ref_name))
                     .await?;
-                // A ref this repository does not hold yet has nothing to be
+                // A ref that this repository does not hold has nothing to be
                 // older than.
                 let Some(current) = current else {
                     return Ok(());
@@ -1387,21 +1545,20 @@ impl Repo {
     }
 }
 
-/// What a pull fetched into its transaction, for the commit that publishes
-/// it.
+/// What a pull fetched into its transaction, for the transaction commit.
 struct FetchedPull {
     txn: Transaction,
     /// The refs to write, and the commit each names.
     targets: Vec<(String, Checksum)>,
-    /// The remote's `summary` and `summary.sig`, which a mirror pull of every
-    /// ref copies.
+    /// The `summary` and `summary.sig` of the remote, which a mirror pull of
+    /// every ref copies.
     summary: Option<Vec<u8>>,
     signature: Option<Vec<u8>>,
 }
 
-/// Refuse a field of [`PullOptions::connect`] that applies to a pull over ssh
-/// alone. The remote ssh command is not read, as an HTTP push does not read
-/// it.
+/// Refuses a field of [`connect`](PullOptions::connect) that applies to a pull
+/// over ssh alone. The pull does not read the remote ssh command, as an HTTP
+/// push does not read it.
 fn refuse_ssh_fields(opts: &PullOptions) -> Result<()> {
     // Each name is the remote key of the field.
     let set = [
@@ -1416,7 +1573,7 @@ fn refuse_ssh_fields(opts: &PullOptions) -> Result<()> {
     }
 }
 
-/// The options of the pull session of `opts`.
+/// Returns the options of the pull session of `opts`.
 fn session_options(opts: &PullOptions) -> PullSessionOptions {
     PullSessionOptions {
         agent: None,
@@ -1424,110 +1581,112 @@ fn session_options(opts: &PullOptions) -> PullSessionOptions {
     }
 }
 
-/// What every step of one pull shares.
+/// The state that every step of one pull shares.
 struct StepCtx<'a> {
     txn: &'a Transaction,
     source: &'a RemoteSource,
-    /// The write throttle: how many fetched content objects stream into the
-    /// object store at once.
+    /// The write throttle: the number of fetched content objects that stream
+    /// into the object store at once.
     writes: Arc<Gate>,
-    /// Repositories consulted for an object before the network, in order.
+    /// The repositories that the pull reads for an object before the network,
+    /// in order.
     sources: &'a [Repo],
     flags: PullFlags,
-    /// The mode checks every content object this pull writes is held to,
-    /// whichever path it arrives by: a loose fetch, a localcache import, or a
-    /// static delta's parts.
+    /// The mode checks for each content object that this pull writes, on each
+    /// path: a loose fetch, a localcache import, or the parts of a static
+    /// delta.
     checks: ModeChecks,
-    /// The prefix the pulled refs are written under, which the timestamp check
-    /// resolves the ref's current tip through. `None` is a local ref.
+    /// The prefix of the pulled refs. The timestamp check resolves the current
+    /// tip of a ref through it. `None` is a local ref.
     ref_prefix: Option<&'a str>,
     timestamp_check: &'a TimestampCheck,
-    /// The requested refs each tip commit is the tip of, which the binding and
-    /// timestamp checks are made against. A commit with no entry is a parent
-    /// reached under `depth`, which no ref names.
+    /// The requested refs of each tip commit, for the binding check and the
+    /// timestamp check. A commit with no entry is a parent under `depth`,
+    /// which no ref names.
     tips: &'a HashMap<Checksum, Vec<String>>,
-    /// The static delta each target commit is delivered by, where the remote
-    /// publishes one. A commit with no entry is fetched object by object.
+    /// The static delta that delivers each target commit, if the remote
+    /// publishes one. The pull fetches a commit with no entry object by
+    /// object.
     deltas: &'a HashMap<Checksum, DeltaJob>,
-    /// The signature checks this pull makes, which every commit a step carries
-    /// is held to before its bytes are staged.
+    /// The signature policy of this pull. The pull verifies each commit of a
+    /// step before it stages its bytes.
     verification: &'a Verification,
-    /// Which properties of a commit's detached metadata this pull stores,
-    /// applied once the commit's checks have passed.
+    /// The filter of the properties of detached metadata that this pull
+    /// stores. It applies after the checks of the commit pass.
     detached_filter: &'a DetachedMetadataFilter,
-    /// The pull's live counters.
+    /// The live counters of the pull.
     progress: &'a PullCounters,
 }
 
 /// One commit to fetch.
 struct CommitItem {
     checksum: Checksum,
-    /// How many more parents to follow from here, `-1` for all of them.
+    /// The number of parents to follow from here, `-1` for all of them.
     depth: i32,
-    /// Whether a remote that does not hold this commit ends the chain rather
-    /// than failing the pull, which is what a parent under `depth` does.
+    /// `true` if a remote that does not hold this commit ends the chain, and
+    /// the pull goes on. A parent under `depth` has this value.
     optional: bool,
 }
 
-/// One part of one commit's delta.
+/// One part of the delta of one commit.
 struct PartItem {
-    /// The commit the delta produces, which the job is keyed by.
+    /// The commit that the delta produces, which is the key of the job.
     commit: Checksum,
-    /// The part's index, which is both its position in the superblock's entry
-    /// list and its file name on the remote.
+    /// The index of the part. It is the position of the part in the entry
+    /// list of the superblock, and its file name on the remote.
     index: usize,
 }
 
-/// One unit of work a slot runs.
+/// One unit of work that a slot runs.
 enum Item {
     Commit(CommitItem),
     Object(ObjectName),
     Part(PartItem),
 }
 
-/// What one step produced.
+/// The outcome of one step.
 enum Step {
     /// A commit object arrived, or was already here.
     Commit(CommitOutcome),
     /// A dirtree is stored: its checksum and its entries, which the plan walks
     /// on from.
     DirTree(Checksum, DirTree),
-    /// A delta part is applied; this is the commit it belongs to.
+    /// A delta part is applied. The value is the commit of the part.
     Part(Checksum),
-    /// Nothing follows: a dirmeta or content object is stored, or a parent the
-    /// remote does not hold ended its chain.
+    /// Nothing follows: a dirmeta or content object is stored, or a parent
+    /// that the remote does not hold ended its chain.
     Done,
 }
 
-/// What a commit contributes to the plan.
+/// What a commit adds to the plan.
 struct CommitOutcome {
     checksum: Checksum,
-    /// What the commit's objects are fetched by.
+    /// How the pull fetches the objects of the commit.
     next: CommitNext,
     /// The parent to follow under `depth`.
     parent: Option<Checksum>,
-    /// Whether this pull wrote the commit's `.commitpartial` marker.
+    /// `true` if this pull wrote the `.commitpartial` marker of the commit.
     marked: bool,
 }
 
-/// How a commit object reaches the object store, once the commit has passed the
-/// checks its step makes.
+/// How a commit object reaches the object store, after the commit passes the
+/// checks of its step.
 enum CommitStaging<'a> {
     /// This repository holds it.
     Held,
-    /// A localcache repository holds it, to import from there.
+    /// A localcache repository holds it, and the pull imports it from there.
     Import(&'a Repo),
-    /// Its bytes are in hand, to write into the transaction.
+    /// Its bytes are in memory, and the pull writes them into the transaction.
     Write,
 }
 
-/// How a commit's objects reach this repository.
+/// How the objects of a commit reach this repository.
 enum CommitNext {
-    /// Object by object: the commit's root dirmeta and dirtree, walked from
-    /// there.
+    /// Object by object: the root dirmeta and dirtree of the commit, and the
+    /// walk from there.
     Scan(Vec<ObjectName>),
-    /// By static delta: the delta's parts, the objects it hands over loose, and
-    /// the tree walk that follows the last part.
+    /// By static delta: the parts of the delta, the objects that it hands over
+    /// loose, and the tree walk after the last part.
     Delta {
         parts: usize,
         fallbacks: Vec<ObjectName>,
@@ -1537,58 +1696,62 @@ enum CommitNext {
     Nothing,
 }
 
-/// What the pull still has to do, and what it has done.
+/// The work that the pull must still do, and the work that it did.
 ///
-/// The loop owns this, so nothing here is shared or locked.
+/// The loop owns the plan, so nothing here is shared or locked.
 #[derive(Default)]
 struct Plan {
     /// The commits, drained first and fetched at high priority.
     commits: VecDeque<CommitItem>,
-    /// The delta parts, drained second, fetched at high priority, and held to
-    /// [`PART_CAP`] in flight whatever the pull's slot count is.
+    /// The delta parts, drained second and fetched at high priority. At most
+    /// [`PART_CAP`] are in flight, whatever the slot count of the pull.
     parts: VecDeque<PartItem>,
-    /// How many part fetches are in flight.
+    /// The number of part fetches in flight.
     parts_in_flight: usize,
-    /// How many parts of each commit's delta have still to be applied, and the
-    /// tree walk queued once that count reaches zero.
+    /// The number of parts of the delta of each commit that are not applied
+    /// yet. When that count is zero, the plan queues the tree walk that
+    /// `delta_trees` holds.
     delta_parts: HashMap<Checksum, usize>,
     delta_trees: HashMap<Checksum, Vec<ObjectName>>,
-    /// The dirtree and dirmeta objects the walk is blocked on, drained third
+    /// The dirtree and dirmeta objects that the walk waits for, drained third
     /// and fetched at high priority.
     scan: VecDeque<ObjectName>,
     /// The content objects, drained last and fetched at low priority.
     content: VecDeque<ObjectName>,
-    /// The objects this pull has queued, so an object several commits reach is
-    /// fetched once.
+    /// The objects that this pull queued, so that the pull fetches an object
+    /// once, also if several commits reach it.
     queued: HashSet<ObjectName>,
-    /// The subpaths the walk is held to, `None` walking every tree whole.
+    /// The subpaths of the walk. `None` walks every tree whole.
     subpaths: Option<Subpaths>,
-    /// The scope each commit's root dirtree is walked under.
+    /// The scope of the walk of the root dirtree of each commit.
     root: Scope,
-    /// The dirtrees queued under a scope short of the whole tree, with the scope
-    /// they are walked under and whether that walk has been applied.
+    /// The dirtrees queued under a scope smaller than the whole tree. Each
+    /// entry holds the scope of the walk, and a flag that tells if the plan
+    /// applied that walk.
     ///
-    /// A dirtree reached again under a scope its own does not cover has its
-    /// scope widened. One still queued or in flight is walked under the wider
-    /// scope when its step is applied; one already walked is queued again, and
-    /// that second step reads the dirtree this pull stored.
+    /// If the plan reaches a dirtree again under a scope that its scope does
+    /// not cover, the plan widens its scope. A dirtree that is still queued or
+    /// in flight gets the walk under the wider scope when the plan applies its
+    /// step. The plan queues a walked dirtree again, and that second step reads
+    /// the dirtree that this pull stored.
     partial_trees: HashMap<Checksum, PartialTree>,
-    /// The remaining depth each commit was reached at, which is what decides
-    /// whether a chain arriving at it again walks on from it.
+    /// The remaining depth at which the plan reached each commit. It decides
+    /// if a chain that reaches the commit again walks on from it.
     seen: HashMap<Checksum, i32>,
-    /// The parent each fetched commit named, so a chain reaching it again with
-    /// further to go resumes without refetching it.
+    /// The parent that each fetched commit named. A chain that reaches the
+    /// commit again, with more depth, resumes at the parent and does not fetch
+    /// the commit again.
     parents: HashMap<Checksum, Option<Checksum>>,
 }
 
-/// A dirtree walked under a scope short of the whole tree.
+/// A dirtree walked under a scope smaller than the whole tree.
 struct PartialTree {
     scope: Scope,
     walked: bool,
 }
 
 impl Plan {
-    /// A plan whose walk is held to `subpaths`.
+    /// Creates a plan whose walk keeps to `subpaths`.
     fn new(subpaths: Option<Subpaths>) -> Plan {
         Plan {
             root: subpaths.as_ref().map(Subpaths::root).unwrap_or_default(),
@@ -1597,12 +1760,12 @@ impl Plan {
         }
     }
 
-    /// Queue a commit unless it has already been reached at least this deep.
+    /// Queues a commit, unless the plan reached it at this depth or deeper.
     ///
-    /// A commit reached again with further to go is not fetched again: the walk
-    /// resumes at the parent it named. A commit still in flight has not named
-    /// one yet, and its own outcome follows the parent to the depth recorded
-    /// here.
+    /// The plan does not fetch again a commit that it reaches again with more
+    /// depth: the walk resumes at the parent that the commit named. A commit
+    /// still in flight named no parent yet. Its own outcome follows the parent
+    /// to the depth recorded here.
     fn push_commit(&mut self, mut item: CommitItem) {
         loop {
             if let Some(&prev) = self.seen.get(&item.checksum)
@@ -1629,7 +1792,7 @@ impl Plan {
         }
     }
 
-    /// Queue an object this pull has not queued already, and a dirtree it has
+    /// Queues an object that this pull did not queue yet, and a dirtree that it
     /// queued under a scope that does not cover `scope`.
     fn push_object(&mut self, name: ObjectName, scope: Scope) {
         if self.queued.insert(name) {
@@ -1665,8 +1828,8 @@ impl Plan {
         }
     }
 
-    /// Queue one object of a commit's tree: the root dirtree under the root
-    /// scope, and the root dirmeta.
+    /// Queues one object of the tree of a commit: the root dirtree under the
+    /// root scope, or the root dirmeta.
     fn push_root(&mut self, name: ObjectName) {
         let scope = if name.ty == ObjectType::DirTree {
             self.root.clone()
@@ -1676,8 +1839,8 @@ impl Plan {
         self.push_object(name, scope);
     }
 
-    /// Queue what a stored dirtree references under the scope it is walked
-    /// under.
+    /// Queues the objects that a stored dirtree references, under the scope of
+    /// its walk.
     fn apply_dirtree(&mut self, checksum: Checksum, dirtree: &DirTree) {
         let Some(subpaths) = &self.subpaths else {
             for name in children_of(dirtree) {
@@ -1697,14 +1860,14 @@ impl Plan {
         }
     }
 
-    /// The next unit of work: the commits, then the delta parts, then the scan,
-    /// then the content.
+    /// Returns the next unit of work: the commits, then the delta parts, then
+    /// the scan, then the content.
     ///
-    /// A queued part is held back while [`PART_CAP`] of them are in flight, so a
-    /// pull with more slots than that spends the rest on the scan and the content
-    /// rather than on a third part. The loop can therefore run out of work while
-    /// parts are queued, which is safe: a part is held back only when one is in
-    /// flight, and that one occupies a slot the loop is waiting on.
+    /// The plan holds back a queued part while [`PART_CAP`] parts are in
+    /// flight. A pull with more slots spends the other slots on the scan and
+    /// the content. The loop can run out of work while parts are queued. This
+    /// is safe: the plan holds back a part only while a part is in flight, in a
+    /// slot that the loop waits on.
     fn next(&mut self) -> Option<Item> {
         if let Some(commit) = self.commits.pop_front() {
             return Some(Item::Commit(commit));
@@ -1721,15 +1884,15 @@ impl Plan {
         self.content.pop_front().map(Item::Object)
     }
 
-    /// Store the progress total and the scanning state: `started` units of
-    /// work handed to a slot, and what is still queued.
+    /// Stores the progress total and the scan state: the `started` units of
+    /// work given to a slot, and the queued work.
     fn report(&self, progress: &PullCounters, started: usize) {
         let queued = self.commits.len() + self.parts.len() + self.scan.len() + self.content.len();
         let total = u32::try_from(started + queued).unwrap_or(u32::MAX);
         progress.report(total, !self.commits.is_empty() || !self.scan.is_empty());
     }
 
-    /// Fold one step's outcome back into the plan.
+    /// Adds the outcome of one step to the plan.
     fn apply(&mut self, step: Step, marked: &mut Vec<Checksum>) {
         match step {
             Step::Commit(outcome) => self.apply_commit(outcome, marked),
@@ -1739,8 +1902,8 @@ impl Plan {
         }
     }
 
-    /// Record an applied delta part, and queue its commit's tree walk once the
-    /// delta's last part is applied.
+    /// Records an applied delta part. After the last part of the delta, queues
+    /// the tree walk of its commit.
     fn apply_part(&mut self, commit: Checksum) {
         self.parts_in_flight -= 1;
         let left = self
@@ -1752,14 +1915,14 @@ impl Plan {
             return;
         }
         self.delta_parts.remove(&commit);
-        // Every object the delta carries is staged now, so the walk reads what is
-        // here and asks the network only for what the delta left out.
+        // Each object of the delta is staged now. The walk reads what is here,
+        // and requests from the network only what the delta left out.
         for name in self.delta_trees.remove(&commit).unwrap_or_default() {
             self.push_root(name);
         }
     }
 
-    /// Record a commit and queue what it needs.
+    /// Records a commit and queues what it needs.
     fn apply_commit(&mut self, outcome: CommitOutcome, marked: &mut Vec<Checksum>) {
         if outcome.marked {
             marked.push(outcome.checksum);
@@ -1777,8 +1940,8 @@ impl Plan {
                 fallbacks,
                 tree,
             } => {
-                // The objects the delta hands over loose are queued at once, so
-                // they travel alongside the parts rather than after them.
+                // The plan queues the objects that the delta hands over loose at
+                // once, so they travel together with the parts.
                 for name in fallbacks {
                     self.push_object(name, Scope::All);
                 }
@@ -1799,8 +1962,8 @@ impl Plan {
                 }
             }
         }
-        // The depth comes from the plan and not from the item: a later chain may
-        // have reached this commit with further to go while it was in flight.
+        // The depth comes from the plan. A later chain can reach this commit
+        // with more depth while the commit is in flight.
         let depth = self.seen.get(&outcome.checksum).copied().unwrap_or(0);
         if depth != 0
             && let Some(parent) = outcome.parent
@@ -1814,13 +1977,14 @@ impl Plan {
     }
 }
 
-/// One parent followed: a finite depth counts down, and `-1` stays `-1`.
+/// Returns the depth after one parent: a finite depth counts down, and `-1`
+/// stays `-1`.
 fn one_less(depth: i32) -> i32 {
     if depth > 0 { depth - 1 } else { depth }
 }
 
-/// The objects a dirtree references: its files, and the dirmeta and dirtree of
-/// each subdirectory.
+/// Returns the objects that a dirtree references: its files, and the dirmeta
+/// and dirtree of each subdirectory.
 fn children_of(dirtree: &DirTree) -> Vec<ObjectName> {
     let mut out = Vec::with_capacity(dirtree.files.len() + 2 * dirtree.dirs.len());
     for (_, file) in &dirtree.files {
@@ -1833,13 +1997,15 @@ fn children_of(dirtree: &DirTree) -> Vec<ObjectName> {
     out
 }
 
-/// The request path of a loose object. The remote is an archive repository, so a
-/// content object is named `.filez` there whatever this repository stores.
+/// Returns the request path of a loose object. The remote is an archive
+/// repository, so a content object has the name `.filez` there, whatever this
+/// repository stores.
 fn object_path(checksum: &Checksum, ty: ObjectType) -> String {
     format!("objects/{}", loose_path(checksum, ty, RepoMode::Archive))
 }
 
-/// A commit's `.commitmeta` from the first localcache repository holding it.
+/// Returns the `.commitmeta` of a commit from the first localcache repository
+/// that holds it.
 async fn cached_detached_metadata(sources: &[Repo], commit: &Checksum) -> Result<Option<Vec<u8>>> {
     for src in sources {
         match src.load_object_bytes(ObjectType::CommitMeta, commit).await {
@@ -1851,7 +2017,7 @@ async fn cached_detached_metadata(sources: &[Repo], commit: &Checksum) -> Result
     Ok(None)
 }
 
-/// The first localcache repository holding `name`.
+/// Returns the first localcache repository that holds `name`.
 async fn cached_source(sources: &[Repo], name: ObjectName) -> Result<Option<&Repo>> {
     for src in sources {
         if src.has_object(name.ty, &name.checksum).await? {
@@ -1861,7 +2027,8 @@ async fn cached_source(sources: &[Repo], name: ObjectName) -> Result<Option<&Rep
     Ok(None)
 }
 
-/// Report a 404 for an object as the object being absent; anything else stands.
+/// Maps a 404 for an object to [`Error::ObjectNotFound`]. Any other error
+/// stays as it is.
 fn object_not_found(error: Error, name: ObjectName) -> Error {
     match error {
         Error::HttpStatus { status: 404, .. } => Error::ObjectNotFound {
@@ -1872,11 +2039,12 @@ fn object_not_found(error: Error, name: ObjectName) -> Error {
     }
 }
 
-/// The remote's summary and its signature, an absent one as `None`.
+/// Fetches the summary of the remote and its signature. An absent file is
+/// `None`.
 ///
-/// The signature is fetched first, which is the order the tool asks in: it
-/// covers the summary that follows, and asking the other way round would pair a
-/// summary with the signature of one the remote had already replaced.
+/// The signature comes first, which is the order of the `ostree` command. The
+/// signature covers the summary that follows. In the other order, a summary
+/// can pair with the signature of a summary that the remote replaced before.
 pub(super) async fn fetch_summary(fetcher: &Fetcher) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
     let signature =
         fetch_optional(fetcher, SUMMARY_SIG_FILE, Priority::High, MAX_ROOT_FILE).await?;
@@ -1884,12 +2052,12 @@ pub(super) async fn fetch_summary(fetcher: &Fetcher) -> Result<(Option<Vec<u8>>,
     Ok((summary, signature))
 }
 
-/// Refuse a remote whose `[core] mode` is not archive, from the bytes of its
+/// Refuses a remote whose `[core] mode` is not archive, from the bytes of its
 /// `config`.
 fn check_remote_mode(config: Option<Vec<u8>>) -> Result<()> {
     let Some(bytes) = config else {
-        // A remote that serves no config is taken at its word as an archive,
-        // which is what the `.filez` objects it serves say it is.
+        // The pull reads a remote that serves no config as an archive,
+        // because the remote serves `.filez` objects.
         return Ok(());
     };
     let text = String::from_utf8(bytes)
@@ -1906,8 +2074,8 @@ fn check_remote_mode(config: Option<Vec<u8>>) -> Result<()> {
     )))
 }
 
-/// The commit a remote's `refs/heads/<name>` names, or `None` when the remote
-/// serves no such ref.
+/// Returns the commit that `refs/heads/<name>` of the remote names, or `None`
+/// if the remote serves no such ref.
 async fn fetch_remote_ref(source: &RemoteSource, name: &str) -> Result<Option<Checksum>> {
     let path = source.ref_path(name);
     let Some(bytes) = source
@@ -1921,14 +2089,17 @@ async fn fetch_remote_ref(source: &RemoteSource, name: &str) -> Result<Option<Ch
     Ok(Some(Checksum::from_hex(text.trim())?))
 }
 
-/// The request path of a remote ref: `refs/heads/` and the percent-encoded name.
+/// Returns the request path of a remote ref: `refs/heads/` and the
+/// percent-encoded name.
 ///
-/// A request path reaches the wire as written, so the name is encoded where it
-/// is built. Everything outside the unreserved set of RFC 3986 -- the ASCII
-/// letters and digits, `-`, `.`, `_`, and `~` -- is encoded, `/` excepted, which
-/// separates the name's components as it does the path's. A name carrying `?`,
-/// `#`, or `%` therefore names the ref rather than a query, a fragment, or an
-/// escape the server decodes into a different name.
+/// A request path goes on the wire as written, so this function encodes the
+/// name. It encodes each byte outside the unreserved set of RFC 3986: the
+/// ASCII letters and digits, `-`, `.`, `_`, and `~`. It keeps `/`, which
+/// separates the components of the name and of the path.
+///
+/// A `?`, `#`, or `%` in a name is so part of the ref name. The server cannot
+/// read it as a query, a fragment, or an escape that decodes into a different
+/// name.
 pub(super) fn ref_request_path(name: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::from("refs/heads/");
@@ -1947,8 +2118,8 @@ pub(super) fn ref_request_path(name: &str) -> String {
     out
 }
 
-/// The low-speed rule a pull's fetcher holds each transfer to. A field left
-/// `None` takes its default, and a zero in either field turns the rule off.
+/// Returns the low-speed rule of the fetcher of a pull. A field left `None`
+/// takes its default, and a zero in either field turns the rule off.
 fn low_speed(opts: &PullOptions) -> Option<LowSpeed> {
     let limit = opts
         .low_speed_limit_bytes
@@ -1957,7 +2128,7 @@ fn low_speed(opts: &PullOptions) -> Option<LowSpeed> {
     (limit != 0 && !time.is_zero()).then_some(LowSpeed { limit, time })
 }
 
-/// Fetch a path whole, or `None` when the remote answers 404.
+/// Fetches a path whole, or returns `None` if the remote answers 404.
 pub(crate) async fn fetch_optional(
     fetcher: &Fetcher,
     path: &str,
@@ -1971,26 +2142,31 @@ pub(crate) async fn fetch_optional(
     }
 }
 
-/// Fetch a path whole, under a size cap.
+/// Fetches a path whole, under a size cap.
 ///
-/// The fetcher refuses a declared `Content-Length` above the cap before the body
-/// is read and stops a body that passes the cap as the bytes arrive. One buffer
-/// belongs to each fetch in flight, so the cap a caller names bounds the memory
-/// of one step: [`MAX_METADATA_SIZE`] for a metadata object,
-/// [`MAX_ROOT_FILE`] for a repository-root file, [`MAX_REF_FILE`] for a
-/// `refs/heads/<ref>` file.
+/// The fetcher refuses a declared `Content-Length` above the cap before it
+/// reads the body. It stops a body that passes the cap when the bytes arrive.
+/// Each fetch in flight has one buffer, so the cap of the caller bounds the
+/// memory of one step:
 ///
-/// The buffer is sized from the declared length, which the fetcher has already
-/// held to the cap, so the body lands in one allocation of its own size and the
-/// resident peak is what the cap states. Each read goes into a chunk of at most
-/// 128 KiB and is appended to the buffer, so no read touches the rest of the
-/// buffer, also where the body arrives slowly and a read waits many times. The
-/// final read, which finds the end of the stream, goes into the chunk, so a
-/// buffer filled to its declared length is not grown. A remote declaring no
-/// length grows its buffer as it reads, under the same cap.
+/// - [`MAX_METADATA_SIZE`] for a metadata object
+/// - [`MAX_ROOT_FILE`] for a repository-root file
+/// - [`MAX_REF_FILE`] for a `refs/heads/<ref>` file
 ///
-/// A body that fails in transit is fetched again from the start, into a new
-/// buffer, while the fetcher's retry count has a repeat left.
+/// The size of the buffer comes from the declared length, which the fetcher
+/// held to the cap. The body so goes into one allocation of its own size, and
+/// the resident peak is the cap. Each read goes into a chunk of at most
+/// 128 KiB, and the function appends the chunk to the buffer.
+///
+/// No read touches the rest of the buffer, also if the body arrives slowly and
+/// a read waits many times. The final read, which finds the end of the stream,
+/// goes into the chunk, so a buffer filled to its declared length does not
+/// grow. If the remote declares no length, the buffer grows as the function
+/// reads, under the same cap.
+///
+/// If a body fails in transit, the function fetches it again from the start,
+/// into a new buffer. It does so while the retry count of the fetcher has a
+/// repeat left.
 async fn fetch_whole(
     fetcher: &Fetcher,
     path: &str,
@@ -2016,10 +2192,10 @@ async fn fetch_whole(
     }
 }
 
-/// Read `body` to its end into one buffer sized from `declared`, its declared
-/// length, which the source has held to `max_size`. Each read goes into a
-/// bounded chunk, the read that finds the end of the body included, so a
-/// buffer filled to its declared length is not grown.
+/// Reads `body` to its end into one buffer. The size of the buffer comes from
+/// `declared`, the declared length, which the source held to `max_size`. Each
+/// read goes into a bounded chunk, also the read that finds the end of the
+/// body. So a buffer filled to its declared length does not grow.
 pub(super) async fn read_whole<R: AsyncRead + Unpin>(
     mut body: R,
     declared: Option<u64>,
@@ -2037,20 +2213,21 @@ pub(super) async fn read_whole<R: AsyncRead + Unpin>(
     }
 }
 
-/// Read the archive framing off the front of a content object's stream: a
-/// four-byte big-endian header length, four zero bytes, then the header itself.
-/// What remains of the stream is the raw-DEFLATE payload.
+/// Reads the archive framing off the front of the stream of a content object.
 ///
-/// The size the header declares for that payload is returned with it, and bounds
-/// what the payload is allowed to decompress to. The raw framed bytes -- the
-/// length prefix and the header variant, exactly as the remote sent them -- are
-/// returned too, for a caller that stores them verbatim rather than
-/// re-serializing the parsed header.
+/// The framing is a four-byte big-endian header length, four zero bytes, and
+/// then the header. The rest of the stream is the raw-DEFLATE payload.
 ///
-/// The remote states the header length and supplies the bytes behind it, so a
-/// length above [`MAX_FILE_HEADER_SIZE`] is refused before the buffer for it is
-/// allocated. That bound holds for each fetch in flight, since one header is
-/// read per content object.
+/// The function also returns the size that the header declares for the
+/// payload. This size bounds the decompressed payload. The function also
+/// returns the raw framed bytes: the length prefix and the header variant, as
+/// the remote sent them. A caller can store these bytes as they are, with no
+/// new serialization of the parsed header.
+///
+/// The remote states the header length and supplies the bytes after it. So the
+/// function refuses a length above [`MAX_FILE_HEADER_SIZE`] before it
+/// allocates the buffer. That bound holds for each fetch in flight, because
+/// each content object has one header.
 async fn read_archive_header<R: AsyncRead + Unpin>(
     mut stream: R,
 ) -> Result<(FileHeader, u64, Vec<u8>, R)> {
@@ -2076,20 +2253,21 @@ async fn read_archive_header<R: AsyncRead + Unpin>(
     Ok((header, uncompressed, framed, stream))
 }
 
-/// Store one content object that arrives in the archive wire form, from the
-/// stream that follows its framed header.
+/// Stores one content object in the archive wire form, from the stream after
+/// its framed header.
 ///
-/// `header` and `declared` come from [`read_archive_header`], `framed_header`
-/// is the framing it read, and `meta` is the logical metadata of `header`,
-/// which the caller has already checked against the destination mode. A
-/// symlink carries no payload, so its stream must end there. An archive
-/// destination stores the compressed bytes as they arrive, and every other
+/// `header` and `declared` come from [`read_archive_header`], and
+/// `framed_header` is the framing that it read. `meta` is the logical metadata
+/// of `header`, which the caller checked against the destination mode.
+///
+/// A symlink carries no payload, so its stream must end after the header. An
+/// archive destination stores the compressed bytes as they arrive. Each other
 /// mode inflates them into a content writer. Both sides of the payload are
-/// held to `declared`. The stream is read to its end before the object is
-/// stored, on each of the three paths.
+/// held to `declared`.
 ///
-/// Every destination refuses a payload that inflates to fewer bytes than
-/// `declared`.
+/// On each of the three paths, the function reads the stream to its end
+/// before it stores the object. Each destination refuses a payload that
+/// inflates to fewer bytes than `declared`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn store_filez_payload<R: AsyncRead + Unpin>(
     txn: &Transaction,
@@ -2107,13 +2285,13 @@ pub(crate) async fn store_filez_payload<R: AsyncRead + Unpin>(
             .await?;
         return Ok(());
     }
-    // The declared size bounds both sides of the payload: what it may
-    // decompress to, and what may come off the connection to produce that.
+    // The declared size bounds both sides of the payload: the decompressed
+    // size, and the bytes that come off the connection to produce it.
     let source = BoundedInput::new(body, *expected, compressed_bound(declared));
     if txn.repo().mode().is_archive() {
-        // The remote already stores this object deflated in the same wire
-        // form this destination writes: store the fetched bytes verbatim
-        // instead of inflating and recompressing them.
+        // The remote stores this object deflated, in the wire form that this
+        // destination writes. So the fetched bytes go to disk as they are,
+        // with no inflate and no new compression.
         txn.write_archive_payload(expected, header, framed_header, declared, source, read_buf)
             .await
             .map_err(payload_refusal)?;
@@ -2132,11 +2310,11 @@ pub(crate) async fn store_filez_payload<R: AsyncRead + Unpin>(
         )));
     }
     // The decoder stops at the DEFLATE end-of-stream marker and asks its
-    // input for nothing more, so the stream has to be read to its end here:
-    // that read is what returns the connection to the pool for the next
-    // object, and what moves a pull session to its next reply. It comes
-    // before the finish of the writer, so the next reply arrives while this
-    // object is stored.
+    // input for no more bytes. So the function must read the stream to its
+    // end here. That read returns the connection to the pool for the next
+    // object, and moves a pull session to its next reply. It comes before
+    // the finish of the writer, so the next reply arrives while this object
+    // is stored.
     check_stream_end(expected, "deflated payload", payload.into_inner())
         .await
         .map_err(payload_refusal)?;
@@ -2144,23 +2322,25 @@ pub(crate) async fn store_filez_payload<R: AsyncRead + Unpin>(
     Ok(())
 }
 
-/// Stream a content object's payload into `writer`, stopping if it outgrows the
-/// size its header declared. Returns how many of the declared bytes the
-/// payload did not hold.
+/// Streams the payload of a content object into `writer`, and stops if the
+/// payload grows past the size that its header declared. Returns the number of
+/// declared bytes that the payload did not hold.
 ///
-/// A correct object decompresses to exactly `declared`, so a stream that passes
-/// it is corrupt or built to expand, and either way there is nothing to be gained
-/// from reading the rest of it. The declared size is not covered by the object's
-/// checksum, which is compared at the end of the payload: this bounds what has to
-/// be written before that comparison is reached. Each read is clamped to what is
-/// left plus the byte that settles it, so at most one byte past the declaration
-/// is stored before the refusal.
+/// A correct object decompresses to exactly `declared`. A stream that passes
+/// it is corrupt or built to expand, so the rest of it has no value. The
+/// checksum of the object covers the declared size only at the comparison at
+/// the end of the payload. This bound limits the bytes written before that
+/// comparison.
 ///
-/// `buf` is the slot's read buffer, grown to [`READ_CHUNK`] on its first use and
-/// reused by every object that slot stores after it.
+/// Each read is clamped to the bytes left plus the one byte that decides the
+/// result. So at most one byte past the declaration is stored before the
+/// refusal.
 ///
-/// The compressed side of the same declaration is bounded by [`BoundedInput`],
-/// under the decoder.
+/// `buf` is the read buffer of the slot. It grows to [`READ_CHUNK`] on its
+/// first use, and each later object of that slot uses it again.
+///
+/// [`BoundedInput`], under the decoder, bounds the compressed side of the same
+/// declaration.
 async fn copy_bounded<R, W>(
     mut reader: R,
     writer: &mut W,
@@ -2197,14 +2377,14 @@ where
     }
 }
 
-/// How many bytes a payload declaring `declared` uncompressed bytes may take off
-/// the connection.
+/// Returns the number of bytes that a payload of `declared` uncompressed bytes
+/// can take off the connection.
 ///
-/// A stored block is the form a DEFLATE compressor falls back to for data it
-/// cannot shrink: five bytes of framing per 65535 bytes of input, which is one
-/// part in thirteen thousand. A part in a thousand covers that with room to spare.
-/// The fixed 64 KiB covers a small object, whose framing outweighs its content.
-/// A stream past this bound is not a compressed form of what the header declares,
+/// A DEFLATE compressor uses a stored block for data that it cannot shrink:
+/// five bytes of framing for each 65535 bytes of input. That is one part in
+/// thirteen thousand, and one part in 1024 covers it with a margin. The fixed
+/// 64 KiB covers a small object, whose framing is larger than its content. A
+/// stream past this bound is not a compressed form of the declared size,
 /// whatever it decompresses to.
 pub(crate) fn compressed_bound(declared: u64) -> u64 {
     declared
@@ -2212,28 +2392,29 @@ pub(crate) fn compressed_bound(declared: u64) -> u64 {
         .saturating_add(64 * 1024)
 }
 
-/// A content object's compressed stream, bounded against the size its header
-/// declares.
+/// The compressed stream of a content object, bounded by the size that its
+/// header declares.
 ///
-/// [`copy_bounded`] bounds what the payload decompresses to. That says nothing
-/// about how many compressed bytes produce it: an empty non-final DEFLATE block is
-/// five bytes that decompress to nothing, so a stream of them decompresses to
-/// nothing for as long as the remote sends it, and memory and disk stay bounded
-/// while time and bandwidth do not. The decoder does not return to its caller
-/// while its input keeps yielding bytes, so the bound on that input belongs in the
-/// read the decoder itself makes, which is this one.
+/// [`copy_bounded`] bounds the decompressed payload. That bound does not limit
+/// the compressed bytes that produce it. An empty non-final DEFLATE block is
+/// five bytes that decompress to nothing. A stream of these blocks
+/// decompresses to nothing for as long as the remote sends it.
 ///
-/// The refusal travels as an [`Error::InvalidFormat`] inside the `io::Error` the
-/// decoder passes up, which [`payload_refusal`] takes back out: the bound comes
-/// from the object's own declaration, so the refusal names the object as the
-/// decompressed-size refusal does.
+/// Memory and disk then stay bounded, and time and bandwidth do not. The
+/// decoder does not return to its caller while its input gives bytes. So the
+/// bound on that input must be in the read of the decoder, which is this read.
+///
+/// The refusal is an [`Error::InvalidFormat`] in the `io::Error` that the
+/// decoder passes up. [`payload_refusal`] takes it back out. The bound comes
+/// from the declaration of the object, so the refusal names the object, as the
+/// refusal of the decompressed size does.
 pub(crate) struct BoundedInput<R> {
     inner: R,
-    /// The object the bound is stated for.
+    /// The object of the bound.
     checksum: Checksum,
     bound: u64,
-    /// What has been taken from `inner`, which passes the bound by at most the one
-    /// read that trips it.
+    /// The bytes taken from `inner`. This count passes the bound by at most the
+    /// one read that trips it.
     taken: u64,
 }
 
@@ -2268,12 +2449,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedInput<R> {
     }
 }
 
-/// Take back the refusal a bounded read reported.
+/// Takes back the refusal that a bounded read reported.
 ///
-/// The decoder returns its input's failure as its own, so a bound [`BoundedInput`]
-/// enforced arrives here inside an `io::Error`. Unwrapping it puts that refusal on
-/// the footing of one [`copy_bounded`] raises itself. Any other failure stands as
-/// it is.
+/// The decoder returns the failure of its input as its own failure. So a
+/// refusal of [`BoundedInput`] arrives here in an `io::Error`. The unwrap gives
+/// that refusal the same form as a refusal of [`copy_bounded`]. Any other error
+/// stays as it is.
 pub(crate) fn payload_refusal(error: Error) -> Error {
     match error {
         Error::Io(io) => io.downcast::<Error>().unwrap_or_else(Error::Io),
@@ -2281,18 +2462,19 @@ pub(crate) fn payload_refusal(error: Error) -> Error {
     }
 }
 
-/// Establish that a content object's stream ends after `after`, and reach that
-/// end.
+/// Checks that the stream of a content object ends after `after`, and reads to
+/// that end.
 ///
-/// One byte settles it. The framing that selects the caller's check arrives from
-/// the remote, so the bytes a remote sends instead of an end of stream are of a
-/// length that remote chose; reading them out would hold all of them. An object
-/// that ends where it should reaches the end of its response in this read, which
-/// returns the connection to the pool for the next object.
+/// One byte decides it. The remote sends the framing that selects the check of
+/// the caller. If bytes follow, the remote chose their length, and a read of
+/// all of them holds all of them. If the object ends at the correct point,
+/// this read reaches the end of its response. The read then returns the
+/// connection to the pool for the next object.
 ///
-/// The payload's stream is the decoder's input buffer, which hands back
-/// read-ahead the decoder left before it asks the body for more. A correct
-/// object leaves none: nothing follows its final DEFLATE block.
+/// The stream of the payload is the input buffer of the decoder. It gives back
+/// the read-ahead that the decoder left before it asks the body for more
+/// bytes. A correct object leaves none: nothing follows its final DEFLATE
+/// block.
 pub(crate) async fn check_stream_end<R: AsyncRead + Unpin>(
     expected: &Checksum,
     after: &str,
@@ -2307,13 +2489,13 @@ pub(crate) async fn check_stream_end<R: AsyncRead + Unpin>(
     Ok(())
 }
 
-/// Read the proxy a remote's `proxy` key names. An empty or absent key leaves
-/// the proxy to the environment variables.
+/// Reads the proxy that the `proxy` key of a remote names. An empty or absent
+/// key leaves the proxy to the environment variables.
 ///
-/// A value with white space at its start or end is refused, as the reference
-/// tool refuses it. The fetcher trims a proxy URL, so it would connect through
-/// such a value. The message leaves the value out, because the userinfo of the
-/// value can hold a password.
+/// The function refuses a value with white space at its start or end, as the
+/// `ostree` command refuses it. The fetcher trims a proxy URL, so without this
+/// check it connects through such a value. The message leaves out the value,
+/// because the userinfo of the value can hold a password.
 fn remote_proxy(remote: &str, section: &crate::config::Remote<'_>) -> Result<Proxy> {
     Ok(match section.proxy()? {
         Some(url) if url.trim() != url => {
@@ -2327,18 +2509,20 @@ fn remote_proxy(remote: &str, section: &crate::config::Remote<'_>) -> Result<Pro
     })
 }
 
-/// Read the trust anchors and the client identity a remote's TLS keys name.
+/// Reads the trust anchors and the client identity that the TLS keys of a
+/// remote name.
 async fn remote_tls(remote: &str, section: &crate::config::Remote<'_>) -> Result<TlsOptions> {
     // `tls-permissive` keeps the host name check and ignores `tls-ca-path`.
-    // Both are measured of the reference tool: a CA that signed nothing in
-    // the chain serves, and so does a path naming a file that is absent. The
-    // path is therefore left unread here rather than read and discarded, so an
-    // absent one is no failure. `DangerousAcceptAnyChain` holds the name check
-    // and takes the chain as presented, so it is the setting that mapping asks
-    // for. It drops the expiry check as well, which is the port's own reading
-    // and not a measurement: a peer verification that ignores the CA path is
-    // libcurl peer verification switched off, and that setting takes the
-    // validity dates with it.
+    // Both facts are observed on the `ostree` command: a CA that signed
+    // nothing in the chain works, and a path that names an absent file works
+    // too. So the function does not read the path, and an absent file is no
+    // failure. `DangerousAcceptAnyChain` keeps the name check and takes the
+    // chain as presented, so it is the setting that this mapping needs.
+    //
+    // `DangerousAcceptAnyChain` also drops the expiry check. That part is a
+    // reading of ostrya, with no observation behind it. A peer verification
+    // that ignores the CA path is libcurl peer verification turned off, and
+    // that setting also drops the validity dates.
     let roots = if section.tls_permissive()? {
         TrustRoots::DangerousAcceptAnyChain
     } else {
@@ -2354,8 +2538,8 @@ async fn remote_tls(remote: &str, section: &crate::config::Remote<'_>) -> Result
         (Some(cert), Some(key)) => Some(ClientIdentity {
             cert_chain_pem: read_pem(&cert).await?,
             key_pem: read_pem(&key).await?,
-            // A remote carries no config key for a passphrase, so a remote
-            // client key has to be one that needs none.
+            // A remote has no config key for a passphrase, so a remote client
+            // key must need no passphrase.
             key_passphrase: None,
         }),
         (None, None) => None,
@@ -2372,14 +2556,14 @@ async fn remote_tls(remote: &str, section: &crate::config::Remote<'_>) -> Result
     })
 }
 
-/// Read a PEM file named by the config.
+/// Reads a PEM file that the config names.
 async fn read_pem(path: &str) -> Result<Vec<u8>> {
     let path = path.to_owned();
     ostrya_rt::unblock(move || std::fs::read(&path).map_err(Error::from)).await
 }
 
-/// The future of a pull runs on a multi-threaded executor, over HTTP, through
-/// the ssh source, and from a local repository.
+/// A compile-time check that the future of a pull is `Send`: over HTTP,
+/// through the ssh source, and from a local repository.
 const _: fn() = || {
     fn assert_send<T: Send>(_: &T) {}
     let _ = |repo: &Repo| assert_send(&repo.pull("origin", PullOptions::default()));
@@ -2404,9 +2588,9 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    /// A pull holds each transfer to 1000 bytes per second over 30 seconds
-    /// unless told otherwise. A field left unset keeps its default, and a zero
-    /// in either field turns the rule off.
+    /// By default, a pull holds each transfer to 1000 bytes per second over 30
+    /// seconds. A field left unset keeps its default, and a zero in either
+    /// field turns the rule off.
     #[test]
     fn the_low_speed_rule_defaults_and_turns_off_at_zero() {
         let rule = |limit: Option<u32>, secs: Option<u64>| {
@@ -2431,8 +2615,8 @@ mod tests {
         assert_eq!(rule(Some(50), Some(2)), low(50, 2));
     }
 
-    /// The archive stored form of a content object: the framed header, then the
-    /// payload the caller supplies.
+    /// Returns the archive stored form of a content object: the framed header,
+    /// then the payload that the caller supplies.
     fn framed(header: &FileHeader, uncompressed: u64, payload: &[u8]) -> Vec<u8> {
         let bytes = header.serialize_archive(uncompressed).unwrap();
         let mut out = Vec::new();
@@ -2453,8 +2637,8 @@ mod tests {
         }
     }
 
-    /// The header comes off the front of the stream and the payload is what is
-    /// left, which is what the decoder is handed.
+    /// The header comes off the front of the stream, and the rest is the
+    /// payload, which goes to the decoder.
     #[test]
     fn the_header_is_read_off_the_front_and_the_payload_is_left() {
         block_on(async {
@@ -2472,8 +2656,8 @@ mod tests {
         });
     }
 
-    /// A symlink's header names its target, and its stored form carries no
-    /// payload at all.
+    /// The header of a symlink names its target, and its stored form carries no
+    /// payload.
     #[test]
     fn a_symlink_header_names_its_target() {
         block_on(async {
@@ -2495,8 +2679,8 @@ mod tests {
         });
     }
 
-    /// The four bytes after the length are padding and must be zero: anything
-    /// else is not the framing this reader is looking at.
+    /// The four bytes after the length are padding and must be zero. Other
+    /// bytes are not the framing that this reader reads.
     #[test]
     fn nonzero_framing_padding_is_rejected() {
         block_on(async {
@@ -2507,8 +2691,8 @@ mod tests {
         });
     }
 
-    /// A stream that ends inside the framing is a truncated object, not an empty
-    /// one.
+    /// A stream that ends inside the framing is a truncated object, and the
+    /// read fails.
     #[test]
     fn a_truncated_stream_fails_rather_than_ending() {
         block_on(async {
@@ -2522,9 +2706,9 @@ mod tests {
         });
     }
 
-    /// A stream that never ends. Past a small budget it fails, so a check that
-    /// reads for an end fails this test rather than running until the process
-    /// runs out of memory.
+    /// A stream that never ends. Past a small budget it fails. So a check that
+    /// reads to an end fails this test, and the process does not run out of
+    /// memory.
     struct Endless {
         handed_out: usize,
     }
@@ -2544,8 +2728,9 @@ mod tests {
         }
     }
 
-    /// A symlink whose stored form carries a payload is refused, and the refusal
-    /// reads one byte of it: the length the remote chose to send is not held.
+    /// A symlink whose stored form carries a payload is refused. The refusal
+    /// reads one byte of the payload, and holds none of the length that the
+    /// remote chose to send.
     #[test]
     fn a_symlink_payload_is_refused_without_reading_it() {
         block_on(async {
@@ -2558,10 +2743,10 @@ mod tests {
         });
     }
 
-    /// The decoder stops at the end of the DEFLATE stream without reading what
-    /// follows it, so the end-of-stream check runs over the decoder's input
-    /// buffer: a payload that ends the stream ends the check, and trailing bytes
-    /// the decoder never consumed are refused.
+    /// The decoder stops at the end of the DEFLATE stream and does not read the
+    /// bytes after it. So the end-of-stream check runs over the input buffer of
+    /// the decoder. A payload that ends the stream passes the check, and the
+    /// check refuses trailing bytes that the decoder did not consume.
     #[test]
     fn the_check_sees_what_the_decoder_left_behind() {
         block_on(async {
@@ -2589,9 +2774,9 @@ mod tests {
         });
     }
 
-    /// A payload that decompresses past the size its header declares is refused,
-    /// and the refusal reads one byte past the declaration rather than the rest
-    /// of a stream that never ends.
+    /// A payload that decompresses past the size that its header declares is
+    /// refused. The refusal reads one byte past the declaration, and no more of
+    /// a stream that never ends.
     #[test]
     fn a_payload_outgrowing_its_declared_size_is_refused() {
         block_on(async {
@@ -2605,10 +2790,10 @@ mod tests {
         });
     }
 
-    /// A stream of empty non-final DEFLATE blocks: five bytes that decompress to
-    /// nothing, repeated. Past a budget well above the bound under test it fails,
-    /// so a compressed stream nothing bounds fails this test rather than running
-    /// until the process runs out of memory.
+    /// A stream of empty non-final DEFLATE blocks: five bytes that decompress
+    /// to nothing, repeated. Past a budget well above the bound under test it
+    /// fails. So an unbounded compressed stream fails this test, and the
+    /// process does not run out of memory.
     struct EmptyBlocks {
         handed_out: usize,
     }
@@ -2634,10 +2819,11 @@ mod tests {
         }
     }
 
-    /// A payload that decompresses to nothing for as long as it is sent is refused
-    /// against the bound its declared size sets, since the decompressed bound never
-    /// trips against it. The refusal reaches the caller as the refusal it is, and
-    /// what the stream delivered is the bound plus the one read that tripped it.
+    /// A payload that decompresses to nothing for as long as it is sent is
+    /// refused against the bound that its declared size sets. The decompressed
+    /// bound never trips against it. The refusal reaches the caller as the
+    /// refusal that it is. The stream delivered the bound plus the one read
+    /// that tripped it.
     #[test]
     fn a_compressed_payload_passing_its_bound_is_refused() {
         block_on(async {
@@ -2667,13 +2853,13 @@ mod tests {
         });
     }
 
-    /// The bound refuses no object of the size it is stated for: data a compressor
-    /// cannot shrink is the worst case, and its compressed form sits inside the
-    /// bound its uncompressed size sets.
+    /// The bound refuses no object of the size that it is stated for. Data that
+    /// a compressor cannot shrink is the worst case, and its compressed form is
+    /// inside the bound that its uncompressed size sets.
     #[test]
     fn the_compressed_bound_holds_incompressible_data() {
         block_on(async {
-            // A linear congruential sequence, which deflate cannot shrink.
+            // A linear congruential sequence, which DEFLATE cannot shrink.
             let mut state = 1u32;
             let data: Vec<u8> = (0..200_000)
                 .map(|_| {
@@ -2702,12 +2888,12 @@ mod tests {
         });
     }
 
-    /// The declaration is a ceiling, not an equality: a payload that reaches it
-    /// is stored whole, and a shorter one is left to the checksum comparison.
+    /// The declaration is a ceiling. A payload that reaches it is stored
+    /// whole, and the checksum comparison decides a shorter one.
     #[test]
     fn a_payload_within_its_declared_size_is_stored() {
         block_on(async {
-            // One buffer serves both objects, the way a slot's does.
+            // One buffer serves both objects, as the buffer of a slot does.
             let mut buf = Vec::new();
             for payload in [&b"four"[..], b"two"] {
                 let mut out = Vec::new();
@@ -2722,16 +2908,16 @@ mod tests {
                 .unwrap();
                 assert_eq!(out, payload);
             }
-            // The buffer the first object grew is the one the second read
-            // through, and it is the slot's read chunk.
+            // The second object reads through the buffer that the first object
+            // grew, and that buffer is the read chunk of the slot.
             assert_eq!(buf.len(), READ_CHUNK);
         });
     }
 
-    /// A declared header length past the header cap is refused before the buffer
-    /// for it is allocated, so a remote directs at most that cap for each fetch
-    /// in flight. The first byte past the cap is refused, as is the largest
-    /// length the four-byte field holds.
+    /// A declared header length past the header cap is refused before the
+    /// buffer is allocated. So a remote controls at most that cap for each
+    /// fetch in flight. The test refuses the first byte past the cap and the
+    /// largest length that the four-byte field holds.
     #[test]
     fn an_oversized_header_length_is_refused() {
         block_on(async {
@@ -2745,8 +2931,8 @@ mod tests {
         });
     }
 
-    /// A ref name reaches the wire encoded: its `/` separators stand, and every
-    /// character that would name something else does not.
+    /// A ref name goes on the wire encoded. Its `/` separators stay, and each
+    /// character that names something else in a URL is encoded.
     #[test]
     fn a_ref_request_path_encodes_the_name() {
         assert_eq!(ref_request_path("test/main"), "refs/heads/test/main");
@@ -2772,7 +2958,7 @@ mod tests {
         ObjectName::new(csum(byte), ty)
     }
 
-    /// The outcome of a commit that was fetched and holds `tree`.
+    /// Returns the outcome of a fetched commit that holds `tree`.
     fn fetched(checksum: Checksum, tree: Vec<ObjectName>, parent: Option<Checksum>) -> Step {
         Step::Commit(CommitOutcome {
             checksum,
@@ -2782,7 +2968,7 @@ mod tests {
         })
     }
 
-    /// The outcome of a commit a delta delivers.
+    /// Returns the outcome of a commit that a delta delivers.
     fn by_delta(
         checksum: Checksum,
         parts: usize,
@@ -2801,8 +2987,8 @@ mod tests {
         })
     }
 
-    /// Drain the plan by applying a stored outcome for each queued object, whose
-    /// dirtrees reference nothing further.
+    /// Drains the plan: applies a stored outcome for each queued object. The
+    /// dirtrees reference no more objects.
     fn drain(plan: &mut Plan, marked: &mut Vec<Checksum>) {
         while let Some(item) = plan.next() {
             let step = match item {
@@ -2817,8 +3003,8 @@ mod tests {
         }
     }
 
-    /// A commit queues the objects it references, and reports that this pull
-    /// marked it partial.
+    /// A commit queues the objects that it references, and reports that this
+    /// pull marked it partial.
     #[test]
     fn a_commit_queues_the_objects_it_references() {
         let mut plan = Plan::default();
@@ -2846,8 +3032,8 @@ mod tests {
         assert_eq!(marked, [csum(1)]);
     }
 
-    /// An object several commits reach is queued once, whether the others reach
-    /// it while it is still queued or after it was fetched.
+    /// An object that several commits reach is queued once. This holds if the
+    /// other commits reach it while it is queued, and after it is fetched.
     #[test]
     fn an_object_several_commits_reach_is_queued_once() {
         let mut plan = Plan::default();
@@ -2862,8 +3048,8 @@ mod tests {
         assert!(plan.next().is_none());
     }
 
-    /// A commit reached again with further to go is not fetched again: the walk
-    /// resumes at the parent it named.
+    /// A commit reached again with more depth is not fetched again: the walk
+    /// resumes at the parent that it named.
     #[test]
     fn a_commit_reached_deeper_resumes_at_its_parent() {
         let mut plan = Plan::default();
@@ -2894,8 +3080,8 @@ mod tests {
         assert!(plan.next().is_none());
     }
 
-    /// The drain order is the fetch order the pull relies on: the commits, then
-    /// the objects the scan is blocked on, then the content.
+    /// The drain order is the fetch order of the pull: the commits, then the
+    /// objects that the scan waits for, then the content.
     #[test]
     fn the_plan_drains_commits_then_scan_then_content() {
         let mut plan = Plan::default();
@@ -2928,8 +3114,8 @@ mod tests {
         assert_eq!(drained, [csum(5), csum(2), csum(3), csum(4)]);
     }
 
-    /// A delta queues its parts and the objects it hands over loose, and the
-    /// commit's tree walk waits for the last part.
+    /// A delta queues its parts and the objects that it hands over loose. The
+    /// tree walk of the commit waits for the last part.
     #[test]
     fn a_delta_queues_its_parts_before_the_tree() {
         let mut plan = Plan::default();
@@ -2960,8 +3146,8 @@ mod tests {
         assert_eq!(name, object(2, ObjectType::DirMeta));
     }
 
-    /// No more than [`PART_CAP`] parts are handed out at once, however many the
-    /// delta has and however many slots the pull holds.
+    /// The plan gives out no more than [`PART_CAP`] parts at once, whatever the
+    /// number of parts of the delta and of slots of the pull.
     #[test]
     fn the_part_cap_holds_however_many_parts_a_delta_has() {
         let mut plan = Plan::default();
@@ -2988,8 +3174,8 @@ mod tests {
         assert_eq!(applied, 5);
     }
 
-    /// A stream that checks, at its end, that the transaction has not staged
-    /// the object yet.
+    /// A stream that checks, at its end, that the transaction did not stage the
+    /// object yet.
     struct EndBeforeStore<'a> {
         inner: Cursor<Vec<u8>>,
         txn: &'a Transaction,
@@ -3016,10 +3202,10 @@ mod tests {
         }
     }
 
-    /// Each destination reads the end of the stream of a content object
-    /// before it stores the object, so a pull session moves to its next reply
-    /// while the store finishes: the regular-file path of an archive and of a
-    /// bare-user destination, and the symlink path.
+    /// Each destination reads the end of the stream of a content object before
+    /// it stores the object. So a pull session moves to its next reply while
+    /// the store finishes. The test covers the regular-file path of an archive
+    /// and of a bare-user destination, and the symlink path.
     #[test]
     fn the_stream_ends_before_the_object_is_stored() {
         let dir =
@@ -3099,9 +3285,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A remote setting `tls-permissive` maps onto the bypass that holds the
-    /// host name check, and the `tls-ca-path` alongside it is never opened:
-    /// the path here names no file, so reading it would fail the call.
+    /// A remote with `tls-permissive` maps to the bypass that keeps the host
+    /// name check. The function never opens the `tls-ca-path` of the remote.
+    /// The path here names no file, so a read of it fails the call.
     #[test]
     fn tls_permissive_leaves_the_ca_path_unread() {
         let cfg = RepoConfig::parse(
@@ -3116,7 +3302,7 @@ mod tests {
         assert!(tls.client_identity.is_none());
     }
 
-    /// Pop the next item, which must be the dirtree `byte`.
+    /// Pops the next item, which must be the dirtree `byte`.
     fn pop_dirtree(plan: &mut Plan, byte: u8) {
         loop {
             match plan.next() {
@@ -3130,9 +3316,9 @@ mod tests {
         }
     }
 
-    /// A dirtree reached at two subpath positions is walked under both, even
-    /// when the second reaches it after its first walk: it is queued again, and
-    /// the second walk fetches what the first left out.
+    /// A dirtree reached at two subpath positions gets a walk under both, also
+    /// if the second position reaches it after its first walk. The plan queues
+    /// it again, and the second walk fetches what the first walk left out.
     #[test]
     fn a_dirtree_reached_again_under_a_wider_scope_is_walked_again() {
         let values = ["/p/x/".to_owned(), "/q/x".to_owned()];
@@ -3171,7 +3357,7 @@ mod tests {
         pop_dirtree(&mut plan, 10);
         pop_dirtree(&mut plan, 11);
         plan.apply(Step::DirTree(csum(10), parent.clone()), &mut marked);
-        // `x` is walked under `/p/x/` alone, which fetches nothing in it.
+        // The walk of `x` is under `/p/x/` alone, which fetches nothing in it.
         pop_dirtree(&mut plan, 20);
         plan.apply(Step::DirTree(csum(20), x.clone()), &mut marked);
         assert!(plan.content.is_empty());
@@ -3183,13 +3369,13 @@ mod tests {
             plan.content.iter().copied().collect::<Vec<_>>(),
             [object(30, ObjectType::File)]
         );
-        // A third reach is covered, so nothing is queued again.
+        // The scope covers a third reach, so the plan queues nothing again.
         plan.push_object(object(20, ObjectType::DirTree), Scope::All);
         assert!(plan.scan.is_empty());
     }
 
-    /// A delta whose objects all went to fallbacks has no part to wait for, so
-    /// its tree walk is queued at once.
+    /// A delta whose objects all went to fallbacks has no part to wait for. So
+    /// the plan queues its tree walk at once.
     #[test]
     fn a_delta_with_no_parts_queues_its_tree_at_once() {
         let mut plan = Plan::default();

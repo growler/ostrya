@@ -18,12 +18,12 @@ pub struct PipeState {
     write_waker: Option<Waker>,
 }
 
-/// The write half of a bounded in-process byte pipe. Dropping it gives the
-/// reader end of file.
+/// The write half of a bounded in-process byte pipe. When this half drops,
+/// the reader gets end of file after the bytes in the buffer.
 pub struct PipeWriter(Arc<Mutex<PipeState>>);
 
-/// The read half of a bounded in-process byte pipe. Dropping it fails each
-/// later write with `BrokenPipe`.
+/// The read half of a bounded in-process byte pipe. When this half drops,
+/// each later write fails with `BrokenPipe`.
 pub struct PipeReader(Arc<Mutex<PipeState>>);
 
 pub fn pipe(cap: usize) -> (PipeWriter, PipeReader) {

@@ -1,9 +1,13 @@
+//! Tests of the writers that take the update lock.
+//!
 //! The writers of refs, config, summary, and detached metadata take the update
-//! lock: each waits for an `UpdateGuard` that another process or another task
-//! holds, and with `lock-timeout-secs=0` each fails with `LockTimeout` and
-//! writes nothing. A transaction publishes its objects under a held guard and
-//! waits only at the step that writes detached metadata and refs. Two
-//! processes that sign one commit keep both signatures.
+//! lock. Each writer waits for an `UpdateGuard` that another process or another
+//! task holds. If `lock-timeout-secs=0`, each writer fails with `LockTimeout`
+//! and writes nothing.
+//!
+//! A transaction publishes its objects under a held guard. It waits only at
+//! the step that writes detached metadata and refs. If two processes sign one
+//! commit, the commit keeps both signatures.
 
 mod common;
 
@@ -21,10 +25,10 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// The base64 of two 64-byte ed25519 secret keys (seed followed by public
-/// key).
+/// The base64 of a 64-byte ed25519 secret key (the seed, then the public key).
 const SECRET_B64: &str =
     "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
+/// The base64 of a second 64-byte ed25519 secret key, in the same form.
 const OTHER_SECRET_B64: &str =
     "5ILWxT+l9G/u3h0BptRpmSi35C9uog7YDdD+Fp1Xk+Hz52p0NlYh6xBA73kJEJKhKbbnjcE0rsWA5XA/K5Sq5Q==";
 
@@ -46,10 +50,11 @@ fn guard_holder_subprocess() {
     guard_holder_main();
 }
 
-/// The writer child signs the commit its argument names, as `<secret>
-/// <commit>`, and writes nothing else in the repository. Right before the
-/// call that signs, it writes the marker [`signing_marker`] names beside the
-/// repository.
+/// Runs the writer child, which signs the commit that its argument names.
+///
+/// The argument is `<secret> <commit>`. The child writes nothing else in the
+/// repository. Immediately before the call that signs, the child writes the
+/// marker that `signing_marker` names, beside the repository.
 #[test]
 #[ignore = "helper process for the update writer tests"]
 fn writer_child_subprocess() {
@@ -66,15 +71,17 @@ fn writer_child_subprocess() {
     });
 }
 
-/// The marker a writer child with the process id `pid` writes beside the
-/// repository at `path` before it signs `commit`.
+/// Returns the path of the marker that the writer child with the process id
+/// `pid` writes before it signs `commit`.
+///
+/// The marker is beside the repository at `path`.
 fn signing_marker(path: &Path, commit: &Checksum, pid: u32) -> PathBuf {
     let name = format!("signing-{}-{pid}", commit.to_hex());
     path.parent().unwrap().join(name)
 }
 
-/// The number of writer children that reached the signing call for `commit`
-/// in the repository at `path`.
+/// Returns the number of writer children that reached the signing call for
+/// `commit` in the repository at `path`.
 fn signing_children(path: &Path, commit: &Checksum) -> usize {
     let prefix = format!("signing-{}-", commit.to_hex());
     std::fs::read_dir(path.parent().unwrap())
@@ -90,7 +97,8 @@ fn signing_children(path: &Path, commit: &Checksum) -> usize {
 // Helpers.
 // ---------------------------------------------------------------------------
 
-/// Replace `lock-timeout-secs` in the config of the repository at `path`.
+/// Sets `lock-timeout-secs` to `secs` in the config of the repository at
+/// `path`.
 fn set_timeout(path: &Path, secs: i64) {
     let config = path.join("config");
     let text = std::fs::read_to_string(&config).unwrap();
@@ -107,7 +115,7 @@ fn open(path: &Path) -> Repo {
     block_on(Repo::open(path)).unwrap()
 }
 
-/// Commit an empty tree with `subject` onto `main`.
+/// Commits an empty tree with `subject` to `main` and returns the commit.
 async fn commit_empty(repo: &Repo, subject: &str) -> Checksum {
     let txn = repo.transaction().await.unwrap();
     let dirmeta = DirMeta {
@@ -141,9 +149,10 @@ async fn commit_empty(repo: &Repo, subject: &str) -> Checksum {
     commit
 }
 
-/// A repository at `<tmp>/repo` that holds a commit on `main` with one
-/// ed25519 signature, a summary, and a keyring of `origin`. Returns its path
-/// and the commit.
+/// Creates a repository at `<tmp>/repo` and returns its path and its commit.
+///
+/// The repository holds a commit on `main` with one ed25519 signature, a
+/// summary, and a keyring of `origin`.
 fn populated(tmp: &TmpDir) -> (PathBuf, Checksum) {
     let path = tmp.path().join("repo");
     let commit = block_on(async {
@@ -165,8 +174,10 @@ fn populated(tmp: &TmpDir) -> (PathBuf, Checksum) {
     (path, commit)
 }
 
-/// Every file of the repository outside `tmp/`, with its bytes. The update
-/// lock file and the markers of the guard helper are left out.
+/// Returns each file of the repository outside `tmp/`, with its bytes.
+///
+/// The list does not include the update lock file or the markers of the guard
+/// helper.
 fn snapshot(path: &Path) -> Vec<(String, Vec<u8>)> {
     file_inventory(path, "")
         .into_iter()
@@ -176,7 +187,8 @@ fn snapshot(path: &Path) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// The ed25519 signatures the detached metadata of `commit` carries.
+/// Returns the number of ed25519 signatures in the detached metadata of
+/// `commit`.
 async fn ed25519_signatures(repo: &Repo, commit: &Checksum) -> usize {
     let Some(dict) = repo.read_commit_detached_metadata(commit).await.unwrap() else {
         return 0;
@@ -191,8 +203,8 @@ async fn ed25519_signatures(repo: &Repo, commit: &Checksum) -> usize {
     array.as_array().map_or(0, <[Value]>::len)
 }
 
-/// Whether the detached metadata of `commit` carries a signature that the
-/// ed25519 key `secret_b64` made.
+/// Returns `true` if the detached metadata of `commit` holds a signature that
+/// the ed25519 key `secret_b64` made.
 async fn signed_by(repo: &Repo, commit: &Checksum, secret_b64: &str) -> bool {
     let public = ostrya::base64::decode(secret_b64).unwrap()[32..].to_vec();
     let verifier = Ed25519Verifier::new([public], Vec::<Vec<u8>>::new()).unwrap();
@@ -207,10 +219,11 @@ fn assert_timeout<T: std::fmt::Debug>(result: ostrya::Result<T>) {
     assert!(matches!(err, Error::LockTimeout { secs: 0 }), "{err:?}");
 }
 
-/// The writers of the update lock, each by its name. Each call writes
-/// something when it runs, so a writer that does not wait for a held guard
-/// changes the snapshot. `gpg_import_keys` builds under the `verify-gpg`
-/// feature alone.
+/// The names of the writers that take the update lock.
+///
+/// Each call writes data when it runs. If a writer does not wait for a held
+/// guard, the snapshot changes. `gpg_import_keys` builds only under the
+/// `verify-gpg` feature.
 const WRITERS: [&str; 12] = [
     "set_ref_immediate",
     "set_collection_ref_immediate",
@@ -226,14 +239,14 @@ const WRITERS: [&str; 12] = [
     "transaction_commit",
 ];
 
-/// The writers of [`WRITERS`] that this build carries.
+/// Returns the writers of `WRITERS` that this build includes.
 fn writers() -> impl Iterator<Item = &'static str> {
     WRITERS
         .into_iter()
         .filter(|name| *name != "gpg_import_keys" || cfg!(feature = "verify-gpg"))
 }
 
-/// Run the writer `name` against `repo`, over the commit `commit`.
+/// Runs the writer `name` against `repo`, on the commit `commit`.
 async fn run_writer(repo: &Repo, name: &str, commit: &Checksum) -> ostrya::Result<()> {
     let other = Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap();
     match name {
@@ -251,8 +264,8 @@ async fn run_writer(repo: &Repo, name: &str, commit: &Checksum) -> ostrya::Resul
         "remove_remote_keyring" => repo.remove_remote_keyring("origin").await,
         #[cfg(feature = "verify-gpg")]
         "gpg_import_keys" => match repo.gpg_import_keys("origin", b"", &[]).await {
-            // The empty stream holds no certificate, so the import is refused
-            // once it holds the lock.
+            // The empty stream holds no certificate, so the import refuses
+            // the stream after it takes the lock.
             Err(Error::LockTimeout { secs }) => Err(Error::LockTimeout { secs }),
             _ => Ok(()),
         },
@@ -283,9 +296,11 @@ async fn run_writer(repo: &Repo, name: &str, commit: &Checksum) -> ostrya::Resul
 // A guard in another process.
 // ---------------------------------------------------------------------------
 
-/// A guard that another process holds makes each writer fail at once with
-/// `lock-timeout-secs=0`, with nothing written, and wait with `-1` until the
-/// holder released the guard.
+/// A guard that another process holds makes each writer wait.
+///
+/// If `lock-timeout-secs=0`, each writer fails at once and writes nothing. If
+/// `lock-timeout-secs=-1`, each writer waits until the holder releases the
+/// guard.
 #[test]
 fn a_foreign_guard_makes_each_writer_wait() {
     let tmp = TmpDir::new("writers-foreign");
@@ -323,9 +338,11 @@ fn a_foreign_guard_makes_each_writer_wait() {
 // A guard in another task of this process.
 // ---------------------------------------------------------------------------
 
-/// A guard that another task of this process holds makes each writer fail at
-/// once with `lock-timeout-secs=0`, with nothing written, and wait with a
-/// longer timeout until the guard is finished.
+/// A guard that another task of this process holds makes each writer wait.
+///
+/// If `lock-timeout-secs=0`, each writer fails at once and writes nothing. If
+/// `lock-timeout-secs=30`, each writer waits until the holder finishes the
+/// guard.
 #[test]
 fn an_in_process_guard_makes_each_writer_wait() {
     let tmp = TmpDir::new("writers-in-process");
@@ -361,10 +378,12 @@ fn an_in_process_guard_makes_each_writer_wait() {
 // Transactions.
 // ---------------------------------------------------------------------------
 
-/// A transaction publishes its objects while another process holds a guard,
-/// and waits only at the step that writes its ref: with
-/// `lock-timeout-secs=0` it fails there with the objects published and no
-/// ref, and with `-1` it writes the ref after the release.
+/// A transaction publishes its objects under a guard of another process and
+/// waits only at the step that writes its ref.
+///
+/// If `lock-timeout-secs=0`, the transaction fails at the ref step. Its
+/// objects are published and its ref does not exist. If
+/// `lock-timeout-secs=-1`, the transaction writes the ref after the release.
 #[test]
 fn a_transaction_publishes_under_a_guard_and_waits_at_the_ref_step() {
     let tmp = TmpDir::new("writers-transaction");
@@ -427,7 +446,7 @@ fn a_transaction_with_no_ref_and_no_detached_metadata_commits_under_a_guard() {
     holder.release();
 }
 
-/// Stage a commit of an empty tree with `subject` in `txn`.
+/// Stages a commit of an empty tree with `subject` in `txn` and returns it.
 async fn commit_in(txn: &ostrya::Transaction, subject: &str) -> Checksum {
     let dirmeta = DirMeta {
         uid: 0,
@@ -460,10 +479,12 @@ async fn commit_in(txn: &ostrya::Transaction, subject: &str) -> Checksum {
 // Signatures.
 // ---------------------------------------------------------------------------
 
-/// Two processes that sign one commit at the same time keep both
-/// signatures: once while a third process holds a guard, and in rounds with
-/// no guard. Under the guard both children reach the signing call, and
-/// neither exits until the guard is released, so both wait for the lock.
+/// Two processes that sign one commit at the same time keep both signatures.
+///
+/// The test runs one round while a third process holds a guard, and three
+/// rounds with no guard. Under the guard, both children reach the signing
+/// call. Neither child exits before the release of the guard, so both wait for
+/// the lock.
 #[test]
 fn two_processes_signing_one_commit_keep_both_signatures() {
     let tmp = TmpDir::new("writers-two-signers");

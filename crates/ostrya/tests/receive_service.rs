@@ -1,11 +1,16 @@
-//! `ReceiveService`: one push session as steps, with concurrent object
-//! streams on the one session transaction, the count of the steps in flight,
-//! and the end of the session on an error, a drop, or an abort.
+//! Tests of `ReceiveService`, which runs one push session as steps:
 //!
-//! Each `objects` call reads a body of frames: an in-memory body, the read
-//! half of an in-process pipe whose writer the test holds, so the call waits
-//! for input, or a body that stops at a gate until each body of the gate
-//! reaches it.
+//! - concurrent object streams on the one transaction of the session
+//! - the count of the steps in flight
+//! - the end of the session on an error, a drop, or an abort
+//!
+//! Each `objects` call reads a body of frames. A test gives it one of these
+//! bodies:
+//!
+//! - an in-memory body
+//! - the read half of an in-process pipe whose writer the test holds, so the
+//!   call waits for input
+//! - a body that stops at a gate until each body of the gate gets to it
 
 #![cfg(feature = "receive")]
 
@@ -40,7 +45,7 @@ fn hello(refs: &[&str]) -> Hello {
     }
 }
 
-/// Open a session of `repo` that runs `parallel` object streams.
+/// Opens a session on `repo` that runs `parallel` object streams.
 fn open(repo: &Repo, parallel: u32, refs: &[&str]) -> ReceiveService {
     let policy = Arc::new(ReceivePolicy::default());
     let (service, reply) = block_on(ReceiveService::hello(
@@ -94,7 +99,7 @@ fn code<T: std::fmt::Debug>(result: &ostrya::Result<T>) -> Option<ErrorCode> {
     }
 }
 
-/// Assert that `result` is the `protocol` error of a session that ended,
+/// Asserts that `result` is the `protocol` error of a session that ended,
 /// with a message that holds `reason`.
 fn assert_ended<T: std::fmt::Debug>(result: ostrya::Result<T>, reason: &str) {
     match result {
@@ -244,7 +249,8 @@ fn hello_refusals_keep_their_codes() {
     let result = block_on(ReceiveService::hello(repo, policy.clone(), 1, hello(&[]))).map(|_| ());
     assert_eq!(code(&result), Some(ErrorCode::LockingDisabled));
 
-    // A server-side failure is the error it is.
+    // A server-side failure, here a bad `[archive] zlib-level`, returns its
+    // own error and no wire code.
     let tmp = TmpDir::new("svc-hello-internal");
     let repo = new_repo(&tmp, RepoMode::Archive, "[archive]\nzlib-level=abc\n");
     let result = block_on(ReceiveService::hello(repo.clone(), policy, 1, hello(&[]))).map(|_| ());
@@ -255,12 +261,17 @@ fn hello_refusals_keep_their_codes() {
     assert!(staging_entries(repo.path()).is_empty());
 }
 
-/// `check_hello` checks the version, then the mode, then `[core]
-/// locking=false` for a two-way `Hello`, then the ref names, then the size of
-/// the reply for a two-way `Hello`. It opens no transaction, and it leaves the
-/// refusal of a `bare` repository to `hello`. `hello` refuses the size of the
-/// reply before it takes the repository lock, so a foreign exclusive lock
-/// does not delay the answer.
+/// `check_hello` runs its checks in this order:
+///
+/// 1. the version
+/// 2. the mode
+/// 3. `[core] locking=false`, for a two-way `Hello` only
+/// 4. the ref names
+/// 5. the size of the reply, for a two-way `Hello` only
+///
+/// It opens no transaction, and it leaves the refusal of a `bare` repository
+/// to `hello`. `hello` refuses a reply that is too large before it takes the
+/// repository lock, so a foreign exclusive lock does not delay the answer.
 #[test]
 fn check_hello_runs_its_checks_in_order() {
     let check = |repo: &Repo, hello: &Hello| ReceiveService::check_hello(repo, hello);
@@ -321,8 +332,9 @@ fn check_hello_runs_its_checks_in_order() {
     assert!(staging_entries(repo.path()).is_empty());
 }
 
-/// Two concurrent streams carry the fixture commit, and the commit writes
-/// the ref. After the commit every step is `protocol`.
+/// Two concurrent streams carry the objects of the fixture commit. The
+/// `commit` step then writes the ref. After that step, each step fails with
+/// `protocol`.
 #[test]
 fn a_push_through_the_steps_commits() {
     let tmp = TmpDir::new("svc-push");
@@ -370,7 +382,7 @@ fn a_push_through_the_steps_commits() {
     );
 }
 
-/// A commit that fails ends the session with its error.
+/// A `commit` step that fails ends the session with its error.
 #[test]
 fn a_failed_commit_ends_the_session() {
     let tmp = TmpDir::new("svc-commit-fail");
@@ -385,10 +397,10 @@ fn a_failed_commit_ends_the_session() {
     assert!(staging_entries(repo.path()).is_empty());
 }
 
-/// A `Commit` whose reply could be over the frame limit once the refs are
-/// read is `limit-exceeded`, and the server writes no ref. Each update
-/// expects its ref absent, so the request states no old commit, and the
-/// reply can state one for each ref.
+/// If the reply to a `Commit` can pass the frame limit after the server reads
+/// the refs, the step fails with `limit-exceeded`. The server writes no ref.
+/// Each update expects its ref to be absent, so the request states no
+/// old commit. The reply can state one old commit for each ref.
 #[test]
 fn a_commit_whose_reply_cannot_fit_writes_no_ref() {
     let tmp = TmpDir::new("svc-commit-reply-limit");
@@ -413,10 +425,11 @@ fn a_commit_whose_reply_cannot_fit_writes_no_ref() {
     assert!(staging_entries(repo.path()).is_empty());
 }
 
-/// The same objects on two streams at the same time both succeed, and the
-/// commit publishes each object once. Both streams stop in the middle of the
-/// largest content object until the other reaches the same point, so each
-/// stream reads that object while the other reads it too.
+/// If two streams carry the same objects at the same time, both streams
+/// succeed. The `commit` step publishes each object once. Each stream stops
+/// in the middle of the largest content object until the other stream gets
+/// to the same point. As a result, the two streams read that object at the
+/// same time.
 #[test]
 fn the_same_objects_on_two_streams_both_succeed() {
     let tmp = TmpDir::new("svc-same");
@@ -530,7 +543,7 @@ fn the_body_of_objects_holds_one_object_stream() {
         assert_staging_removed(repo.path());
     }
 
-    // A body of ObjectsEnd alone is a stream of no object.
+    // A body that holds only `ObjectsEnd` is a stream of zero objects.
     let tmp = TmpDir::new("svc-body-empty");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
     let service = open(&repo, 1, &[]);
@@ -597,8 +610,8 @@ fn a_commit_while_objects_is_in_flight_is_protocol() {
     assert!(!repo.path().join("refs/heads/test/main").exists());
 }
 
-/// An error in one stream fails the other stream at its next read, also in
-/// the middle of an object, and ends the session.
+/// An error in one stream ends the session. The other stream fails at its
+/// next read, also in the middle of an object.
 #[test]
 fn an_error_in_one_stream_fails_the_other_and_aborts() {
     let tmp = TmpDir::new("svc-error");
@@ -662,8 +675,8 @@ fn abort_wakes_a_waiting_stream_and_ends_the_session() {
     assert_staging_removed(repo.path());
 }
 
-/// A step future dropped in the middle of its body ends the session, and a
-/// later commit is `protocol` and writes no ref.
+/// A drop of a step future in the middle of its body ends the session. A
+/// later `commit` step fails with `protocol` and writes no ref.
 #[test]
 fn a_dropped_objects_call_aborts_the_session() {
     let tmp = TmpDir::new("svc-drop");
@@ -730,8 +743,8 @@ fn a_dropped_commit_ends_the_session() {
     assert_ended(block_on(service.commit(fixture_update())), reason);
 }
 
-/// A step that completes after `abort` gives the reason of the end in place
-/// of its result.
+/// A step that completes after `abort` returns a `protocol` error with the
+/// reason for the end of the session.
 #[test]
 fn a_step_that_completes_after_abort_is_protocol() {
     let tmp = TmpDir::new("svc-late");
@@ -747,8 +760,8 @@ fn a_step_that_completes_after_abort_is_protocol() {
     assert_staging_removed(repo.path());
 }
 
-/// A service dropped while its session is open ends the session, and the
-/// staging directory goes. The drop here runs outside any runtime.
+/// A drop of a service with an open session ends the session and removes
+/// the staging directory. This test drops the service outside any runtime.
 #[test]
 fn a_dropped_open_service_removes_its_staging_directory() {
     let tmp = TmpDir::new("svc-drop-service");
@@ -760,8 +773,8 @@ fn a_dropped_open_service_removes_its_staging_directory() {
     assert_staging_removed(repo.path());
 }
 
-/// One `have` runs at a time. A second one while the first is in flight is
-/// `limit-exceeded`, and ends the session.
+/// One `have` step runs at a time. If a second `have` starts while the first
+/// is in flight, it fails with `limit-exceeded` and ends the session.
 #[test]
 fn a_second_have_in_flight_is_limit_exceeded_and_aborts() {
     let tmp = TmpDir::new("svc-two-haves");
@@ -775,8 +788,8 @@ fn a_second_have_in_flight_is_limit_exceeded_and_aborts() {
             "the first call waits"
         );
         let second = service.have(names.clone()).await;
-        // The first call completes after the session ended, and gives the
-        // reason of the end in place of its reply.
+        // The first call completes after the end of the session. It returns
+        // a `protocol` error with the reason for the end.
         assert_ended(first.await, "the session was aborted: limit-exceeded:");
         second
     });
@@ -789,8 +802,8 @@ fn a_second_have_in_flight_is_limit_exceeded_and_aborts() {
 }
 
 /// The dirtree, dirmeta, and commit objects that the streams of one session
-/// read at the same time share one budget. Each object here is under the
-/// budget, and the two together are over it.
+/// read at the same time share one budget. In this test, each object is
+/// smaller than the budget, and the two objects together are larger.
 #[test]
 fn metadata_objects_read_at_the_same_time_past_the_budget_are_limit_exceeded() {
     let tmp = TmpDir::new("svc-budget");
@@ -807,8 +820,9 @@ fn metadata_objects_read_at_the_same_time_past_the_budget_are_limit_exceeded() {
         })
     };
     let ((a, b), sent) = block_on(zip(zip(service.objects(ra), service.objects(rb)), async {
-        // The first stream holds about 65 MiB of an object that does not
-        // end, and the second one takes the session past the budget.
+        // The first stream sends about 65 MiB of an object and does not end
+        // the object, so the server holds these bytes. The second stream
+        // takes the session past the budget.
         wa.write_message(&dirtree(b"first")).await.unwrap();
         for _ in 0..chunks {
             wa.write_object_data(&zeros).await.unwrap();
@@ -839,7 +853,7 @@ fn metadata_objects_read_at_the_same_time_past_the_budget_are_limit_exceeded() {
     assert_staging_removed(repo.path());
 }
 
-/// The service moves freely across tasks and threads.
+/// `ReceiveService` is `Send` and `Sync`, so tasks and threads can share it.
 #[test]
 fn the_service_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}

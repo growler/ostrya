@@ -1,53 +1,15 @@
 //! The archive view of a repository.
 //!
-//! The `ostree` tool pulls over HTTP from a repository whose `config` states
-//! the archive mode, and it requests the files of the archive layout. An
-//! [`ArchiveView`] answers those requests over a repository of any mode: for a
-//! request path it gives the bytes or a stream to serve, or a not-found, or a
+//! The `ostree` command pulls over HTTP from a repository whose `config`
+//! states the archive mode. It requests the files of the archive layout. An
+//! [`ArchiveView`] answers these requests over a repository of any mode. For
+//! a request path, it gives the bytes or a stream to serve, a not-found, or a
 //! refusal. A server maps the answers onto its protocol.
 //!
-//! - `config` is built for each request: a `[core]` group with
-//!   `repo_version=1` and `mode=archive-z2`, then `collection-id` and
-//!   `indexed-deltas` with the values of the repository when it sets them. No
-//!   other key is served.
-//! - `summary`, `summary.sig`, the files under `refs/` and `extensions/`, and
-//!   the `.commit`, `.dirtree`, `.dirmeta`, and `.commitmeta` objects are
-//!   served as stored. So are the `.filez` objects and the files under
-//!   `deltas/` and `delta-indexes/` of an `archive` repository.
-//! - In every other mode a `.filez` object is built on request from the
-//!   stored content object: the archive file header, then the payload in raw
-//!   DEFLATE at `[archive] zlib-level`, as a stream of unknown length. The
-//!   files under `deltas/` and `delta-indexes/` are not found there.
-//! - A `.file` path is not found, and so is every path outside the families
-//!   above.
-//! - A path with an empty component, or a component that starts with `.`, is
-//!   refused, and so are `tmp/` and `state/`. A path with a symlink on it is
-//!   refused wherever the symlink leads, with one exception: a symlink at the
-//!   last component of a path under `refs/` is a ref alias, and the view
-//!   serves the ref it names when that ref is a regular file under `refs/`.
-//!   The view follows one link, so an alias of an alias is refused.
-//!
-//! A stored file is opened one component at a time with `openat` and
-//! `O_NOFOLLOW`, from the descriptor of the repository or of `objects/`, so
-//! the walk needs no `openat2`. The walk starts at the descriptors the
-//! repository handle opened, so a symlink at `objects/` itself is part of the
-//! layout of the repository and is followed once, when the handle opens. The
-//! view reads the repository `config` again when its inode number, size,
-//! modification time, or change time differs from the last parse, so a change
-//! shows in the next answer. One request reads a changed file, and the
-//! requests that see the same change wait for its parse.
-//!
-//! A built `.filez` takes a compressor from a pool of at most
-//! [`MAX_COMPRESSORS`] when its body first reads past the header, and gives it
-//! back when the body ends or is dropped. A body that waits for a compressor
-//! is pending. A body dropped before that read does no deflate work. The
-//! payload must hold the size the header states: a stored file that ends
-//! sooner, or holds more, fails the body. An error of the body is sticky, so
-//! a read after it fails too.
-//!
-//! [`ArchiveView::head`] answers a `HEAD` with the same routing and the same
-//! walk. For a `.filez` built on request it checks that the object is there
-//! and reads no xattr and no byte of it.
+//! - [`ArchiveView::get`] gives the [`ArchiveAnswer`] for a `GET`.
+//! - [`ArchiveView::head`] gives the [`ArchiveHead`] for a `HEAD`.
+//! - [`ArchiveView`] states the [routing](ArchiveView#routing) of a path and
+//!   the [file access](ArchiveView#file-access).
 
 use std::fmt;
 use std::future::Future;
@@ -71,12 +33,54 @@ use crate::file::{Contained, ContentReader, FileKind};
 use crate::repo::Repo;
 use crate::write::archive_level;
 
-/// The most `.filez` objects one view deflates at the same time. Each one
-/// holds a compressor and two 64 KiB buffers.
+/// The maximum number of `.filez` objects that one view deflates at one time.
+///
+/// Each of these objects holds a compressor and two 64 KiB buffers.
 pub const MAX_COMPRESSORS: usize = 16;
 
-/// The archive view over one repository. `Send + Sync`, so one view serves
-/// every connection of a server.
+/// The archive view over one repository.
+///
+/// The view is `Send + Sync`, so one view serves every connection of a
+/// server.
+///
+/// # Routing
+///
+/// - `config`: the view builds it for each request. It holds a `[core]`
+///   group with `repo_version=1` and `mode=archive-z2`. Then come
+///   `collection-id` and `indexed-deltas`, with the values of the repository,
+///   if the repository sets them. The view serves no other key.
+/// - `summary`, `summary.sig`, the files under `refs/` and `extensions/`, and
+///   the `.commit`, `.dirtree`, `.dirmeta`, and `.commitmeta` objects: the
+///   view serves them as stored.
+/// - In an `archive` repository, the view also serves the `.filez` objects
+///   and the files under `deltas/` and `delta-indexes/` as stored.
+/// - In every other mode, the view builds a `.filez` object on request from
+///   the stored content object. [`get`](ArchiveView::get) states the format
+///   of the body. The files under `deltas/` and `delta-indexes/` are not
+///   found in these modes.
+/// - A `.file` path is not found. Every path outside these families is not
+///   found.
+/// - The view refuses a path with an empty component, or with a `.` at the
+///   start of a component. It also refuses `tmp/` and `state/`.
+///
+/// The view refuses a path with a symlink on it, wherever the symlink leads.
+/// One exception is a ref alias: a symlink at the last component of a path
+/// under `refs/`. If the alias names a ref that is a regular file under
+/// `refs/`, the view serves that ref. The view follows one link, so it
+/// refuses an alias of an alias.
+///
+/// # File access
+///
+/// The view opens a stored file one component at a time, with `openat` and
+/// `O_NOFOLLOW`. The walk starts at the descriptor of the repository or of
+/// `objects/`, so it needs no `openat2`. The repository handle opened these
+/// descriptors. Because of this, a symlink at `objects/` itself is part of
+/// the layout of the repository. The handle follows it once, when it opens.
+///
+/// The view reads the repository `config` again if its inode number, size,
+/// modification time, or change time differs from the last parse. The next
+/// answer then shows the change. One request reads a changed file, and the
+/// requests that see the same change wait for its parse.
 pub struct ArchiveView {
     repo: Repo,
     /// The `config` of the last parse and the `statx` fields it was read
@@ -94,38 +98,54 @@ pub struct ArchiveView {
 pub enum ArchiveAnswer {
     /// The built `config`.
     Bytes(Vec<u8>),
-    /// A stored file served as stored, with `len` from its `fstat`, or a
-    /// `.filez` built on request, with `len` of `None`. A stream that is
-    /// dropped before its first read reads no byte, and a built `.filez` then
-    /// does no deflate work.
+    /// A stream to serve: a stored file, or a `.filez` built on request.
+    ///
+    /// For a stored file, `len` comes from its `fstat`. For a built `.filez`,
+    /// `len` is `None`. If the caller drops the stream before its first read,
+    /// the stream reads no byte, and a built `.filez` does no deflate work.
     Stream {
-        /// The number of bytes the stream gives, when it is known.
+        /// The number of bytes that the stream gives, if it is known.
         len: Option<u64>,
         /// The bytes to serve.
         body: Box<dyn AsyncRead + Unpin + Send>,
     },
-    /// A `.file` path, `deltas/` and `delta-indexes/` in a mode other than
-    /// `archive`, a path outside the served families, or a served path with
-    /// nothing at it.
+    /// The answer for a path with nothing to serve.
+    ///
+    /// The view gives this answer for:
+    ///
+    /// - a `.file` path
+    /// - a path under `deltas/` or `delta-indexes/` in a mode other than
+    ///   `archive`
+    /// - a path outside the served families
+    /// - a served path with nothing at it.
     NotFound,
-    /// A path with an empty component or a component that starts with `.`,
-    /// `tmp/`, `state/`, or a path with a symlink on it that is no ref alias.
+    /// The answer for a path that the view refuses.
+    ///
+    /// The view gives this answer for:
+    ///
+    /// - a path with an empty component, or with a `.` at the start of a
+    ///   component
+    /// - `tmp/` and `state/`
+    /// - a path with a symlink on it that is no ref alias.
     Refused,
 }
 
-/// The answer of the view for one `HEAD` request path. The variants match
-/// those of [`ArchiveAnswer`] for the same path.
+/// The answer of the view for one `HEAD` request path.
+///
+/// Each variant matches the [`ArchiveAnswer`] variant for the same path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveHead {
-    /// The path is served. `len` is the length a `GET` gives, or `None` for a
-    /// `.filez` built on request.
+    /// The answer for a path that the view serves.
+    ///
+    /// `len` is the length that a `GET` gives. It is `None` for a `.filez`
+    /// built on request.
     Found {
-        /// The number of bytes a `GET` gives, when it is known.
+        /// The number of bytes that a `GET` gives, if it is known.
         len: Option<u64>,
     },
-    /// See [`ArchiveAnswer::NotFound`].
+    /// The same answer as [`ArchiveAnswer::NotFound`].
     NotFound,
-    /// See [`ArchiveAnswer::Refused`].
+    /// The same answer as [`ArchiveAnswer::Refused`].
     Refused,
 }
 
@@ -144,7 +164,9 @@ impl fmt::Debug for ArchiveAnswer {
 }
 
 impl ArchiveView {
-    /// The view over `repo`. It reads nothing until a request needs it.
+    /// Creates the view over `repo`.
+    ///
+    /// The view reads nothing until a request needs it.
     pub fn new(repo: Repo) -> ArchiveView {
         ArchiveView {
             repo,
@@ -161,8 +183,45 @@ impl ArchiveView {
         }
     }
 
-    /// The answer for one request path, relative to the repository root and
-    /// with no leading `/`.
+    /// Returns the answer for one `GET` request path.
+    ///
+    /// The path is relative to the repository root and has no leading `/`.
+    /// [`ArchiveView`](ArchiveView#routing) states the routing.
+    ///
+    /// # Built `.filez` objects
+    ///
+    /// In a mode other than `archive`, the view builds a `.filez` object on
+    /// request from the stored content object. The body is the archive file
+    /// header, then the payload in raw DEFLATE at `[archive] zlib-level`. The
+    /// length of the stream is unknown.
+    ///
+    /// The body takes a compressor from a pool of at most [`MAX_COMPRESSORS`]
+    /// when it first reads past the header. It gives the compressor back when
+    /// it ends or when the caller drops it. While the body waits for a
+    /// compressor, its read is pending. A body dropped before that read does
+    /// no deflate work.
+    ///
+    /// The payload must hold the size that the header states. If the stored
+    /// file ends sooner, the body fails with `io::ErrorKind::UnexpectedEof`.
+    /// If it holds more, the body fails with `io::ErrorKind::InvalidData`. An
+    /// error of the body is sticky, so a read after it fails too.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if the `statx` or the read of `config` fails, for the
+    ///   path `config` or a built `.filez`.
+    /// - [`Error::InvalidFormat`] or [`Error::Core`] if `config` is not a
+    ///   valid repository config, for the path `config` or a built `.filez`.
+    /// - [`Error::Io`] if the walk to a stored file fails with an error that
+    ///   gives no not-found and no refusal. A directory that the process
+    ///   cannot search gives this error.
+    /// - [`Error::Core`] if `[archive] zlib-level` is not an integer, for a
+    ///   built `.filez`.
+    /// - [`Error::Io`] if the load of the content object for a built `.filez`
+    ///   fails with an error other than a missing object or a symlink.
+    /// - [`Error::InvalidFormat`] or [`Error::Core`] if the content object
+    ///   for a built `.filez` is not a valid object, or its archive header
+    ///   cannot be written.
     pub async fn get(&self, path: &str) -> Result<ArchiveAnswer> {
         match classify(path, self.repo.mode()) {
             Route::Config => Ok(ArchiveAnswer::Bytes(built_config(
@@ -186,11 +245,34 @@ impl ArchiveView {
         }
     }
 
-    /// The answer for one `HEAD` request path, which [`ArchiveView::get`]
-    /// gives for a `GET` of it. A stored file is opened through the same walk
-    /// and is not read. For a `.filez` built on request the object is checked
-    /// with no read of its xattrs or its payload, so a `bare-split-xattrs`
-    /// object whose xattrs a `GET` cannot read is still found.
+    /// Returns the answer for one `HEAD` request path.
+    ///
+    /// The answer matches the answer of [`get`](ArchiveView::get) for a `GET`
+    /// of the same path. The view uses the same routing and the same walk. It
+    /// opens a stored file and does not read it.
+    ///
+    /// For a `.filez` built on request, the view checks that the object is
+    /// there. It reads no xattr and no byte of the object. Because of this, a
+    /// `bare-split-xattrs` object is found even if a `GET` cannot read its
+    /// xattrs.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if the `statx` or the read of `config` fails, for the
+    ///   path `config`.
+    /// - [`Error::InvalidFormat`] or [`Error::Core`] if `config` is not a
+    ///   valid repository config, for the path `config`.
+    /// - [`Error::Io`] if the walk to a stored file fails with an error that
+    ///   gives no not-found and no refusal.
+    /// - [`Error::Io`] if the check of the content object for a built `.filez`
+    ///   fails with an error other than a missing object or a symlink.
+    /// - [`Error::InvalidFormat`] if the content object for a built `.filez`
+    ///   is neither a regular file nor a symlink.
+    /// - [`Error::InvalidFormat`] if the repository mode is `bare-split-xattrs`
+    ///   and the object path has no `.file-xattrs-link` entry next to it. The
+    ///   view checks this entry before the object, so a missing object in a
+    ///   fan-out directory that exists also gives this error. For the same
+    ///   path, [`get`](ArchiveView::get) gives [`ArchiveAnswer::NotFound`].
     pub async fn head(&self, path: &str) -> Result<ArchiveHead> {
         match classify(path, self.repo.mode()) {
             Route::Config => Ok(ArchiveHead::Found {
@@ -220,17 +302,20 @@ impl ArchiveView {
         }
     }
 
-    /// The parsed repository `config`. One `statx` tells whether the file
-    /// changed since the last parse, and an unchanged file reuses that parse.
+    /// Returns the parsed repository `config`.
+    ///
+    /// One `statx` shows if the file changed since the last parse. An
+    /// unchanged file reuses that parse.
     async fn current_config(&self) -> Result<Arc<RepoConfig>> {
         let repo = self.repo.clone();
         let stat = ostrya_rt::unblock(move || config_statx(repo.repo_fd())).await?;
         self.config_for(&stat).await
     }
 
-    /// The parsed repository `config` for the `statx` fields `stat` of it.
-    /// A change of the file is read by one request, and the requests that
-    /// wait meanwhile take its parse when they saw the same change.
+    /// Returns the parsed repository `config` for its `statx` fields `stat`.
+    ///
+    /// One request reads a change of the file. The requests that wait at the
+    /// same time take its parse if they saw the same change.
     async fn config_for(&self, stat: &Statx) -> Result<Arc<RepoConfig>> {
         let key = ConfigKey::of(stat);
         if let Some(config) = self.cached_config(key) {
@@ -243,8 +328,8 @@ impl ArchiveView {
         #[cfg(test)]
         self.config_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // The file is read after the `statx`, so the parse is at least as new
-        // as the key it is stored under. A later change gives another key.
+        // The view reads the file after the `statx`, so the parse is at least
+        // as new as its key. A later change gives another key.
         let config = Arc::new(self.repo.read_config_file().await?);
         *self.config.lock().expect("archive view config mutex") = Some(ConfigSnapshot {
             key,
@@ -253,7 +338,7 @@ impl ArchiveView {
         Ok(config)
     }
 
-    /// The parse stored under `key`, when the last parse has that key.
+    /// Returns the parse stored under `key`, if the last parse has that key.
     fn cached_config(&self, key: ConfigKey) -> Option<Arc<RepoConfig>> {
         let snapshot = self.config.lock().expect("archive view config mutex");
         snapshot
@@ -262,7 +347,7 @@ impl ArchiveView {
             .map(|snapshot| snapshot.config.clone())
     }
 
-    /// A stored file, opened through the safe walk.
+    /// Opens a stored file through the safe walk.
     async fn stored(&self, anchor: Anchor, path: String, alias_ok: bool) -> Result<Walked> {
         let repo = self.repo.clone();
         let walked = ostrya_rt::unblock(move || {
@@ -285,9 +370,10 @@ impl ArchiveView {
         Ok(walked)
     }
 
-    /// A `.filez` built from the stored content object `checksum`. The
-    /// `statx` of `config` and the load of the object share one call on the
-    /// blocking pool.
+    /// Builds a `.filez` from the stored content object `checksum`.
+    ///
+    /// The `statx` of `config` and the load of the object share one call on
+    /// the blocking pool.
     async fn built_filez(&self, checksum: &Checksum) -> Result<ArchiveAnswer> {
         let repo = self.repo.clone();
         let key = *checksum;
@@ -343,8 +429,10 @@ enum Object<T> {
     Refused,
 }
 
-/// The outcome of `loaded`: a missing object is not found, a symlink on its
-/// path (`ELOOP`) is refused, and every other error is an error.
+/// Maps `loaded` to an outcome.
+///
+/// A missing object is not found. A symlink on its path (`ELOOP`) is refused.
+/// Every other error stays an error.
 fn object_answer<T>(loaded: Result<T>) -> Result<Object<T>> {
     match loaded {
         Ok(found) => Ok(Object::Found(found)),
@@ -356,7 +444,7 @@ fn object_answer<T>(loaded: Result<T>) -> Result<Object<T>> {
     }
 }
 
-/// The `statx` of `config` under `repo_fd`, with the fields of a
+/// Returns the `statx` of `config` under `repo_fd`, with the fields of a
 /// [`ConfigKey`].
 fn config_statx(repo_fd: BorrowedFd<'_>) -> io::Result<Statx> {
     Ok(rustix::fs::statx(
@@ -373,7 +461,7 @@ struct ConfigSnapshot {
     config: Arc<RepoConfig>,
 }
 
-/// The `statx` fields that tell whether `config` changed: the inode number,
+/// The `statx` fields that show if `config` changed: the inode number,
 /// the size, and the modification and change times in nanoseconds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ConfigKey {
@@ -394,7 +482,7 @@ impl ConfigKey {
     }
 }
 
-/// The `config` an archive repository with the values of `config` holds.
+/// Returns the `config` of an archive repository with the values of `config`.
 fn built_config(config: &RepoConfig) -> Vec<u8> {
     let mut out = String::from("[core]\nrepo_version=1\nmode=archive-z2\n");
     for key in ["collection-id", "indexed-deltas"] {
@@ -434,14 +522,15 @@ enum Route {
     Refused,
 }
 
-/// Whether a path component is refused by its name alone: an empty one, and
-/// one that starts with `.`, which covers `.`, `..`, `.lock`, and
-/// `.update.lock`.
+/// Returns `true` if the router refuses a path component by its name alone.
+///
+/// The router refuses an empty component and a component that starts with
+/// `.`. This covers `.`, `..`, `.lock`, and `.update.lock`.
 fn refused_component(part: &str) -> bool {
     part.is_empty() || part.starts_with('.')
 }
 
-/// Classify a request path. This reads no file.
+/// Classifies a request path. The function reads no file.
 fn classify(path: &str, mode: RepoMode) -> Route {
     if path.is_empty() {
         return Route::NotFound;
@@ -475,7 +564,7 @@ fn classify(path: &str, mode: RepoMode) -> Route {
     }
 }
 
-/// Classify `objects/<fanout>/<name>`.
+/// Classifies `objects/<fanout>/<name>`.
 fn object_route(fanout: &str, name: &str, archive: bool) -> Route {
     let Some((rest, ext)) = name.split_once('.') else {
         return Route::NotFound;
@@ -510,16 +599,20 @@ enum Walked {
     Alias(Vec<u8>),
 }
 
-/// Open the file at `path` under `root`, following no symlink. The walk
-/// takes the components of `path` one at a time. Each
-/// intermediate component opens with `O_PATH`, `O_DIRECTORY`, and
-/// `O_NOFOLLOW`, and the last one with `O_RDONLY` and `O_NOFOLLOW`.
-/// `O_NONBLOCK` keeps the open of a FIFO from waiting for a writer, and the
+/// Opens the file at `path` under `root` and follows no symlink.
+///
+/// The walk takes the components of `path` one at a time. Each intermediate
+/// component opens with `O_PATH`, `O_DIRECTORY`, and `O_NOFOLLOW`. The last
+/// one opens with `O_RDONLY` and `O_NOFOLLOW`.
+///
+/// `O_NONBLOCK` keeps the open of a FIFO from a wait for a writer. The
 /// `fstat` then gives not-found for anything but a regular file. The flag
-/// changes no read of a regular file. With `alias_ok`, a symlink at the last
-/// component gives its body. A name longer than the kernel accepts is not
-/// found, and so is a path with nothing at it. A directory the process
-/// cannot search fails the walk with its error.
+/// changes no read of a regular file.
+///
+/// With `alias_ok`, a symlink at the last component gives its body. A name
+/// longer than the kernel accepts is not found, and so is a path with nothing
+/// at it. A directory that the process cannot search fails the walk with its
+/// error.
 fn walk(root: BorrowedFd<'_>, path: &str, alias_ok: bool) -> io::Result<Walked> {
     let (dirs, last) = match path.rsplit_once('/') {
         Some((dirs, last)) => (Some(dirs), last),
@@ -582,11 +675,17 @@ fn not_a_directory(dir: BorrowedFd<'_>, part: &str) -> io::Result<Walked> {
     }
 }
 
-/// Resolve the body of a ref alias in the directory `link_dir`, which starts
-/// with `refs`. `.` and `..` fold by name. The result is `None` for an
-/// absolute body, a body that is not UTF-8, an empty component, which a
-/// trailing `/` gives, a `..` that leaves `refs/`, a component the router
-/// refuses by name, and a result with no component under `refs/`.
+/// Resolves the body of a ref alias in the directory `link_dir`, which
+/// starts with `refs`.
+///
+/// The function resolves `.` and `..` by name. The result is `None` for:
+///
+/// - an absolute body
+/// - a body that is not UTF-8
+/// - an empty component, which a trailing `/` gives
+/// - a `..` that leaves `refs/`
+/// - a component that the router refuses by name
+/// - a result with no component under `refs/`.
 fn resolve_alias(link_dir: &str, body: &[u8]) -> Option<String> {
     let body = std::str::from_utf8(body).ok()?;
     if body.starts_with('/') {
@@ -623,15 +722,16 @@ fn resolve_alias(link_dir: &str, body: &[u8]) -> Option<String> {
 struct Compressors {
     gate: Arc<Gate>,
     idle: Mutex<Vec<DeflateReader<Exact>>>,
-    /// How many leases the view has given, for the tests that prove a body
-    /// dropped unread takes none.
+    /// The number of leases that the view gave. The tests use it to prove
+    /// that a body dropped unread takes no lease.
     #[cfg(test)]
     leases: std::sync::atomic::AtomicUsize,
 }
 
 impl Compressors {
-    /// A compressor over `source` at `level`, reused from the idle ones when
-    /// one is there.
+    /// Leases a compressor over `source` at `level`.
+    ///
+    /// The lease reuses an idle compressor if one is there.
     fn lease(self: &Arc<Self>, source: Exact, level: u8, permit: Permit) -> Lease {
         #[cfg(test)]
         self.leases
@@ -656,8 +756,10 @@ impl Compressors {
     }
 }
 
-/// A compressor held by one body. On drop the compressor goes back to the
-/// idle ones before the permit is released.
+/// A compressor held by one body.
+///
+/// When the lease drops, the compressor goes back to the idle ones before the
+/// lease releases the permit.
 struct Lease {
     reader: Option<DeflateReader<Exact>>,
     compressors: Arc<Compressors>,
@@ -691,15 +793,15 @@ struct BuiltFilez {
 
 /// The payload half of a built `.filez`.
 enum Payload {
-    /// The payload source, waiting for a compressor. The wait starts on the
-    /// first read past the header.
+    /// The payload source, which waits for a compressor. The wait starts on
+    /// the first read past the header.
     Waiting {
         source: Exact,
         level: u8,
         acquire: Option<Acquire>,
     },
     Deflating(Lease),
-    /// The payload has ended, or a symlink has none.
+    /// The payload is at its end, or a symlink has no payload.
     Done,
     /// A read failed with an error of this kind. Each later read fails too,
     /// so a reader that reads again does not see the end of the stream.
@@ -716,7 +818,7 @@ struct Exact {
 }
 
 impl Exact {
-    /// A source of no bytes that holds no descriptor.
+    /// Returns a source of no bytes that holds no descriptor.
     fn empty() -> Exact {
         Exact {
             source: ContentReader::empty(),
@@ -735,7 +837,7 @@ impl AsyncRead for Exact {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        // One byte past the size is asked for, so a longer source shows.
+        // The read asks for one byte past the size, so a longer source shows.
         let want =
             usize::try_from(me.remaining.saturating_add(1)).map_or(buf.len(), |n| n.min(buf.len()));
         let n = ready!(Pin::new(&mut me.source).poll_read(cx, &mut buf[..want]))?;

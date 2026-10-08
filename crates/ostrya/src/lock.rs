@@ -1,45 +1,24 @@
-//! The repository lock: cross-process exclusion plus in-process coordination.
+//! The repository lock and the process-global registry of lock files.
 //!
-//! ostree guards a repository with an advisory lock on `<repo>/.lock`. This
-//! module reproduces that with a classic `fcntl` record lock (`F_SETLK`, via
-//! [`rustix::fs::fcntl_lock`]), which shares a lock space with the OFD locks the
-//! `ostree` tool takes, so the library and the tool exclude each other on the
-//! same repository.
+//! [`LockKind`] holds the rules that a caller sees: the lock file, the
+//! in-process rules, and the wait. The record lock calls go through
+//! [`rustix::fs::fcntl_lock`]. The retry loop waits on [`ostrya_rt::Timer`].
 //!
-//! `F_SETLK` locks are process-associated: two descriptors in one process do
-//! not conflict, and closing any one descriptor to the file drops every lock
-//! the process holds on it. Both hazards are avoided by keeping exactly one
-//! `.lock` descriptor per repository per process. A process-global registry
-//! keyed by the lock file's `(device, inode)` hands every repository handle to
-//! one underlying repository -- clones and independent opens alike -- the same
-//! [`RepoLock`], so a single descriptor and a shared reference count mediate all
-//! in-process holders. The reference count lets several shared holders share
-//! one descriptor lock, touching the descriptor only at the transitions that
-//! change the effective lock.
+//! A process-global registry maps the `(device, inode)` of each lock file to
+//! its lock. Each handle to one repository gets the same [`RepoLock`]: clones
+//! and separate opens. Hold counts let many shared holders share one record
+//! lock. The calls change the record lock only when the effective lock
+//! changes.
 //!
 //! A dropped lock closes its descriptor and removes its registry entry under
-//! the registry mutex, and no call opens a new descriptor to an inode while
-//! the registry holds an entry for it. So the descriptor of a dropped lock
-//! never closes after a new lock on the same inode is taken.
+//! the registry mutex. No call opens a new descriptor to an inode while the
+//! registry holds an entry for it. As a result, the descriptor of a dropped
+//! lock never closes after the process takes a new lock on the same inode.
 //!
-//! A shared acquire and an exclusive acquire exclude each other inside the
-//! process: an exclusive acquire waits while any shared holder stands, and a
-//! shared acquire waits while an exclusive holder stands. An exclusive acquire
-//! is not re-entrant, so a second one waits for the first to release. A
-//! destructive run therefore excludes this process's own transactions for the
-//! whole of the run.
-//!
-//! Cross-process contention is resolved by a non-blocking attempt followed by an
-//! [`ostrya_rt::Timer`] retry loop bounded by `lock-timeout-secs`, matching the
-//! tool's retry-until-timeout behavior. A loop with no deadline stands for the
-//! value `-1`, which the tool reads as no limit. No attempt blocks in the
-//! kernel, so a dropped wait leaves no lock request behind.
-//!
-//! A second lock file, `<repo>/.update.lock`, holds the update lock, which
-//! serializes the writes of refs and of the other repository state outside
-//! the object store (see [`update`]). The same registry holds both locks, so
-//! one inode is never open through two live descriptors in the process, and a
-//! lock file that shares its inode with the other lock file is refused.
+//! The update lock on `<repo>/.update.lock` serializes the writes of refs and
+//! of the other repository state outside the object store (see [`update`]).
+//! The same registry holds both locks, so the process never opens one inode
+//! through two live descriptors.
 
 use std::collections::HashMap;
 use std::os::fd::{BorrowedFd, OwnedFd};
@@ -61,19 +40,99 @@ pub(crate) use update::{UpdateLock, UpdateLockHeld, acquire_update};
 /// The repository lock file, relative to the repository root.
 const LOCK_FILE: &str = ".lock";
 
-/// The mode a created lock file is requested with, matching the tool. The
-/// process umask reduces it. In a `bare-user-shared` repository an `fchmod`
-/// after the create restores [`perm::SHARED_LOCK_MODE`].
+/// The mode of a new lock file in the create call. The `ostree` command uses
+/// the same mode. The process umask reduces it. In a `bare-user-shared`
+/// repository, an `fchmod` after the create sets [`perm::SHARED_LOCK_MODE`].
 const LOCK_MODE: u32 = 0o660;
 
-/// The delay between lock-acquisition attempts while contended.
+/// The delay between two lock attempts while another holder has the lock.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Whether a transaction takes the repository lock shared or exclusive.
+/// The kind of hold on the repository lock: shared or exclusive.
 ///
-/// A writing transaction takes it [`Shared`](LockKind::Shared): many commits
-/// proceed at once, matching the read lock the tool holds during a commit.
-/// Destructive maintenance takes it [`Exclusive`](LockKind::Exclusive).
+/// A writing transaction takes the lock [`Shared`](LockKind::Shared), so many
+/// commits run at the same time. The `ostree` command also holds a read lock
+/// during a commit. [`Repo::prune`](crate::Repo::prune) takes the lock
+/// [`Exclusive`](LockKind::Exclusive).
+///
+/// If `[core] locking` is `false`, ostrya does not take the repository lock
+/// ([`RepoConfig::locking`](crate::config::RepoConfig::locking)). The default
+/// is `true`.
+///
+/// # Lock file
+///
+/// The repository lock is an `fcntl` record lock (`F_SETLK`) on
+/// `<repo>/.lock`. The `ostree` command takes OFD locks on the same file.
+/// Record locks and OFD locks share one lock space, so ostrya and the `ostree`
+/// command exclude each other on one repository.
+///
+/// If the file does not exist, the first lock creates it with mode `0660`.
+/// The `ostree` command uses the same mode. The process umask reduces this
+/// mode.
+///
+/// In a `bare-user-shared` repository, ostrya sets the mode of a file that it
+/// creates to `0660` after the create. Each member of the repository group can
+/// then open the file for reading and writing. A file that another member
+/// created keeps its mode.
+///
+/// If `.lock` and `.update.lock` are hard links to one inode, the repository
+/// lock and the update lock refuse each other. While the process has one of
+/// the two files open as its lock file, a lock on the other fails with
+/// [`Error::Io`].
+///
+/// # In-process rules
+///
+/// An `F_SETLK` lock belongs to the process. Two descriptors in one process
+/// do not conflict. Also, the close of any descriptor to the file releases
+/// each lock of the process on it.
+///
+/// To prevent both faults, ostrya keeps one `.lock` descriptor for each
+/// repository in each process. All handles to one repository share it, clones
+/// and separate opens alike.
+///
+/// Hold counts in the process apply these rules:
+///
+/// - Many shared holders can hold the lock at the same time. They share one
+///   record lock.
+/// - An exclusive acquire waits while a shared holder exists.
+/// - A shared acquire waits while an exclusive holder exists.
+/// - An exclusive hold is not re-entrant. A second exclusive acquire waits for
+///   the release of the first, also when the same caller makes it.
+/// - When the last holder releases the lock, ostrya releases the record lock.
+///
+/// # A holder that waits for its own lock
+///
+/// No call detects a caller that waits for its own hold. This wait occurs if
+/// a caller that holds the lock makes an acquire that its hold excludes:
+///
+/// - A second exclusive acquire while it holds the lock exclusive.
+/// - A shared acquire while it holds the lock exclusive. A
+///   [`Transaction`](crate::Transaction) and
+///   [`Repo::set_ref_immediate`](crate::Repo::set_ref_immediate) make a
+///   shared acquire.
+/// - An exclusive acquire, for example [`Repo::prune`](crate::Repo::prune),
+///   while it holds the lock shared, for example through a transaction or an
+///   [`UpdateGuard`](crate::UpdateGuard).
+///
+/// The wait lasts until `[core] lock-timeout-secs` passes. The acquire then
+/// fails with [`Error::LockTimeout`]. If the value is `-1`, the caller waits
+/// forever. If `[core] locking` is `false`, no such wait occurs.
+///
+/// # Waiting
+///
+/// An acquire makes one non-blocking lock request. If another process holds a
+/// conflicting lock, or an in-process rule makes the acquire wait, the acquire
+/// tries again every 100 ms. The `ostree` command also tries again until its
+/// timeout.
+///
+/// `[core] lock-timeout-secs` sets the limit of the wait, in seconds
+/// ([`RepoConfig::lock_timeout_secs`](crate::config::RepoConfig::lock_timeout_secs)).
+/// The default is `300`. If the wait passes the limit, the acquire fails with
+/// [`Error::LockTimeout`]. The value `0` makes one attempt. The value `-1`
+/// means no limit, as in the `ostree` command.
+///
+/// No lock request blocks in the kernel. If a caller drops a future that
+/// waits for the lock, no lock request stays behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockKind {
     /// A shared (read) lock.
@@ -123,7 +182,8 @@ enum Registered {
 }
 
 impl Registered {
-    /// The repository lock of this entry, or `None` for another kind of lock.
+    /// Returns the repository lock of this entry, or `None` for another kind
+    /// of lock.
     fn repo(&self) -> Option<&Weak<RepoLock>> {
         match self {
             Registered::Repo(weak) => Some(weak),
@@ -131,7 +191,8 @@ impl Registered {
         }
     }
 
-    /// The update lock of this entry, or `None` for another kind of lock.
+    /// Returns the update lock of this entry, or `None` for another kind of
+    /// lock.
     fn update(&self) -> Option<&Weak<UpdateLock>> {
         match self {
             Registered::Update(weak) => Some(weak),
@@ -144,13 +205,13 @@ impl Registered {
 #[derive(Debug)]
 struct Entry {
     lock: Registered,
-    /// Descriptors to the same inode that an open made after the entry was
-    /// registered. Closing one would drop the record locks of `lock`, so each
-    /// stays open until the entry is removed.
+    /// The descriptors to the same inode that an open made after the registry
+    /// added the entry. The close of one of them drops the record locks of
+    /// `lock`, so each one stays open until the registry removes the entry.
     parked: Vec<OwnedFd>,
 }
 
-/// The process-global registry mapping a lock file's `(device, inode)` to its
+/// The process-global map from the `(device, inode)` of a lock file to its
 /// lock.
 type LockRegistry = HashMap<(u64, u64), Entry>;
 
@@ -169,9 +230,10 @@ fn registry() -> &'static Registry {
     })
 }
 
-/// The registry entry for the file `name` under `repo_fd`, found without
-/// opening the file: opening and closing another descriptor to a lock file
-/// would drop the live lock.
+/// Returns the registry entry for the file `name` under `repo_fd`.
+///
+/// The call does not open the file. The open and the close of a second
+/// descriptor to a lock file drop the live lock.
 fn probe<'r>(reg: &'r LockRegistry, repo_fd: BorrowedFd<'_>, name: &str) -> Option<&'r Entry> {
     let stat = rustix::fs::statat(repo_fd, name, AtFlags::empty()).ok()?;
     reg.get(&(stat.st_dev, stat.st_ino))
@@ -195,22 +257,25 @@ fn find<T>(entry: &Entry, view: fn(&Registered) -> Option<&Weak<T>>) -> Found<T>
     }
 }
 
-/// Return the live lock of type `T` for the file `name` under `repo_fd`, or
-/// open the file by the rules of [`open_lock_file`] and register the lock that
-/// `make` builds from the descriptor and the `(device, inode)`.
+/// Returns the live lock of type `T` for the file `name` under `repo_fd`.
+///
+/// If no live lock exists, the call opens the file by the rules of
+/// [`open_lock_file`]. It then registers the lock that `make` builds from the
+/// descriptor and the `(device, inode)`.
 ///
 /// Two rules keep one open descriptor for each lock inode in the process:
 ///
-/// - A new descriptor is opened only while the registry holds no entry for
-///   the inode. A dying entry still owns an open descriptor, so the call waits
-///   until the drop of that lock closes it and removes the entry.
-/// - A descriptor the open returns for an inode the registry already holds,
-///   as a link or a rename made between the probe and the open makes, is never
-///   closed here. It is parked in the entry and closes when the entry goes.
+/// - The call opens a new descriptor only while the registry holds no entry
+///   for the inode. A dying entry still owns an open descriptor. The call
+///   waits until the drop of that lock closes it and removes the entry.
+/// - A link or a rename can occur between the probe and the open. The open
+///   then returns a descriptor for an inode that the registry already holds.
+///   The call never closes this descriptor. It parks the descriptor in the
+///   entry, and the descriptor closes when the entry goes.
 ///
 /// The registry mutex stays held across the open, so no other call registers
-/// the inode between the probe and the insert. This serializes the first
-/// opens in the process and keeps both rules simple.
+/// the inode between the probe and the insert. The first opens in the process
+/// therefore run one at a time.
 fn get_or_register<T>(
     repo_fd: BorrowedFd<'_>,
     name: &str,
@@ -255,16 +320,15 @@ fn get_or_register<T>(
     }
 }
 
-/// Close the descriptor `fd` of a dropped lock and then remove its entry at
-/// `key`, with the parked descriptors, under the registry mutex. Then wake the
-/// calls that wait for the entry to go.
+/// Closes the descriptor `fd` of a dropped lock and removes its entry at
+/// `key`, with the parked descriptors, under the registry mutex.
 ///
-/// No call replaces an entry, so the entry at `key` is the one of the dropped
-/// lock.
+/// The call then wakes the calls that wait for the entry to go. No call
+/// replaces an entry, so the entry at `key` belongs to the dropped lock.
 fn unregister(key: (u64, u64), fd: Option<OwnedFd>) {
     let registry = registry();
-    // A poisoned mutex still guards a whole map. A drop that skipped the
-    // removal would leave the waiters for this inode waiting with no end.
+    // A poisoned mutex still guards a whole map. If a drop skips the removal,
+    // the waiters for this inode wait with no end.
     let mut reg = registry.map.lock().unwrap_or_else(PoisonError::into_inner);
     drop(fd);
     drop(reg.remove(&key));
@@ -272,14 +336,15 @@ fn unregister(key: (u64, u64), fd: Option<OwnedFd>) {
     registry.gone.notify_all();
 }
 
-/// Open the lock file `name` under `repo_fd`, creating it with [`LOCK_MODE`]
-/// on first use, and return the descriptor with the file's `(device, inode)`.
+/// Opens the lock file `name` under `repo_fd` and returns the descriptor with
+/// the `(device, inode)` of the file.
 ///
-/// A file this call creates in a `bare-user-shared` repository is forced to
-/// [`perm::SHARED_LOCK_MODE`], so every member of the repository group opens
-/// it `O_RDWR` and takes the lock. The create attempt therefore carries
-/// `O_EXCL`, which separates the arm that made the file from the arm that
-/// found one: a file another member owns keeps the mode it has.
+/// If the file does not exist, the call creates it with [`LOCK_MODE`]. In a
+/// `bare-user-shared` repository, the call sets [`perm::SHARED_LOCK_MODE`] on
+/// a file that it creates. Each member of the repository group can then open
+/// the file `O_RDWR` and take the lock. The create attempt carries `O_EXCL` to
+/// tell the arm that made the file from the arm that found one. A file that
+/// another member owns keeps its mode.
 fn open_lock_file(
     repo_fd: BorrowedFd<'_>,
     name: &str,
@@ -304,10 +369,12 @@ fn open_lock_file(
     Ok((fd, (stat.st_dev, stat.st_ino)))
 }
 
-/// The refusal of a lock file whose inode the registry holds for another kind
-/// of lock, as a hard link between the two lock files makes. A second
-/// descriptor to that inode would drop the other lock when it closes, and the
-/// two locks would not exclude each other inside the process.
+/// Returns the error for a lock file whose inode the registry holds for
+/// another kind of lock.
+///
+/// A hard link between the two lock files causes this state. The close of a
+/// second descriptor to that inode drops the other lock. Also, the two locks
+/// do not exclude each other inside the process.
 fn shared_inode(name: &str) -> std::io::Error {
     std::io::Error::other(format!(
         "lock file {name} shares its inode with another lock file of the repository"
@@ -315,12 +382,12 @@ fn shared_inode(name: &str) -> std::io::Error {
 }
 
 impl RepoLock {
-    /// Return the [`RepoLock`] for the repository rooted at `repo_fd`, creating
-    /// `<repo>/.lock` and registering it on first use. Runs synchronous
-    /// filesystem calls and is meant to be offloaded to the blocking pool.
+    /// Returns the [`RepoLock`] for the repository at `repo_fd`.
     ///
-    /// The file is opened by the rules of [`open_lock_file`], through
-    /// [`get_or_register`].
+    /// The first use creates `<repo>/.lock` and registers the lock. The call
+    /// opens the file by the rules of [`open_lock_file`], through
+    /// [`get_or_register`]. It runs synchronous file system calls, so the
+    /// caller runs it on the blocking pool.
     pub(crate) fn get_or_create(
         repo_fd: BorrowedFd<'_>,
         repo_mode: RepoMode,
@@ -352,12 +419,12 @@ impl RepoLock {
             .expect("the descriptor stays open until the drop")
     }
 
-    /// Add one holder of `kind` without blocking.
+    /// Adds one holder of `kind` without blocking.
     ///
-    /// A record lock is process-associated, so the descriptor alone cannot hold
-    /// one in-process holder off another. The hold counts do that: an acquire
-    /// that the rule excludes reports [`TryOutcome::WouldBlock`], which sends
-    /// the caller into the retry loop, and it raises no count.
+    /// A record lock belongs to the process, so the descriptor alone cannot
+    /// keep one in-process holder from another. The hold counts do that. If a
+    /// rule excludes the acquire, the call reports [`TryOutcome::WouldBlock`]
+    /// and raises no count. The caller then goes into the retry loop.
     fn try_acquire(&self, kind: LockKind) -> std::io::Result<TryOutcome> {
         let mut st = self.state.lock().unwrap();
         match kind {
@@ -401,8 +468,8 @@ impl RepoLock {
         }
     }
 
-    /// Drop one holder of `kind`, releasing the descriptor lock when the last
-    /// holder goes away.
+    /// Drops one holder of `kind`. When the last holder goes, the call releases
+    /// the record lock.
     fn release(&self, kind: LockKind) {
         let mut st = self.state.lock().unwrap();
         match kind {
@@ -420,8 +487,8 @@ impl RepoLock {
             return;
         }
         // A shared holder and an exclusive holder exclude each other, so one of
-        // the two counts is zero and the target reached here is `Unlocked`.
-        // Errors are ignored so a release (including Drop) never fails.
+        // the two counts is zero, and the target here is `Unlocked`. The call
+        // ignores errors, so a release never fails, also in a drop.
         let _ = rustix::fs::fcntl_lock(self.fd(), FlockOperation::Unlock);
         st.os = target;
     }
@@ -434,19 +501,20 @@ impl Drop for RepoLock {
     }
 }
 
-/// Whether a lock error means the lock is held elsewhere.
+/// Returns `true` if a lock error means that another holder has the lock.
 fn would_block(e: Errno) -> bool {
     e == Errno::AGAIN || e == Errno::ACCESS
 }
 
-/// An acquired lock hold. Releasing happens on drop.
+/// A hold on the repository lock. The drop of the guard releases the hold.
 #[derive(Debug)]
 pub(crate) struct LockGuard {
     hold: Option<(Arc<RepoLock>, LockKind)>,
 }
 
 impl LockGuard {
-    /// A guard that holds no lock, for a repository with locking disabled.
+    /// Creates a guard that holds no lock, for a repository with `[core]
+    /// locking` set to `false`.
     pub(crate) fn disabled() -> LockGuard {
         LockGuard { hold: None }
     }
@@ -460,25 +528,25 @@ impl Drop for LockGuard {
     }
 }
 
-/// The two locks a writer of the state the update lock covers holds: the
-/// update lock and the repository lock, held shared. The fields drop in
-/// declaration order, so the update lock is released first.
+/// The two locks that a writer of the update-lock state holds: the update
+/// lock, and the repository lock held shared. The fields drop in declaration
+/// order, so the drop releases the update lock first.
 #[derive(Debug)]
 pub(crate) struct UpdateLocks {
-    // Both holds are kept for their drop alone. Never read.
+    // The code never reads the two fields. Each field exists for its drop.
     #[allow(dead_code)]
     pub(crate) update: UpdateLockHeld,
     #[allow(dead_code)]
     pub(crate) repo: LockGuard,
 }
 
-/// Acquire `kind` on `lock`, retrying until `timeout` elapses. `None` retries
-/// with no deadline.
+/// Acquires `kind` on `lock` and tries again until `timeout` passes. `None`
+/// tries again with no limit.
 ///
-/// Each attempt runs on the calling task: it takes the state mutex and makes one
-/// non-blocking lock request, so it returns at once. An attempt that ran on the
-/// blocking pool could complete after the caller dropped this future and leave
-/// a hold that no guard releases.
+/// Each attempt runs on the calling task. It takes the state mutex and makes
+/// one non-blocking lock request, so it returns at once. If an attempt ran on
+/// the blocking pool, it can complete after the caller drops this future. It
+/// then leaves a hold that no guard releases.
 pub(crate) async fn acquire(
     lock: Arc<RepoLock>,
     kind: LockKind,
@@ -697,13 +765,13 @@ mod tests {
         );
     }
 
-    /// Whether the kernel records an exclusive record lock of this process
-    /// that `lock` set through its descriptor.
+    /// Returns `true` if the kernel records an exclusive record lock that
+    /// this process set through the descriptor of `lock`.
     ///
-    /// The fdinfo of a descriptor lists only the locks this process set
-    /// through that descriptor. It is built in one pass, so it is a
-    /// consistent snapshot. `/proc/locks` is read in several calls, and a
-    /// line goes missing when other locks change between two of them.
+    /// The fdinfo of a descriptor lists only the locks that this process set
+    /// through that descriptor. The kernel builds it in one pass, so it is a
+    /// consistent snapshot. A read of `/proc/locks` takes several calls. If
+    /// other locks change between two of them, a line goes missing.
     fn holds_write_lock(lock: &RepoLock) -> bool {
         let path = format!("/proc/self/fdinfo/{}", lock.fd().as_raw_fd());
         let info = std::fs::read_to_string(path).unwrap();
@@ -713,9 +781,9 @@ mod tests {
         })
     }
 
-    /// A lock dropped on another thread closes its descriptor before a new
-    /// lock on the same inode is created, so the close does not drop the
-    /// record lock of the new one.
+    /// A lock dropped on another thread closes its descriptor before the
+    /// process creates a new lock on the same inode. As a result, the close
+    /// does not drop the record lock of the new lock.
     #[test]
     fn a_new_lock_survives_the_close_of_a_dropped_one() {
         for _ in 0..20 {
@@ -724,7 +792,8 @@ mod tests {
             let weak = Arc::downgrade(&old);
 
             // The held registry mutex stops the drop of `old` before it
-            // closes the descriptor. The new lock is then asked for at once.
+            // closes the descriptor. The test then asks for the new lock at
+            // once.
             let reg = registry().map.lock().unwrap();
             let dropper = std::thread::spawn(move || drop(old));
             while weak.strong_count() > 0 {

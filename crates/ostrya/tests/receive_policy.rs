@@ -2,9 +2,9 @@
 //! groups, `[core] auto-update-summary`, and `detached-metadata-exclude`.
 //!
 //! Each case writes one repository configuration, and a policy file where the
-//! case needs one, and reads the policy from it. A malformed group is refused
-//! with the error kind the policy documents, and each accepted value reaches
-//! its own field alone.
+//! case needs one. Then it reads the policy. The policy read refuses a
+//! malformed group with the error kind that the policy documents. Each
+//! accepted value reaches its own field alone.
 
 #![cfg(feature = "receive")]
 
@@ -28,7 +28,7 @@ const SECRET_B64: &str =
 /// The matching 32-byte ed25519 public key.
 const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
 
-/// A trust group `t` that trusts [`PUBLIC_B64`].
+/// The header of a trust group `t` that selects ed25519, with no key.
 const TRUST_T: &str = "[ex-ostrya trust \"t\"]\nsign-verify=ed25519\n";
 
 /// A trust group `t` that trusts [`PUBLIC_B64`], with its key.
@@ -36,8 +36,8 @@ fn trust_t() -> String {
     format!("{TRUST_T}verification-ed25519-key={PUBLIC_B64}\n")
 }
 
-/// Create an archive repository under `dir` whose config carries `core` at the
-/// end of `[core]` and `groups` after it, and open it.
+/// Creates and opens an archive repository under `dir` whose config carries
+/// `core` at the end of `[core]` and `groups` after it.
 fn repo_with(dir: &Path, core: &str, groups: &str) -> Repo {
     let root = dir.join("repo");
     block_on(async {
@@ -74,7 +74,8 @@ fn refusal(groups: &str) -> Error {
     }
 }
 
-/// Assert that `groups` is refused as malformed, with `part` in the message.
+/// Asserts that `from_config` refuses `groups` as malformed, with `part` in the
+/// message.
 fn assert_malformed(groups: &str, part: &str) {
     let err = refusal(groups);
     assert!(
@@ -92,7 +93,7 @@ fn file_policy(dir: &Path, groups: &str, text: &str) -> ostrya::Result<ReceivePo
     block_on(ReceivePolicy::from_file(&repo, &file))
 }
 
-/// A secret key file holding [`SECRET_B64`] under `dir`.
+/// A secret key file under `dir` that holds [`SECRET_B64`].
 fn secret_file(dir: &Path) -> std::path::PathBuf {
     let file = dir.join("secret.ed25519");
     std::fs::write(&file, format!("\n{SECRET_B64}\n")).unwrap();
@@ -135,7 +136,7 @@ fn no_group_gives_the_default_rule() {
 }
 
 /// Each boolean rule key reaches its own field, in the default group and in a
-/// pattern group, and a pattern rule takes no key from the default rule.
+/// pattern group. A pattern rule takes no key from the default rule.
 #[test]
 fn each_rule_boolean_reaches_its_own_field() {
     type Field = fn(&ReceiveRule) -> bool;
@@ -165,8 +166,8 @@ fn each_rule_boolean_reaches_its_own_field() {
     }
 }
 
-/// The session keys reach their fields in the default group, and a pattern
-/// group that states one is refused.
+/// The session keys reach their fields in the default group. `from_config`
+/// refuses a pattern group that states a session key.
 #[test]
 fn the_session_keys_live_in_the_default_group() {
     let dir = TmpDir::new("receive-session");
@@ -194,8 +195,8 @@ fn the_session_keys_live_in_the_default_group() {
     }
 }
 
-/// A boolean the key-file syntax does not read is refused as a key-file
-/// error.
+/// `from_config` refuses a boolean that the key-file syntax does not read, with
+/// a key-file error.
 #[test]
 fn a_malformed_boolean_is_refused() {
     for key in [
@@ -211,8 +212,8 @@ fn a_malformed_boolean_is_refused() {
     assert!(matches!(err, Error::Core(_)), "{err}");
 }
 
-/// `update_summary` reads `[core] auto-update-summary` and its alias, and
-/// either one true turns it on.
+/// `update_summary` reads `[core] auto-update-summary` and its alias
+/// `commit-update-summary`. If either key is true, `update_summary` is `true`.
 #[test]
 fn update_summary_reads_the_core_keys() {
     for (core, expected) in [
@@ -237,8 +238,8 @@ fn update_summary_reads_the_core_keys() {
     assert!(matches!(err, Error::Core(_)), "{err}");
 }
 
-/// `detached-metadata-exclude` gives a filter when it names a key, and none
-/// when it is empty.
+/// If `detached-metadata-exclude` names a key, the policy has a filter. If the
+/// value is empty, the policy has no filter.
 #[test]
 fn detached_metadata_exclude_gives_the_filter() {
     let named = policy("[ex-ostrya]\ndetached-metadata-exclude=app.secret;app.other\n").unwrap();
@@ -247,8 +248,8 @@ fn detached_metadata_exclude_gives_the_filter() {
     assert!(empty.detached_metadata_filter.is_none());
 }
 
-/// Each pattern group becomes a rule under its pattern, in file order, and
-/// the rules select as their patterns say.
+/// Each pattern group becomes a rule under its pattern, in file order. Each
+/// rule selects the refs that its pattern matches.
 #[test]
 fn the_pattern_groups_become_rules() {
     let policy = policy(
@@ -269,7 +270,7 @@ fn the_pattern_groups_become_rules() {
     assert!(policy.rule_for("other:apps/y").is_none());
 }
 
-/// A hand-built rule takes a pattern `RefPattern::parse` accepts.
+/// A hand-built rule takes a pattern that `RefPattern::parse` accepts.
 #[test]
 fn a_hand_built_policy_selects_its_rules() {
     let policy = ReceivePolicy {
@@ -286,7 +287,7 @@ fn a_hand_built_policy_selects_its_rules() {
     assert!(!policy.rule_for("x").unwrap().allow_delete);
 }
 
-/// Each malformed pattern in a group name is refused.
+/// `from_config` refuses each malformed pattern in a group name.
 #[test]
 fn a_malformed_pattern_is_refused() {
     for pattern in [
@@ -299,8 +300,8 @@ fn a_malformed_pattern_is_refused() {
     }
 }
 
-/// Each group name that starts with `ex-ostrya ` and has no shape of a receive
-/// group is refused, and `[ex-ostrya]` keeps its keys.
+/// `from_config` refuses each group name that starts with `ex-ostrya ` and has
+/// no shape of a receive group. `[ex-ostrya]` keeps its keys.
 #[test]
 fn an_unknown_receive_group_is_refused() {
     for group in [
@@ -317,7 +318,7 @@ fn an_unknown_receive_group_is_refused() {
     policy("[ex-ostrya]\ngc-root-metadata-keys=app.roots\n").unwrap();
 }
 
-/// An unknown key in each receive group shape is refused.
+/// `from_config` refuses an unknown key in each receive group shape.
 #[test]
 fn an_unknown_key_is_refused() {
     let dir = TmpDir::new("receive-unknown");
@@ -350,7 +351,7 @@ fn verify_reads_its_three_forms() {
     assert!(keys(&policy.rules[1].1).is_some());
 }
 
-/// Each malformed `verify` value is refused.
+/// `from_config` refuses each malformed `verify` value.
 #[test]
 fn a_malformed_verify_is_refused() {
     for value in [
@@ -361,7 +362,7 @@ fn a_malformed_verify_is_refused() {
             "malformed [ex-ostrya receive] verify value",
         );
     }
-    // One value, so the `;` is part of the trust group name.
+    // `verify` takes one value, so the `;` is part of the trust group name.
     assert_malformed(
         &format!(
             "[ex-ostrya receive]\nverify=trust:t;remote:c\n{}",
@@ -371,8 +372,8 @@ fn a_malformed_verify_is_refused() {
     );
 }
 
-/// The remote name of `verify=remote:NAME` is one path component, even where
-/// a remote section of that name exists.
+/// The remote name of `verify=remote:NAME` must be one path component. If a
+/// remote section of that name exists, `from_config` still refuses the name.
 #[test]
 fn a_remote_reference_names_one_path_component() {
     for name in ["../x", "a/b", "..", "."] {
@@ -386,7 +387,8 @@ fn a_remote_reference_names_one_path_component() {
     }
 }
 
-/// A reference to a group or a section that does not exist is refused.
+/// `from_config` refuses a reference to a group or a section that does not
+/// exist.
 #[test]
 fn a_reference_to_a_missing_group_is_refused() {
     assert_malformed(
@@ -418,8 +420,10 @@ fn a_reference_to_a_missing_group_is_refused() {
     );
 }
 
-/// A rule that refuses its refs and states a key that only an accepted ref
-/// reads is refused, whatever the value. The session keys are not such keys.
+/// If a rule with `accept=false` states a key that only an accepted ref reads,
+/// `from_config` refuses the rule. The value of the key does not change the
+/// result. The session keys `allow-privileged` and `sign-summary` are not such
+/// keys.
 #[test]
 fn a_refusing_rule_takes_no_accept_only_key() {
     for key in [
@@ -457,7 +461,7 @@ fn a_refusing_rule_takes_no_accept_only_key() {
     assert!(!policy.default_rule.accept);
 }
 
-/// A trust group turns on one axis at least, and states no summary key.
+/// A trust group must turn on one axis at least. It must state no summary key.
 #[test]
 fn a_trust_group_turns_on_an_axis() {
     for group in [
@@ -474,8 +478,8 @@ fn a_trust_group_turns_on_an_axis() {
     }
 }
 
-/// A trust group key that no axis reads is refused, and so is an engine
-/// other than ed25519 and spki.
+/// `from_config` refuses a trust group key that no axis reads. It also refuses
+/// an engine that is not ed25519 or spki.
 #[test]
 fn a_trust_group_key_no_axis_reads_is_refused() {
     assert_malformed(
@@ -504,7 +508,7 @@ fn a_trust_group_key_no_axis_reads_is_refused() {
             "is not ed25519 or spki",
         );
     }
-    // An spki key under an axis that selects ed25519 alone.
+    // This case puts an spki key under an axis that selects ed25519 alone.
     let err = refusal(&format!("{}verification-spki-key=AAAA\n", trust_t()));
     #[cfg(feature = "sign-spki")]
     assert!(
@@ -515,8 +519,8 @@ fn a_trust_group_key_no_axis_reads_is_refused() {
     assert!(matches!(err, Error::Unsupported(_)), "{err}");
 }
 
-/// `sign-verify=true` in a trust group names every engine of the build, and
-/// an engine with no key is passed over.
+/// `sign-verify=true` in a trust group names every engine of the build.
+/// `from_config` skips an engine that has no key.
 #[test]
 fn a_trust_group_takes_every_engine() {
     let policy = policy(&format!(
@@ -527,8 +531,8 @@ fn a_trust_group_takes_every_engine() {
     assert!(keys(&policy.default_rule).is_some());
 }
 
-/// The key sources of a trust group are read when the policy is read, also
-/// for a group that no rule names.
+/// `from_config` reads the key sources of each trust group, also of a group
+/// that no rule names.
 #[test]
 fn a_trust_group_needs_readable_keys() {
     let err = refusal(TRUST_T);
@@ -545,7 +549,7 @@ fn a_trust_group_needs_readable_keys() {
         matches!(&err, Error::Signature(m) if m.contains("/nonexistent/ostrya/keys.ed25519")),
         "{err}"
     );
-    // A key file of trusted keys, one per line, is read.
+    // `from_config` reads a key file of trusted keys, one key per line.
     let dir = TmpDir::new("receive-keyfile");
     let file = dir.path().join("keys.ed25519");
     std::fs::write(&file, format!("{PUBLIC_B64}\n\n")).unwrap();
@@ -557,7 +561,7 @@ fn a_trust_group_needs_readable_keys() {
     .unwrap();
 }
 
-/// A remote's verification keys do not reach a trust group.
+/// The verification keys of a remote do not reach a trust group.
 #[test]
 fn a_remote_key_is_not_a_trust_group_key() {
     let err = refusal(&format!(
@@ -566,8 +570,8 @@ fn a_remote_key_is_not_a_trust_group_key() {
     assert!(matches!(err, Error::Signature(_)), "{err}");
 }
 
-/// The GPG axis of a trust group needs `gpgkeypath`, and a build without the
-/// GPG engine refuses the axis.
+/// The GPG axis of a trust group needs `gpgkeypath`. A build without the GPG
+/// engine refuses the axis.
 #[test]
 fn a_trust_group_gpg_axis_needs_a_keypath() {
     let err = refusal("[ex-ostrya trust \"t\"]\ngpg-verify=true\ngpgkeypath=;\n");
@@ -580,8 +584,9 @@ fn a_trust_group_gpg_axis_needs_a_keypath() {
     assert!(matches!(err, Error::Unsupported(_)), "{err}");
 }
 
-/// A `gpgkeypath` entry that names nothing is refused by the group and the
-/// entry, and keyrings that hold no certificate are refused.
+/// `from_config` refuses a `gpgkeypath` entry that names nothing, and the
+/// message names the group and the entry. It also refuses keyrings that hold
+/// no certificate.
 #[cfg(feature = "verify-gpg")]
 #[test]
 fn a_trust_group_gpg_axis_needs_a_certificate() {
@@ -612,8 +617,8 @@ fn a_trust_group_gpg_axis_needs_a_certificate() {
     }
 }
 
-/// A trust group with a GPG axis over a keyring that holds a certificate, and
-/// a sign-api axis beside it.
+/// A trust group takes a GPG axis over a keyring that holds a certificate,
+/// together with a sign-api axis.
 #[cfg(feature = "verify-gpg")]
 #[test]
 fn a_trust_group_takes_both_axes() {
@@ -658,7 +663,7 @@ fn a_remote_reference_turns_on_a_check() {
     );
 }
 
-/// An ed25519 key group is read, and its key signs as the server.
+/// `from_config` reads an ed25519 key group. Its key signs as the server.
 #[test]
 fn an_ed25519_key_group_is_read() {
     let dir = TmpDir::new("receive-signer");
@@ -681,7 +686,7 @@ fn an_ed25519_key_group_is_read() {
     );
 }
 
-/// Each malformed key group is refused.
+/// `from_config` refuses each malformed key group.
 #[test]
 fn a_malformed_key_group_is_refused() {
     assert_malformed(
@@ -713,7 +718,7 @@ fn a_malformed_key_group_is_refused() {
     }
 }
 
-/// The key file of a key group holds exactly one key, and each refusal names
+/// The key file of a key group must hold exactly one key. Each refusal names
 /// the group.
 #[test]
 fn a_key_group_file_holds_one_key() {
@@ -748,7 +753,7 @@ fn an_spki_key_group_needs_the_engine() {
     assert!(matches!(err, Error::Unsupported(_)), "{err}");
 }
 
-/// An spki key group is read from its base64 PKCS#8 form.
+/// `from_config` reads an spki key group from its base64 PKCS#8 form.
 #[cfg(feature = "sign-spki")]
 #[test]
 fn an_spki_key_group_is_read() {
@@ -779,8 +784,8 @@ fn a_gpg_key_group_needs_the_engine() {
     assert!(matches!(err, Error::Unsupported(_)), "{err}");
 }
 
-/// A GPG key group is read, and a selector that names no secret key is
-/// refused by the group.
+/// `from_config` reads a GPG key group. It refuses a selector that names no
+/// secret key, and the message names the group.
 #[cfg(feature = "sign-gpg")]
 #[test]
 fn a_gpg_key_group_is_read() {
@@ -829,8 +834,8 @@ fn a_gpg_key_group_is_read() {
     );
 }
 
-/// A key group that no rule names is built too, so a key it cannot read fails
-/// the call.
+/// `from_config` also builds a key group that no rule names. If it cannot read
+/// the key, the call fails.
 #[test]
 fn an_unnamed_key_group_is_built() {
     let err = refusal(
@@ -839,9 +844,9 @@ fn an_unnamed_key_group_is_built() {
     assert!(matches!(err, Error::Signature(_)), "{err}");
 }
 
-/// Two rules that name one key group share one signer, and so does the
-/// summary. Two rules that name one trust group share its keys. A name given
-/// twice in one list counts once.
+/// Two rules that name one key group share one signer. The summary shares
+/// that signer too. Two rules that name one trust group share its keys. If a
+/// list gives a name two times, the name counts once.
 #[test]
 fn the_rules_share_what_the_groups_build() {
     let dir = TmpDir::new("receive-share");
@@ -865,9 +870,10 @@ fn the_rules_share_what_the_groups_build() {
     assert!(Arc::ptr_eq(keys(default).unwrap(), keys(apps).unwrap()));
 }
 
-/// Under `from_file`, the receive groups come from the file alone: the groups
-/// of the repository config are not read, a malformed one included, and
-/// `update_summary` and the filter still come from the repository config.
+/// Under `from_file`, the receive groups come from the file alone. `from_file`
+/// ignores the groups of the repository config, and a malformed group there
+/// causes no error. `update_summary` and the filter come from the repository
+/// config.
 #[test]
 fn a_policy_file_replaces_the_config_groups() {
     let dir = TmpDir::new("receive-file");
@@ -907,8 +913,9 @@ fn a_policy_file_resolves_remotes_in_itself() {
     );
 }
 
-/// A policy file holds the receive groups and remote sections alone, and a
-/// file that cannot be read is refused by its path.
+/// A policy file holds the receive groups and remote sections alone.
+/// `from_file` refuses an absent file, and the message names the path. It also
+/// refuses a path that is not a regular file.
 #[test]
 fn a_policy_file_holds_the_receive_groups_alone() {
     for text in [
@@ -946,9 +953,9 @@ fn a_policy_file_holds_the_receive_groups_alone() {
     );
 }
 
-/// The tool reads a repository whose config holds the receive group shapes:
-/// `refs`, `fsck`, and `summary -u` exit 0 and write nothing to standard
-/// error.
+/// The `ostree` command reads a repository whose config holds the receive group
+/// shapes. Its `refs`, `fsck`, and `summary -u` commands exit 0 and write
+/// nothing to standard error.
 #[test]
 fn the_tool_tolerates_the_receive_groups() {
     if !common::ostree_available() {

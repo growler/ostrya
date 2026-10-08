@@ -1,28 +1,30 @@
-//! The permission bits ostrya forces on the entries it creates inside a
-//! `bare-user-shared` repository.
+//! The permission bits that ostrya forces on the entries that it creates inside
+//! a `bare-user-shared` repository.
 //!
-//! `mkdirat` and `openat(O_CREAT)` reduce their mode argument by the calling
-//! process's file-creation mask, so the mode argument alone cannot carry a
-//! guarantee. Each helper here applies the wanted bits with `fchmod` after the
-//! create, which the mask does not touch. Every other repository mode keeps the
-//! masked result, so the helpers return immediately for it.
+//! `mkdirat` and `openat(O_CREAT)` reduce their mode argument by the
+//! file-creation mask of the calling process, so the mode argument alone cannot
+//! give a guarantee. Each helper here applies the wanted bits with `fchmod`
+//! after the create, and the mask does not apply to `fchmod`. All other
+//! repository modes keep the masked result, so the helpers return at once for
+//! them.
 //!
-//! A directory takes `02770`. The setgid bit is part of the forced mode:
-//! `mkdirat` inherits it from the parent, and an `fchmod` that leaves it out
-//! clears it, which stops group inheritance below that level. A directory keeps
-//! an `S_ISGID` bit a non-privileged `chmod` sets; the kernel's silent-clear
-//! rule covers non-directory files. The sticky bit stays off `tmp/` and off the
-//! repository root, because the stale-staging reaper removes staging trees that
-//! other members of the group own.
+//! A directory gets `02770`. The setgid bit is part of the forced mode, because
+//! `mkdirat` inherits it from the parent. If an `fchmod` leaves the bit out, it
+//! clears the bit, and group inheritance stops below that level. If a
+//! non-privileged `chmod` sets the `S_ISGID` bit on a directory, the directory
+//! keeps the bit. The silent-clear rule of the kernel applies to non-directory
+//! files. The sticky bit stays off `tmp/` and off the repository root, because
+//! the stale-staging reaper removes staging trees that other members of the
+//! group own.
 //!
 //! A helper runs on the arm of a create where that call made the entry. An
-//! entry that already stands may belong to another uid, where `fchmod` answers
-//! `EPERM`.
+//! entry that exists before the call can belong to another uid, and then
+//! `fchmod` returns `EPERM`.
 //!
 //! [`force_created_dir`] opens the entry and calls `fchmod` on the descriptor.
-//! Linux does not honour `AT_SYMLINK_NOFOLLOW` in `fchmodat`, so a path-based
-//! chmod carries a symlink-swap race that an `openat` with `O_NOFOLLOW`
-//! followed by `fchmod` does not.
+//! Linux does not support `AT_SYMLINK_NOFOLLOW` in `fchmodat`, so a chmod by
+//! path has a symlink-swap race. An `openat` with `O_NOFOLLOW` and then an
+//! `fchmod` on the descriptor has no such race.
 
 use std::os::fd::AsFd;
 
@@ -42,11 +44,11 @@ pub(crate) const SHARED_LOCK_MODE: u32 = 0o660;
 /// repository outside the object store, such as a `.commitpartial` marker.
 pub(crate) const SHARED_FILE_MODE: u32 = 0o644;
 
-/// Force [`SHARED_DIR_MODE`] on the directory `path` names under `dir`, which
-/// the calling code has just created.
+/// Forces [`SHARED_DIR_MODE`] on the directory that the calling code created
+/// at `path` under `dir`.
 ///
-/// Call this on the arm of the create that made the directory. Every other
-/// repository mode returns at once.
+/// Call this on the arm of the create that made the directory. In all other
+/// repository modes, the function returns at once.
 pub(crate) fn force_created_dir<Fd: AsFd, P: Arg>(
     dir: Fd,
     path: P,
@@ -65,11 +67,11 @@ pub(crate) fn force_created_dir<Fd: AsFd, P: Arg>(
     Ok(())
 }
 
-/// Force `bits` on an open descriptor for an entry the calling code has just
+/// Forces `bits` on an open descriptor of an entry that the calling code
 /// created.
 ///
-/// Call this on the arm of the create that made the entry. Every other
-/// repository mode returns at once.
+/// Call this on the arm of the create that made the entry. In all other
+/// repository modes, the function returns at once.
 pub(crate) fn force_created_mode<Fd: AsFd>(
     fd: Fd,
     repo_mode: RepoMode,

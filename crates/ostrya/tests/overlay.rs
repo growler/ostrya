@@ -1,14 +1,21 @@
-//! Overlay changeset import integration tests.
+//! Integration tests for the import of an overlay changeset.
 //!
-//! These synthesize overlayfs upperdir changesets on disk -- whiteout devices
-//! through `mknodat` (char 0:0, unprivileged) and opacity through
-//! `user.overlay.opaque` -- and merge them over a base `MutableTree` through
-//! `merge_overlay_dfd_to_mtree`. The central check builds the expected merged
-//! tree by hand and ingests it through `write_dfd_to_mtree`, asserting the two
-//! roads reach the same root checksum. The rest cover whiteout deletion, opaque
-//! replacement, `overlay.*` stripping, the metacopy/redirect hard errors,
-//! cross-type replacement (a directory over a base symlink and leaves over base
-//! directories), and the filter leaving base entries in place.
+//! The tests make overlayfs upper-directory changesets on disk. A whiteout is a
+//! character device 0:0, which `mknodat` makes without privileges. An opaque
+//! directory has the xattr `user.overlay.opaque`. The tests merge each
+//! changeset over a base `MutableTree` with `merge_overlay_dfd_to_mtree`.
+//!
+//! The main test builds the expected merged tree by hand and ingests it with
+//! `write_dfd_to_mtree`. The two paths must give the same root checksum. The
+//! other tests cover:
+//!
+//! - whiteout deletion
+//! - opaque replacement
+//! - removal of the `overlay.*` xattrs
+//! - the errors for metacopy and redirect
+//! - replacement across types: a directory over a base symlink, and leaves
+//!   over base directories
+//! - a filter that keeps base entries in place
 
 mod common;
 
@@ -22,7 +29,8 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// Compile-time pin: the overlay merge future is `Send`, callbacks included.
+/// Returns `value` and checks at compile time that its type is `Send`.
+/// A call pins that the overlay merge future, with its callbacks, is `Send`.
 fn assert_send<T: Send>(value: T) -> T {
     value
 }
@@ -42,8 +50,8 @@ fn write_file(path: &Path, content: &[u8], mode: u32) {
     set_mode(path, mode);
 }
 
-/// Create an overlayfs whiteout: a character device with device number 0:0.
-/// Char 0:0 creation needs no capability.
+/// Creates an overlayfs whiteout: a character device with device number 0:0.
+/// A process needs no capability to create a character device 0:0.
 fn whiteout(path: &Path) {
     rustix::fs::mknodat(
         rustix::fs::CWD,
@@ -55,18 +63,18 @@ fn whiteout(path: &Path) {
     .unwrap();
 }
 
-/// Set an extended attribute (path-based, following) on `path`.
+/// Sets an extended attribute on `path`. The call follows symlinks.
 fn set_xattr(path: &Path, name: &str, value: &[u8]) {
     rustix::fs::setxattr(path, name, value, rustix::fs::XattrFlags::empty()).unwrap();
 }
 
-/// Mark a directory opaque in the rootless `user.*` namespace.
+/// Marks a directory as opaque in the `user.*` namespace, which needs no root.
 fn opaque(path: &Path) {
     set_xattr(path, "user.overlay.opaque", b"y");
 }
 
-/// Commit the on-disk tree at `path` (relative to `dfd`) onto `refname`, so it
-/// can be hydrated with `MutableTree::from_commit`.
+/// Commits the tree on disk at `path` (relative to `dfd`) to `refname`.
+/// `MutableTree::from_commit` can then load the tree from the ref.
 async fn commit_dir(
     repo: &Repo,
     dfd: std::os::fd::BorrowedFd<'_>,
@@ -89,23 +97,25 @@ async fn commit_dir(
     txn.commit().await.unwrap();
 }
 
-/// The canonical-permissions, xattr-free flags the equivalence tests use so the
-/// merge and the by-hand ingest agree on owner and mode.
+/// Returns the flags for canonical permissions and no xattrs.
+/// The equivalence tests use these flags so that the merge and the ingest by
+/// hand get the same owner and mode.
 fn canon_flags() -> CommitModifierFlags {
     CommitModifierFlags::CANONICAL_PERMISSIONS | CommitModifierFlags::SKIP_XATTRS
 }
 
 #[test]
 fn merge_equals_scratch_checkout_then_ingest() {
-    // Merging a changeset over a hydrated base mtree reaches the same root
-    // checksum as building the expected merged tree by hand and ingesting it.
-    // Exercises: file modify, file add, whiteout delete, a merged directory
-    // whose metadata changed and whose base-only file survives, and an opaque
-    // directory replacement whose metadata changed.
+    // A merge of a changeset over a base mtree from a commit gives the same
+    // root checksum as an ingest of the expected merged tree. The test builds
+    // the expected tree by hand. The test covers these cases:
+    // - a file change, a file addition, and a whiteout deletion
+    // - a merged directory with changed metadata that keeps its base-only file
+    // - an opaque directory replacement with changed metadata
     let tmp = TmpDir::new("overlay-equiv");
     let base = tmp.path();
 
-    // Base tree on disk.
+    // The base tree on disk.
     let base_src = base.join("base");
     mkdir(&base_src, 0o755);
     write_file(&base_src.join("a.txt"), b"base-a", 0o644);
@@ -116,7 +126,7 @@ fn merge_equals_scratch_checkout_then_ingest() {
     mkdir(&base_src.join("keep"), 0o755);
     write_file(&base_src.join("keep/old.txt"), b"old", 0o644);
 
-    // Upperdir changeset.
+    // The changeset in the upper directory.
     let upper = base.join("upper");
     mkdir(&upper, 0o755);
     write_file(&upper.join("a.txt"), b"UPPER-A", 0o644); // modify a
@@ -199,7 +209,8 @@ fn merge_equals_scratch_checkout_then_ingest() {
 
 #[test]
 fn whiteouts_remove_exactly_the_whited_out_paths() {
-    // A whiteout removes its path (present or not) and leaves the rest intact.
+    // A whiteout removes its path and keeps all other entries. A whiteout of a
+    // path that does not exist is not an error.
     let tmp = TmpDir::new("overlay-whiteout");
     let base = tmp.path();
 
@@ -247,8 +258,8 @@ fn whiteouts_remove_exactly_the_whited_out_paths() {
 
 #[test]
 fn opaque_directory_drops_base_only_entries() {
-    // An opaque upper directory drops the base's entries beneath that name and
-    // keeps only what the upper provides.
+    // An opaque upper directory removes the base entries under its name. Only
+    // the entries of the upper directory stay.
     let tmp = TmpDir::new("overlay-opaque");
     let base = tmp.path();
 
@@ -305,10 +316,10 @@ fn opaque_directory_drops_base_only_entries() {
 
 #[test]
 fn overlay_xattrs_appear_in_no_staged_object() {
-    // Every xattr under `trusted.overlay.` or `user.overlay.` is stripped from
-    // every ingested object; every other xattr, including a name that merely
-    // contains `overlay`, survives. Committed without SKIP_XATTRS so content
-    // xattrs are captured.
+    // The merge removes each xattr under `trusted.overlay.` or `user.overlay.`
+    // from each ingested object. Every other xattr stays, also a name that
+    // contains `overlay` without one of these prefixes. The test commits
+    // without `SKIP_XATTRS`, so the merge records the xattrs of the content.
     let tmp = TmpDir::new("overlay-xattr-strip");
     let base = tmp.path();
 
@@ -317,8 +328,8 @@ fn overlay_xattrs_appear_in_no_staged_object() {
     write_file(&upper.join("file.txt"), b"content", 0o644);
     set_xattr(&upper.join("file.txt"), "user.keep", b"1");
     set_xattr(&upper.join("file.txt"), "user.overlay.foo", b"bar");
-    // Neither is the overlay prefix: no trailing dot, and the suffix is not
-    // dot-separated. Both must survive the strip.
+    // Neither name has the overlay prefix. The first has no final dot, and the
+    // second has no dot after `overlay`. Both must stay after the merge.
     set_xattr(&upper.join("file.txt"), "user.overlay", b"kept-no-dot");
     set_xattr(&upper.join("file.txt"), "user.overlayish", b"kept-suffix");
     mkdir(&upper.join("od"), 0o755);
@@ -332,7 +343,7 @@ fn overlay_xattrs_appear_in_no_staged_object() {
             .unwrap();
         let mut mtree = MutableTree::new();
         let txn = repo.transaction().await.unwrap();
-        // No flags: on-disk xattrs are captured (minus overlay.*).
+        // No flags: the merge records the xattrs on disk, except `overlay.*`.
         let mut modifier = CommitModifier::new(CommitModifierFlags::NONE);
         let upper_fd = std::fs::File::open(&upper).unwrap();
         txn.merge_overlay_dfd_to_mtree(upper_fd.as_fd(), &mut mtree, Some(&mut modifier))
@@ -345,8 +356,8 @@ fn overlay_xattrs_appear_in_no_staged_object() {
         let repo = Repo::open(&base.join("repo")).await.unwrap();
         let tree = repo.load_dirtree(&root_dirtree).await.unwrap();
 
-        // The file keeps user.keep and carries no trusted.overlay. or
-        // user.overlay. xattr.
+        // The file keeps `user.keep` and has no `trusted.overlay.` or
+        // `user.overlay.` xattr.
         let file = tree.files.iter().find(|(n, _)| n == "file.txt").unwrap().1;
         let file = repo.load_file(&file).await.unwrap();
         assert!(
@@ -360,8 +371,8 @@ fn overlay_xattrs_appear_in_no_staged_object() {
             "no overlay.* xattr on the file object: {:?}",
             file.xattrs
         );
-        // A name that only contains `overlay`, without matching either
-        // prefix exactly, is not a control xattr and survives untouched.
+        // A name that contains `overlay` without one of the two prefixes is not
+        // a control xattr. It stays unchanged.
         assert!(
             file.xattrs
                 .iter()
@@ -377,7 +388,8 @@ fn overlay_xattrs_appear_in_no_staged_object() {
             file.xattrs
         );
 
-        // The opaque directory keeps user.dirkeep and drops user.overlay.opaque.
+        // The opaque directory keeps `user.dirkeep` and loses
+        // `user.overlay.opaque`.
         let d = tree.dirs.iter().find(|(n, ..)| n == "od").unwrap();
         let dirmeta = repo.load_dirmeta(&d.2).await.unwrap();
         assert!(
@@ -395,7 +407,8 @@ fn overlay_xattrs_appear_in_no_staged_object() {
     });
 }
 
-/// Whether a stored (NUL-terminated) xattr name is in an overlay namespace.
+/// Returns `true` if a stored, NUL-terminated xattr name is in an overlay
+/// namespace.
 fn is_overlay(name: &[u8]) -> bool {
     name.starts_with(b"trusted.overlay.") || name.starts_with(b"user.overlay.")
 }
@@ -460,9 +473,9 @@ fn redirect_is_a_hard_error() {
 
 #[test]
 fn dir_over_base_symlink_wins() {
-    // An upper directory over a base symlink drops the symlink and creates a
-    // fresh directory holding the upper entries; the symlink's former target
-    // survives as its own base entry.
+    // An upper directory over a base symlink removes the symlink. The merge
+    // makes a new directory with the upper entries. The old target of the
+    // symlink stays as a separate base entry.
     let tmp = TmpDir::new("overlay-dir-over-symlink");
     let base = tmp.path();
 
@@ -524,9 +537,10 @@ fn dir_over_base_symlink_wins() {
 
 #[test]
 fn upper_leaf_replaces_base_directory() {
-    // usrmerge-style: an upper file or symlink at a name the base holds as a
-    // directory drops the base directory and applies the leaf. overlayfs records
-    // this as a plain non-opaque leaf, needing no whiteout or opaque marker.
+    // This is the usrmerge case. An upper file or symlink at the name of a base
+    // directory removes the base directory and adds the leaf. overlayfs records
+    // this change as a plain leaf that is not opaque. The change needs no
+    // whiteout and no opaque marker.
     let tmp = TmpDir::new("overlay-leaf-over-dir");
     let base = tmp.path();
 
@@ -581,7 +595,7 @@ fn upper_leaf_replaces_base_directory() {
             "the leaves take the directories' names"
         );
 
-        // d is a symlink, f is a regular file.
+        // `d` is a symlink and `f` is a regular file.
         let d = tree.files.iter().find(|(n, _)| n == "d").unwrap().1;
         assert!(
             repo.load_file(&d).await.unwrap().is_symlink(),
@@ -597,8 +611,8 @@ fn upper_leaf_replaces_base_directory() {
 
 #[test]
 fn filter_skip_leaves_base_entry_in_place() {
-    // A filter that skips an upper file leaves the base version untouched, while
-    // a non-skipped upper entry still applies.
+    // If a filter skips an upper file, the base version stays unchanged. The
+    // merge applies an upper entry that the filter does not skip.
     let tmp = TmpDir::new("overlay-filter");
     let base = tmp.path();
 
@@ -625,7 +639,8 @@ fn filter_skip_leaves_base_entry_in_place() {
         )
         .await;
 
-        // The base a.txt checksum, to prove it is unchanged after the skip.
+        // The checksum of the base `a.txt`. The test uses it to show that the
+        // skip keeps the base file.
         let (base_tree, _) = repo.read_commit("test/base").await.unwrap();
         let base_a = file_checksum(&base_tree, "a.txt").await;
 
@@ -659,7 +674,7 @@ fn filter_skip_leaves_base_entry_in_place() {
     });
 }
 
-/// The content checksum of a file `name` in the root of `tree`.
+/// Returns the content checksum of the file `name` in the root of `tree`.
 async fn file_checksum(tree: &ostrya::RepoTree, name: &str) -> Checksum {
     let Some(TreeEntry::File { checksum, .. }) = tree.lookup(Path::new(name)).await.unwrap() else {
         panic!("{name} is not a file");

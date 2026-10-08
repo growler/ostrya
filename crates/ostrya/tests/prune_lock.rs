@@ -1,12 +1,14 @@
-//! The repository lock a prune holds.
+//! Integration tests of the repository lock that a prune holds.
 //!
-//! [`Repo::prune`] takes the repository lock exclusive for its whole run, so it
-//! excludes every other writer, this process's own transactions included. These
-//! tests drive that from the library side: a prune contended by a live
-//! transaction, a transaction contended by a live exclusive hold, the same
-//! prune once that transaction commits, a prune in a repository whose
-//! `[core] locking` is false, and the one refusal that stands ahead of the
-//! lock.
+//! [`Repo::prune`] takes the repository lock in exclusive mode for its full
+//! run. The lock excludes all other writers, also the transactions of the same
+//! process. The tests check this through the library:
+//!
+//! - a prune that a live transaction blocks
+//! - a transaction that a live exclusive hold blocks
+//! - the same prune after that transaction commits
+//! - a prune in a repository where `[core] locking` is false
+//! - the one refusal that comes before the lock
 
 mod common;
 
@@ -23,10 +25,11 @@ use ostrya_rt::block_on;
 /// A fixed timestamp, so the commits are reproducible.
 const FIXED_TS: u64 = 1_700_000_000;
 
-/// A repository under `<tmp>/repo`, with the config lines `extra` appended.
+/// Creates a repository under `<tmp>/repo` and appends the config lines
+/// `extra`.
 ///
-/// The config is read once at open, so every key a test states is written
-/// before the handle exists.
+/// A handle reads the config once, at open, so the function writes each key of
+/// a test before the handle exists.
 fn new_repo(tag: &str, extra: &str) -> (TmpDir, PathBuf) {
     let dir = TmpDir::new(tag);
     let repo_path = dir.path().join("repo");
@@ -44,14 +47,14 @@ fn new_repo(tag: &str, extra: &str) -> (TmpDir, PathBuf) {
     (dir, repo_path)
 }
 
-/// Write a one-file tree at `<base>/<name>`.
+/// Writes a tree with one file at `<base>/<name>`.
 fn write_tree(base: &Path, name: &str) {
     let dir = base.join(name);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("payload.txt"), format!("{name}\n")).unwrap();
 }
 
-/// Commit the tree `<base>/<name>` onto `branch` of `repo`.
+/// Commits the tree `<base>/<name>` to `branch` of `repo`.
 async fn commit_tree(repo: &Repo, base: &Path, name: &str, branch: &str) {
     use std::os::fd::AsFd;
     let txn = repo.transaction().await.unwrap();
@@ -106,18 +109,18 @@ fn prune_times_out_while_a_transaction_is_open() {
             "the prune waited out the timeout, took {elapsed:?}"
         );
 
-        // The transaction stands for the whole of the assertion above.
+        // The transaction stays open until the assertions are complete.
         drop(txn);
     });
 }
 
-/// A transaction opened while an exclusive hold stands waits for that hold, so
-/// the exclusion runs in both directions inside one process.
+/// A transaction that opens during an exclusive hold waits for that hold, so
+/// the exclusion works in both directions in one process.
 ///
-/// This is the direction a prune depends on: the run takes the lock before it
-/// lists the store, and a writer that opened afterwards must not reach the
-/// objects the sweep is about to remove. The hold here is taken directly, so
-/// the rule is pinned at the public API with no timing between two tasks.
+/// A prune depends on this direction. The run takes the lock before it lists
+/// the object store. A writer that opens after that must not reach the objects
+/// that the sweep will remove. The test takes the hold directly, so it pins the
+/// rule at the public API with no timing between two tasks.
 #[test]
 fn a_transaction_waits_for_an_exclusive_hold() {
     let (_dir, repo_path) = new_repo("prune-lock-txn-blocked", "lock-timeout-secs=1\n");
@@ -143,7 +146,7 @@ fn a_transaction_waits_for_an_exclusive_hold() {
             "the transaction waited out the timeout, took {elapsed:?}"
         );
 
-        // The hold goes away and the next transaction opens at once.
+        // The hold ends, and the next transaction opens immediately.
         held.abort().await.unwrap();
         let txn = repo
             .transaction()
@@ -168,8 +171,9 @@ fn prune_succeeds_once_the_transaction_commits() {
             .expect("the prune runs once no transaction stands");
         assert_eq!(stats.pruned_objects, 0, "a default prune removes nothing");
 
-        // The commit the branch names is still in the store, so the run above
-        // reached the sweep and kept what a ref roots.
+        // The commit that the branch names is still in the object store. This
+        // shows that the run reached the sweep and kept the objects that a ref
+        // roots.
         let head = repo.resolve_rev("kept", false).await.unwrap().unwrap();
         assert!(
             repo.has_object(ObjectType::Commit, &head).await.unwrap(),
@@ -191,7 +195,7 @@ fn prune_with_locking_disabled_runs_while_a_transaction_is_open() {
         let repo = Repo::open(&repo_path).await.unwrap();
         commit_tree(&repo, dir.path(), "tree", "kept").await;
 
-        // With `locking` true this call is the contended one that times out.
+        // If `locking` is true, this call is the contended call that times out.
         let txn = repo.transaction().await.unwrap();
         let stats = repo
             .prune(&PruneOptions::new())

@@ -1,42 +1,13 @@
-//! Reachability traversal and loose-object enumeration.
+//! Walks of the objects that commits reach, and listings of loose objects.
 //!
-//! [`Repo::list_objects`] enumerates every loose object present under
-//! `objects/`. [`Repo::traverse_commit`] and [`Repo::traverse_reachable`] walk
-//! the Merkle DAG from one or more commits, collecting the [`ObjectName`] of
-//! every object reachable from them: the commit object, its root dirmeta, and
-//! recursively each dirtree, subdirectory dirmeta, and file object, following
-//! parent commits up to a caller-supplied depth. These are the primitives prune
-//! and fsck build on.
+//! - [`Repo::list_objects`] lists each loose object in `objects/`.
+//! - [`Repo::traverse_commit`] walks the objects that one commit and its
+//!   parents reach.
+//! - [`Repo::traverse_reachable`] walks the objects that a set of commits and
+//!   their parents reach.
 //!
-//! Depth follows the tool's observed semantics (recovered by running
-//! `ostree prune --refs-only --depth=N`): `depth` is the number of parent
-//! commits to follow. `depth = 0` keeps only the named commit; `depth = 1`
-//! keeps it and its immediate parent; `depth = -1` follows the whole ancestry.
-//! `-1` is the one negative value that follows the whole ancestry: every other
-//! negative depth keeps the named commit alone, which `ostree prune
-//! --refs-only --depth=-2` and `--depth=-3` show.
-//!
-//! A walk bounds the `parent` chain by depth or by time. `ParentBound::Since`
-//! follows the chain while each parent commit's own timestamp is at or after a
-//! chosen second count, which is what `ostree prune --keep-younger-than=DATE`
-//! does. A commit a root names is kept whatever its timestamp; the bound acts
-//! on the `parent` edge alone.
-//!
-//! Traversal is lenient about objects that are referenced but absent: a missing
-//! object's name is still collected (it is a reachable reference), but a missing
-//! or unparseable commit or dirtree cannot be descended into, so its children
-//! are not enumerated. [`traverse_commit`](Repo::traverse_commit) is the one
-//! exception: the commit the caller names must exist, else
-//! [`Error::ObjectNotFound`] is returned.
-//!
-//! A walk follows two further edges under `GcRoots`, which
-//! [`PruneOptions`](crate::PruneOptions) exposes. The commit `parent` edge is
-//! optional, and any number of metadata keys name further commits: the value of
-//! each configured key, in a commit's own metadata and in its detached
-//! metadata, is an `aay` whose elements are commit checksums. Each such commit
-//! is walked in turn, so a metadata-key edge reaches everything the commit it
-//! names reaches. A commit arrived at this way is a root in its own right and
-//! is given the walk's full depth, since depth counts parent hops.
+//! [`Repo::prune`](crate::Repo::prune) and [`Repo::fsck`](crate::Repo::fsck)
+//! use these listings and walks.
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, BorrowedFd};
@@ -49,47 +20,58 @@ use crate::error::{Error, Result};
 use crate::refs::walk_ref_dir;
 use crate::repo::Repo;
 
-/// The GVariant type a garbage-collection root metadata key holds: an array of
-/// commit checksums in their 32-byte binary form.
+/// The GVariant type of the value of a GC-root metadata key.
+///
+/// The value is an array of commit checksums, each in its 32-byte binary form.
 const GC_ROOT_SIGNATURE: &str = "aay";
 
-/// The bound a walk puts on one root's `parent` chain.
+/// The bound that a walk puts on the `parent` chain of one root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParentBound {
-    /// Follow this many more `parent` hops. `-1` is the whole ancestry and is
-    /// the one negative value the bound carries.
+    /// The number of `parent` hops that the walk can still follow.
+    ///
+    /// `-1` is the whole ancestry. It is the one negative value that the bound
+    /// holds.
     Depth(i32),
-    /// Follow the `parent` chain while each parent commit's own timestamp is at
-    /// or after this count of seconds since the Unix epoch.
+    /// A time in seconds since the Unix epoch.
+    ///
+    /// The walk follows the `parent` chain while the timestamp of each parent
+    /// commit is at or after this time. This is the bound of
+    /// `ostree prune --keep-younger-than=DATE`. A commit that a root names is
+    /// kept whatever its timestamp, because the bound acts on the `parent` edge
+    /// alone.
     Since(u64),
 }
 
 impl ParentBound {
-    /// The depth bound `depth` names: `-1` is the whole ancestry, and every
-    /// other negative value is the named commit alone.
+    /// Returns the depth bound for `depth`.
+    ///
+    /// `-1` is the whole ancestry. Each other negative value is the named
+    /// commit alone.
     pub(crate) fn depth(depth: i32) -> ParentBound {
         ParentBound::Depth(if depth == -1 { -1 } else { depth.max(0) })
     }
 }
 
-/// The bounds one commit takes from the weak refs that name it.
+/// The bounds that one commit takes from the weak refs that name it.
 ///
-/// At most one bound of each kind is held: the depth bound that follows the
-/// furthest and the earliest timestamp bound. A further bound of the same kind
-/// is dropped where a held bound already reaches at least as far, because
-/// [`Expanded::covers`] skips the expansion that bound asks for. The two kinds
-/// are held apart, because `covers` compares a depth with a depth and a
-/// timestamp with a timestamp.
+/// The struct holds at most one bound of each kind: the depth bound that
+/// reaches furthest, and the earliest timestamp bound. If a held bound reaches
+/// at least as far as a new bound of the same kind, the new bound is dropped.
+/// [`Expanded::covers`] skips the expansion of that new bound in any case.
+///
+/// The two kinds are held apart, because `covers` compares a depth with a
+/// depth and a timestamp with a timestamp.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct WeakBounds {
-    /// The furthest reaching depth bound, `-1` for the whole ancestry.
+    /// The depth bound that reaches furthest, `-1` for the whole ancestry.
     depth: Option<i32>,
     /// The earliest timestamp bound.
     since: Option<u64>,
 }
 
 impl WeakBounds {
-    /// Fold one more bound in.
+    /// Adds one more bound.
     pub(crate) fn add(&mut self, bound: ParentBound) {
         match bound {
             ParentBound::Depth(depth) => {
@@ -105,7 +87,7 @@ impl WeakBounds {
         }
     }
 
-    /// The bounds to seed, at most one of each kind.
+    /// Returns the bounds to seed, at most one of each kind.
     fn seeds(self) -> impl Iterator<Item = ParentBound> {
         self.depth
             .map(ParentBound::Depth)
@@ -114,72 +96,76 @@ impl WeakBounds {
     }
 }
 
-/// The directory of `refs/` one ref lives under.
+/// The directory under `refs/` that holds one ref.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefSpace {
-    /// A local ref, below `refs/heads`.
+    /// A local ref, under `refs/heads`.
     Heads,
-    /// A remote ref, below `refs/remotes`.
+    /// A remote ref, under `refs/remotes`.
     Remotes,
-    /// A mirror ref, below `refs/mirrors`.
+    /// A mirror ref, under `refs/mirrors`.
     Mirrors,
 }
 
-/// One ref a listing found, as [`Repo::list_all_refs`] reports it.
+/// One ref that [`Repo::list_all_refs`] found.
 #[derive(Debug)]
 pub(crate) struct ListedRef {
-    /// The directory of `refs/` the ref file lives under.
+    /// The directory under `refs/` that holds the ref file.
     pub(crate) space: RefSpace,
-    /// The name the listing gave the ref.
+    /// The name that the listing gave the ref.
     pub(crate) name: String,
-    /// Whether that name addresses the file it was listed from, by
-    /// [`crate::refs::listed_name_addresses_it`].
+    /// `true` if that name addresses the file that the listing read, by the
+    /// rule of [`listed_name_addresses_it`](crate::refs::listed_name_addresses_it).
     pub(crate) addressable: bool,
-    /// The commit the ref resolves to.
+    /// The commit that the ref resolves to.
     pub(crate) checksum: Checksum,
 }
 
-/// How the walk arrived at a commit.
+/// The kind of edge over which the walk arrived at a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arrival {
-    /// The commit is a root: a caller-supplied seed or a commit a metadata-key
-    /// edge names. The bound the arrival carries is the commit's own.
+    /// An arrival at a root: a seed of the caller, or a commit that a
+    /// metadata-key edge names. The bound of the arrival is the bound of the
+    /// commit itself.
     Root,
-    /// The commit was reached over a depth-bounded `parent` edge, so the bound
-    /// it carries is the one the child had left.
+    /// An arrival over a `parent` edge with a depth bound. The bound of the
+    /// arrival is the bound that the child had left.
     Parent,
-    /// The commit was reached over a [`ParentBound::Since`] `parent` edge, so
-    /// it is kept only while its own timestamp is at or after the bound.
+    /// An arrival over a `parent` edge with a [`ParentBound::Since`] bound. The
+    /// walk keeps the commit only while its timestamp is at or after the bound.
     TimedParent,
 }
 
 impl Arrival {
-    /// Whether the bound the arrival carries came down a `parent` edge.
+    /// Returns `true` if the bound of the arrival came over a `parent` edge.
     fn inherited(self) -> bool {
         self != Arrival::Root
     }
 }
 
-/// What the expansions of one commit have reached so far.
+/// The furthest bounds under which the walk expanded one commit.
 ///
-/// A commit is expanded again only under a bound that follows further than
-/// every bound it was expanded under, so each expansion strictly improves one
-/// of the first two fields and the walk terminates.
+/// The walk expands a commit again only under a bound that reaches further
+/// than each earlier bound of that commit. So each expansion strictly extends
+/// `depth` or `since`, and the walk ends.
 #[derive(Debug, Clone, Copy, Default)]
 struct Expanded {
-    /// The most reaching depth bound an expansion carried.
+    /// The depth bound of an expansion that reaches furthest.
     depth: Option<i32>,
-    /// The earliest timestamp bound an expansion carried.
+    /// The earliest timestamp bound of an expansion.
     since: Option<u64>,
-    /// The earliest timestamp bound a conditional arrival was rejected under.
-    /// The commit's own timestamp is below it, so every conditional arrival at
-    /// or above it is rejected too and needs no second read of the commit.
+    /// The earliest timestamp bound under which the walk rejected a
+    /// conditional arrival.
+    ///
+    /// The timestamp of the commit is below this bound. So the walk also
+    /// rejects each conditional arrival at or after this bound, and reads the
+    /// commit no second time.
     rejected_since: Option<u64>,
 }
 
 impl Expanded {
-    /// Whether an expansion already made follows at least as far as `bound`
-    /// would.
+    /// Returns `true` if an earlier expansion reaches at least as far as
+    /// `bound`.
     fn covers(&self, bound: ParentBound) -> bool {
         if self.depth == Some(-1) {
             return true;
@@ -192,8 +178,8 @@ impl Expanded {
         }
     }
 
-    /// Whether a conditional arrival under `bound` is already known to fall
-    /// below the commit's own timestamp.
+    /// Returns `true` if the walk already knows that the timestamp of the
+    /// commit is below `bound`, the bound of a conditional arrival.
     fn rejects(&self, bound: ParentBound) -> bool {
         match bound {
             ParentBound::Since(since) => self.rejected_since.is_some_and(|prev| since >= prev),
@@ -201,7 +187,7 @@ impl Expanded {
         }
     }
 
-    /// Record an expansion under `bound`.
+    /// Records an expansion under `bound`.
     fn record(&mut self, bound: ParentBound) {
         match bound {
             ParentBound::Depth(depth) => {
@@ -217,8 +203,8 @@ impl Expanded {
         }
     }
 
-    /// Record that a conditional arrival under `since` fell below the commit's
-    /// own timestamp.
+    /// Records that the timestamp of the commit is below `since`, the bound of
+    /// a conditional arrival.
     fn reject(&mut self, since: u64) {
         if self.rejected_since.is_none_or(|prev| prev > since) {
             self.rejected_since = Some(since);
@@ -226,32 +212,35 @@ impl Expanded {
     }
 }
 
-/// The edges a reachability walk follows out of a commit, beyond the objects its
-/// tree names.
+/// The edges that a walk follows out of a commit, in addition to the objects
+/// of its tree.
 #[derive(Debug, Clone)]
 pub(crate) struct GcRoots {
-    /// Metadata keys whose value names further reachable commits. Empty
-    /// configures the walk to read no metadata at all.
-    pub metadata_keys: Vec<String>,
-    /// Whether the commit `parent` edge is followed.
-    pub traverse_parent: bool,
-    /// Whether the objects a commit's tree names are reachable. False collects
-    /// commit names alone and reads no dirtree, which is the set
-    /// `prune --commit-only` consults.
-    pub traverse_tree: bool,
-    /// The commits weak refs name, each with the bounds those refs' own names
-    /// carry.
+    /// The metadata keys whose values name more reachable commits.
     ///
-    /// A weak ref is no seed, so an arrival at one of these commits is replaced
-    /// by a seed at the bounds recorded here. A commit several weak refs name
-    /// takes the bounds [`WeakBounds`] holds: the depth bound that follows the
-    /// furthest and the earliest timestamp bound.
+    /// If the list is empty, the walk reads no metadata.
+    pub metadata_keys: Vec<String>,
+    /// `true` if the walk follows the `parent` edge of a commit.
+    pub traverse_parent: bool,
+    /// `true` if the objects of the tree of a commit are reachable.
+    ///
+    /// If `false`, the walk collects commit names alone and reads no dirtree.
+    /// `prune --commit-only` sets it to `false`.
+    pub traverse_tree: bool,
+    /// The commits that weak refs name, each with the bounds of the names of
+    /// those refs.
+    ///
+    /// A weak ref is no seed. So the walk replaces an arrival at one of these
+    /// commits with a seed at the bounds recorded here. If several weak refs
+    /// name one commit, the commit takes the bounds that [`WeakBounds`] holds.
+    /// These are the depth bound that reaches furthest and the earliest
+    /// timestamp bound.
     pub weak_roots: HashMap<Checksum, WeakBounds>,
 }
 
 impl GcRoots {
-    /// The plain ostree walk: the `parent` edge, the trees, and no
-    /// metadata-key edges.
+    /// Returns the edges of the walk of the `ostree` command: the `parent`
+    /// edge, the trees, and no metadata-key edges.
     fn parents_only() -> GcRoots {
         GcRoots {
             metadata_keys: Vec::new(),
@@ -262,23 +251,31 @@ impl GcRoots {
     }
 }
 
+/// Methods that list objects and walk the objects that commits reach.
 impl Repo {
-    /// Enumerate every loose object present under `objects/`.
+    /// Returns the name of each loose object in `objects/`.
     ///
-    /// The `objects/<xx>/` fanout directories are scanned and each
-    /// `<62hex>.<ext>` entry is parsed into an [`ObjectName`]. Entries whose
-    /// name is not a valid loose object (a leftover `.tmp-` temporary, say) are
-    /// skipped.
+    /// The method reads each `objects/<xx>/` fanout directory and parses each
+    /// `<62hex>.<ext>` entry into an [`ObjectName`]. It skips an entry whose
+    /// name is not a loose object name, for example a leftover `.tmp-` file.
+    /// It also skips each entry of `objects/` that is not two hexadecimal
+    /// characters, and each name that is not UTF-8.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if the read of `objects/` or of a fanout directory
+    ///   fails. A fanout directory that is removed during the listing is
+    ///   skipped.
     pub async fn list_objects(&self) -> Result<HashSet<ObjectName>> {
         let repo = self.clone();
         ostrya_rt::unblock(move || list_objects_blocking(repo.objects_fd())).await
     }
 
-    /// List the checksums of the loose objects of one type, sorted.
+    /// Returns the checksums of the loose objects of one type, in sorted order.
     ///
-    /// The enumeration is the one [`list_objects`](Repo::list_objects) makes,
-    /// with the type read off the entry's extension before its name is parsed,
-    /// so a caller after one type pays for no other type's name.
+    /// The listing is the listing of [`list_objects`](Repo::list_objects). It
+    /// reads the type from the extension of an entry before it parses the
+    /// name. So the method parses no name of another type.
     pub(crate) async fn list_objects_of_type(&self, ty: ObjectType) -> Result<Vec<Checksum>> {
         let repo = self.clone();
         let mut names = ostrya_rt::unblock(move || -> Result<Vec<Checksum>> {
@@ -295,10 +292,11 @@ impl Repo {
         Ok(names)
     }
 
-    /// Count the loose objects under `objects/` whose type `keep` admits.
+    /// Returns the number of loose objects in `objects/` whose type `keep`
+    /// accepts.
     ///
-    /// The enumeration is the one [`list_objects`](Repo::list_objects) makes
-    /// and holds no name, so a caller that needs a total alone pays for no set.
+    /// The listing is the listing of [`list_objects`](Repo::list_objects). It
+    /// keeps no name, so a caller that needs only the total builds no set.
     pub(crate) async fn count_objects<F>(&self, keep: F) -> Result<usize>
     where
         F: Fn(ObjectType) -> bool + Send + 'static,
@@ -307,9 +305,39 @@ impl Repo {
         ostrya_rt::unblock(move || count_objects_blocking(repo.objects_fd(), keep)).await
     }
 
-    /// Collect every object reachable from `commit`, following parent commits up
-    /// to `max_depth` (`-1` for the whole ancestry). The named commit must
-    /// exist; a parent that is absent stops that chain without error.
+    /// Returns the name of each object that `commit` and its parents reach.
+    ///
+    /// The set holds the commit, its root dirmeta, and each dirtree, dirmeta,
+    /// and file object of its tree. It holds the same objects for each parent
+    /// commit that the walk follows. The repository must hold `commit`.
+    ///
+    /// If a parent commit is absent, the set holds its name, and the walk of
+    /// that chain stops without an error. Other absent objects follow the rules
+    /// of [`traverse_reachable`](Repo::traverse_reachable).
+    ///
+    /// # Depth
+    ///
+    /// `max_depth` is the number of parent commits that the walk follows:
+    ///
+    /// - `0`: the named commit alone.
+    /// - `1`: the named commit and its parent.
+    /// - `N`: the named commit and `N` parents.
+    /// - `-1`: the whole ancestry.
+    /// - Each other negative value: the named commit alone.
+    ///
+    /// The `ostree` command uses the same depths, as
+    /// `ostree prune --refs-only --depth=N` shows. `--depth=-2` and
+    /// `--depth=-3` keep the named commit alone.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if the repository does not hold `commit`.
+    /// - [`Error::Core`] if a commit or a dirtree that the walk reads does not
+    ///   parse.
+    /// - [`Error::Io`] if a read of the object store fails. This includes a
+    ///   commit or a dirtree that is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or that is not a
+    ///   regular file.
     pub async fn traverse_commit(
         &self,
         commit: &Checksum,
@@ -335,9 +363,38 @@ impl Repo {
         Ok(reachable)
     }
 
-    /// Collect every object reachable from any of `roots`, each followed to
-    /// `max_depth` parents. Roots that are absent are skipped, so a dangling ref
-    /// does not fail the walk.
+    /// Returns the name of each object that one of `roots` and its parents
+    /// reach.
+    ///
+    /// For each root, the set holds the objects that
+    /// [`traverse_commit`](Repo::traverse_commit) collects. If two roots reach
+    /// one commit, the walk follows its parents under the depth that reaches
+    /// further. So the result does not depend on the order of `roots`.
+    ///
+    /// # Depth
+    ///
+    /// `max_depth` applies to each root. `0` is the root alone, `N` is the root
+    /// and `N` parents, and `-1` is the whole ancestry. Each other negative
+    /// value is the root alone.
+    ///
+    /// # Missing objects
+    ///
+    /// - The set holds the name of each object that a reached object refers
+    ///   to, also if the repository does not hold that object.
+    /// - If a commit or a dirtree is absent, the walk cannot read its children.
+    ///   So the set holds no object below it.
+    /// - An absent root causes no error, so a ref to an absent commit does not
+    ///   stop the walk.
+    /// - The walk does not look up dirmeta objects and file objects.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Core`] if a commit or a dirtree that the walk reads does not
+    ///   parse.
+    /// - [`Error::Io`] if a read of the object store fails. This includes a
+    ///   commit or a dirtree that is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or that is not a
+    ///   regular file.
     pub async fn traverse_reachable(
         &self,
         roots: impl IntoIterator<Item = Checksum>,
@@ -354,24 +411,28 @@ impl Repo {
         .await
     }
 
-    /// Collect every object reachable from any of `roots` under the edges `gc`
-    /// names. This is [`traverse_reachable`](Repo::traverse_reachable) with the
-    /// `parent` edge made optional and the metadata-key edges added.
+    /// Returns the name of each object that one of `roots` reaches over the
+    /// edges of `gc`.
     ///
-    /// Each root carries its own bound, so one walk holds a branch cut to a
-    /// depth beside a branch kept in full. `root_bound` is the bound every
-    /// commit a metadata-key edge names is seeded at.
+    /// The walk is the walk of
+    /// [`traverse_reachable`](Repo::traverse_reachable), with an optional
+    /// `parent` edge and with the metadata-key edges.
     ///
-    /// `bounded_roots` names the commits whose bound is a property of the
-    /// commit and not of the path that reached it: the walk drops every
-    /// `parent`-edge arrival at one of them and leaves the expansion to the
-    /// seed, so the bound the arrival inherited is replaced rather than
-    /// narrowed. Every checksum in it must also be a seed in `roots`.
+    /// Each root has its own bound. So one walk can cut one branch to a depth
+    /// and keep another branch in full. The walk seeds each commit that a
+    /// metadata-key edge names at `root_bound`.
     ///
-    /// `pending_delete` names a commit the walk reads as absent. Prune unlinks
-    /// the commit it deletes only once the walk has succeeded, and this keeps
-    /// the walk's result the same as one run against the store the unlink
-    /// leaves: the commit's own name is reachable, and nothing under it is.
+    /// `bounded_roots` names the commits whose bound belongs to the commit,
+    /// and not to the path that reached it. The walk drops each `parent`-edge
+    /// arrival at one of these commits, and the seed does the expansion. So the
+    /// seed replaces the inherited bound. Each checksum in `bounded_roots` must
+    /// also be a seed in `roots`.
+    ///
+    /// `pending_delete` names a commit that the walk reads as absent. Prune
+    /// unlinks the commit that it deletes only after the walk succeeds. With
+    /// `pending_delete`, the result is the result of a walk of the store after
+    /// the unlink. The name of the commit is reachable, and nothing below it
+    /// is.
     pub(crate) async fn traverse_reachable_gc(
         &self,
         roots: impl IntoIterator<Item = (Checksum, ParentBound)>,
@@ -397,44 +458,50 @@ impl Repo {
         Ok(reachable)
     }
 
-    /// The shared reachability walk. `seeds` pairs each root commit with the
-    /// bound its `parent` chain follows and with the kind of arrival it is.
-    /// Names are added for every referenced object; recursion into a commit or
-    /// dirtree needs the object to load, so an absent or corrupt one
-    /// contributes its own name but none beneath it.
+    /// Adds to `reachable` the name of each object that `seeds` reach.
     ///
-    /// A commit reached from more than one root is expanded under the furthest
-    /// reaching bound any root gives it, so the reachable set does not depend on
-    /// the order roots are supplied in: a commit already expanded under a bound
-    /// that follows at least as far is skipped, otherwise it is expanded again
-    /// to push its parent further back.
+    /// `seeds` pairs each root commit with the bound of its `parent` chain and
+    /// with the kind of its arrival. The walk adds the name of each object that
+    /// a reached object refers to. To read the children of a commit or a
+    /// dirtree, the walk must load it. So an absent commit or dirtree adds its
+    /// own name and no name below it. A commit or a dirtree that does not
+    /// parse stops the walk with an error.
     ///
-    /// A commit `bounded_roots` names carries its own bound. Every
-    /// `parent`-edge arrival at one is dropped, so the seed's bound stands in
-    /// place of the bound the arrival inherited.
+    /// If more than one root reaches a commit, the walk expands the commit
+    /// under the bound that reaches furthest. So the reachable set does not
+    /// depend on the order of the roots. If an earlier expansion of the commit
+    /// reaches at least as far, the walk skips the arrival. Otherwise it
+    /// expands the commit again, to follow its parents further.
     ///
-    /// A commit `gc.weak_roots` names carries its own bounds as well, and
-    /// enters the walk through no seed of the caller's. The first arrival at
-    /// one pushes a seed for each bound the map records, at most one of each
-    /// kind. A `parent`-edge arrival
-    /// is then dropped the way a `bounded_roots` arrival is, so the pushed
-    /// seeds stand in place of the bound the arrival inherited. An arrival that
-    /// is a root in its own right stands, and the commit expands under the
-    /// arrival's bound and under the pushed seeds alike. The pushed seeds go
-    /// through the same memoization as every other entry: a commit already
-    /// expanded under a bound that reaches at least as far is skipped, and one
-    /// reached under a longer bound is expanded again. A commit takes its weak
-    /// seeds once, and each extra entry is either skipped or strictly improves
-    /// the recorded depth or timestamp, so the walk terminates.
+    /// A commit that `bounded_roots` names has its own bound. The walk drops
+    /// each `parent`-edge arrival at such a commit. So the bound of the seed
+    /// replaces the bound that the arrival inherited.
     ///
-    /// A conditional arrival is one a [`ParentBound::Since`] parent edge made.
-    /// It contributes nothing at all where the commit's own timestamp is below
-    /// the bound, and no expansion is recorded for it, so a root naming that
-    /// same commit still keeps it. The rejection itself is memoized, so a
-    /// second child arriving under the same bound reads no commit.
+    /// A commit that `gc.weak_roots` names also has its own bounds, and no
+    /// seed of the caller adds it to the walk. The first arrival at such a
+    /// commit pushes one seed for each bound that the map records, at most
+    /// one of each kind. Then the walk drops a `parent`-edge arrival as it
+    /// drops one for `bounded_roots`, so the pushed seeds replace the
+    /// inherited bound.
     ///
-    /// `root_bound` is the bound every commit a metadata-key edge names is
-    /// seeded at. `pending_delete` names a commit that is read as absent.
+    /// An arrival at a weak-ref commit that is a root itself stays. The commit
+    /// expands under the bound of the arrival and under the pushed seeds. The
+    /// pushed seeds go through the same memoization as each other entry. The
+    /// walk skips a commit that an earlier expansion covers, and expands again
+    /// a commit that a further bound reaches.
+    ///
+    /// A commit takes its weak seeds once. Each extra entry is either skipped
+    /// or strictly extends the recorded depth or timestamp. So the walk ends.
+    ///
+    /// A conditional arrival is an arrival over a [`ParentBound::Since`]
+    /// `parent` edge. If the timestamp of the commit is below the bound, the
+    /// arrival adds nothing and records no expansion. So a root that names the
+    /// same commit still keeps it. The walk memoizes the rejection, so a second
+    /// child that arrives under the same bound reads no commit.
+    ///
+    /// The walk seeds each commit that a metadata-key edge names at
+    /// `root_bound`. The walk reads the commit `pending_delete` names as
+    /// absent.
     async fn collect_reachable(
         &self,
         seeds: Vec<(Checksum, ParentBound, Arrival)>,
@@ -447,24 +514,24 @@ impl Repo {
         let mut commit_stack = seeds;
         let mut seen_commits: HashMap<Checksum, Expanded> = HashMap::new();
         let mut seen_dirtrees: HashSet<Checksum> = HashSet::new();
-        // The commits a weak-ref seed was pushed for. A pushed seed matches
-        // `weak_roots` again on its own pop, so the set is what stops the walk
-        // from pushing it a second time.
+        // The commits for which the walk pushed a weak-ref seed. A pushed seed
+        // matches `weak_roots` again when the walk pops it. This set stops the
+        // walk from a second push of the seed.
         let mut weak_seeded: HashSet<Checksum> = HashSet::new();
 
         while let Some((commit_checksum, bound, arrival)) = commit_stack.pop() {
-            // A weak ref's commit takes the bound that ref's own name carries,
-            // the moment the walk reaches it over any edge. The seed is a
-            // `Root` arrival, so the bound is the commit's own and the commit
-            // is kept whatever its timestamp under a `Since` bound, which is
-            // what a strong ref's target already gets.
+            // When the walk reaches the commit of a weak ref over any edge,
+            // the commit takes the bound of the name of that ref. The seed is
+            // a `Root` arrival, so the bound belongs to the commit. Under a
+            // `Since` bound, the walk keeps the commit whatever its timestamp,
+            // as it keeps the target of a strong ref.
             //
-            // The test stands ahead of the `inherited` drop below and covers
-            // every arrival kind. A metadata-key edge pushes a `Root` arrival
-            // at the run's global bound, so a rule keyed on `inherited` alone
-            // would let that arrival expand the commit at the global bound
-            // while the weak ref's own bound reaches further, and the sweep
-            // would then take the ancestry of a ref that still stands.
+            // This test comes before the `inherited` drop and applies to each
+            // kind of arrival. A metadata-key edge pushes a `Root` arrival at
+            // the global bound of the run. If the rule tested `inherited`
+            // alone, that arrival can expand the commit at the global bound
+            // while the bound of the weak ref reaches further. Then the sweep
+            // deletes the ancestry of a ref that stays.
             if let Some(bounds) = gc.weak_roots.get(&commit_checksum)
                 && weak_seeded.insert(commit_checksum)
             {
@@ -473,11 +540,11 @@ impl Repo {
                 }
             }
 
-            // A commit that carries its own bound takes it whatever the
-            // `parent` edge that reached it had left. The seed holds that
-            // bound, so the arrival is dropped here and the seed's expansion
-            // stands for it. A weak ref's commit is dropped on the same terms:
-            // the seed pushed above holds its bound.
+            // A commit with its own bound takes that bound, whatever bound the
+            // `parent` edge had left. The seed holds that bound. So the walk
+            // drops the arrival here, and the expansion of the seed replaces
+            // it. The walk drops an arrival at the commit of a weak ref in the
+            // same way, because the pushed weak-ref seed holds its bound.
             if arrival.inherited()
                 && (bounded_roots.contains(&commit_checksum)
                     || gc.weak_roots.contains_key(&commit_checksum))
@@ -502,10 +569,10 @@ impl Repo {
                 self.try_load_commit(&commit_checksum).await?
             };
 
-            // A commit the timestamp bound rules out is not kept and no
-            // expansion is recorded for it, so a ref naming it still reaches
-            // it. The rejection is recorded, so a second child under the same
-            // bound does not read the commit again.
+            // The walk does not keep a commit that the timestamp bound rejects,
+            // and records no expansion for it. So a ref that names the commit
+            // still reaches it. The walk records the rejection, so a second
+            // child under the same bound does not read the commit again.
             if arrival == Arrival::TimedParent
                 && let ParentBound::Since(since) = bound
                 && let Some(commit) = &loaded
@@ -567,9 +634,11 @@ impl Repo {
         Ok(())
     }
 
-    /// Walk a dirtree subtree, collecting the name of every dirtree, dirmeta,
-    /// and file reachable from it. A dirtree that cannot be loaded contributes
-    /// its own name only.
+    /// Adds to `reachable` the name of each dirtree, dirmeta, and file object
+    /// that `root_dirtree` reaches.
+    ///
+    /// An absent dirtree adds its own name only. A dirtree that does not parse
+    /// stops the walk with an error.
     async fn walk_tree(
         &self,
         root_dirtree: Checksum,
@@ -597,15 +666,17 @@ impl Repo {
         Ok(())
     }
 
-    /// Collect the names of one tree: the root dirmeta, the root dirtree, and
-    /// every dirtree, dirmeta, and file object they reach.
+    /// Adds the names of one tree to `seen` and `out`.
     ///
-    /// A name that `seen` holds is skipped, and so is the subtree below a
-    /// dirtree that `seen` holds, so several trees share one walk. Each new
-    /// name goes into `seen` and onto the end of `out`.
+    /// The names are the root dirmeta, the root dirtree, and each dirtree,
+    /// dirmeta, and file object that they reach. The walk skips a name that
+    /// `seen` holds, and the subtree below a dirtree that `seen` holds. So
+    /// several trees share one walk. Each new name goes into `seen` and onto
+    /// the end of `out`.
     ///
     /// The walk is strict: a dirtree or a dirmeta that the repository does
-    /// not hold is [`Error::ObjectNotFound`]. A file object is not looked up.
+    /// not hold is [`Error::ObjectNotFound`]. The walk does not look up file
+    /// objects.
     ///
     /// The walk loads up to [`STRICT_TREE_LOADS`] dirtrees at the same time.
     /// It takes them from its stack in order, and it reads their entries in
@@ -650,8 +721,10 @@ impl Repo {
         Ok(())
     }
 
-    /// Add the dirmeta `checksum` to `seen` and `out` when `seen` does not
-    /// hold it. A dirmeta that the repository does not hold is
+    /// Adds the dirmeta `checksum` to `seen` and `out` if `seen` does not
+    /// hold it.
+    ///
+    /// A dirmeta that the repository does not hold is
     /// [`Error::ObjectNotFound`].
     #[cfg(feature = "push")]
     async fn collect_dirmeta_strict(
@@ -674,19 +747,22 @@ impl Repo {
         Ok(())
     }
 
-    /// Push every commit the configured metadata keys name onto the walk.
+    /// Pushes onto the walk each commit that the configured metadata keys
+    /// name.
     ///
-    /// Each key is read from `metadata`, the commit's own, and then from its
-    /// detached metadata, so one key name carries edges from both. A key no
-    /// dict holds contributes nothing. A key that is present and does not hold
-    /// an `aay` of 32-byte checksums fails the walk with
-    /// [`Error::InvalidGcRoot`], because a value the walk cannot read is an
-    /// edge it cannot follow, and objects would be deleted for it.
+    /// The method reads each key from `metadata`, the metadata of the commit,
+    /// and then from its detached metadata. So one key name gives edges from
+    /// both. A key that no dict holds adds nothing.
     ///
-    /// The detached metadata is read once per expansion of a commit, and only
-    /// for a walk that has metadata keys configured. A commit reached again at
-    /// a depth that follows more parents is expanded a second time and read
-    /// again.
+    /// If a key is present and does not hold an `aay` of 32-byte checksums,
+    /// the walk fails with [`Error::InvalidGcRoot`]. If the walk does not
+    /// follow an edge, a sweep deletes the objects of that edge. So a value
+    /// that the walk cannot read stops the walk.
+    ///
+    /// The method reads the detached metadata once for each expansion of a
+    /// commit, and only if the walk has metadata keys. The walk can reach a
+    /// commit again at a depth that follows more parents. It then expands the
+    /// commit a second time and reads the detached metadata again.
     async fn push_metadata_key_edges(
         &self,
         commit: &Checksum,
@@ -709,8 +785,9 @@ impl Repo {
         Ok(())
     }
 
-    /// Load and parse a commit, treating an absent object as `None` rather than
-    /// an error, for the lenient traversal walk.
+    /// Loads and parses a commit for the lenient walk.
+    ///
+    /// Returns `None` if the repository does not hold the commit.
     async fn try_load_commit(&self, checksum: &Checksum) -> Result<Option<Commit>> {
         match self.load_object_bytes(ObjectType::Commit, checksum).await {
             Ok(bytes) => Ok(Some(Commit::parse(&bytes)?)),
@@ -719,7 +796,7 @@ impl Repo {
         }
     }
 
-    /// Load and parse a dirtree, treating an absent object as `None`.
+    /// Loads and parses a dirtree, or returns `None` if it is absent.
     async fn try_load_dirtree(&self, checksum: &Checksum) -> Result<Option<ostrya_core::DirTree>> {
         match self.load_dirtree(checksum).await {
             Ok(dirtree) => Ok(Some(dirtree)),
@@ -728,9 +805,10 @@ impl Repo {
         }
     }
 
-    /// Collect the commit checksum every ref resolves to, across
-    /// `refs/heads`, `refs/remotes`, and `refs/mirrors`. Used to seed prune and
-    /// fsck with the set of refs' targets.
+    /// Returns the commit checksum of each ref in `refs/heads`,
+    /// `refs/remotes`, and `refs/mirrors`.
+    ///
+    /// Prune and fsck seed their walks with these targets.
     pub(crate) async fn list_all_ref_targets(&self) -> Result<Vec<Checksum>> {
         Ok(self
             .list_all_refs()
@@ -740,18 +818,20 @@ impl Repo {
             .collect())
     }
 
-    /// Collect every ref across `refs/heads`, `refs/remotes`, and
-    /// `refs/mirrors`.
+    /// Returns each ref in `refs/heads`, `refs/remotes`, and `refs/mirrors`.
     ///
-    /// A local ref is named by its path under `refs/heads`, so a nested name
-    /// keeps its `/`. A remote ref is named by its `<remote>:<name>` refspec. A
-    /// mirror ref is named by its path under `refs/mirrors`, which is the
-    /// collection id and the ref name below it. Each ref also reports whether
-    /// the name it was given addresses the file it was listed from, which is
-    /// the test a caller that reads or unlinks a ref by its name needs. Prune
-    /// reads the names to decide which branch a depth applies to, and reads the
-    /// [`RefSpace`] and the addressability to decide which refs its classifier
-    /// sees.
+    /// The name of each kind of ref:
+    ///
+    /// - A local ref: its path under `refs/heads`. A nested name keeps its `/`.
+    /// - A remote ref: its `<remote>:<name>` refspec.
+    /// - A mirror ref: its path under `refs/mirrors`, that is the collection id
+    ///   and the ref name below it.
+    ///
+    /// Each ref also tells if its name addresses the file that the listing
+    /// read. A caller that reads or unlinks a ref by its name needs this check.
+    /// Prune reads the names to find the branch that a depth applies to. It
+    /// reads the [`RefSpace`] and the addressability to find the refs that its
+    /// classifier sees.
     pub(crate) async fn list_all_refs(&self) -> Result<Vec<ListedRef>> {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
@@ -769,18 +849,15 @@ impl Repo {
     }
 }
 
-/// Read one metadata key's value as the list of commits it names.
+/// The maximum number of dirtrees that [`Repo::collect_tree_strict`] loads at
+/// the same time.
 ///
-/// The value is the variant an `a{sv}` entry holds. It has to carry an `aay`
-/// whose every element is a 32-byte commit checksum; anything else is an
-/// [`Error::InvalidGcRoot`] naming the commit the value came from.
-/// The most dirtrees that [`Repo::collect_tree_strict`] loads at the same
-/// time. Each load holds one dirtree object, which the format caps in size,
-/// so the loads hold at most this many objects in memory.
+/// Each load holds one dirtree object, and the format caps its size. So the
+/// loads hold at most this many objects in memory.
 #[cfg(feature = "push")]
 const STRICT_TREE_LOADS: usize = 8;
 
-/// Run `futures` at the same time, and give their outputs in the order of
+/// Runs `futures` at the same time and returns their outputs in the order of
 /// `futures`.
 #[cfg(feature = "push")]
 async fn join_all<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output> {
@@ -812,6 +889,11 @@ async fn join_all<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Out
         .collect()
 }
 
+/// Returns the commits that the value of one metadata key names.
+///
+/// The value is the variant that an `a{sv}` entry holds. It must hold an `aay`
+/// in which each element is a 32-byte commit checksum. Any other value is an
+/// [`Error::InvalidGcRoot`] that names the commit of the value.
 fn metadata_key_targets(commit: &Checksum, key: &str, value: &Value) -> Result<Vec<Checksum>> {
     let invalid = |reason: String| Error::InvalidGcRoot {
         commit: *commit,
@@ -842,9 +924,11 @@ fn metadata_key_targets(commit: &Checksum, key: &str, value: &Value) -> Result<V
     Ok(targets)
 }
 
-/// Whether a commit already expanded at remaining depth `prev` follows at least
-/// as many parents as a fresh arrival at remaining depth `depth`. A negative
-/// depth is unbounded and dominates any finite depth.
+/// Returns `true` if an expansion at remaining depth `prev` follows at least
+/// as many parents as a new arrival at remaining depth `depth`.
+///
+/// A negative depth has no bound, so it reaches further than each finite
+/// depth.
 pub(crate) fn reaches_at_least(prev: i32, depth: i32) -> bool {
     if prev < 0 {
         true
@@ -855,23 +939,24 @@ pub(crate) fn reaches_at_least(prev: i32, depth: i32) -> bool {
     }
 }
 
-/// Call `f` with the [`ObjectName`] of each loose object under an `objects/`
-/// directory fd.
+/// Calls `f` with the [`ObjectName`] of each loose object under the
+/// `objects/` directory `objects_fd`.
 ///
-/// `keep` is read off the entry's extension, before its checksum is parsed, so
-/// a caller after one type pays for no other type's hexadecimal.
+/// The function calls `keep` with the type from the extension of the entry,
+/// before it parses the checksum. So it parses no hexadecimal name of another
+/// type.
 ///
-/// The enumeration holds one directory open at a time and borrows each entry
-/// name from the reader, so it allocates nothing per object.
+/// The listing holds one directory open at a time and borrows each entry name
+/// from the reader. So it makes no allocation for each object.
 fn for_each_object(
     objects_fd: BorrowedFd<'_>,
     keep: impl Fn(ObjectType) -> bool,
     mut f: impl FnMut(ObjectName),
 ) -> Result<()> {
     for_each_dir_name(objects_fd, |fanout| {
-        // Object fanout directories are exactly two hex characters; anything
-        // else under `objects/` (a stray file, a cache directory) is not a
-        // loose-object fanout.
+        // The name of a fanout directory is two hexadecimal characters. Any
+        // other entry of `objects/` (a stray file, a cache directory) is not
+        // a fanout directory.
         if fanout.len() != 2 || !fanout.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Ok(());
         }
@@ -894,7 +979,8 @@ fn for_each_object(
     })
 }
 
-/// Enumerate loose objects under an `objects/` directory fd.
+/// Returns the name of each loose object under the `objects/` directory
+/// `objects_fd`.
 fn list_objects_blocking(objects_fd: BorrowedFd<'_>) -> Result<HashSet<ObjectName>> {
     let mut out = HashSet::new();
     for_each_object(
@@ -907,8 +993,10 @@ fn list_objects_blocking(objects_fd: BorrowedFd<'_>) -> Result<HashSet<ObjectNam
     Ok(out)
 }
 
-/// Count the loose objects under an `objects/` directory fd whose type `keep`
-/// admits, holding no name.
+/// Returns the number of loose objects under the `objects/` directory
+/// `objects_fd` whose type `keep` accepts.
+///
+/// The count keeps no name.
 fn count_objects_blocking(
     objects_fd: BorrowedFd<'_>,
     keep: impl Fn(ObjectType) -> bool,
@@ -920,9 +1008,10 @@ fn count_objects_blocking(
     Ok(count)
 }
 
-/// Parse one `objects/<fanout>/<rest>.<ext>` entry into an [`ObjectName`], or
-/// `None` when the name is not a valid loose object or `keep` refuses its
-/// type.
+/// Parses one `objects/<fanout>/<rest>.<ext>` entry into an [`ObjectName`].
+///
+/// Returns `None` if the name is not a loose object name, or if `keep` refuses
+/// its type.
 fn parse_object_entry(
     fanout: &str,
     entry: &str,
@@ -943,8 +1032,10 @@ fn parse_object_entry(
     Some(ObjectName::new(checksum, ty))
 }
 
-/// Call `f` with the name of each entry of an open directory, skipping `.` and
-/// `..`. The name borrows the reader's own buffer.
+/// Calls `f` with the name of each entry of an open directory, except `.` and
+/// `..`.
+///
+/// The name borrows the buffer of the reader.
 fn for_each_dir_name(dir: BorrowedFd<'_>, mut f: impl FnMut(&str) -> Result<()>) -> Result<()> {
     let reader = rustix::fs::Dir::read_from(dir).map_err(|e| Error::Io(e.into()))?;
     for entry in reader {
@@ -953,8 +1044,8 @@ fn for_each_dir_name(dir: BorrowedFd<'_>, mut f: impl FnMut(&str) -> Result<()>)
         if bytes == b"." || bytes == b".." {
             continue;
         }
-        // Object and fanout names are ASCII and a ref name is UTF-8; anything
-        // else is neither a loose object nor a ref.
+        // Object names and fanout names are ASCII, and a ref name is UTF-8.
+        // Any other name is not a loose object and not a ref.
         if let Ok(name) = std::str::from_utf8(bytes) {
             f(name)?;
         }
@@ -962,7 +1053,7 @@ fn for_each_dir_name(dir: BorrowedFd<'_>, mut f: impl FnMut(&str) -> Result<()>)
     Ok(())
 }
 
-/// Read the entry names of an open directory, skipping `.` and `..`.
+/// Returns the entry names of an open directory, except `.` and `..`.
 pub(crate) fn read_dir_names(dir: BorrowedFd<'_>) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for_each_dir_name(dir, |name| {
@@ -972,10 +1063,11 @@ pub(crate) fn read_dir_names(dir: BorrowedFd<'_>) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Recursively collect each ref file under `top`, following the `refs/`
-/// subtree. Alias symlinks are followed; a dangling one is skipped. A ref under
-/// `refs/remotes` takes its `<remote>:<name>` refspec, and a ref under either
-/// of the other two takes its path below `top`.
+/// Adds to `out` each ref file in the tree under `top`.
+///
+/// The walk follows alias symlinks and skips a dangling symlink. A ref under
+/// `refs/remotes` takes its `<remote>:<name>` refspec as its name. A ref under
+/// `refs/heads` or `refs/mirrors` takes its path below `top`.
 fn collect_named_refs(
     repo_fd: BorrowedFd<'_>,
     space: RefSpace,
@@ -998,7 +1090,7 @@ fn collect_named_refs(
                 RefSpace::Remotes => entry.path.replacen('/', ":", 1),
                 RefSpace::Heads | RefSpace::Mirrors => entry.path.to_owned(),
             };
-            // A mirror entry answers false by construction: no refspec maps to
+            // A mirror entry always gives `false`, because no refspec maps to
             // a path below `refs/mirrors`.
             let addressable = crate::refs::listed_name_addresses_it(&name, top, entry.path);
             out.push(ListedRef {
@@ -1012,11 +1104,14 @@ fn collect_named_refs(
     })
 }
 
-/// The largest ref file the reader will load; a ref is 65 bytes.
+/// The largest ref file that the reader loads, in bytes.
+///
+/// A ref file is 65 bytes.
 const REF_READ_CAP: u64 = 4096;
 
-/// Read a ref file's target checksum relative to `dir`, following alias
-/// symlinks; `None` when the file is absent.
+/// Returns the target checksum of the ref file `name` in `dir`.
+///
+/// The read follows alias symlinks. Returns `None` if the file is absent.
 fn read_ref_target(dir: BorrowedFd<'_>, name: &str) -> Result<Option<Checksum>> {
     use std::io::Read;
     let fd = match rustix::fs::openat(dir, name, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()) {

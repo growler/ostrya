@@ -1,12 +1,18 @@
 //! Prune with a weak-ref classifier.
 //!
-//! `PruneOptions::weak_ref_filter` splits the refs under `refs/heads` and the
-//! refs under `refs/remotes` into strong refs, which root the walk, and weak
-//! refs, which root nothing. A weak ref survives where the walk reaches its
-//! commit over some other edge, and the run unlinks it otherwise. A ref under
-//! `refs/mirrors` is strong and never reaches the classifier. The classifier is
-//! a port extension with no counterpart in the `ostree` tool, so these
-//! repositories are built and pruned with the port alone.
+//! `PruneOptions::weak_ref_filter` sorts the refs under `refs/heads` and
+//! `refs/remotes` into strong refs and weak refs. A strong ref roots the walk.
+//! A weak ref roots nothing.
+//!
+//! If the walk reaches the commit of a weak ref over another edge, the weak ref
+//! survives. If not, the run unlinks the weak ref. A ref under `refs/mirrors`
+//! is strong and never reaches the classifier.
+//!
+//! Rule B: if the walk reaches the commit of a weak ref, the walk restarts at
+//! that commit under the own bound of the weak ref.
+//!
+//! The classifier is an ostrya extension that the `ostree` command does not
+//! have. The tests build and prune each repository with ostrya alone.
 
 mod common;
 
@@ -24,17 +30,18 @@ use ostrya_rt::block_on;
 /// A fixed timestamp, so the commits are reproducible.
 const FIXED_TS: u64 = 1_700_000_000;
 
-/// The metadata key these tests configure as a GC root.
+/// The metadata key that these tests configure as a GC root.
 const GC_ROOTS: &str = "test.gc-roots";
 
-/// Write a one-file tree at `dir`, its content naming it.
+/// Writes a tree of one file at `base/<name>`. The file content is the name.
 fn write_tree(base: &Path, name: &str) {
     let dir = base.join(name);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("payload.txt"), format!("{name}\n")).unwrap();
 }
 
-/// An `a{sv}` holding one key whose value is an `aay` of commit checksums.
+/// Returns an `a{sv}` with one key. The value of the key is an `aay` of commit
+/// checksums.
 fn checksum_list(key: &str, commits: &[Checksum]) -> Value {
     let elements = commits
         .iter()
@@ -43,7 +50,8 @@ fn checksum_list(key: &str, commits: &[Checksum]) -> Value {
     dict(key, Type::parse("aay").unwrap(), Value::Array(elements))
 }
 
-/// An `a{sv}` holding one key of the caller's type and value.
+/// Returns an `a{sv}` with one key, of the type and the value that the caller
+/// gives.
 fn dict(key: &str, ty: Type, value: Value) -> Value {
     Value::Array(vec![Value::Tuple(vec![
         Value::Str(key.to_owned()),
@@ -51,8 +59,9 @@ fn dict(key: &str, ty: Type, value: Value) -> Value {
     ])])
 }
 
-/// Commit the tree `base/<name>` into `repo`, with the given parent, metadata,
-/// and, where `branch` names one, a ref pointing at the result.
+/// Commits the tree `base/<name>` into `repo` with the given parent and
+/// metadata. If `branch` names a ref, the transaction also sets that ref to the
+/// new commit.
 async fn commit(
     repo: &Repo,
     base: &Path,
@@ -95,7 +104,8 @@ async fn commit(
     commit
 }
 
-/// A repository under `base/repo` with the trees `base/<name>` written.
+/// Writes the trees `base/<name>` and creates an archive repository at
+/// `base/repo`.
 async fn repo_with_trees(base: &Path, names: &[&str]) -> Repo {
     for name in names {
         write_tree(base, name);
@@ -105,24 +115,26 @@ async fn repo_with_trees(base: &Path, names: &[&str]) -> Repo {
         .unwrap()
 }
 
-/// Whether the repository still holds `commit` as an object.
+/// Returns `true` if the repository still holds the commit object `commit`.
 async fn holds(repo: &Repo, commit: &Checksum) -> bool {
     repo.has_object(ObjectType::Commit, commit).await.unwrap()
 }
 
-/// The root dirtree checksum of a stored commit.
+/// Returns the checksum of the root dirtree of a stored commit.
 async fn commit_root(repo: &Repo, commit: &Checksum) -> Checksum {
     repo.load_commit(commit).await.unwrap().0.root_dirtree
 }
 
-/// Whether the repository still holds the root dirtree of `commit`, read from
-/// the checksum the caller recorded while the commit stood.
+/// Returns `true` if the repository still holds the dirtree `root`.
+///
+/// `root` is the root dirtree of a commit. The caller records it while the
+/// commit still stands.
 async fn holds_tree(repo: &Repo, root: &Checksum) -> bool {
     repo.has_object(ObjectType::DirTree, root).await.unwrap()
 }
 
-/// The options these tests prune with: refs alone, the parent edge, the one
-/// metadata key configured, and the caller's classifier.
+/// Returns the prune options of these tests: refs only, the parent edge, the
+/// one configured metadata key, and the classifier of the caller.
 fn weak_options(filter: WeakRefFilter) -> PruneOptions {
     PruneOptions {
         refs_only: true,
@@ -132,22 +144,22 @@ fn weak_options(filter: WeakRefFilter) -> PruneOptions {
     }
 }
 
-/// A classifier that answers weak for every ref whose name starts with `pool/`.
+/// Returns a classifier that answers weak for each ref whose name starts with
+/// `pool/`.
 fn pool_is_weak() -> WeakRefFilter {
     WeakRefFilter::new(|name: &str, _: &Checksum| !name.starts_with("pool/"))
 }
 
-/// A classifier that answers weak for every name holding `pool`, which reaches
-/// a local name and a remote refspec alike.
+/// Returns a classifier that answers weak for each name that contains `pool`.
+/// The rule applies to local names and to remote refspecs.
 fn any_pool_is_weak() -> WeakRefFilter {
     WeakRefFilter::new(|name: &str, _: &Checksum| !name.contains("pool"))
 }
 
-/// A classifier that records the name of every ref it classifies, and takes its
-/// verdict from `strong`.
+/// Returns a classifier that records each ref name it gets, and the record.
 ///
-/// The record is the proof that a ref reached the classifier, or that it never
-/// did.
+/// `strong` gives the verdict for each name. The record proves which refs
+/// reached the classifier and which refs did not.
 fn recording_filter<F>(strong: F) -> (WeakRefFilter, Arc<Mutex<Vec<String>>>)
 where
     F: Fn(&str) -> bool + Send + Sync + 'static,
@@ -161,18 +173,20 @@ where
     (filter, seen)
 }
 
-/// The names a recording classifier was called with.
+/// Returns the names that a recording classifier got.
 fn recorded(seen: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
     seen.lock().unwrap().clone()
 }
 
-/// A recording classifier that answers weak for every name holding `pool`,
-/// which reaches a local name, a remote refspec, and a mirror path alike.
+/// Returns a recording classifier that answers weak for each name that
+/// contains `pool`. The rule applies to local names, remote refspecs, and
+/// mirror paths.
 fn recording_pool_is_weak() -> (WeakRefFilter, Arc<Mutex<Vec<String>>>) {
     recording_filter(|name: &str| !name.contains("pool"))
 }
 
-/// The commit a ref names, or `None` where the store carries no such ref.
+/// Returns the commit that a ref names, or `None` if the repository has no
+/// such ref.
 async fn tip(repo: &Repo, name: &str) -> Option<Checksum> {
     repo.resolve_ref_tip(name).await.unwrap()
 }
@@ -264,9 +278,10 @@ fn a_reached_weak_ref_reseeds_the_walk_at_its_own_bound() {
         let c3 = commit(&repo, tmp.path(), "c3", Some(c2), None, None).await;
         let c4 = commit(&repo, tmp.path(), "c4", Some(c3), None, Some("pool/a")).await;
         let c5 = commit(&repo, tmp.path(), "c5", Some(c4), None, Some("main")).await;
-        // The control chain: a strong ref at the global depth of 1, so the walk
-        // keeps d3 and d2 and drops d1. It proves the depth bound is in force,
-        // so the assertions on the weak ref's ancestry cannot pass vacuously.
+        // The control chain has a strong ref at the global depth of 1. The walk
+        // keeps d3 and d2 and drops d1. This chain proves that the depth bound
+        // applies, so the assertions on the weak ref's ancestry cannot pass
+        // vacuously.
         let d1 = commit(&repo, tmp.path(), "d1", None, None, None).await;
         let d2 = commit(&repo, tmp.path(), "d2", Some(d1), None, None).await;
         let d3 = commit(&repo, tmp.path(), "d3", Some(d2), None, Some("other")).await;
@@ -294,8 +309,8 @@ fn a_reached_weak_ref_reseeds_the_walk_at_its_own_bound() {
             Some(c4),
             "the weak ref still names its commit"
         );
-        // `main` reaches c4 with its depth spent, so everything below c4 is
-        // there because the weak ref re-seeded the walk at its own bound.
+        // `main` reaches c4 with no depth left, so each commit below c4
+        // survives because the weak ref re-seeds the walk at its own bound.
         for (name, checksum, root) in [
             ("c5", c5, trees[4]),
             ("c4", c4, trees[3]),
@@ -322,8 +337,8 @@ fn the_ancestry_rule_b_reaches_roots_a_second_weak_ref() {
         let repo = repo_with_trees(tmp.path(), &["c1", "c2", "c3", "x", "y"]).await;
         let x = commit(&repo, tmp.path(), "x", None, None, Some("pool/b")).await;
         let x_root = commit_root(&repo, &x).await;
-        // c1 carries the key naming x, and the walk reads it only where the
-        // weak ref pool/a re-seeds c2 at the bound its own name carries.
+        // c1 holds the key that names x. The walk reads this key only if the
+        // weak ref pool/a re-seeds c2 at the bound of its own name.
         let c1 = commit(
             &repo,
             tmp.path(),
@@ -444,8 +459,8 @@ fn a_classifier_without_refs_only_is_refused() {
     });
 }
 
-/// The refusal stands ahead of the repository lock, so a repository another
-/// holder keeps gives the same refusal a free one gives.
+/// The refusal comes before the repository lock. A repository that another
+/// holder locks gives the same refusal as a free repository.
 #[test]
 fn the_classifier_refusal_precedes_the_lock() {
     let tmp = TmpDir::new("weak-refs-refusal-lock");
@@ -475,7 +490,7 @@ fn the_classifier_refusal_precedes_the_lock() {
             "the refusal stands ahead of the lock, so it is no timeout: {err:?}"
         );
 
-        // The transaction stands for the whole of the assertion above.
+        // The transaction stays open until the assertion is complete.
         drop(txn);
     });
 }
@@ -483,8 +498,8 @@ fn the_classifier_refusal_precedes_the_lock() {
 #[test]
 fn the_deleted_ref_list_is_sorted() {
     let tmp = TmpDir::new("weak-refs-sorted");
-    // The directories and the leaf names are chosen so that a listing in
-    // directory order is very unlikely to be sorted.
+    // The test picks the directory names and the leaf names so that a listing
+    // in directory order is almost never in sorted order.
     let weak = [
         "zeta/one",
         "zeta/two",
@@ -534,9 +549,9 @@ fn the_deleted_ref_list_is_sorted() {
     });
 }
 
-/// A classifier that repoints a ref from inside its own call leaves that ref
-/// where it now stands: the run reads the ref again next to the unlink and
-/// skips it where the checksum moved.
+/// If a classifier moves a ref during its own call, the ref stays at its new
+/// commit. The run reads the ref again immediately before the unlink. If the
+/// checksum changed, the run skips the ref.
 #[test]
 fn a_ref_that_moved_under_the_classifier_is_not_unlinked() {
     let tmp = TmpDir::new("weak-refs-moved");
@@ -548,10 +563,10 @@ fn a_ref_that_moved_under_the_classifier_is_not_unlinked() {
         let repo_path = tmp.path().join("repo");
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
-        // The repoint goes through blocking `std::fs` against the path the
-        // closure captured. A `Repo` method here would re-enter the runtime.
-        // The new target is a commit the run keeps, so the repository the test
-        // leaves is consistent.
+        // The closure moves the ref with blocking `std::fs` calls on the path
+        // that it captured. A `Repo` method in the closure re-enters the
+        // runtime. The new target is a commit that the run keeps, so the
+        // repository stays consistent after the test.
         let filter = WeakRefFilter::new(move |name: &str, _: &Checksum| {
             if name == "pool/a" {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -585,8 +600,8 @@ fn a_ref_that_moved_under_the_classifier_is_not_unlinked() {
     });
 }
 
-/// A local ref name holding a `:` maps to a different file through the refspec
-/// rule, so the classifier never sees it and the run never deletes it.
+/// The refspec rule maps a local ref name that contains `:` to a different
+/// file, so the classifier never sees the name. The run never deletes the ref.
 #[test]
 fn a_local_ref_name_holding_a_colon_is_never_classified() {
     let tmp = TmpDir::new("weak-refs-colon");
@@ -595,8 +610,8 @@ fn a_local_ref_name_holding_a_colon_is_never_classified() {
         commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
         let odd = commit(&repo, tmp.path(), "colon", None, None, None).await;
 
-        // `set_ref_immediate` reads the `:` as a remote separator, so the file
-        // is written with blocking `std::fs`.
+        // `set_ref_immediate` reads the `:` as a remote separator, so the test
+        // writes the file with blocking `std::fs`.
         let path = tmp.path().join("repo/refs/heads/foo:bar");
         std::fs::write(&path, format!("{}\n", odd.to_hex())).unwrap();
 
@@ -622,12 +637,12 @@ fn a_local_ref_name_holding_a_colon_is_never_classified() {
     });
 }
 
-/// A weak alias and the weak ref it names both enter the classification with
-/// the checksum behind the link, and the run removes both files whatever order
-/// it visits them in.
+/// A weak alias and the weak ref that it names both get the checksum behind the
+/// link in the classification. The run removes both files in any visit order.
 ///
-/// The two pairs are created in opposite orders, so a listing that follows the
-/// order of creation gives one pair alias first and the other target first.
+/// The test creates the two pairs in opposite orders. A listing in the order of
+/// creation gives the alias first for one pair and the target first for the
+/// other pair.
 #[test]
 fn a_weak_alias_over_a_weak_ref_leaves_no_ref_file() {
     let tmp = TmpDir::new("weak-refs-alias");
@@ -635,15 +650,15 @@ fn a_weak_alias_over_a_weak_ref_leaves_no_ref_file() {
         let repo = repo_with_trees(tmp.path(), &["head", "first", "second"]).await;
         commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
 
-        // The target is written first, so a listing in creation order reaches
-        // the aliased ref ahead of the alias that names it.
+        // The test writes the target first, so a listing in creation order
+        // reaches the target before the alias that names it.
         let first = commit(&repo, tmp.path(), "first", None, None, Some("pool/b")).await;
         repo.set_ref_alias_immediate("pool/a", "pool/b")
             .await
             .unwrap();
 
-        // The alias is written first, so the same listing reaches the alias
-        // ahead of the ref it names.
+        // The test writes the alias first, so the same listing reaches the
+        // alias before the ref that it names.
         repo.set_ref_alias_immediate("pool/x", "pool/y")
             .await
             .unwrap();
@@ -679,9 +694,9 @@ fn a_weak_alias_over_a_weak_ref_leaves_no_ref_file() {
     });
 }
 
-/// Rule B narrows as well as widens: a weak ref whose own bound reaches less
-/// far than the arrival's replaces that arrival's bound, so the ancestry beyond
-/// the weak ref's bound is swept.
+/// Rule B can make a bound smaller as well as larger. If the own bound of a
+/// weak ref is shorter than the bound of the arrival, the own bound replaces
+/// it. The run then sweeps the ancestry beyond the own bound of the weak ref.
 #[test]
 fn a_reached_weak_ref_narrows_the_arrival_bound() {
     let tmp = TmpDir::new("weak-refs-rule-b-narrow");
@@ -691,9 +706,9 @@ fn a_reached_weak_ref_narrows_the_arrival_bound() {
         let c2 = commit(&repo, tmp.path(), "c2", Some(c1), None, Some("pool/a")).await;
         let c3 = commit(&repo, tmp.path(), "c3", Some(c2), None, Some("main")).await;
 
-        // `main` reaches c2 with the whole ancestry left, and the weak ref's
-        // own name carries a bound of the head alone. A depth of -2 is one of
-        // the negative values that keep the named commit alone.
+        // `main` reaches c2 with the whole ancestry left. The weak ref's own
+        // name carries a bound that keeps the head alone. A depth of -2 is one
+        // of the negative values that keep only the named commit.
         let opts = PruneOptions {
             depth: -1,
             retain_branch_depth: vec![("pool/a".to_owned(), -2)],
@@ -723,8 +738,8 @@ fn a_reached_weak_ref_narrows_the_arrival_bound() {
     });
 }
 
-/// A ref under `refs/remotes` reaches the classifier under its
-/// `<remote>:<name>` refspec, and the run deletes it through the same name.
+/// A ref under `refs/remotes` reaches the classifier as its `<remote>:<name>`
+/// refspec. The run deletes the ref through the same name.
 #[test]
 fn a_weak_remote_ref_is_classified_and_deleted() {
     let tmp = TmpDir::new("weak-refs-remote");
@@ -802,8 +817,8 @@ fn a_weak_remote_ref_is_classified_and_deleted() {
     });
 }
 
-/// A ref under `refs/mirrors` never reaches the classifier, and it roots the
-/// walk: its commit survives with the objects under it.
+/// A ref under `refs/mirrors` never reaches the classifier. The ref roots the
+/// walk, so its commit and the objects under the commit survive.
 #[test]
 fn a_mirror_ref_is_never_classified_and_never_deleted() {
     let tmp = TmpDir::new("weak-refs-mirror");
@@ -819,8 +834,8 @@ fn a_mirror_ref_is_never_classified_and_never_deleted() {
             .unwrap();
 
         let (filter, seen) = recording_pool_is_weak();
-        // The record is read ahead of the run's own result, so the name the
-        // classifier saw is what this reports.
+        // The test reads the record before the result of the run, so a failure
+        // reports the names that the classifier saw.
         let result = repo.prune(&weak_options(filter)).await;
 
         let names = recorded(&seen);
@@ -861,8 +876,8 @@ fn a_mirror_ref_is_never_classified_and_never_deleted() {
     });
 }
 
-/// A strong alias over a weak ref roots the commit the two share, so the walk
-/// reaches the weak ref and both files stand.
+/// A strong alias over a weak ref roots the commit that the two refs share, so
+/// the walk reaches the weak ref. Both files stay.
 #[test]
 fn a_strong_alias_over_a_weak_ref_keeps_both_refs() {
     let tmp = TmpDir::new("weak-refs-strong-alias");
@@ -905,8 +920,8 @@ fn a_strong_alias_over_a_weak_ref_keeps_both_refs() {
     });
 }
 
-/// A weak alias over a strong ref is classified weak and survives, because the
-/// ref it names roots the commit behind the link.
+/// The classifier answers weak for an alias over a strong ref. The alias
+/// survives because the ref that it names roots the commit behind the link.
 #[test]
 fn a_weak_alias_over_a_strong_ref_survives() {
     let tmp = TmpDir::new("weak-refs-weak-alias");
@@ -944,8 +959,8 @@ fn a_weak_alias_over_a_strong_ref_survives() {
     });
 }
 
-/// An alias whose target ref is absent is skipped by the reader, so it never
-/// reaches the classifier and the run leaves it where it stands.
+/// The ref reader skips an alias whose target ref is absent, so the alias never
+/// reaches the classifier. The run leaves the alias in place.
 #[test]
 fn a_dangling_alias_is_never_classified_and_never_deleted() {
     let tmp = TmpDir::new("weak-refs-dangling-alias");
@@ -953,7 +968,7 @@ fn a_dangling_alias_is_never_classified_and_never_deleted() {
         let repo = repo_with_trees(tmp.path(), &["head", "orphan"]).await;
         commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
         let orphan = commit(&repo, tmp.path(), "orphan", None, None, Some("pool/a")).await;
-        // `pool/missing` is never written, so the link dangles.
+        // The test never writes `pool/missing`, so the link dangles.
         repo.set_ref_alias_immediate("pool/dangle", "pool/missing")
             .await
             .unwrap();
@@ -985,12 +1000,12 @@ fn a_dangling_alias_is_never_classified_and_never_deleted() {
 }
 
 /// Two ref files under `refs/remotes` can list under one name, and the refspec
-/// rule addresses one of the two. The run classifies the one the name
-/// addresses, and leaves the other strong and untouched.
+/// rule addresses only one of them. The run classifies the file that the name
+/// addresses. The other file stays strong, and the run does not change it.
 ///
 /// `refs/remotes/a:b/pool/x` and `refs/remotes/a/b:pool/x` both list as
-/// `a:b:pool/x`, and that name maps to the second. The same holds one level up:
-/// a file directly under `refs/remotes` lists under a name that maps below
+/// `a:b:pool/x`. That name maps to the second file. The same is true one level
+/// up. A file directly under `refs/remotes` lists under a name that maps below
 /// `refs/heads`.
 #[test]
 fn a_colon_bearing_remote_directory_is_never_classified() {
@@ -999,7 +1014,7 @@ fn a_colon_bearing_remote_directory_is_never_classified() {
         let repo = repo_with_trees(tmp.path(), &["head", "shadowed", "addressed", "stray"]).await;
         commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
 
-        // No refspec addresses this file, so it is written with blocking
+        // No refspec addresses this file, so the test writes it with blocking
         // `std::fs`.
         let shadowed = commit(&repo, tmp.path(), "shadowed", None, None, None).await;
         let shadowed_root = commit_root(&repo, &shadowed).await;
@@ -1021,7 +1036,7 @@ fn a_colon_bearing_remote_directory_is_never_classified() {
         );
 
         // A file directly under `refs/remotes` lists under a name that maps
-        // below `refs/heads`, where a ref of that name stands.
+        // below `refs/heads`. A ref of that name also stands there.
         let stray = commit(&repo, tmp.path(), "stray", None, None, None).await;
         let stray_path = tmp.path().join("repo/refs/remotes/poolstray");
         std::fs::write(&stray_path, format!("{}\n", stray.to_hex())).unwrap();
@@ -1079,10 +1094,11 @@ fn a_colon_bearing_remote_directory_is_never_classified() {
     });
 }
 
-/// A classifier runs caller code, and an actor outside the process can clear a
-/// ref directory at any point between the listing and the unlink. A doomed ref
-/// whose file and whose parent directory are both gone by the time the pass
-/// reaches it is reported deleted, and the run goes on to sweep.
+/// A classifier runs caller code. An actor outside the process can clear a ref
+/// directory at any time between the listing and the unlink. The file of a
+/// doomed ref and its parent directory can both be gone when the pass reaches
+/// the ref. In that case, the run reports the ref as deleted and continues to
+/// the sweep.
 #[test]
 fn a_ref_directory_gone_before_the_unlink_does_not_fail_the_run() {
     let tmp = TmpDir::new("weak-refs-vanished-parent");
@@ -1092,9 +1108,9 @@ fn a_ref_directory_gone_before_the_unlink_does_not_fail_the_run() {
         let doomed = commit(&repo, tmp.path(), "doomed", None, None, Some("pool/doomed")).await;
         let doomed_root = commit_root(&repo, &doomed).await;
 
-        // The classifier clears the directory holding the doomed ref, so the
-        // unlink meets an absent file and the directory that held it is gone
-        // as well.
+        // The classifier clears the directory that holds the doomed ref. The
+        // unlink then finds no file, and the directory that held the file is
+        // also gone.
         let dir = tmp.path().join("repo/refs/heads/pool");
         let filter = WeakRefFilter::new(move |name: &str, _: &Checksum| {
             if name == "pool/doomed" {
@@ -1127,10 +1143,10 @@ fn a_ref_directory_gone_before_the_unlink_does_not_fail_the_run() {
     });
 }
 
-/// A weak remote ref re-seeds the walk under the bound its own name carries,
-/// and its name is its `<remote>:<name>` refspec. A
-/// [`PruneOptions::retain_branch_depth`] entry keyed on that refspec holds the
-/// ancestry below the commit the walk arrived at.
+/// A weak remote ref re-seeds the walk under the bound of its own name. That
+/// name is its `<remote>:<name>` refspec. A `PruneOptions::retain_branch_depth`
+/// entry with that refspec as key keeps the ancestry below the commit that the
+/// walk arrived at.
 #[test]
 fn a_reached_weak_remote_ref_reseeds_the_walk_at_its_refspec_bound() {
     let tmp = TmpDir::new("weak-refs-remote-rule-b");
@@ -1147,8 +1163,8 @@ fn a_reached_weak_remote_ref_reseeds_the_walk_at_its_refspec_bound() {
             Some("origin:pool/chain"),
         )
         .await;
-        // `main` reaches g3 over a metadata edge, which carries the global
-        // bound of 0, so g2 and g1 stand only under the weak ref's own bound.
+        // `main` reaches g3 over a metadata edge with the global bound of 0.
+        // g2 and g1 survive only under the weak ref's own bound.
         commit(
             &repo,
             tmp.path(),
@@ -1158,9 +1174,10 @@ fn a_reached_weak_remote_ref_reseeds_the_walk_at_its_refspec_bound() {
             Some("main"),
         )
         .await;
-        // The control chain: a strong ref at the global depth of 0, so the walk
-        // keeps d2 and drops d1. It proves the depth bound is in force, so the
-        // assertions on the weak ref's ancestry cannot pass vacuously.
+        // The control chain has a strong ref at the global depth of 0. The walk
+        // keeps d2 and drops d1. This chain proves that the depth bound
+        // applies, so the assertions on the weak ref's ancestry cannot pass
+        // vacuously.
         let d1 = commit(&repo, tmp.path(), "d1", None, None, None).await;
         let d2 = commit(&repo, tmp.path(), "d2", Some(d1), None, Some("other")).await;
 
@@ -1202,10 +1219,10 @@ fn a_reached_weak_remote_ref_reseeds_the_walk_at_its_refspec_bound() {
     });
 }
 
-/// An alias links a ref of one space to a ref of another. Each alias is
-/// classified under the name of the file it is stored in, whichever space its
-/// target lives in. An alias whose commit the walk never reaches is unlinked,
-/// and the link itself is what goes.
+/// An alias links a ref of one space to a ref of another space. The classifier
+/// gets each alias under the name of the file that holds the alias. The space
+/// of the target does not change this name. If the walk never reaches the
+/// commit of an alias, the run removes the symlink of the alias.
 #[test]
 fn a_cross_space_alias_is_classified_under_its_own_name() {
     let tmp = TmpDir::new("weak-refs-cross-space-alias");
@@ -1222,8 +1239,8 @@ fn a_cross_space_alias_is_classified_under_its_own_name() {
         )
         .await;
         let target_root = commit_root(&repo, &target).await;
-        // A local alias naming a remote ref, and a remote alias naming the
-        // strong local ref.
+        // A local alias that names a remote ref, and a remote alias that names
+        // the strong local ref.
         repo.set_ref_alias_immediate("pool/into-remote", "origin:pool/target")
             .await
             .unwrap();
@@ -1267,8 +1284,8 @@ fn a_cross_space_alias_is_classified_under_its_own_name() {
             !holds_tree(&repo, &target_root).await,
             "and so is the tree only it reached"
         );
-        // The remote alias is weak too, and the ref it names roots the commit
-        // behind the link, so it survives as a link.
+        // The remote alias is also weak. The ref that it names roots the
+        // commit behind the link, so the alias survives as a link.
         assert_eq!(
             tip(&repo, "origin:pool/into-heads").await,
             Some(head),
@@ -1283,9 +1300,9 @@ fn a_cross_space_alias_is_classified_under_its_own_name() {
     });
 }
 
-/// A weak alias under `refs/remotes` over a weak remote ref leaves no ref file:
-/// the run removes the link and the file the link names, and sweeps the commit
-/// the two shared.
+/// A weak alias under `refs/remotes` over a weak remote ref leaves no ref file.
+/// The run removes the link and the file that the link names. The run then
+/// sweeps the commit that the two refs shared.
 #[test]
 fn a_weak_remote_alias_over_a_weak_remote_ref_leaves_no_ref_file() {
     let tmp = TmpDir::new("weak-refs-remote-alias");

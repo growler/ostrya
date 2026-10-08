@@ -11,37 +11,68 @@ use crate::sign::{Ed25519Signer, Ed25519Verifier, Signer, Verifier, signatures_f
 /// public key.
 const ED25519_SECRET_LEN: usize = 64;
 
-/// One signing key the receiving server holds, paired with a verifier that
-/// trusts that key alone.
+/// A signing key of the server, with a verifier that trusts that key alone.
 ///
-/// The server signs each commit that becomes the new value of a ref. The
-/// verifier tells whether a signature on the commit, stored or incoming, was
-/// made with this key already. A GPG signature carries the time it was made,
-/// so two signatures from one key over one commit differ, and the check
-/// verifies each signature rather than compare its bytes.
+/// The server signs each commit that becomes the new value of a ref with the
+/// keys in [`ReceiveRule::signers`](super::ReceiveRule::signers). Before it
+/// signs, the server looks for a signature of this key in the detached
+/// metadata of the commit, stored or incoming. If it finds one, the server
+/// does not add a second signature.
+///
+/// # Existing signatures
+///
+/// The server verifies each signature with the verifier and makes no byte
+/// comparison. A GPG signature holds the time of signing, so two GPG
+/// signatures from one key over one commit have different bytes.
+///
+/// The server reads the signatures under the detached-metadata key of the
+/// engine, in the stored order. It verifies each signature on its own, with
+/// this key alone, and stops at the first signature that verifies. These
+/// signatures count as not made by this key:
+///
+/// - a signature from another key
+/// - a signature over other bytes
+/// - a signature that the verifier refuses, for example a blob that does not
+///   parse, a blob over 1 MiB, or a blob with more than 64 GPG signature
+///   packets (the limits of `GpgVerifier`).
+///
+/// A refused signature does not stop the search, so a signature that a
+/// client adds cannot hide the signature of the server.
 pub struct ServerSigner {
-    /// The key the server signs with.
+    /// The key that the server signs with.
     signer: Box<dyn Signer>,
-    /// A verifier that trusts the public half of `signer`'s key and no other
-    /// key.
+    /// A verifier that trusts the public half of the key of `signer` and no
+    /// other key.
     verifier: Arc<dyn Verifier>,
-    /// Whether `verifier` does its work in the call to
-    /// [`Verifier::verify`], on the thread that calls it. This is true for the
-    /// keys [`ed25519`](Self::ed25519) and [`spki`](Self::spki) give.
-    /// [`has_signed`](Self::has_signed) then runs the check on the blocking
-    /// pool, so the check does not hold the async executor.
+    /// `true` if `verifier` does its work in the call to
+    /// [`Verifier::verify`], on the thread that calls it.
+    ///
+    /// The value is `true` for the keys that [`ed25519`](Self::ed25519) and
+    /// `spki` give. [`has_signed`](Self::has_signed) then verifies on the
+    /// blocking pool, so the verification does not hold the async executor.
     verifies_in_call: bool,
 }
 
 impl ServerSigner {
-    /// Pair `signer` with `verifier`, which must trust the public half of the
-    /// signer's key and no other key.
+    /// Creates a server key from a signer and a verifier of its public key.
     ///
-    /// The two must read one detached-metadata key, which is refused as
-    /// [`Error::InvalidFormat`] where they do not. The pairing itself is the
-    /// caller's to state: a verifier that trusts another key makes the server
-    /// sign a commit its own key already signed, and a verifier that trusts
-    /// more keys makes it skip a commit another key signed.
+    /// `verifier` must trust the public half of the key of `signer` and no
+    /// other key. The caller is responsible for this pairing, and `new` does
+    /// not check it:
+    ///
+    /// - If `verifier` trusts another key, the server signs a commit that its
+    ///   own key already signed.
+    /// - If `verifier` trusts more keys, the server does not sign a commit
+    ///   that another key signed.
+    ///
+    /// The server verifies the [existing signatures](ServerSigner#existing-signatures)
+    /// with this pair in the calling task.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if `signer` and `verifier` use different
+    ///   detached-metadata keys. The message is
+    ///   `the signer writes '<key>' and the verifier reads '<key>'`.
     pub fn new(signer: Box<dyn Signer>, verifier: Box<dyn Verifier>) -> Result<ServerSigner> {
         if signer.metadata_key() != verifier.metadata_key() {
             return Err(Error::InvalidFormat(format!(
@@ -57,9 +88,17 @@ impl ServerSigner {
         })
     }
 
-    /// An ed25519 server key from its 64-byte secret: the 32-byte seed, then
-    /// the 32-byte public key. A secret of another length, and one whose public
-    /// half does not match its seed, is refused.
+    /// Creates a server key from a 64-byte ed25519 secret key.
+    ///
+    /// The secret is the 32-byte seed, then the 32-byte public key. The
+    /// verifier trusts that public key alone.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] if `secret` is not 64 bytes long. The message is
+    ///   `ed25519 secret key must be 64 bytes, got <n>`.
+    /// - [`Error::Signature`] if the public half of `secret` does not match
+    ///   its seed. The message starts with `ed25519 secret key:`.
     pub fn ed25519(secret: &[u8]) -> Result<ServerSigner> {
         let signer = Ed25519Signer::from_secret_key(secret)?;
         let public = &secret[ED25519_SECRET_LEN / 2..ED25519_SECRET_LEN];
@@ -71,7 +110,16 @@ impl ServerSigner {
         })
     }
 
-    /// An spki server key.
+    /// Creates a server key from an spki signer.
+    ///
+    /// The verifier is a [`SpkiVerifier`](crate::spki::SpkiVerifier) that
+    /// trusts the public key of `signer` alone.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] if the verifier does not accept the DER public
+    ///   key of `signer`. The message is
+    ///   `spki public key: expected SubjectPublicKeyInfo DER or a SEC1 point`.
     #[cfg(feature = "sign-spki")]
     pub fn spki(signer: crate::spki::SpkiSigner) -> Result<ServerSigner> {
         let verifier =
@@ -83,14 +131,33 @@ impl ServerSigner {
         })
     }
 
-    /// A GPG server key: the one secret key `signer`'s selector names in its
-    /// GnuPG home.
+    /// Creates a server key from the one secret key that a GPG signer selects.
     ///
-    /// The selector has to name exactly one secret key, so a user id that
-    /// matches two keys is refused, and the signer this gives signs with that
-    /// key by its fingerprint. The key's public certificate is read with
-    /// `gpg --export` from the same home, and the verifier trusts that
-    /// certificate alone.
+    /// The selector of `signer` must name exactly one secret key in the GnuPG
+    /// home of `signer`. The function refuses a user id that matches two keys.
+    /// The server key signs with the selected key by its fingerprint.
+    ///
+    /// `gpg --export` reads the public certificate of the key from the same
+    /// home. The verifier trusts that certificate alone.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] if `gpg` cannot start. If `gpg` is not in
+    ///   `PATH`, the message is `gpg: program not found in PATH`. For another
+    ///   failure, the message is `gpg: <io error>`.
+    /// - [`Error::Signature`] with the message
+    ///   `the key selector names no secret key` if the selector names no
+    ///   secret key. The same error occurs if the `gpg` listing fails, for
+    ///   example if the GnuPG home does not exist.
+    /// - [`Error::Signature`] with the message
+    ///   `the key selector names more than one secret key; use the fingerprint`
+    ///   if the selector names two or more secret keys.
+    /// - [`Error::Signature`] if the export is over 4 MiB, if `gpg --export`
+    ///   fails, or if it writes nothing.
+    /// - [`Error::Io`] if the read of the export or the wait for `gpg` fails.
+    /// - The errors of
+    ///   [`GpgVerifier::from_keyring_bytes`](crate::gpg::GpgVerifier::from_keyring_bytes)
+    ///   for the exported certificate.
     #[cfg(feature = "sign-gpg")]
     pub async fn gpg(signer: crate::gpg::GpgSigner) -> Result<ServerSigner> {
         let fingerprints = signer.secret_key_fingerprints().await?;
@@ -120,29 +187,22 @@ impl ServerSigner {
         })
     }
 
-    /// The key the server signs with.
+    /// Returns the key that the server signs with.
     pub fn signer(&self) -> &dyn Signer {
         self.signer.as_ref()
     }
 
-    /// Whether `dict`, a commit's detached metadata, holds a signature over
-    /// `payload` that this key made. `dict` is `None` for a commit with no
-    /// detached metadata.
+    /// Returns `true` if `dict` holds a signature over `payload` that this key
+    /// made.
     ///
-    /// Each blob under the key's detached-metadata key is verified on its own
-    /// against the key alone, in the stored order, and the check stops at the
-    /// first blob that verifies. A signature from another key, a signature over
-    /// other bytes, and a blob the verifier refuses all count as not signed.
-    /// A blob the verifier refuses is, for example, one that does not parse,
-    /// one over the size ceiling of a GPG signature blob, or one that holds
-    /// too many GPG signature packets. Such a blob does not make the check
-    /// fail, so a blob a client adds cannot hide the server's own signature.
+    /// `dict` is the detached metadata of a commit, or `None` for a commit
+    /// with no detached metadata. [`ServerSigner`](ServerSigner#existing-signatures)
+    /// states the rules of the search.
     ///
-    /// For a key that [`ed25519`](Self::ed25519) or [`spki`](Self::spki)
-    /// gives, the check runs on the blocking pool, because those verifiers do
-    /// their work in the calling thread. The GPG verifier moves its own work to
-    /// the blocking pool. A pair from [`new`](Self::new) is checked in the
-    /// calling task.
+    /// For a key from [`ed25519`](Self::ed25519) or `spki`, the search runs on
+    /// the blocking pool, because those verifiers do their work in the calling
+    /// thread. The GPG verifier moves its own work to the blocking pool. The
+    /// search of a pair from [`new`](Self::new) runs in the calling task.
     pub(crate) async fn has_signed(&self, payload: &[u8], dict: Option<&Value>) -> bool {
         let Some(dict) = dict else {
             return false;
@@ -163,9 +223,10 @@ impl ServerSigner {
     }
 }
 
-/// Whether one of `blobs` verifies over `payload` under `verifier`. Each blob is
-/// verified on its own, a blob the verifier refuses counts as not valid, and
-/// the check stops at the first blob that verifies.
+/// Returns `true` if one of `blobs` verifies over `payload` under `verifier`.
+///
+/// The function verifies each blob on its own and stops at the first blob that
+/// verifies. A blob that the verifier refuses counts as not valid.
 async fn any_verifies(verifier: &dyn Verifier, payload: &[u8], blobs: &[Vec<u8>]) -> bool {
     for blob in blobs {
         if let Ok(outcome) = verifier.verify(payload, std::slice::from_ref(blob)).await
@@ -201,14 +262,14 @@ mod tests {
 
     const PAYLOAD: &[u8] = b"the commit bytes";
 
-    /// A detached-metadata dict holding `blob` under `key`.
+    /// Returns a detached-metadata dict that holds `blob` under `key`.
     fn dict_with(key: &str, blob: Vec<u8>) -> Value {
         let mut dict = Value::Array(Vec::new());
         append_signature(&mut dict, key, blob).unwrap();
         dict
     }
 
-    /// A detached-metadata dict holding `blobs` under `key`, in order.
+    /// Returns a detached-metadata dict that holds `blobs` under `key`, in order.
     fn dict_of(key: &str, blobs: Vec<Vec<u8>>) -> Value {
         let mut dict = Value::Array(Vec::new());
         for blob in blobs {
@@ -217,12 +278,12 @@ mod tests {
         dict
     }
 
-    /// A blob one byte over the size ceiling of a GPG signature blob.
+    /// Returns a blob one byte over the size limit of a GPG signature blob.
     fn oversize_blob() -> Vec<u8> {
         vec![0x88; 1024 * 1024 + 1]
     }
 
-    /// A signature `signer` makes over [`PAYLOAD`].
+    /// Returns a signature that `signer` makes over [`PAYLOAD`].
     fn signature(signer: &ServerSigner) -> Vec<u8> {
         ostrya_rt::block_on(signer.signer().sign(PAYLOAD)).unwrap()
     }
@@ -231,7 +292,8 @@ mod tests {
         ostrya_rt::block_on(signer.has_signed(PAYLOAD, dict))
     }
 
-    /// The ed25519 check recognizes the key's own signature, and no other.
+    /// The ed25519 search recognizes the signature of the key and no other
+    /// signature.
     #[test]
     fn an_ed25519_key_recognizes_its_own_signature() {
         let server = ServerSigner::ed25519(&base64::decode(SECRET_B64).unwrap()).unwrap();
@@ -253,7 +315,8 @@ mod tests {
         ));
         assert!(!has_signed(&server, None));
         assert!(!has_signed(&server, Some(&Value::Array(Vec::new()))));
-        // The key's signature under another engine's key is not read.
+        // The search does not read a signature of this key under the
+        // detached-metadata key of another engine.
         assert!(!has_signed(
             &server,
             Some(&dict_with("ostree.sign.dummy", signature(&server)))
@@ -263,8 +326,8 @@ mod tests {
         assert!(!has_signed(&server, Some(&dict_with(&key, elsewhere))));
     }
 
-    /// A garbage or oversize blob beside the key's own ed25519 signature does
-    /// not hide it, in either order.
+    /// A garbage or oversize blob beside the ed25519 signature of the key does
+    /// not hide that signature, in either order.
     #[test]
     fn an_ed25519_signature_beside_a_bad_blob_is_recognized() {
         let server = ServerSigner::ed25519(&base64::decode(SECRET_B64).unwrap()).unwrap();
@@ -279,7 +342,7 @@ mod tests {
         }
     }
 
-    /// A verifier that refuses every blob but one with an error.
+    /// A verifier that returns an error for each blob except one.
     struct RefusesOthers {
         good: Vec<u8>,
     }
@@ -306,8 +369,8 @@ mod tests {
         }
     }
 
-    /// A blob the verifier refuses with an error counts as not signed and does
-    /// not hide a blob that verifies.
+    /// A blob that the verifier refuses with an error counts as not signed. It
+    /// does not hide a blob that verifies.
     #[test]
     fn a_refused_blob_counts_as_not_signed() {
         let server = ServerSigner::new(
@@ -323,8 +386,8 @@ mod tests {
         assert!(!has_signed(&server, Some(&dict_with(key, b"bad".to_vec()))));
     }
 
-    /// A secret of another length is refused, and so is one whose public half
-    /// does not match its seed.
+    /// `ServerSigner::ed25519` refuses a secret of another length and a secret
+    /// whose public half does not match its seed.
     #[test]
     fn a_malformed_ed25519_secret_is_refused() {
         let secret = base64::decode(SECRET_B64).unwrap();
@@ -335,8 +398,8 @@ mod tests {
         assert!(ServerSigner::ed25519(&mixed).is_err());
     }
 
-    /// A pair the caller builds is recognized, and a pair whose two halves read
-    /// different detached-metadata keys is refused.
+    /// The search recognizes a signature of a pair that the caller builds. `new`
+    /// refuses a pair whose two halves read different detached-metadata keys.
     #[test]
     fn new_checks_the_metadata_key() {
         let server = ServerSigner::new(
@@ -357,8 +420,9 @@ mod tests {
         assert!(matches!(err, Error::InvalidFormat(_)), "{err}");
     }
 
-    /// The spki check recognizes the key's own signature in both forms the
-    /// verifier reads, DER and fixed-width `r || s`, and no other key's.
+    /// The spki search recognizes the signature of the key in the two forms
+    /// that the verifier reads, DER and fixed-width `r || s`. It does not
+    /// recognize the signature of another key.
     #[cfg(feature = "sign-spki")]
     #[test]
     fn an_spki_key_recognizes_its_own_signature() {
@@ -380,7 +444,8 @@ mod tests {
         ));
     }
 
-    /// The fixed-width `r || s` form of a DER ECDSA signature over P-256.
+    /// Returns the fixed-width `r || s` form of a DER ECDSA signature over
+    /// P-256.
     #[cfg(feature = "sign-spki")]
     fn fixed_width(der: &[u8]) -> Vec<u8> {
         // SEQUENCE { INTEGER r, INTEGER s }, each short-form length.
@@ -399,8 +464,10 @@ mod tests {
         out
     }
 
-    /// Whether `gpg` answers. A test that needs it skips where it does not,
-    /// unless `OSTRYA_REQUIRE_GNUPG` is set, where the absence fails the test.
+    /// Returns `true` if `gpg` answers.
+    ///
+    /// If `gpg` does not answer, a test that needs it skips. If
+    /// `OSTRYA_REQUIRE_GNUPG` is set, the absence of `gpg` fails the test.
     #[cfg(feature = "sign-gpg")]
     fn gpg_or_skip() -> bool {
         if crate::gpg::tests::gpg_available() {
@@ -414,8 +481,8 @@ mod tests {
         false
     }
 
-    /// The GPG check recognizes a signature the server key made, stored or
-    /// reached through the merge, and not one from another key.
+    /// The GPG search recognizes a signature that the server key made, stored
+    /// or from the merge. It does not recognize a signature from another key.
     #[cfg(feature = "sign-gpg")]
     #[test]
     fn a_gpg_key_recognizes_its_own_signature() {
@@ -442,8 +509,8 @@ mod tests {
             Some(&dict_with(&key, foreign.clone()))
         ));
 
-        // Through the merge: a stored foreign signature and an incoming own
-        // signature.
+        // Through the merge: a stored signature from another key and an
+        // incoming signature from the server key.
         let merged = super::super::merge::merge_detached(
             Some(dict_with(&key, foreign)),
             dict_with(&key, own),
@@ -453,9 +520,9 @@ mod tests {
         assert!(has_signed(&server, Some(&merged)));
     }
 
-    /// A blob the GPG verifier refuses -- one over the blob ceiling, one with
-    /// too many signature packets, garbage -- beside the key's own signature
-    /// does not hide it.
+    /// A blob that the GPG verifier refuses does not hide the signature of the
+    /// key beside it. The blobs are one over the blob limit, one with too many
+    /// signature packets, and garbage.
     #[cfg(feature = "sign-gpg")]
     #[test]
     fn a_gpg_signature_beside_a_refused_blob_is_recognized() {
@@ -479,7 +546,8 @@ mod tests {
         }
     }
 
-    /// A selector naming no secret key, and one naming two, are refused.
+    /// `ServerSigner::gpg` refuses a selector that names no secret key and a
+    /// selector that names two.
     #[cfg(feature = "sign-gpg")]
     #[test]
     fn a_gpg_selector_names_exactly_one_key() {

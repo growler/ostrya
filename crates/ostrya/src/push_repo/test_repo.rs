@@ -1,4 +1,4 @@
-//! Repositories the push tests read from.
+//! Repositories that the push tests read from.
 
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use ostrya_core::{Checksum, RepoMode};
 
 use crate::{CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree, Repo};
 
-/// A scratch directory, removed when the value drops.
+/// A scratch directory. When the value drops, it removes the directory.
 pub(super) struct Scratch {
     dir: PathBuf,
 }
@@ -27,7 +27,7 @@ impl Scratch {
         &self.dir
     }
 
-    /// A new repository of `mode` at `repo` in the scratch directory.
+    /// Creates a repository of `mode` at `repo` in the scratch directory.
     pub(super) async fn create(&self, mode: RepoMode) -> Repo {
         Repo::create(&self.dir.join("repo"), CreateOptions::new(mode))
             .await
@@ -41,9 +41,9 @@ impl Drop for Scratch {
     }
 }
 
-/// Commit a tree with `parent`, and point the ref `name` at the commit. The
-/// tree holds a regular file `file` with `content`, and a symlink `link` to
-/// `file`.
+/// Commits a tree with the parent `parent`, points the ref `name` at the
+/// commit, and returns its checksum. The tree holds a regular file `file`
+/// with `content` and a symlink `link` to `file`.
 pub(super) async fn commit_tree(
     repo: &Repo,
     scratch: &Scratch,

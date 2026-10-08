@@ -1,10 +1,14 @@
-//! `Repo::receive` through the object stream: `Hello`, `Have`, the ingest of
-//! each object encoding, the content rules of each repository mode, the codes
-//! each failure sends, and the repository lock the session holds.
+//! Tests of `Repo::receive` through the object stream. They cover:
+//!
+//! - `Hello` and `Have`
+//! - the ingest of each object encoding
+//! - the content rules of each repository mode
+//! - the code that each failure sends
+//! - the repository lock that the session holds
 //!
 //! A test client drives the session over two in-process pipes with the frame
-//! codec of `ostrya::push::proto`. No case sends `Commit`, so every session
-//! ends in an error, and no case publishes an object. The tests of `Commit`
+//! codec of `ostrya::push::proto`. No case sends `Commit`, so each session
+//! ends in an error and no case publishes an object. The tests of `Commit`
 //! are in `receive_commit.rs`.
 
 #![cfg(feature = "receive")]
@@ -170,8 +174,8 @@ fn a_ref_path_through_a_directory_or_a_file_is_absent() {
     assert_eq!(refs, vec![None, Some(tip), None]);
 }
 
-/// A malformed setting of the write paths is a fault of the server: the
-/// session refuses at Hello with `internal`.
+/// A malformed setting of the write paths is a fault of the server. The
+/// session refuses it at `Hello` with `internal`.
 #[test]
 fn a_malformed_write_setting_is_internal_at_hello() {
     for (mode, extra) in [
@@ -194,10 +198,11 @@ fn a_malformed_write_setting_is_internal_at_hello() {
     }
 }
 
-/// A `Hello` whose reply can need a frame over the limit is
-/// `limit-exceeded` on the wire and for the caller, before the session
-/// transaction opens: under a foreign exclusive lock the answer comes at
-/// once, and not as the `internal` of the lock timeout.
+/// If the reply to a `Hello` can need a frame over the limit, the session
+/// refuses with `limit-exceeded`, on the wire and to the caller. The refusal
+/// comes before the session transaction opens. Under a foreign exclusive
+/// lock, the answer comes at once, with no wait for the `internal` of the
+/// lock timeout.
 #[test]
 fn a_reply_over_the_frame_limit_is_limit_exceeded() {
     let tmp = TmpDir::new("recv-bigreply");
@@ -328,8 +333,8 @@ fn a_message_out_of_order_is_protocol() {
     }
 }
 
-/// A kind of the pull is `protocol` at the receive side: `PullHello` as the
-/// first frame, and `Get` after `Hello`.
+/// A message kind of the pull protocol gets `protocol` at the receive side.
+/// The cases are `PullHello` as the first frame and `Get` after `Hello`.
 #[test]
 fn a_pull_kind_is_protocol() {
     let cases: Vec<(&str, Script)> = vec![
@@ -703,7 +708,7 @@ fn malformed_content_is_protocol() {
                 c.hello_reply(&[]).await;
                 let _ = c.object(ObjectType::File, sum, encoding, &bytes).await;
                 // A server that took the object ends the session here with no
-                // Error, and the test fails rather than waits.
+                // Error. The test then fails at once and does not wait.
                 let _ = c.send(&Message::ObjectsEnd).await;
                 let _ = c.send(&Message::Abort).await;
                 c.error().await

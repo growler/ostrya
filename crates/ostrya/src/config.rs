@@ -1,30 +1,9 @@
-//! Typed view of the repository `config` file.
+//! The typed view of the repository `config` file.
 //!
-//! [`RepoConfig`] wraps the [`KeyFile`] parsed from `<repo>/config` and applies
-//! the value-level conventions the `ostree` tool uses: the `[core]` group with
-//! `repo_version` and `mode`, the documented `[core]` tunables with their
-//! defaults, the `[archive]` group, and `[remote "<name>"]` sections.
-//!
-//! The `[ex-ostrya]` group carries the keys that are ostrya extensions:
-//! `gc-root-metadata-keys` for a prune, and `detached-metadata-exclude` for
-//! what a repository stores and sends. The groups whose names start with
-//! `ex-ostrya ` state the policy a repository applies to the commits it
-//! receives. Under the `receive` feature, `ReceivePolicy::from_config` reads
-//! them, and reads a trust group through the [`Remote`] accessors, because a
-//! trust group takes the key names of a remote section.
-//!
-//! The `repo_version` and `mode` keys are validated when the config is loaded,
-//! matching the tool, which refuses to open a repository whose version is not
-//! `1`. The remaining tunables are read on demand through accessors that apply
-//! the documented default when the key is absent and surface a malformed value
-//! as an error, the same way the tool reports a value it cannot interpret.
-//!
-//! The parsed [`KeyFile`] is retained so a caller can read keys this view does
-//! not model and so the document reserializes in the order it was written.
-//!
-//! The write side is [`Repo::write_config`]: it replaces `config` atomically
-//! with the document a caller edited through [`KeyFile`]'s own setters and
-//! removers.
+//! - [`RepoConfig`] reads the keys of the repository groups.
+//! - [`Remote`] reads the keys of one `[remote "<name>"]` section.
+//! - [`Repo::write_config`] writes an edited config back to the repository.
+//! - [`valid_remote_name`] checks a remote name.
 
 use ostrya_core::{KeyFile, RepoMode};
 
@@ -36,10 +15,41 @@ const CORE: &str = "core";
 const ARCHIVE: &str = "archive";
 const EX_INTEGRITY: &str = "ex-integrity";
 const EX_OSTRYA: &str = "ex-ostrya";
-/// The name of the repository file holding `config`.
+/// The name of the `config` file at the repository root.
 const CONFIG_FILE: &str = "config";
 
 /// A parsed repository configuration.
+///
+/// The type holds the [`KeyFile`] parsed from `<repo>/config`. It reads the
+/// values with the conventions of the `ostree` command.
+///
+/// # Groups
+///
+/// - `[core]`: `repo_version`, `mode`, and the other tunables, each with its
+///   default.
+/// - `[archive]`: [`zlib_level`](RepoConfig::zlib_level).
+/// - `[ex-integrity]`: [`composefs`](RepoConfig::composefs) and
+///   [`fsverity`](RepoConfig::fsverity).
+/// - `[remote "<name>"]`: one section for each remote, read through
+///   [`Remote`].
+/// - `[ex-ostrya]`: the keys that are ostrya extensions,
+///   [`gc_root_metadata_keys`](RepoConfig::gc_root_metadata_keys) and
+///   [`detached_metadata_exclude`](RepoConfig::detached_metadata_exclude).
+/// - The groups whose names start with `ex-ostrya` and a space, for example
+///   `[ex-ostrya receive]`: the policy that a repository applies to the
+///   commits that it receives. Under the `receive` feature,
+///   `ReceivePolicy::from_config` reads these groups.
+///
+/// # Checks
+///
+/// [`from_keyfile`](RepoConfig::from_keyfile) checks `repo_version` and `mode`
+/// when it loads the config. The `ostree` command also refuses to open a
+/// repository whose version is not `1`.
+///
+/// Each other accessor reads its key when it is called. If the key is absent,
+/// the accessor returns the default. If the value is malformed, the accessor
+/// returns an error, as the `ostree` command reports a value that it cannot
+/// read.
 #[derive(Debug, Clone)]
 pub struct RepoConfig {
     keyfile: KeyFile,
@@ -49,21 +59,25 @@ pub struct RepoConfig {
     remotes: Vec<String>,
 }
 
-/// The minimum free space a write must leave, as configured. A size, when set,
-/// takes precedence over a percentage.
+/// The minimum free space that a write must leave.
 ///
-/// The byte value of a [`Size`](MinFreeSpace::Size) spec is applied by the
-/// write path; this type carries the parsed magnitude and unit verbatim.
+/// If the config sets a size, the size applies and the percentage does not.
+/// The write path applies the byte value of a [`Size`](MinFreeSpace::Size).
+/// This type holds the parsed magnitude and unit as written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MinFreeSpace {
-    /// `min-free-space-percent`, `0`-`100`. The default is `3`.
+    /// `min-free-space-percent`, from `0` to `100`.
+    ///
+    /// The default is `3`.
     Percent(u32),
     /// `min-free-space-size`, a magnitude with a binary unit suffix.
     Size(SizeSpec),
 }
 
-/// A `min-free-space-size` value: a magnitude and one of the `MB`, `GB`, `TB`
-/// unit suffixes the tool accepts (regex `^([0-9]+)(G|M|T)B$`).
+/// A `min-free-space-size` value: a magnitude and a unit suffix.
+///
+/// The `ostree` command accepts the suffixes `MB`, `GB`, and `TB`, with the
+/// regex `^([0-9]+)(G|M|T)B$`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SizeSpec {
     /// The numeric magnitude.
@@ -72,7 +86,7 @@ pub struct SizeSpec {
     pub unit: SizeUnit,
 }
 
-/// The unit suffix on a `min-free-space-size` value.
+/// The unit suffix of a `min-free-space-size` value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizeUnit {
     /// `MB`.
@@ -84,8 +98,10 @@ pub enum SizeUnit {
 }
 
 impl SizeUnit {
-    /// The byte multiplier for this unit. The `MB`/`GB`/`TB` suffixes denote
-    /// binary multiples (2^20, 2^30, 2^40).
+    /// Returns the byte multiplier of this unit.
+    ///
+    /// The suffixes `MB`, `GB`, and `TB` are binary multiples: 2^20, 2^30, and
+    /// 2^40.
     pub fn multiplier(self) -> u64 {
         match self {
             SizeUnit::Mega => 1 << 20,
@@ -96,46 +112,50 @@ impl SizeUnit {
 }
 
 impl SizeSpec {
-    /// The value in bytes, saturating on overflow.
+    /// Returns the value in bytes, or `u64::MAX` if the product overflows.
     pub fn bytes(self) -> u64 {
         self.value.saturating_mul(self.unit.multiplier())
     }
 }
 
-/// The `sign-verify` remote setting: which sign-api engines a pull checks the
-/// signatures of the commits it fetches with.
+/// The value of a `sign-verify` key: the engines that verify signatures.
 ///
-/// The value is either a boolean, spelled the way the key file spells one, or a
-/// list of engine names separated by `,` or `;`. A name is taken as written: the
-/// space in `ed25519, ed25519` belongs to the second name, which no engine
-/// answers to, and the tool refuses that value as well.
+/// The value is a boolean in the key-file spelling (`true`, `false`, `1`,
+/// `0`), or a list of engine names. A `,` or a `;` separates the names.
+///
+/// Each name is used as written. In `ed25519, ed25519`, the second name starts
+/// with a space, so no engine has that name. The `ostree` command also refuses
+/// this value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignVerify {
-    /// No sign-api check: the key is absent, `false`, or names nothing.
+    /// No sign-api verification: the key is absent, `false`, or names no
+    /// engine.
     Off,
-    /// Every engine this build has, which is what `true` selects.
+    /// Every engine of this build, selected by `true`.
     All,
-    /// The engines the value names, in the order it names them.
+    /// The engines that the value names, in the order of the value.
     Engines(Vec<String>),
 }
 
-/// A tri-state repository setting, spelled `no`, `maybe`, or `yes`.
+/// A tri-state repository setting: `no`, `maybe`, or `yes`.
 ///
-/// The `[ex-integrity]` keys use this form: `No` disables the feature, `Maybe`
-/// enables it best-effort (ignoring a filesystem that cannot provide it), and
-/// `Yes` requires it (failing where it cannot be provided).
+/// The `[ex-integrity]` keys use this form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tristate {
-    /// The feature is disabled.
+    /// The feature is off.
     No,
-    /// Best effort: enable where supported, ignore where not.
+    /// Best effort: on where the file system supports the feature.
+    ///
+    /// Where the file system cannot provide the feature, the operation ignores
+    /// it.
     Maybe,
-    /// Required: fail where the feature cannot be provided.
+    /// Required: the operation fails where the file system cannot provide it.
     Yes,
 }
 
 impl Tristate {
-    /// Parse the `no`/`maybe`/`yes` spelling the tool writes.
+    /// Parses the `no`, `maybe`, or `yes` spelling that the `ostree` command
+    /// writes.
     fn parse(raw: &str) -> Option<Tristate> {
         match raw {
             "no" => Some(Tristate::No),
@@ -147,8 +167,19 @@ impl Tristate {
 }
 
 impl RepoConfig {
-    /// Build a typed view over an already-parsed [`KeyFile`], validating the
-    /// `[core]` `repo_version` and `mode` keys.
+    /// Creates a typed view of a parsed [`KeyFile`].
+    ///
+    /// The call checks the `[core]` keys `repo_version` and `mode`. It also
+    /// reads `[core] collection-id` and the names of the remote sections.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if the config has no `[core]` group, no
+    ///   `repo_version` key, or no `mode` key.
+    /// - [`Error::InvalidFormat`] if `repo_version` is not `1`, or if `mode`
+    ///   names no repository mode.
+    /// - [`Error::Core`] if `repo_version` is not an integer, or if `mode` or
+    ///   `collection-id` holds a malformed escape sequence.
     pub fn from_keyfile(keyfile: KeyFile) -> Result<RepoConfig> {
         if !keyfile.has_group(CORE) {
             return Err(Error::InvalidFormat("config has no [core] group".into()));
@@ -188,43 +219,63 @@ impl RepoConfig {
         })
     }
 
-    /// Parse a config document from its text.
+    /// Parses a config from its text.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Core`] if the text is not a valid key file.
+    /// - The errors of [`from_keyfile`](RepoConfig::from_keyfile).
     pub fn parse(text: &str) -> Result<RepoConfig> {
         RepoConfig::from_keyfile(KeyFile::parse(text)?)
     }
 
-    /// The repository storage mode.
+    /// Returns the storage mode of the repository.
     pub fn mode(&self) -> RepoMode {
         self.mode
     }
 
-    /// The `[core] repo_version`. Always `1` for a config this type accepts.
+    /// Returns the `[core] repo_version` value.
+    ///
+    /// The value is always `1` for a config that this type accepts.
     pub fn repo_version(&self) -> i64 {
         self.repo_version
     }
 
-    /// The repository collection id, if `[core] collection-id` is set.
+    /// Returns the `[core] collection-id` of the repository, if it is set.
     pub fn collection_id(&self) -> Option<&str> {
         self.collection_id.as_deref()
     }
 
-    /// The names of the configured remotes, in the order their sections appear.
+    /// Returns the names of the remotes, in the order of their sections.
     pub fn remotes(&self) -> impl Iterator<Item = &str> {
         self.remotes.iter().map(String::as_str)
     }
 
-    /// A typed accessor for one remote, or `None` if no such section exists.
+    /// Returns the accessor of one remote, or `None` if the section does not
+    /// exist.
     pub fn remote(&self, name: &str) -> Option<Remote<'_>> {
         Remote::in_keyfile(&self.keyfile, name)
     }
 
-    /// Whether `fsync` durability is enabled. Default `true`.
+    /// Returns `true` if `[core] fsync` is on.
+    ///
+    /// The default is `true`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value is not a boolean.
     pub fn fsync(&self) -> Result<bool> {
         Ok(self.keyfile.get_bool(CORE, "fsync")?.unwrap_or(true))
     }
 
-    /// Whether the file of each content object is fsynced individually as it
-    /// is staged. A metadata object is not synced on its own. Default `false`.
+    /// Returns `true` if each content object file is synced when it is staged.
+    ///
+    /// The key is `[core] per-object-fsync`, and the default is `false`. A
+    /// metadata object is not synced alone.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value is not a boolean.
     pub fn per_object_fsync(&self) -> Result<bool> {
         Ok(self
             .keyfile
@@ -232,13 +283,26 @@ impl RepoConfig {
             .unwrap_or(false))
     }
 
-    /// Whether repository locking is enabled. Default `true`.
+    /// Returns `true` if `[core] locking` turns on the repository lock.
+    ///
+    /// The default is `true`. [`LockKind`](crate::LockKind) describes the
+    /// repository lock.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value is not a boolean.
     pub fn locking(&self) -> Result<bool> {
         Ok(self.keyfile.get_bool(CORE, "locking")?.unwrap_or(true))
     }
 
-    /// The lock-acquisition timeout in seconds. Default `300`. `-1` means no
-    /// limit, and a value below `-1` is refused.
+    /// Returns the `[core] lock-timeout-secs` limit of a lock wait, in seconds.
+    ///
+    /// The default is `300`. The value `-1` means no limit.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if the value is less than `-1`.
+    /// - [`Error::Core`] if the value is not an integer.
     pub fn lock_timeout_secs(&self) -> Result<i64> {
         let secs = self
             .keyfile
@@ -252,7 +316,14 @@ impl RepoConfig {
         Ok(secs)
     }
 
-    /// The staging-directory expiry in seconds. Default `86400`.
+    /// Returns the `[core] tmp-expiry-secs` expiry of a stale entry in `tmp/`,
+    /// in seconds.
+    ///
+    /// The default is `86400`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value is not an integer.
     pub fn tmp_expiry_secs(&self) -> Result<i64> {
         Ok(self
             .keyfile
@@ -260,9 +331,14 @@ impl RepoConfig {
             .unwrap_or(86400))
     }
 
-    /// Whether the repository advertises tombstone commits in its summary.
-    /// Default `false`. The summary emits `ostree.summary.tombstone-commits`
-    /// with this value.
+    /// Returns `true` if the summary announces tombstone commits.
+    ///
+    /// The key is `[core] tombstone-commits`, and the default is `false`. The
+    /// summary writes this value as `ostree.summary.tombstone-commits`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value is not a boolean.
     pub fn tombstone_commits(&self) -> Result<bool> {
         Ok(self
             .keyfile
@@ -270,8 +346,14 @@ impl RepoConfig {
             .unwrap_or(false))
     }
 
-    /// Whether the repository indexes its static deltas. Default `true`. The
-    /// summary emits `ostree.summary.indexed-deltas` with this value.
+    /// Returns `true` if the repository indexes its static deltas.
+    ///
+    /// The key is `[core] indexed-deltas`, and the default is `true`. The
+    /// summary writes this value as `ostree.summary.indexed-deltas`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value is not a boolean.
     pub fn indexed_deltas(&self) -> Result<bool> {
         Ok(self
             .keyfile
@@ -279,7 +361,13 @@ impl RepoConfig {
             .unwrap_or(true))
     }
 
-    /// Whether xattr storage is disabled. Default `false`.
+    /// Returns `true` if `[core] disable-xattrs` turns off xattr storage.
+    ///
+    /// The default is `false`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value is not a boolean.
     pub fn disable_xattrs(&self) -> Result<bool> {
         Ok(self
             .keyfile
@@ -287,12 +375,22 @@ impl RepoConfig {
             .unwrap_or(false))
     }
 
-    /// The `[core] parent` repository path, if set.
+    /// Returns the `[core] parent` repository path, if it is set.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn parent(&self) -> Result<Option<String>> {
         self.keyfile.get_string(CORE, "parent").map_err(Error::from)
     }
 
-    /// The configured repo finders. Default `["config", "mount"]`.
+    /// Returns the `[core] default-repo-finders` list.
+    ///
+    /// The default is `["config", "mount"]`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn default_repo_finders(&self) -> Result<Vec<String>> {
         Ok(self
             .keyfile
@@ -300,9 +398,18 @@ impl RepoConfig {
             .unwrap_or_else(|| vec!["config".to_owned(), "mount".to_owned()]))
     }
 
-    /// The minimum free space a write must leave. A `min-free-space-size` value
-    /// takes precedence; otherwise `min-free-space-percent` applies, defaulting
-    /// to `3`.
+    /// Returns the minimum free space that a write must leave.
+    ///
+    /// If `[core] min-free-space-size` is set, it applies. If it is not set,
+    /// `[core] min-free-space-percent` applies, with the default `3`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if `min-free-space-size` does not match
+    ///   `^([0-9]+)(G|M|T)B$`, or if its magnitude does not fit in a `u64`.
+    /// - [`Error::InvalidFormat`] if `min-free-space-percent` is outside the
+    ///   range `0` to `100`.
+    /// - [`Error::Core`] if `min-free-space-percent` is not an integer.
     pub fn min_free_space(&self) -> Result<MinFreeSpace> {
         if let Some(raw) = self.keyfile.get_value(CORE, "min-free-space-size") {
             let spec = parse_size(raw).ok_or_else(|| {
@@ -322,7 +429,13 @@ impl RepoConfig {
         Ok(MinFreeSpace::Percent(percent as u32))
     }
 
-    /// The `[archive] zlib-level` compression level. Default `6`.
+    /// Returns the `[archive] zlib-level` compression level.
+    ///
+    /// The default is `6`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value is not an integer.
     pub fn zlib_level(&self) -> Result<i64> {
         Ok(self
             .keyfile
@@ -330,63 +443,83 @@ impl RepoConfig {
             .unwrap_or(6))
     }
 
-    /// The `[ex-ostrya] gc-root-metadata-keys` setting: the metadata keys a
-    /// prune reads for further reachable commits. Empty by default.
+    /// Returns the `[ex-ostrya] gc-root-metadata-keys` list.
+    ///
+    /// The list names the metadata keys from which a prune reads more
+    /// reachable commits. The key is an ostrya extension, and the list is empty
+    /// by default.
     ///
     /// The `ostrya prune` command puts this list into
     /// [`PruneOptions::gc_root_metadata_keys`](crate::PruneOptions::gc_root_metadata_keys).
-    /// The list adds roots and removes none, and it carries no counterpart for
-    /// [`traverse_parent`](crate::PruneOptions::traverse_parent), so a
-    /// configured prune keeps at least what a prune with the tool's own
-    /// reachability keeps.
+    /// The list adds roots and removes none. It has no counterpart for
+    /// [`traverse_parent`](crate::PruneOptions::traverse_parent). As a result,
+    /// a prune with this list keeps at least what a prune with the
+    /// reachability of the `ostree` command keeps.
     ///
-    /// The library reads this key nowhere: [`Repo::prune`](crate::Repo::prune)
-    /// acts on the options its caller supplies.
+    /// The library does not read this key. [`Repo::prune`](crate::Repo::prune)
+    /// uses only the options that its caller gives.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn gc_root_metadata_keys(&self) -> Result<Vec<String>> {
         self.string_list(EX_OSTRYA, "gc-root-metadata-keys")
     }
 
-    /// The `[ex-ostrya] detached-metadata-exclude` setting: the detached
-    /// metadata keys this repository does not store when it receives a commit,
-    /// and does not send when it serves one. Empty by default.
+    /// Returns the `[ex-ostrya] detached-metadata-exclude` list.
+    ///
+    /// The list names the detached metadata keys that this repository does not
+    /// store when it receives a commit. The repository also does not send these
+    /// keys when it serves a commit. The key is an ostrya extension, and the
+    /// list is empty by default.
     ///
     /// The `ostrya pull` and `ostrya pull-local` commands put this list into
     /// [`PullOptions::detached_metadata_filter`](crate::PullOptions::detached_metadata_filter)
     /// through
     /// [`DetachedMetadataFilter::excluding`](crate::DetachedMetadataFilter::excluding).
     /// Under the `receive` feature, `ReceivePolicy::from_config` reads it into
-    /// the filter the receive path applies.
+    /// the filter of the receive path.
     ///
-    /// This list is never derived from
-    /// [`gc_root_metadata_keys`](RepoConfig::gc_root_metadata_keys), even when
-    /// the two lists are identical. A repository that roots on a key and does
-    /// not list it in the exclude list keeps transferring it.
+    /// This list never comes from
+    /// [`gc_root_metadata_keys`](RepoConfig::gc_root_metadata_keys), also when
+    /// the two lists are equal. If a repository roots on a key and does not
+    /// list it here, the repository continues to transfer the key.
     ///
-    /// The list governs what a pull stores, not what the repository already
-    /// holds. A commit whose every detached-metadata key the list names leaves
-    /// the copy the destination already holds where it stands, so setting this
-    /// key and pulling again does not remove a copy an earlier pull stored.
+    /// The list controls what a pull stores. It does not change what the
+    /// repository already holds. If the list names each detached metadata key
+    /// of a commit, a pull keeps the copy that the destination holds. A new
+    /// pull after a change of this key does not remove a copy from an earlier
+    /// pull.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn detached_metadata_exclude(&self) -> Result<Vec<String>> {
         self.string_list(EX_OSTRYA, "detached-metadata-exclude")
     }
 
-    /// Whether the summary is regenerated after a ref changes: `[core]
-    /// auto-update-summary`, or its deprecated alias `commit-update-summary`.
-    /// Default `false`.
+    /// Returns `true` if a ref change regenerates the summary.
     ///
-    /// The two keys are read together, and either one set to true turns the
-    /// regeneration on, which is what the tool was observed to do: with one key
-    /// true and the other false, in either order, `ostree commit` writes a
-    /// summary. A malformed value in either key is an error, also when the
-    /// other key is true, as the tool refuses it.
+    /// The keys are `[core] auto-update-summary` and its deprecated alias
+    /// `commit-update-summary`. The default is `false`.
+    ///
+    /// The call reads the two keys together. If either key is true, the
+    /// regeneration is on. An observation of the `ostree` command shows the
+    /// same rule: with one key true and the other false, in either order,
+    /// `ostree commit` writes a summary.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if either key is not a boolean, also when the other key
+    /// is true. The `ostree` command also refuses this value.
     pub fn auto_update_summary(&self) -> Result<bool> {
         let canonical = self.keyfile.get_bool(CORE, "auto-update-summary")?;
         let alias = self.keyfile.get_bool(CORE, "commit-update-summary")?;
         Ok(canonical.unwrap_or(false) || alias.unwrap_or(false))
     }
 
-    /// Read a `;`-separated list key, empty when the key is absent. A value the
-    /// key-file syntax cannot split is reported as an error.
+    /// Reads a `;`-separated list key. The list is empty if the key is absent.
+    /// A value that the key-file syntax cannot split is an error.
     fn string_list(&self, group: &str, key: &str) -> Result<Vec<String>> {
         Ok(self
             .keyfile
@@ -394,24 +527,42 @@ impl RepoConfig {
             .unwrap_or_default())
     }
 
-    /// The `[ex-integrity] composefs` setting. Default `No`.
+    /// Returns the `[ex-integrity] composefs` setting.
     ///
-    /// This is read to compute the [`fsverity`](RepoConfig::fsverity) default.
-    /// The composefs deployment behavior the key otherwise governs is out of
-    /// scope for the write path.
+    /// The default is [`Tristate::No`]. The setting sets the default of
+    /// [`fsverity`](RepoConfig::fsverity). The write path does not use the
+    /// composefs deployment behavior that the key also controls.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if the value is not `no`, `maybe`, or `yes`.
+    /// - [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn composefs(&self) -> Result<Tristate> {
         Ok(self
             .tristate(EX_INTEGRITY, "composefs")?
             .unwrap_or(Tristate::No))
     }
 
-    /// The `[ex-integrity] fsverity` setting: whether loose objects are sealed
-    /// with fs-verity as they are written.
+    /// Returns the `[ex-integrity] fsverity` setting.
     ///
-    /// An explicit value is honored as written. When the key is absent it
-    /// defaults to `No`, raised to `Maybe` when
-    /// [`composefs`](RepoConfig::composefs) is `Yes` or `Maybe`; `composefs` is
-    /// read only in that fallback.
+    /// The setting controls the fs-verity seal of the loose objects:
+    ///
+    /// - `maybe` or `yes`: each loose object that the object store holds as a
+    ///   regular file gets a seal at staging, in every repository mode.
+    /// - `yes`: if a seal fails, the write fails with [`Error::Unsupported`].
+    /// - `maybe`: the write ignores a seal that fails.
+    ///
+    /// An explicit value applies as written. If the key is absent, the default
+    /// is `No`. If the key is absent and [`composefs`](RepoConfig::composefs)
+    /// is `Yes` or `Maybe`, the default is `Maybe`. The call reads `composefs`
+    /// only when the key is absent.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if the value is not `no`, `maybe`, or `yes`.
+    /// - [`Error::Core`] if the value holds a malformed escape sequence.
+    /// - If the key is absent, the errors of
+    ///   [`composefs`](RepoConfig::composefs).
     pub fn fsverity(&self) -> Result<Tristate> {
         if let Some(explicit) = self.tristate(EX_INTEGRITY, "fsverity")? {
             return Ok(explicit);
@@ -422,8 +573,8 @@ impl RepoConfig {
         })
     }
 
-    /// Read a tri-state key, returning `None` when it is absent and reporting a
-    /// value that is not `no`/`maybe`/`yes` as a malformed config error.
+    /// Reads a tri-state key. Returns `None` if the key is absent. A value
+    /// other than `no`, `maybe`, or `yes` is a malformed config error.
     fn tristate(&self, group: &str, key: &str) -> Result<Option<Tristate>> {
         match self.keyfile.get_string(group, key)? {
             None => Ok(None),
@@ -433,44 +584,69 @@ impl RepoConfig {
         }
     }
 
-    /// The parsed key file backing this view.
+    /// Returns the parsed key file of this view.
+    ///
+    /// A caller can read the keys that this type does not model. The key file
+    /// keeps the order of the source text when it writes the config again.
     pub fn keyfile(&self) -> &KeyFile {
         &self.keyfile
     }
 
-    /// The parsed key file backing this view, taken by value.
+    /// Returns the parsed key file of this view by value.
     pub(crate) fn into_keyfile(self) -> KeyFile {
         self.keyfile
     }
 }
 
+/// Methods that write the config and the keyring of a remote.
 impl Repo {
-    /// Replace the repository `config` with the document `keyfile` holds.
+    /// Replaces the repository `config` with the document in `keyfile`.
     ///
-    /// The file is written the way the rest of the write path writes a
-    /// repository-root file: a fresh temporary file at mode `0644`,
-    /// `fdatasync`ed when `[core] fsync` is set, renamed over `config`, with the
-    /// repository directory synced after the rename. A reader therefore sees
-    /// either the old document or the new one.
+    /// The call writes the file as the write path writes each file at the
+    /// repository root:
     ///
-    /// The document is written as given. A caller that removes `[core] mode` or
-    /// `[core] repo_version` writes a file [`Repo::open`] refuses, so read the
-    /// current document through [`RepoConfig::keyfile`], edit it, and write it
-    /// back. A document over 1 MiB, the size an open accepts, is refused with
-    /// [`Error::InvalidFormat`] and nothing is written.
+    /// 1. It writes a new temporary file at mode `0644`.
+    /// 2. If `[core] fsync` is on, it syncs the file with `fdatasync`.
+    /// 3. It renames the file over `config`.
+    /// 4. If `[core] fsync` is on, it syncs the repository directory.
     ///
-    /// This handle keeps the configuration it was opened with; reopen the
-    /// repository to read the new values.
+    /// A reader sees the old document or the new one.
     ///
-    /// The call takes the repository lock shared and then the update lock, as
-    /// [`Repo::begin_update`] does, and writes under both. Each of the two
-    /// waits fails with [`Error::LockTimeout`] after `lock-timeout-secs`. The
-    /// locks cover the write alone: a document read from this handle before
-    /// the call can miss a write another writer made in between. A
-    /// read-modify-write that must see the file as it stands reads and writes
-    /// it through an [`UpdateGuard`](crate::UpdateGuard). A caller that holds
-    /// a guard of this repository and calls this waits for its own guard until
-    /// the timeout, and with `lock-timeout-secs=-1` it waits forever.
+    /// # Edits
+    ///
+    /// The call writes the document as given. If a caller removes `[core] mode`
+    /// or `[core] repo_version`, [`Repo::open`] refuses the written file. To
+    /// change a key, a caller reads the current document through
+    /// [`RepoConfig::keyfile`], changes it with the setters and removers of
+    /// [`KeyFile`], and writes it back.
+    ///
+    /// This handle keeps the configuration that it was opened with. To read
+    /// the new values, open the repository again.
+    ///
+    /// # Locks
+    ///
+    /// The call takes the repository lock shared, as
+    /// [`LockKind`](crate::LockKind) describes. Then it takes the update lock
+    /// for its write step, as [`Repo::begin_update`] does. It writes under both
+    /// locks.
+    ///
+    /// The locks cover the write alone. A document that a caller read from
+    /// this handle before the call can miss the write of another writer. A
+    /// read-modify-write that must see the current file reads and writes it
+    /// through an [`UpdateGuard`](crate::UpdateGuard).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if the document is larger than 1 MiB, the
+    ///   size that an open accepts. The call then writes nothing.
+    /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
+    ///   lock-timeout-secs`. Each of the two waits gets the full timeout.
+    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` of this handle
+    ///   is less than `-1`.
+    /// - [`Error::Core`] if `[core] fsync` or `[core] locking` of this handle
+    ///   is not a boolean, or if `[core] lock-timeout-secs` is not an integer.
+    /// - [`Error::Io`] if a lock file, the write, the rename, or a sync fails
+    ///   on the file system.
     pub async fn write_config(&self, keyfile: &KeyFile) -> Result<()> {
         let fsync = self.config().fsync()?;
         let bytes = keyfile.to_string().into_bytes();
@@ -481,13 +657,24 @@ impl Repo {
         .await
     }
 
-    /// Remove a remote's trusted GPG keyring, `<remote>.trustedkeys.gpg`, at the
-    /// repository root. An already-absent keyring is success.
+    /// Removes the trusted GPG keyring of a remote at the repository root.
     ///
-    /// A remote's keyring belongs to its configuration section, so deleting the
-    /// section deletes this file with it. The call takes the locks
-    /// [`write_config`](Repo::write_config) takes and waits for them the same
-    /// way.
+    /// The file is `<remote>.trustedkeys.gpg`. If the keyring is absent, the
+    /// call succeeds. The keyring belongs to the config section of the remote,
+    /// so a deletion of the section also deletes this file.
+    ///
+    /// The call takes the same locks as [`write_config`](Repo::write_config)
+    /// and waits for them in the same way.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
+    ///   lock-timeout-secs`.
+    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` of this handle
+    ///   is less than `-1`.
+    /// - [`Error::Core`] if `[core] locking` of this handle is not a boolean,
+    ///   or if `[core] lock-timeout-secs` is not an integer.
+    /// - [`Error::Io`] if a lock file or the removal fails on the file system.
     pub async fn remove_remote_keyring(&self, remote: &str) -> Result<()> {
         let name = remote_keyring_name(remote);
         self.write_locked(move |repo| remove_root_file_blocking(repo.repo_fd(), &name))
@@ -495,12 +682,16 @@ impl Repo {
     }
 }
 
-/// The name of a remote's trusted keyring at the repository root.
+/// Returns the name of the trusted keyring of a remote at the repository root.
 pub(crate) fn remote_keyring_name(remote: &str) -> String {
     format!("{remote}.trustedkeys.gpg")
 }
 
 /// A typed accessor for one `[remote "<name>"]` section.
+///
+/// A trust group of a receive policy takes the key names of a remote section.
+/// Under the `receive` feature, `ReceivePolicy::from_config` reads a trust
+/// group through this type.
 #[derive(Debug, Clone)]
 pub struct Remote<'a> {
     keyfile: &'a KeyFile,
@@ -508,8 +699,8 @@ pub struct Remote<'a> {
 }
 
 impl<'a> Remote<'a> {
-    /// The `[remote "<name>"]` section of `keyfile`, or `None` if no such
-    /// section exists.
+    /// Returns the `[remote "<name>"]` section of `keyfile`, or `None` if the
+    /// section does not exist.
     pub(crate) fn in_keyfile(keyfile: &'a KeyFile, name: &str) -> Option<Remote<'a>> {
         let group = remote_group(name);
         keyfile
@@ -517,8 +708,9 @@ impl<'a> Remote<'a> {
             .then_some(Remote { keyfile, group })
     }
 
-    /// The accessors of a remote section over another group of `keyfile`,
-    /// which takes the key names and the value forms of a remote section.
+    /// Returns the accessors of a remote section over another group of
+    /// `keyfile`. The group takes the key names and the value forms of a
+    /// remote section.
     #[cfg(feature = "receive")]
     pub(crate) fn view(keyfile: &'a KeyFile, group: String) -> Remote<'a> {
         Remote { keyfile, group }
@@ -526,23 +718,42 @@ impl<'a> Remote<'a> {
 }
 
 impl Remote<'_> {
-    /// The base URL for objects and refs.
+    /// Returns the `url` key: the base URL of the objects and the refs.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn url(&self) -> Result<Option<String>> {
         self.string("url")
     }
 
-    /// The URL for content objects, when it differs from `url`.
+    /// Returns the `contenturl` key: the URL of the content objects.
+    ///
+    /// A remote sets this key if the URL differs from `url`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn contenturl(&self) -> Result<Option<String>> {
         self.string("contenturl")
     }
 
-    /// The metalink URL, when the remote is described by a metalink.
+    /// Returns the `metalink` key: the URL of a metalink for this remote.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn metalink(&self) -> Result<Option<String>> {
         self.string("metalink")
     }
 
-    /// Whether commits pulled from this remote are GPG-verified. Default
-    /// `true`.
+    /// Returns `true` if a pull verifies the GPG signatures of commits.
+    ///
+    /// The key is `gpg-verify`, and the default is `true`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value is not a boolean.
     pub fn gpg_verify(&self) -> Result<bool> {
         Ok(self
             .keyfile
@@ -550,7 +761,13 @@ impl Remote<'_> {
             .unwrap_or(true))
     }
 
-    /// Whether the summary of this remote is GPG-verified. Default `false`.
+    /// Returns `true` if a pull verifies the GPG signature of the summary.
+    ///
+    /// The key is `gpg-verify-summary`, and the default is `false`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value is not a boolean.
     pub fn gpg_verify_summary(&self) -> Result<bool> {
         Ok(self
             .keyfile
@@ -558,9 +775,16 @@ impl Remote<'_> {
             .unwrap_or(false))
     }
 
-    /// The GPG keyrings this remote trusts beyond the repository's own
-    /// `<remote>.trustedkeys.gpg` and the system trusted set: the `;`-separated
-    /// entries of `gpgkeypath`, each a keyring file or a directory of them.
+    /// Returns the `gpgkeypath` entries: more trusted GPG keyrings.
+    ///
+    /// The remote also trusts the keyring `<remote>.trustedkeys.gpg` of the
+    /// repository and the system trusted set. A `;` separates the entries, and
+    /// the list skips an empty entry. Each entry is a keyring file or a
+    /// directory of keyring files.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn gpgkeypath(&self) -> Result<Vec<String>> {
         Ok(self
             .string("gpgkeypath")?
@@ -573,70 +797,126 @@ impl Remote<'_> {
             .unwrap_or_default())
     }
 
-    /// Which sign-api engines a pull checks the commits of this remote with.
-    /// Default [`SignVerify::Off`].
+    /// Returns the sign-api engines that verify the commits of this remote.
+    ///
+    /// The key is `sign-verify`, and the default is [`SignVerify::Off`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn sign_verify(&self) -> Result<SignVerify> {
         Ok(parse_sign_verify(self.string("sign-verify")?.as_deref()))
     }
 
-    /// Which sign-api engines a pull checks this remote's summary with. Default
-    /// [`SignVerify::Off`]. This is read on its own: `sign-verify=false` leaves
-    /// a summary check the key asks for in place.
+    /// Returns the sign-api engines that verify the summary of this remote.
+    ///
+    /// The key is `sign-verify-summary`, and the default is
+    /// [`SignVerify::Off`]. The call reads this key alone. `sign-verify=false`
+    /// does not turn off a summary verification that this key asks for.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn sign_verify_summary(&self) -> Result<SignVerify> {
         Ok(parse_sign_verify(
             self.string("sign-verify-summary")?.as_deref(),
         ))
     }
 
-    /// The inline trusted key for one sign-api engine,
-    /// `verification-<engine>-key`. One key, not a list.
+    /// Returns the inline trusted key of one sign-api engine.
+    ///
+    /// The key is `verification-<engine>-key`. It holds exactly one key.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn verification_key(&self, engine: &str) -> Result<Option<String>> {
         self.string(&format!("verification-{engine}-key"))
     }
 
-    /// The path to a file of trusted keys for one sign-api engine,
-    /// `verification-<engine>-file`, holding one key per line.
+    /// Returns the path of a file of trusted keys for one sign-api engine.
+    ///
+    /// The key is `verification-<engine>-file`. The file holds one key on each
+    /// line.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn verification_file(&self, engine: &str) -> Result<Option<String>> {
         self.string(&format!("verification-{engine}-file"))
     }
 
-    /// The collection id bound to this remote, if set.
+    /// Returns the `collection-id` of this remote, if it is set.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn collection_id(&self) -> Result<Option<String>> {
         self.string("collection-id")
     }
 
-    /// The refs a pull of this remote takes when it is asked for none.
+    /// Returns the `branches` key: the refs of a pull that names no ref.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn branches(&self) -> Result<Option<Vec<String>>> {
         self.keyfile
             .get_string_list(&self.group, "branches")
             .map_err(Error::from)
     }
 
-    /// The path to a PEM file of trust anchors for this remote's TLS, replacing
-    /// the host trust store. A pull and a push read a relative path from the
-    /// current directory of the process, and do not expand `~`.
+    /// Returns the `tls-ca-path` key: a PEM file of trust anchors for TLS.
+    ///
+    /// The anchors replace the trust store of the host. A pull and a push read
+    /// a relative path from the current directory of the process. They do not
+    /// expand `~`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn tls_ca_path(&self) -> Result<Option<String>> {
         self.string("tls-ca-path")
     }
 
-    /// The path to the PEM client certificate chain presented to this remote.
-    /// A relative path is read as [`tls_ca_path`](Remote::tls_ca_path) states.
+    /// Returns the `tls-client-cert-path` key: the PEM client certificate
+    /// chain.
+    ///
+    /// The client presents this chain to the remote. A relative path is read as
+    /// [`tls_ca_path`](Remote::tls_ca_path) states.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn tls_client_cert_path(&self) -> Result<Option<String>> {
         self.string("tls-client-cert-path")
     }
 
-    /// The path to the PEM private key of
+    /// Returns the `tls-client-key-path` key: the PEM private key of the
+    /// client.
+    ///
+    /// The key belongs to the chain of
     /// [`tls_client_cert_path`](Remote::tls_client_cert_path). A relative path
     /// is read as [`tls_ca_path`](Remote::tls_ca_path) states.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn tls_client_key_path(&self) -> Result<Option<String>> {
         self.string("tls-client-key-path")
     }
 
-    /// Whether this remote's TLS certificate chain is accepted unverified.
-    /// Default `false`. A pull from a remote that sets it takes the chain as
-    /// presented and keeps the host name check. A push to an `https://`
-    /// address of a remote that sets it is refused. A push to an `http://`
-    /// address uses no TLS and ignores the key.
+    /// Returns `true` if `tls-permissive` turns off the TLS chain verification.
+    ///
+    /// The default is `false`. A pull from a remote that sets the key accepts
+    /// the certificate chain as presented and keeps the host name check.
+    ///
+    /// A push refuses an `https://` address of a remote that sets the key. A
+    /// push to an `http://` address uses no TLS and ignores the key.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value is not a boolean.
     pub fn tls_permissive(&self) -> Result<bool> {
         Ok(self
             .keyfile
@@ -644,67 +924,112 @@ impl Remote<'_> {
             .unwrap_or(false))
     }
 
-    /// The push address of this remote, `push-url`. A push to this remote
-    /// uses `url` when this key is absent and `url` is an `http://` or an
-    /// `https://` URL.
+    /// Returns the `push-url` key: the push address of this remote.
+    ///
+    /// If the key is absent and `url` is an `http://` or an `https://` URL, a
+    /// push uses `url`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn push_url(&self) -> Result<Option<String>> {
         self.string("push-url")
     }
 
-    /// The ssh command line a push to this remote and a pull over ssh from it
-    /// run, `ssh-command`. The ssh transport splits it at ASCII whitespace,
-    /// with no quoting rule.
+    /// Returns the `ssh-command` key: the ssh command line of this remote.
+    ///
+    /// A push to this remote and a pull over ssh from it run this command. The
+    /// ssh transport splits it at ASCII white space, with no quoting rule.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn ssh_command(&self) -> Result<Option<String>> {
         self.string("ssh-command")
     }
 
-    /// The command the remote side of a push to this remote runs,
-    /// `receive-command`. The remote shell parses it.
+    /// Returns the `receive-command` key: the remote command of a push.
+    ///
+    /// The remote side of a push to this remote runs this command. The remote
+    /// shell parses it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn receive_command(&self) -> Result<Option<String>> {
         self.string("receive-command")
     }
 
-    /// The path to a file whose first line is the token of an HTTP push to
-    /// this remote, `push-token-file`. The push reads a relative path from
-    /// the current directory of the process, as a pull reads the TLS keys,
-    /// and does not expand `~`.
+    /// Returns the `push-token-file` key: the token file of an HTTP push.
+    ///
+    /// The first line of the file is the token of an HTTP push to this remote.
+    /// The push reads a relative path from the current directory of the
+    /// process, as a pull reads the TLS keys. It does not expand `~`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn push_token_file(&self) -> Result<Option<String>> {
         self.string("push-token-file")
     }
 
-    /// The name of the Basic credential of an HTTP push to this remote,
-    /// `push-user`. The token of
-    /// [`push_token_file`](Remote::push_token_file) is its password. When the
-    /// key is absent, the token goes as a bearer token.
+    /// Returns the `push-user` key: the Basic credential name of an HTTP push.
+    ///
+    /// The token of [`push_token_file`](Remote::push_token_file) is the
+    /// password. If the key is absent, the push sends the token as a bearer
+    /// token.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn push_user(&self) -> Result<Option<String>> {
         self.string("push-user")
     }
 
-    /// The pull address of this remote in the port, `pull-url`: an ssh
-    /// address, or an `http://` or `https://` URL. A pull from this remote
-    /// uses it in place of `url`. The tool does not read the key.
+    /// Returns the `pull-url` key: the pull address of this remote.
+    ///
+    /// The value is an ssh address, or an `http://` or `https://` URL. If the
+    /// key is set, a pull from this remote uses it and ignores `url`. The key
+    /// is an ostrya extension, and the `ostree` command does not read it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn pull_url(&self) -> Result<Option<String>> {
         self.string("pull-url")
     }
 
-    /// The command the remote side of a pull over ssh from this remote runs,
-    /// `send-command`. The remote shell parses it.
+    /// Returns the `send-command` key: the remote command of a pull over ssh.
+    ///
+    /// The remote side of a pull over ssh from this remote runs this command.
+    /// The remote shell parses it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn send_command(&self) -> Result<Option<String>> {
         self.string("send-command")
     }
 
-    /// The `http://` proxy URL an HTTP pull from this remote connects
-    /// through, `proxy`. An empty value counts as an absent key, and the pull
-    /// then reads the proxy environment variables. A pull that uses the key
-    /// connects through the proxy for every origin and ignores `no_proxy`. The
-    /// value is returned as written, and an HTTP pull refuses a non-empty
-    /// value with white space at its start or end. A push and a pull over ssh
-    /// do not read the key.
+    /// Returns the `proxy` key: the `http://` proxy URL of an HTTP pull.
+    ///
+    /// An HTTP pull from this remote connects through this proxy. If the value
+    /// is empty, the key counts as absent, and the pull reads the proxy
+    /// environment variables. A pull that uses the key connects through the
+    /// proxy for every origin and ignores `no_proxy`.
+    ///
+    /// The call keeps white space at the end of the value. An HTTP pull
+    /// refuses a non-empty value with white space at its start or end. A push
+    /// and a pull over ssh do not read the key.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn proxy(&self) -> Result<Option<String>> {
         self.string("proxy")
     }
 
-    /// The raw value of an arbitrary key in this remote's section.
+    /// Returns the raw value of any key in this remote section.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.keyfile.get_value(&self.group, key)
     }
@@ -716,8 +1041,9 @@ impl Remote<'_> {
     }
 }
 
-/// Read a `sign-verify` or `sign-verify-summary` value: a boolean in the key
-/// file's own spelling, or a list of engine names separated by `,` or `;`.
+/// Reads a `sign-verify` or `sign-verify-summary` value. The value is a
+/// boolean in the key-file spelling, or a list of engine names that `,` or `;`
+/// separates.
 fn parse_sign_verify(raw: Option<&str>) -> SignVerify {
     let Some(raw) = raw else {
         return SignVerify::Off;
@@ -738,16 +1064,21 @@ fn parse_sign_verify(raw: Option<&str>) -> SignVerify {
     SignVerify::Engines(engines)
 }
 
-/// The key-file group name for a remote: `remote "<name>"`.
+/// Returns the key-file group name of a remote: `remote "<name>"`.
 pub(crate) fn remote_group(name: &str) -> String {
     format!("remote \"{name}\"")
 }
 
-/// Whether `name` is a name the tool accepts for a remote: at least one
-/// character, every character alphanumeric or one of `-`, `_`, `.`, and the
-/// first one alphanumeric or `_`. So `_` is a name, and `-`, `.`, and `..` are
-/// not. "Alphanumeric" is [`char::is_alphanumeric`], so a non-ASCII letter
-/// counts.
+/// Returns `true` if the `ostree` command accepts `name` as a remote name.
+///
+/// A valid name obeys these rules:
+///
+/// - It has at least one character.
+/// - Each character is alphanumeric, `-`, `_`, or `.`.
+/// - The first character is alphanumeric or `_`.
+///
+/// For example, `_` is a valid name, and `-`, `.`, and `..` are not.
+/// "Alphanumeric" is [`char::is_alphanumeric`], so a non-ASCII letter counts.
 pub fn valid_remote_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -760,15 +1091,15 @@ pub fn valid_remote_name(name: &str) -> bool {
         .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// The remote name in a `remote "<name>"` group header, or `None` for any other
-/// group.
+/// Returns the remote name in a `remote "<name>"` group header, or `None` for
+/// another group.
 pub(crate) fn remote_group_name(group: &str) -> Option<&str> {
     group
         .strip_prefix("remote \"")
         .and_then(|rest| rest.strip_suffix('"'))
 }
 
-/// Parse a `min-free-space-size` value against `^([0-9]+)(G|M|T)B$`.
+/// Parses a `min-free-space-size` value with the pattern `^([0-9]+)(G|M|T)B$`.
 fn parse_size(raw: &str) -> Option<SizeSpec> {
     let digits = raw
         .strip_suffix("MB")
@@ -974,8 +1305,8 @@ mod tests {
 
     #[test]
     fn explicit_fsverity_ignores_a_malformed_composefs() {
-        // An explicit fsverity value is honored without consulting composefs, so
-        // a malformed composefs does not fail the fsverity read.
+        // The call does not read composefs when fsverity has an explicit
+        // value, so a malformed composefs does not fail the fsverity read.
         let text = "[core]\nrepo_version=1\nmode=bare\n\
                     [ex-integrity]\ncomposefs=perhaps\nfsverity=no\n";
         let cfg = RepoConfig::parse(text).unwrap();
@@ -1020,8 +1351,8 @@ mod tests {
 
     #[test]
     fn a_malformed_ex_ostrya_list_is_an_error() {
-        // A value ending in a lone backslash is not a list the key-file syntax
-        // can split.
+        // A value that ends in a lone backslash is not a list that the
+        // key-file syntax can split.
         let text = "[core]\nrepo_version=1\nmode=bare\n[ex-ostrya]\n\
                     detached-metadata-exclude=app.roots\\\n";
         let cfg = RepoConfig::parse(text).unwrap();
@@ -1128,7 +1459,7 @@ mod tests {
             vec!["/etc/one.gpg".to_owned(), "/etc/keys.d".to_owned()]
         );
 
-        // The defaults: no sign-api check and no extra keyring.
+        // The defaults: no sign-api verification and no extra keyring.
         let plain = cfg.remote("signed").unwrap();
         assert!(plain.gpg_verify().unwrap());
         let bare = RepoConfig::parse(
@@ -1160,15 +1491,14 @@ mod tests {
             parse_sign_verify(Some("ed25519;spki,")),
             SignVerify::Engines(vec!["ed25519".to_owned(), "spki".to_owned()])
         );
-        // A name is not trimmed: the tool refuses this value too.
+        // A name is not trimmed. The `ostree` command also refuses this value.
         assert_eq!(
             parse_sign_verify(Some("ed25519, ed25519")),
             SignVerify::Engines(vec!["ed25519".to_owned(), " ed25519".to_owned()])
         );
     }
 
-    /// The TLS keys a pull fills its fetcher's options from, and the one it
-    /// refuses rather than misrepresent.
+    /// The TLS keys from which a pull fills the options of its fetcher.
     #[test]
     fn reads_remote_tls_keys() {
         let text = "[core]\nrepo_version=1\nmode=archive-z2\n\n\
@@ -1192,9 +1522,11 @@ mod tests {
         assert!(remote.tls_permissive().unwrap());
     }
 
-    /// The `proxy` key of a remote section, read as written with its trailing
-    /// spaces and its escapes, empty when the value is empty or spaces, and
-    /// absent when the section does not set it.
+    /// The `proxy` key of a remote section, read as written.
+    ///
+    /// The value keeps its trailing spaces, and the read decodes its escapes.
+    /// It is empty when the value is empty or spaces, and absent when the
+    /// section does not set it.
     #[test]
     fn reads_remote_proxy_key() {
         let text = "[core]\nrepo_version=1\nmode=archive-z2\n\n\
@@ -1229,8 +1561,8 @@ mod tests {
         assert_eq!(cfg.remote("plain").unwrap().proxy().unwrap(), None);
     }
 
-    /// The push keys and the pull keys of the port in a remote section, each
-    /// read as written, and absent when the section does not set it.
+    /// The push keys and the pull keys of ostrya in a remote section. Each key
+    /// is read as written, and is absent when the section does not set it.
     #[test]
     fn reads_remote_push_keys() {
         let text = "[core]\nrepo_version=1\nmode=archive-z2\n\n\

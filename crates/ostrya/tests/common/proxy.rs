@@ -1,8 +1,8 @@
-//! An in-process HTTP/1.1 proxy for the tests that reach an origin through
-//! one.
+//! An in-process HTTP/1.1 proxy for the tests that reach an origin through a
+//! proxy.
 //!
-//! The proxy forwards an absolute-form request to the origin it names and
-//! answers a `CONNECT` with a tunnel, and it records every request it reads.
+//! The proxy forwards an absolute-form request to the origin that it names. It
+//! answers a `CONNECT` with a tunnel. It records each request that it reads.
 
 #![allow(dead_code)]
 
@@ -23,7 +23,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use ostrya_rt::{TcpListener, TcpStream, spawn};
 
-/// A `futures-io` stream presented to hyper, on both sides of the proxy.
+/// A `futures-io` stream that hyper uses on both sides of the proxy.
 struct ProxyIo<S> {
     inner: S,
     scratch: Vec<u8>,
@@ -86,7 +86,7 @@ struct ProxyBody {
 }
 
 impl ProxyBody {
-    /// A body of `bytes`, delivered in one chunk.
+    /// Creates a body of `bytes` that comes in one chunk.
     fn measured(bytes: &[u8]) -> ProxyBody {
         ProxyBody {
             data: Some(Bytes::copy_from_slice(bytes)),
@@ -115,7 +115,7 @@ impl hyper::body::Body for ProxyBody {
     }
 }
 
-/// What the proxy saw of one request.
+/// The record of one request that the proxy read.
 #[derive(Clone, Debug)]
 pub struct ProxySeen {
     pub method: String,
@@ -134,27 +134,30 @@ impl ProxySeen {
     }
 }
 
-/// How the proxy answers a `CONNECT`.
+/// The answer of the proxy to a `CONNECT`.
 #[derive(Clone, Copy)]
 pub enum Tunnel {
-    /// Open a connection to the target and carry the bytes both ways.
+    /// Opens a connection to the target and carries the bytes in both
+    /// directions.
     Open,
-    /// Answer with this status and tunnel nothing.
+    /// Answers with this status and tunnels nothing.
     Refuse(u16),
-    /// Answer the first `CONNECT` with this status, and open every later one.
+    /// Answers the first `CONNECT` with this status and opens each later one.
     RefuseFirst(u16),
 }
 
 /// An in-process HTTP/1.1 proxy.
 ///
-/// A forwarded request is sent on to the origin the absolute-form target names,
-/// and a `CONNECT` is answered by splicing a connection to the target. Every
-/// request line and every header is recorded, so a test states what reached the
-/// proxy and what reached the origin.
+/// The proxy sends a forwarded request on to the origin that the absolute-form
+/// target names. It answers a `CONNECT` with a splice of a connection to the
+/// target. It records each request line and each header, so a test can state
+/// what reached the proxy and what reached the origin.
 ///
-/// The headers of a forwarded request are sent on as the client wrote them, the
-/// hop-by-hop ones excepted: `Proxy-Authorization` names the proxy and travels
-/// no further, which is what a proxy does with it.
+/// The proxy sends on each header of a forwarded request as the client wrote
+/// it, except four headers. These are the hop-by-hop headers
+/// `Proxy-Authorization` and `Proxy-Connection`, and the framing headers
+/// `Content-Length` and `Transfer-Encoding`. `Proxy-Authorization` names the
+/// proxy and travels no further, as with any proxy.
 pub struct TestProxy {
     pub addr: SocketAddr,
     seen: Arc<Mutex<Vec<ProxySeen>>>,
@@ -184,8 +187,8 @@ impl TestProxy {
                         let seen = seen.clone();
                         proxied(request, tunnel, seen)
                     });
-                    // The upgrades are what carries a `CONNECT`: the tunneled
-                    // socket comes back through one.
+                    // A `CONNECT` needs the upgrades, because the tunneled
+                    // socket comes back through an upgrade.
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, service)
                         .with_upgrades()
@@ -200,12 +203,13 @@ impl TestProxy {
         }
     }
 
-    /// The URL a fetcher names this proxy by.
+    /// Returns the URL that a fetcher uses for this proxy.
     pub fn url(&self) -> String {
         format!("http://127.0.0.1:{}", self.addr.port())
     }
 
-    /// The URL with `userinfo` in it, which the proxy is sent as a credential.
+    /// Returns the URL with `userinfo` in it. The fetcher sends `userinfo` to
+    /// the proxy as a credential.
     pub fn url_with(&self, userinfo: &str) -> String {
         format!("http://{userinfo}@127.0.0.1:{}", self.addr.port())
     }
@@ -223,7 +227,7 @@ impl TestProxy {
     }
 }
 
-/// Serve one request the proxy received.
+/// Serves one request that the proxy received.
 async fn proxied(
     mut request: Request<hyper::body::Incoming>,
     tunnel: Tunnel,
@@ -252,8 +256,8 @@ async fn proxied(
             Tunnel::Open => {
                 let target = request.uri().authority().unwrap().clone();
                 let upgrade = hyper::upgrade::on(&mut request);
-                // The splice runs once the 200 below has reached the client,
-                // which is when the upgrade is delivered.
+                // The splice runs after the 200 answer reaches the client.
+                // At that time, hyper delivers the upgrade.
                 drop(spawn(splice(upgrade, target)));
                 200
             }
@@ -266,7 +270,7 @@ async fn proxied(
     Ok(forwarded(request).await)
 }
 
-/// Carry the bytes of one tunnel both ways.
+/// Carries the bytes of one tunnel in both directions.
 async fn splice(upgrade: hyper::upgrade::OnUpgrade, target: hyper::http::uri::Authority) {
     let port = target.port_u16().unwrap_or(80);
     let host = target.host().trim_start_matches('[').trim_end_matches(']');
@@ -281,14 +285,14 @@ async fn splice(upgrade: hyper::upgrade::OnUpgrade, target: hyper::http::uri::Au
     };
     let (client_reader, mut client_writer) = futures_lite::io::split(parts.io.inner);
     let (target_reader, mut target_writer) = futures_lite::io::split(target);
-    // Whatever arrived behind the request head belongs to the tunnel.
+    // The bytes that arrived after the request head belong to the tunnel.
     if !parts.read_buf.is_empty() && target_writer.write_all(&parts.read_buf).await.is_err() {
         return;
     }
     let mut client_reader = client_reader;
     let mut target_reader = target_reader;
-    // The first direction to end ends the tunnel, and dropping the other half
-    // closes what is left of it.
+    // If one direction ends, the tunnel ends. The drop of the other half
+    // closes the rest of the tunnel.
     or(
         async {
             let _ = futures_lite::io::copy(&mut client_reader, &mut target_writer).await;
@@ -300,8 +304,8 @@ async fn splice(upgrade: hyper::upgrade::OnUpgrade, target: hyper::http::uri::Au
     .await;
 }
 
-/// Send one absolute-form request on to the origin it names and answer with
-/// what came back. The request body streams on to the origin as it arrives.
+/// Sends one absolute-form request on to the origin that it names and answers
+/// with the response. The request body streams on to the origin as it arrives.
 async fn forwarded(request: Request<Incoming>) -> Response<ProxyBody> {
     let refused = || {
         Response::builder()
@@ -341,8 +345,8 @@ async fn forwarded(request: Request<Incoming>) -> Response<ProxyBody> {
         .body(body)
         .unwrap();
     for (name, value) in &parts.headers {
-        // A hop-by-hop header names this proxy and travels no further, and the
-        // framing headers belong to the connection the body travels over.
+        // A hop-by-hop header names this proxy and travels no further. The
+        // framing headers belong to the connection that carries the body.
         if name == hyper::header::PROXY_AUTHORIZATION
             || name == "proxy-connection"
             || name == hyper::header::CONTENT_LENGTH
@@ -370,9 +374,9 @@ async fn forwarded(request: Request<Incoming>) -> Response<ProxyBody> {
         .body(ProxyBody::measured(&bytes))
         .unwrap();
     for (name, value) in &headers {
-        // The framing headers belong to the connection this answer travels
-        // over, and the body is re-measured here. Every other header is what
-        // the origin said, a `Location` a redirect names among them.
+        // The framing headers belong to the connection that carries this
+        // answer, and this function measures the body again. Each other header
+        // comes from the origin, for example the `Location` of a redirect.
         if name == hyper::header::CONTENT_LENGTH || name == hyper::header::TRANSFER_ENCODING {
             continue;
         }

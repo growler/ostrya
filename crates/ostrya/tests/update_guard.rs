@@ -1,7 +1,7 @@
-//! `Repo::begin_update` and `UpdateGuard`: the lock file, the exclusion across
-//! processes and inside one process, the lock order against the repository
-//! lock, the reads and writes of the guard, and the release rules of `finish`
-//! and of a guard that drops.
+//! Tests of `Repo::begin_update` and `UpdateGuard`. They cover the lock file,
+//! the exclusion across processes and inside one process, and the lock order
+//! against the repository lock. They also cover the reads and writes of the
+//! guard, and the release rules of `finish` and of a guard that drops.
 
 mod common;
 
@@ -46,8 +46,8 @@ fn guard_holder_subprocess() {
 // Helpers.
 // ---------------------------------------------------------------------------
 
-/// Create a repository in `mode` at `<tmp>/repo`, with the `[core]` lines
-/// `core` appended, and return its path.
+/// Creates a repository in `mode` at `<tmp>/repo`, appends the `[core]` lines
+/// `core` to its config, and returns its path.
 fn create(tmp: &TmpDir, mode: RepoMode, core: &str) -> PathBuf {
     let path = tmp.path().join("repo");
     block_on(Repo::create(&path, CreateOptions::new(mode))).unwrap();
@@ -55,7 +55,7 @@ fn create(tmp: &TmpDir, mode: RepoMode, core: &str) -> PathBuf {
     path
 }
 
-/// Append `lines` to the config of the repository at `path`.
+/// Appends `lines` to the config of the repository at `path`.
 fn append_config(path: &Path, lines: &str) {
     let config = path.join("config");
     let mut text = std::fs::read_to_string(&config).unwrap();
@@ -63,7 +63,8 @@ fn append_config(path: &Path, lines: &str) {
     std::fs::write(&config, text).unwrap();
 }
 
-/// Replace `lock-timeout-secs` in the config of the repository at `path`.
+/// Sets `lock-timeout-secs` to `secs` in the config of the repository at
+/// `path`.
 fn set_timeout(path: &Path, secs: i64) {
     let config = path.join("config");
     let text = std::fs::read_to_string(&config).unwrap();
@@ -88,8 +89,8 @@ fn mode_of(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
 }
 
-/// The mode a file created with request `0660` takes under the mask this
-/// process runs with.
+/// Returns the mode of a file that this process creates in `dir` with the
+/// requested mode `0660`, under the umask of this process.
 fn masked_lock_mode(dir: &Path) -> u32 {
     use std::os::unix::fs::OpenOptionsExt;
     let probe = dir.join("probe-file");
@@ -109,9 +110,9 @@ fn assert_timeout<T: std::fmt::Debug>(result: ostrya::Result<T>) {
     assert!(matches!(err, Error::LockTimeout { secs: 0 }), "{err:?}");
 }
 
-/// Assert that both locks of a guard are free: a handle with
-/// `lock-timeout-secs=0` takes the repository lock exclusive, and then the
-/// update lock, at the first attempt.
+/// Asserts that both locks of a guard are free. A handle with
+/// `lock-timeout-secs=0` takes the repository lock exclusive and then the
+/// update lock, each at the first attempt.
 async fn assert_locks_free(path: &Path) {
     let repo = Repo::open(path).await.unwrap();
     assert_eq!(repo.config().lock_timeout_secs().unwrap(), 0);
@@ -124,15 +125,19 @@ async fn assert_locks_free(path: &Path) {
     guard.finish().await.unwrap();
 }
 
-/// The first record lock that another process holds on the file at `path`,
-/// or `None` when no other process holds one.
+/// Returns the first record lock that another process holds on the file at
+/// `path`, or `None` if no other process holds one.
 ///
-/// The probe tests a write lock over the whole file, so a read or write lock
-/// of another process is reported, and the classic record locks of this
-/// process are not. The kernel answers from one consistent state, which
-/// `/proc/locks` is not, as it is read in several calls. Call it only where
-/// this process holds no record lock on the file: closing the probe
-/// descriptor drops each one.
+/// The probe checks for a lock that conflicts with a write lock over the
+/// whole file. It reports a read lock or a write lock of another process. It
+/// does not report the classic record locks of this process.
+///
+/// The kernel answers from one consistent state. `/proc/locks` gives no
+/// consistent state, because a reader reads it in several calls.
+///
+/// This process must hold no record lock on the file at the call. The close
+/// of the probe descriptor drops each record lock of this process on the
+/// file.
 fn foreign_record_lock(path: &Path) -> Option<Flock> {
     let file = std::fs::File::open(path).unwrap();
     rustix::process::fcntl_getlk(&file, &Flock::from(FlockType::WriteLock)).unwrap()
@@ -143,7 +148,7 @@ fn foreign_record_lock(path: &Path) -> Option<Flock> {
 // ---------------------------------------------------------------------------
 
 /// The first `begin_update` creates `<repo>/.update.lock` with mode 0660
-/// reduced by the umask, and the file stays after the guard and the handle go.
+/// reduced by the umask. The file stays after the guard and the handle drop.
 #[test]
 fn the_lock_file_is_created_on_first_use_and_stays() {
     let tmp = TmpDir::new("guard-file");
@@ -173,9 +178,10 @@ fn an_existing_lock_file_keeps_its_mode() {
     assert_eq!(mode_of(&file), 0o600);
 }
 
-/// In a `bare-user-shared` repository the lock file is 0660 under a umask of
-/// 0077. The umask is a property of the process, so the check runs in a
-/// child: this test binary re-executed for this test alone.
+/// In a `bare-user-shared` repository, the lock file gets mode 0660 under a
+/// umask of 0077. The umask is a property of the process, so the check runs
+/// in a child process. The child is this test binary, which runs this test
+/// alone.
 #[test]
 fn a_shared_repository_forces_the_lock_file_mode() {
     if let Some(marker) = std::env::var_os(UMASK_ENV) {
@@ -207,8 +213,8 @@ fn a_shared_repository_forces_the_lock_file_mode() {
         .status()
         .expect("re-execute this test binary");
     assert!(status.success(), "the child failed: {status}");
-    // A name the filter does not match runs nothing and still exits 0, so
-    // the marker is what proves the check ran.
+    // If the filter matches no test name, the child runs nothing and exits
+    // 0. Only the marker proves that the check ran.
     assert!(marker.exists(), "the child ran no check");
 }
 
@@ -216,9 +222,9 @@ fn a_shared_repository_forces_the_lock_file_mode() {
 // Exclusion.
 // ---------------------------------------------------------------------------
 
-/// A guard that another process holds excludes this process: with
-/// `lock-timeout-secs=0` a `begin_update` fails, and with `-1` it gets the
-/// guard only after the holder released it.
+/// A guard that another process holds excludes this process. With
+/// `lock-timeout-secs=0`, a `begin_update` fails. With `-1`, it gets the
+/// guard only after the holder releases it.
 #[test]
 fn two_processes_serialize() {
     let tmp = TmpDir::new("guard-processes");
@@ -254,7 +260,7 @@ fn two_tasks_serialize_in_first_poll_order() {
     let repo = open(&path);
     block_on(async {
         // The first call on a handle opens the lock file on the blocking pool
-        // before it joins the queue, so the handles are used once first.
+        // before it joins the queue, so the test uses each handle once first.
         repo.begin_update().await.unwrap().finish().await.unwrap();
         no_wait
             .begin_update()
@@ -272,7 +278,8 @@ fn two_tasks_serialize_in_first_poll_order() {
         assert_timeout(no_wait.begin_update().await);
         holder.finish().await.unwrap();
 
-        // Poll the second call first. It waits until the first releases.
+        // Poll the second call first. It waits until the first call releases
+        // the guard.
         assert!(poll_once(&mut y).await.is_none(), "the second call waits");
         let first = x.await.unwrap();
         assert!(poll_once(&mut y).await.is_none(), "the second call waits");
@@ -307,8 +314,8 @@ fn a_transaction_stages_while_a_guard_is_held() {
     });
 }
 
-/// A prune waits for a held guard: with `lock-timeout-secs=0` it fails while
-/// the guard is held, and it runs once the guard is finished.
+/// A prune waits for a held guard. With `lock-timeout-secs=0`, the prune
+/// fails while the guard is held. It runs after the guard finishes.
 #[test]
 fn a_prune_waits_for_a_held_guard() {
     let tmp = TmpDir::new("guard-prune");
@@ -322,8 +329,8 @@ fn a_prune_waits_for_a_held_guard() {
     });
 }
 
-/// `begin_update` waits for a holder of the repository lock exclusive in this
-/// process.
+/// `begin_update` waits while a transaction of this process holds the
+/// repository lock exclusive.
 #[test]
 fn begin_update_waits_for_an_exclusive_transaction() {
     let tmp = TmpDir::new("guard-exclusive");
@@ -369,10 +376,10 @@ fn begin_update_waits_for_a_foreign_exclusive_lock() {
     release.join().unwrap();
 }
 
-/// With `[core] locking=false` the guard takes the update lock and no
-/// repository lock: another process gets no guard, and the kernel records
-/// the exclusive record lock of the holder on `.update.lock` and none on
-/// `.lock`.
+/// With `[core] locking=false`, the guard takes the update lock and no
+/// repository lock. While another process holds the guard, this process gets
+/// no guard. The kernel records the exclusive record lock of the holder on
+/// `.update.lock` and no lock on `.lock`.
 #[test]
 fn locking_false_still_takes_the_update_lock() {
     let tmp = TmpDir::new("guard-locking-false");
@@ -381,16 +388,16 @@ fn locking_false_still_takes_the_update_lock() {
         RepoMode::BareUser,
         "locking=false\nlock-timeout-secs=0\n",
     );
-    // `.lock` exists, so an inode is there to hold no lock.
+    // The test creates `.lock`, so the probe of `.lock` has an inode to check.
     std::fs::write(path.join(".lock"), b"").unwrap();
     let repo = open(&path);
 
     let holder = guard_holder(&path);
     assert_timeout(block_on(repo.begin_update()));
-    // The attempt above failed and `locking=false` takes no repository lock,
-    // so this process holds no record lock on either file, as
-    // `foreign_record_lock` requires. A write lock of the holder over the
-    // whole file excludes any other lock of the holder on it.
+    // The `begin_update` attempt failed, and `locking=false` takes no
+    // repository lock. As a result, this process holds no record lock on
+    // either file, as `foreign_record_lock` requires. A write lock of the
+    // holder over the whole file excludes any other lock of the holder on it.
     let whole_file_write_lock = Flock {
         pid: Pid::from_raw(holder.pid().try_into().unwrap()),
         ..Flock::from(FlockType::WriteLock)
@@ -412,8 +419,8 @@ fn locking_false_still_takes_the_update_lock() {
 // ---------------------------------------------------------------------------
 
 /// Each write of the guard is visible to another handle while the guard is
-/// held, and `read_config` returns the file `write_config` wrote while the
-/// handle keeps the config it was opened with.
+/// held. `read_config` returns the file that `write_config` wrote. The handle
+/// keeps the config that it read at open.
 #[test]
 fn the_writes_of_the_guard_are_visible_under_the_guard() {
     let tmp = TmpDir::new("guard-writes");
@@ -496,7 +503,7 @@ fn the_writes_of_the_guard_are_visible_under_the_guard() {
 }
 
 /// A guard of one handle reads the config that the guard of another handle
-/// wrote, while the first handle keeps the config it was opened with.
+/// wrote. The first handle keeps the config that it read at open.
 #[test]
 fn a_guard_reads_the_config_another_handle_wrote() {
     let tmp = TmpDir::new("guard-config-other-handle");
@@ -529,20 +536,20 @@ fn a_guard_reads_the_config_another_handle_wrote() {
 // Remotes.
 // ---------------------------------------------------------------------------
 
-/// The key-file group of the remote `name`.
+/// Returns the name of the key-file group of the remote `name`.
 fn group(name: &str) -> String {
     format!("remote \"{name}\"")
 }
 
-/// The bytes and the inode of the config of the repository at `path`.
+/// Returns the bytes and the inode of the config of the repository at `path`.
 fn config_file(path: &Path) -> (Vec<u8>, u64) {
     let config = path.join("config");
     let ino = std::fs::metadata(&config).unwrap().ino();
     (std::fs::read(&config).unwrap(), ino)
 }
 
-/// The keys of the remote `name` and their values, in file order, as the
-/// config of the repository at `path` holds them on disk.
+/// Returns the keys of the remote `name` and their values, in file order, as
+/// the config of the repository at `path` holds them on disk.
 fn remote_keys(path: &Path, name: &str) -> Vec<(String, String)> {
     let text = std::fs::read_to_string(path.join("config")).unwrap();
     let keyfile = ostrya_core::KeyFile::parse(&text).unwrap();
@@ -556,7 +563,7 @@ fn remote_keys(path: &Path, name: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Add the remote `name` with `keys` through a guard of its own.
+/// Adds the remote `name` with `keys` through a guard of its own.
 fn add_remote(path: &Path, name: &str, keys: &[(&str, &str)]) {
     let repo = open(path);
     block_on(async {
@@ -580,8 +587,9 @@ fn assert_remote_not_found<T: std::fmt::Debug>(result: ostrya::Result<T>, name: 
     }
 }
 
-/// A remote added through the guard is in the config a new open reads, with
-/// its keys in the order given and a value escaped as the key file escapes it.
+/// A remote that a guard adds is in the config that a new open reads. Its
+/// keys are in the given order. The guard escapes each value as the key file
+/// escapes it, so a parse returns the given value.
 #[test]
 fn add_remote_writes_a_group_a_new_open_reads() {
     let tmp = TmpDir::new("guard-remote-add");
@@ -629,8 +637,9 @@ fn add_remote_over_an_existing_remote_writes_nothing() {
     assert_eq!(config_file(&path), before);
 }
 
-/// An add refuses a name the tool refuses and an empty key list, and an add
-/// and a set refuse a key name the config cannot hold. Nothing is written.
+/// An add refuses an empty key list and a name that the `ostree` command
+/// refuses. An add and a set refuse a key name that the config cannot hold.
+/// The calls write nothing.
 #[test]
 fn the_remote_calls_refuse_bad_names_and_keys() {
     let tmp = TmpDir::new("guard-remote-invalid");
@@ -653,9 +662,9 @@ fn the_remote_calls_refuse_bad_names_and_keys() {
     assert_eq!(config_file(&path), before);
 }
 
-/// A set writes one key and leaves the other keys of the group as they were;
-/// an unset removes it. An unset of an absent key returns `false` and leaves
-/// the config file as it was, down to its inode.
+/// A set writes one key and leaves the other keys of the group as they were.
+/// An unset removes one key. An unset of an absent key returns `false` and
+/// leaves the config file as it was, down to its inode.
 #[test]
 fn set_and_unset_remote_key_edit_one_key() {
     let tmp = TmpDir::new("guard-remote-set");
@@ -704,7 +713,7 @@ fn set_and_unset_remote_key_edit_one_key() {
     });
 }
 
-/// A set and an unset on a remote the config does not carry fail with
+/// If the config has no remote of the name, a set and an unset fail with
 /// `RemoteNotFound` and write nothing.
 #[test]
 fn set_and_unset_on_an_absent_remote_fail() {
@@ -721,8 +730,8 @@ fn set_and_unset_on_an_absent_remote_fail() {
     assert_eq!(config_file(&path), before);
 }
 
-/// A delete removes the group and the trusted keyring of the remote, and it
-/// succeeds for a remote that has no keyring.
+/// A delete removes the group and the trusted keyring of the remote. A delete
+/// of a remote that has no keyring also succeeds.
 #[test]
 fn delete_remote_removes_the_group_and_the_keyring() {
     let tmp = TmpDir::new("guard-remote-delete");
@@ -744,9 +753,9 @@ fn delete_remote_removes_the_group_and_the_keyring() {
     assert!(!reopened.config().keyfile().has_group(&group("keyed")));
 }
 
-/// A delete of a remote the config does not carry fails with
-/// `RemoteNotFound` and removes no keyring; a delete of a name the tool
-/// refuses fails with `InvalidInput`.
+/// If the config has no remote of the name, a delete fails with
+/// `RemoteNotFound` and removes no keyring. A delete of a name that the
+/// `ostree` command refuses fails with `InvalidInput`.
 #[test]
 fn delete_remote_refuses_an_absent_remote_and_a_bad_name() {
     let tmp = TmpDir::new("guard-remote-delete-absent");
@@ -767,8 +776,9 @@ fn delete_remote_refuses_an_absent_remote_and_a_bad_name() {
     assert_eq!(config_file(&path), before);
 }
 
-/// Each guard reads the config on disk, so a guard of a handle opened before
-/// another handle added a remote keeps that remote when it adds its own.
+/// Each guard reads the config on disk. If a handle opens before another
+/// handle adds a remote, a guard of the first handle keeps that remote when it
+/// adds its own.
 #[test]
 fn a_guard_adds_to_the_config_another_handle_wrote() {
     let tmp = TmpDir::new("guard-remote-two-handles");
@@ -790,7 +800,7 @@ fn a_guard_adds_to_the_config_another_handle_wrote() {
     );
 }
 
-/// Poll each future of `futures` in turn until all of them are ready, so
+/// Polls each future of `futures` in turn until all of them are ready, so
 /// their blocking work runs at the same time.
 async fn join_all(mut futures: Vec<Pin<Box<dyn Future<Output = ()> + '_>>>) {
     let mut done = vec![false; futures.len()];
@@ -813,8 +823,8 @@ async fn join_all(mut futures: Vec<Pin<Box<dyn Future<Output = ()> + '_>>>) {
     .await;
 }
 
-/// Eight adds on one guard, polled together, each keep the remotes the
-/// others added.
+/// If the test polls eight adds on one guard together, each add keeps the
+/// remotes that the other adds wrote.
 #[test]
 fn concurrent_adds_on_one_guard_lose_no_remote() {
     let tmp = TmpDir::new("guard-remote-concurrent-add");
@@ -844,8 +854,8 @@ fn concurrent_adds_on_one_guard_lose_no_remote() {
     assert_eq!(remotes, names);
 }
 
-/// An add, a set, an unset, and a delete on one guard, polled together, each
-/// keep the edits of the others.
+/// If the test polls an add, a set, an unset, and a delete on one guard
+/// together, each call keeps the edits of the other calls.
 #[test]
 fn concurrent_remote_calls_on_one_guard_keep_each_edit() {
     let tmp = TmpDir::new("guard-remote-concurrent-mix");
@@ -893,9 +903,9 @@ fn concurrent_remote_calls_on_one_guard_keep_each_edit() {
     assert_eq!(remotes, ["added", "set", "unset"]);
 }
 
-/// A delete removes the keyring before it writes the config: a keyring path
-/// that is a directory fails the delete, and the config file stays as it
-/// was, down to its inode.
+/// A delete removes the keyring before it writes the config. If the keyring
+/// path is a directory, the delete fails. The config file stays as it was,
+/// down to its inode.
 #[test]
 fn delete_remote_fails_on_the_keyring_before_it_writes_the_config() {
     let tmp = TmpDir::new("guard-remote-delete-order");
@@ -924,8 +934,8 @@ fn add_remote_leaves_an_existing_keyring() {
     assert_eq!(std::fs::read(&keyring).unwrap(), b"keys");
 }
 
-/// A remote whose keyring name is too long for any file is added and then
-/// deleted.
+/// A guard adds and then deletes a remote whose keyring name is too long for
+/// a file name.
 #[test]
 fn a_remote_with_a_long_name_is_added_and_deleted() {
     let tmp = TmpDir::new("guard-remote-long-name");
@@ -942,8 +952,8 @@ fn a_remote_with_a_long_name_is_added_and_deleted() {
     assert!(!open(&path).config().keyfile().has_group(&group(&name)));
 }
 
-/// A set of the value a key holds writes nothing, also when the file spells
-/// the value with an escape the set would not write.
+/// A set of the value that a key holds writes nothing. This is also true if
+/// the file spells the value with an escape that a set does not write.
 #[test]
 fn set_remote_key_to_the_held_value_writes_nothing() {
     let tmp = TmpDir::new("guard-remote-set-same");
@@ -967,8 +977,8 @@ fn set_remote_key_to_the_held_value_writes_nothing() {
     assert_eq!(config_file(&path), before);
 }
 
-/// A set on a remote whose group name the config parses and a set refuses
-/// fails with the error of the key file, and writes nothing.
+/// If the config parses a remote group name that a set refuses, the set fails
+/// with the error of the key file. The set writes nothing.
 #[test]
 fn set_remote_key_passes_on_an_error_of_the_group() {
     let tmp = TmpDir::new("guard-remote-set-bad-group");
@@ -991,8 +1001,9 @@ fn set_remote_key_passes_on_an_error_of_the_group() {
 // Release.
 // ---------------------------------------------------------------------------
 
-/// `finish` returns the error of a directory sync, here of a recorded
-/// directory that a regular file replaced, and it releases both locks.
+/// `finish` returns the error of a directory sync and releases both locks.
+/// In this test, the sync fails because a regular file replaced a recorded
+/// directory.
 #[test]
 fn finish_returns_a_sync_error_and_releases_the_locks() {
     let tmp = TmpDir::new("guard-finish-error");
@@ -1034,9 +1045,9 @@ fn a_dropped_guard_releases_both_locks() {
     });
 }
 
-/// A `finish` future polled once and then dropped releases both locks, after
-/// its syncs. The other handle waits for the locks, since the syncs can still
-/// run on the blocking pool.
+/// If a `finish` future is polled once and then dropped, it releases both
+/// locks after its syncs. The other handle waits for the locks, because the
+/// syncs can still run on the blocking pool.
 #[test]
 fn a_dropped_finish_releases_both_locks() {
     let tmp = TmpDir::new("guard-finish-dropped");

@@ -1,12 +1,18 @@
-//! Repository fs-verity (ex-integrity) write-path integration tests.
+//! Integration tests of the fs-verity seal on the write path of a repository
+//! (`[ex-integrity] fsverity`).
 //!
-//! These drive commits through the write path with `[ex-integrity] fsverity`
-//! set and observe the loose objects: every object stored as a regular file is
-//! sealed with fs-verity, real symlink objects are skipped, `maybe` is best
-//! effort, and `yes` fails where the filesystem cannot provide verity. A sealed
-//! regular file is detected by a rejected write-open, which needs no privileged
-//! syscall. Every check that requires a working verity kernel is gated on
-//! filesystem support, so the suite passes on filesystems without it.
+//! These tests commit through the write path with `[ex-integrity] fsverity`
+//! set, and then examine the loose objects. They check these facts:
+//!
+//! - Each object that is stored as a regular file is sealed with fs-verity.
+//! - The write path skips real symlink objects.
+//! - `maybe` is best effort.
+//! - `yes` fails where the file system cannot provide verity.
+//!
+//! A test finds a sealed regular file by a rejected open for write. This needs
+//! no privileged syscall. Each check that needs a working verity kernel runs
+//! only if the file system supports verity, so the suite passes on file
+//! systems without it.
 
 mod common;
 
@@ -22,9 +28,9 @@ use ostrya::{
 use ostrya_rt::block_on;
 use std::os::fd::AsFd;
 
-/// Build a small source tree under `base/src`: two regular files (one nested),
-/// and a symlink, so a commit produces content, dirtree, dirmeta, and commit
-/// objects plus one symlink object.
+/// Builds a small source tree under `base/src`: two regular files (one nested)
+/// and a symlink. A commit of the tree makes content, dirtree, dirmeta, and
+/// commit objects, and one symlink object.
 fn build_source(base: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let chmod = |p: PathBuf, m: u32| {
@@ -41,8 +47,8 @@ fn build_source(base: &Path) {
     chmod(src.clone(), 0o755);
 }
 
-/// Create a repository at `root` in `mode`, set `[ex-integrity] fsverity` to
-/// `fsverity`, and reopen it so the setting is parsed.
+/// Creates a repository at `root` in `mode`, sets `[ex-integrity] fsverity` to
+/// `fsverity`, and opens the repository again, so it parses the setting.
 async fn make_repo(root: &Path, mode: RepoMode, fsverity: &str) -> Repo {
     drop(Repo::create(root, CreateOptions::new(mode)).await.unwrap());
     let cfg = root.join("config");
@@ -52,8 +58,8 @@ async fn make_repo(root: &Path, mode: RepoMode, fsverity: &str) -> Repo {
     Repo::open(root).await.unwrap()
 }
 
-/// Ingest `base/src` with canonical permissions (owner 0:0, unprivileged-safe),
-/// write the tree and a commit, and point `test/main` at it.
+/// Reads `base/src` with canonical permissions (owner 0:0, safe without
+/// privileges), writes the tree and a commit, and points `test/main` at it.
 async fn commit_source(repo: &Repo, base: &Path) -> Result<Checksum, Error> {
     let txn = repo.transaction().await?;
     let mut modifier = CommitModifier::new(
@@ -75,15 +81,17 @@ async fn commit_source(repo: &Repo, base: &Path) -> Result<Checksum, Error> {
     Ok(commit)
 }
 
-/// Whether a regular file is sealed with fs-verity: a sealed file rejects being
-/// opened for writing. The objects examined are owner-writable (mode 0644), so a
-/// write-open failure signals verity rather than permissions.
+/// Returns `true` if a regular file is sealed with fs-verity.
+///
+/// A sealed file refuses an open for write. The examined objects are writable
+/// by the owner (mode 0644), so if an open for write fails, the cause is
+/// verity.
 fn is_sealed(path: &Path) -> bool {
     OpenOptions::new().write(true).open(path).is_err()
 }
 
-/// Classify the loose objects under `root/objects`: return (regular-file object
-/// paths, count of real-symlink objects).
+/// Returns the paths of the regular-file objects under `root/objects` and the
+/// count of the real symlink objects there.
 fn loose_objects(root: &Path) -> (Vec<PathBuf>, usize) {
     let mut regulars = Vec::new();
     let mut symlinks = 0usize;
@@ -106,8 +114,9 @@ fn loose_objects(root: &Path) -> (Vec<PathBuf>, usize) {
     (regulars, symlinks)
 }
 
-/// Whether the test's temporary filesystem supports fs-verity, probed by
-/// committing one object with `fsverity=maybe` and checking whether it sealed.
+/// Returns `true` if the temporary file system of the test supports fs-verity.
+///
+/// The probe commits with `fsverity=maybe` and checks if an object is sealed.
 async fn fs_supports_verity(tmp: &TmpDir) -> bool {
     let root = tmp.path().join("probe-repo");
     let base = tmp.path().join("probe");
@@ -127,7 +136,7 @@ fn seals_every_regular_object_when_supported() {
             return;
         }
         // bare-user-shared stores objects at mode 0644 and symlinks as regular
-        // files, so every object is a regular file and must be sealed.
+        // files, so each object is a regular file and must be sealed.
         let base = tmp.path().join("shared");
         build_source(&base);
         let root = tmp.path().join("shared-repo");
@@ -157,9 +166,10 @@ fn skips_real_symlink_objects_under_yes() {
             eprintln!("skipping: filesystem does not support fs-verity");
             return;
         }
-        // bare-user-only stores real symlink objects. Under `yes` the commit
-        // must still succeed, which proves the symlink object was skipped (a
-        // verity-enable attempt on a symlink would fail and fail the commit).
+        // bare-user-only stores real symlink objects. Under `yes`, the commit
+        // must succeed. This proves that the write path skips the symlink
+        // object, because an attempt to enable verity on a symlink fails, and
+        // the commit then fails.
         let base = tmp.path().join("only");
         build_source(&base);
         let root = tmp.path().join("only-repo");
@@ -185,8 +195,8 @@ fn skips_real_symlink_objects_under_yes() {
 
 #[test]
 fn maybe_commits_regardless_of_support() {
-    // `maybe` is best effort: the commit succeeds whether or not the filesystem
-    // can seal objects.
+    // `maybe` is best effort: the commit succeeds on a file system that can
+    // seal objects and on a file system that cannot.
     block_on(async {
         let tmp = TmpDir::new("fsverity-maybe");
         let base = tmp.path().join("src-base");
@@ -201,9 +211,9 @@ fn maybe_commits_regardless_of_support() {
 
 #[test]
 fn yes_fails_without_filesystem_support() {
-    // On a filesystem without fs-verity, `yes` fails the commit. tmpfs (found at
-    // /dev/shm on Linux) never supports verity; where it is unavailable or, in
-    // an unusual setup, does support verity, the check is skipped.
+    // On a file system without fs-verity, `yes` fails the commit. tmpfs (at
+    // /dev/shm on Linux) never supports verity. If /dev/shm is not available,
+    // or if an unusual setup supports verity there, the test skips the check.
     let shm = PathBuf::from("/dev/shm");
     if !shm.is_dir() {
         eprintln!("skipping: no tmpfs at /dev/shm");
@@ -214,7 +224,8 @@ fn yes_fails_without_filesystem_support() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let result = block_on(async {
-        // If tmpfs somehow sealed a maybe-commit, it supports verity: skip.
+        // If tmpfs seals an object of a `maybe` commit, it supports verity, so
+        // the test skips.
         let probe_root = dir.join("probe-repo");
         let probe_base = dir.join("probe");
         build_source(&probe_base);
@@ -255,15 +266,16 @@ fn tool_reads_a_port_written_verity_repo() {
             eprintln!("skipping: filesystem does not support fs-verity");
             return;
         }
-        // archive is a mode the tool recognizes; its objects are regular files
-        // and are sealed. The tool reads verity-sealed objects transparently.
+        // The `ostree` command knows the archive mode. Its objects are regular
+        // files, and the write path seals them. The `ostree` command reads
+        // sealed objects the same way as other objects.
         let base = tmp.path().join("archive");
         build_source(&base);
         let root = tmp.path().join("archive-repo");
         let repo = make_repo(&root, RepoMode::Archive, "yes").await;
         commit_source(&repo, &base).await.unwrap();
 
-        // Sanity: the objects really are sealed.
+        // Check that the objects are sealed.
         let (regulars, _) = loose_objects(&root);
         assert!(
             regulars.iter().all(|p| is_sealed(p)),

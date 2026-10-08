@@ -1,29 +1,11 @@
-//! In-memory mutable trees and their serialization to dirtree objects.
+//! Directory trees built in memory and written as dirtree objects.
 //!
-//! A [`MutableTree`] is a directory under construction: a name-keyed set of
-//! files (each a content checksum) and subdirectories (each a nested tree),
-//! plus the dirmeta checksum for the directory itself. Building a tree in
-//! memory and then calling [`Transaction::write_mtree`] serializes the dirty
-//! subtrees into `(a(say)a(sayay))` dirtree objects and stages them, yielding
-//! the root as a [`RepoTree`].
+//! A [`MutableTree`] holds the entries of one directory and its nested
+//! subdirectories. [`MutableTree::new`] creates an empty tree.
+//! [`MutableTree::from_commit`] creates a tree from the root of a commit.
 //!
-//! Lazy hydration. [`MutableTree::from_commit`] reads only the root dirtree and
-//! records the checksums of each subdirectory. A subdirectory's contents are
-//! read when [`ensure_dir`](MutableTree::ensure_dir) or
-//! [`subtree`](MutableTree::subtree) first descends into it, so reaching one
-//! path in a large commit reads only the directories along that path.
-//! Descending is `async` because it may read a dirtree; the other mutators
-//! operate on already-hydrated contents and stay synchronous.
-//!
-//! Dirty tracking. A subtree that matches a committed dirtree and has not been
-//! mutated keeps that dirtree checksum, and [`write_mtree`](Transaction::write_mtree)
-//! reuses it without re-serializing or re-staging anything beneath it. A
-//! subtree that has been mutated, or that has a descended (loaded) child, is
-//! reassembled; identical reassembled bytes deduplicate against the store.
-//!
-//! Names are validated on insertion (non-empty, not `.` or `..`, no `/`) and
-//! one name cannot be both a file and a directory, matching the owned-parse
-//! rule the dirtree object model enforces.
+//! [`Transaction::write_mtree`] writes the changed subtrees as dirtree
+//! objects, stages them, and returns the root as a [`RepoTree`].
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -36,108 +18,144 @@ use crate::repo::Repo;
 use crate::transaction::Transaction;
 use crate::tree::RepoTree;
 
-/// A directory being assembled in memory.
+/// A directory that a caller builds in memory.
 ///
-/// Files map a name to a content checksum; subdirectories map a name to a
-/// `Child`, which is either a lazy reference to a committed dirtree or a
-/// materialized nested tree. `clean` holds the committed dirtree checksum while
-/// this directory exactly matches a committed dirtree and has not been mutated;
-/// it is cleared on mutation and set again once the directory is written.
+/// A tree holds these items:
+///
+/// - files, each a name and a content checksum. A symlink is a file entry.
+/// - subdirectories, each a name and a nested tree.
+/// - the dirmeta checksum of the directory itself.
+///
+/// A name is a file or a subdirectory, never both. The methods that insert an
+/// entry check that each name is not empty, is not `.` or `..`, and holds no
+/// `/`. They do not check for a NUL byte. [`write_mtree`](Transaction::write_mtree)
+/// checks each name against the [rules](crate::DirTree#rules) of a dirtree
+/// object.
+///
+/// # Lazy hydration
+///
+/// [`from_commit`](MutableTree::from_commit) reads only the root dirtree. It
+/// records the dirtree and dirmeta checksums of each subdirectory. The tree
+/// reads a subdirectory when [`ensure_dir`](MutableTree::ensure_dir) or
+/// [`subtree`](MutableTree::subtree) first descends into it. A walk to one
+/// path in a large commit reads only the directories on that path.
+///
+/// A descent is `async` because it can read a dirtree. The other methods
+/// change entries that the tree holds already, and they are synchronous.
+///
+/// # Dirty tracking
+///
+/// A subtree that matches a committed dirtree and has no change keeps the
+/// checksum of that dirtree. [`write_mtree`](Transaction::write_mtree) reuses
+/// this checksum. It serializes and stages nothing for that subtree or for
+/// the entries under it.
+///
+/// `write_mtree` writes a new dirtree for a subtree in these cases:
+///
+/// - The subtree has a change.
+/// - A child of the subtree is loaded, because a descent read it.
+///
+/// If the new bytes are equal to a dirtree in the object store, the new
+/// dirtree has the same checksum. The store keeps one copy.
 #[derive(Debug)]
 pub struct MutableTree {
-    /// The dirmeta checksum for this directory, set with
-    /// [`set_metadata_checksum`](MutableTree::set_metadata_checksum). Required
-    /// by [`write_mtree`](Transaction::write_mtree) for every directory it
-    /// emits.
+    /// The dirmeta checksum of this directory, set with
+    /// [`set_metadata_checksum`](MutableTree::set_metadata_checksum).
+    /// [`write_mtree`](Transaction::write_mtree) requires it on each directory
+    /// that it writes.
     metadata_checksum: Option<Checksum>,
-    /// Files by name, in byte-wise name order (the `BTreeMap` key order).
+    /// The files by name, in byte-wise name order (the `BTreeMap` key order).
     files: BTreeMap<String, Checksum>,
-    /// Subdirectories by name, in byte-wise name order.
+    /// The subdirectories by name, in byte-wise name order.
     dirs: BTreeMap<String, Child>,
-    /// The committed dirtree checksum when this directory is unmutated since
-    /// load; `None` for a from-scratch or mutated directory.
+    /// The committed dirtree checksum while this directory has no change since
+    /// the load. `None` for a new or a changed directory. A change clears it,
+    /// and a write of the directory sets it again.
     clean: Option<Checksum>,
-    /// The repository lazy children are hydrated from; `None` for a
-    /// from-scratch tree, which has no lazy children.
+    /// The repository that lazy children are read from. `None` for a tree
+    /// that `new` created, which has no lazy children.
     repo: Option<Repo>,
 }
 
-/// A subdirectory entry: a committed dirtree not yet read, or a loaded tree.
+/// A subdirectory entry: a committed dirtree that is not read yet, or a loaded
+/// tree.
 #[derive(Debug)]
 enum Child {
-    /// A committed subdirectory whose contents have not been read. The
-    /// checksums name its dirtree and dirmeta objects.
+    /// A committed subdirectory whose contents are not read yet. The checksums
+    /// name its dirtree and dirmeta objects.
     Lazy {
         dirtree: Checksum,
         dirmeta: Checksum,
     },
-    /// A materialized subtree.
+    /// A loaded subtree.
     Loaded(MutableTree),
 }
 
-/// What a directory holds at a given name, for the staging-tree path walker.
+/// The entry that a directory holds at a name, for the path walker of the
+/// staging tree.
 pub(crate) enum ChildKind {
     /// No entry with that name.
     Absent,
-    /// A file or symlink, named by its content checksum.
+    /// A file or a symlink, named by its content checksum.
     File(Checksum),
-    /// A materialized (loaded) subdirectory.
+    /// A loaded subdirectory.
     Dir,
-    /// A committed subdirectory not yet read; hydrate before descending.
+    /// A committed subdirectory that is not read yet. The walker hydrates it
+    /// before a descent.
     LazyDir {
-        /// The subdirectory's dirtree checksum.
+        /// The dirtree checksum of the subdirectory.
         dirtree: Checksum,
-        /// The subdirectory's dirmeta checksum.
+        /// The dirmeta checksum of the subdirectory.
         dirmeta: Checksum,
     },
 }
 
-/// A borrowed view of a subdirectory entry, for reading a tree without mutating
-/// it (the right side of a [`merge`](crate::StagingTree::merge)).
+/// A borrowed view of a subdirectory entry, for a read of a tree with no change
+/// to it (the right side of a [`merge`](crate::StagingTree::merge)).
 pub(crate) enum ChildRef<'a> {
-    /// A materialized subtree, borrowed in place.
+    /// A loaded subtree, borrowed in place.
     Loaded(&'a MutableTree),
     /// A committed subtree named by its dirtree and dirmeta checksums.
     Lazy {
-        /// The subdirectory's dirtree checksum.
+        /// The dirtree checksum of the subdirectory.
         dirtree: Checksum,
-        /// The subdirectory's dirmeta checksum.
+        /// The dirmeta checksum of the subdirectory.
         dirmeta: Checksum,
     },
 }
 
-/// An entry taken out of one directory by
-/// [`take_child`](MutableTree::take_child) for reinsertion under another name
-/// with [`insert_child`](MutableTree::insert_child). The node is carried as it
-/// was taken, so a lazy subdirectory stays lazy.
+/// An entry that [`take_child`](MutableTree::take_child) took out of one
+/// directory, for [`insert_child`](MutableTree::insert_child) to put under
+/// another name. The node does not change, so a lazy subdirectory stays lazy.
 pub(crate) struct TakenEntry {
     inner: TakenInner,
 }
 
-/// The taken node: a file entry's checksum, or a subdirectory.
+/// The taken node: the checksum of a file entry, or a subdirectory.
 enum TakenInner {
     File(Checksum),
     Dir(Child),
 }
 
-/// Which mode a descent runs in. It selects what a name the directory does not
-/// hold does, and with it the variant a file of that name raises.
+/// The mode of a descent. It selects the result for a name that the directory
+/// does not hold, and the variant for a file of that name.
 enum Absent {
     /// Insert an empty subdirectory of that name and return it. A file of that
-    /// name is [`Error::ReplaceFileWithDir`].
+    /// name gives [`Error::ReplaceFileWithDir`].
     Create,
-    /// Refuse that name with [`Error::PathNotFound`]. A file of that name is
-    /// [`Error::NotADirectory`].
+    /// Refuse that name with [`Error::PathNotFound`]. A file of that name
+    /// gives [`Error::NotADirectory`].
     Refuse,
 }
 
-/// The checksums a written directory contributes to its parent's dirtree entry.
+/// The checksums that a written directory gives to the dirtree entry of its
+/// parent.
 struct Emitted {
     dirtree: Checksum,
     dirmeta: Checksum,
 }
 
-/// Validate one entry name as a single path component.
+/// Checks that one entry name is a single path component.
 fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::MutableTree("entry name is empty".into()));
@@ -156,7 +174,7 @@ fn validate_name(name: &str) -> Result<()> {
 }
 
 impl MutableTree {
-    /// An empty tree with no dirmeta checksum set.
+    /// Creates an empty tree with no dirmeta checksum.
     pub fn new() -> MutableTree {
         MutableTree {
             metadata_checksum: None,
@@ -167,8 +185,30 @@ impl MutableTree {
         }
     }
 
-    /// Build a tree from a committed revision, reading only the root dirtree.
-    /// Subdirectories are recorded lazily and read on first descent.
+    /// Creates a tree from the root of a commit and reads only the root dirtree.
+    ///
+    /// `rev` is a revision in the syntax of
+    /// [`Repo::resolve_rev`](crate::Repo::resolve_rev). The root of the tree
+    /// takes the dirmeta checksum of the commit root. The tree reads each
+    /// subdirectory on the first descent, as
+    /// [`MutableTree`](MutableTree#lazy-hydration) states.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::RefNotFound`] if `rev` names no ref and no commit.
+    /// - [`Error::InvalidRefspec`] if `rev` is not a checksum and not a valid
+    ///   refspec.
+    /// - [`Error::AmbiguousRefspec`] if more than one commit checksum starts
+    ///   with the abbreviated checksum in `rev`.
+    /// - [`Error::NoParentCommit`] if a `^` in `rev` steps back from a commit
+    ///   with no parent.
+    /// - [`Error::ObjectNotFound`] if the commit, a commit that a `^` step
+    ///   reads, or the root dirtree is not in the repository.
+    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
+    /// - [`Error::Core`] if a ref file holds no checksum, or if the commit or
+    ///   the root dirtree does not parse.
+    /// - [`Error::Io`] if a read from the file system fails, or if an object is
+    ///   larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
     pub async fn from_commit(repo: &Repo, rev: &str) -> Result<MutableTree> {
         let checksum = repo
             .resolve_rev(rev, true)
@@ -178,8 +218,8 @@ impl MutableTree {
         MutableTree::hydrate(repo, commit.root_dirtree, commit.root_dirmeta).await
     }
 
-    /// Read one committed dirtree into a loaded tree; its subdirectories become
-    /// lazy children carrying the same repository handle.
+    /// Reads one committed dirtree into a loaded tree. Its subdirectories
+    /// become lazy children that hold the same repository handle.
     pub(crate) async fn hydrate(
         repo: &Repo,
         dirtree: Checksum,
@@ -209,35 +249,69 @@ impl MutableTree {
         })
     }
 
-    /// Set this directory's dirmeta checksum. The directory's own dirtree does
-    /// not include its dirmeta, so `clean` stays valid; the parent picks up the
-    /// new dirmeta when it reassembles.
+    /// Sets the dirmeta checksum of this directory.
+    ///
+    /// The dirtree of a directory does not hold its own dirmeta checksum, so
+    /// this call does not count as a change of the directory. The dirtree of
+    /// the parent holds it. [`write_mtree`](Transaction::write_mtree) writes
+    /// the new value into the parent when it writes the parent.
     pub fn set_metadata_checksum(&mut self, checksum: Checksum) {
         self.metadata_checksum = Some(checksum);
     }
 
-    /// Ensure a subdirectory named `name` exists and return it, creating an
-    /// empty one if absent or hydrating a lazy committed one. Fails if a file
-    /// with that name exists.
+    /// Returns the subdirectory `name`, and creates an empty one if it is
+    /// absent.
+    ///
+    /// If the subdirectory is a committed child that is not read yet, the call
+    /// reads its dirtree first. A new subdirectory has no dirmeta checksum, and
+    /// it counts as a change of this directory.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::MutableTree`] if `name` is empty, is `.` or `..`, or holds a
+    ///   `/`.
+    /// - [`Error::ReplaceFileWithDir`] if a file of that name exists. The
+    ///   payload is `name`.
+    /// - [`Error::ObjectNotFound`] if the dirtree of the committed child is not
+    ///   in the repository.
+    /// - [`Error::Core`] if the dirtree of the committed child does not parse.
+    /// - [`Error::Io`] if the read of that dirtree fails, or if the dirtree is
+    ///   larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
     pub async fn ensure_dir(&mut self, name: &str) -> Result<&mut MutableTree> {
         self.descend(name, Absent::Create).await
     }
 
-    /// The existing subdirectory named `name`, hydrating a lazy committed child
-    /// in place. Creates nothing: an absent name is [`Error::PathNotFound`] and
-    /// a file of that name is [`Error::NotADirectory`]. A symlink is a file
-    /// entry in this model, so a symlink whose target is a directory is
-    /// [`Error::NotADirectory`] as well: the accessor resolves one name in one
-    /// directory and reads no symlink target. Both payloads are the entry name,
-    /// because this layer holds no path, the same carve-out
-    /// [`Error::ReplaceDirWithFile`] records for the staging tree.
+    /// Returns the existing subdirectory `name`, and creates nothing.
+    ///
+    /// If the subdirectory is a committed child that is not read yet, the call
+    /// reads its dirtree first.
+    ///
+    /// A symlink is a file entry in this tree. A symlink to a directory gives
+    /// [`Error::NotADirectory`] too, because the call resolves one name in one
+    /// directory and reads no symlink target.
+    ///
+    /// The payload of [`Error::NotADirectory`] and of [`Error::PathNotFound`]
+    /// is `name` alone, because a tree holds no path. The staging tree puts one
+    /// entry name in [`Error::ReplaceDirWithFile`] in the same way.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::MutableTree`] if `name` is empty, is `.` or `..`, or holds a
+    ///   `/`.
+    /// - [`Error::NotADirectory`] if a file or a symlink of that name exists.
+    /// - [`Error::PathNotFound`] if no entry of that name exists.
+    /// - [`Error::ObjectNotFound`] if the dirtree of the committed child is not
+    ///   in the repository.
+    /// - [`Error::Core`] if the dirtree of the committed child does not parse.
+    /// - [`Error::Io`] if the read of that dirtree fails, or if the dirtree is
+    ///   larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
     pub async fn subtree(&mut self, name: &str) -> Result<&mut MutableTree> {
         self.descend(name, Absent::Refuse).await
     }
 
-    /// Return the subdirectory named `name`, hydrating a lazy committed child in
-    /// place. `absent` selects what an absent name does, and with it the variant
-    /// a file of that name raises.
+    /// Returns the subdirectory `name`, and reads a committed child that is not
+    /// read yet in place. `absent` selects the result for an absent name, and
+    /// the variant for a file of that name.
     async fn descend(&mut self, name: &str, absent: Absent) -> Result<&mut MutableTree> {
         validate_name(name)?;
         if self.files.contains_key(name) {
@@ -263,7 +337,7 @@ impl MutableTree {
                     repo: self.repo.clone(),
                 };
                 self.dirs.insert(name.to_owned(), Child::Loaded(child));
-                // Adding a subdirectory changes this directory's dirtree.
+                // A new subdirectory changes the dirtree of this directory.
                 self.clean = None;
             }
             Some(Child::Lazy { dirtree, dirmeta }) => {
@@ -275,7 +349,7 @@ impl MutableTree {
                 })?;
                 let loaded = MutableTree::hydrate(&repo, dirtree, dirmeta).await?;
                 self.dirs.insert(name.to_owned(), Child::Loaded(loaded));
-                // Descending does not change this directory's dirtree, so
+                // A descent does not change the dirtree of this directory, so
                 // `clean` stays as it was.
             }
             Some(Child::Loaded(_)) => {}
@@ -288,8 +362,17 @@ impl MutableTree {
         }
     }
 
-    /// Set the file named `name` to the given content checksum, replacing any
-    /// existing file of that name. Fails if a directory with that name exists.
+    /// Sets the file `name` to a content checksum.
+    ///
+    /// If a file of that name exists, the call replaces it. The call counts as
+    /// a change of this directory.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::MutableTree`] if `name` is empty, is `.` or `..`, or holds a
+    ///   `/`.
+    /// - [`Error::ReplaceDirWithFile`] if a subdirectory of that name exists.
+    ///   The payload is `name`.
     pub fn replace_file(&mut self, name: &str, checksum: Checksum) -> Result<()> {
         validate_name(name)?;
         if self.dirs.contains_key(name) {
@@ -300,16 +383,16 @@ impl MutableTree {
         Ok(())
     }
 
-    /// The content checksum recorded for the file (or symlink) entry `name`, if
-    /// one is present. A directory entry of that name yields `None`. Used by the
-    /// overlay merge to detect a base leaf an upper directory must replace.
+    /// Returns the content checksum of the file or symlink entry `name`, if one
+    /// is present. A directory entry of that name gives `None`. The overlay
+    /// merge uses it to find a base leaf that an upper directory must replace.
     pub(crate) fn file_checksum(&self, name: &str) -> Option<Checksum> {
         self.files.get(name).copied()
     }
 
-    /// Remove every file and subdirectory, marking the directory dirty. Used by
-    /// the overlay merge to clear an opaque directory before ingesting the
-    /// upper entries fresh.
+    /// Removes every file and subdirectory, and marks the directory dirty. The
+    /// overlay merge uses it to clear an opaque directory before it reads the
+    /// upper entries.
     pub(crate) fn clear_children(&mut self) {
         if !self.files.is_empty() || !self.dirs.is_empty() {
             self.files.clear();
@@ -318,12 +401,12 @@ impl MutableTree {
         }
     }
 
-    /// Take the entry named `name` out of this directory, file or
-    /// subdirectory, for reinsertion under another name with
-    /// [`insert_child`](MutableTree::insert_child). Marks this directory
-    /// dirty. The taken node itself is untouched, so a moved subtree keeps
-    /// its own `clean` state and a lazy child stays lazy. An absent name
-    /// yields `None`.
+    /// Takes the file or subdirectory `name` out of this directory, for
+    /// [`insert_child`](MutableTree::insert_child) to put under another name.
+    ///
+    /// The call marks this directory dirty. The taken node does not change, so
+    /// a moved subtree keeps its own `clean` state and a lazy child stays lazy.
+    /// An absent name gives `None`.
     pub(crate) fn take_child(&mut self, name: &str) -> Option<TakenEntry> {
         let inner = if let Some(checksum) = self.files.remove(name) {
             TakenInner::File(checksum)
@@ -336,13 +419,16 @@ impl MutableTree {
         Some(TakenEntry { inner })
     }
 
-    /// Insert a taken entry under `name`, marking this directory dirty. The
-    /// name must be fresh: an existing entry of that name is refused, which
-    /// keeps the one-name-one-entry rule every other mutator holds. A moved
-    /// lazy child hydrates from this directory's own repository handle: every
-    /// directory takes that handle from its parent, and a lazy child exists
-    /// only under a tree [`hydrate`](MutableTree::hydrate) built, so a
-    /// directory that can receive one always holds a handle.
+    /// Inserts a taken entry under `name`, and marks this directory dirty.
+    ///
+    /// The call refuses a name that an entry holds already. This keeps the
+    /// rule of one entry for each name that every other mutator keeps.
+    ///
+    /// A moved lazy child reads its dirtree through the repository handle of
+    /// this directory. Every directory takes that handle from its parent. A
+    /// lazy child exists only under a tree that
+    /// [`hydrate`](MutableTree::hydrate) built, so a directory that can
+    /// receive one always holds a handle.
     pub(crate) fn insert_child(&mut self, name: &str, entry: TakenEntry) -> Result<()> {
         validate_name(name)?;
         if self.files.contains_key(name) || self.dirs.contains_key(name) {
@@ -362,8 +448,16 @@ impl MutableTree {
         Ok(())
     }
 
-    /// Remove the file or subdirectory named `name`. With `allow_noent`, an
-    /// absent entry is not an error.
+    /// Removes the file or the subdirectory `name`.
+    ///
+    /// If `allow_noent` is `true`, an absent entry is not an error. The call
+    /// does not check the form of `name`, so an invalid name matches no entry.
+    /// A removal counts as a change of this directory.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MutableTree`] if no entry of that name exists and
+    /// `allow_noent` is `false`.
     pub fn remove(&mut self, name: &str, allow_noent: bool) -> Result<()> {
         let removed = self.files.remove(name).is_some() || self.dirs.remove(name).is_some();
         if removed {
@@ -376,20 +470,22 @@ impl MutableTree {
         Ok(())
     }
 
-    /// This directory's dirmeta checksum, if set. A tree whose root has none
-    /// cannot be written, which is how a source list that supplied no root
-    /// directory is recognized.
+    /// Returns the dirmeta checksum of this directory, if it is set.
+    ///
+    /// [`write_mtree`](Transaction::write_mtree) cannot write a root with no
+    /// dirmeta checksum. A caller can call this method before `write_mtree` to
+    /// find a tree whose sources set no root dirmeta.
     pub fn metadata_checksum(&self) -> Option<Checksum> {
         self.metadata_checksum
     }
 
-    /// Record a committed subdirectory at `name` without reading it, so the
-    /// overlay reads only the paths a later source names. `repo` is the
-    /// repository the child is read from when a later source does descend into
-    /// it.
+    /// Records a committed subdirectory at `name` and does not read it.
     ///
-    /// A name this tree already holds as a file is refused, which is the rule
-    /// every other mutator follows.
+    /// The overlay reads only the paths that a later source names. If a later
+    /// source descends into the child, the tree reads the child from `repo`.
+    ///
+    /// The call refuses a name that this tree holds as a file, as every other
+    /// mutator does.
     pub(crate) fn insert_lazy_dir(
         &mut self,
         name: &str,
@@ -410,12 +506,13 @@ impl MutableTree {
         Ok(())
     }
 
-    /// The repository this tree hydrates lazy children from, if any.
+    /// Returns the repository that this tree reads lazy children from, if any.
     pub(crate) fn repo(&self) -> Option<Repo> {
         self.repo.clone()
     }
 
-    /// What this directory holds at `name`, for the staging-tree path walker.
+    /// Returns the entry that this directory holds at `name`, for the path
+    /// walker of the staging tree.
     pub(crate) fn child_kind(&self, name: &str) -> ChildKind {
         if let Some(checksum) = self.files.get(name) {
             return ChildKind::File(*checksum);
@@ -430,9 +527,11 @@ impl MutableTree {
         }
     }
 
-    /// Navigate to the loaded directory at the literal component `path`, or
-    /// `None` if any component is missing or is not a loaded directory. Lazy
-    /// children must be hydrated by the caller before they can be traversed.
+    /// Returns the loaded directory at the literal components of `path`.
+    ///
+    /// The result is `None` if a component is absent or is not a loaded
+    /// directory. The caller must hydrate lazy children before this walk can
+    /// pass through them.
     pub(crate) fn dir_at(&self, path: &[String]) -> Option<&MutableTree> {
         let mut cur = self;
         for name in path {
@@ -444,7 +543,8 @@ impl MutableTree {
         Some(cur)
     }
 
-    /// The mutable counterpart of [`dir_at`](MutableTree::dir_at).
+    /// Returns the loaded directory at `path` for a change, as
+    /// [`dir_at`](MutableTree::dir_at) does for a read.
     pub(crate) fn dir_at_mut(&mut self, path: &[String]) -> Option<&mut MutableTree> {
         let mut cur = self;
         for name in path {
@@ -456,18 +556,22 @@ impl MutableTree {
         Some(cur)
     }
 
-    /// Replace a lazy child `name` with its hydrated subtree. The directory's
-    /// own dirtree is unchanged, so `clean` stays as it was.
+    /// Replaces the lazy child `name` with its hydrated subtree. The dirtree of
+    /// this directory does not change, so `clean` stays as it was.
     pub(crate) fn install_hydrated_child(&mut self, name: &str, loaded: MutableTree) {
         self.dirs.insert(name.to_owned(), Child::Loaded(loaded));
     }
 
-    /// Set the dirmeta checksum recorded for the subdirectory `name` without
-    /// hydrating a lazy child: a loaded child takes it as its own metadata
-    /// checksum, and a lazy child's entry is rewritten in place keeping its
-    /// dirtree, because the child's contents do not change. This directory's
-    /// dirtree embeds the child's dirmeta, so a changed lazy entry marks it
-    /// dirty; a loaded child already forces its parent to reassemble.
+    /// Sets the dirmeta checksum of the subdirectory `name`, and does not
+    /// hydrate a lazy child.
+    ///
+    /// A loaded child takes the checksum as its own dirmeta checksum. The call
+    /// changes the entry of a lazy child in place and keeps its dirtree,
+    /// because the contents of the child do not change.
+    ///
+    /// The dirtree of this directory holds the dirmeta checksum of the child,
+    /// so a changed lazy entry marks this directory dirty. A loaded child
+    /// already causes a new dirtree for its parent.
     pub(crate) fn set_child_dirmeta(&mut self, name: &str, dirmeta: Checksum) -> Result<()> {
         match self.dirs.get_mut(name) {
             Some(Child::Loaded(child)) => {
@@ -487,8 +591,10 @@ impl MutableTree {
         }
     }
 
-    /// Insert a fresh empty loaded subdirectory named `name` with the given
-    /// dirmeta checksum, replacing any existing entry of that name. Marks this
+    /// Inserts a new empty loaded subdirectory `name` with the given dirmeta
+    /// checksum.
+    ///
+    /// The call replaces an existing entry of that name, and marks this
     /// directory dirty.
     pub(crate) fn insert_empty_dir(&mut self, name: &str, dirmeta: Option<Checksum>) {
         let child = MutableTree {
@@ -503,15 +609,15 @@ impl MutableTree {
         self.clean = None;
     }
 
-    /// The file entries of this directory, byte-wise name-sorted.
+    /// Returns the file entries of this directory, in byte-wise name order.
     pub(crate) fn file_entries(&self) -> impl Iterator<Item = (&str, Checksum)> {
         self.files
             .iter()
             .map(|(name, checksum)| (name.as_str(), *checksum))
     }
 
-    /// The subdirectory entries of this directory as borrowed views, byte-wise
-    /// name-sorted.
+    /// Returns the subdirectory entries of this directory as borrowed views, in
+    /// byte-wise name order.
     pub(crate) fn dir_entries(&self) -> impl Iterator<Item = (&str, ChildRef<'_>)> {
         self.dirs.iter().map(|(name, child)| {
             let view = match child {
@@ -532,21 +638,40 @@ impl Default for MutableTree {
     }
 }
 
+/// Methods that write a mutable tree as dirtree objects.
 impl Transaction {
-    /// Serialize the dirty subtrees of `mtree` into dirtree objects, stage
-    /// them, and return the root as a [`RepoTree`].
+    /// Writes the changed subtrees of `mtree` as dirtree objects.
     ///
-    /// The walk is post-order over dirty subtrees. An unmutated subtree keeps
-    /// its committed dirtree checksum and is neither re-serialized nor
-    /// re-staged. Each written directory requires its dirmeta checksum set;
-    /// an unset checksum is an error naming the directory's path.
+    /// The call stages each new dirtree as an object of GVariant type
+    /// `(a(say)a(sayay))`, and returns the root as a [`RepoTree`]. The walk is
+    /// post-order: it writes the children of a directory before the directory.
+    /// A subtree with no change keeps its committed dirtree checksum, and the
+    /// call does not serialize or stage it again, as
+    /// [`MutableTree`](MutableTree#dirty-tracking) states.
     ///
-    /// The root it returns reads back through this transaction alone, the same
-    /// constraint [`Transaction::read_dir`](Transaction::read_dir) states:
-    /// passing it to [`RepoTree::read_dir`](crate::RepoTree::read_dir) before
-    /// the transaction commits reaches
-    /// [`Error::ObjectNotFound`] for the staged
-    /// dirtree.
+    /// Each directory that the call writes must have a dirmeta checksum.
+    ///
+    /// The returned root reads back through this transaction alone, as
+    /// [`read_dir`](Transaction::read_dir) states. Before the
+    /// transaction commit, [`RepoTree::read_dir`](crate::RepoTree::read_dir)
+    /// on a dirtree that this call staged fails with
+    /// [`Error::ObjectNotFound`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::MutableTree`] if a directory that the call writes has no
+    ///   dirmeta checksum. The message names the path of the directory, with
+    ///   `/` for the root.
+    /// - [`Error::Core`] if an entry name holds a NUL byte, or if
+    ///   `[core] fsync` or `[core] per-object-fsync` in the repository config
+    ///   is malformed.
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`,
+    ///   or if `[ex-integrity] fsverity` is `yes` and the fs-verity seal fails.
+    /// - [`Error::InsufficientFreeSpace`] if a dirtree needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
+    ///   `[ex-integrity] composefs` in the repository config is malformed.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_mtree(&self, mtree: &mut MutableTree) -> Result<RepoTree> {
         let emitted = write_node(self, mtree, "/".to_owned()).await?;
         Ok(RepoTree::from_parts(
@@ -557,20 +682,22 @@ impl Transaction {
     }
 }
 
-/// The boxed future type for the recursive post-order walk. Async recursion
+/// The boxed future type of the recursive post-order walk. Async recursion
 /// needs indirection, so each level returns a boxed future.
 type NodeFuture<'a> = Pin<Box<dyn Future<Output = Result<Emitted>> + Send + 'a>>;
 
-/// Resolve one directory node: reuse its dirtree checksum when clean, otherwise
-/// assemble and stage a dirtree from its files and children.
+/// Writes one directory node. If the node is clean, the function reuses its
+/// dirtree checksum. If not, it builds and stages a dirtree from the files and
+/// children of the node.
 fn write_node<'a>(txn: &'a Transaction, node: &'a mut MutableTree, path: String) -> NodeFuture<'a> {
     Box::pin(async move {
         let dirmeta = node.metadata_checksum.ok_or_else(|| {
             Error::MutableTree(format!("directory {path} has no dirmeta checksum set"))
         })?;
 
-        // A directory with no descended children and an intact committed
-        // checksum is reused untouched; nothing beneath it is read or staged.
+        // A directory with no loaded children and an intact committed
+        // checksum keeps that checksum. The walk reads and stages nothing
+        // under it.
         let has_loaded_child = node
             .dirs
             .values()
@@ -606,7 +733,7 @@ fn write_node<'a>(txn: &'a Transaction, node: &'a mut MutableTree, path: String)
     })
 }
 
-/// Join a parent path and a child name for error messages.
+/// Joins a parent path and a child name for error messages.
 fn join_path(parent: &str, name: &str) -> String {
     if parent == "/" {
         format!("/{name}")
@@ -615,7 +742,8 @@ fn join_path(parent: &str, name: &str) -> String {
     }
 }
 
-/// A mutable tree moves freely across tasks and threads.
+/// A compile-time check that a mutable tree is `Send + Sync`, so it can move
+/// across tasks and threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<MutableTree>();
@@ -650,8 +778,8 @@ mod tests {
         }
     }
 
-    /// `insert_lazy_dir` refuses the same names `replace_file` and `ensure_dir`
-    /// refuse, and records nothing for a refused name.
+    /// `insert_lazy_dir` refuses the names that `replace_file` and
+    /// `ensure_dir` refuse, and records nothing for a refused name.
     #[test]
     fn insert_lazy_dir_rejects_invalid_names() {
         let scratch = Scratch::new("lazy-names");

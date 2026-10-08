@@ -1,11 +1,16 @@
-//! Filesystem-ingest integration tests.
+//! Integration tests for the ingest of a file system tree.
 //!
-//! These build source trees on disk and ingest them through
-//! `write_dfd_to_mtree` under a `CommitModifier`: reproducing the fixture
-//! tree's checksums, matching the tool's canonical-permissions output for modes
-//! and for xattrs, the filter's subtree pruning, an xattr callback landing in the
-//! object id, a devino-cache hit skipping ingestion, source consumption, and a
-//! `user.*` xattr round-trip.
+//! These tests build source trees on disk. Then they ingest each tree through
+//! `write_dfd_to_mtree` under a `CommitModifier`. The tests cover:
+//!
+//! - the checksums of the fixture tree
+//! - the modes and the xattrs of the canonical-permissions output of the
+//!   `ostree` command
+//! - the pruning of a subtree by the filter
+//! - an xattr callback that changes the object id
+//! - a devino-cache hit that skips the ingest of a file
+//! - the consumption of the source
+//! - a round trip of a `user.*` xattr
 
 mod common;
 
@@ -25,19 +30,20 @@ fn csum(hex: &str) -> Checksum {
     Checksum::from_hex(hex).unwrap()
 }
 
-/// Compile-time pin: the ingest walk future is `Send`, callbacks included.
+/// Returns `value`. A call is a compile-time check that the future of the
+/// ingest walk is `Send`, callbacks included.
 fn assert_send<T: Send>(value: T) -> T {
     value
 }
 
-/// Set a path's permission bits.
+/// Sets the permission bits of a path.
 fn set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-/// Build the fixture source tree (hello/empty/nested/link, owner-agnostic) under
-/// `base/src` and return the source directory.
+/// Builds the fixture source tree (hello/empty/nested/link) under `base/src`
+/// and returns the source directory. The tree does not depend on the owner.
 fn build_fixture_source(base: &Path) -> std::path::PathBuf {
     let src = base.join("src");
     std::fs::create_dir_all(src.join("subdir")).unwrap();
@@ -53,7 +59,8 @@ fn build_fixture_source(base: &Path) -> std::path::PathBuf {
     src
 }
 
-/// The uid/gid this process owns, taken from a directory it created.
+/// Returns the uid and gid of this process, read from a directory that it
+/// created.
 fn own_ids(path: &Path) -> (u32, u32) {
     let stat = rustix::fs::stat(path).unwrap();
     (stat.st_uid, stat.st_gid)
@@ -61,8 +68,9 @@ fn own_ids(path: &Path) -> (u32, u32) {
 
 #[test]
 fn ingest_reproduces_the_fixture_tree() {
-    // Canonicalizing owner to 0:0 with modes already canonical (0644 files,
-    // 0755 dirs) reproduces the tool's owner-0:0 fixture exactly.
+    // The modes are already canonical (0644 files, 0755 dirs). An ingest that
+    // sets the owner to 0:0 gives the owner-0:0 fixture of the `ostree`
+    // command exactly.
     let tmp = TmpDir::new("ingest-fixture");
     let base = tmp.path();
     build_fixture_source(base);
@@ -97,9 +105,9 @@ fn ingest_reproduces_the_fixture_tree() {
 
 #[test]
 fn canonical_permissions_match_the_canon_fixture() {
-    // The same assorted-mode tree the canon fixture was built from, ingested
-    // with CANONICAL_PERMISSIONS, has the root-tree identity the tool produced
-    // with --canonical-permissions.
+    // The source is the tree of mixed modes that the canon fixture comes from.
+    // An ingest with CANONICAL_PERMISSIONS gives the root-tree identity that
+    // the `ostree` command gave with --canonical-permissions.
     let tmp = TmpDir::new("ingest-canon");
     let base = tmp.path();
     let src = base.join("src");
@@ -150,8 +158,9 @@ fn canonical_permissions_match_the_canon_fixture() {
 
 #[test]
 fn canonical_permissions_apply_the_recovered_mode_rule() {
-    // 0664 -> 0644, 0755 -> 0755, 04755 -> 0755; owner forced to 0:0. Read the
-    // ingested modes back through the port, tool-free.
+    // The rule: 0664 -> 0644, 0755 -> 0755, 04755 -> 0755, and the owner is
+    // 0:0. The test reads the ingested modes back through ostrya, without the
+    // `ostree` command.
     let tmp = TmpDir::new("ingest-canon-rule");
     let base = tmp.path();
     let src = base.join("src");
@@ -209,13 +218,14 @@ fn canonical_permissions_apply_the_recovered_mode_rule() {
 
 #[test]
 fn canonical_permissions_records_no_xattrs() {
-    // Canonical ingest records no xattrs, so an entry carrying one takes the
-    // identity of the same entry without it -- for a file and for a directory's
-    // metadata alike. Pinned to the tool by
-    // `canonical_permissions_match_the_tool_over_xattrs`.
+    // Because a canonical ingest records no xattrs, an entry with an xattr gets
+    // the identity of the same entry without it. This applies to a file and to
+    // the metadata of a directory. The test
+    // `canonical_permissions_match_the_tool_over_xattrs` compares this with the
+    // `ostree` command.
     let tmp = TmpDir::new("ingest-canon-xattr");
     let base = tmp.path();
-    // Two copies of one tree, identical but for the xattrs one of them carries.
+    // Two copies of one tree. Only one copy has the xattrs.
     for variant in ["with", "without"] {
         let src = base.join(variant).join("src");
         std::fs::create_dir_all(src.join("subdir")).unwrap();
@@ -243,8 +253,8 @@ fn canonical_permissions_records_no_xattrs() {
         let mut ingested = Vec::new();
         for variant in ["with", "without"] {
             let txn = repo.transaction().await.unwrap();
-            // No SKIP_XATTRS: the walk captures the on-disk set, and canonical
-            // ingest is what drops it.
+            // No SKIP_XATTRS: the walk reads the xattrs on disk, and the
+            // canonical ingest removes them.
             let mut modifier = CommitModifier::new(CommitModifierFlags::CANONICAL_PERMISSIONS);
             let mut mtree = MutableTree::new();
             let dfd = std::fs::File::open(base.join(variant)).unwrap();
@@ -265,7 +275,7 @@ fn canonical_permissions_records_no_xattrs() {
             "the xattr-bearing tree has the identity of the tree without xattrs"
         );
 
-        // The recorded file header carries no xattr either.
+        // The recorded file header also has no xattr.
         let tree = repo.load_dirtree(&ingested[0].0).await.unwrap();
         let hello = tree.files.iter().find(|(n, _)| n == "hello.txt").unwrap().1;
         let file = repo.load_file(&hello).await.unwrap();
@@ -285,9 +295,9 @@ fn canonical_permissions_match_the_tool_over_xattrs() {
         );
         return;
     }
-    // The tool's `--canonical-permissions` records no xattrs, so the port's
-    // canonical ingest of an xattr-bearing tree has to produce the tool's own
-    // object names for it.
+    // The `--canonical-permissions` option of the `ostree` command records no
+    // xattrs. The canonical ingest of ostrya must give the same object names
+    // as the `ostree` command for a tree with xattrs.
     let tmp = TmpDir::new("ingest-canon-tool");
     let base = tmp.path();
     let src = base.join("src");
@@ -359,7 +369,7 @@ fn run_ostree(args: &[&str]) {
 
 #[test]
 fn filter_prunes_a_subtree() {
-    // A filter that skips /subdir excludes it and its contents entirely.
+    // A filter that skips /subdir excludes the directory and all its contents.
     let tmp = TmpDir::new("ingest-filter");
     let base = tmp.path();
     build_fixture_source(base);
@@ -407,8 +417,9 @@ fn filter_prunes_a_subtree() {
 
 #[test]
 fn xattr_callback_lands_in_the_object_id() {
-    // A callback that sets user.extra on hello.txt makes the ingested object id
-    // equal to the same content written with that xattr in its header.
+    // A callback sets user.extra on hello.txt. The ingested object id is then
+    // equal to the id of the same content, written with that xattr in its
+    // header.
     let tmp = TmpDir::new("ingest-xattr-cb");
     let base = tmp.path();
     let src = base.join("src");
@@ -425,7 +436,7 @@ fn xattr_callback_lands_in_the_object_id() {
             .await
             .unwrap();
 
-        // The identity the same payload gets with the xattr set directly.
+        // The identity of the same payload, written with the xattr directly.
         let expected = {
             let txn = repo.transaction().await.unwrap();
             let mut meta = FileMeta::regular(uid, gid, 0o644);
@@ -478,11 +489,12 @@ fn xattr_callback_lands_in_the_object_id() {
 
 #[test]
 fn canonical_permissions_reduce_the_mode_callback_result() {
-    // The canonical reduction stands last of the mode modifiers, so a mode
-    // callback states the mode the reduction then masks. The file type stays
-    // the one the walk found, so a callback naming a type of its own leaves
-    // the entry the kind it is. Both the plain walk and the devino-cache path
-    // run the callback through the same step, so both are asserted here.
+    // The canonical reduction is the last of the mode modifiers. A mode
+    // callback sets the mode, and then the reduction masks it. The file type
+    // stays the type that the walk found: a callback that names a different
+    // type does not change the kind of the entry. The plain walk and the
+    // devino-cache path run the callback through the same step, so the test
+    // checks both.
     let tmp = TmpDir::new("ingest-canon-order");
     let base = tmp.path();
     let src = base.join("src");
@@ -493,8 +505,9 @@ fn canonical_permissions_reduce_the_mode_callback_result() {
     set_mode(&src, 0o755);
     let stat = rustix::fs::stat(src.join("hello.txt")).unwrap();
 
-    // What the CLI's `--statoverride` mode callback does for `=511 /hello.txt`,
-    // `=2048 /sub`, and a value renaming the file's type.
+    // This closure does what the mode callback of the CLI `--statoverride`
+    // option does for `=511 /hello.txt`, `=2048 /sub`, and a value that names
+    // a different file type.
     let assign = |value: u32| {
         move |path: &Path, meta: &FileMeta| -> u32 {
             match path.to_str().unwrap() {
@@ -539,17 +552,17 @@ fn canonical_permissions_reduce_the_mode_callback_result() {
             )
         };
 
-        // 0o777 assigned, then reduced: 0o755. 0o4000 assigned, then reduced:
-        // nothing survives the mask. Running the reduction first would give
-        // 0o777 and 0o4000.
+        // 0o777 is set, then reduced to 0o755. 0o4000 is set, then reduced: no
+        // bit passes the mask. A reduction before the callback gives 0o777 and
+        // 0o4000.
         assert_eq!(walk(0o777, None).await, (0o100755, 0o40755));
         assert_eq!(walk(0o4000, None).await, (0o100000, 0o40000));
-        // A value naming a directory's type over a regular file leaves a
-        // regular file, and the permission bits it carries are masked.
+        // A value that names the directory type on a regular file leaves a
+        // regular file. The mask applies to the permission bits of the value.
         assert_eq!(walk(0o40755, None).await, (0o100755, 0o40755));
 
-        // The same over the devino-cache path: the stored object supplies the
-        // metadata, and the callback and the reduction shape it in that order.
+        // The same on the devino-cache path: the stored object supplies the
+        // metadata. The callback changes it first, and then the reduction.
         let stored = {
             let (mode, _) = walk(0o777, None).await;
             assert_eq!(mode, 0o100755);
@@ -570,11 +583,12 @@ fn canonical_permissions_reduce_the_mode_callback_result() {
 
 #[test]
 fn devino_cache_hit_skips_rehashing() {
-    // With DEVINO_CANONICAL and a cache entry for the file's (dev, ino), the
-    // file takes the cached checksum and no object is staged. Without the flag,
-    // the cache is still consulted: the stored object supplies the metadata the
-    // modifier shapes, and the object is reused where the shaped metadata
-    // matches it and rewritten from the stored content where it does not.
+    // With DEVINO_CANONICAL and a cache entry for the (dev, ino) of the file,
+    // the file gets the cached checksum, and the walk stages no object.
+    // Without the flag, the walk also reads the cache. The stored object
+    // supplies the metadata that the modifier changes. If the changed metadata
+    // matches the stored object, the walk reuses the object. If not, the walk
+    // writes the object again from the stored content.
     let tmp = TmpDir::new("ingest-devino");
     let base = tmp.path();
     let src = base.join("src");
@@ -585,7 +599,7 @@ fn devino_cache_hit_skips_rehashing() {
     let sentinel = Checksum::sha256(b"a checksum that is not the real content");
 
     block_on(async {
-        // Hit: the cache is consulted and the object is not staged.
+        // Hit: the walk reads the cache and stages no object.
         let root = base.join("repo-hit");
         let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
             .await
@@ -618,7 +632,7 @@ fn devino_cache_hit_skips_rehashing() {
         let hello = tree.files.iter().find(|(n, _)| n == "hello.txt").unwrap().1;
         assert_eq!(hello, sentinel, "the cached checksum is used verbatim");
 
-        // A repository holding the real object, for the two walks below.
+        // A repository with the real object, for the next two walks.
         let root = base.join("repo-plain");
         let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
             .await
@@ -643,10 +657,10 @@ fn devino_cache_hit_skips_rehashing() {
             tree.files.iter().find(|(n, _)| n == "hello.txt").unwrap().1
         };
 
-        // The source file is rewritten in place, keeping its inode, so the
-        // stored object's payload and the source file's payload now differ.
-        // Either half below that read the source would produce an object
-        // holding `rewritten` rather than the stored bytes.
+        // The test writes a new payload to the source file in place, and the
+        // inode stays the same. The payload of the stored object and the
+        // payload of the source file are now different. If one of the next two
+        // walks reads the source, its object holds the new payload.
         std::fs::write(
             src.join("hello.txt"),
             b"a payload the store does not hold\n",
@@ -660,8 +674,8 @@ fn devino_cache_hit_skips_rehashing() {
             "the rewrite kept the inode the cache is keyed on"
         );
 
-        // No flag, and the shaped metadata equals the stored metadata: the
-        // object is reused and the hit is counted.
+        // No flag, and the changed metadata is equal to the stored metadata:
+        // the walk reuses the object and counts the hit.
         let txn = repo.transaction().await.unwrap();
         let dfd = std::fs::File::open(base).unwrap();
         let mut cache = DevInoCache::new();
@@ -686,8 +700,8 @@ fn devino_cache_hit_skips_rehashing() {
         let hello = tree.files.iter().find(|(n, _)| n == "hello.txt").unwrap().1;
         assert_eq!(hello, real, "the stored object is reused");
 
-        // No flag, and the modifier changes the metadata: the object is
-        // rewritten from the stored content under the shaped metadata.
+        // No flag, and the modifier changes the metadata: the walk writes the
+        // object again from the stored content, with the changed metadata.
         let txn = repo.transaction().await.unwrap();
         let dfd = std::fs::File::open(base).unwrap();
         let mut modifier = CommitModifier::new(CommitModifierFlags::SKIP_XATTRS);
@@ -729,8 +743,8 @@ fn devino_cache_hit_skips_rehashing() {
 
 #[test]
 fn consume_empties_the_source() {
-    // A consuming walk removes every source file and the walk-root directory,
-    // leaving its parent, while the objects are still staged.
+    // A consuming walk removes each source file and the walk-root directory.
+    // The parent of the walk root stays. The objects are still staged.
     let tmp = TmpDir::new("ingest-consume");
     let base = tmp.path();
     let src = build_fixture_source(base);
@@ -763,14 +777,13 @@ fn consume_empties_the_source() {
 
 #[test]
 fn consume_spares_a_walk_root_spelled_dot() {
-    // A consuming walk spares the walk root when the path is exactly `.`, and
-    // removes it under every other spelling, `./` among them. The test is on
-    // the text the path carries, which is the rule
-    // `docs/format-reference.md`, "CLI output formats", `commit` records for
-    // `--consume`. Both spellings here name the directory the walk-root
-    // descriptor is open on, and the kernel refuses to unlink a path whose
-    // last component is `.`, so each leaves the directory in place and empties
-    // it.
+    // A consuming walk keeps the walk root if the path is exactly `.`. It
+    // removes the walk root for each other spelling, `./` included. The check
+    // is on the text of the path. The `ostree` command applies the same rule
+    // to `commit --consume`.
+    // Both spellings here name the directory that the walk-root descriptor is
+    // open on. The kernel refuses to unlink a path whose last component is
+    // `.`, so each spelling leaves the directory in place and empties it.
     for spelling in [".", "./"] {
         let tmp = TmpDir::new("ingest-consume-dot");
         let base = tmp.path();
@@ -812,8 +825,8 @@ fn consume_spares_a_walk_root_spelled_dot() {
 
 #[test]
 fn user_xattr_round_trips_through_ingest() {
-    // A file bearing a user.* xattr ingests into bare-user and reads back with
-    // the xattr intact.
+    // A file with a user.* xattr ingests into bare-user and reads back with
+    // the same xattr.
     let tmp = TmpDir::new("ingest-xattr-roundtrip");
     let base = tmp.path();
     let src = base.join("src");
@@ -837,7 +850,7 @@ fn user_xattr_round_trips_through_ingest() {
         let txn = repo.transaction().await.unwrap();
         let dfd = std::fs::File::open(base).unwrap();
         let mut mtree = MutableTree::new();
-        // No SKIP_XATTRS: on-disk xattrs are captured.
+        // No SKIP_XATTRS: the walk reads the xattrs on disk.
         txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("src"), &mut mtree, None)
             .await
             .unwrap();
@@ -864,11 +877,13 @@ fn user_xattr_round_trips_through_ingest() {
 
 #[test]
 fn reads_the_tool_written_user_xattr_from_the_fixture() {
-    // The xattr fixture is a bare-user commit the tool made with a user.demo
-    // xattr on hello.txt, folded into the file's user.ostreemeta and carried
-    // across git in the fixture tarball. Reading it back proves the port decodes
-    // a tool-written xattr set: the ingest round-trip test above uses the port on
-    // both ends, while this reads the bytes the tool itself wrote.
+    // The xattr fixture is a bare-user commit that the `ostree` command made,
+    // with a user.demo xattr on hello.txt. The command stored the xattr in the
+    // user.ostreemeta of the file, and the fixture tarball carries it in git.
+    // The read proves that ostrya decodes an xattr set that the `ostree`
+    // command wrote. The test `user_xattr_round_trips_through_ingest` uses
+    // ostrya at both ends. This test reads the bytes that the `ostree` command
+    // wrote.
     block_on(async {
         let repo = Repo::open(&fixture_repo("xattr")).await.unwrap();
         let (root, _) = repo.read_commit("test/main").await.unwrap();
@@ -893,13 +908,14 @@ fn reads_the_tool_written_user_xattr_from_the_fixture() {
 
 #[test]
 fn symlink_xattrs_round_trip_through_the_object_store() {
-    // A symlink object carrying a user.* xattr round-trips through the modes
-    // that store xattrs in-band: archive keeps them in the framed header,
-    // bare-user in user.ostreemeta. write_symlink takes the xattr set directly,
-    // so this exercises storage and read-back without setting an xattr on a
-    // source symlink, which the VFS forbids for user.* and gates behind
-    // CAP_SYS_ADMIN otherwise. The bare mode's on-inode storage of the same
-    // xattr needs that privilege and is covered on a privileged host.
+    // A symlink object with a user.* xattr makes a round trip through the
+    // modes that store xattrs in-band. Archive keeps them in the framed
+    // header, and bare-user keeps them in user.ostreemeta. write_symlink takes
+    // the xattr set directly, so the test checks storage and read-back with
+    // no xattr on a source symlink. The VFS forbids user.* xattrs on a
+    // symlink, and other xattrs on a symlink need CAP_SYS_ADMIN. The bare mode
+    // stores the same xattr on the inode. That needs the same privilege, so a
+    // test on a privileged host covers it.
     let tmp = TmpDir::new("symlink-xattr-roundtrip");
     let base = tmp.path();
     let xattrs = Xattrs::new([(b"user.demo\0".to_vec(), b"value".to_vec())]).unwrap();
@@ -943,10 +959,10 @@ fn symlink_xattrs_round_trip_through_the_object_store() {
 
 #[test]
 fn ingest_reads_symlink_xattrs_no_follow() {
-    // A symlink pointing at an xattr-bearing regular file ingests with the
-    // link's own (empty) xattr set: the target's user.demo must not leak into
-    // the symlink object. Committed without SKIP_XATTRS so the walk reads
-    // on-disk xattrs.
+    // A symlink to a regular file with an xattr ingests with the xattr set of
+    // the link itself, which is empty. The user.demo of the target must not go
+    // into the symlink object. The ingest has no SKIP_XATTRS, so the walk
+    // reads the xattrs on disk.
     let tmp = TmpDir::new("ingest-symlink-nofollow");
     let base = tmp.path();
     let src = base.join("src");
@@ -997,7 +1013,8 @@ fn ingest_reads_symlink_xattrs_no_follow() {
             "the regular file keeps its xattr"
         );
 
-        // The symlink does not inherit it: no-follow read of an empty own set.
+        // The symlink does not get the xattr: a no-follow read gives an empty
+        // set for the link.
         let link = tree.files.iter().find(|(n, _)| n == "link").unwrap().1;
         let link_file = repo.load_file(&link).await.unwrap();
         let FileKind::Symlink { target } = link_file.kind else {
@@ -1015,8 +1032,9 @@ fn ingest_reads_symlink_xattrs_no_follow() {
 
 #[test]
 fn label_callback_sets_selinux_in_the_object_id() {
-    // A label callback's SELinux label enters the content object's xattr set,
-    // so its object id matches the same content written with that label.
+    // A label callback gives an SELinux label. The label goes into the xattr
+    // set of the content object, so the object id matches the id of the same
+    // content with that label.
     let tmp = TmpDir::new("ingest-label");
     let base = tmp.path();
     let src = base.join("src");
@@ -1032,7 +1050,7 @@ fn label_callback_sets_selinux_in_the_object_id() {
             .await
             .unwrap();
 
-        // The identity the same payload gets with the label set directly.
+        // The identity of the same payload, written with the label directly.
         let expected = {
             let txn = repo.transaction().await.unwrap();
             let mut meta = FileMeta::regular(uid, gid, 0o644);
@@ -1071,8 +1089,8 @@ fn label_callback_sets_selinux_in_the_object_id() {
 
 #[test]
 fn error_on_unlabeled_fails_when_the_hook_returns_no_label() {
-    // With ERROR_ON_UNLABELED and a label callback that labels nothing, ingest
-    // fails rather than committing an unlabeled path.
+    // With ERROR_ON_UNLABELED and a label callback that labels nothing, the
+    // ingest fails. It does not commit an unlabeled path.
     let tmp = TmpDir::new("ingest-unlabeled");
     let base = tmp.path();
     let src = base.join("src");
@@ -1111,10 +1129,11 @@ fn error_on_unlabeled_fails_when_the_hook_returns_no_label() {
 
 #[test]
 fn consume_with_a_pruning_filter_still_empties_the_source() {
-    // CONSUME empties each ingested source whatever the filter kept out of the
-    // commit: a pruned file and its parent are removed with the rest, and the
-    // committed tree omits the pruned file. Leaving them would strand the
-    // source half-deleted and fail the removal of the directory above.
+    // CONSUME empties each ingested source, also the parts that the filter
+    // keeps out of the commit. The walk removes a pruned file and its parent
+    // with the rest, and the committed tree does not hold the pruned file. If
+    // the walk leaves them, the source stays half deleted, and the removal of
+    // the directory that holds them fails.
     let tmp = TmpDir::new("ingest-consume-prune");
     let base = tmp.path();
     let src = base.join("src");
@@ -1171,7 +1190,8 @@ fn consume_with_a_pruning_filter_still_empties_the_source() {
 
 #[test]
 fn modifier_callbacks_run_once_per_directory() {
-    // The xattr callback fires exactly once per path, directories included.
+    // The xattr callback runs exactly once for each path, directories
+    // included.
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -1226,9 +1246,9 @@ fn modifier_callbacks_run_once_per_directory() {
 
 #[test]
 fn devino_hit_bypasses_the_label_hook() {
-    // A devino-cache hit takes the cached checksum without running the label
-    // hook, so ERROR_ON_UNLABELED with a hook that leaves the cached file
-    // unlabeled does not fail the ingest.
+    // A devino-cache hit takes the cached checksum and does not run the label
+    // hook. As a result, ERROR_ON_UNLABELED with a hook that does not label
+    // the cached file does not make the ingest fail.
     let tmp = TmpDir::new("ingest-devino-label");
     let base = tmp.path();
     let src = base.join("src");
@@ -1248,8 +1268,9 @@ fn devino_hit_bypasses_the_label_hook() {
         let dfd = std::fs::File::open(base).unwrap();
         let mut cache = DevInoCache::new();
         cache.insert(stat.st_dev, stat.st_ino, sentinel);
-        // The hook labels everything except the cached file; if it ran for the
-        // cached file it would return None and abort under ERROR_ON_UNLABELED.
+        // The hook labels each path except the cached file. If the hook runs
+        // for the cached file, it returns None, and ERROR_ON_UNLABELED stops
+        // the ingest.
         let mut modifier = CommitModifier::new(
             CommitModifierFlags::DEVINO_CANONICAL
                 | CommitModifierFlags::ERROR_ON_UNLABELED
@@ -1286,8 +1307,8 @@ fn devino_hit_bypasses_the_label_hook() {
 
 #[test]
 fn devino_hit_skips_the_xattr_callback() {
-    // A devino-cache hit runs no user callbacks: a counting xattr callback is
-    // never invoked for the cached file.
+    // A devino-cache hit runs no user callbacks: the walk does not call a
+    // counting xattr callback for the cached file.
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1342,29 +1363,33 @@ fn devino_hit_skips_the_xattr_callback() {
     );
 }
 
-/// Marks the re-executed child of
-/// [`deep_source_tree_ingests_under_a_low_descriptor_limit`], and names the
-/// file the child writes to record that the ingest ran.
+/// The environment variable that marks the re-executed child of
+/// [`deep_source_tree_ingests_under_a_low_descriptor_limit`]. Its value names
+/// the file that the child writes to record that the ingest ran.
 const DEEP_INGEST_CHILD: &str = "OSTRYA_DEEP_INGEST_CHILD";
-/// The soft descriptor limit the child runs under. It stands well above what
-/// the repository, the runtime, and the blocking pool open for themselves.
+/// The soft descriptor limit of the child. It is much higher than the number
+/// of descriptors that the repository, the runtime, and the blocking pool open
+/// for themselves.
 const DEEP_INGEST_NOFILE: usize = 256;
-/// The depth of the source tree the child ingests. It stands well above
-/// [`DEEP_INGEST_NOFILE`], so a walk holding one descriptor per level runs out.
+/// The depth of the source tree that the child ingests. It is much higher than
+/// [`DEEP_INGEST_NOFILE`], so a walk that holds one descriptor for each level
+/// runs out.
 const DEEP_INGEST_DEPTH: usize = 1024;
-/// The thread stack the child runs with. One level of the walk costs one
-/// future, and the tree is deep, so the child is given room for the whole
-/// descent and the descriptor limit is what the walk meets.
+/// The thread stack size of the child. Each level of the walk costs one
+/// future, and the tree is deep. The stack has room for the full descent, so
+/// the walk meets the descriptor limit first.
 const DEEP_INGEST_STACK: usize = 512 * 1024 * 1024;
 
 #[test]
 fn deep_source_tree_ingests_under_a_low_descriptor_limit() {
-    // The walk holds at most two directory descriptors, whatever the depth of
-    // the source, so a tree deeper than the process descriptor limit ingests.
+    // The walk holds at most two directory descriptors at a time, for any
+    // depth of the source. As a result, a tree deeper than the descriptor
+    // limit of the process ingests.
     //
-    // The limit is a property of the process and the tests of this binary run
-    // in parallel threads, so the lowered limit goes to a child: this test
-    // binary re-executed for this test alone, through `sh` with `ulimit -n`.
+    // The limit applies to the whole process, and the tests of this binary
+    // run in parallel threads. For this reason, a child gets the lowered
+    // limit. The child is this test binary, run again for this test alone,
+    // through `sh` with `ulimit -n`.
     if let Some(marker) = std::env::var_os(DEEP_INGEST_CHILD) {
         ingest_a_deep_tree();
         std::fs::write(marker, b"ingested").expect("record that the deep ingest ran");
@@ -1390,15 +1415,15 @@ fn deep_source_tree_ingests_under_a_low_descriptor_limit() {
         status.success(),
         "the deep ingest failed under a soft limit of {DEEP_INGEST_NOFILE} descriptors: {status}"
     );
-    // A name the child's filter does not match runs nothing and still exits 0,
-    // so the marker is what proves the ingest ran.
+    // If the filter of the child matches no test name, the child runs nothing
+    // and still exits 0. The marker proves that the ingest ran.
     assert!(
         marker.exists(),
         "the child ran no deep ingest: the test name the filter names is stale"
     );
 }
 
-/// The soft `RLIMIT_NOFILE` of the running process, read from `/proc`.
+/// Returns the soft `RLIMIT_NOFILE` of the running process, read from `/proc`.
 fn soft_nofile_limit() -> usize {
     let limits = std::fs::read_to_string("/proc/self/limits").expect("read /proc/self/limits");
     let line = limits
@@ -1411,8 +1436,8 @@ fn soft_nofile_limit() -> usize {
         .expect("the soft open-file limit")
 }
 
-/// Ingest a source tree [`DEEP_INGEST_DEPTH`] directories deep, consuming it.
-/// Runs in the child process, under the lowered descriptor limit.
+/// Ingests a source tree [`DEEP_INGEST_DEPTH`] directories deep and consumes
+/// it. Runs in the child process, under the lowered descriptor limit.
 fn ingest_a_deep_tree() {
     assert_eq!(
         soft_nofile_limit(),
@@ -1424,10 +1449,10 @@ fn ingest_a_deep_tree() {
     let src = base.join("src");
     std::fs::create_dir(&src).unwrap();
     set_mode(&src, 0o755);
-    // The tree is built through a descending descriptor, so no path of its own
-    // grows past the kernel's limit. CONSUME then empties it as the walk
-    // ascends, which is also what removes it: a path-based removal of a tree
-    // this deep runs out of descriptors itself.
+    // The test builds the tree through a descriptor that descends, so no path
+    // that it uses grows past the path limit of the kernel. CONSUME empties
+    // the tree as the walk ascends, and this also removes the tree. A removal
+    // by path of a tree this deep runs out of descriptors itself.
     let mut dir: std::os::fd::OwnedFd = std::fs::File::open(&src).unwrap().into();
     for _ in 0..DEEP_INGEST_DEPTH {
         rustix::fs::mkdirat(dir.as_fd(), "d", rustix::fs::Mode::from_raw_mode(0o755)).unwrap();

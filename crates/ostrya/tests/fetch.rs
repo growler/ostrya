@@ -1,12 +1,15 @@
-//! Fetcher integration tests.
+//! Integration tests of the fetcher.
 //!
-//! Every test serves requests from an in-process server built on hyper's server
-//! half, over cleartext HTTP/1.1 and over TLS where ALPN selects HTTP/1.1 or
-//! HTTP/2. The upload tests at the end send request bodies to the same
-//! servers, which record the length and the SHA-256 digest of each body. The
-//! fixture certificates under `tests/fixtures/tls/` provide a certificate
-//! authority the client trusts, a server certificate for `127.0.0.1`, and a
-//! client certificate for the mutual-TLS test.
+//! Each test sends its requests to an in-process server on the server half of
+//! hyper. The server uses cleartext HTTP/1.1, or TLS where ALPN selects
+//! HTTP/1.1 or HTTP/2. The upload tests send request bodies to the same
+//! servers. The servers record the length and the SHA-256 digest of each body.
+//!
+//! The fixture certificates in `tests/fixtures/tls/` supply:
+//!
+//! - a certificate authority that the client trusts
+//! - a server certificate for `localhost` and `127.0.0.1`
+//! - a client certificate for the mutual-TLS test
 
 #[path = "common/proxy.rs"]
 mod proxy;
@@ -47,7 +50,8 @@ const SERVER_KEY_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/server
 const CLIENT_CERT_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/client.pem");
 const CLIENT_KEY_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/client.key.pem");
 const CLIENT_KEY_ENC_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/client.key.enc.pem");
-/// The passphrase `tests/fixtures/tls/generate.sh` encrypted that key with.
+/// The passphrase that `tests/fixtures/tls/generate.sh` used to encrypt the
+/// key in `CLIENT_KEY_ENC_PEM`.
 const CLIENT_KEY_PASSPHRASE: &str = "ostrya test passphrase";
 const OTHERNAME_CERT_PEM: &[u8] =
     include_bytes!("../../../tests/fixtures/tls/server-othername.pem");
@@ -62,8 +66,8 @@ const EXPIRED_KEY_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/serve
 
 // --- server plumbing -------------------------------------------------------
 
-/// A `futures-io` stream presented to hyper, the server-side counterpart of the
-/// adapter the fetcher uses.
+/// A `futures-io` stream adapted for hyper. It is the server-side counterpart
+/// of the adapter that the fetcher uses.
 struct TestIo<S> {
     inner: S,
     scratch: Vec<u8>,
@@ -132,17 +136,17 @@ where
     }
 }
 
-/// A response body of pre-baked chunks.
+/// A response body made of prepared chunks.
 struct TestBody {
     chunks: VecDeque<Bytes>,
-    /// The exact length, when the response should declare `Content-Length`.
+    /// The exact length. If it is set, the response declares `Content-Length`.
     exact: Option<u64>,
-    /// Whether the body stays open once its chunks are gone, so it never ends.
+    /// If `true`, the body stays open after its last chunk, so it never ends.
     endless: bool,
 }
 
 impl TestBody {
-    /// A body of `bytes`, delivered in one chunk with a declared length.
+    /// Returns a body of `bytes` in one chunk, with a declared length.
     fn measured(bytes: &[u8]) -> TestBody {
         TestBody {
             chunks: VecDeque::from([Bytes::copy_from_slice(bytes)]),
@@ -151,8 +155,8 @@ impl TestBody {
         }
     }
 
-    /// A body delivered in `count` chunks with no declared length, which makes
-    /// the server answer with chunked transfer encoding.
+    /// Returns a body of `bytes` in `count` chunks, with no declared length.
+    /// The server then answers with chunked transfer encoding.
     fn chunked(bytes: &[u8], count: usize) -> TestBody {
         let size = bytes.len().div_ceil(count.max(1));
         TestBody {
@@ -170,7 +174,7 @@ impl TestBody {
         }
     }
 
-    /// A body that delivers nothing and never ends.
+    /// Returns a body that delivers nothing and never ends.
     fn endless() -> TestBody {
         TestBody {
             chunks: VecDeque::new(),
@@ -204,25 +208,26 @@ impl hyper::body::Body for TestBody {
     }
 }
 
-/// What the client asked for, as the server saw it.
+/// A request of the client, as the server received it.
 #[derive(Clone, Debug)]
 struct Seen {
     method: String,
-    /// The request target's path alone.
+    /// The path of the request target, without the query string.
     path: String,
-    /// The whole request target, the query string included.
+    /// The full request target, with the query string.
     target: String,
     headers: HeaderMap,
-    /// The request body as the server read it: its length, its SHA-256
-    /// digest, and whether it reached its end. A handler that reads the body
-    /// itself leaves all three at the values of an unread body.
+    /// The request body as the server read it. The three fields are its
+    /// length, its SHA-256 digest, and `true` if the read got to the end. If
+    /// a handler reads the body itself, the fields keep the values of an
+    /// unread body.
     body_len: u64,
     body_sha256: [u8; 32],
     body_complete: bool,
 }
 
 impl Seen {
-    /// The head of `request`, with the values of an unread body.
+    /// Records the head of `request`, with the values of an unread body.
     fn head(request: &Request<Incoming>) -> Seen {
         Seen {
             method: request.method().to_string(),
@@ -235,8 +240,9 @@ impl Seen {
         }
     }
 
-    /// Read `body` to its end and record it, adding each frame to `received`
-    /// as it arrives. The body is hashed as it arrives and never held whole.
+    /// Reads `body` to its end and records it. The function adds the size of
+    /// each frame to `received` when the frame arrives. It hashes each frame on
+    /// arrival and never holds the whole body.
     async fn read_body(&mut self, mut body: Incoming, received: &AtomicU64) {
         let mut digest = Sha256::new();
         loop {
@@ -270,8 +276,8 @@ impl Seen {
 enum Transport {
     /// Cleartext HTTP/1.1.
     Cleartext,
-    /// TLS, offering these ALPN protocols and asking of its clients what
-    /// `client_auth` states.
+    /// TLS with the ALPN protocols in `alpn`. `client_auth` states what the
+    /// server asks of its clients.
     Tls {
         alpn: Vec<&'static str>,
         client_auth: ClientAuth,
@@ -281,41 +287,44 @@ enum Transport {
 /// What a TLS server asks of its clients.
 #[derive(Clone, Copy)]
 enum ClientAuth {
-    /// No certificate is asked for.
+    /// The server asks for no certificate.
     None,
-    /// A certificate signed by the fixture authority is demanded, and a client
-    /// that presents none is refused.
+    /// The server demands a certificate signed by the fixture authority. It
+    /// refuses a client that presents none.
     Required,
-    /// A certificate signed by the fixture authority is asked for, and a client
-    /// that presents none is served. The server records what each connection
-    /// presented.
+    /// The server asks for a certificate signed by the fixture authority. It
+    /// also serves a client that presents none. The server records what each
+    /// connection presented.
     Optional,
 }
 
-/// Which server leaf a TLS test server presents. Each one beyond the fixture
-/// leaf fails exactly one of the checks the full verification makes, so a test
-/// states which check a bypass dropped.
+/// The server leaf certificate that a TLS test server presents. Each leaf
+/// other than the fixture leaf fails exactly one check of the full
+/// verification. With these leaves, a test shows which check a bypass drops.
 #[derive(Clone, Copy)]
 enum Leaf {
-    /// Signed by the fixture authority, valid, and covering both `localhost`
-    /// and `127.0.0.1`.
+    /// A leaf signed by the fixture authority, in validity, with the names
+    /// `localhost` and `127.0.0.1`.
     Fixture,
-    /// Signed by the fixture authority and valid, covering neither name.
+    /// A leaf signed by the fixture authority and in validity, with neither
+    /// name.
     OtherName,
-    /// Covering both names and valid, signed by an authority nothing trusts.
+    /// A leaf with both names and in validity, signed by an authority that
+    /// nothing trusts.
     Untrusted,
-    /// Signed by the fixture authority and covering both names, out of
+    /// A leaf signed by the fixture authority, with both names, and out of
     /// validity since 2020.
     Expired,
     /// The `server-untrusted` certificate with the `server` private key, which
-    /// belongs to a different certificate: every server certificate check the
-    /// bypass drops passes for it under `DangerousAcceptAnyChain`, and the
-    /// handshake signature the bypass still checks is made with the wrong key.
+    /// belongs to a different certificate. Under `DangerousAcceptAnyChain`,
+    /// this pair passes each server certificate check that the bypass drops.
+    /// The handshake signature, which the bypass still checks, uses the wrong
+    /// key.
     MismatchedKey,
 }
 
 impl Leaf {
-    /// The certificate and the private key, both PEM-encoded.
+    /// Returns the certificate and the private key, both PEM-encoded.
     fn pem(self) -> (&'static [u8], &'static [u8]) {
         match self {
             Leaf::Fixture => (SERVER_CERT_PEM, SERVER_KEY_PEM),
@@ -327,13 +336,14 @@ impl Leaf {
     }
 }
 
-/// The handler a test installs: it sees the request and the 1-based count of
-/// requests this server has answered. The server reads the request body to its
-/// end before it calls the handler.
+/// The handler that a test installs. It gets the request and the 1-based
+/// count of the requests that this server received, with this request
+/// included. The server reads the request body to its end before it calls the
+/// handler.
 type Handler = Arc<dyn Fn(&Seen, usize) -> Response<TestBody> + Send + Sync>;
 
 /// A handler that reads the request body itself. An error ends the exchange
-/// without a response: an HTTP/1.1 connection closes, and an HTTP/2 stream is
+/// with no response. An HTTP/1.1 connection closes, and an HTTP/2 stream is
 /// reset.
 type StreamHandler = Arc<
     dyn Fn(
@@ -346,25 +356,25 @@ type StreamHandler = Arc<
 /// How a server answers a request.
 #[derive(Clone)]
 enum Answering {
-    /// Read the body, record it, and answer with the handler.
+    /// The server reads the body, records it, and answers with the handler.
     Collected(Handler),
-    /// Record the head and hand the request to the handler.
+    /// The server records the head and gives the request to the handler.
     Streamed(StreamHandler),
 }
 
 /// An in-process HTTP server.
 ///
-/// The accept loop runs in a detached task for the life of the test process;
-/// the tests are short and each server answers a handful of requests.
+/// The accept loop runs in a detached task for the life of the test process.
+/// The tests are short, and each server answers a small number of requests.
 struct TestServer {
     addr: SocketAddr,
     seen: Arc<Mutex<Vec<Seen>>>,
     connections: Arc<AtomicUsize>,
-    /// The request body bytes the server has read, counted as each frame
-    /// arrives.
+    /// The number of request body bytes that the server read. The count
+    /// increases when each frame arrives.
     received: Arc<AtomicU64>,
-    /// Whether each accepted TLS connection presented a client certificate, in
-    /// the order the connections arrived.
+    /// For each accepted TLS connection, `true` if it presented a client
+    /// certificate. The entries are in the order of arrival.
     client_certificates: Arc<Mutex<Vec<bool>>>,
 }
 
@@ -379,7 +389,7 @@ impl TestServer {
         .await
     }
 
-    /// A server on an ephemeral port presenting `leaf`.
+    /// Starts a server on an ephemeral port that presents `leaf`.
     async fn start_with_leaf(leaf: Leaf, transport: Transport, handler: Handler) -> TestServer {
         TestServer::start_on("127.0.0.1:0".parse().unwrap(), leaf, transport, handler).await
     }
@@ -393,8 +403,8 @@ impl TestServer {
         TestServer::start_answering(bind, leaf, transport, Answering::Collected(handler)).await
     }
 
-    /// A server on an ephemeral port whose handler reads each request body
-    /// itself.
+    /// Starts a server on an ephemeral port whose handler reads each request
+    /// body itself.
     async fn start_streamed(transport: Transport, handler: StreamHandler) -> TestServer {
         TestServer::start_answering(
             "127.0.0.1:0".parse().unwrap(),
@@ -444,8 +454,8 @@ impl TestServer {
                             let Ok(tls) = acceptor.accept(stream).await else {
                                 return;
                             };
-                            // The handshake is complete, so the client's
-                            // certificate has arrived if it sent one.
+                            // The handshake is complete, so the certificate
+                            // of the client is here if the client sent one.
                             let presented = tls.get_ref().1.peer_certificates().is_some();
                             certificates.lock().unwrap().push(presented);
                             let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
@@ -465,7 +475,7 @@ impl TestServer {
         }
     }
 
-    /// The base URL clients should use.
+    /// Returns the base URL for clients.
     fn url(&self, tls: bool) -> String {
         let scheme = if tls { "https" } else { "http" };
         // The fixture server certificate covers `localhost` and `127.0.0.1`.
@@ -488,13 +498,14 @@ impl TestServer {
         self.received.load(Ordering::SeqCst)
     }
 
-    /// Whether each accepted TLS connection presented a client certificate.
+    /// Returns, for each accepted TLS connection, `true` if it presented a
+    /// client certificate.
     fn client_certificates(&self) -> Vec<bool> {
         self.client_certificates.lock().unwrap().clone()
     }
 }
 
-/// Serve one connection.
+/// Serves one connection.
 async fn serve<S>(
     io: S,
     h2: bool,
@@ -541,7 +552,7 @@ async fn serve<S>(
     }
 }
 
-/// The fixture server's rustls configuration.
+/// Returns the rustls configuration of a test server.
 fn server_config(alpn: &[&str], client_auth: ClientAuth, leaf: Leaf) -> rustls::ServerConfig {
     let provider = Arc::new(rustls_graviola::default_provider());
     let (cert_pem, key_pem) = leaf.pem();
@@ -551,9 +562,9 @@ fn server_config(alpn: &[&str], client_auth: ClientAuth, leaf: Leaf) -> rustls::
     let key = rustls_pemfile::private_key(&mut io::BufReader::new(key_pem))
         .unwrap()
         .unwrap();
-    // The certificate and the key are paired here rather than through
-    // `with_single_cert`, which refuses a key that does not belong to the
-    // certificate. `Leaf::MismatchedKey` is exactly that pair.
+    // This code pairs the certificate and the key directly.
+    // `with_single_cert` refuses a key that does not belong to the
+    // certificate, and `Leaf::MismatchedKey` is such a pair.
     let signing_key = provider.key_provider.load_private_key(key).unwrap();
     let resolver: Arc<dyn rustls::server::ResolvesServerCert> = Arc::new(
         rustls::sign::SingleCertAndKey::from(rustls::sign::CertifiedKey::new(certs, signing_key)),
@@ -590,7 +601,7 @@ fn server_config(alpn: &[&str], client_auth: ClientAuth, leaf: Leaf) -> rustls::
 
 // --- client helpers --------------------------------------------------------
 
-/// A handler that answers every request with `body` and a 200.
+/// Returns a handler that answers each request with a 200 and `body`.
 fn always(body: &'static [u8]) -> Handler {
     Arc::new(move |_seen, _count| {
         Response::builder()
@@ -600,7 +611,7 @@ fn always(body: &'static [u8]) -> Handler {
     })
 }
 
-/// A handler that answers every request with `status` and no body.
+/// Returns a handler that answers each request with `status` and no body.
 fn always_status(status: u16) -> Handler {
     Arc::new(move |_seen, _count| {
         Response::builder()
@@ -610,7 +621,8 @@ fn always_status(status: u16) -> Handler {
     })
 }
 
-/// A response that redirects to `location` with `status` and an empty body.
+/// Returns a response that redirects to `location` with `status` and an
+/// empty body.
 fn redirect(status: u16, location: &str) -> Response<TestBody> {
     Response::builder()
         .status(status)
@@ -619,8 +631,8 @@ fn redirect(status: u16, location: &str) -> Response<TestBody> {
         .unwrap()
 }
 
-/// A handler that redirects the first request to `location` and answers every
-/// one after it with `body` and a 200.
+/// Returns a handler that redirects the first request to `location`. It
+/// answers each later request with a 200 and `body`.
 fn redirect_once(location: String, body: &'static [u8]) -> Handler {
     Arc::new(move |_seen, count| {
         if count == 1 {
@@ -634,7 +646,7 @@ fn redirect_once(location: String, body: &'static [u8]) -> Handler {
     })
 }
 
-/// Fetch `path` and return the error the fetch failed with.
+/// Fetches `path` and returns the error of the failed fetch.
 async fn fetch_error(fetcher: &Fetcher, path: &str) -> Error {
     match fetcher.fetch(FetchRequest::path(path)).await {
         Ok(_) => panic!("the fetch of {path} was expected to fail"),
@@ -642,17 +654,17 @@ async fn fetch_error(fetcher: &Fetcher, path: &str) -> Error {
     }
 }
 
-/// A peer that accepts a connection, reads what the client sent, answers with
-/// `answer`, and then holds the connection open without another byte. An empty
-/// answer stands in for a mirror that never replies at all.
+/// Starts a peer that accepts a connection, reads what the client sent, and
+/// writes `answer`. Then the peer holds the connection open and sends no more
+/// bytes. An empty `answer` acts as a mirror that never replies.
 async fn stalling_server(answer: &'static [u8]) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
     drop(spawn(async move {
-        // The accepted connections are kept so the peer stays silent instead of
-        // closing, which is what makes the client wait.
+        // The peer keeps the accepted connections, so it stays silent and does
+        // not close them. This makes the client wait.
         let mut held = Vec::new();
         while let Ok((mut stream, _peer)) = listener.accept().await {
             let mut request = [0u8; 1024];
@@ -667,10 +679,12 @@ async fn stalling_server(answer: &'static [u8]) -> SocketAddr {
     addr
 }
 
-/// A peer that answers every request with a head declaring `body`, and then
-/// sends `body` a `step`-byte piece at a time, one piece every `interval`, on a
-/// connection of its own. With `head` false it answers nothing and holds the
-/// connection open. The counter reports how many requests the peer read.
+/// Starts a peer that answers each request with a head that declares the
+/// length of `body`. Then the peer sends `body` in `step`-byte pieces, one
+/// piece each `interval`. Each request gets a connection of its own. If `head`
+/// is `false`, the peer answers nothing and holds the connection open.
+///
+/// The counter gives the number of requests that the peer read.
 async fn trickling_server(
     head: bool,
     body: &'static [u8],
@@ -699,8 +713,8 @@ async fn trickling_server(
                     return;
                 }
                 for piece in body.chunks(step) {
-                    // A client that gave up closes the connection, which ends
-                    // the trickle.
+                    // A client that stopped closes the connection. Then the
+                    // write fails, and the trickle ends.
                     if stream.write_all(piece).await.is_err() || stream.flush().await.is_err() {
                         return;
                     }
@@ -715,8 +729,8 @@ async fn trickling_server(
 /// The body the trickling tests send.
 static TRICKLED: [u8; 4096] = [b'x'; 4096];
 
-/// A low-speed rule of `limit` bytes per second, which the rate may stay below
-/// for `millis` milliseconds.
+/// Returns a low-speed rule of `limit` bytes per second. The rate can stay
+/// less than the limit for `millis` milliseconds.
 fn low_speed(limit: u32, millis: u64) -> Option<LowSpeed> {
     Some(LowSpeed {
         limit,
@@ -724,9 +738,9 @@ fn low_speed(limit: u32, millis: u64) -> Option<LowSpeed> {
     })
 }
 
-/// A peer that accepts a connection, reads what the client sent, answers with
-/// `answer`, and closes the connection. With a head that declares more bytes
-/// than `answer` carries, the body is cut short mid-stream.
+/// Starts a peer that accepts a connection, reads what the client sent, writes
+/// `answer`, and closes the connection. If the head in `answer` declares more
+/// bytes than `answer` carries, the body stops before its end.
 async fn truncating_server(answer: &'static [u8]) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -744,17 +758,17 @@ async fn truncating_server(answer: &'static [u8]) -> SocketAddr {
     addr
 }
 
-/// A peer that answers every `CONNECT` with a 200 carrying bytes behind it, and
-/// then holds the connection open. Nothing follows a `CONNECT` response before
-/// the client has spoken, so those bytes are what the tunnel refuses.
+/// Starts a peer that answers each `CONNECT` with a 200 and extra bytes after
+/// it. Then the peer holds the connection open. No byte can follow a `CONNECT`
+/// response before the client sends data, so the tunnel refuses those bytes.
 async fn talkative_connect_proxy() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
     drop(spawn(async move {
-        // The accepted connections are kept, so the client reads the answer and
-        // not a close.
+        // The peer keeps the accepted connections, so the client reads the
+        // answer and does not see a close.
         let mut held = Vec::new();
         while let Ok((mut stream, _peer)) = listener.accept().await {
             let mut request = [0u8; 1024];
@@ -768,10 +782,12 @@ async fn talkative_connect_proxy() -> SocketAddr {
     addr
 }
 
-/// A peer that answers every request with a redirect declaring a body it does
-/// not finish sending, and then holds the connection open without another byte.
-/// Every hop leaves a body short of its declared length, which is what an
-/// attempt drains. The counter reports how many requests the peer read.
+/// Starts a peer that answers each request with a redirect. The redirect
+/// declares a body that the peer does not finish. Then the peer holds the
+/// connection open and sends no more bytes. Each hop leaves a body shorter
+/// than its declared length, and an attempt drains that body.
+///
+/// The counter gives the number of requests that the peer read.
 async fn short_redirecting_server() -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -780,8 +796,8 @@ async fn short_redirecting_server() -> (SocketAddr, Arc<AtomicUsize>) {
     let requests = Arc::new(AtomicUsize::new(0));
     let counter = requests.clone();
     drop(spawn(async move {
-        // The accepted connections are kept so the peer stays silent instead of
-        // closing, which is what leaves the declared body unfinished.
+        // The peer keeps the accepted connections, so it stays silent and does
+        // not close them. This leaves the declared body unfinished.
         let mut held = Vec::new();
         while let Ok((mut stream, _peer)) = listener.accept().await {
             let mut request = [0u8; 1024];
@@ -798,7 +814,7 @@ async fn short_redirecting_server() -> (SocketAddr, Arc<AtomicUsize>) {
     (addr, requests)
 }
 
-/// Options for a client that trusts the fixture authority.
+/// Returns the TLS options of a client that trusts the fixture authority.
 fn tls_options(identity: Option<ClientIdentity>) -> TlsOptions {
     TlsOptions {
         roots: TrustRoots::Pem(CA_PEM.to_vec()),
@@ -806,8 +822,9 @@ fn tls_options(identity: Option<ClientIdentity>) -> TlsOptions {
     }
 }
 
-/// Fetch `path` at `priority`, reading the body out so the permit is released.
-/// Owned arguments, so the whole thing can be spawned.
+/// Fetches `path` at `priority` and reads the body to the end, so the permit
+/// is released. The arguments are owned, so the call can run in a spawned
+/// task.
 async fn queued(fetcher: Fetcher, path: &'static str, priority: Priority) {
     let fetched = fetcher
         .fetch(FetchRequest {
@@ -823,7 +840,8 @@ async fn queued(fetcher: Fetcher, path: &'static str, priority: Priority) {
     body.read_to_end(&mut out).await.unwrap();
 }
 
-/// Fetch `path` and return the body's bytes with the protocol that carried it.
+/// Fetches `path` and returns the bytes of the body with the protocol that
+/// carried it.
 async fn fetch_bytes(fetcher: &Fetcher, path: &str) -> (Vec<u8>, Protocol) {
     match fetcher.fetch(FetchRequest::path(path)).await.unwrap() {
         Fetched::Body(mut body) => {
@@ -836,8 +854,8 @@ async fn fetch_bytes(fetcher: &Fetcher, path: &str) -> (Vec<u8>, Protocol) {
     }
 }
 
-/// Fetch the absolute URL `url` and return the body's bytes with the protocol
-/// that carried it.
+/// Fetches the absolute URL `url` and returns the bytes of the body with the
+/// protocol that carried it.
 async fn fetch_url_bytes(fetcher: &Fetcher, url: &str) -> (Vec<u8>, Protocol) {
     match fetcher.fetch(FetchRequest::url(url)).await.unwrap() {
         Fetched::Body(mut body) => {
@@ -850,7 +868,7 @@ async fn fetch_url_bytes(fetcher: &Fetcher, url: &str) -> (Vec<u8>, Protocol) {
     }
 }
 
-/// Read a fetched body to the end, which releases the admission permit.
+/// Reads a fetched body to the end, which releases the admission permit.
 async fn read_body(fetched: Fetched) -> Vec<u8> {
     let Fetched::Body(mut body) = fetched else {
         panic!("unexpected 304");
@@ -860,9 +878,9 @@ async fn read_body(fetched: Fetched) -> Vec<u8> {
     out
 }
 
-/// Options for a fetcher with no mirror, which serves the URLs its requests
-/// name. The fixture anchors stand in for the host trust store, which an empty
-/// mirror list otherwise demands.
+/// Returns the options of a fetcher with no mirror. The fetcher serves the
+/// URLs that its requests name. The fixture anchors replace the host trust
+/// store, which an empty mirror list otherwise demands.
 fn mirrorless_options() -> FetcherOptions {
     FetcherOptions {
         tls: tls_options(None),
@@ -871,12 +889,13 @@ fn mirrorless_options() -> FetcherOptions {
     }
 }
 
-/// Options for a fetcher whose mirror is `url` and which reaches every origin
-/// directly.
+/// Returns the options of a fetcher whose mirror is `url` and that connects
+/// to each origin directly.
 ///
-/// A test that is not about the proxy states this, so the proxy variables the
-/// host running the suite holds decide nothing: the default form reads them,
-/// and a fetcher built under one would travel to a proxy no test started.
+/// A test that is not about the proxy uses these options. Then the proxy
+/// variables of the host that runs the suite have no effect. The default
+/// options read those variables. If one is set, a fetcher with the default
+/// options connects to a proxy that no test started.
 fn direct_options(url: impl Into<String>) -> FetcherOptions {
     FetcherOptions {
         proxy: Proxy::None,
@@ -884,7 +903,7 @@ fn direct_options(url: impl Into<String>) -> FetcherOptions {
     }
 }
 
-/// Credentials a test sends.
+/// Returns the credentials that a test sends.
 fn basic_auth(user: &str, password: &str) -> BasicAuth {
     BasicAuth {
         user: user.to_owned(),
@@ -913,14 +932,14 @@ fn fetches_a_body_over_cleartext_http1() {
     });
 }
 
-/// A mirror URL may name its host as an IPv6 literal. The brackets are the
-/// URL's, not the address's: the connect target is the address alone, while the
-/// `Host` header carries the bracketed form.
+/// A mirror URL can name its host as an IPv6 literal. The brackets are part
+/// of the URL syntax. The connect target is the address alone, and the `Host`
+/// header carries the form with brackets.
 #[test]
 fn fetches_from_an_ipv6_literal_mirror() {
     block_on(async {
-        // A client of another test that dials `localhost` tries `::1` first,
-        // so the port number is held on 127.0.0.1 as well.
+        // A client of another test that connects to `localhost` tries `::1`
+        // first, so the test also holds the port number on 127.0.0.1.
         let reserved = reserved_port();
         let port = reserved.port;
         let server = TestServer::start_on(
@@ -945,8 +964,8 @@ fn fetches_from_an_ipv6_literal_mirror() {
 }
 
 /// An HTTP/1.1 request must carry the origin-form target and a `Host` header.
-/// The absolute form belongs to proxy requests, and a plain static-file server
-/// -- what an ostree repository is usually served by -- answers 404 to it.
+/// The absolute form is for proxy requests. A plain static-file server answers
+/// 404 to it, and such a server usually serves an ostree repository.
 #[test]
 fn http1_requests_use_origin_form_with_a_host_header() {
     block_on(async {
@@ -1012,7 +1031,7 @@ fn alpn_selects_http2_over_tls() {
 #[test]
 fn disabling_http2_negotiates_http1_over_tls() {
     block_on(async {
-        // The server offers HTTP/2, so the version comes from the client's offer.
+        // The server offers HTTP/2, so the offer of the client sets the version.
         let server = TestServer::start(
             Transport::Tls {
                 alpn: vec!["h2", "http/1.1"],
@@ -1076,7 +1095,7 @@ fn a_conditional_fetch_resolves_to_not_modified() {
             fetcher.fetch(request).await.unwrap(),
             Fetched::NotModified
         ));
-        // The conditional request replayed both validators.
+        // The conditional request sent both validators again.
         let second = &server.seen()[1];
         assert_eq!(second.header("if-none-match"), Some("\"v1\""));
         assert_eq!(
@@ -1157,10 +1176,10 @@ fn retries_stop_at_the_configured_count() {
     });
 }
 
-/// A mirror that answered definitively answers the same in every round, so a
-/// repeated round asks only the mirrors that failed retryably. Running out of
-/// rounds reports the same thing running out of mirrors does: the earliest
-/// definitive answer, which here is the first mirror's, from the first round.
+/// The definitive answer of a mirror is the same in each round, so a repeated
+/// round asks only the mirrors with a retryable failure. When the rounds end,
+/// the fetch reports the same error as when the mirrors end. That error is the
+/// earliest definitive answer, here the answer of the first mirror in round 1.
 #[test]
 fn a_mirror_that_answered_definitively_is_not_asked_again() {
     block_on(async {
@@ -1178,22 +1197,21 @@ fn a_mirror_that_answered_definitively_is_not_asked_again() {
             .fetch(FetchRequest::path("objects/ab/cd.dirtree"))
             .await
             .unwrap_err();
-        // The first mirror in the list is the first that had something to say.
+        // The first mirror in the list gave the first definitive answer.
         assert!(
             matches!(err, Error::HttpStatus { status: 404, .. }),
             "{err}"
         );
-        // Three rounds for the mirror whose answer another attempt may change,
-        // one apiece for the two that answered definitively.
+        // The mirror whose answer can change on a new attempt gets three
+        // rounds. Each of the two mirrors with a definitive answer gets one.
         assert_eq!(flapping.requests(), 3);
         assert_eq!(absent.requests(), 1);
         assert_eq!(gone.requests(), 1);
     });
 }
 
-/// The earliest definitive answer is what a fetch reports, from whichever round
-/// it came, so an answer given in an earlier round outlives the round it came
-/// from.
+/// A fetch reports the earliest definitive answer, from any round. An answer
+/// from an earlier round stays valid after that round ends.
 #[test]
 fn a_definitive_answer_from_an_earlier_round_is_reported() {
     block_on(async {
@@ -1228,8 +1246,9 @@ fn a_definitive_answer_from_an_earlier_round_is_reported() {
     });
 }
 
-/// A definitive answer is reported even when a retryable failure came first, so
-/// a caller that reads 404 as absence reads it through a flaky link.
+/// If a retryable failure comes first, the fetch still reports a later
+/// definitive answer. A caller that reads 404 as absence then reads it through
+/// an unreliable link.
 #[test]
 fn a_definitive_answer_after_a_retryable_failure_is_reported() {
     block_on(async {
@@ -1255,7 +1274,7 @@ fn a_definitive_answer_after_a_retryable_failure_is_reported() {
             matches!(err, Error::HttpStatus { status: 404, .. }),
             "{err}"
         );
-        // The 404 settled the one mirror, so the remaining rounds were not run.
+        // The 404 is final for the one mirror, so the fetch ran no more rounds.
         assert_eq!(turning.requests(), 2);
     });
 }
@@ -1280,9 +1299,9 @@ fn mirrors_are_tried_in_order_until_one_answers() {
     });
 }
 
-/// A path a target cannot carry is the same path for every mirror, so it is
-/// rejected before the fetch is admitted: no mirror is connected to, and the
-/// failure is reported once.
+/// A path that a target cannot carry is invalid for each mirror, so the
+/// fetcher refuses it before it admits the fetch. The fetcher connects to no
+/// mirror and reports the failure once.
 #[test]
 fn an_invalid_path_connects_to_no_mirror() {
     block_on(async {
@@ -1303,8 +1322,8 @@ fn an_invalid_path_connects_to_no_mirror() {
         assert_eq!(first.connections(), 0);
         assert_eq!(second.connections(), 0);
 
-        // The fetcher still serves the next request, so the rejection left no
-        // permit or connection behind.
+        // The fetcher still serves the next request, so the refusal kept no
+        // permit or connection.
         let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
         assert_eq!(bytes, b"unreachable");
     });
@@ -1312,8 +1331,8 @@ fn an_invalid_path_connects_to_no_mirror() {
 
 // --- url targets, request headers, and request credentials ----------------
 
-/// A URL target names the whole request target, so its query string reaches
-/// the handler as it was written, escapes included.
+/// A URL target names the full request target, so its query string reaches
+/// the handler as written, with its escapes.
 #[test]
 fn a_url_target_sends_its_query_string_verbatim() {
     block_on(async {
@@ -1328,10 +1347,10 @@ fn a_url_target_sends_its_query_string_verbatim() {
     });
 }
 
-/// Neither userinfo nor a fragment is ever sent, so a URL target carrying one
-/// asks for something other than what the caller named. Both are refused
-/// before the fetch is admitted: no connection is opened, and the fetcher
-/// serves the next request.
+/// A request never sends userinfo or a fragment. A URL target with one of
+/// them then asks for a resource other than the one that the caller named.
+/// The fetcher refuses both before it admits the fetch. It opens no connection
+/// and serves the next request.
 #[test]
 fn a_url_target_with_userinfo_or_a_fragment_connects_to_nothing() {
     block_on(async {
@@ -1358,8 +1377,8 @@ fn a_url_target_with_userinfo_or_a_fragment_connects_to_nothing() {
     });
 }
 
-/// A fetcher with no mirror serves the URLs its requests name, and pools their
-/// connections by origin: two URL fetches of one origin travel over one
+/// A fetcher with no mirror serves the URLs that its requests name. It pools
+/// their connections by origin, so two URL fetches of one origin use one
 /// HTTP/2 connection.
 #[test]
 fn a_mirrorless_fetcher_pools_one_connection_per_origin() {
@@ -1386,9 +1405,9 @@ fn a_mirrorless_fetcher_pools_one_connection_per_origin() {
     });
 }
 
-/// A request's headers are merged over the fetcher's: one of the same name
-/// replaces the fetcher's and is seen once, and one of another name is sent
-/// beside the fetcher's own.
+/// The headers of a request merge over the headers of the fetcher. A request
+/// header replaces the fetcher header of the same name, and the server sees it
+/// once. A request header of another name goes with the fetcher headers.
 #[test]
 fn a_request_header_replaces_the_fetchers_header_of_the_same_name() {
     block_on(async {
@@ -1400,8 +1419,8 @@ fn a_request_header_replaces_the_fetchers_header_of_the_same_name() {
         ];
         let fetcher = Fetcher::new(options).await.unwrap();
 
-        // The name is written in another case, which a header name compares
-        // the same as.
+        // The name is in another case. Header names compare without regard to
+        // case.
         let headers = vec![
             ("X-Trace".to_owned(), "request".to_owned()),
             ("x-request-only".to_owned(), "yes".to_owned()),
@@ -1423,10 +1442,10 @@ fn a_request_header_replaces_the_fetchers_header_of_the_same_name() {
     });
 }
 
-/// The connection layer frames a request and holds the connection carrying it,
-/// so a request header of one of those names is refused before the fetch is
-/// admitted: no request reaches the server, and the connection pool is left as
-/// it was, so the next fetch over the same fetcher is served.
+/// The connection layer frames a request and holds its connection. The
+/// fetcher refuses a request header with a name that this layer owns before it
+/// admits the fetch. No request reaches the server. The connection pool does
+/// not change, so the same fetcher serves the next fetch.
 #[test]
 fn a_request_framing_header_reaches_no_server() {
     block_on(async {
@@ -1455,8 +1474,8 @@ fn a_request_framing_header_reaches_no_server() {
     });
 }
 
-/// A fetcher header of a connection-layer name fails the constructor, which is
-/// where the fetcher's own headers are read.
+/// A fetcher header with a name that the connection layer owns fails the
+/// constructor. The constructor is where the fetcher reads its own headers.
 #[test]
 fn a_fetcher_framing_header_fails_the_constructor() {
     block_on(async {
@@ -1471,8 +1490,8 @@ fn a_fetcher_framing_header_fails_the_constructor() {
     });
 }
 
-/// A fetch delivers the bytes the remote stores, so every request states that
-/// it accepts no content coding, and it states it once.
+/// A fetch delivers the bytes that the remote stores, so each request states
+/// once that it accepts no content coding.
 #[test]
 fn every_request_asks_for_no_content_coding() {
     block_on(async {
@@ -1489,10 +1508,10 @@ fn every_request_asks_for_no_content_coding() {
     });
 }
 
-/// A coded body holds bytes other than the ones the remote stores, so a
-/// response declaring a coding is refused and the coding is named. The refusal
-/// drains the short body the response declared, so the next fetch is served over
-/// the same connection.
+/// A coded body differs from the bytes that the remote stores, so the fetcher
+/// refuses a response that declares a coding. The error names the coding. The
+/// refusal drains the short body that the response declared, so the next
+/// fetch uses the same connection.
 #[test]
 fn a_coded_response_is_refused_and_keeps_its_connection() {
     block_on(async {
@@ -1530,8 +1549,8 @@ fn a_coded_response_is_refused_and_keeps_its_connection() {
     });
 }
 
-/// `identity` names no coding, so a response declaring it carries the bytes the
-/// remote stores and is served whole.
+/// `identity` names no coding. A response that declares it carries the bytes
+/// that the remote stores, and the fetcher serves it whole.
 #[test]
 fn a_response_declaring_identity_is_served() {
     block_on(async {
@@ -1552,15 +1571,15 @@ fn a_response_declaring_identity_is_served() {
     });
 }
 
-/// A caller that asks for a content coding of its own replaces what the fetcher
-/// asks for, at either layer, and the server sees the caller's value once. The
-/// coding the caller asked for is refused all the same, so a caller that wants
-/// a coded body decodes it outside the fetcher.
+/// A caller can ask for a content coding at either layer. The value of the
+/// caller replaces the value of the fetcher, and the server sees it once. The
+/// fetcher still refuses the coding that the caller asked for. A caller that
+/// wants a coded body decodes it outside the fetcher.
 #[test]
 fn a_caller_supplied_accept_encoding_replaces_the_fetchers() {
     block_on(async {
-        // A server that honors the request: it codes the response where the
-        // request asked for gzip, and leaves it alone otherwise.
+        // A server that obeys the request. If the request asks for gzip, the
+        // server codes the response. Otherwise it sends the response uncoded.
         let handler: Handler = Arc::new(|seen, _count| {
             let mut response = Response::builder().status(StatusCode::OK);
             if seen.header("accept-encoding") == Some("gzip") {
@@ -1570,7 +1589,7 @@ fn a_caller_supplied_accept_encoding_replaces_the_fetchers() {
         });
         let server = TestServer::start(Transport::Cleartext, handler).await;
 
-        // A request header, with the name written in another case.
+        // A request header, with the name in another case.
         let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
@@ -1590,9 +1609,9 @@ fn a_caller_supplied_accept_encoding_replaces_the_fetchers() {
         assert_eq!(seen.header("accept-encoding"), Some("gzip"));
         assert_eq!(seen.headers.get_all("accept-encoding").iter().count(), 1);
 
-        // A fetcher header, and the `User-Agent` the fetcher sets beside it.
-        // The coded answer to the first is refused, and the second asks for no
-        // coding, so it is served.
+        // A fetcher header, and the `User-Agent` that the fetcher also sets.
+        // The fetcher refuses the coded answer to the first. The second asks
+        // for no coding, so the fetcher serves it.
         for (name, value, coded) in [
             ("accept-encoding", "gzip", true),
             ("user-agent", "caller/1", false),
@@ -1618,25 +1637,28 @@ fn a_caller_supplied_accept_encoding_replaces_the_fetchers() {
     });
 }
 
-/// A transfer coding other than `chunked` leaves the body coded, so a response
-/// declaring one is refused and the coding is named. `chunked` frames a message
-/// and the connection undoes the framing, so a response carrying it alone
-/// delivers the body as the remote wrote it. The peer is raw, since the
-/// transfer coding of a response is the connection layer's to write.
+/// A transfer coding other than `chunked` leaves the body coded, so the
+/// fetcher refuses a response that declares one. The error names the coding.
+///
+/// `chunked` frames a message, and the connection removes the framing. A
+/// response with `chunked` alone then delivers the body as the remote wrote it.
+/// The test uses a raw peer, because the connection layer writes the transfer
+/// coding of a response.
 #[test]
 fn a_transfer_coded_response_is_refused() {
     block_on(async {
-        // Each row states the whole answer the peer writes, then the coding the
-        // refusal names, or nothing where the response is served.
+        // Each row gives the full answer that the peer writes. Then it gives
+        // the coding that the refusal names, or `None` if the fetcher serves
+        // the response.
         for (answer, refused) in [
-            // A final coding other than `chunked`, under a body that runs to
-            // the close.
+            // A final coding other than `chunked`, with a body that ends at the
+            // close.
             (
                 &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nsqueezed"[..],
                 Some("gzip"),
             ),
-            // Chunked framing over a coded body: the connection undoes the
-            // framing and the coding stays.
+            // Chunked framing over a coded body. The connection removes the
+            // framing, and the coding stays.
             (
                 &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n8\r\nsqueezed\r\n0\r\n\r\n"[..],
                 Some("gzip, chunked"),
@@ -1668,8 +1690,8 @@ fn a_transfer_coded_response_is_refused() {
     });
 }
 
-/// A host is one origin whichever case it is written in, so two URL targets
-/// that differ only in the case of the host travel over one connection.
+/// The letter case of a host does not change its origin. Two URL targets that
+/// differ only in the case of the host use one connection.
 #[test]
 fn a_host_written_in_two_cases_shares_one_connection() {
     block_on(async {
@@ -1687,9 +1709,9 @@ fn a_host_written_in_two_cases_shares_one_connection() {
     });
 }
 
-/// A request's credentials replace the fetcher's, whether the fetcher holds
-/// them as credentials or as an `Authorization` header. Both layers reach an
-/// https destination, which is where a credential may go.
+/// The credentials of a request replace the credentials of the fetcher. This
+/// is true if the fetcher holds them as credentials or as an `Authorization`
+/// header. Both layers reach an https destination, where a credential can go.
 #[test]
 fn a_request_basic_auth_overrides_the_fetchers_authorization() {
     block_on(async {
@@ -1738,9 +1760,9 @@ fn a_request_basic_auth_overrides_the_fetchers_authorization() {
     });
 }
 
-/// A credential is withheld from no destination, so a cleartext destination
-/// refuses the fetch and is named. A request that means it says so, and the
-/// credential goes over cleartext.
+/// The fetcher withholds a credential from no destination, so it refuses a
+/// fetch to a cleartext destination and names the destination. A request that
+/// sets `allow_cleartext_credentials` sends the credential over cleartext.
 #[test]
 fn a_request_credential_to_a_cleartext_origin_is_refused() {
     block_on(async {
@@ -1779,17 +1801,18 @@ fn a_request_credential_to_a_cleartext_origin_is_refused() {
     });
 }
 
-/// Credentials beside an `Authorization` header give two answers to one
-/// question. The fetcher refuses them at construction, and a request refuses
-/// them before it is admitted.
+/// Credentials together with an `Authorization` header give two answers to
+/// one question. The constructor of the fetcher refuses this pair. A request
+/// refuses it before the fetcher admits the request.
 #[test]
 fn basic_auth_beside_an_authorization_header_is_refused() {
     block_on(async {
         let server = TestServer::start(Transport::Cleartext, always(b"unreachable")).await;
         let auth = basic_auth("u", "p");
 
-        // An https mirror, so the refusal is the ambiguity and not the
-        // cleartext one. The mirror is never contacted.
+        // The mirror is https, so the refusal of a credential to a cleartext
+        // mirror does not apply. The cause of the refusal is the ambiguity.
+        // The fetcher never connects to the mirror.
         let mut options = FetcherOptions {
             tls: tls_options(None),
             ..direct_options("https://secure.example/repo")
@@ -1817,8 +1840,9 @@ fn basic_auth_beside_an_authorization_header_is_refused() {
     });
 }
 
-/// A path target is served under the mirrors, so a fetcher with none has
-/// nowhere to send it and says so before the fetch is admitted.
+/// The fetcher serves a path target under its mirrors. A fetcher with no
+/// mirror has no place to send it, and it reports this before it admits the
+/// fetch.
 #[test]
 fn a_path_target_without_a_mirror_reaches_no_server() {
     block_on(async {
@@ -1836,8 +1860,8 @@ fn a_path_target_without_a_mirror_reaches_no_server() {
     });
 }
 
-/// The pool is keyed by origin, so a URL target and a path target for one
-/// origin travel over one connection.
+/// The key of the pool is the origin, so a URL target and a path target for
+/// one origin use one connection.
 #[test]
 fn a_url_target_shares_the_pooled_connection_with_a_path_target() {
     block_on(async {
@@ -1940,7 +1964,8 @@ fn a_fetch_error_converts_into_the_library_error() {
 #[test]
 fn a_body_that_outgrows_the_cap_fails_the_read() {
     block_on(async {
-        // No declared length, so the cap can only be enforced while streaming.
+        // The body has no declared length, so the fetcher can apply the cap
+        // only while it streams the body.
         let handler: Handler = Arc::new(|_seen, _count| {
             Response::builder()
                 .status(StatusCode::OK)
@@ -1963,9 +1988,10 @@ fn a_body_that_outgrows_the_cap_fails_the_read() {
         assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
         assert!(err.to_string().contains("1024-byte cap"), "{err}");
 
-        // A consumer that reads on sees the failure again, past the end of the
-        // response: more reads here than the eight-frame body has frames, so a
-        // read that reported the end of stream instead would be caught.
+        // A consumer that continues to read gets the same failure again, past
+        // the end of the response. The loop reads more times than the body has
+        // frames (eight). If a read reports the end of stream, the assertion
+        // catches it.
         let mut buf = [0u8; 512];
         for _ in 0..16 {
             let repeat = body.read(&mut buf).await.unwrap_err();
@@ -1976,8 +2002,7 @@ fn a_body_that_outgrows_the_cap_fails_the_read() {
     });
 }
 
-/// Credentials go only to `https` mirrors, so the server this reaches is a TLS
-/// one.
+/// Credentials go only to `https` mirrors, so this test uses a TLS server.
 #[test]
 fn credentials_and_extra_headers_reach_the_server() {
     block_on(async {
@@ -2007,8 +2032,9 @@ fn credentials_and_extra_headers_reach_the_server() {
     });
 }
 
-/// A credential reaches every mirror, so a cleartext mirror alongside one fails
-/// the constructor rather than putting the credential on the wire in the clear.
+/// A credential goes to each mirror, so a cleartext mirror with a credential
+/// fails the constructor. The credential never goes over the wire in
+/// cleartext.
 #[test]
 fn credentials_with_a_cleartext_mirror_fail_the_constructor() {
     block_on(async {
@@ -2035,7 +2061,7 @@ fn credentials_with_a_cleartext_mirror_fail_the_constructor() {
             "the cleartext mirror is named: {err}"
         );
 
-        // Nothing was fetched, so neither server was reached.
+        // The fetcher fetched nothing, so no connection reached either server.
         assert_eq!(cleartext.connections(), 0);
         assert_eq!(secure.connections(), 0);
     });
@@ -2063,8 +2089,9 @@ fn a_client_certificate_is_presented_when_the_server_demands_one() {
         let (bytes, _) = fetch_bytes(&fetcher, "config").await;
         assert_eq!(bytes, b"mutual");
 
-        // Without the certificate the handshake fails, and a failed handshake
-        // is retryable, so the attempt is repeated before it is reported.
+        // Without the certificate, the handshake fails. A failed handshake is
+        // retryable, so the fetcher repeats the attempt before it reports the
+        // failure.
         let mut without_cert = direct_options(server.url(true));
         without_cert.tls = tls_options(None);
         without_cert.max_retries = 0;
@@ -2077,9 +2104,9 @@ fn a_client_certificate_is_presented_when_the_server_demands_one() {
     });
 }
 
-/// The same client certificate under an encrypted PKCS#8 key completes client
-/// authentication: the fetcher decrypts the key with the passphrase and
-/// presents the certificate the server demands.
+/// The same client certificate with an encrypted PKCS#8 key completes client
+/// authentication. The fetcher decrypts the key with the passphrase and
+/// presents the certificate that the server demands.
 #[test]
 fn an_encrypted_client_key_is_presented_when_the_server_demands_one() {
     block_on(async {
@@ -2105,9 +2132,9 @@ fn an_encrypted_client_key_is_presented_when_the_server_demands_one() {
     });
 }
 
-/// Fetch one path over TLS from a server presenting `leaf`, verifying it under
-/// `roots`. Retries are off, so a refused handshake reports at once rather
-/// than spending every round and every backoff first.
+/// Fetches one path over TLS from a server that presents `leaf`, and verifies
+/// the server with `roots`. Retries are off, so a refused handshake reports at
+/// once and spends no round and no backoff.
 async fn tls_fetch(leaf: Leaf, roots: TrustRoots) -> Result<Vec<u8>, Error> {
     let server = TestServer::start_with_leaf(
         leaf,
@@ -2135,8 +2162,8 @@ async fn tls_fetch(leaf: Leaf, roots: TrustRoots) -> Result<Vec<u8>, Error> {
     }
 }
 
-/// A leaf covering neither name the tests reach fails the host name check
-/// alone: the fixture authority signed it and it is in validity. Only the
+/// A leaf with neither name that the tests use fails only the host name
+/// check. The fixture authority signed it, and it is in validity. Only the
 /// bypass that drops the name check serves it.
 #[test]
 fn a_name_mismatch_is_served_only_where_the_name_check_is_dropped() {
@@ -2160,8 +2187,8 @@ fn a_name_mismatch_is_served_only_where_the_name_check_is_dropped() {
     });
 }
 
-/// A leaf carrying the right name that no trusted authority signed fails the
-/// chain check alone. Both bypasses serve it, and the anchors refuse it.
+/// A leaf with the right name that no trusted authority signed fails only the
+/// chain check. Both bypasses serve it, and the anchors refuse it.
 #[test]
 fn an_untrusted_chain_is_served_by_either_bypass() {
     block_on(async {
@@ -2180,9 +2207,9 @@ fn an_untrusted_chain_is_served_by_either_bypass() {
     });
 }
 
-/// A leaf carrying the right name that the fixture authority signed, whose
-/// validity ended in 2020, fails the expiry check alone. Both bypasses serve
-/// it, and the anchors refuse it.
+/// A leaf with the right name, signed by the fixture authority, with a
+/// validity that ended in 2020, fails only the expiry check. Both bypasses
+/// serve it, and the anchors refuse it.
 #[test]
 fn an_expired_leaf_is_served_by_either_bypass() {
     block_on(async {
@@ -2201,11 +2228,13 @@ fn an_expired_leaf_is_served_by_either_bypass() {
     });
 }
 
-/// The one check a bypass keeps is the handshake signature. A server that
-/// presents the `server-untrusted` certificate and signs with the `server`
-/// private key passes every check either bypass drops -- the name check finds
-/// the right name in that certificate -- and fails that one, so both bypasses
-/// refuse it. The harness pairs the certificate and the key directly, since
+/// A bypass keeps one check, the handshake signature. This server presents
+/// the `server-untrusted` certificate and signs with the `server` private key.
+/// It passes each check that either bypass drops. The name check finds the
+/// right name in that certificate.
+///
+/// The server fails the signature check, so both bypasses refuse it. The
+/// harness pairs the certificate and the key directly, because
 /// `with_single_cert` refuses a pair that does not match.
 #[test]
 fn a_signature_made_with_another_key_is_refused_by_either_bypass() {
@@ -2226,9 +2255,10 @@ fn a_signature_made_with_another_key_is_refused_by_either_bypass() {
     });
 }
 
-/// A redirect to another origin carries every header but the credentials: the
-/// server the route named receives them, and the server the hop reaches
-/// receives none of the three. A header that is not a credential reaches both.
+/// A redirect to another origin carries each header except the credentials.
+/// The server that the route named receives the three credential headers. The
+/// server that the hop reaches receives none of them. A header that is not a
+/// credential reaches both.
 #[test]
 fn a_redirect_to_another_origin_leaves_the_credentials_behind() {
     block_on(async {
@@ -2270,14 +2300,14 @@ fn a_redirect_to_another_origin_leaves_the_credentials_behind() {
         assert_eq!(second.header("proxy-authorization"), None);
         assert_eq!(second.header("cookie"), None);
         assert_eq!(second.header("x-trace"), Some("abc"));
-        // The fetcher's own headers reach the hop as well.
+        // The headers of the fetcher also reach the hop.
         assert_eq!(second.header("accept-encoding"), Some("identity"));
         assert!(second.header("user-agent").is_some());
     });
 }
 
-/// A hop at the origin the route named is the origin the credentials were
-/// meant for, so they go with it.
+/// A hop at the origin that the route named goes to the origin of the
+/// credentials, so the credentials go with the hop.
 #[test]
 fn a_same_origin_redirect_keeps_the_credentials() {
     block_on(async {
@@ -2312,9 +2342,9 @@ fn a_same_origin_redirect_keeps_the_credentials() {
     });
 }
 
-/// A `Location` is resolved against the URL of the response that carried it, so
-/// a rooted one names a path at that origin and a bare one names a sibling of
-/// the path the response was answered at.
+/// The fetcher resolves a `Location` against the URL of the response that
+/// carried it. A rooted `Location` names a path at that origin. A bare
+/// `Location` names a sibling of the path of the response.
 #[test]
 fn a_relative_location_resolves_against_the_response() {
     block_on(async {
@@ -2367,8 +2397,8 @@ fn a_scheme_relative_location_keeps_the_scheme() {
     });
 }
 
-/// A fragment names a part of a representation and reaches no request, so a
-/// redirect drops the one its `Location` carries.
+/// A fragment names a part of a representation and goes in no request, so a
+/// redirect drops the fragment of its `Location`.
 #[test]
 fn a_fragment_in_a_location_reaches_no_server() {
     block_on(async {
@@ -2391,8 +2421,8 @@ fn a_fragment_in_a_location_reaches_no_server() {
     });
 }
 
-/// A request the caller made over tls is not followed onto cleartext: the hop
-/// is refused, both URLs are named, and the cleartext server is never asked.
+/// The fetcher does not follow a TLS request of the caller to cleartext. It
+/// refuses the hop and names both URLs. The cleartext server gets no request.
 #[test]
 fn a_redirect_from_tls_to_cleartext_is_refused() {
     block_on(async {
@@ -2426,8 +2456,8 @@ fn a_redirect_from_tls_to_cleartext_is_refused() {
     });
 }
 
-/// A chain longer than the limit fails the attempt, and the failure names the
-/// hop the limit stopped it at.
+/// A chain longer than the limit fails the attempt. The error names the hop
+/// where the limit stopped the chain.
 #[test]
 fn a_chain_longer_than_the_limit_is_refused() {
     block_on(async {
@@ -2450,8 +2480,7 @@ fn a_chain_longer_than_the_limit_is_refused() {
     });
 }
 
-/// A limit of zero follows nothing, which leaves a redirect a definitive answer
-/// of its own.
+/// A limit of zero follows no redirect, so a redirect is a definitive answer.
 #[test]
 fn a_limit_of_zero_follows_nothing() {
     block_on(async {
@@ -2473,7 +2502,7 @@ fn a_limit_of_zero_follows_nothing() {
     });
 }
 
-/// A redirect with nothing to follow is reported as the status it answered.
+/// The fetch reports a redirect with nothing to follow as its status.
 #[test]
 fn a_redirect_without_a_location_reports_its_status() {
     block_on(async {
@@ -2490,9 +2519,9 @@ fn a_redirect_without_a_location_reports_its_status() {
     });
 }
 
-/// The cap is the caller's bound on the object, so it is compared against the
-/// response that answers and against no redirect on the way there: an
-/// intermediate response declaring more than the cap leaves the fetch standing.
+/// The cap is the limit of the caller on the object, so the fetcher applies it
+/// to the final response alone. An intermediate response that declares more
+/// than the cap does not fail the fetch.
 #[test]
 fn the_size_cap_measures_the_final_response_alone() {
     block_on(async {
@@ -2527,7 +2556,7 @@ fn the_size_cap_measures_the_final_response_alone() {
             .unwrap();
         assert_eq!(read_body(fetched).await, b"tiny");
 
-        // The response that answers is measured: a final body over the cap
+        // The fetcher measures the final response. A final body over the cap
         // fails the fetch.
         let err = fetcher
             .fetch(FetchRequest {
@@ -2540,14 +2569,17 @@ fn the_size_cap_measures_the_final_response_alone() {
     });
 }
 
-/// A configured client certificate identifies the fetcher to the origin its
-/// route named and to no other, so a hop at another origin presents none.
+/// A configured client certificate identifies the fetcher only to the origin
+/// that its route named. A hop at another origin presents no certificate.
 ///
-/// Both servers ask for a certificate and serve a client that presents none, so
-/// each records what its connection presented and the chain runs to its end.
-/// TLS 1.3 sends the client certificate after the server has finished, and the
-/// server's accept resolves once the client's whole flight has arrived, so a
-/// certificate the client sent is on the connection by then.
+/// Both servers ask for a certificate and also serve a client that presents
+/// none. Each server records what its connection presented, and the chain runs
+/// to its end.
+///
+/// TLS 1.3 sends the client certificate after the Finished message of the
+/// server. The accept of the server resolves after the full flight of the
+/// client arrives. At that time, a certificate that the client sent is on the
+/// connection.
 #[test]
 fn a_client_certificate_reaches_the_named_origin_alone() {
     block_on(async {
@@ -2578,7 +2610,7 @@ fn a_client_certificate_reaches_the_named_origin_alone() {
         let (bytes, _) = fetch_bytes(&fetcher, "config").await;
         assert_eq!(bytes, b"hopped");
 
-        // The origin the route named received the certificate, and the hop
+        // The origin that the route named received the certificate. The hop
         // received none.
         assert_eq!(named.client_certificates(), [true]);
         assert_eq!(hop.client_certificates(), [false]);
@@ -2588,9 +2620,9 @@ fn a_client_certificate_reaches_the_named_origin_alone() {
     });
 }
 
-/// An intermediate body is discarded the way an unsuccessful one is, so a chain
-/// of short redirects on one origin travels over the connection the first hop
-/// opened.
+/// The fetcher discards an intermediate body as it discards an unsuccessful
+/// body. A chain of short redirects on one origin then uses the connection
+/// that the first hop opened.
 #[test]
 fn a_redirect_chain_on_one_origin_travels_over_one_connection() {
     block_on(async {
@@ -2619,9 +2651,9 @@ fn a_redirect_chain_on_one_origin_travels_over_one_connection() {
     });
 }
 
-/// Every drain one attempt makes shares one progress window, however many hops
-/// the attempt follows: a peer that answers each hop with a short declared body
-/// and then sends fewer bytes than it declared spends that window once.
+/// All drains of one attempt share one progress window, for any number of
+/// hops. A peer can answer each hop with a short declared body and send fewer
+/// bytes than it declared. That peer spends the window once.
 #[test]
 fn one_progress_window_covers_every_drain_of_an_attempt() {
     block_on(async {
@@ -2644,9 +2676,9 @@ fn one_progress_window_covers_every_drain_of_an_attempt() {
     });
 }
 
-/// A `Location` with no value resolves to the URL of the response that carried
-/// it, so it names no URL a request can be sent to and the status the response
-/// answered is the answer the attempt reports.
+/// A `Location` with no value resolves to the URL of the response that
+/// carried it, so it names no new URL for a request. The attempt reports the
+/// status of the response.
 #[test]
 fn an_empty_location_names_no_url() {
     block_on(async {
@@ -2668,9 +2700,9 @@ fn an_empty_location_names_no_url() {
     });
 }
 
-/// The limit stops an attempt at a URL it would otherwise follow, so a redirect
-/// with nothing to follow reports the status it answered whatever the hop count,
-/// and one that does name a URL reports the limit.
+/// The limit stops an attempt only at a URL that the attempt can follow. A
+/// redirect with nothing to follow reports its status at any hop count. A
+/// redirect that names a URL reports the limit.
 #[test]
 fn at_the_limit_a_redirect_reports_what_it_carried() {
     block_on(async {
@@ -2750,7 +2782,8 @@ fn http2_multiplexes_concurrent_fetches_over_one_connection() {
         options.tls = tls_options(None);
         let fetcher = Fetcher::new(options).await.unwrap();
 
-        // Warm the pool so the concurrent fetches share one connection.
+        // The first fetch fills the pool, so the concurrent fetches share one
+        // connection.
         let (bytes, protocol) = fetch_bytes(&fetcher, "config").await;
         assert_eq!(bytes, b"multiplexed");
         assert_eq!(protocol, Protocol::Http2);
@@ -2812,8 +2845,8 @@ fn a_fetched_body_verifies_against_its_expected_digest() {
     });
 }
 
-/// A body dropped before the end must not be returned to the connection pool,
-/// because the rest of the response is still in flight.
+/// If the caller drops a body before its end, the fetcher must not return the
+/// connection to the pool. The rest of the response is still in flight.
 #[test]
 fn an_abandoned_body_is_not_pooled() {
     block_on(async {
@@ -2834,21 +2867,22 @@ fn an_abandoned_body_is_not_pooled() {
         };
         let mut head = [0u8; 16];
         body.read_exact(&mut head).await.unwrap();
-        // The counter is bytes off the connection, so one whole 4 KiB frame is
-        // counted against the 16 bytes the caller took out of it.
+        // The counter gives the bytes read from the connection, so it counts
+        // the whole 4 KiB frame. The caller took only 16 bytes of that frame.
         assert_eq!(body.received(), 64 * 1024 / 16);
         drop(body);
 
-        // The next fetch opens a fresh connection.
+        // The next fetch opens a new connection.
         let (bytes, _) = fetch_bytes(&fetcher, "big").await;
         assert_eq!(bytes.len(), 64 * 1024);
         assert_eq!(server.connections(), 2);
     });
 }
 
-/// A 404 is the ordinary answer for an object a remote does not hold, so an
-/// attempt that ends on one drains the short body it declares and keeps the
-/// connection. Otherwise a scan would pay a connection setup per absent object.
+/// A 404 is the usual answer for an object that a remote does not hold. An
+/// attempt that ends on a 404 drains the short body that it declares and keeps
+/// the connection. Without the drain, a scan opens a new connection for each
+/// absent object.
 #[test]
 fn an_unsuccessful_status_with_a_short_body_keeps_its_connection() {
     block_on(async {
@@ -2878,8 +2912,9 @@ fn an_unsuccessful_status_with_a_short_body_keeps_its_connection() {
     });
 }
 
-/// A declared body over the request's cap is the same shape of failure and gets
-/// the same treatment, as long as what it declares is small enough to drain.
+/// A declared body longer than the cap of the request is the same type of
+/// failure. If the declared length is small enough to drain, the attempt drains
+/// the body and keeps the connection.
 #[test]
 fn an_over_cap_response_with_a_short_body_keeps_its_connection() {
     block_on(async {
@@ -2903,8 +2938,9 @@ fn an_over_cap_response_with_a_short_body_keeps_its_connection() {
     });
 }
 
-/// A body with no declared length is not drained: the rest of the response is
-/// still in flight and its size is unknown, so the connection is closed instead.
+/// The fetcher does not drain a body with no declared length. The rest of the
+/// response is still in transit and its size is unknown, so the fetcher closes
+/// the connection.
 #[test]
 fn an_unsuccessful_status_with_an_undeclared_body_closes_its_connection() {
     block_on(async {
@@ -2931,9 +2967,9 @@ fn an_unsuccessful_status_with_an_undeclared_body_closes_its_connection() {
     });
 }
 
-/// The fetcher's admission gate serves the queue highest priority first, which
-/// the state machine of a pull relies on: the metadata its scan is blocked on
-/// overtakes queued bulk content.
+/// The admission gate of the fetcher serves the queue in order of priority,
+/// highest first. The state machine of a pull uses this order: the metadata
+/// that blocks its scan goes before queued bulk content.
 #[test]
 fn a_queued_high_priority_fetch_is_served_before_a_low_priority_one() {
     block_on(async {
@@ -2942,13 +2978,13 @@ fn a_queued_high_priority_fetch_is_served_before_a_low_priority_one() {
         options.max_outstanding = 1;
         let fetcher = Fetcher::new(options).await.unwrap();
 
-        // The one permit is held by a body that has not been read to the end.
+        // A body that the test did not read to the end holds the one permit.
         let Fetched::Body(held) = fetcher.fetch(FetchRequest::path("held")).await.unwrap() else {
             panic!("unexpected 304");
         };
 
-        // Queue the low-priority fetch first, so priority and not arrival order
-        // is what decides which the freed permit goes to.
+        // Queue the low-priority fetch first. Then only the priority can give
+        // the released permit to the high-priority fetch.
         let low = spawn(queued(fetcher.clone(), "objects/low.filez", Priority::Low));
         Timer::after(Duration::from_millis(50)).await;
         let high = spawn(queued(
@@ -2957,7 +2993,7 @@ fn a_queued_high_priority_fetch_is_served_before_a_low_priority_one() {
             Priority::High,
         ));
         Timer::after(Duration::from_millis(50)).await;
-        // Neither has reached the server: the permit is still held.
+        // Neither fetch reached the server. The held body still has the permit.
         assert_eq!(server.requests(), 1);
 
         drop(held);
@@ -2972,8 +3008,8 @@ fn a_queued_high_priority_fetch_is_served_before_a_low_priority_one() {
     });
 }
 
-/// The connect deadline covers the TLS handshake, so a peer that accepts the
-/// connection and then says nothing fails the attempt.
+/// The connect deadline includes the TLS handshake. If a peer accepts the
+/// connection and then sends nothing, the attempt fails.
 #[test]
 fn a_stalled_handshake_times_out() {
     block_on(async {
@@ -2992,8 +3028,8 @@ fn a_stalled_handshake_times_out() {
     });
 }
 
-/// A peer that takes the request and answers nothing fails the attempt once the
-/// progress window is gone.
+/// If a peer takes the request and sends no answer, the attempt fails when the
+/// progress window ends.
 #[test]
 fn a_stalled_response_times_out() {
     block_on(async {
@@ -3011,21 +3047,22 @@ fn a_stalled_response_times_out() {
     });
 }
 
-/// The per-attempt deadlines bound one mirror, and a fetch multiplies them by
-/// the mirror count and the retry count. The whole-fetch deadline bounds that
-/// product, and the attempt it cancels takes the admission permit with it.
+/// The deadlines of an attempt apply to one mirror. A fetch multiplies them by
+/// the number of mirrors and the number of retries. The deadline of the whole
+/// fetch limits that product. When it cancels an attempt, the attempt releases
+/// its admission permit.
 #[test]
 fn a_fetch_gives_up_when_its_own_deadline_passes() {
     block_on(async {
         let addr = stalling_server(b"").await;
         let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
         options.progress_timeout = Duration::from_millis(100);
-        // Rounds enough that the per-attempt deadline and the backoff alone
-        // would keep this fetch going for minutes.
+        // With this number of rounds, the deadline of each attempt and the
+        // backoff alone keep this fetch running for minutes.
         options.max_retries = 200;
         options.fetch_timeout = Some(Duration::from_millis(300));
-        // One permit, so a second fetch is admitted only if the first gave its
-        // permit back.
+        // One permit, so the fetcher admits a second fetch only if the first
+        // fetch released its permit.
         options.max_outstanding = 1;
         let fetcher = Fetcher::new(options).await.unwrap();
 
@@ -3054,8 +3091,8 @@ fn a_fetch_gives_up_when_its_own_deadline_passes() {
     });
 }
 
-/// Without a whole-fetch deadline the mirror-and-retry loop runs to its own end,
-/// and a response that arrives is unaffected.
+/// If the whole fetch has no deadline, the loop over the mirrors and the
+/// retries runs to its own end. A response that arrives is not affected.
 #[test]
 fn a_fetch_without_a_deadline_still_completes() {
     block_on(async {
@@ -3069,12 +3106,12 @@ fn a_fetch_without_a_deadline_still_completes() {
     });
 }
 
-/// A body that stops mid-stream fails the read that finds no bytes, and keeps
-/// failing it, rather than waiting for the rest forever.
+/// If a body stops in mid-stream, the read that finds no bytes fails. Each
+/// later read fails too, so the body does not wait for the rest forever.
 #[test]
 fn a_stalled_body_fails_the_read() {
     block_on(async {
-        // A head promising 64 bytes, eight of them, and then silence.
+        // A head that declares 64 bytes, then eight bytes, then silence.
         let addr = stalling_server(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\nfirst   ").await;
         let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
         options.progress_timeout = Duration::from_millis(150);
@@ -3099,10 +3136,10 @@ fn a_stalled_body_fails_the_read() {
     });
 }
 
-/// A peer that stays silent past the window and then resumes has already failed
-/// the body: the read that reported the timeout latched it, so the bytes that
-/// follow never reach the consumer and the body never reaches a clean end of
-/// stream.
+/// If a peer stays silent past the window and then sends again, the body has
+/// already failed. The read that reported the timeout latched the failure. The
+/// bytes that follow never reach the consumer, and the body never gets a clean
+/// end of stream.
 #[test]
 fn a_body_that_resumes_after_the_window_stays_failed() {
     block_on(async {
@@ -3114,8 +3151,8 @@ fn a_body_that_resumes_after_the_window_stays_failed() {
             let (mut stream, _peer) = listener.accept().await.unwrap();
             let mut request = [0u8; 1024];
             let _ = stream.read(&mut request).await;
-            // A head promising 16 bytes, eight of them, silence for longer than
-            // the window, and then the rest.
+            // A head that declares 16 bytes, then eight bytes, then silence for
+            // longer than the window, then the rest.
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\nfirst   ")
                 .await
@@ -3144,8 +3181,9 @@ fn a_body_that_resumes_after_the_window_stays_failed() {
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(err.to_string().contains("delivered nothing"), "{err}");
 
-        // The rest of the object is on the wire now, and the body still reports
-        // the failure rather than handing out what arrived or ending cleanly.
+        // The rest of the object is now on the wire. The body still reports the
+        // failure. It does not give out the bytes that arrived and does not end
+        // cleanly.
         served.await;
         for _ in 0..2 {
             let repeat = body.read(&mut rest).await.unwrap_err();
@@ -3158,14 +3196,14 @@ fn a_body_that_resumes_after_the_window_stays_failed() {
     });
 }
 
-/// A peer that closes the connection short of the length it declared fails the
-/// read, and keeps failing it. hyper reports the body as ended after it reports
-/// the error, so an unlatched failure would let the next read hand a consumer a
+/// If a peer closes the connection before the declared length, the read fails,
+/// and each later read fails too. hyper reports the end of the body after it
+/// reports the error. Without the latch, the next read can give a consumer a
 /// clean end of stream for a truncated object.
 #[test]
 fn a_truncated_body_fails_the_read() {
     block_on(async {
-        // A head promising 64 bytes, eight of them, and then a close.
+        // A head that declares 64 bytes, then eight bytes, then a close.
         let addr =
             truncating_server(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\nfirst   ").await;
         let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
@@ -3178,15 +3216,16 @@ fn a_truncated_body_fails_the_read() {
         };
         assert_eq!(body.content_length(), Some(64));
 
-        // What arrived is short of the declared length, and the read that finds
-        // the failure reports it rather than the end of the object.
+        // The bytes that arrived are fewer than the declared length. The read
+        // that finds the failure reports it. It does not report the end of the
+        // object.
         let mut out = Vec::new();
         let err = body.read_to_end(&mut out).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert!(out.len() < 64, "{} bytes", out.len());
 
-        // A consumer that reads on sees the same failure, not a clean end of
-        // stream.
+        // A consumer that continues to read gets the same failure. It does not
+        // get a clean end of stream.
         let mut buf = [0u8; 8];
         for _ in 0..8 {
             let repeat = body.read(&mut buf).await.unwrap_err();
@@ -3197,9 +3236,9 @@ fn a_truncated_body_fails_the_read() {
     });
 }
 
-/// The window starts at the read that finds nothing, so a body no read has yet
-/// found empty is not on the clock at all: a consumer that starts later than the
-/// window still reads.
+/// The window starts at the read that finds nothing. A body that no read found
+/// empty is not on the clock, so a consumer that starts later than the window
+/// can still read.
 #[test]
 fn an_unread_body_is_not_on_the_progress_clock() {
     block_on(async {
@@ -3216,7 +3255,7 @@ fn an_unread_body_is_not_on_the_progress_clock() {
                 .await
                 .unwrap();
             stream.flush().await.unwrap();
-            // The payload follows later than the window the client is given.
+            // The payload comes later than the window of the client.
             Timer::after(Duration::from_millis(400)).await;
             stream.write_all(b"late one").await.unwrap();
             stream.flush().await.unwrap();
@@ -3231,7 +3270,7 @@ fn an_unread_body_is_not_on_the_progress_clock() {
         else {
             panic!("unexpected 304");
         };
-        // Nobody reads for longer than the window, and then the read succeeds.
+        // No read occurs for longer than the window. Then the read succeeds.
         Timer::after(Duration::from_millis(350)).await;
         let mut out = Vec::new();
         body.read_to_end(&mut out).await.unwrap();
@@ -3239,10 +3278,10 @@ fn an_unread_body_is_not_on_the_progress_clock() {
     });
 }
 
-/// Once a read has found nothing the window runs whether or not a read is
-/// outstanding: what it measures is silence since a read wanted bytes, not the
-/// time a read spends waiting. A read abandoned while the peer is silent leaves
-/// the window running, so the next read finds it gone.
+/// After a read finds nothing, the window measures the silence since that read
+/// asked for bytes. The window runs also while no read is pending. If the test
+/// abandons a read while the peer is silent, the window continues, so the next
+/// read finds it expired.
 #[test]
 fn an_abandoned_read_leaves_the_progress_window_running() {
     block_on(async {
@@ -3261,8 +3300,8 @@ fn an_abandoned_read_leaves_the_progress_window_running() {
         body.read_exact(&mut head).await.unwrap();
         assert_eq!(&head, b"first   ");
 
-        // A read that finds nothing starts the window, and is then abandoned
-        // well inside it.
+        // A read that finds nothing starts the window. The test then abandons
+        // the read well before the window ends.
         let mut rest = [0u8; 8];
         let abandoned = or(async { Some(body.read(&mut rest).await) }, async {
             Timer::after(Duration::from_millis(50)).await;
@@ -3271,10 +3310,10 @@ fn an_abandoned_read_leaves_the_progress_window_running() {
         .await;
         assert!(abandoned.is_none(), "the silent peer delivered nothing");
 
-        // Nobody is reading while the rest of the window passes. The next read
-        // finds it spent and fails at once: raced against a timer shorter than
-        // the window, so a read that started a fresh window instead would still
-        // be waiting when the race ends.
+        // No read runs while the rest of the window passes. The next read finds
+        // the window expired and fails at once. The test races the read against
+        // a timer shorter than the window. If the read started a new window, it
+        // is still pending when the race ends.
         Timer::after(Duration::from_millis(400)).await;
         let settled = or(async { Some(body.read(&mut rest).await) }, async {
             Timer::after(Duration::from_millis(100)).await;
@@ -3289,9 +3328,9 @@ fn an_abandoned_read_leaves_the_progress_window_running() {
     });
 }
 
-/// A cleartext origin behind a proxy is reached over a connection to the proxy,
-/// and the request carries the absolute-form target with the origin's own
-/// `Host` header. What the origin answers is what the fetch delivers.
+/// The fetcher reaches a cleartext origin behind a proxy over a connection to
+/// the proxy. The request carries the absolute-form target and the `Host`
+/// header of the origin. The fetch delivers the answer of the origin.
 #[test]
 fn a_cleartext_fetch_travels_through_the_proxy() {
     block_on(async {
@@ -3307,7 +3346,7 @@ fn a_cleartext_fetch_travels_through_the_proxy() {
 
         let (bytes, protocol) = fetch_bytes(&fetcher, "objects/ab/cd.filez").await;
         assert_eq!(bytes, b"object bytes");
-        // A proxy connection is cleartext, so it speaks HTTP/1.1.
+        // A connection to a proxy is cleartext, so it uses HTTP/1.1.
         assert_eq!(protocol, Protocol::Http11);
 
         let authority = format!("localhost:{}", origin.addr.port());
@@ -3319,13 +3358,13 @@ fn a_cleartext_fetch_travels_through_the_proxy() {
             format!("http://{authority}/objects/ab/cd.filez")
         );
         assert_eq!(seen[0].header("host"), Some(authority.as_str()));
-        // The origin was asked for the object, in the origin form a server
-        // answers.
+        // The origin got the request for the object in origin form, which a
+        // server answers.
         assert_eq!(origin.seen()[0].path, "/objects/ab/cd.filez");
         assert_eq!(origin.seen()[0].target, "/objects/ab/cd.filez");
 
-        // One proxy connection carries requests for any cleartext origin: a
-        // fetch of another origin's URL travels over the connection the first
+        // One proxy connection carries requests for each cleartext origin. A
+        // fetch of the URL of another origin uses the connection that the first
         // fetch returned to the pool.
         let other = TestServer::start(Transport::Cleartext, always(b"other bytes")).await;
         let url = format!("{}/summary", other.url(false));
@@ -3338,9 +3377,9 @@ fn a_cleartext_fetch_travels_through_the_proxy() {
     });
 }
 
-/// A TLS origin behind a proxy is reached over a `CONNECT` tunnel, and the
-/// handshake that follows is the one a direct connection makes: ALPN selects
-/// HTTP/2 end to end, and the proxy carries the bytes without reading them.
+/// The fetcher reaches a TLS origin behind a proxy over a `CONNECT` tunnel. The
+/// handshake in the tunnel is the same as on a direct connection. ALPN selects
+/// HTTP/2 end to end, and the proxy carries the bytes and does not read them.
 #[test]
 fn a_tls_fetch_tunnels_through_the_proxy() {
     block_on(async {
@@ -3365,8 +3404,8 @@ fn a_tls_fetch_tunnels_through_the_proxy() {
         assert_eq!(bytes, b"over h2");
         assert_eq!(protocol, Protocol::Http2);
 
-        // The proxy saw the tunnel and nothing of the request inside it. The
-        // target is named with its port, and the `Host` header holds the same.
+        // The proxy saw the tunnel and no part of the request in it. The target
+        // includes the port, and the `Host` header holds the same value.
         let authority = format!("localhost:{}", origin.addr.port());
         let seen = proxy.seen();
         assert_eq!(seen.len(), 1);
@@ -3377,10 +3416,14 @@ fn a_tls_fetch_tunnels_through_the_proxy() {
     });
 }
 
-/// `no_proxy` exempts an origin from the proxy: an exact host, the same host
-/// written with the leading `.`, an entry qualified by the port the origin
-/// names, and `*`. An exempt fetch reaches the origin directly, and the proxy
-/// records nothing.
+/// `no_proxy` exempts an origin from the proxy. These entries match:
+///
+/// - the exact host
+/// - the same host with a leading `.`
+/// - the host with the port of the origin
+/// - `*`
+///
+/// An exempt fetch goes to the origin directly, and the proxy records nothing.
 #[test]
 fn no_proxy_exempts_the_origin_from_the_proxy() {
     block_on(async {
@@ -3412,12 +3455,13 @@ fn no_proxy_exempts_the_origin_from_the_proxy() {
             assert_eq!(proxy.requests(), 0, "{no_proxy}");
         }
 
-        // An entry that exempts something else leaves the origin behind the
-        // proxy: an unrelated host, and the same host at another port.
+        // An entry that exempts a different origin keeps the origin behind the
+        // proxy. The test uses an unrelated host, and the same host at a
+        // different port.
         for (asked, no_proxy) in [
             (1, "other.example".to_owned()),
-            // The listener holds a port of its own, so the wrap names one it
-            // does not.
+            // The listener holds its own port, so the wrapped value names a
+            // different port.
             (2, format!("localhost:{}", port.wrapping_add(1))),
         ] {
             let fetcher = fetcher(no_proxy.clone()).await.unwrap();
@@ -3428,18 +3472,20 @@ fn no_proxy_exempts_the_origin_from_the_proxy() {
     });
 }
 
-/// An entry exempts every host under the domain it names.
+/// An entry exempts each host under the domain that it names.
 ///
-/// The origin here is a name that resolves to nothing, so what the exemption
-/// decides is which endpoint the connect names: a request that is not exempt
-/// reaches the proxy, which records it and then answers 502, having nothing to
-/// forward it to, while an exempt one is a connect the fetch makes itself and
-/// the proxy sees no more of it.
+/// Here the origin is a name that resolves to no address. The exemption decides
+/// which endpoint the connect names. A request that is not exempt goes to the
+/// proxy. The proxy records it and answers 502, because it has no destination
+/// for the request.
+///
+/// For an exempt request, the fetch makes the connect itself, and the proxy
+/// sees nothing more.
 #[test]
 fn no_proxy_exempts_a_host_under_a_listed_domain() {
     block_on(async {
         let proxy = TestProxy::start(Tunnel::Open).await;
-        // Port 9 of a `.invalid` name, which the DNS answers for nothing.
+        // Port 9 of a `.invalid` name, for which DNS gives no address.
         let mirror = "http://deep.host.example.invalid:9/repo";
         let fetcher = |no_proxy: &str| {
             let variables = vec![
@@ -3450,9 +3496,9 @@ fn no_proxy_exempts_a_host_under_a_listed_domain() {
                 tls: tls_options(None),
                 proxy: Proxy::Variables(variables),
                 max_retries: 0,
-                // The assertions read what reached the proxy, and both arms
-                // discard what the fetch resolved to, so the window is the one
-                // that keeps a name nothing answers for off the test clock.
+                // The assertions read what reached the proxy. Both arms discard
+                // the result of the fetch. This window is then the only limit
+                // on the time spent on a name that has no answer.
                 fetch_timeout: Some(Duration::from_secs(1)),
                 ..direct_options(mirror)
             })
@@ -3475,9 +3521,9 @@ fn no_proxy_exempts_a_host_under_a_listed_domain() {
     });
 }
 
-/// [`Proxy::None`] reaches every origin directly. The variables that would name
-/// the proxy are stated in the other form, so what the two fetchers part over
-/// is which of them reads them at all.
+/// [`Proxy::None`] reaches each origin directly. The other fetcher gets the
+/// proxy variables as `Proxy::Variables`. Only one of the two fetchers reads
+/// the variables, and this is the only difference between them.
 #[test]
 fn proxy_none_reaches_the_origin_directly() {
     block_on(async {
@@ -3510,15 +3556,17 @@ fn proxy_none_reaches_the_origin_directly() {
     });
 }
 
-/// The userinfo of a proxy URL is the proxy's credential: it reaches the proxy
-/// as `Proxy-Authorization`, and it is no part of the merged header list, which
-/// carries the caller's own credential beside it.
+/// The userinfo of a proxy URL is the credential of the proxy. It reaches the
+/// proxy as `Proxy-Authorization`. It is not part of the merged header list,
+/// which carries the credential of the caller next to it.
 ///
-/// A proxied cleartext request is one request, so what the proxy recorded is
-/// the header list the fetcher built, and the two credentials arrive there
-/// under their own names. On the tunnel path nothing between the fetcher and
-/// the origin reads the bytes at all, so what the origin recorded is the
-/// fetcher's own doing, and the credential it holds is the caller's alone.
+/// A proxied cleartext request is one request. The proxy records the header
+/// list that the fetcher built, and the two credentials arrive there under
+/// their own names.
+///
+/// On the tunnel path, nothing between the fetcher and the origin reads the
+/// bytes. The origin records what the fetcher sent, and the only credential
+/// that it gets is the credential of the caller.
 #[test]
 fn the_proxy_credential_reaches_the_proxy_and_no_origin() {
     block_on(async {
@@ -3575,8 +3623,8 @@ fn the_proxy_credential_reaches_the_proxy_and_no_origin() {
         assert_eq!(seen[0].method, "CONNECT");
         assert_eq!(seen[0].header("proxy-authorization"), expected);
         assert_eq!(tls_origin.seen()[0].header("proxy-authorization"), None);
-        // The credential the origin is asked for is the caller's, which the
-        // tunnel carried past a proxy that read none of it.
+        // The origin gets the credential of the caller. The tunnel carried it
+        // past a proxy that read none of it.
         assert_eq!(
             tls_origin.seen()[0].header("authorization"),
             Some("Basic Ym9iOm9yaWdpbg==")
@@ -3584,10 +3632,10 @@ fn the_proxy_credential_reaches_the_proxy_and_no_origin() {
     });
 }
 
-/// A proxy that refuses the tunnel names the proxy and the status in the
-/// failure. A 407 refuses the credential the fetcher holds, which no retry
-/// changes, so the proxy is asked once; every other status is retryable and the
-/// round that repeats asks again.
+/// If a proxy refuses the tunnel, the failure names the proxy and the status. A
+/// 407 refuses the credential of the fetcher, and a retry does not change that,
+/// so the fetcher asks the proxy once. Each other status is retryable, and the
+/// next round asks again.
 #[test]
 fn a_refused_connect_is_definitive_at_407_and_retried_at_502() {
     block_on(async {
@@ -3597,8 +3645,9 @@ fn a_refused_connect_is_definitive_at_407_and_retried_at_502() {
                 tls: tls_options(None),
                 proxy: Proxy::Url(proxy.url()),
                 max_retries,
-                // Nothing listens on port 1 of the loopback, so a fetch that
-                // reached past the proxy would fail on the connect instead.
+                // Nothing listens on port 1 of the loopback. If a fetch gets
+                // past the proxy, it fails on the connect, with a different
+                // error.
                 ..direct_options("https://localhost:1/repo")
             })
             .await
@@ -3623,14 +3672,14 @@ fn a_refused_connect_is_definitive_at_407_and_retried_at_502() {
         let message = err.to_string();
         assert!(message.contains("502"), "{message}");
         assert!(message.contains(&proxy.url()), "{message}");
-        // One round, then the round the retry repeats.
+        // One round, then the round that the retry repeats.
         assert_eq!(proxy.requests(), 2);
     });
 }
 
-/// A proxy URL the fetcher cannot connect through fails the constructor, and
-/// the value is named. The environment forms are read the same way, so a
-/// variable holding one fails it too.
+/// If the fetcher cannot connect through a proxy URL, the constructor fails and
+/// names the value. The fetcher reads the environment forms in the same way, so
+/// a variable that holds such a URL also fails the constructor.
 #[test]
 fn a_proxy_the_fetcher_cannot_reach_is_refused_at_construction() {
     block_on(async {
@@ -3657,9 +3706,9 @@ fn a_proxy_the_fetcher_cannot_reach_is_refused_at_construction() {
     });
 }
 
-/// A redirect under a proxy is served the way a route naming the hop's origin
-/// would be: the hop that follows carries the absolute form to the same proxy,
-/// and one proxy connection carries both.
+/// The fetcher serves a redirect under a proxy in the same way as a route that
+/// names the origin of the hop. The next hop carries the absolute form to the
+/// same proxy, and one proxy connection carries both hops.
 #[test]
 fn a_redirect_under_the_proxy_travels_over_one_proxy_connection() {
     block_on(async {
@@ -3685,16 +3734,16 @@ fn a_redirect_under_the_proxy_travels_over_one_proxy_connection() {
         assert_eq!(seen[0].target, format!("{}/summary", first.url(false)));
         assert_eq!(seen[1].target, format!("{}/moved", second.url(false)));
         // Both hops are cleartext origins behind one proxy, and the redirect
-        // carried an empty body, so its connection was back in the pool for the
-        // hop that followed it.
+        // carried an empty body. Its connection was then back in the pool for
+        // the next hop.
         assert_eq!(proxy.connections(), 1);
         assert_eq!(second.seen()[0].target, "/moved");
     });
 }
 
-/// The proxy decision is made per hop, so a proxied origin that redirects onto
-/// an exempt one is followed to that origin itself: the hop opens its own
-/// connection and carries the origin form a server answers.
+/// The fetcher decides on the proxy for each hop. If a proxied origin redirects
+/// to an exempt origin, the fetcher goes to that origin directly. The hop opens
+/// its own connection and carries the origin form, which a server answers.
 #[test]
 fn a_redirect_onto_an_exempt_origin_is_followed_directly() {
     block_on(async {
@@ -3705,8 +3754,8 @@ fn a_redirect_onto_an_exempt_origin_is_followed_directly() {
         )
         .await;
         let proxy = TestProxy::start(Tunnel::Open).await;
-        // The two origins are one host at two ports, which a port-qualified
-        // entry tells apart.
+        // The two origins are one host at two ports. An entry with a port tells
+        // them apart.
         let variables = vec![
             ("http_proxy".to_owned(), proxy.url()),
             (
@@ -3733,10 +3782,10 @@ fn a_redirect_onto_an_exempt_origin_is_followed_directly() {
 }
 
 /// A direct connection and a proxied connection to one endpoint are two
-/// connections, and each carries its own request form. The endpoint is the
-/// proxy's own here, exempted by `no_proxy` so a URL target naming it is
-/// reached directly: the proxy reads the absolute form of the proxied request
-/// and the origin form of the direct one.
+/// connections, and each carries its own request form. Here the endpoint is the
+/// proxy itself. `no_proxy` exempts it, so the fetcher reaches a URL target
+/// that names it directly. The proxy reads the absolute form of the proxied
+/// request and the origin form of the direct request.
 #[test]
 fn a_proxied_connection_is_not_handed_to_a_direct_request() {
     block_on(async {
@@ -3762,9 +3811,9 @@ fn a_proxied_connection_is_not_handed_to_a_direct_request() {
         assert_eq!(bytes, b"proxied");
         assert_eq!(proxy.connections(), 1);
 
-        // The same endpoint asked for a path of its own: the proxy has no
-        // absolute-form target to forward and answers 502, which is the answer
-        // a server gives the form it was not expecting.
+        // The test asks the same endpoint for its own path. The proxy has no
+        // absolute-form target to forward, so it answers 502. A server gives
+        // this answer to a form that it does not expect.
         let url = format!("{}/direct", proxy.url());
         let err = fetcher
             .fetch(FetchRequest::url(&url))
@@ -3779,9 +3828,9 @@ fn a_proxied_connection_is_not_handed_to_a_direct_request() {
     });
 }
 
-/// A byte behind a `CONNECT` response fails the connect: nothing follows that
-/// response before the client has spoken, so the TLS handshake would read the
-/// stream from after those bytes.
+/// A byte after a `CONNECT` response fails the connect. No byte follows that
+/// response before the client sends data. If the fetcher accepts these bytes,
+/// the TLS handshake reads the stream from after them.
 #[test]
 fn a_connect_answered_with_trailing_bytes_fails_the_connect() {
     block_on(async {
@@ -3791,8 +3840,8 @@ fn a_connect_answered_with_trailing_bytes_fails_the_connect() {
             tls: tls_options(None),
             proxy: Proxy::Url(proxy.clone()),
             max_retries: 0,
-            // Nothing listens on port 1 of the loopback, so a tunnel the
-            // fetcher took up would fail on the handshake instead.
+            // Nothing listens on port 1 of the loopback. If the fetcher used
+            // the tunnel, it fails on the handshake, with a different error.
             ..direct_options("https://localhost:1/repo")
         })
         .await
@@ -3806,14 +3855,14 @@ fn a_connect_answered_with_trailing_bytes_fails_the_connect() {
     });
 }
 
-/// A connect window that ends on a proxied hop names the proxy: the connection
-/// the window covers is the one to the proxy, and the origin behind it is
-/// contacted by nothing until that connection is open.
+/// If the connect window ends on a proxied hop, the error names the proxy. The
+/// window covers the connection to the proxy. Nothing contacts the origin
+/// behind the proxy before that connection is open.
 #[test]
 fn a_connect_timeout_on_a_proxied_hop_names_the_proxy() {
     block_on(async {
-        // A peer that accepts the connection, reads the `CONNECT`, and answers
-        // nothing.
+        // A peer that accepts the connection, reads the `CONNECT`, and sends no
+        // answer.
         let addr = stalling_server(b"").await;
         let proxy = format!("http://127.0.0.1:{}", addr.port());
         let fetcher = Fetcher::new(FetcherOptions {
@@ -3833,15 +3882,15 @@ fn a_connect_timeout_on_a_proxied_hop_names_the_proxy() {
     });
 }
 
-/// A body that keeps delivering, but below the low-speed rate, fails the read
-/// once the rate has stayed below the limit for the rule's time: long before
-/// the progress window, which the trickle never lets run out, and long before
-/// the body could end.
+/// A body that continues to deliver at a rate less than the low-speed limit
+/// fails the read. The failure occurs when the rate stays less than the limit
+/// for the time of the rule. This is long before the end of the progress
+/// window, which the trickle keeps open, and long before the body can end.
 #[test]
 fn a_body_below_the_low_speed_rate_fails_the_read() {
     block_on(async {
-        // 10 bytes every 50ms is 200 bytes per second, against a rule of 1000
-        // for one second.
+        // 10 bytes each 50ms is 200 bytes per second. The rule is 1000 bytes
+        // per second for one second.
         let (addr, requests) =
             trickling_server(true, &TRICKLED, 10, Duration::from_millis(50)).await;
         let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
@@ -3868,19 +3917,20 @@ fn a_body_below_the_low_speed_rate_fails_the_read() {
             started.elapsed()
         );
         assert!(out.len() < TRICKLED.len());
-        // The failure latches, as every failure of a body does.
+        // The failure latches, as each failure of a body does.
         let err = body.read(&mut [0u8; 8]).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert_eq!(requests.load(Ordering::SeqCst), 1);
     });
 }
 
-/// A body that stays above the rate over several samples completes.
+/// A body with a rate that stays more than the limit over several samples
+/// completes.
 #[test]
 fn a_body_above_the_low_speed_rate_completes() {
     block_on(async {
-        // 100 bytes every 50ms is about 2000 bytes per second, against a rule
-        // of 1000 for one second, for about two samples.
+        // 100 bytes each 50ms is about 2000 bytes per second, for about two
+        // samples. The rule is 1000 bytes per second for one second.
         let (addr, _) = trickling_server(true, &TRICKLED, 100, Duration::from_millis(50)).await;
         let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
         options.low_speed = low_speed(1000, 1000);
@@ -3894,15 +3944,16 @@ fn a_body_above_the_low_speed_rate_completes() {
     });
 }
 
-/// A body that arrives in bursts completes while the rate over the samples so
-/// far stays above the limit, though a whole second passes with no byte. Held
-/// to the limit one second at a time, the body would fail.
+/// A body that arrives in bursts completes while the rate over all samples so
+/// far stays more than the limit. This is also true when a full second passes with
+/// no byte. A check that applies the limit to each second alone fails this
+/// body.
 #[test]
 fn a_bursty_body_above_the_low_speed_rate_completes() {
     block_on(async {
-        // 2600 bytes, and the other 1496 bytes 2.5 seconds later: the second
-        // second carries nothing, and the rate over two seconds is 1300 bytes
-        // per second, against a rule of 1000 for one second.
+        // 2600 bytes, then the other 1496 bytes 2.5 seconds later. The second
+        // second carries nothing. The rate over two seconds is 1300 bytes per
+        // second, and the rule is 1000 bytes per second for one second.
         let (addr, requests) =
             trickling_server(true, &TRICKLED, 2600, Duration::from_millis(2500)).await;
         let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
@@ -3918,9 +3969,9 @@ fn a_bursty_body_above_the_low_speed_rate_completes() {
     });
 }
 
-/// A head that never arrives fails the attempt once the rule's time, rounded up
-/// to a whole second, has passed, well before the progress window, and the
-/// failure is retryable.
+/// If a head never arrives, the attempt fails after the time of the rule,
+/// rounded up to a full second. This is long before the end of the progress
+/// window. The failure is retryable.
 #[test]
 fn a_head_that_never_arrives_fails_after_the_low_speed_time() {
     block_on(async {
@@ -3947,16 +3998,16 @@ fn a_head_that_never_arrives_fails_after_the_low_speed_time() {
     });
 }
 
-/// The low-speed rate of a body is measured from its first read, so a body its
-/// consumer leaves unread for longer than one sample is not failed for it.
+/// The low-speed rate of a body starts at its first read. If the consumer
+/// leaves a body unread for longer than one sample, the body does not fail.
 #[test]
 fn the_low_speed_rate_is_measured_from_the_first_read() {
     block_on(async {
         let (addr, _) = trickling_server(true, &TRICKLED, TRICKLED.len(), Duration::ZERO).await;
         let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
-        // A limit above the whole body: a sample taken while the body is read
-        // fails it, so the body completes only if the reads end before the
-        // first sample is due, one second after the first read.
+        // The limit is more than the full body, so a sample during the reads
+        // fails the body. The body completes only if the reads end before the
+        // first sample, one second after the first read.
         options.low_speed = low_speed(1_000_000, 1000);
         options.max_retries = 0;
         let fetcher = Fetcher::new(options).await.unwrap();
@@ -3967,7 +4018,7 @@ fn the_low_speed_rate_is_measured_from_the_first_read() {
     });
 }
 
-/// A low-speed rule holding a zero measures nothing, and is refused.
+/// A low-speed rule with a zero measures nothing, so the fetcher refuses it.
 #[test]
 fn a_low_speed_rule_with_a_zero_is_refused() {
     block_on(async {
@@ -3982,14 +4033,16 @@ fn a_low_speed_rule_with_a_zero_is_refused() {
 
 // --- uploads ---------------------------------------------------------------
 
-/// The longest an upload test runs before it fails rather than hangs.
+/// The longest time that an upload test runs. Then the test fails, so it does
+/// not hang.
 const UPLOAD_TEST_LIMIT: Duration = Duration::from_secs(60);
 
-/// The piece sizes a streamed upload writes in, in turn: none of them is a
-/// frame or a buffer size, so a piece crosses frame boundaries at every offset.
+/// The piece sizes in which a streamed upload writes, in turn. No size is a
+/// frame size or a buffer size, so the pieces cross frame boundaries at each
+/// offset.
 const PIECES: [usize; 6] = [1, 7, 4096, 65_535, 100_003, 13];
 
-/// Run `future`, failing the test if it runs past [`UPLOAD_TEST_LIMIT`].
+/// Runs `future` and fails the test if it runs past [`UPLOAD_TEST_LIMIT`].
 async fn bounded<F: Future>(future: F) -> F::Output {
     or(future, async {
         Timer::after(UPLOAD_TEST_LIMIT).await;
@@ -3998,7 +4051,7 @@ async fn bounded<F: Future>(future: F) -> F::Output {
     .await
 }
 
-/// Wait until `done` holds, failing the test after five seconds.
+/// Waits until `done` returns `true`, and fails the test after five seconds.
 async fn eventually(what: &str, done: impl Fn() -> bool) {
     let started = Instant::now();
     while !done() {
@@ -4007,8 +4060,8 @@ async fn eventually(what: &str, done: impl Fn() -> bool) {
     }
 }
 
-/// `len` bytes of a pattern in which a lost, a repeated, or a moved piece
-/// changes the digest.
+/// Returns `len` bytes of a pattern. A lost, a repeated, or a moved piece
+/// changes the digest of the pattern.
 fn upload_data(len: usize) -> Vec<u8> {
     (0..len)
         .map(|i| (i % 251) as u8 ^ (i >> 12) as u8)
@@ -4019,14 +4072,14 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-/// Check that the server read `data` whole as the body of `seen`.
+/// Asserts that the server read all of `data` as the body of `seen`.
 fn assert_body(seen: &Seen, data: &[u8]) {
     assert!(seen.body_complete, "the body of {} ended short", seen.path);
     assert_eq!(seen.body_len, data.len() as u64);
     assert_eq!(seen.body_sha256, sha256(data));
 }
 
-/// Write `data` into `writer` in the sizes of [`PIECES`], then close it.
+/// Writes `data` into `writer` in the sizes of [`PIECES`], then closes it.
 async fn write_in_pieces(mut writer: UploadWriter, data: &[u8]) -> io::Result<()> {
     let mut at = 0;
     for piece in PIECES.iter().cycle() {
@@ -4040,8 +4093,8 @@ async fn write_in_pieces(mut writer: UploadWriter, data: &[u8]) -> io::Result<()
     writer.close().await
 }
 
-/// Run `request`, whose body is the channel of `writer`, while `data` is
-/// written into it, and give the result of each.
+/// Runs `request`, whose body is the channel of `writer`, while it writes
+/// `data` into `writer`. Returns the result of each.
 async fn upload_streamed(
     fetcher: &Fetcher,
     request: UploadRequest<'_>,
@@ -4051,7 +4104,7 @@ async fn upload_streamed(
     futures_lite::future::zip(fetcher.upload(request), write_in_pieces(writer, data)).await
 }
 
-/// Upload `data` as a streamed `POST` to `path`, and give the status, the
+/// Uploads `data` as a streamed `POST` to `path`. Returns the status, the
 /// protocol, and the response body.
 async fn post_streamed(fetcher: &Fetcher, path: &str, data: &[u8]) -> (u16, Protocol, Vec<u8>) {
     let (body, writer) = UploadBody::channel();
@@ -4063,7 +4116,7 @@ async fn post_streamed(fetcher: &Fetcher, path: &str, data: &[u8]) -> (u16, Prot
     (status, protocol, read_uploaded(uploaded).await)
 }
 
-/// Read the response body of an upload to its end.
+/// Reads the response body of an upload to its end.
 async fn read_uploaded(uploaded: Uploaded) -> Vec<u8> {
     let mut body = uploaded.into_body();
     let mut out = Vec::new();
@@ -4071,7 +4124,7 @@ async fn read_uploaded(uploaded: Uploaded) -> Vec<u8> {
     out
 }
 
-/// The error an upload failed with.
+/// Runs `request` and returns the error of the failed upload.
 async fn upload_error(fetcher: &Fetcher, request: UploadRequest<'_>) -> Error {
     match fetcher.upload(request).await {
         Ok(uploaded) => panic!("the upload was expected to fail, got {}", uploaded.status()),
@@ -4079,8 +4132,8 @@ async fn upload_error(fetcher: &Fetcher, request: UploadRequest<'_>) -> Error {
     }
 }
 
-/// Options for a fetcher at `url` that trusts the fixture authority and
-/// reaches every origin directly.
+/// Returns the options of a fetcher at `url` that trusts the fixture authority
+/// and connects to each origin directly.
 fn upload_options(url: impl Into<String>) -> FetcherOptions {
     FetcherOptions {
         tls: tls_options(None),
@@ -4088,7 +4141,7 @@ fn upload_options(url: impl Into<String>) -> FetcherOptions {
     }
 }
 
-/// A TLS transport offering `alpn` alone.
+/// Returns a TLS transport that offers only `alpn`.
 fn tls_transport(alpn: &'static str) -> Transport {
     Transport::Tls {
         alpn: vec![alpn],
@@ -4096,12 +4149,12 @@ fn tls_transport(alpn: &'static str) -> Transport {
     }
 }
 
-/// A loopback port held by a socket that is bound and does not listen.
+/// A loopback port that a bound socket holds. The socket does not listen.
 ///
-/// While the value lives, a connect to the port is refused and no IPv4 or
+/// While the value exists, a connect to the port is refused. No IPv4 or
 /// dual-stack bind to port 0 gets the port number. A server that sets
-/// `SO_REUSEADDR`, as both runtime backends do, can still bind the port
-/// explicitly.
+/// `SO_REUSEADDR` can still bind the port explicitly. Both runtime backends set
+/// it.
 struct ReservedPort {
     port: u16,
     _socket: OwnedFd,
@@ -4124,8 +4177,8 @@ fn reserved_port() -> ReservedPort {
     }
 }
 
-/// Read `body` until at least `bytes` have arrived or it ends, and give the
-/// count that arrived.
+/// Reads `body` until at least `bytes` arrive or the body ends. Returns the
+/// number of bytes that arrived.
 async fn read_at_least(body: &mut Incoming, bytes: u64) -> u64 {
     let mut read = 0;
     while read < bytes {
@@ -4141,9 +4194,9 @@ async fn read_at_least(body: &mut Incoming, bytes: u64) -> u64 {
     read
 }
 
-/// A handler that reads `bytes` of the request body and then ends the exchange
-/// with no answer: an HTTP/1.1 connection closes, and an HTTP/2 stream is
-/// reset.
+/// Returns a handler that reads `bytes` of the request body and then ends the
+/// exchange with no answer. An HTTP/1.1 connection closes, and an HTTP/2 stream
+/// is reset.
 fn cut_after(bytes: u64) -> StreamHandler {
     Arc::new(move |request| {
         Box::pin(async move {
@@ -4154,8 +4207,8 @@ fn cut_after(bytes: u64) -> StreamHandler {
     })
 }
 
-/// A handler that reads the whole request body and then gives no answer:
-/// with `close`, it ends the exchange, and without, it never answers.
+/// Returns a handler that reads the full request body and gives no answer. If
+/// `close` is `true`, the handler ends the exchange. If not, it never answers.
 fn no_answer_after_the_body(close: bool) -> StreamHandler {
     Arc::new(move |request| {
         Box::pin(async move {
@@ -4169,8 +4222,8 @@ fn no_answer_after_the_body(close: bool) -> StreamHandler {
     })
 }
 
-/// A peer that accepts connections and never reads from them, so a client
-/// writing to one fills the socket buffers and then stalls.
+/// Starts a peer that accepts connections and never reads from them. A client
+/// that writes to one fills the socket buffers and then stalls.
 async fn silent_reader() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -4185,8 +4238,8 @@ async fn silent_reader() -> SocketAddr {
     addr
 }
 
-/// A front that closes the first connection it accepts before a byte crosses
-/// it, and carries every later one to `target`.
+/// Starts a front that closes the first accepted connection before a byte
+/// crosses it. It carries each later connection to `target`.
 async fn dropping_front(target: SocketAddr) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -4222,11 +4275,14 @@ async fn dropping_front(target: SocketAddr) -> SocketAddr {
     addr
 }
 
-/// A streamed `POST` reaches the server whole -- its method, its path, its
-/// length, and its digest -- over cleartext HTTP/1.1, where it travels
-/// chunked, over HTTP/1.1 on TLS, and over HTTP/2, where the body is larger
-/// than the flow-control window. The fetcher sets no `Content-Type` and no
-/// `Expect`.
+/// A streamed `POST` reaches the server complete: its method, its path, its
+/// length, and its digest. The test uses three transports:
+///
+/// - cleartext HTTP/1.1, where the body travels chunked
+/// - HTTP/1.1 on TLS
+/// - HTTP/2, where the body is larger than the flow-control window
+///
+/// The fetcher sets no `Content-Type` and no `Expect`.
 #[test]
 fn a_streamed_post_arrives_intact_over_http1_tls_and_http2() {
     block_on(bounded(async {
@@ -4260,7 +4316,7 @@ fn a_streamed_post_arrives_intact_over_http1_tls_and_http2() {
     }));
 }
 
-/// The body streams: the server reads part of it while the writer still holds
+/// The body streams. The server reads part of it while the writer still holds
 /// it open.
 #[test]
 fn a_streamed_body_reaches_the_server_before_the_writer_closes_it() {
@@ -4293,8 +4349,8 @@ fn a_streamed_body_reaches_the_server_before_the_writer_closes_it() {
     }));
 }
 
-/// A body given whole declares its length, over HTTP/1.1 and over HTTP/2, and
-/// an empty `POST` declares a length of zero.
+/// A body given whole declares its length, over HTTP/1.1 and over HTTP/2. An
+/// empty `POST` declares a length of zero.
 #[test]
 fn a_whole_body_declares_its_length() {
     block_on(bounded(async {
@@ -4330,8 +4386,8 @@ fn a_whole_body_declares_its_length() {
     }));
 }
 
-/// A streamed `POST` to a cleartext origin travels to the proxy in absolute
-/// form, and the proxy carries the body on whole.
+/// A streamed `POST` to a cleartext origin goes to the proxy in absolute form,
+/// and the proxy forwards the complete body.
 #[test]
 fn a_streamed_post_travels_through_the_proxy() {
     block_on(bounded(async {
@@ -4360,8 +4416,8 @@ fn a_streamed_post_travels_through_the_proxy() {
     }));
 }
 
-/// A streamed `POST` to a TLS origin travels over a `CONNECT` tunnel, with
-/// HTTP/1.1 or HTTP/2 inside it as ALPN selects.
+/// A streamed `POST` to a TLS origin travels over a `CONNECT` tunnel. In the
+/// tunnel, ALPN selects HTTP/1.1 or HTTP/2.
 #[test]
 fn a_streamed_post_tunnels_through_the_proxy_over_http1_and_http2() {
     block_on(bounded(async {
@@ -4388,7 +4444,7 @@ fn a_streamed_post_tunnels_through_the_proxy_over_http1_and_http2() {
 }
 
 /// A bearer token and Basic credentials each reach the server as the
-/// `Authorization` of the upload.
+/// `Authorization` header of the upload.
 #[test]
 fn a_bearer_token_and_basic_credentials_reach_the_server() {
     block_on(bounded(async {
@@ -4426,8 +4482,8 @@ fn a_bearer_token_and_basic_credentials_reach_the_server() {
     }));
 }
 
-/// Two credentials for one header, and a token outside the token68 syntax,
-/// are refused before admission: no connection is opened, and the writer of
+/// The fetcher refuses two credentials for one header, and a token outside the
+/// token68 syntax, before admission. It opens no connection, and the writer of
 /// a streamed body gets a broken pipe.
 #[test]
 fn an_ambiguous_or_malformed_credential_reaches_no_server() {
@@ -4502,7 +4558,7 @@ fn an_ambiguous_or_malformed_credential_reaches_no_server() {
     }));
 }
 
-/// A credential bound for a cleartext origin is refused unless the request
+/// The fetcher refuses a credential for a cleartext origin, unless the request
 /// allows it.
 #[test]
 fn an_upload_credential_to_a_cleartext_origin_is_refused_unless_allowed() {
@@ -4540,8 +4596,8 @@ fn an_upload_credential_to_a_cleartext_origin_is_refused_unless_allowed() {
     }));
 }
 
-/// A 307 followed onto another origin sends the body again and leaves the
-/// credential with the origin the route named.
+/// The fetcher follows a 307 to another origin and sends the body again. The
+/// credential stays with the origin that the route named.
 #[test]
 fn a_followed_upload_redirect_leaves_the_credentials_at_the_named_origin() {
     block_on(bounded(async {
@@ -4582,8 +4638,9 @@ fn a_followed_upload_redirect_leaves_the_credentials_at_the_named_origin() {
     }));
 }
 
-/// A refused connection sends nothing, so the upload is tried again, and the
-/// streamed body arrives whole on the one request that reaches the server.
+/// A refused connection sends nothing, so the fetcher tries the upload again.
+/// The streamed body arrives complete on the one request that reaches the
+/// server.
 #[test]
 fn a_refused_connection_is_retried_with_the_body_intact() {
     block_on(bounded(async {
@@ -4616,8 +4673,8 @@ fn a_refused_connection_is_retried_with_the_body_intact() {
     }));
 }
 
-/// An upload refused by the first mirror before it was sent goes on to the
-/// next one.
+/// If the first mirror refuses an upload before it is sent, the upload goes to
+/// the next mirror.
 #[test]
 fn an_unsent_upload_moves_on_to_the_next_mirror() {
     block_on(bounded(async {
@@ -4653,8 +4710,8 @@ fn an_unsent_upload_moves_on_to_the_next_mirror() {
     }));
 }
 
-/// A connection closed before the TLS handshake sends nothing, so the upload
-/// is tried again over a new one.
+/// A connection that closes before the TLS handshake sends nothing, so the
+/// fetcher tries the upload again over a new connection.
 #[test]
 fn a_tls_handshake_dropped_on_the_first_connection_is_retried() {
     block_on(bounded(async {
@@ -4676,8 +4733,9 @@ fn a_tls_handshake_dropped_on_the_first_connection_is_retried() {
     }));
 }
 
-/// A tunnel the proxy refuses with 503 is tried again, and the upload goes
-/// through on the next round. A 407 refuses the credential, so it is final.
+/// If the proxy refuses a tunnel with 503, the fetcher tries again, and the
+/// upload succeeds on the next round. A 407 refuses the credential, so it is
+/// final.
 #[test]
 fn a_refused_tunnel_is_retried_at_503_and_final_at_407() {
     block_on(bounded(async {
@@ -4712,9 +4770,9 @@ fn a_refused_tunnel_is_retried_at_503_and_final_at_407() {
     }));
 }
 
-/// Rounds that run out before the request is sent report the error a fetch
-/// reports. The writer waits through the rounds with no stall window, since
-/// nothing has taken the body, and then gets a broken pipe.
+/// If the rounds end before the request is sent, the upload reports the same
+/// error as a fetch. The writer waits through the rounds with no stall window,
+/// because nothing took the body. Then it gets a broken pipe.
 #[test]
 fn retries_that_run_out_before_sending_report_a_fetch_error() {
     block_on(bounded(async {
@@ -4744,9 +4802,9 @@ fn retries_that_run_out_before_sending_report_a_fetch_error() {
     }));
 }
 
-/// A writer whose slot is full while the upload waits out the backoff between
-/// rounds has no stall window: the window starts when the request is handed
-/// over, so the body arrives whole once a round reaches the server.
+/// A writer with a full slot has no stall window while the upload waits for the
+/// backoff between rounds. The window starts when the fetcher hands over the
+/// request, so the body arrives complete when a round reaches the server.
 #[test]
 fn a_writer_waiting_through_the_retry_rounds_does_not_time_out() {
     block_on(bounded(async {
@@ -4780,8 +4838,8 @@ fn a_writer_waiting_through_the_retry_rounds_does_not_time_out() {
     }));
 }
 
-/// A writer whose slot is full while the upload waits at the gate has no
-/// stall window either.
+/// A writer with a full slot also has no stall window while the upload waits at
+/// the admission gate.
 #[test]
 fn a_writer_waiting_at_the_gate_does_not_time_out() {
     block_on(bounded(async {
@@ -4819,9 +4877,9 @@ fn a_writer_waiting_at_the_gate_does_not_time_out() {
     }));
 }
 
-/// A writer dropped before the upload hands its request over leaves a body
-/// that fails, so the request is never sent: the upload fails as unsent, and
-/// the server sees no request of it.
+/// If the writer is dropped before the upload hands over its request, the body
+/// fails, so the fetcher never sends the request. The upload fails as unsent,
+/// and the server sees no request from it.
 #[test]
 fn a_writer_dropped_before_the_hand_over_sends_nothing() {
     block_on(bounded(async {
@@ -4856,9 +4914,9 @@ fn a_writer_dropped_before_the_hand_over_sends_nothing() {
     }));
 }
 
-/// The fetch timeout bounds an upload that is never handed over: a peer that
-/// takes the connection and never completes the TLS handshake fails the
-/// upload as unsent, and the writer then gets a broken pipe.
+/// The fetch timeout limits an upload that the fetcher never hands over. If a
+/// peer takes the connection and never completes the TLS handshake, the upload
+/// fails as unsent. The writer then gets a broken pipe.
 #[test]
 fn the_fetch_timeout_bounds_an_upload_before_the_hand_over() {
     block_on(bounded(async {
@@ -4882,8 +4940,8 @@ fn the_fetch_timeout_bounds_an_upload_before_the_hand_over() {
     }));
 }
 
-/// A body the server cuts short was sent in part, so the upload fails as
-/// interrupted, and neither another round nor another mirror is asked.
+/// A body that the server cuts short was sent in part, so the upload fails as
+/// interrupted. The fetcher asks no other round and no other mirror.
 #[test]
 fn a_body_cut_short_by_the_server_is_not_sent_again() {
     block_on(bounded(async {
@@ -4917,8 +4975,9 @@ fn a_body_cut_short_by_the_server_is_not_sent_again() {
     }));
 }
 
-/// Every status that follows the whole body is the caller's answer, the
-/// retryable ones of a fetch included: one request, and no other mirror.
+/// Each status after the full body is the answer for the caller. This includes
+/// the statuses that are retryable for a fetch. The fetcher sends one request
+/// and asks no other mirror.
 #[test]
 fn every_status_after_the_full_body_is_the_callers_answer() {
     block_on(bounded(async {
@@ -4942,8 +5001,8 @@ fn every_status_after_the_full_body_is_the_callers_answer() {
     }));
 }
 
-/// A server that takes the whole body and closes without an answer leaves the
-/// outcome unknown: the upload is interrupted, and nothing is asked again.
+/// If a server takes the full body and closes with no answer, the outcome is
+/// unknown. The upload is interrupted, and the fetcher asks nothing again.
 #[test]
 fn a_full_body_with_no_answer_is_interrupted() {
     block_on(bounded(async {
@@ -4969,9 +5028,9 @@ fn a_full_body_with_no_answer_is_interrupted() {
     }));
 }
 
-/// The wait for the head starts when the body ends and lasts the response
-/// timeout, past which the upload is interrupted. The fetch timeout ends at
-/// the hand-over, so a shorter one does not cut the wait.
+/// The wait for the head starts when the body ends and lasts for the response
+/// timeout. After that time, the upload is interrupted. The fetch timeout ends
+/// at the hand-over, so a shorter fetch timeout does not cut the wait.
 #[test]
 fn a_head_that_stalls_past_the_response_timeout_is_interrupted() {
     block_on(bounded(async {
@@ -5000,8 +5059,8 @@ fn a_head_that_stalls_past_the_response_timeout_is_interrupted() {
     }));
 }
 
-/// An HTTP/2 stream the server resets after part of the body ends the upload
-/// as interrupted, with no other request.
+/// If the server resets an HTTP/2 stream after part of the body, the upload
+/// ends as interrupted, with no other request.
 #[test]
 fn an_http2_stream_reset_after_part_of_the_body_is_interrupted() {
     block_on(bounded(async {
@@ -5031,9 +5090,10 @@ fn an_http2_stream_reset_after_part_of_the_body_is_interrupted() {
     }));
 }
 
-/// A 307 or a 308 is followed for a body given whole, with the method kept and
-/// the bytes sent again. A streamed body is not followed, and neither is a
-/// 302: each is delivered as its status.
+/// The fetcher follows a 307 or a 308 for a body given whole. It keeps the
+/// method and sends the bytes again. It does not follow a redirect for a
+/// streamed body, and it does not follow a 302. The upload delivers each of
+/// these as its status.
 #[test]
 fn an_upload_follows_307_and_308_for_a_whole_body_alone() {
     block_on(bounded(async {
@@ -5090,8 +5150,8 @@ fn an_upload_follows_307_and_308_for_a_whole_body_alone() {
     }));
 }
 
-/// A declared response length over the cap fails the upload after its one
-/// request, whatever the status.
+/// If the declared response length is more than the cap, the upload fails after
+/// its one request, for each status.
 #[test]
 fn a_declared_response_over_the_cap_fails_after_one_request() {
     block_on(bounded(async {
@@ -5135,8 +5195,8 @@ fn a_declared_response_over_the_cap_fails_after_one_request() {
     }));
 }
 
-/// A response body that outgrows the cap while it streams fails the read, and
-/// every read after it.
+/// If a response body grows past the cap while it streams, the read fails, and
+/// each later read fails too.
 #[test]
 fn a_chunked_response_past_the_cap_fails_the_read_and_stays_failed() {
     block_on(bounded(async {
@@ -5171,8 +5231,8 @@ fn a_chunked_response_past_the_cap_fails_the_read_and_stays_failed() {
     }));
 }
 
-/// A response that declares a coding is refused. The request was sent, so the
-/// upload is interrupted, and the message names the coding.
+/// The fetcher refuses a response that declares a coding. The request was sent,
+/// so the upload is interrupted, and the message names the coding.
 #[test]
 fn a_coded_response_to_an_upload_is_refused() {
     block_on(bounded(async {
@@ -5204,8 +5264,8 @@ fn a_coded_response_to_an_upload_is_refused() {
     }));
 }
 
-/// A writer dropped before close fails the body: the upload is interrupted,
-/// and the server reads a body that never reaches its end.
+/// A writer dropped before close fails the body. The upload is interrupted, and
+/// the server reads a body that never gets to its end.
 #[test]
 fn a_writer_dropped_before_close_interrupts_the_upload() {
     block_on(bounded(async {
@@ -5235,9 +5295,8 @@ fn a_writer_dropped_before_close_interrupts_the_upload() {
     }));
 }
 
-/// Against a server that never reads, the frame in the slot waits past the
-/// stall window: the write fails with a timeout, and the upload is
-/// interrupted.
+/// If a server never reads, the frame in the slot waits past the stall window.
+/// The write fails with a timeout, and the upload is interrupted.
 #[test]
 fn a_writer_stalls_against_a_server_that_never_reads() {
     block_on(bounded(async {
@@ -5250,8 +5309,8 @@ fn a_writer_stalls_against_a_server_that_never_reads() {
         .await
         .unwrap();
         let (body, mut writer) = UploadBody::channel();
-        // The body is made as it is written, and the socket buffers fill long
-        // before the bound.
+        // The writer makes the body as it writes it. The socket buffers fill
+        // long before the bound of 1 GiB.
         let written = async move {
             let piece = vec![0u8; 64 * 1024];
             let mut total = 0u64;
@@ -5275,7 +5334,7 @@ fn a_writer_stalls_against_a_server_that_never_reads() {
     }));
 }
 
-/// Once the upload is done with the body, a write fails with a broken pipe.
+/// When the upload no longer uses the body, a write fails with a broken pipe.
 #[test]
 fn a_write_after_the_upload_ended_is_a_broken_pipe() {
     block_on(bounded(async {
@@ -5284,8 +5343,8 @@ fn a_write_after_the_upload_ended_is_a_broken_pipe() {
             .await
             .unwrap();
         let (body, mut writer) = UploadBody::channel();
-        // One frame waits in the slot and one in the writer, so the server
-        // has its 64 KiB without another write.
+        // One frame waits in the slot and one in the writer, so the server gets
+        // its 64 KiB with no other write.
         writer.write_all(&upload_data(128 * 1024)).await.unwrap();
         let err = upload_error(&fetcher, UploadRequest::path("objects", body)).await;
         assert!(matches!(err, Error::UploadInterrupted { .. }), "{err}");
@@ -5299,8 +5358,8 @@ fn a_write_after_the_upload_ended_is_a_broken_pipe() {
     }));
 }
 
-/// A `DELETE` reaches the server with no body and no framing headers, and a
-/// `DELETE` that carries a body is refused before admission.
+/// A `DELETE` reaches the server with no body and no framing headers. The
+/// fetcher refuses a `DELETE` that carries a body before admission.
 #[test]
 fn a_delete_reaches_the_server_with_no_body() {
     block_on(bounded(async {
@@ -5338,10 +5397,11 @@ fn a_delete_reaches_the_server_with_no_body() {
     }));
 }
 
-/// An upload takes an HTTP/1.1 connection that went idle a short time ago,
-/// and its connection goes back to the pool once its response body ends, so
-/// a fetch and two sequential uploads travel over one connection. HTTP/2
-/// connections are shared.
+/// An upload takes an HTTP/1.1 connection that became idle a short time ago.
+/// Its connection goes back to the pool when its response body ends, so a fetch
+/// and the three sequential uploads after it use one connection. Two uploads
+/// send a whole body, and one sends a streamed body. HTTP/2 connections are
+/// shared.
 #[test]
 fn sequential_uploads_reuse_one_http1_connection_and_share_http2() {
     block_on(bounded(async {
@@ -5370,8 +5430,8 @@ fn sequential_uploads_reuse_one_http1_connection_and_share_http2() {
         read_uploaded(uploaded.unwrap()).await;
         assert_eq!(server.requests(), 4);
         assert_eq!(server.connections(), 1);
-        // Two fetches in flight at once: the pool holds one connection, so
-        // the second opens another.
+        // Two fetches in progress at the same time. The pool holds one
+        // connection, so the second fetch opens another.
         let first = fetcher.fetch(FetchRequest::path("config")).await.unwrap();
         let second = fetcher.fetch(FetchRequest::path("config")).await.unwrap();
         assert_eq!(server.connections(), 2);
@@ -5394,10 +5454,10 @@ fn sequential_uploads_reuse_one_http1_connection_and_share_http2() {
     }));
 }
 
-/// A response head that arrives before the end of the request body is an
-/// early answer. The connection of that upload does not go back to the pool,
-/// also when the writer then ends the body cleanly and the response is read
-/// to its end, so the next upload opens a new connection.
+/// A response head that arrives before the end of the request body is an early
+/// answer. The connection of that upload does not go back to the pool. This is
+/// also true when the writer then ends the body cleanly and the response is
+/// read to its end. The next upload opens a new connection.
 #[test]
 fn an_early_answer_keeps_the_http1_connection_out_of_the_pool() {
     block_on(bounded(async {
@@ -5405,7 +5465,7 @@ fn an_early_answer_keeps_the_http1_connection_out_of_the_pool() {
             Box::pin(async move {
                 let mut body = request.into_body();
                 read_at_least(&mut body, 1024).await;
-                // The rest of the body is read after the answer.
+                // The handler reads the rest of the body after the answer.
                 drop(spawn(async move {
                     read_at_least(&mut body, u64::MAX).await;
                 }));
@@ -5430,8 +5490,8 @@ fn an_early_answer_keeps_the_http1_connection_out_of_the_pool() {
         )
         .await;
         let uploaded = uploaded.unwrap();
-        // The head has arrived. The body now ends cleanly, and the response
-        // is read to its end.
+        // The head arrived. Now the body ends cleanly, and the test reads the
+        // response to its end.
         writer.write_all(&[7u8; 1024]).await.unwrap();
         writer.close().await.unwrap();
         assert_eq!(read_uploaded(uploaded).await, b"early");
@@ -5450,8 +5510,8 @@ fn an_early_answer_keeps_the_http1_connection_out_of_the_pool() {
     }));
 }
 
-/// An HTTP/1.1 connection that has been idle for two seconds or more stays
-/// in the pool for a fetch, and an upload opens a new connection.
+/// If an HTTP/1.1 connection is idle for two seconds or more, an upload opens a
+/// new connection. The idle connection stays in the pool for a fetch.
 #[test]
 fn an_upload_does_not_take_a_connection_idle_for_two_seconds() {
     block_on(bounded(async {
@@ -5467,15 +5527,15 @@ fn an_upload_does_not_take_a_connection_idle_for_two_seconds() {
             .unwrap();
         read_uploaded(uploaded).await;
         assert_eq!(server.connections(), 2);
-        // The fetch takes the connection that the upload did not.
+        // The fetch takes the connection that the upload did not take.
         fetch_bytes(&fetcher, "config").await;
         assert_eq!(server.connections(), 2);
     }));
 }
 
-/// A pooled connection that the server closed while it was idle does not
-/// carry an upload: the upload goes over a new connection with no round
-/// spent, so it succeeds with no retry allowed.
+/// An upload does not use a pooled connection that the server closed while it
+/// was idle. The upload uses a new connection and spends no round, so it
+/// succeeds with no retry allowed.
 #[test]
 fn an_upload_does_not_use_an_idle_connection_the_server_closed() {
     block_on(bounded(async {
@@ -5486,8 +5546,8 @@ fn an_upload_does_not_use_an_idle_connection_the_server_closed() {
         let accepted = Arc::new(AtomicUsize::new(0));
         let counter = accepted.clone();
         drop(spawn(async move {
-            // Each connection carries one exchange, and the server then
-            // closes it with no `Connection: close`.
+            // Each connection carries one exchange. Then the server closes it
+            // with no `Connection: close`.
             while let Ok((mut stream, _peer)) = listener.accept().await {
                 counter.fetch_add(1, Ordering::SeqCst);
                 let mut request = [0u8; 1024];
@@ -5515,8 +5575,8 @@ fn an_upload_does_not_use_an_idle_connection_the_server_closed() {
     }));
 }
 
-/// The response body of an upload holds its admission permit until it ends,
-/// and its bytes reach the counters of the fetcher.
+/// The response body of an upload holds its admission permit until it ends. Its
+/// bytes reach the counters of the fetcher.
 #[test]
 fn an_upload_response_holds_its_permit_and_is_counted() {
     block_on(bounded(async {
@@ -5556,7 +5616,7 @@ fn an_upload_response_holds_its_permit_and_is_counted() {
     }));
 }
 
-/// The upload future travels between threads with its writer.
+/// The upload future and its writer can move between threads.
 #[test]
 fn the_upload_future_is_send() {
     fn assert_send<T: Send>(_: &T) {}
@@ -5571,10 +5631,10 @@ fn the_upload_future_is_send() {
     });
 }
 
-/// A body given whole travels in frames, and the window for the response head
-/// starts when hyper takes the last of them. A server that stops reading for
-/// longer than the response timeout, and then reads the rest at once, answers
-/// within the window.
+/// A body given whole travels in frames. The window for the response head
+/// starts when hyper takes the last frame. If a server stops reading for longer
+/// than the response timeout and then reads the rest at once, it answers within
+/// the window.
 #[test]
 fn a_whole_body_streams_in_frames_before_the_response_window() {
     block_on(bounded(async {
@@ -5623,9 +5683,11 @@ fn a_whole_body_streams_in_frames_before_the_response_window() {
 }
 
 /// An HTTP/2 server that lets one stream open at a time on each connection.
-/// A request for `/held` gets a response head and a body that never ends,
-/// which keeps its stream open. Every other request has its body read and
-/// recorded, and gets a 200. Once `cut` is set, the first connection closes.
+///
+/// A request for `/held` gets a response head and a body that never ends, which
+/// keeps its stream open. The server reads and records the body of each other
+/// request and answers it with a 200. When `cut` is set, the first connection
+/// closes.
 struct OneStreamServer {
     addr: SocketAddr,
     seen: Arc<Mutex<Vec<Seen>>>,
@@ -5709,9 +5771,9 @@ impl OneStreamServer {
     }
 }
 
-/// A body given whole on an HTTP/2 stream that never opens, because the
-/// server has no stream to spare, is bounded by the stall window: its first
-/// frame is not taken, and the upload is interrupted.
+/// The stall window limits a body given whole on an HTTP/2 stream that never
+/// opens, because the server has no free stream. The connection does not take
+/// the first frame, and the upload is interrupted.
 #[test]
 fn a_whole_body_on_a_stream_that_never_opens_is_bounded() {
     block_on(bounded(async {
@@ -5744,10 +5806,11 @@ fn a_whole_body_on_a_stream_that_never_opens_is_bounded() {
     }));
 }
 
-/// A request that hyper gives back unsent spends a round and is sent on the
-/// next one. The upload waits in the queue of an HTTP/2 connection behind a
-/// stream that cannot open, and the connection closes: hyper returns the
-/// queued request, and the next round sends it over a new connection.
+/// If hyper gives back a request unsent, the request spends a round, and the
+/// next round sends it. Here the upload waits in the queue of an HTTP/2
+/// connection behind a stream that cannot open. Then the connection closes,
+/// hyper returns the queued request, and the next round sends it over a new
+/// connection.
 #[test]
 fn a_request_given_back_unsent_is_sent_on_the_next_round() {
     block_on(bounded(async {
@@ -5759,8 +5822,8 @@ fn a_request_given_back_unsent_is_sent_on_the_next_round() {
         .await
         .unwrap();
         let held = fetcher.fetch(FetchRequest::path("held")).await.unwrap();
-        // A second fetch waits for a stream to open, so the connection takes
-        // no further request from its queue.
+        // A second fetch waits for a stream to open, so the connection takes no
+        // other request from its queue.
         let blocked = spawn({
             let fetcher = fetcher.clone();
             async move {
@@ -5793,9 +5856,9 @@ fn a_request_given_back_unsent_is_sent_on_the_next_round() {
     }));
 }
 
-/// A server that answers before it has read the streamed body, and keeps
-/// reading, does not get the rest of it: once the response has ended, the
-/// body fails, and the writer gets a broken pipe.
+/// If a server answers before it reads the streamed body and continues to read,
+/// it does not get the rest of the body. When the response ends, the body
+/// fails, and the writer gets a broken pipe.
 #[test]
 fn an_early_answer_ends_the_streamed_body() {
     block_on(bounded(async {
@@ -5853,8 +5916,8 @@ fn an_early_answer_ends_the_streamed_body() {
     }));
 }
 
-/// A `POST` whose streamed body is at its end when the request is handed over
-/// declares a length of zero, over HTTP/1.1 and over HTTP/2.
+/// A `POST` whose streamed body is at its end at the hand-over declares a
+/// length of zero, over HTTP/1.1 and over HTTP/2.
 #[test]
 fn an_empty_streamed_post_declares_a_length_of_zero() {
     block_on(bounded(async {

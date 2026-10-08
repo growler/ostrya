@@ -1,57 +1,15 @@
-//! Static-delta reading and offline application, and the reading a
-//! delta-accelerated pull does over the network.
+//! Static-delta reads, offline application, and the part reads of a pull.
 //!
-//! A static delta is a compact description of the objects that make up a target
-//! commit, optionally expressed as a patch against a source commit. The format
-//! this module reads was recovered by observing the `ostree` tool as a black box
-//! (see `format-reference.md`, "Static delta wire format"). This module reads a
-//! delta -- one the tool wrote or one [`crate::deltagen`] wrote -- and applies it
-//! offline, producing the target commit's objects into the repository.
+//! Maintainer notes. The public items hold the text for the reader:
 //!
-//! A delta directory holds a `superblock` and numbered part files `0`, `1`, ...
-//! The superblock is a GVariant listing the target commit (embedded whole),
-//! per-part checksums and object lists, and any fallback objects; each part is a
-//! compressed GVariant carrying a mode table, an xattr table, a data-source
-//! blob, and an operation stream. Applying a part runs the operation stream
-//! against the data source and the source commit's objects, and every produced
-//! object's checksum is asserted as it is written, so a malformed or misapplied
-//! delta fails rather than storing a wrong object.
+//! - the format, the checks, and the memory rules: [`DeltaSuperblock`] and
+//!   [`Repo::apply_static_delta_offline`]
+//! - the signed envelope: [`DeltaSuperblock::verify`]
+//! - the three passes of a part read: [`DeltaSuperblock::part_stats`]
 //!
-//! Application is memory-bounded, and a part is checked before it is expanded.
-//! The part file is taken in under the size its meta-entry declares and hashed
-//! against the checksum that entry names; the verified bytes then decompress
-//! through `async-compression`'s xz codec into the payload the operations read.
-//! Each blob stays on the heap at or below [`MMAP_THRESHOLD`] and is spilled to a
-//! read-only mmapped temp file above it, so a large part costs address space and
-//! staging space rather than resident heap, and a body that passes its declared
-//! size never reaches the decoder. Splice and bspatch output streams through the
-//! transaction's content writer, and a bspatch source object is spilled to a temp
-//! file the same way, so no whole object is materialized.
-//!
-//! Signed deltas wrap the superblock in a magic-prefixed envelope carrying the
-//! detached signatures; [`Repo::verify_static_delta`] checks them with the
-//! signing engines over the raw superblock bytes, and
-//! [`DeltaSuperblock::verify`] does the same for a superblock file read under
-//! any name.
-//! [`Repo::apply_static_delta`] applies a superblock already read, with the
-//! parts in a directory the caller names, so a caller that verifies a
-//! superblock with [`DeltaSuperblock::verify`] applies the same read and not a
-//! second read of the file.
-//!
-//! An HTTP pull reads a delta through the same superblock parse and part
-//! application, over a fetched response body rather than a part file, and applies
-//! it into the pull's own transaction.
-//!
-//! [`DeltaSuperblock::part_stats`] reads what a part holds -- the table counts,
-//! the blob and operation-stream sizes, and the count of each opcode -- without
-//! applying it. It needs no transaction and no staging directory, so a
-//! read-only repository can report a delta. The payload framing sits at the end
-//! of the payload, so the part is read in up to three passes: one that verifies
-//! the part against its meta-entry with no byte decompressed, one that finds the
-//! framing and keeps the payload's last 1 MiB, and, where that tail does not
-//! hold the operations and the xattr framing, one that reads them. Each pass
-//! holds one fixed-size buffer and the tail, and a compressed pass holds the xz
-//! decoder's state under a 128 MiB limit, whatever the payload size.
+//! An HTTP pull uses the same superblock parse and the same part application.
+//! It reads each part from a fetched response body, and it applies the part
+//! into the transaction of the pull.
 
 use std::ffi::{CStr, CString};
 use std::io::{self, SeekFrom};
@@ -116,30 +74,30 @@ const S_IFMT: u32 = 0o170000;
 /// The symlink file-type bits.
 const S_IFLNK: u32 = 0o120000;
 
-/// The largest superblock accepted. The superblock is read whole onto the heap,
-/// since it is parsed as one GVariant tree, so it is capped at the metadata
-/// ceiling: it holds the embedded target commit (a metadata object) plus the
-/// per-part and fallback tables, all bounded metadata.
+/// The size limit of a superblock. The parse reads the superblock whole onto
+/// the heap as one GVariant tree, so the limit is the metadata limit. The
+/// superblock holds the embedded target commit (a metadata object) and the
+/// part and fallback tables, which are all bounded metadata.
 pub(crate) const MAX_SUPERBLOCK: u64 = crate::object::MAX_METADATA_SIZE;
 
-/// A decompressed part payload or source object at or below this size is kept on
-/// the heap; a larger one is spilled to a temp file and read-only mmapped, so it
-/// costs address space and demand-paged file cache rather than resident heap.
+/// The heap limit of a decompressed part payload or a source object. A larger
+/// one goes to a temp file, mapped read-only. It costs address space and file
+/// cache that loads on demand, and no resident heap.
 pub(crate) const MMAP_THRESHOLD: usize = 128 * 1024;
 
-/// The chunk size for streaming object payloads to and from disk.
+/// The chunk size of the object payload streams to and from disk.
 pub(crate) const IO_CHUNK: usize = 128 * 1024;
 
-/// The largest combined heap footprint accepted for a part's mode and xattr
-/// tables. They are bounded metadata, so they are collected onto the heap and
-/// capped at the metadata ceiling, turning a hostile table size into a
-/// bounded-size failure rather than an unbounded copy.
+/// The limit of the combined heap size of the mode and xattr tables of a part.
+/// The tables are bounded metadata, so they go onto the heap under the
+/// metadata limit. A hostile table size fails at the limit and causes no
+/// unbounded copy.
 pub(crate) const MAX_TABLE_BYTES: usize = crate::object::MAX_METADATA_SIZE as usize;
 
 /// The zero-copy view of a decompressed part payload
 /// `(a(uuu) aa(ayay) ay ay)`: the mode table, the xattr table, the data-source
 /// blob, and the operation stream. The two trailing byte arrays borrow the
-/// backing payload rather than copying it.
+/// backing payload with no copy.
 type PartView<'a> = (
     ArrayIter<'a, (u32, u32, u32)>,
     ArrayIter<'a, ArrayIter<'a, (&'a [u8], &'a [u8])>>,
@@ -147,12 +105,49 @@ type PartView<'a> = (
     &'a [u8],
 );
 
-/// A parsed static-delta superblock: the fields `static-delta show` reports and
-/// what application reads.
+/// A parsed static-delta superblock.
 ///
-/// [`DeltaSuperblock::read`] takes a superblock file, signed or not, and
-/// [`DeltaSuperblock::part_stats`] reads what one part payload holds without
-/// applying it.
+/// A static delta describes the objects of a target commit. It carries them
+/// whole, or as patches against the objects of a source commit. This type
+/// reads a delta that the `ostree` command wrote or that
+/// [`Repo::generate_static_delta`] wrote. It holds the fields that
+/// `ostree static-delta show` reports and the fields that an application
+/// reads.
+///
+/// [`read`](DeltaSuperblock::read) reads a superblock file, signed or not.
+/// [`part_stats`](DeltaSuperblock::part_stats) reads what one part holds
+/// and does not apply it. [`Repo::apply_static_delta`] applies the parsed
+/// superblock.
+///
+/// # Format
+///
+/// The format is observed on the files that the `ostree` command writes. A
+/// delta directory holds a `superblock` file and the part files `0`, `1`, and
+/// so on.
+///
+/// The superblock is a GVariant of type
+/// `(a{sv}tayay(a{sv}aya(say)sstayay)aya(uayttay)a(yaytt))`. Its fields are,
+/// in order:
+///
+/// - the metadata: `ostree.endianness`, a copy of the detached metadata of
+///   the target commit, and the parts that the superblock carries inline
+/// - the generation timestamp, big-endian
+/// - the source commit, empty for a delta from scratch
+/// - the target commit
+/// - the target commit object, embedded whole
+/// - the recursion array, which the `ostree` command and ostrya write empty.
+///   A parse accepts any length, and
+///   [`parent_count`](DeltaSuperblock::parent_count) reports it.
+/// - one [meta-entry](DeltaPart) for each part: the part checksum, the
+///   object list, and two sizes
+/// - the [fallback objects](DeltaFallback)
+///
+/// A part is a compressed GVariant. It holds a mode table, an xattr table, a
+/// data-source blob, and an operation stream. An application runs the
+/// operation stream against the data-source blob and the objects of the
+/// source commit.
+///
+/// [`Repo::generate_static_delta`]: crate::Repo::generate_static_delta
 #[derive(Debug)]
 pub struct DeltaSuperblock {
     /// The source commit checksum, `None` for a from-scratch delta.
@@ -167,8 +162,8 @@ pub struct DeltaSuperblock {
     pub(crate) fallbacks: Vec<DeltaFallback>,
     /// The detached signatures when the delta is signed.
     pub(crate) signatures: Option<Value>,
-    /// The raw superblock bytes: the payload signatures cover. Empty for an
-    /// unsigned superblock, which no signature check reads.
+    /// The raw superblock bytes, which the signatures cover. Empty for an
+    /// unsigned superblock, because no signature verification reads them.
     pub(crate) superblock_bytes: Vec<u8>,
     /// The leading `a{sv}`: `ostree.endianness`, a copy of the target commit's
     /// detached metadata, and any part carried inline.
@@ -182,94 +177,113 @@ pub struct DeltaSuperblock {
     pub(crate) recursion_len: usize,
 }
 
-/// One part's meta-entry: its part-file checksum, the part file's size, the
-/// size of what the part delivers, and the ordered list of objects the part
-/// produces.
+/// The meta-entry of one part of a static delta.
+///
+/// The meta-entry names the checksum and the size of the part file. It also
+/// names the size of what the part delivers, and the objects that the part
+/// produces, in order. In the superblock it is a `(uayttay)` tuple. The object list holds
+/// 33 bytes for each object: the object type byte, then the 32-byte checksum.
 #[derive(Debug, Clone)]
 pub struct DeltaPart {
     pub(crate) part_csum: Checksum,
-    /// The part file's on-disk size, the compression byte included. It bounds
-    /// what a part fetch takes off the connection and what a part read takes in
-    /// before the checksum above is asserted.
+    /// The on-disk size of the part file, with the compression byte. Before
+    /// `part_csum` is verified, a part fetch takes at most this many bytes off
+    /// the connection. A part read has the same limit.
     pub(crate) size: u64,
-    /// The `usize` field: what the part's objects add up to.
+    /// The `usize` field: the sum of the sizes of the objects of the part.
     pub(crate) uncompressed_size: u64,
     pub(crate) objects: Vec<(ObjectType, Checksum)>,
 }
 
 impl DeltaPart {
-    /// The SHA-256 of the part file, the compression byte included.
+    /// Returns the SHA-256 of the part file, with the compression byte.
     pub fn checksum(&self) -> &Checksum {
         &self.part_csum
     }
 
-    /// The part file's size in bytes, the compression byte included.
+    /// Returns the size of the part file in bytes, with the compression byte.
+    ///
+    /// A part fetch and a part read take in at most this many bytes before
+    /// they verify the [`checksum`](DeltaPart::checksum).
     pub fn size(&self) -> u64 {
         self.size
     }
 
-    /// The `usize` field: the sum of the sizes of the objects the part
-    /// delivers, as its producer wrote it.
+    /// Returns the `usize` field: the sum of the sizes of the part objects.
+    ///
+    /// The value is the one that the producer of the delta wrote.
     pub fn uncompressed_size(&self) -> u64 {
         self.uncompressed_size
     }
 
-    /// The objects the part produces, in the order its operations produce them.
+    /// Returns the objects that the part produces, in the order of its operations.
     pub fn objects(&self) -> &[(ObjectType, Checksum)] {
         &self.objects
     }
 }
 
-/// A fallback object: one delivered outside the parts (as a plain loose object).
+/// An object that a static delta delivers as a loose object, outside its parts.
+///
+/// In the superblock a fallback is a `(yaytt)` tuple: the object type, the
+/// checksum, and two sizes.
 #[derive(Debug, Clone)]
 pub struct DeltaFallback {
     pub(crate) objtype: ObjectType,
     pub(crate) checksum: Checksum,
-    /// The loose object's size in the producing repository.
+    /// The size of the loose object in the repository that wrote the delta.
     pub(crate) size: u64,
-    /// The object's content size.
+    /// The content size of the object.
     pub(crate) uncompressed_size: u64,
 }
 
 impl DeltaFallback {
-    /// The fallback object's type.
+    /// Returns the type of the fallback object.
     pub fn object_type(&self) -> ObjectType {
         self.objtype
     }
 
-    /// The fallback object's checksum.
+    /// Returns the checksum of the fallback object.
     pub fn checksum(&self) -> &Checksum {
         &self.checksum
     }
 
-    /// The compressed size field: the loose object's size in the repository
-    /// that produced the delta.
+    /// Returns the size of the loose object in the repository that wrote the delta.
+    ///
+    /// This is the compressed size field of the fallback.
     pub fn size(&self) -> u64 {
         self.size
     }
 
-    /// The uncompressed size field: the object's content size.
+    /// Returns the content size of the object: the uncompressed size field.
     pub fn uncompressed_size(&self) -> u64 {
         self.uncompressed_size
     }
 }
 
-/// The byte order the `ostree.endianness` byte declares for the host-order
-/// fields of a superblock: a meta-entry's `size` and `usize`, and a fallback's
-/// two sizes. A superblock carrying no such byte, or any byte other than `B`,
-/// reads as little-endian. [`DeltaOptions::endianness`](crate::DeltaOptions)
-/// selects the order the generator writes.
+/// The byte order of the host-order size fields of a superblock.
+///
+/// The `ostree.endianness` metadata byte declares the order. It applies to the
+/// `size` and `usize` fields of a meta-entry and to the two sizes of a
+/// fallback. If a superblock has no such byte, or a byte other than `B`, the
+/// fields read as little-endian. [`DeltaOptions::endianness`](crate::DeltaOptions::endianness)
+/// selects the order that the generator writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeltaEndianness {
-    /// Read: the byte is `l`, absent, or another value. Write: the byte `l`,
-    /// and the four fields little-endian.
+    /// Little-endian.
+    ///
+    /// A read gives this value if the byte is `l`, absent, or another value. A
+    /// write puts the byte `l` and writes the four fields little-endian.
     Little,
-    /// Read: the byte is `B`. Write: the byte `B`, and the four fields
-    /// big-endian.
+    /// Big-endian.
+    ///
+    /// A read gives this value if the byte is `B`. A write puts the byte `B`
+    /// and writes the four fields big-endian.
     Big,
 }
 
-/// What one part payload holds, read without applying it.
+/// The table sizes, the blob size, and the operation counts of one part.
+///
+/// [`DeltaSuperblock::part_stats`] reads these values and applies nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeltaPartStats {
     /// The number of entries of the mode table.
@@ -284,7 +298,7 @@ pub struct DeltaPartStats {
     pub ops: DeltaOpCounts,
 }
 
-/// The operations of one part stream, counted by opcode.
+/// The number of operations of each opcode in the operation stream of a part.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeltaOpCounts {
     /// `S`, open-splice-and-close.
@@ -319,51 +333,128 @@ impl Blob {
     }
 }
 
+/// Methods that apply, verify, list, and delete static deltas.
 impl Repo {
-    /// Apply a static delta from `dir` offline, producing the target commit and
-    /// its objects into the repository, and return the target commit checksum.
+    /// Applies the static delta in `dir` and returns the target commit.
     ///
-    /// A part the superblock carries inline, under the metadata key
-    /// `<relative_dir>/<index>`, is read from the metadata dict, and any other
-    /// part from the file `dir/<index>`. Where both are present, the inline part
-    /// is used. An inline part is checked against the size and the checksum its
-    /// meta-entry declares before it is decompressed, as a part file is.
+    /// The call reads `dir/superblock` and writes the target commit and its
+    /// objects into the repository in one transaction. The transaction holds
+    /// the repository lock shared ([`LockKind`](crate::LockKind)). The call
+    /// sets no ref: the caller decides that.
     ///
-    /// The delta's source objects (for parts that patch against a source commit)
-    /// must already be present in the repository. Every produced object's
-    /// checksum is asserted as it is written. Fallback objects the delta
-    /// references must already be present; offline application does not fetch
-    /// them. The target commit's ref is not set: the caller decides that.
+    /// # Parts
+    ///
+    /// If the superblock carries part `<index>` inline, under the metadata key
+    /// `<relative_dir>/<index>`, the call reads the part from the metadata.
+    /// Otherwise it reads the file `dir/<index>`. If both are present, the call
+    /// uses the inline part. An inline part gets the size and checksum checks
+    /// of a part file before it is decompressed.
+    ///
+    /// # Prerequisites
+    ///
+    /// If a part patches against a source commit, the objects of the source
+    /// commit must be in the repository. The fallback objects of the delta
+    /// must be in the repository too, because an offline application does not
+    /// fetch them.
+    ///
+    /// # Verification
+    ///
+    /// The call runs the operation stream of each part against the data-source
+    /// blob of the part and the objects of the source commit. It verifies the
+    /// checksum of each object as it writes the object. So a malformed or
+    /// misapplied delta fails and commits no wrong object.
+    ///
+    /// # Memory
+    ///
+    /// The memory that an application uses has a limit, whatever the size of
+    /// a part:
+    ///
+    /// - The call reads a part file under the size that its meta-entry
+    ///   declares. It verifies the SHA-256 of the part against the checksum of
+    ///   the meta-entry before it decompresses a byte. A body that passes the
+    ///   declared size never gets to the decoder.
+    /// - An xz body then decompresses through the xz decoder of
+    ///   `async-compression` into the payload that the operations read.
+    /// - A payload of 128 KiB or less stays on the heap. A larger payload goes
+    ///   to a temp file in the staging directory, mapped read-only. It costs
+    ///   address space and staging space, and no resident heap.
+    /// - The output of a splice and of a bspatch streams through the content
+    ///   writer of the transaction. The source object of a bspatch goes to a
+    ///   temp file in the same way. So the call holds no whole object in
+    ///   memory.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if `dir/superblock` cannot be read or is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) bytes.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if the superblock does not
+    ///   parse, as [`DeltaSuperblock::parse`] states.
+    /// - Each error of [`apply_static_delta`](Repo::apply_static_delta).
     pub async fn apply_static_delta_offline(&self, dir: &Path) -> Result<Checksum> {
         let sb = DeltaSuperblock::read(&dir.join("superblock")).await?;
         self.apply_static_delta(sb, dir).await
     }
 
-    /// Apply a superblock already read, with the part files in `parts_dir`, and
-    /// return the target commit checksum.
+    /// Applies a superblock that is already read and returns the target commit.
     ///
-    /// The superblock is not read again, so a caller that checks it with
-    /// [`DeltaSuperblock::verify`] first applies the bytes it verified. The
-    /// superblock file can have any name and can be in any directory. A part
-    /// the superblock carries inline is read from the superblock, and any other
-    /// part from the file `parts_dir/<index>`. The rules of
-    /// [`Repo::apply_static_delta_offline`] apply otherwise: no signature is
-    /// checked here, fallback objects must already be present, and no ref is
-    /// set.
+    /// The part files are in `parts_dir`. The call does not read the
+    /// superblock again, so a caller that verifies it with
+    /// [`DeltaSuperblock::verify`] applies the bytes that it verified. The
+    /// superblock file can have any name and can be in any directory.
+    ///
+    /// The call reads a part that the superblock carries inline from the
+    /// superblock, and each other part from the file `parts_dir/<index>`. The
+    /// other rules of [`apply_static_delta_offline`](Repo::apply_static_delta_offline)
+    /// apply: the call verifies no signature, the fallback objects must be in
+    /// the repository, and the call sets no ref.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if a fallback object of the delta, or a
+    ///   source object that a part reads, is not in the repository.
+    /// - [`Error::InvalidFormat`] if a part breaks the format:
+    ///   - an inline part that is not a `(yay)` variant
+    ///   - a part that passes its declared size or fails its checksum
+    ///   - an unknown compression byte or opcode
+    ///   - an operand range outside the data, or a mode or xattr index outside
+    ///     its table
+    ///   - a write, a bspatch, or a close with no open object, or a bspatch
+    ///     with no read source
+    ///   - a malformed bspatch stream
+    ///   - an object of the wrong size or count
+    ///   - mode and xattr tables larger than 128 MiB together, or a metadata
+    ///     object or a symlink target larger than 128 MiB
+    ///   - a symlink target that is not UTF-8
+    /// - [`Error::Core`] if a part payload, an operand, a checksum, or an xattr
+    ///   set does not decode.
+    /// - [`Error::ChecksumMismatch`] if an object that a part produces does not
+    ///   hash to the checksum that the part names for it.
+    /// - [`Error::Pull`] if the repository is `bare-user-only` and a content
+    ///   object has an owner, xattrs, or mode bits that this mode does not store.
+    /// - [`Error::InsufficientFreeSpace`] if a write makes the free space less
+    ///   than the reserve of the repository.
+    /// - [`Error::LockTimeout`] if the wait for the repository lock passes
+    ///   `[core] lock-timeout-secs`.
+    /// - [`Error::Io`] if the object store, a part file, a temp file, or the
+    ///   staging directory cannot be read or written.
+    /// - [`Error::Io`] if an xz body does not decode.
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`,
+    ///   which this crate does not write, or if `[ex-integrity] fsverity` is
+    ///   `yes` and the seal of an object fails.
     pub async fn apply_static_delta(
         &self,
         mut sb: DeltaSuperblock,
         parts_dir: &Path,
     ) -> Result<Checksum> {
-        // Nothing here checks a signature, so a signed superblock's payload
-        // and signatures go before the parts are applied.
+        // Nothing here verifies a signature, so the payload and the signatures
+        // of a signed superblock are dropped before the parts are applied.
         drop(std::mem::take(&mut sb.superblock_bytes));
         sb.signatures = None;
 
-        // Fallback objects the delta references but does not carry must already
-        // be present; offline application does not fetch them. Checked up front,
-        // against the repository, so a missing prerequisite fails before any
-        // object is staged.
+        // The fallback objects that the delta names but does not carry must be
+        // present, because an offline application does not fetch them. The
+        // check runs against the repository first, so a missing prerequisite
+        // fails before an object is staged.
         for fb in &sb.fallbacks {
             if !self.has_object(fb.objtype, &fb.checksum).await? {
                 return Err(Error::ObjectNotFound {
@@ -380,14 +471,14 @@ impl Repo {
         txn.write_metadata(ObjectType::Commit, Some(&sb.to), &sb.commit_bytes)
             .await?;
 
-        // Offline application carries no pull flags, so the checks are the
-        // destination's own: a bare-user-only repository stores an object under a
-        // name that covers the canonical form alone, which it states here rather
-        // than through the checksum the content writer would miss.
+        // An offline application has no pull flags, so the checks are those of
+        // the destination. A bare-user-only repository stores an object under a
+        // name that covers the canonical form alone. This check states that
+        // rule, because the checksum check of the content writer does not see it.
         let checks = ModeChecks::new(PullFlags::empty(), self.mode());
         for (i, entry) in sb.meta_entries.iter().enumerate() {
-            // A part the superblock carries inline is read from there, also
-            // where a part file of the same number is present.
+            // A part that the superblock carries inline is read from there,
+            // also if a part file of the same number is present.
             match sb.inline_part(i)? {
                 Some((compression, body)) => {
                     verify_inline_part(compression, body, entry)?;
@@ -405,12 +496,20 @@ impl Repo {
         Ok(sb.to)
     }
 
-    /// Verify a signed static delta's signatures against `verifiers`.
+    /// Verifies the signatures of the static delta in `dir` against `verifiers`.
     ///
-    /// Each verifier receives the signature blobs stored under its engine key in
-    /// the delta's envelope together with the raw superblock bytes (the signed
-    /// payload). The outcome is valid when any verifier reports a valid
-    /// signature. An unsigned delta returns [`Error::Signature`].
+    /// The call reads `dir/superblock` and verifies it as
+    /// [`DeltaSuperblock::verify`] does.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if `dir/superblock` cannot be read or is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) bytes.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if the superblock does not
+    ///   parse, as [`DeltaSuperblock::parse`] states.
+    /// - [`Error::Signature`] if the delta is not signed.
+    /// - An error that a verifier returns, as [`Error::Signature`],
+    ///   [`Error::InvalidFormat`], or [`Error::Core`].
     pub async fn verify_static_delta(
         &self,
         dir: &Path,
@@ -422,46 +521,62 @@ impl Repo {
             .await
     }
 
-    /// List the static deltas stored in the repository under `deltas/`, sorted
-    /// by name.
+    /// Returns the names of the static deltas in `deltas/`, sorted.
     ///
-    /// Each is named as the tool names it: the target commit hex for a
-    /// from-scratch delta, or `<from-hex>-<to-hex>` for a delta against a source
-    /// commit. A `deltas/<fanout>/<rest>` entry is a delta only where
-    /// `<fanout>` and `<rest>` are directories and `<rest>/superblock`
-    /// resolves. No symlink at `<fanout>` or at `<rest>` is followed, and a
-    /// symlink at `superblock` or at `deltas` itself is followed. A dangling
-    /// symlink at `deltas` holds no delta. Other entries are skipped, also
-    /// where their names do not decode. An entry that holds a superblock and
-    /// whose name does not decode fails the call.
+    /// Each name is the name that the `ostree` command uses. A delta from
+    /// scratch has the target commit in hex. A delta from a source commit has
+    /// `<from-hex>-<to-hex>`. The `delta-indexes/` cache advertises these
+    /// deltas to a fetcher. [`reindex_static_deltas`](Repo::reindex_static_deltas)
+    /// writes the cache, and a pull reads it.
     ///
-    /// The `delta-indexes/` cache that advertises these deltas to a fetcher is
-    /// written by [`reindex_static_deltas`](Repo::reindex_static_deltas) and
-    /// read by a pull.
+    /// # Entries
+    ///
+    /// An entry `deltas/<fanout>/<rest>` is a delta only if `<fanout>` and
+    /// `<rest>` are directories and `<rest>/superblock` resolves. The call
+    /// follows no symlink at `<fanout>` or at `<rest>`. It follows a symlink at
+    /// `superblock` and at `deltas` itself. A dangling symlink at `deltas`
+    /// holds no delta.
+    ///
+    /// The call skips each other entry, also if its name does not decode.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Core`] if an entry holds a superblock and its name does not
+    ///   decode to a checksum.
+    /// - [`Error::Io`] if `deltas/` or a fanout directory cannot be read.
+    /// - [`Error::Io`] if the superblock check of an entry fails with an error
+    ///   other than `ENOENT` or `ENOTDIR`.
     pub async fn list_static_deltas(&self) -> Result<Vec<String>> {
         let repo_fd = self.repo_fd().try_clone_to_owned()?;
         ostrya_rt::unblock(move || list_static_deltas_blocking(repo_fd.as_fd())).await
     }
 
-    /// Remove one static delta: from scratch to `to` where `from` is `None`,
-    /// and from `from` to `to` otherwise.
+    /// Removes the static delta from `from` to `to`.
     ///
-    /// The call removes the entry at the delta's `deltas/<fanout>/<rest>` path
-    /// and everything below it: nested directories, and also a regular file or
-    /// a directory with no superblock at that path. A symlink at that path is
-    /// removed as a link, and its target stays. No symlink below the path is
-    /// followed. The fanout directory stays, also where it becomes empty.
-    /// `delta-indexes/` and `summary` stay as they are, so they can still name
-    /// the delta; [`reindex_static_deltas`](Repo::reindex_static_deltas) and a
-    /// new summary refresh them.
+    /// If `from` is `None`, the delta is the delta from scratch to `to`.
     ///
-    /// Where nothing resolves at the path, the call returns
-    /// [`Error::StaticDeltaNotFound`]. The check follows symlinks, so a
-    /// dangling symlink at the path reports the same error and stays.
+    /// The call removes the entry at the path `deltas/<fanout>/<rest>` of the
+    /// delta and all entries under it. The entry can be a directory tree, a
+    /// regular file, or a directory with no superblock. If the entry is a
+    /// symlink, the call removes the link and keeps its target. It follows no
+    /// symlink under the path.
+    ///
+    /// The fanout directory stays, also if it becomes empty. `delta-indexes/`
+    /// and `summary` do not change, so they can still name the delta.
+    /// [`reindex_static_deltas`](Repo::reindex_static_deltas) and a new summary
+    /// update them.
     ///
     /// The call takes no repository lock. A concurrent generation of the same
     /// delta can fail, or can leave a partial directory. A removal that fails
-    /// leaves the entries it did not reach.
+    /// leaves the entries that it did not reach.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::StaticDeltaNotFound`] if nothing resolves at the path. The
+    ///   check follows symlinks, so a dangling symlink at the path gives this
+    ///   error, and the symlink stays.
+    /// - [`Error::Io`] if an entry cannot be read or removed, or if a directory
+    ///   moves during the removal.
     pub async fn delete_static_delta(&self, from: Option<&Checksum>, to: &Checksum) -> Result<()> {
         let (from, to) = (from.copied(), *to);
         let repo_fd = self.repo_fd().try_clone_to_owned()?;
@@ -472,8 +587,8 @@ impl Repo {
     }
 }
 
-/// Remove the entry at one delta's `deltas/<fanout>/<rest>` path, following no
-/// symlink at or below that path.
+/// Removes the entry at the path `deltas/<fanout>/<rest>` of one delta. It
+/// follows no symlink at or under that path.
 fn delete_static_delta_blocking(
     repo_fd: BorrowedFd<'_>,
     from: Option<&Checksum>,
@@ -490,8 +605,8 @@ fn delete_static_delta_blocking(
     let (parent_rel, leaf) = rel
         .rsplit_once('/')
         .expect("a delta path holds a fanout directory");
-    // The existence check follows symlinks, as the tool's does: a dangling
-    // symlink at the path is an absent delta.
+    // The existence check follows symlinks, as the check of the `ostree`
+    // command does: a dangling symlink at the path is an absent delta.
     match statat(repo_fd, rel.as_str(), AtFlags::empty()) {
         Ok(_) => {}
         Err(Errno::NOENT) => return Err(not_found()),
@@ -522,40 +637,40 @@ fn delete_static_delta_blocking(
     }
 }
 
-/// Scan `deltas/<fanout>/<leaf>` and reconstruct each delta's tool name.
+/// Scans `deltas/<fanout>/<leaf>` and returns the name that the `ostree`
+/// command gives each delta, sorted.
 fn list_static_deltas_blocking(repo_fd: BorrowedFd<'_>) -> Result<Vec<String>> {
     let mut names = scan_deltas(repo_fd, delta_name)?;
     names.sort();
     Ok(names)
 }
 
-/// Scan `deltas/<fanout>/<leaf>` and collect the source and target commit of
-/// every delta present, for the index cache.
+/// Scans `deltas/<fanout>/<leaf>` and returns the source and target commit of
+/// each delta, for the index cache.
 pub(crate) fn list_delta_targets(
     repo_fd: BorrowedFd<'_>,
 ) -> Result<Vec<(Option<Checksum>, Checksum)>> {
     scan_deltas(repo_fd, parse_delta_dir)
 }
 
-/// Remove each `deltas/<fanout>/<leaf>` delta whose target commit `remove`
+/// Removes each `deltas/<fanout>/<leaf>` delta whose target commit `remove`
 /// selects, for the prune sweep.
 ///
-/// The walk is the one [`scan_deltas`] takes, with the name parsed and
-/// `remove` asked ahead of the superblock check, so only a selected entry
-/// costs a `statat`. A name that does not decode names no commit, so the sweep
-/// skips it and leaves the entry in place. A directory with no superblock is
-/// not a delta, and the sweep leaves it, which is what the `ostree` tool's
-/// prune leaves.
+/// The walk is the walk of [`scan_deltas`]. The name is parsed and `remove`
+/// is asked before the superblock check, so only a selected entry costs a
+/// `statat`. A name that does not decode names no commit, so the sweep skips
+/// it and leaves the entry in place. A directory with no superblock is no
+/// delta. The sweep leaves it, as the prune of the `ostree` command does.
 ///
-/// A delta is keyed by the commit it produces, so a delta whose source commit
-/// `remove` selects is left where it stands. A delta directory is removed
-/// whole, nested directories included, through the fanout descriptor the walk
-/// holds, and no symlink at the fanout, at the delta path, or below it is
-/// followed. An entry at the delta path that is not a directory is left in
-/// place. The fanout directory above it is left in place, empty where this was
-/// its last entry. A directory that is already gone is success. The
-/// `delta-indexes/` cache is not touched, which is what the `ostree` tool's
-/// prune leaves.
+/// The key of a delta is the commit that it produces, so a delta whose source
+/// commit `remove` selects stays. A delta directory is removed whole, with
+/// its nested directories, through the fanout descriptor that the walk holds.
+/// No symlink at the fanout, at the delta path, or under it is followed.
+///
+/// An entry at the delta path that is not a directory stays. The fanout
+/// directory stays, empty if the delta was its last entry. A directory that is
+/// already gone is a success. The `delta-indexes/` cache does not change, as
+/// with the prune of the `ostree` command.
 pub(crate) fn prune_delta_dirs(
     repo_fd: BorrowedFd<'_>,
     remove: impl Fn(&Checksum) -> bool,
@@ -581,25 +696,28 @@ pub(crate) fn prune_delta_dirs(
     })
 }
 
-/// Remove the directory `name` under `parent`, open as `dir`, and everything
-/// below it, following no symlink. A symlink below it is unlinked as a link.
+/// Removes the directory `name` under `parent`, open as `dir`, and all entries
+/// under it. It follows no symlink, and it unlinks a symlink under it as a link.
 ///
-/// The removal is a loop over an explicit stack of levels, and it holds at
-/// most two directory descriptors of its own at a time, whatever the depth:
-/// the level in hand, and the child or the `..` it opens next. Descending
-/// replaces the level's descriptor with the child's, and ascending replaces it
-/// with the one `..` opens, which names the parent while the emptied level is
-/// still linked where it was opened. Each level keeps the device and inode of
-/// its directory, and the descriptor `..` opens must match the recorded
-/// parent, so a directory that a concurrent rename moves stops the removal
-/// instead of redirecting it. Depth costs a name and an entry list on the
-/// heap, so a tree deeper than the process descriptor limit is removed whole.
+/// The removal is a loop over an explicit stack of levels. It holds at most
+/// two directory descriptors of its own at a time, whatever the depth. These
+/// are the level in hand, and the child or the `..` that it opens next. A descent
+/// replaces the descriptor of the level with the descriptor of the child. An
+/// ascent replaces it with the descriptor that `..` opens. That descriptor
+/// names the parent, because the emptied level is still linked where it was
+/// opened.
+///
+/// Each level keeps the device and inode of its directory. The descriptor
+/// that `..` opens must match the recorded parent. So if a concurrent rename
+/// moves a directory, the removal stops and does not follow the directory.
+/// Depth costs a name and an entry list on the heap, so a tree deeper than
+/// the process descriptor limit is removed whole.
 ///
 /// A directory is read through the descriptor that opened it, which needs
 /// read permission alone. A child directory with no entries is removed from
 /// its parent at once, so an empty directory with no search permission goes
 /// too. Names are kept as bytes, so a name that is not UTF-8 is removed too.
-/// An entry that is gone before it is reached is skipped.
+/// An entry that is gone before the removal gets to it is skipped.
 fn remove_dir_tree(parent: BorrowedFd<'_>, name: &CStr, dir: OwnedFd) -> Result<()> {
     use rustix::fs::{AtFlags, Dir};
     use rustix::io::Errno;
@@ -607,9 +725,9 @@ fn remove_dir_tree(parent: BorrowedFd<'_>, name: &CStr, dir: OwnedFd) -> Result<
     let io_err = |e: Errno| Error::Io(e.into());
     let identity = dir_identity(dir.as_fd())?;
     let mut level = Dir::new(dir).map_err(io_err)?;
-    // One entry per level on the path from `name` down to the level in hand:
-    // the level's own name, its device and inode, and what is left to remove
-    // within it.
+    // One entry for each level on the path from `name` down to the level in
+    // hand. An entry holds the name of the level, its device and inode, and
+    // what is left to remove in it.
     let mut levels = vec![(name.to_owned(), identity, read_tree_level(&mut level)?)];
 
     while let Some((_, _, entries)) = levels.last_mut() {
@@ -656,7 +774,7 @@ fn remove_dir_tree(parent: BorrowedFd<'_>, name: &CStr, dir: OwnedFd) -> Result<
     Ok(())
 }
 
-/// Unlink `name` under `dir`. A name that is already gone is not an error.
+/// Unlinks `name` under `dir`. A name that is already gone is a success.
 fn unlink_tree_entry(dir: BorrowedFd<'_>, name: &CStr, flags: rustix::fs::AtFlags) -> Result<()> {
     match rustix::fs::unlinkat(dir, name, flags) {
         Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
@@ -664,7 +782,7 @@ fn unlink_tree_entry(dir: BorrowedFd<'_>, name: &CStr, flags: rustix::fs::AtFlag
     }
 }
 
-/// Open the directory `name` under `dir`, following no symlink.
+/// Opens the directory `name` under `dir`. It follows no symlink.
 fn open_dir_nofollow(dir: BorrowedFd<'_>, name: &CStr) -> rustix::io::Result<OwnedFd> {
     use rustix::fs::{Mode, OFlags, openat};
 
@@ -676,17 +794,18 @@ fn open_dir_nofollow(dir: BorrowedFd<'_>, name: &CStr) -> rustix::io::Result<Own
     )
 }
 
-/// The device and inode of an open directory.
+/// Returns the device and inode of an open directory.
 fn dir_identity(dir: BorrowedFd<'_>) -> Result<(u64, u64)> {
     let st = rustix::fs::fstat(dir).map_err(|e| Error::Io(e.into()))?;
     Ok((st.st_dev, st.st_ino))
 }
 
-/// The entries of one directory level, each with whether it is a directory.
+/// Returns the entries of one directory level, each with a flag that is `true`
+/// for a directory.
 ///
-/// `getdents64` already carries the type. A filesystem that reports
-/// [`FileType::Unknown`](rustix::fs::FileType::Unknown) leaves the type to one
-/// no-follow `statat` for that name alone; a name that is gone by the time that
+/// `getdents64` already carries the type. If a file system reports
+/// [`FileType::Unknown`](rustix::fs::FileType::Unknown), one no-follow
+/// `statat` for that name alone gives the type. A name that is gone when that
 /// call runs is left out.
 fn read_tree_level(dir: &mut rustix::fs::Dir) -> Result<Vec<(CString, bool)>> {
     use rustix::fs::{AtFlags, FileType, statat};
@@ -716,17 +835,20 @@ fn read_tree_level(dir: &mut rustix::fs::Dir) -> Result<Vec<(CString, bool)>> {
     Ok(entries)
 }
 
-/// Walk the two-level `deltas/` tree, applying `parse` to each delta's fanout
-/// and leaf directory names. A repository with no `deltas/` yields nothing.
+/// Walks the two-level `deltas/` tree and applies `parse` to the fanout and
+/// leaf directory names of each delta. A repository with no `deltas/` gives
+/// nothing.
 ///
-/// A fanout and a leaf count only where they are directories, and no symlink
-/// at either is followed. A symlink at `deltas` itself is followed, as the
-/// tool follows it. A leaf counts as a delta only where
-/// `<leaf>/superblock` resolves, following symlinks, which is the `ostree`
-/// tool's rule. Any other entry is skipped before its name is parsed, so such
-/// an entry with a malformed name is skipped too. The entry type comes from
-/// the directory read, and only a filesystem that reports no type costs one
-/// no-follow `statat` per entry more; no superblock byte is read.
+/// A fanout and a leaf count only if they are directories, and no symlink at
+/// either is followed. A symlink at `deltas` itself is followed, as the
+/// `ostree` command follows it. A leaf counts as a delta only if
+/// `<leaf>/superblock` resolves with symlinks followed, which is the rule of
+/// the `ostree` command. Each other entry is skipped before its name is
+/// parsed, so such an entry with a malformed name is skipped too.
+///
+/// The entry type comes from the directory read. Only a file system that
+/// reports no type costs one more no-follow `statat` for each entry. No
+/// superblock byte is read.
 fn scan_deltas<T>(
     repo_fd: BorrowedFd<'_>,
     parse: impl Fn(&str, &str) -> Result<T>,
@@ -741,15 +863,15 @@ fn scan_deltas<T>(
     Ok(out)
 }
 
-/// Walk the two-level `deltas/` tree and call `visit` with the fanout
+/// Walks the two-level `deltas/` tree and calls `visit` with the fanout
 /// descriptor, the fanout name, and the leaf name of each leaf directory. A
 /// repository with no `deltas/` visits nothing.
 ///
-/// A fanout and a leaf count only where they are directories and their names
+/// A fanout and a leaf count only if they are directories and their names
 /// are UTF-8, and no symlink at either is followed. A symlink at `deltas`
-/// itself is followed. `deltas/` is opened once, and each fanout once, and the
-/// leaves of a fanout are read in full before the first call, so `visit` can
-/// remove a leaf through the descriptor it is given.
+/// itself is followed. The walk opens `deltas/` once and each fanout once. It
+/// reads the leaves of a fanout in full before the first call, so `visit` can
+/// remove a leaf through the descriptor that it gets.
 fn walk_deltas(
     repo_fd: BorrowedFd<'_>,
     mut visit: impl FnMut(BorrowedFd<'_>, &str, &str) -> Result<()>,
@@ -773,7 +895,7 @@ fn walk_deltas(
     let mut deltas = Dir::new(deltas).map_err(io_err)?;
     for (fanout, is_dir) in read_tree_level(&mut deltas)? {
         // Delta directory names are base64, so a name that is not UTF-8 is
-        // no fanout.
+        // not a fanout.
         let (true, Ok(fanout_name)) = (is_dir, fanout.to_str()) else {
             continue;
         };
@@ -795,8 +917,9 @@ fn walk_deltas(
     Ok(())
 }
 
-/// Whether `<leaf>/superblock` resolves below the fanout `fan_fd`, following
-/// symlinks, which is the `ostree` tool's rule for what counts as a delta.
+/// Returns `true` if `<leaf>/superblock` resolves under the fanout `fan_fd`,
+/// with symlinks followed. This is the rule of the `ostree` command for a
+/// delta.
 fn has_superblock(fan_fd: BorrowedFd<'_>, leaf: &str) -> Result<bool> {
     use rustix::fs::{AtFlags, statat};
     use rustix::io::Errno;
@@ -812,8 +935,8 @@ fn has_superblock(fan_fd: BorrowedFd<'_>, leaf: &str) -> Result<bool> {
     }
 }
 
-/// Collect the child names of an open directory, dropping `.` and `..` and any
-/// non-UTF-8 name (delta directory names are base64, so always UTF-8).
+/// Returns the child names of an open directory, without `.`, `..`, and names
+/// that are not UTF-8. Delta directory names are base64, so they are UTF-8.
 pub(crate) fn dir_child_names(dir: &OwnedFd) -> Result<Vec<String>> {
     let reader = rustix::fs::Dir::read_from(dir).map_err(|e| Error::Io(e.into()))?;
     let mut out = Vec::new();
@@ -830,9 +953,9 @@ pub(crate) fn dir_child_names(dir: &OwnedFd) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Recover a delta's source and target commit from its
-/// `deltas/<fanout>/<leaf>` directory names. The leaf carries a `-` (which never
-/// occurs in base64) exactly when the delta is from a source commit.
+/// Returns the source and target commit of a delta from its
+/// `deltas/<fanout>/<leaf>` directory names. The leaf holds a `-`, which
+/// base64 never holds, if and only if the delta is from a source commit.
 fn parse_delta_dir(fanout: &str, leaf: &str) -> Result<(Option<Checksum>, Checksum)> {
     match leaf.split_once('-') {
         Some((from_rest, to_b64)) => Ok((
@@ -848,14 +971,14 @@ fn parse_delta_dir(fanout: &str, leaf: &str) -> Result<(Option<Checksum>, Checks
     }
 }
 
-/// Reconstruct a delta's hex name from its `deltas/<fanout>/<leaf>` directory.
+/// Returns the hex name of a delta from its `deltas/<fanout>/<leaf>` directory.
 fn delta_name(fanout: &str, leaf: &str) -> Result<String> {
     let (from, to) = parse_delta_dir(fanout, leaf)?;
     Ok(delta_hex_name(from.as_ref(), &to))
 }
 
-/// A delta's hex name as the tool names it: the target hex for a delta from
-/// scratch, and `<from-hex>-<to-hex>` otherwise.
+/// Returns the hex name of a delta as the `ostree` command names it: the
+/// target hex for a delta from scratch, and `<from-hex>-<to-hex>` otherwise.
 pub(crate) fn delta_hex_name(from: Option<&Checksum>, to: &Checksum) -> String {
     match from {
         Some(from) => format!("{}-{}", from.to_hex(), to.to_hex()),
@@ -864,15 +987,30 @@ pub(crate) fn delta_hex_name(from: Option<&Checksum>, to: &Checksum) -> String {
 }
 
 impl DeltaSuperblock {
-    /// Parse a superblock file's bytes, detecting and unwrapping the signed
-    /// envelope.
+    /// Parses the bytes of a superblock file, signed or not.
     ///
-    /// The file bytes are dropped once they are decoded, and the payload of the
-    /// signed envelope moves out of the decoded envelope with no copy, so the
-    /// parse holds at most two copies of the superblock at once: the bytes and
-    /// the tree decoded from them. The signed payload is kept after the parse,
-    /// since [`verify`](DeltaSuperblock::verify) reads it. An unsigned
-    /// superblock keeps no raw bytes.
+    /// If the bytes start with the magic of the signed envelope, the call
+    /// unwraps the envelope and keeps its signatures. The call verifies that
+    /// the embedded commit object hashes to the target commit checksum.
+    ///
+    /// The call drops the file bytes after it decodes them. It moves the
+    /// payload of a signed envelope out of the decoded envelope with no copy.
+    /// So the parse holds at most two copies of the superblock at a time: the
+    /// bytes and the tree decoded from them.
+    ///
+    /// A signed superblock keeps its payload after the parse, because
+    /// [`verify`](DeltaSuperblock::verify) reads it. An unsigned superblock
+    /// keeps no raw bytes.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Core`] if the bytes are not a GVariant of the superblock type
+    ///   or of the envelope type.
+    /// - [`Error::Core`] if a checksum or an object type does not decode.
+    /// - [`Error::InvalidFormat`] if a field has the wrong type, or if an
+    ///   object list is not a multiple of 33 bytes.
+    /// - [`Error::InvalidFormat`] if the embedded commit does not hash to the
+    ///   target commit checksum.
     pub fn parse(bytes: Vec<u8>) -> Result<DeltaSuperblock> {
         let (payload, signatures) = if bytes.starts_with(SIGNED_MAGIC) {
             let ty = Type::parse(SIGNED_SIG).map_err(ostrya_core::Error::from)?;
@@ -894,7 +1032,7 @@ impl DeltaSuperblock {
 
         let ty = Type::parse(SUPERBLOCK_SIG).map_err(ostrya_core::Error::from)?;
         let value = from_bytes(&ty, &payload).map_err(ostrya_core::Error::from)?;
-        // Only a signature check reads the raw bytes, so an unsigned
+        // Only a signature verification reads the raw bytes, so an unsigned
         // superblock drops them here.
         let superblock_bytes = if signatures.is_some() {
             payload
@@ -904,13 +1042,13 @@ impl DeltaSuperblock {
         };
         let fields = tuple(&value)?;
 
-        // The `ostree.endianness` metadata byte gates the meta-entry and
-        // fallback size fields, so the byte is read here and those fields are
-        // swapped for a big-endian producer. The timestamp and the `(uuu)`
-        // modes are always big-endian and the embedded commit is normal-form
-        // little-endian, so nothing else here turns on it.
+        // The `ostree.endianness` metadata byte sets the order of the
+        // meta-entry and fallback size fields. The byte is read here, and those
+        // fields are swapped for a big-endian producer. The timestamp and the
+        // `(uuu)` modes are always big-endian, and the embedded commit is
+        // normal-form little-endian, so nothing else here depends on the byte.
         let big_endian = declares_big_endian(&fields[0]);
-        // GVariant decodes the `t` little-endian; the field is big-endian.
+        // GVariant decodes the `t` little-endian. The field is big-endian.
         let timestamp = fields[1]
             .as_u64()
             .ok_or_else(|| {
@@ -927,8 +1065,8 @@ impl DeltaSuperblock {
             Some(Checksum::from_ay(from_bytes)?)
         };
 
-        // Re-serialize the embedded commit to its normal-form bytes and assert
-        // the target checksum, closing the loop on the commit the delta carries.
+        // Serialize the embedded commit again to its normal-form bytes, and
+        // verify the target checksum on the commit that the delta carries.
         let commit_ty = Type::parse(COMMIT_SIG).map_err(ostrya_core::Error::from)?;
         let commit_bytes = to_bytes(&commit_ty, &fields[4]).map_err(ostrya_core::Error::from)?;
         if Checksum::sha256(&commit_bytes) != to {
@@ -940,8 +1078,8 @@ impl DeltaSuperblock {
         let meta_entries = parse_meta_entries(array(&fields[6])?, big_endian)?;
         let fallbacks = parse_fallbacks(array(&fields[7])?, big_endian)?;
 
-        // The metadata dict moves out of the parsed tree rather than being
-        // copied: it can carry inline parts.
+        // The metadata dict moves out of the parsed tree with no copy, because
+        // it can carry inline parts.
         let Value::Tuple(mut owned) = value else {
             unreachable!("`tuple` accepted the value as a tuple");
         };
@@ -967,34 +1105,55 @@ impl DeltaSuperblock {
         })
     }
 
-    /// Read a superblock file, under the metadata ceiling, and parse it.
+    /// Reads a superblock file and parses it.
+    ///
+    /// The file can be at most [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE)
+    /// bytes. The read stops one byte past that limit, also for a device or a
+    /// FIFO that states no length.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if the file cannot be read or is larger than the limit.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if the bytes do not parse,
+    ///   as [`parse`](DeltaSuperblock::parse) states.
     pub async fn read(path: &Path) -> Result<DeltaSuperblock> {
         DeltaSuperblock::parse(read_capped(path.to_owned()).await?)
     }
 
-    /// The source commit, `None` for a delta from scratch.
+    /// Returns the source commit, or `None` for a delta from scratch.
     pub fn from_commit(&self) -> Option<&Checksum> {
         self.from.as_ref()
     }
 
-    /// The target commit.
+    /// Returns the target commit.
     pub fn to_commit(&self) -> &Checksum {
         &self.to
     }
 
-    /// Whether the superblock file is the signed envelope.
+    /// Returns `true` if the superblock file is a signed envelope.
     pub fn is_signed(&self) -> bool {
         self.signatures.is_some()
     }
 
-    /// Verify the signed envelope's signatures against `verifiers`.
+    /// Verifies the signatures of the signed envelope against `verifiers`.
     ///
-    /// Each verifier receives the signature blobs stored under its engine key
-    /// in the envelope together with the raw superblock bytes the envelope
-    /// wraps (the signed payload). A verifier whose engine key holds no blob
-    /// examines no signature. The outcome is valid when any verifier reports a
-    /// valid signature. A superblock with no envelope returns
-    /// [`Error::Signature`].
+    /// Each verifier gets the raw superblock bytes that the envelope wraps,
+    /// which are the signed payload. It also gets the signature blobs that
+    /// the envelope stores under its engine key. A verifier with no blob under its engine key
+    /// examines no signature. The outcome is valid if any verifier reports a
+    /// valid signature. The superblock file can have any name.
+    ///
+    /// # Signed envelope
+    ///
+    /// A signed superblock file is a GVariant of type `(taya{sv})`. Its fields
+    /// are the magic, stored as the eight ASCII bytes `OSTSGNDT`, the raw
+    /// superblock bytes, and the signatures under the key of each engine.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] if the superblock has no signed envelope.
+    /// - An error that a verifier returns, as [`Error::Signature`],
+    ///   [`Error::InvalidFormat`], or [`Error::Core`].
     pub async fn verify(&self, verifiers: &[&dyn Verifier]) -> Result<VerifyOutcome> {
         let signatures = self
             .signatures
@@ -1010,7 +1169,7 @@ impl DeltaSuperblock {
         Ok(outcome)
     }
 
-    /// The byte order the `ostree.endianness` byte declares.
+    /// Returns the byte order that the `ostree.endianness` byte declares.
     pub fn endianness(&self) -> DeltaEndianness {
         if declares_big_endian(&self.metadata) {
             DeltaEndianness::Big
@@ -1019,54 +1178,92 @@ impl DeltaSuperblock {
         }
     }
 
-    /// The generation timestamp, in seconds since the Unix epoch.
+    /// Returns the generation timestamp, in seconds since the Unix epoch.
+    ///
+    /// The field is big-endian, whatever the `ostree.endianness` byte states.
     pub fn timestamp(&self) -> u64 {
         self.timestamp
     }
 
-    /// The byte length of the recursion array, field 5, divided by 64: the
-    /// parent count `static-delta show` reports.
+    /// Returns the parent count that `ostree static-delta show` reports.
+    ///
+    /// The count is the byte length of the recursion array, field 5, divided
+    /// by 64 and rounded down.
     pub fn parent_count(&self) -> usize {
         self.recursion_len / 64
     }
 
-    /// The per-part meta-entries, in part order.
+    /// Returns the meta-entries of the parts, in part order.
     pub fn parts(&self) -> &[DeltaPart] {
         &self.meta_entries
     }
 
-    /// The fallback objects, in superblock order.
+    /// Returns the fallback objects, in superblock order.
     pub fn fallbacks(&self) -> &[DeltaFallback] {
         &self.fallbacks
     }
 
-    /// The delta's directory relative to the repository root,
-    /// `deltas/<fanout>/<rest>`, derived from the source and target commits.
+    /// Returns the directory of the delta, relative to the repository root.
+    ///
+    /// The path is `deltas/<fanout>/<rest>`, built from the source and target
+    /// commits.
     pub fn relative_dir(&self) -> String {
         crate::deltagen::delta_relative_dir(self.from.as_ref(), &self.to)
     }
 
-    /// Part `index` as the superblock carries it inline: its compression byte
-    /// and its body, borrowed from the metadata dict. `None` where the dict
-    /// holds no key for it.
+    /// Returns part `index` as the superblock carries it inline: its
+    /// compression byte and its body, borrowed from the metadata dict. `None`
+    /// if the dict holds no key for it.
     pub(crate) fn inline_part(&self, index: usize) -> Result<Option<(u8, &[u8])>> {
         inline_part_at(&self.metadata, &self.inline_index, index, || {
             self.relative_dir()
         })
     }
 
-    /// Read what part `index` holds without applying it.
+    /// Reads what part `index` holds and does not apply it.
     ///
-    /// A part the superblock carries inline, under the metadata key
-    /// `<relative_dir>/<index>`, is read from the metadata dict; any other part
-    /// is read from the file `dir/<index>`. The part is checked against the
-    /// size and the checksum its meta-entry declares before any byte of it is
-    /// decompressed. No transaction and no temp file are needed: the payload is
-    /// read in up to three passes over the part source, and the heap holds one
-    /// fixed-size read buffer, a 1 MiB tail of the payload, and the xz
-    /// decoder's state, whatever the payload size. The decoder takes at most
-    /// 128 MiB, and a part whose xz stream states a dictionary that needs more
-    /// is refused.
+    /// If the superblock carries the part inline, under the metadata key
+    /// `<relative_dir>/<index>`, the call reads it from the metadata.
+    /// Otherwise it reads the file `dir/<index>`. The call needs no
+    /// transaction, no staging directory, and no temp file, so it can report a
+    /// delta in a read-only repository.
+    ///
+    /// # Passes
+    ///
+    /// The framing offsets of the payload are at its end, so the call reads
+    /// the part in up to three passes:
+    ///
+    /// 1. The first pass verifies the part against the size and the checksum
+    ///    of its meta-entry. It decompresses no byte.
+    /// 2. The second pass finds the framing and keeps the last 1 MiB of the
+    ///    payload. For an uncompressed part, the first pass keeps this tail,
+    ///    and the second pass does not occur.
+    /// 3. If the tail does not hold the operation stream and the xattr
+    ///    framing, the third pass reads them.
+    ///
+    /// # Memory
+    ///
+    /// Each pass holds one fixed-size read buffer and the 1 MiB tail, whatever
+    /// the payload size. A pass over a compressed part also holds the state of
+    /// the xz decoder, with a limit of 128 MiB.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if the superblock has no part `index`.
+    /// - [`Error::InvalidFormat`] if the part breaks the format:
+    ///   - an inline part that is not a `(yay)` variant
+    ///   - a part that passes its declared size or fails its checksum
+    ///   - an unknown compression byte or opcode
+    ///   - invalid framing
+    ///   - an `S` payload range or an `r` checksum range outside the
+    ///     data-source blob
+    ///   - more objects than the object list holds
+    ///   - a stream that ends inside an operation
+    /// - [`Error::InvalidFormat`] if the xz stream states a dictionary that
+    ///   needs more than 128 MiB of decoder memory.
+    /// - [`Error::Core`] if an operand does not decode.
+    /// - [`Error::Io`] if the part file cannot be opened or read, or if the xz
+    ///   stream does not decode.
     pub async fn part_stats(&self, index: usize, dir: &Path) -> Result<DeltaPartStats> {
         let entry = self
             .meta_entries
@@ -1092,14 +1289,17 @@ impl DeltaSuperblock {
     }
 }
 
-/// Find, in one pass over a superblock metadata dict, the entry that carries
-/// each of `parts` parts inline: for part `index`, the position of the first
-/// entry keyed `<dir>/<index>`, where `dir` is the delta's repository-relative
-/// directory, and `None` where the dict holds no such key. A later entry under
-/// the same key is not read, which is the rule of a lookup by key. A key whose
-/// last component is not a part number in plain decimal, or is a number no
-/// meta-entry has, names no part. Nothing is type-checked here:
-/// [`inline_part_at`] checks each value when its part is read.
+/// Finds, in one pass over a superblock metadata dict, the entry that carries
+/// each of `parts` parts inline.
+///
+/// For part `index`, the result holds the position of the first entry with
+/// the key `<dir>/<index>`, or `None` if the dict holds no such key. `dir` is
+/// the directory of the delta, relative to the repository. A later entry
+/// under the same key is not read, which is the rule of a lookup by key.
+///
+/// A key whose last component is not a part number in plain decimal, or is a
+/// number that no meta-entry has, names no part. This function checks no
+/// type: [`inline_part_at`] checks each value when its part is read.
 pub(crate) fn index_inline_parts(metadata: &Value, dir: &str, parts: usize) -> Vec<Option<usize>> {
     let mut index = vec![None; parts];
     let Some(entries) = metadata.as_array() else {
@@ -1135,12 +1335,14 @@ pub(crate) fn index_inline_parts(metadata: &Value, dir: &str, parts: usize) -> V
     index
 }
 
-/// Part `part` as a superblock metadata dict carries it inline, at the
-/// position [`index_inline_parts`] found for it: its compression byte and its
-/// body, borrowed from the dict. `None` where the dict carries the part
-/// nowhere. A value of a type other than `(yay)` is refused, and the caller
-/// does not read the part file in its place. `dir` gives the delta's
-/// repository-relative directory, for the refusal text alone.
+/// Returns part `part` as a superblock metadata dict carries it inline, at
+/// the position that [`index_inline_parts`] found for it.
+///
+/// The result is the compression byte and the body, borrowed from the dict,
+/// or `None` if the dict does not carry the part. A value of a type other
+/// than `(yay)` is refused, and the caller does not read the part file in its
+/// place. `dir` gives the directory of the delta, relative to the repository,
+/// for the refusal text alone.
 pub(crate) fn inline_part_at<'a>(
     metadata: &'a Value,
     index: &[Option<usize>],
@@ -1167,10 +1369,12 @@ pub(crate) fn inline_part_at<'a>(
     }
 }
 
-/// Check an inline part against its meta-entry by the rules a part file is
-/// read under: the compression byte and the body together fit in the size the
-/// entry declares, their SHA-256 is the checksum the entry names, and the
-/// compression byte is one the reader decodes. Nothing is decompressed.
+/// Verifies an inline part against its meta-entry by the rules of a part file.
+///
+/// The compression byte and the body together must fit in the size that the
+/// entry declares. Their SHA-256 must be the checksum that the entry names.
+/// The compression byte must be one that the reader decodes. Nothing is
+/// decompressed.
 pub(crate) fn verify_inline_part(compression: u8, body: &[u8], entry: &DeltaPart) -> Result<()> {
     let limit = entry.size.saturating_sub(1);
     if body.len() as u64 > limit {
@@ -1194,8 +1398,8 @@ pub(crate) fn verify_inline_part(compression: u8, body: &[u8], entry: &DeltaPart
     }
 }
 
-/// The payload of an inline part: the body itself where it is uncompressed, and
-/// the decompressed [`Blob`] where it is xz.
+/// The payload of an inline part: the body itself if it is uncompressed, and
+/// the decompressed [`Blob`] if it is xz.
 pub(crate) enum InlinePayload<'a> {
     Borrowed(&'a [u8]),
     Owned(Blob),
@@ -1210,10 +1414,11 @@ impl InlinePayload<'_> {
     }
 }
 
-/// Decode the body of an inline part that [`verify_inline_part`] accepted. An
-/// uncompressed body is used where it lies, with no copy. An xz body
-/// decompresses through [`spill_to_blob`], on the heap at or below
-/// [`MMAP_THRESHOLD`] and into a mapped temp file in `staging` above it.
+/// Decodes the body of an inline part that [`verify_inline_part`] accepted.
+///
+/// An uncompressed body is used where it lies, with no copy. An xz body
+/// decompresses through [`spill_to_blob`]: on the heap up to
+/// [`MMAP_THRESHOLD`], and into a mapped temp file in `staging` if larger.
 pub(crate) async fn decode_inline_part<'a>(
     compression: u8,
     body: &'a [u8],
@@ -1291,9 +1496,10 @@ impl AsyncSeek for InlineSource<'_> {
     }
 }
 
-/// Parse the meta-entry array `a(uayttay)`. The `size` field is the ceiling a
-/// part is read under; the `usize` field states what the part's objects add up
-/// to. Both are host order.
+/// Parses the meta-entry array `a(uayttay)`.
+///
+/// The `size` field is the limit that a part is read under. The `usize` field
+/// states the sum of the sizes of the part objects. Both are host order.
 fn parse_meta_entries(entries: &[Value], big_endian: bool) -> Result<Vec<DeltaPart>> {
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -1312,9 +1518,9 @@ fn parse_meta_entries(entries: &[Value], big_endian: bool) -> Result<Vec<DeltaPa
     Ok(out)
 }
 
-/// Whether the superblock's metadata dict states big-endian host order. A
-/// superblock carrying no `ostree.endianness` byte is read as little-endian,
-/// which is what every producer of these deltas writes.
+/// Returns `true` if the metadata dict of a superblock states big-endian host
+/// order. A superblock with no `ostree.endianness` byte reads as
+/// little-endian, which is what each producer of these deltas writes.
 fn declares_big_endian(metadata: &Value) -> bool {
     metadata
         .dict_get(ENDIANNESS_KEY)
@@ -1323,9 +1529,9 @@ fn declares_big_endian(metadata: &Value) -> bool {
         == Some(ENDIANNESS_BIG)
 }
 
-/// Read one host-order `t` field. GVariant decodes it little-endian, which is the
-/// order a little-endian producer wrote it in, so a big-endian producer's field is
-/// swapped back.
+/// Reads one host-order `t` field. GVariant decodes it little-endian, which is
+/// the order of a little-endian producer. So the field of a big-endian
+/// producer is swapped back.
 fn size_field(value: &Value, what: &str, big_endian: bool) -> Result<u64> {
     let raw = value
         .as_u64()
@@ -1333,8 +1539,8 @@ fn size_field(value: &Value, what: &str, big_endian: bool) -> Result<u64> {
     Ok(if big_endian { raw.swap_bytes() } else { raw })
 }
 
-/// Parse the stride-33 `objtype + 32-byte checksum` object array that gives each
-/// part's object order and types.
+/// Parses the stride-33 `objtype + 32-byte checksum` object array, which gives
+/// the object order and types of a part.
 fn parse_object_array(bytes: &[u8]) -> Result<Vec<(ObjectType, Checksum)>> {
     if !bytes.len().is_multiple_of(33) {
         return Err(Error::InvalidFormat(
@@ -1350,7 +1556,7 @@ fn parse_object_array(bytes: &[u8]) -> Result<Vec<(ObjectType, Checksum)>> {
     Ok(out)
 }
 
-/// Parse the fallback array `a(yaytt)`. The two sizes are host order.
+/// Parses the fallback array `a(yaytt)`. The two sizes are host order.
 fn parse_fallbacks(entries: &[Value], big_endian: bool) -> Result<Vec<DeltaFallback>> {
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -1369,8 +1575,8 @@ fn parse_fallbacks(entries: &[Value], big_endian: bool) -> Result<Vec<DeltaFallb
     Ok(out)
 }
 
-/// Decode a part file into a random-access [`Blob`], verifying the part
-/// checksum over the whole on-disk file before the payload is expanded.
+/// Decodes a part file into a random-access [`Blob`]. It verifies the part
+/// checksum over the whole on-disk file before it expands the payload.
 async fn decode_part(part_path: PathBuf, entry: &DeltaPart, staging: &OwnedFd) -> Result<Blob> {
     let std_file = ostrya_rt::unblock(move || std::fs::File::open(&part_path))
         .await
@@ -1383,22 +1589,23 @@ async fn decode_part(part_path: PathBuf, entry: &DeltaPart, staging: &OwnedFd) -
     .await
 }
 
-/// Decode a part stream into a random-access [`Blob`], verifying the part
-/// checksum over the whole stream before any of it is decompressed.
+/// Decodes a part stream into a random-access [`Blob`]. It verifies the part
+/// checksum over the whole stream before it decompresses a byte.
 ///
-/// The `(yay)` part frame is a compression byte followed by the body to EOF (a
-/// tuple whose fixed `y` sits at offset 0 and whose trailing `ay` runs to the
-/// end). The stream is a part file for an offline application and a fetched
+/// The `(yay)` part frame is a compression byte, then the body to EOF. It is
+/// a tuple whose fixed `y` is at offset 0 and whose trailing `ay` runs to the
+/// end. The stream is a part file for an offline application and a fetched
 /// response body for a pull.
 ///
-/// The body is taken in under the size `entry` declares for the part file and
-/// hashed as it arrives, and the part checksum is asserted before the decoder
-/// runs. What the payload decompresses to is therefore bounded by a stream that
-/// hashes to the checksum the superblock names: a body that grew, shrank, or was
-/// swapped is refused having written at most the declared size, and a payload
-/// that expands without bound is one the delta's own publisher wrote. Both blobs
-/// spill through [`spill_to_blob`], so neither the body nor the payload is held
-/// beyond [`MMAP_THRESHOLD`] on the heap.
+/// The body is taken in under the size that `entry` declares for the part
+/// file, and hashed as it arrives. The part checksum is verified before the
+/// decoder runs. So the payload comes from a stream that hashes to the
+/// checksum that the superblock names. A body that grew, shrank, or was
+/// swapped is refused after at most the declared size is written. A payload
+/// that expands without a limit is one that the publisher of the delta wrote.
+///
+/// Both blobs go through [`spill_to_blob`], so the heap holds at most
+/// [`MMAP_THRESHOLD`] of the body and of the payload.
 pub(crate) async fn decode_part_stream<R: AsyncRead + Unpin>(
     mut stream: R,
     entry: &DeltaPart,
@@ -1406,13 +1613,13 @@ pub(crate) async fn decode_part_stream<R: AsyncRead + Unpin>(
 ) -> Result<Blob> {
     let mut first = [0u8; 1];
     stream.read_exact(&mut first).await.map_err(Error::Io)?;
-    // The checksum covers the whole part file, so the framing byte seeds the
-    // digest the body streams into.
+    // The checksum covers the whole part file, so the framing byte goes into
+    // the digest first, and the body streams into it after.
     let mut hasher = Sha256::new();
     hasher.update(first);
     let mut reader = HashingReader::new(hasher, stream);
 
-    // What the declared size leaves for the body, the framing byte spent.
+    // The declared size, less the framing byte, is the limit of the body.
     let body_limit = entry.size.saturating_sub(1);
     let body = spill_to_blob(&mut reader, staging, Some(body_limit)).await?;
     let (part_csum, _size) = reader.finalize();
@@ -1434,24 +1641,25 @@ pub(crate) async fn decode_part_stream<R: AsyncRead + Unpin>(
     }
 }
 
-/// The type of a part the superblock carries inline in its metadata dict: the
-/// compression byte and the body, the framing a part file has on disk.
+/// The type of a part that the superblock carries inline in its metadata dict:
+/// the compression byte and the body, as in a part file on disk.
 const INLINE_PART_SIG: &str = "(yay)";
 
-/// The number of trailing payload bytes [`part_stats_from`] keeps as it reads a
-/// payload to its end. A payload whose operation stream and xattr framing lie
-/// in this tail is read once.
+/// The number of trailing payload bytes that [`part_stats_from`] keeps as it
+/// reads a payload to its end. A payload whose operation stream and xattr
+/// framing are in this tail is read once.
 const PAYLOAD_TAIL: usize = 1024 * 1024;
 
-/// The memory the xz decoder may take to read the statistics of a part. The
-/// dictionary size an xz stream states sets what the decoder allocates, so a
-/// small part could state a dictionary of gigabytes. A part the tool's
-/// generator or the port's writes states a 32 MiB dictionary in its xz block
-/// header.
+/// The memory limit of the xz decoder that reads the statistics of a part.
+///
+/// The dictionary size that an xz stream states sets what the decoder
+/// allocates, so a small part can state a dictionary of gigabytes. A part that
+/// the generator of the `ostree` command or of ostrya writes states a 32 MiB
+/// dictionary in its xz block header.
 pub(crate) const STATS_XZ_MEM_LIMIT: u64 = 128 * 1024 * 1024;
 
 /// How far [`part_stats_from`] read a payload after the pass that found its
-/// framing. The tests assert which reads a payload took.
+/// framing. The tests check which reads a payload took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TailWalk {
     /// The kept tail held the operation stream and the xattr framing.
@@ -1464,28 +1672,28 @@ enum TailWalk {
     Full,
 }
 
-/// Read what one part source holds without applying it.
+/// Reads what one part source holds and does not apply it.
 ///
-/// The framing offsets of the payload `(a(uuu)aa(ayay)ayay)` sit at its end,
-/// so one forward pass cannot find the operation stream, and a payload has no
-/// size ceiling, so it is never held. The source is read in up to three
+/// The framing offsets of the payload `(a(uuu)aa(ayay)ayay)` are at its end,
+/// so one forward pass cannot find the operation stream. A payload has no
+/// size limit, so it is never held whole. The source is read in up to three
 /// passes:
 ///
-/// 1. Verify: the body is hashed under the size `entry` declares and the part
-///    checksum is asserted, with no byte decompressed, the rules
-///    [`decode_part_stream`] applies.
-/// 2. Frame: the payload streams to its end, keeping its length and its last
-///    [`PAYLOAD_TAIL`] bytes, which end with the three framing offsets of the
-///    tuple. An uncompressed body is the payload itself, so pass 1 keeps the
-///    tail and this pass is not made.
-/// 3. Walk: where the tail does not hold the operation stream and the last
-///    framing offset of the xattr table, the payload is read again up to the
+/// 1. Verify: the body is hashed under the size that `entry` declares, and
+///    the part checksum is verified. No byte is decompressed. These are the
+///    rules of [`decode_part_stream`].
+/// 2. Frame: the payload streams to its end. The pass keeps its length and
+///    its last [`PAYLOAD_TAIL`] bytes, which end with the three framing
+///    offsets of the tuple. An uncompressed body is the payload itself, so
+///    pass 1 keeps the tail and this pass does not occur.
+/// 3. Walk: the tail can lack the operation stream or the last framing
+///    offset of the xattr table. If so, the payload is read again up to the
 ///    last of the two. An uncompressed body is read at those offsets through
-///    a seek, and a compressed one streams from its start.
+///    a seek. A compressed body streams from its start.
 ///
 /// Each pass holds one [`IO_CHUNK`] buffer and the tail. A compressed pass
-/// also holds the xz decoder's state, whose size the dictionary the stream
-/// states sets, and which [`STATS_XZ_MEM_LIMIT`] caps.
+/// also holds the state of the xz decoder. The dictionary that the stream
+/// states sets its size, and [`STATS_XZ_MEM_LIMIT`] is its limit.
 pub(crate) async fn part_stats_from<R>(source: R, entry: &DeltaPart) -> Result<DeltaPartStats>
 where
     R: AsyncRead + AsyncSeek + Unpin + Send,
@@ -1527,7 +1735,7 @@ where
     let xattr_len = frame.xattrs_end - frame.modes_end;
     let xattr_offset_size = offset_size(xattr_len)?;
     // The last framing offset of the xattr table, which states where the
-    // table's framing starts. An empty table carries none.
+    // framing of the table starts. An empty table has none.
     let last_start = if xattr_len == 0 {
         frame.xattrs_end
     } else {
@@ -1642,8 +1850,8 @@ where
     Ok((stats, walk))
 }
 
-/// Stream `reader`, positioned at payload offset `from`, up to payload offset
-/// `upto`, handing each chunk to `sink` with the payload offset it starts at.
+/// Streams `reader`, which is at payload offset `from`, up to payload offset
+/// `upto`. It gives each chunk to `sink` with the payload offset of its start.
 async fn read_region<R, F>(
     reader: &mut R,
     chunk: &mut [u8],
@@ -1671,10 +1879,11 @@ where
     Ok(())
 }
 
-/// Pass 1 of [`part_stats_from`]: hash the part source under the size `entry`
-/// declares, assert the part checksum, and return the compression byte. No byte
-/// is decompressed. For an uncompressed part, whose body is the payload, the
-/// payload length and its last [`PAYLOAD_TAIL`] bytes come back too.
+/// Runs pass 1 of [`part_stats_from`]: hashes the part source under the size
+/// that `entry` declares, verifies the part checksum, and returns the
+/// compression byte. No byte is decompressed. For an uncompressed part, whose
+/// body is the payload, the result also holds the payload length and its last
+/// [`PAYLOAD_TAIL`] bytes.
 async fn verify_part_source<R: AsyncRead + Unpin>(
     source: &mut R,
     entry: &DeltaPart,
@@ -1717,9 +1926,9 @@ async fn verify_part_source<R: AsyncRead + Unpin>(
     }
 }
 
-/// The payload of an xz part source positioned after its compression byte,
-/// read under the body size `entry` declares and under [`STATS_XZ_MEM_LIMIT`]
-/// of decoder memory.
+/// Returns the payload of an xz part source that is at the byte after its
+/// compression byte. The read is under the body size that `entry` declares and
+/// under [`STATS_XZ_MEM_LIMIT`] of decoder memory.
 fn xz_payload<'a, R>(source: &'a mut R, entry: &DeltaPart) -> impl AsyncRead + Send + Unpin + 'a
 where
     R: AsyncRead + Unpin + Send,
@@ -1728,8 +1937,8 @@ where
     XzDecoder::with_mem_limit(BufReader::with_capacity(IO_CHUNK, body), STATS_XZ_MEM_LIMIT)
 }
 
-/// Map a payload read error, naming a stream that needs more decoder memory
-/// than [`STATS_XZ_MEM_LIMIT`].
+/// Maps a payload read error. The result names a stream that needs more
+/// decoder memory than [`STATS_XZ_MEM_LIMIT`].
 fn payload_error(err: io::Error) -> Error {
     // liblzma reports the limit as an `Other` error carrying this text, and a
     // failed allocation as `OutOfMemory`.
@@ -1801,9 +2010,9 @@ struct PartFrame {
 }
 
 impl PartFrame {
-    /// Read the framing of a payload of `len` bytes whose last 24 bytes are
-    /// `tail`. The last offset closes the mode table, the one before it the
-    /// xattr table, and the one before that the blob.
+    /// Reads the framing of a payload of `len` bytes whose last 24 bytes are
+    /// `tail`. The last offset ends the mode table, the offset before it ends
+    /// the xattr table, and the offset before that ends the blob.
     fn from_tail(len: u64, tail: &[u8; 24]) -> Result<PartFrame> {
         let z = offset_size(len)?;
         let ops_end = len.checked_sub(3 * z as u64).ok_or_else(bad_frame)?;
@@ -1830,7 +2039,7 @@ impl PartFrame {
     }
 }
 
-/// The framing-offset width of a GVariant container of `len` bytes.
+/// Returns the framing-offset width of a GVariant container of `len` bytes.
 fn offset_size(len: u64) -> Result<usize> {
     let len = usize::try_from(len).map_err(|_| bad_frame())?;
     Ok(offset_size_for(len))
@@ -1840,9 +2049,9 @@ fn bad_frame() -> Error {
     Error::InvalidFormat("static delta part payload framing is invalid".to_owned())
 }
 
-/// The operand count of `opcode`, `meta` stating whether the object at the
-/// current index is a metadata object: the rules [`apply_part`] decodes by.
-/// `None` for a byte that is no opcode.
+/// Returns the operand count of `opcode`, by the rules that [`apply_part`]
+/// decodes with. `meta` is `true` if the object at the current index is a
+/// metadata object. `None` for a byte that is not an opcode.
 fn operand_count(opcode: u8, meta: bool) -> Option<usize> {
     match opcode {
         OP_OPEN_SPLICE_CLOSE if meta => Some(2),
@@ -1855,16 +2064,18 @@ fn operand_count(opcode: u8, meta: bool) -> Option<usize> {
     }
 }
 
-/// Count the operations of a part stream fed in chunks of any size.
+/// The counter of the operations of a part stream, fed in chunks of any size.
 ///
-/// The operands are decoded by the rules [`apply_part`] applies. Two ranges into
-/// the data-source blob are checked against the blob length, the ones the
-/// tool's `static-delta show` also refuses: the payload range of an `S` and the
-/// checksum range of an `r`. The ranges of `w` and `B` are counted with no
-/// check, as the tool counts them, and so are the mode and xattr indexes of an
-/// `o`, on which the tool aborts where they leave the tables. The rules that
-/// need the objects themselves -- an open object at `c`, every object produced
-/// by the end -- are application's and are not checked here.
+/// The operands are decoded by the rules of [`apply_part`]. Two ranges into
+/// the data-source blob are checked against the blob length. These are the two
+/// that `ostree static-delta show` also refuses: the payload range of an `S`
+/// and the checksum range of an `r`.
+///
+/// The ranges of `w` and `B` are counted with no check, as the `ostree`
+/// command counts them. The mode and xattr indexes of an `o` are counted with
+/// no check too. The `ostree` command aborts on them if they are outside the
+/// tables. The rules that need the objects themselves -- an open object at
+/// `c`, each object produced by the end -- belong to the application.
 struct OpCounter<'a> {
     objects: &'a [(ObjectType, Checksum)],
     blob_len: u64,
@@ -1880,8 +2091,8 @@ struct PendingOp {
     need: usize,
     have: usize,
     operands: [u64; 4],
-    /// The bytes of the operand being read. Eleven bytes always hold a value
-    /// [`varint::decode`] refuses, so the buffer never needs to grow.
+    /// The bytes of the operand in progress. Eleven bytes always hold a value
+    /// that [`varint::decode`] refuses, so the buffer never needs to grow.
     leb: [u8; 11],
     leb_len: usize,
 }
@@ -1967,7 +2178,7 @@ impl<'a> OpCounter<'a> {
         Ok(())
     }
 
-    /// Refuse a range `[off, off + len)` that leaves the data-source blob.
+    /// Refuses a range `[off, off + len)` that goes outside the data-source blob.
     fn check_range(&self, off: u64, len: u64) -> Result<()> {
         off.checked_add(len)
             .filter(|end| *end <= self.blob_len)
@@ -1983,17 +2194,21 @@ impl<'a> OpCounter<'a> {
     }
 }
 
-/// Drain `reader` into a [`Blob`], keeping bytes on the heap until they exceed
-/// [`MMAP_THRESHOLD`], then spilling to an anonymous temp file that is mmapped
-/// read-only. A blob past the heap threshold costs staging-filesystem space and
-/// address space, not resident heap.
+/// Drains `reader` into a [`Blob`].
 ///
-/// `limit` is the number of bytes the stream is allowed to deliver, for a stream
-/// whose length is declared ahead of it: a part file's body is read under the size
-/// its meta-entry states, so a body that grew is refused at that ceiling instead
-/// of filling the staging filesystem. A stream with nothing declared for it takes
-/// `None` and is bounded by free disk the way the reference tool is: a spill that
-/// would exhaust the filesystem fails when the write returns `ENOSPC`.
+/// The bytes stay on the heap up to [`MMAP_THRESHOLD`]. Past it, they go to
+/// an anonymous temp file that is mapped read-only. A blob larger than the heap
+/// limit costs space on the staging file system and address space, and no
+/// resident heap.
+///
+/// `limit` is the number of bytes that the stream can deliver, for a stream
+/// whose length is declared before it. The body of a part file is read under
+/// the size that its meta-entry states. So a body that grew is refused at
+/// that limit, and it does not fill the staging file system.
+///
+/// A stream with no declared length takes `None`. Free disk space is its
+/// limit, as for the `ostree` command: if a spill fills the file system, it
+/// fails when the write returns `ENOSPC`.
 pub(crate) async fn spill_to_blob<R: AsyncRead + Unpin>(
     mut reader: R,
     staging: &OwnedFd,
@@ -2048,11 +2263,13 @@ pub(crate) async fn spill_to_blob<R: AsyncRead + Unpin>(
     }
 }
 
-/// Copy `slices`, in order, into one [`Blob`]: on the heap where they total
-/// [`MMAP_THRESHOLD`] or less, and otherwise into one anonymous temp file in
-/// `staging`, mapped read-only. A slice starts in the blob at the sum of the
-/// lengths before it. The heap held after the call is [`MMAP_THRESHOLD`] at
-/// most, whatever the number of slices.
+/// Copies `slices`, in order, into one [`Blob`].
+///
+/// If they total [`MMAP_THRESHOLD`] or less, the blob is on the heap.
+/// Otherwise it is one anonymous temp file in `staging`, mapped read-only. A
+/// slice starts in the blob at the sum of the lengths before it. The heap held
+/// after the call is [`MMAP_THRESHOLD`] at most, whatever the number of
+/// slices.
 pub(crate) async fn concat_to_blob(slices: &[&[u8]], staging: &OwnedFd) -> Result<Blob> {
     let total = slices
         .iter()
@@ -2075,9 +2292,11 @@ pub(crate) async fn concat_to_blob(slices: &[&[u8]], staging: &OwnedFd) -> Resul
     Ok(Blob::Mapped(mmap))
 }
 
-/// Open an anonymous read-write temp file on the staging filesystem: `O_TMPFILE`
-/// where supported, a named temp unlinked immediately otherwise. Both yield a
-/// readable-writable descriptor that needs no later cleanup.
+/// Opens an anonymous read-write temp file on the staging file system.
+///
+/// The call uses `O_TMPFILE` if the file system supports it. Otherwise it
+/// opens a named temp file and unlinks it at once. Both give a read-write
+/// descriptor that needs no later cleanup.
 pub(crate) fn open_rw_temp(staging: BorrowedFd<'_>) -> Result<OwnedFd> {
     use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
 
@@ -2108,21 +2327,22 @@ pub(crate) fn open_rw_temp(staging: BorrowedFd<'_>) -> Result<OwnedFd> {
     }
 }
 
-/// Execute a part's operation stream, producing its objects into `txn`.
+/// Runs the operation stream of a part and writes its objects into `txn`.
 ///
-/// Objects are produced in `objects` order; the object type at the current index
-/// determines whether an operation carries file metadata (mode and xattr
-/// indices) or is a bare metadata splice. Each produced object is written with
-/// its expected checksum, so a misapply fails at the write rather than storing a
-/// wrong object. The mode and xattr tables are small (format-bounded) and are
-/// collected up front; the data source and operation stream borrow the part
-/// blob, and object payloads stream to disk without buffering the whole object.
+/// The objects come in `objects` order. The object type at the current index
+/// sets the operand form: file metadata (mode and xattr indexes), or a bare
+/// metadata splice. Each object is written with its expected checksum, so a
+/// misapply fails at the write and stores no wrong object.
 ///
-/// `checks` holds the mode checks a content object this part produces is subject
-/// to: what the caller's flags require and what the destination mode requires.
-/// They are made on the part's own mode and xattr tables, before the object's
-/// bytes are written, so a delta delivers no object a loose fetch of the same
-/// object would be refused.
+/// The format bounds the mode and xattr tables, so they are collected first.
+/// The data source and the operation stream borrow the part blob. Object
+/// payloads stream to disk, and no whole object is buffered.
+///
+/// `checks` holds the mode checks for each content object of this part: what
+/// the flags of the caller require and what the destination mode requires.
+/// They run on the mode and xattr tables of the part, before the bytes of the
+/// object are written. So a delta delivers no object that a loose fetch of
+/// the same object refuses.
 pub(crate) async fn apply_part(
     txn: &Transaction,
     payload: &[u8],
@@ -2133,12 +2353,12 @@ pub(crate) async fn apply_part(
     let view: PartView<'_> = GvDecode::decode(payload).map_err(ostrya_core::Error::from)?;
     let (mode_it, xattr_it, data_source, ops) = view;
 
-    // The (uuu) mode triples are big-endian on the wire regardless of the
-    // superblock endianness byte, so they are byte-swapped here to host order.
-    // The mode and xattr tables are bounded metadata (a handful of distinct
-    // triples and xattr sets), so they are collected onto the heap; their
-    // combined footprint is capped at the metadata ceiling so a hostile part
-    // cannot force an unbounded table copy.
+    // The (uuu) mode triples are big-endian on the wire, whatever the
+    // endianness byte of the superblock states, so they are swapped here to
+    // host order. The mode and xattr tables are bounded metadata (a few
+    // distinct triples and xattr sets), so they go onto the heap. Their
+    // combined size has the metadata limit, so a hostile part cannot force an
+    // unbounded table copy.
     let mut table_bytes = 0usize;
     let mut modes: Vec<(u32, u32, u32)> = Vec::new();
     for entry in mode_it {
@@ -2173,8 +2393,8 @@ pub(crate) async fn apply_part(
                 if objtype.is_meta() {
                     let len = take_leb(ops, &mut cur)? as usize;
                     let off = take_leb(ops, &mut cur)? as usize;
-                    // A spliced metadata object is buffered whole (it re-hashes
-                    // to its checksum), so it is held to the metadata ceiling.
+                    // A spliced metadata object is buffered whole (it hashes
+                    // again to its checksum), so the metadata limit applies.
                     if len > crate::object::MAX_METADATA_SIZE as usize {
                         return Err(op_error(
                             "spliced metadata object exceeds the metadata ceiling",
@@ -2209,12 +2429,12 @@ pub(crate) async fn apply_part(
                     checks.check(&csum, &meta)?;
                     Some(meta)
                 };
-                // A metadata object or a symlink target buffers whole on the
-                // heap ([`Sink::Buffer`]), so its declared size is held to the
-                // metadata ceiling. A regular file streams to the content writer,
-                // so its size is bounded by the staging filesystem rather than a
-                // fixed ceiling; `close_object` asserts the produced size equals
-                // `out_size` and the content writer asserts the checksum.
+                // A metadata object or a symlink target is buffered whole on
+                // the heap ([`Sink::Buffer`]), so the metadata limit applies to
+                // its declared size. A regular file streams to the content
+                // writer, so the staging file system is the limit of its size.
+                // `close_object` checks that the produced size is `out_size`,
+                // and the content writer verifies the checksum.
                 let streams = matches!(&meta, Some(m) if m.mode & S_IFMT != S_IFLNK);
                 if !streams && out_size > crate::object::MAX_METADATA_SIZE as usize {
                     return Err(op_error("open object size exceeds the metadata ceiling"));
@@ -2254,11 +2474,12 @@ pub(crate) async fn apply_part(
             }
             OP_WRITE => {
                 // The rollsum `write` op appends `length` bytes to the open
-                // object, read at `offset` in the current source: the read-source
-                // object when one is set, the part's data source otherwise. The
-                // tool emits it for from->to deltas of larger objects, copying
-                // unchanged runs out of the source object and carrying only the
-                // changed runs in the payload.
+                // object, read at `offset` in the current source. The current
+                // source is the read-source object if one is set, and the data
+                // source of the part otherwise. The `ostree` command emits it
+                // for from->to deltas of larger objects. It copies the unchanged
+                // runs from the source object, and the payload carries only the
+                // changed runs.
                 let length = take_leb(ops, &mut cur)? as usize;
                 let off = take_leb(ops, &mut cur)? as usize;
                 let from = source.active().unwrap_or(data_source);
@@ -2296,30 +2517,31 @@ pub(crate) async fn apply_part(
     Ok(())
 }
 
-/// State for an object opened by `open` and finished by `close`.
+/// The state of an object that `open` opened and `close` finishes.
 struct OpenState<'t> {
     objtype: ObjectType,
     csum: Checksum,
     out_size: usize,
-    /// The file metadata for a content object; `None` for a metadata object.
+    /// The file metadata of a content object, or `None` for a metadata object.
     meta: Option<FileMeta>,
     sink: Sink<'t>,
 }
 
-/// The output sink for an opened object: a bounded in-memory buffer for a
-/// metadata object or a symlink target, or the streaming content writer for a
-/// regular file.
+/// The output sink of an open object: a bounded memory buffer for a metadata
+/// object or a symlink target, or the streaming content writer for a regular
+/// file.
 enum Sink<'t> {
     Buffer(Vec<u8>),
     Content {
-        // Boxed: a `ContentWriter` is far larger than the buffer variant.
+        // Boxed, because a `ContentWriter` is much larger than the buffer
+        // variant.
         writer: Box<ContentWriter<'t>>,
         written: usize,
     },
 }
 
 impl Sink<'_> {
-    /// The number of object bytes produced so far.
+    /// Returns the number of object bytes produced so far.
     fn produced(&self) -> usize {
         match self {
             Sink::Buffer(buf) => buf.len(),
@@ -2362,8 +2584,10 @@ impl AsyncWrite for Sink<'_> {
     }
 }
 
-/// Open the sink for the object at the current index: a content writer for a
-/// regular file, a buffer for a metadata object (`meta` is `None`) or a symlink.
+/// Opens the sink of the object at the current index.
+///
+/// The sink is a content writer for a regular file. It is a buffer for a
+/// metadata object (`meta` is `None`) or a symlink.
 async fn open_object<'t>(
     txn: &'t Transaction,
     objtype: ObjectType,
@@ -2388,9 +2612,9 @@ async fn open_object<'t>(
     })
 }
 
-/// Finish an opened object: assert its produced size and write it out, letting
-/// the content writer's `finish` or the metadata/symlink write assert the
-/// checksum.
+/// Finishes an open object: checks its produced size and writes it out. The
+/// `finish` of the content writer, or the metadata or symlink write, verifies
+/// the checksum.
 async fn close_object(txn: &Transaction, obj: OpenState<'_>) -> Result<()> {
     let OpenState {
         objtype,
@@ -2420,9 +2644,10 @@ async fn close_object(txn: &Transaction, obj: OpenState<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Write a content object (a regular file or a symlink) spliced from `content`,
-/// with the mode and xattrs the part's tables supply. A regular file streams to
-/// disk in bounded chunks; a symlink takes the bytes as its target.
+/// Writes a content object (a regular file or a symlink) spliced from
+/// `content`, with the mode and xattrs from the tables of the part. A regular
+/// file streams to disk in bounded chunks. A symlink takes the bytes as its
+/// target.
 #[allow(clippy::too_many_arguments)]
 async fn write_content_slice(
     txn: &Transaction,
@@ -2451,7 +2676,7 @@ async fn write_content_slice(
     Ok(())
 }
 
-/// Build the file metadata for the object at `mode_idx`/`xattr_idx`.
+/// Returns the file metadata of the object at `mode_idx` and `xattr_idx`.
 fn file_meta(
     modes: &[(u32, u32, u32)],
     xattrs: &[Xattrs],
@@ -2473,31 +2698,32 @@ fn file_meta(
     })
 }
 
-/// The read source the `r`/`R` ops select, holding the loaded object across the
-/// pairs that name it.
+/// The read source that the `r` and `R` ops select. It holds the loaded object
+/// across the pairs that name it.
 ///
-/// A part sets and unsets the read source once per contiguous run it copies out
-/// of the source object, so a heavily modified object names the same source
-/// dozens of times: the 4 MiB object of a delta with forty scattered edits
-/// carries forty-one `r` ops. Reloading on each one would re-read and re-spill
-/// the whole object every time, so the loaded blob outlives the `R` that ends a
-/// run and a later `r` naming the same checksum reuses it. Objects are
-/// content-addressed, so a checksum match means identical bytes and the reuse
-/// needs no revalidation. At most one source object is held: a different
-/// checksum drops the previous blob (releasing its temp file and mapping) before
-/// loading the next.
+/// A part sets and unsets the read source once for each contiguous run that
+/// it copies from the source object. So an object with many changes names the
+/// same source many times: the 4 MiB object of a delta with forty scattered
+/// edits carries forty-one `r` ops. A reload at each `r` reads and spills the
+/// whole object again each time. So the loaded blob outlives the `R` that ends
+/// a run, and a later `r` that names the same checksum uses it again.
+///
+/// Objects are content-addressed, so equal checksums mean identical bytes,
+/// and the reuse needs no second check. At most one source object is held. A
+/// different checksum drops the previous blob, with its temp file and mapping,
+/// before the next one loads.
 #[derive(Default)]
 struct SourceCache {
     loaded: Option<(Checksum, Blob)>,
-    /// Whether an `r` op currently has the loaded source selected. `R` clears
-    /// this without dropping the blob, so a `write` op with no read source falls
-    /// back to the part's data source as the format requires.
+    /// `true` while an `r` op selects the loaded source. `R` clears it and
+    /// keeps the blob, so a `write` op with no read source reads the data
+    /// source of the part, as the format requires.
     active: bool,
 }
 
 impl SourceCache {
-    /// Select `checksum` as the read source, loading it unless it is already
-    /// held.
+    /// Selects `checksum` as the read source, and loads it if it is not
+    /// already held.
     async fn set(
         &mut self,
         txn: &Transaction,
@@ -2505,8 +2731,8 @@ impl SourceCache {
         staging: &OwnedFd,
     ) -> Result<()> {
         if !matches!(&self.loaded, Some((held, _)) if held == checksum) {
-            // Drop any previously held source first, so the peak cost is one
-            // source object's temp file and mapping rather than two.
+            // Drop the source that is held first, so the peak cost is the temp
+            // file and mapping of one source object.
             self.loaded = None;
             self.loaded = Some((*checksum, load_source_blob(txn, checksum, staging).await?));
         }
@@ -2514,12 +2740,14 @@ impl SourceCache {
         Ok(())
     }
 
-    /// Deselect the read source, keeping it loaded for a later `r`.
+    /// Clears the read source selection, and keeps the object loaded for a
+    /// later `r`.
     fn unset(&mut self) {
         self.active = false;
     }
 
-    /// The selected read source's bytes, or `None` when no `r` op is in effect.
+    /// Returns the bytes of the selected read source, or `None` if no `r` op is
+    /// in effect.
     fn active(&self) -> Option<&[u8]> {
         self.active
             .then_some(self.loaded.as_ref())
@@ -2528,11 +2756,13 @@ impl SourceCache {
     }
 }
 
-/// Load a content object as a random-access [`Blob`] for use as a bspatch or
-/// rollsum source, checking the current transaction's staged objects before the
-/// repository. The object streams through its reader into the same spill path as
-/// a part payload, so a large source object is mmapped rather than held on the
-/// heap.
+/// Loads a content object as a random-access [`Blob`], the source of a
+/// bspatch or rollsum op.
+///
+/// The call looks in the staged objects of the current transaction before the
+/// repository. The object streams through its reader into the spill path of a
+/// part payload. So a large source object is a memory map, and it is not held
+/// on the heap.
 async fn load_source_blob(
     txn: &Transaction,
     checksum: &Checksum,
@@ -2543,18 +2773,18 @@ async fn load_source_blob(
     spill_to_blob(reader, staging, None).await
 }
 
-/// Read a whole file into a size-bounded buffer, off the async thread. Used for
-/// the superblock, which is bounded metadata.
+/// Reads a whole file into a size-bounded buffer, off the async thread. The
+/// superblock read uses it, because the superblock is bounded metadata.
 ///
-/// The read stops one byte past the ceiling, whatever the file is: a device or a
-/// FIFO states no length, so the ceiling is applied to the bytes read. For a
-/// regular file the buffer is sized from the length of the open file, up to the
-/// ceiling, so the file is read with no growth of the buffer.
+/// The read stops one byte past the limit, whatever the file is. A device or
+/// a FIFO states no length, so the limit applies to the bytes read. For a
+/// regular file, the length of the open file sets the buffer size, up to the
+/// limit. So the buffer does not grow during the read.
 pub(crate) async fn read_capped(path: PathBuf) -> Result<Vec<u8>> {
     read_under(path, MAX_SUPERBLOCK).await
 }
 
-/// [`read_capped`] under a ceiling of `cap` bytes.
+/// Runs [`read_capped`] under a limit of `cap` bytes.
 async fn read_under(path: PathBuf, cap: u64) -> Result<Vec<u8>> {
     ostrya_rt::unblock(move || {
         use std::io::Read;
@@ -2579,14 +2809,14 @@ async fn read_under(path: PathBuf, cap: u64) -> Result<Vec<u8>> {
     .map_err(Error::Io)
 }
 
-/// Decode one LEB128 operand from `ops` at `*cur`, advancing the cursor.
+/// Decodes one LEB128 operand from `ops` at `*cur` and moves the cursor past it.
 fn take_leb(ops: &[u8], cur: &mut usize) -> Result<u64> {
     let (value, consumed) = varint::decode(&ops[*cur..])?;
     *cur += consumed;
     Ok(value)
 }
 
-/// Borrow `data[off..off + len]`, erroring on an out-of-range range.
+/// Borrows `data[off..off + len]`. It fails if the range is out of bounds.
 fn slice(data: &[u8], off: usize, len: usize) -> Result<&[u8]> {
     let end = off
         .checked_add(len)
@@ -2595,7 +2825,7 @@ fn slice(data: &[u8], off: usize, len: usize) -> Result<&[u8]> {
         .ok_or_else(|| op_error("data-source range out of bounds"))
 }
 
-/// Look up the object at `index`, erroring when the stream runs past the list.
+/// Returns the object at `index`. It fails if the stream runs past the list.
 fn object_at(objects: &[(ObjectType, Checksum)], index: usize) -> Result<(ObjectType, Checksum)> {
     objects
         .get(index)
@@ -2607,8 +2837,8 @@ fn op_error(msg: &str) -> Error {
     Error::InvalidFormat(format!("static delta: {msg}"))
 }
 
-/// Add `n` bytes to a running mode/xattr table footprint, failing once the
-/// combined tables would exceed [`MAX_TABLE_BYTES`].
+/// Adds `n` bytes to the running size of the mode and xattr tables. It fails
+/// if the combined tables become larger than [`MAX_TABLE_BYTES`].
 fn bump_table(total: usize, n: usize) -> Result<usize> {
     total
         .checked_add(n)
@@ -2649,8 +2879,8 @@ mod tests {
     use super::*;
     use ostrya_rt::block_on;
 
-    /// A directory descriptor for the spill path. Every part here is far below
-    /// [`MMAP_THRESHOLD`], so no temp file is opened through it.
+    /// A directory descriptor for the spill path. Every part here is much
+    /// smaller than [`MMAP_THRESHOLD`], so no temp file is opened through it.
     fn staging_fd() -> OwnedFd {
         use rustix::fs::{Mode, OFlags, open};
         open(
@@ -2661,7 +2891,8 @@ mod tests {
         .unwrap()
     }
 
-    /// A meta-entry naming a part file of `file` bytes, declaring `size` for it.
+    /// A meta-entry that names a part file of `file` bytes and declares `size`
+    /// for it.
     fn meta_entry(file: &[u8], size: u64) -> DeltaPart {
         DeltaPart {
             part_csum: Checksum::sha256(file),
@@ -2694,9 +2925,9 @@ mod tests {
         dict
     }
 
-    /// An uncompressed part reads back as its payload, and a body longer than the
-    /// meta-entry declares is refused at that ceiling -- here with a checksum that
-    /// covers the longer body, so the size is what stops it.
+    /// An uncompressed part reads back as its payload. A body longer than the
+    /// meta-entry declares is refused at that limit. Here the checksum covers
+    /// the longer body, so the size is what stops it.
     #[test]
     fn a_part_body_is_read_under_the_declared_size() {
         block_on(async {
@@ -2726,9 +2957,9 @@ mod tests {
         });
     }
 
-    /// The part checksum is asserted before the decoder runs: a part declaring xz
-    /// whose body is not an xz stream is refused for what it is, and the decoder
-    /// never sees the body.
+    /// The part checksum is verified before the decoder runs. A part that
+    /// declares xz and whose body is not an xz stream fails the checksum, and
+    /// the decoder never sees the body.
     #[test]
     fn a_swapped_part_body_fails_its_checksum_before_the_decoder_runs() {
         block_on(async {
@@ -2778,9 +3009,9 @@ mod tests {
         out
     }
 
-    /// One of every opcode against a 64-byte blob: a metadata splice, a
-    /// content splice, then an object built from a payload write, a read
-    /// source, a write against it, and a bspatch.
+    /// One of every opcode against a 64-byte blob. The stream holds a metadata
+    /// splice and a content splice. Then it builds an object from a payload
+    /// write, a read source, a write against it, and a bspatch.
     fn every_opcode() -> Vec<u8> {
         [
             op(OP_OPEN_SPLICE_CLOSE, &[3, 0]),
@@ -2808,8 +3039,8 @@ mod tests {
         }
     }
 
-    /// Operands split across feeds decode the same as a stream fed whole: a
-    /// multi-byte operand may end one chunk and finish in the next.
+    /// Operands split across feeds decode the same as a stream fed whole. A
+    /// multi-byte operand can start in one chunk and end in the next.
     #[test]
     fn the_op_counter_reads_operands_split_across_chunks() {
         let objects = two_objects();
@@ -2836,8 +3067,8 @@ mod tests {
             (ObjectType::DirTree, Checksum::from_bytes([0x01; 32])),
             (ObjectType::DirMeta, Checksum::from_bytes([0x02; 32])),
         ];
-        // `(1, 2)` then `(3, 4)`: two metadata splices, the second `S` byte
-        // being the opcode read from the stream's third byte.
+        // `(1, 2)` then `(3, 4)`: two metadata splices. The second `S` byte is
+        // the opcode read from the third byte of the stream.
         let mut two = OpCounter::new(&meta, 64);
         two.feed(&[OP_OPEN_SPLICE_CLOSE, 1, 2, OP_OPEN_SPLICE_CLOSE, 3, 4])
             .unwrap();
@@ -2849,9 +3080,9 @@ mod tests {
         assert_eq!(one.finish().unwrap().open_splice_close, 1);
     }
 
-    /// The counter refuses the streams the tool's `static-delta show` refuses
-    /// on their bytes alone, and counts the `w`, `B`, and `o` operands the tool
-    /// counts unchecked.
+    /// The counter refuses the streams that `ostree static-delta show` refuses
+    /// on their bytes alone. It counts the `w`, `B`, and `o` operands that the
+    /// `ostree` command counts with no check.
     #[test]
     fn the_op_counter_refuses_what_the_tools_show_refuses() {
         let objects = two_objects();
@@ -2881,8 +3112,8 @@ mod tests {
         ]
         .concat();
         assert!(refused(&past_the_list).contains("more objects than declared"));
-        // A close with no open object is application's refusal, not the
-        // counter's.
+        // A close with no open object is a refusal of the application. The
+        // counter accepts it.
         let mut closes = OpCounter::new(&objects, 64);
         closes.feed(&[OP_CLOSE, OP_CLOSE]).unwrap();
         assert_eq!(closes.finish().unwrap().close, 2);
@@ -2983,8 +3214,8 @@ mod tests {
         inline_part_at(dict, &found, index, || dir.to_owned())
     }
 
-    /// An inline part is borrowed from the dict under its own key, an absent
-    /// key reads as no inline part, and a value of another type is refused.
+    /// An inline part is borrowed from the dict under its own key. An absent
+    /// key reads as no inline part. A value of another type is refused.
     #[test]
     fn an_inline_part_is_borrowed_from_the_metadata_dict() {
         let dir = "deltas/ab/cdef";
@@ -3006,9 +3237,9 @@ mod tests {
         assert!(message.contains("deltas/ab/cdef/0"), "{message}");
     }
 
-    /// The one-pass index reads the keys a lookup by key reads: the first
-    /// entry under a key wins, and a part number written with a sign, a
-    /// leading zero, or a trailing character is another key.
+    /// The one-pass index reads the keys that a lookup by key reads. The first
+    /// entry under a key wins. A part number written with a sign, a leading
+    /// zero, or a trailing character is another key.
     #[test]
     fn the_inline_index_takes_the_first_entry_under_the_exact_key() {
         let dir = "deltas/ab/cdef";
@@ -3032,9 +3263,9 @@ mod tests {
         assert_eq!(read(2), None);
     }
 
-    /// An inline part is held to the rules a part file is read under, each
-    /// checked before any decoder runs: the declared size, the checksum, and
-    /// the compression byte.
+    /// An inline part is held to the rules that a part file is read under. The
+    /// checks of the declared size, the checksum, and the compression byte
+    /// each run before any decoder runs.
     #[test]
     fn an_inline_part_is_checked_against_its_size_and_checksum() {
         let (file, entry) = part_file(b"a part payload", COMPRESSION_XZ, Vec::new());
@@ -3156,7 +3387,8 @@ mod tests {
         let err = block_on(part_stats_from(Cursor::new(file), &entry)).unwrap_err();
         assert!(err.to_string().contains("byte(s) declared for it"), "{err}");
 
-        // A swapped body declaring xz fails the checksum, not the decoder.
+        // A swapped body that declares xz fails at the checksum, before the
+        // decoder.
         let mut swapped = vec![COMPRESSION_XZ];
         swapped.extend_from_slice(b"not an xz stream");
         let entry = DeltaPart {
@@ -3259,9 +3491,9 @@ mod tests {
         );
     }
 
-    /// A superblock file past the ceiling is refused on the bytes read, one at
-    /// the ceiling is read whole, and a device that states no length is read
-    /// only up to one byte past the ceiling.
+    /// A superblock file past the limit is refused on the bytes read. A file
+    /// at the limit is read whole. A device that states no length is read only
+    /// up to one byte past the limit.
     #[test]
     fn a_superblock_file_is_read_under_the_ceiling() {
         let dir = std::env::temp_dir().join(format!("ostrya-read-capped-{}", std::process::id()));
@@ -3329,7 +3561,7 @@ mod tests {
     }
 
     /// Under `B` the meta-entry `size` and `usize` and both fallback sizes are
-    /// swapped; under `l` none is.
+    /// swapped. Under `l` none is.
     #[test]
     fn a_big_endian_superblock_swaps_every_size_field() {
         let entry = |size: u64, usize: u64| {

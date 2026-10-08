@@ -1,26 +1,17 @@
-//! The kernel version a bootable commit records, and the metadata pair that
-//! carries it.
+//! The kernel version of a bootable commit, and the metadata pair that holds
+//! it.
 //!
-//! A bootable commit holds `ostree.linux` and `ostree.bootable`. `ostree.linux`
-//! is the name of the one directory under `/usr/lib/modules` in the commit's
-//! tree that holds an entry named `vmlinuz`, and `ostree.bootable` is `true`
-//! beside it (`docs/format-reference.md`, "CLI output formats", `commit`).
+//! A bootable commit holds two keys in its metadata:
 //!
-//! The search is one level deep under `/usr/lib/modules`. An entry there that
-//! is not a directory takes no part, and the type of the `vmlinuz` entry is not
-//! read: a regular file, a symlink, and a directory of that name each count.
+//! - `ostree.linux`, the name of the directory under `/usr/lib/modules` that
+//!   holds an entry named `vmlinuz`. The tree of the commit holds exactly one
+//!   such directory.
+//! - `ostree.bootable`, the value `true`.
 //!
-//! Four tree shapes give no kernel version, and [`BootableRefusal`] names them.
-//! They are outcomes of the search rather than failures of it, so they arrive
-//! through the inner `Result` and leave the outer one for the object reads.
-//!
-//! The search runs over a staged tree through
-//! [`Transaction::kernel_version`] and over a published one through
-//! [`RepoTree::kernel_version`]. A caller deriving the pair for a commit it is
-//! about to write uses the first; a caller reading a deployment uses the second.
-//!
-//! [`BootableMetadata`] adds the pair to a [`DictBuilder`] in the order the pair
-//! holds on disk.
+//! [`Transaction::kernel_version`] finds the version in a staged tree.
+//! [`RepoTree::kernel_version`] finds it in a committed tree.
+//! [`BootableRefusal`] names the four tree shapes that give no version.
+//! [`BootableMetadata`] adds the pair to a [`DictBuilder`].
 
 use ostrya_core::DictBuilder;
 
@@ -28,45 +19,49 @@ use crate::error::Result;
 use crate::transaction::Transaction;
 use crate::tree::{RepoTree, TreeEntry};
 
-/// The commit metadata key holding the kernel directory's name.
+/// The commit metadata key that holds the name of the kernel directory.
 const LINUX_KEY: &str = "ostree.linux";
-/// The commit metadata key marking a commit as bootable.
+/// The commit metadata key that marks a commit as bootable.
 const BOOTABLE_KEY: &str = "ostree.bootable";
-/// The directory the search reads, one level deep, for the kernel.
+/// The directory that the search reads, one level deep, for the kernel.
 const MODULES_DIR: &str = "/usr/lib/modules";
-/// The entry name a kernel directory must hold.
+/// The entry name that a kernel directory must hold.
 const KERNEL_ENTRY: &str = "vmlinuz";
 
 /// A tree shape that names no kernel version.
+///
+/// The `kernel_version` methods return it in the inner `Result`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootableRefusal {
-    /// The tree does not hold this component of `/usr/lib/modules`. The path is
-    /// absolute and names the first component that is absent.
+    /// A component of `/usr/lib/modules` that the tree does not hold.
     MissingComponent {
-        /// The absolute path of the absent component.
+        /// The absolute path of the first absent component.
         path: String,
     },
-    /// The tree holds this component of `/usr/lib/modules` as something other
-    /// than a directory. A regular file and a symlink both reach this.
+    /// A component of `/usr/lib/modules` that is not a directory.
+    ///
+    /// A regular file and a symlink both give this refusal.
     NotADirectory {
         /// The absolute path of the component that is not a directory.
         path: String,
     },
     /// No directory under `/usr/lib/modules` holds an entry named `vmlinuz`.
     NoKernel,
-    /// More than one directory under `/usr/lib/modules` holds an entry named
-    /// `vmlinuz`, so no single version names the tree.
+    /// Two or more directories under `/usr/lib/modules` hold a `vmlinuz` entry.
+    ///
+    /// No single kernel version names the tree.
     MultipleKernels,
 }
 
-/// Where the search reads the tree's directories.
+/// The place where the search reads the directories of the tree.
 #[derive(Clone, Copy)]
 enum DirSource<'a> {
-    /// A published repository: every dirtree is a loose object under
+    /// A published repository. Every dirtree is a loose object under
     /// `objects/`.
     Published,
-    /// A transaction: a dirtree it staged is read from the staging directory,
-    /// and one that deduplicated from `objects/`.
+    /// A transaction. The search reads a dirtree that the transaction staged
+    /// from the staging directory. It reads a dirtree that deduplicated
+    /// against a stored object from `objects/`.
     Staged(&'a Transaction),
 }
 
@@ -79,18 +74,31 @@ impl DirSource<'_> {
     }
 }
 
+/// Methods that read the kernel version of a staged tree.
 impl Transaction {
-    /// The kernel version of a tree this transaction assembled, the value
-    /// `ostree.linux` holds.
+    /// Returns the kernel version of a tree that this transaction staged.
     ///
-    /// The tree is read through [`Transaction::read_dir`], so the search sees
-    /// the objects this transaction staged as well as those already in
-    /// `objects/`. That makes the version available before the transaction
-    /// publishes, which is what a caller deriving the metadata of the commit it
-    /// is about to write needs.
+    /// The version is the value of `ostree.linux`. The search reads each
+    /// dirtree with [`read_dir`](Transaction::read_dir), so it sees the objects
+    /// that this transaction staged and the objects in `objects/`. A caller can
+    /// derive the metadata of a commit before the transaction commit.
     ///
-    /// The outer `Result` carries the object reads. The inner one carries the
-    /// four tree shapes that name no version.
+    /// The search rules are the same as in [`RepoTree::kernel_version`]. The
+    /// inner `Result` holds the version or a [`BootableRefusal`]. A refusal is
+    /// an outcome of the search. The outer `Result` holds the errors of the
+    /// object reads.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if a dirtree on the search path is not
+    ///   staged and not in `objects/`.
+    /// - [`Error::Io`] if the read of a dirtree fails, or if a dirtree is
+    ///   larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::Core`] if a dirtree does not parse.
+    ///
+    /// [`Error::ObjectNotFound`]: crate::error::Error::ObjectNotFound
+    /// [`Error::Io`]: crate::error::Error::Io
+    /// [`Error::Core`]: crate::error::Error::Core
     pub async fn kernel_version(
         &self,
         root: &RepoTree,
@@ -100,22 +108,51 @@ impl Transaction {
 }
 
 impl RepoTree {
-    /// The kernel version of this tree, the value `ostree.linux` holds.
+    /// Returns the kernel version of this tree.
     ///
-    /// The tree is read through [`RepoTree::read_dir`], which reads `objects/`
-    /// alone, so the search sees a tree only once the transaction that
-    /// assembled it has committed. [`Transaction::kernel_version`] covers a tree
-    /// that is still staged.
+    /// The version is the value of `ostree.linux`. The search reads each
+    /// dirtree with [`read_dir`](RepoTree::read_dir), which reads `objects/`
+    /// alone, so it sees a tree only after the transaction commit. A caller
+    /// that reads a deployed commit uses this method.
+    /// [`Transaction::kernel_version`] reads a tree that is still staged.
     ///
-    /// The outer `Result` carries the object reads. The inner one carries the
-    /// four tree shapes that name no version.
+    /// The inner `Result` holds the version or a [`BootableRefusal`]. A refusal
+    /// is an outcome of the search. The outer `Result` holds the errors of the
+    /// object reads.
+    ///
+    /// # Search
+    ///
+    /// The search walks `/usr/lib/modules` from this tree. Then it reads each
+    /// directory one level under `/usr/lib/modules` and looks for an entry
+    /// named `vmlinuz`. It reads no deeper level.
+    ///
+    /// - An entry under `/usr/lib/modules` that is not a directory takes no
+    ///   part in the search.
+    /// - The search does not read the type of the `vmlinuz` entry. A regular
+    ///   file, a symlink, and a directory of that name each count.
+    /// - If exactly one directory holds `vmlinuz`, its name is the version.
+    ///   Each other outcome is a [`BootableRefusal`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if a dirtree on the search path is not in
+    ///   the object store. This includes a dirtree that a transaction staged
+    ///   before its transaction commit.
+    /// - [`Error::Io`] if a dirtree is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, and for other failures of the file system.
+    /// - [`Error::Core`] if a dirtree does not parse.
+    ///
+    /// [`Error::ObjectNotFound`]: crate::error::Error::ObjectNotFound
+    /// [`Error::Io`]: crate::error::Error::Io
+    /// [`Error::Core`]: crate::error::Error::Core
     pub async fn kernel_version(&self) -> Result<std::result::Result<String, BootableRefusal>> {
         kernel_version(DirSource::Published, self).await
     }
 }
 
-/// The one walk both entry points expose: descend `/usr/lib/modules` from
-/// `root`, then take the name of the single child directory holding `vmlinuz`.
+/// Walks `/usr/lib/modules` from `root` and returns the name of the single
+/// child directory that holds `vmlinuz`. Both `kernel_version` methods call it.
 async fn kernel_version(
     source: DirSource<'_>,
     root: &RepoTree,
@@ -157,23 +194,24 @@ async fn kernel_version(
     }
 }
 
-/// The name of a directory entry, whichever kind it is.
+/// Returns the name of a directory entry of either kind.
 fn entry_name(entry: &TreeEntry) -> &str {
     match entry {
         TreeEntry::File { name, .. } | TreeEntry::Dir { name, .. } => name,
     }
 }
 
-/// The bootable pair, added to a metadata dict under construction.
+/// An extension of [`DictBuilder`] that adds the bootable metadata pair.
 pub trait BootableMetadata {
-    /// Append `ostree.linux` holding `kernel_version`, then `ostree.bootable`
-    /// holding true.
+    /// Appends `ostree.linux` with `kernel_version`, then `ostree.bootable`
+    /// with `true`.
     ///
-    /// The pair goes in at the position the builder has reached, so a caller
-    /// that has already inserted its own keys puts the pair after them. The
-    /// tool writes the pair at the head of the dict, ahead of every other key,
-    /// and a commit whose dict holds the pair elsewhere carries another
-    /// checksum for the same tree.
+    /// The pair goes in at the current position of the builder. If the caller
+    /// inserted its own keys before this call, the pair comes after them.
+    ///
+    /// The `ostree` command writes the pair at the head of the dict, before
+    /// every other key. If the dict holds the pair at another position, the
+    /// commit gets a different checksum for the same tree.
     fn insert_bootable(&mut self, kernel_version: &str) -> &mut Self;
 }
 
@@ -189,8 +227,8 @@ mod tests {
     use super::*;
     use ostrya_core::{Type, Value, to_bytes};
 
-    /// The pair the trait writes: the two keys, in that order, with the types
-    /// the format states, and the same bytes as the pair assembled by hand.
+    /// Checks that the trait writes the two keys in order, with the types of
+    /// the format. The bytes match a pair built by hand.
     #[test]
     fn writes_the_pair_in_order() {
         let mut builder = DictBuilder::new();
@@ -213,7 +251,7 @@ mod tests {
         assert_eq!(to_bytes(&ty, &dict).unwrap(), to_bytes(&ty, &hand).unwrap());
     }
 
-    /// The pair appends, so keys inserted before it stand ahead of it.
+    /// Checks that the pair goes after the keys that the builder holds.
     #[test]
     fn appends_after_the_keys_already_inserted() {
         let mut builder = DictBuilder::new();

@@ -1,24 +1,27 @@
 //! The update lock: the lock that serializes the writes of refs and of the
 //! other repository state outside the object store.
 //!
-//! A holder of [`crate::UpdateGuard`] holds it, the receive path holds it while
-//! it reads the state of its target refs, checks it, and commits, and summary
-//! regeneration holds it while it refreshes the anchor commit and writes the
-//! summary.
+//! These callers hold it:
+//!
+//! - An [`UpdateGuard`](crate::UpdateGuard), and each writer that the
+//!   `UpdateGuard` doc lists.
+//! - The receive path, while it reads the state of its target refs, checks
+//!   it, and commits.
+//! - Summary regeneration, while it refreshes the anchor commit and writes the
+//!   summary.
 //!
 //! The lock is an exclusive `fcntl` record lock (`F_SETLK`) on
-//! `<repo>/.update.lock`, beside `.lock`. The file is opened by the rules of
-//! `.lock` and is held through the same process-global registry, so the process
-//! keeps one descriptor to it. The tool never opens this file, so the lock
-//! excludes port processes alone.
+//! `<repo>/.update.lock`, beside `.lock`. The lock file opens by the rules of
+//! `.lock`. The same process-global registry holds it, so the process keeps one
+//! descriptor to it. [`Repo::begin_update`](crate::Repo::begin_update) states
+//! the rules that a caller sees.
 //!
 //! Inside the process the lock is exclusive too. Its waiters queue in the order
-//! of their first poll, and only the head of the queue makes lock requests.
+//! of their first poll. Only the head of the queue makes lock requests.
 //! Against another process the head runs the retry loop of the repository lock:
-//! one non-blocking request, then an [`ostrya_rt::Timer`] wait of at most
+//! one non-blocking request, then a [`Timer`](ostrya_rt::Timer) wait of at most
 //! [`POLL_INTERVAL`]. No request blocks in the kernel, so a dropped wait leaves
-//! no lock request behind. A release always drops the record lock, so another
-//! process can take the lock between two holders of this process.
+//! no lock request behind.
 //!
 //! The lock ignores `[core] locking` and always takes the record lock.
 
@@ -38,10 +41,10 @@ use crate::error::{Error, Result};
 /// The update lock file, relative to the repository root.
 const UPDATE_LOCK_FILE: &str = ".update.lock";
 
-/// The in-process holder and the queue of waiters.
+/// The in-process state of an update lock: the hold and the queue of waiters.
 #[derive(Debug)]
 struct UpdateState {
-    /// Whether a guard holds the lock.
+    /// `true` while a guard holds the lock.
     held: bool,
     /// The ticket the next waiter takes.
     next_ticket: u64,
@@ -62,14 +65,15 @@ pub(crate) struct UpdateLock {
 }
 
 impl UpdateLock {
-    /// Return the [`UpdateLock`] for the repository rooted at `repo_fd`,
-    /// creating `<repo>/.update.lock` and registering it on first use. Runs
-    /// synchronous filesystem calls and is meant to be offloaded to the
-    /// blocking pool.
+    /// Returns the [`UpdateLock`] of the repository at `repo_fd`.
     ///
-    /// The file is opened by the rules of `.lock`, through the registry helper
-    /// the repository lock uses. A file that shares its inode with `.lock` is
-    /// refused.
+    /// On first use, the call creates `<repo>/.update.lock` and registers the
+    /// lock. It makes synchronous file system calls, so run it on the blocking
+    /// pool.
+    ///
+    /// The call opens the file by the rules of `.lock`, through the registry
+    /// helper that the repository lock uses. It refuses a file that shares its
+    /// inode with `.lock`.
     pub(crate) fn get_or_create(
         repo_fd: BorrowedFd<'_>,
         repo_mode: RepoMode,
@@ -109,20 +113,22 @@ impl Drop for UpdateLock {
     }
 }
 
-/// Take the waker the head of the queue left, if any, for a wake after the
-/// state mutex is released. Call this only while no guard holds the lock.
+/// Takes the waker that the head of the queue left, if any.
+///
+/// The caller wakes it after it releases the state mutex. Call this only
+/// while no guard holds the lock.
 fn wake_head(st: &mut UpdateState) -> Option<Waker> {
     st.queue.front_mut().and_then(|(_, waker)| waker.take())
 }
 
-/// An acquired update lock. Releasing happens on drop.
+/// An acquired update lock. The drop releases it.
 #[derive(Debug)]
 pub(crate) struct UpdateLockHeld {
     lock: Arc<UpdateLock>,
 }
 
 impl UpdateLockHeld {
-    /// Whether this hold is a hold of `lock`.
+    /// Returns `true` if this hold is a hold of `lock`.
     pub(crate) fn is_of(&self, lock: &Arc<UpdateLock>) -> bool {
         Arc::ptr_eq(&self.lock, lock)
     }
@@ -130,8 +136,8 @@ impl UpdateLockHeld {
 
 impl Drop for UpdateLockHeld {
     fn drop(&mut self) {
-        // The record lock goes first: no waiter makes a request while `held`
-        // stands. Errors are ignored so a release never fails.
+        // The record lock goes first, because no waiter makes a request while
+        // `held` is `true`. The release ignores errors, so it never fails.
         let _ = rustix::fs::fcntl_lock(self.lock.fd(), FlockOperation::Unlock);
         let waker = match self.lock.state.lock() {
             Ok(mut st) => {
@@ -146,18 +152,19 @@ impl Drop for UpdateLockHeld {
     }
 }
 
-/// The outcome of one poll of a waiter's turn.
+/// The outcome of one poll of the turn of a waiter.
 enum Turn {
     /// The waiter holds the lock.
     Granted,
     /// The waiter is at the head and another process holds the lock.
     Contended,
-    /// The deadline passed before the waiter's turn came.
+    /// The deadline passes before the turn of the waiter comes.
     TimedOut,
 }
 
-/// One waiter's place in the queue. Dropping a place that was not granted
-/// removes it from the queue.
+/// The place of one waiter in the queue.
+///
+/// If a place drops before its grant, the drop removes it from the queue.
 struct Place {
     lock: Arc<UpdateLock>,
     ticket: u64,
@@ -165,7 +172,7 @@ struct Place {
 }
 
 impl Place {
-    /// Take a ticket at the tail of the queue.
+    /// Takes a ticket at the tail of the queue.
     fn enqueue(lock: Arc<UpdateLock>) -> Place {
         let ticket = {
             let mut st = lock.state.lock().unwrap();
@@ -181,12 +188,13 @@ impl Place {
         }
     }
 
-    /// Make one attempt when this place is the head and no guard holds the
-    /// lock. Otherwise keep the waker for the release that makes this place
-    /// the head, and stay pending.
+    /// Makes one lock request if this place is the head and no guard holds the
+    /// lock.
     ///
-    /// The attempt and the grant happen under the state mutex in one poll, so a
-    /// dropped wait cannot leave a hold that no guard releases.
+    /// Otherwise the call keeps the waker for the release that makes this
+    /// place the head, and returns `Poll::Pending`. The request and the grant
+    /// happen under the state mutex in one poll, so a dropped wait cannot leave
+    /// a hold that no guard releases.
     fn poll_turn(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<Turn>> {
         let mut st = self.lock.state.lock().unwrap();
         let head = st.queue.front().map(|(ticket, _)| *ticket) == Some(self.ticket);
@@ -236,12 +244,16 @@ impl Drop for Place {
     }
 }
 
-/// Acquire the update lock, waiting until `timeout` elapses. `None` waits
-/// with no deadline, and `Some(Duration::ZERO)` makes one attempt.
+/// Acquires the update lock within `timeout`.
 ///
-/// The waiter takes its place in the queue on the first poll of the returned
-/// future. The timeout covers the whole wait: the wait in the queue and the
-/// retries against other processes.
+/// If `timeout` is `None`, the wait has no deadline. `Some(Duration::ZERO)`
+/// makes one attempt. The waiter takes its place in the queue on the first
+/// poll of the returned future. The timeout covers the whole wait: the wait in
+/// the queue and the retries against other processes.
+///
+/// If the deadline passes, the call returns [`Error::LockTimeout`] with the
+/// whole seconds of `timeout`. If a lock request fails, it returns
+/// [`Error::Io`].
 pub(crate) async fn acquire_update(
     lock: Arc<UpdateLock>,
     timeout: Option<Duration>,
@@ -285,9 +297,12 @@ pub(crate) async fn acquire_update(
     }
 }
 
-/// Whether a guard of this process holds the update lock of the repository
-/// at `repo_fd`, for the unit tests. The registry is read without opening the
-/// lock file, and a repository whose lock is not registered reads as free.
+/// Returns `true` if a guard of this process holds the update lock of the
+/// repository at `repo_fd`.
+///
+/// The unit tests use it. The call reads the registry and does not open the
+/// lock file. If the lock of the repository is not registered, it returns
+/// `false`.
 #[cfg(test)]
 pub(crate) fn held_in_process(repo_fd: BorrowedFd<'_>) -> bool {
     let found = {
@@ -295,15 +310,16 @@ pub(crate) fn held_in_process(repo_fd: BorrowedFd<'_>) -> bool {
         super::probe(&reg, repo_fd, UPDATE_LOCK_FILE)
             .map(|entry| super::find(entry, Registered::update))
     };
-    // The registry mutex is released before the lock can drop: the drop of
-    // the last reference takes it again.
+    // The registry mutex is released before the lock can drop, because the
+    // drop of the last reference takes the mutex again.
     match found {
         Some(super::Found::Live(lock)) => lock.state.lock().unwrap().held,
         _ => false,
     }
 }
 
-/// The update lock moves freely across tasks and threads.
+/// Compile-time checks that the update lock types are `Send + Sync`, and that
+/// the future of `Repo::lock_update` is `Send`.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     fn assert_send<T: Send>(_: &T) {}
@@ -329,8 +345,8 @@ mod tests {
     /// The environment variable that names the marker file of the umask child.
     const UMASK_ENV: &str = "OSTRYA_UPDATE_UMASK_CHILD";
 
-    /// A scratch directory holding a repository at `repo`, removed when the
-    /// guard drops.
+    /// A scratch directory that holds a repository at `repo`. The drop removes
+    /// the directory.
     struct Scratch {
         dir: PathBuf,
     }
@@ -350,12 +366,12 @@ mod tests {
             self.dir.join("repo")
         }
 
-        /// Create the repository in `mode`.
+        /// Creates the repository in `mode`.
         fn create(&self, mode: RepoMode) -> Repo {
             ostrya_rt::block_on(Repo::create(&self.path(), CreateOptions::new(mode))).unwrap()
         }
 
-        /// Create the repository with `lock-timeout-secs` set to `secs`.
+        /// Creates the repository with `lock-timeout-secs` set to `secs`.
         fn create_with_timeout(&self, secs: i64) -> Repo {
             drop(self.create(RepoMode::BareUser));
             let config = self.path().join("config");
@@ -376,17 +392,18 @@ mod tests {
         }
     }
 
-    /// The lock of `repo`, from the registry the handle's cached lock is in.
+    /// Returns the lock of `repo` from the registry that holds the cached lock
+    /// of the handle.
     fn lock_of(repo: &Repo) -> Arc<UpdateLock> {
         UpdateLock::get_or_create(repo.repo_fd(), RepoMode::BareUser).unwrap()
     }
 
-    /// The number of waiters in the queue of `lock`.
+    /// Returns the number of waiters in the queue of `lock`.
     fn waiters(lock: &UpdateLock) -> usize {
         lock.state.lock().unwrap().queue.len()
     }
 
-    /// Wait until the queue of `lock` holds `n` waiters. The wait yields to
+    /// Waits until the queue of `lock` holds `n` waiters. The wait yields to
     /// the executor, so a task spawned on a single-threaded runtime can run.
     async fn wait_for_waiters(lock: &UpdateLock, n: usize) {
         for _ in 0..500 {
@@ -408,8 +425,8 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
     }
 
-    /// The mode a file created with request `0660` takes under the mask this
-    /// process runs with.
+    /// Returns the mode that a file created with mode `0660` gets under the
+    /// umask of this process.
     fn masked_lock_mode(dir: &Path) -> u32 {
         use std::os::unix::fs::OpenOptionsExt;
         let probe = dir.join("probe-file");
@@ -445,9 +462,9 @@ mod tests {
     /// A lock file created in a `bare-user-shared` repository is `0660` under a
     /// umask of `0077`.
     ///
-    /// The umask is a property of the process and the tests of this binary run
-    /// in parallel threads, so the acquire runs in a child: this test binary
-    /// re-executed for this test alone.
+    /// The tests of this binary run in parallel threads, and the umask is a
+    /// property of the process. For this reason, the acquire runs in a child
+    /// process. The child is this test binary, run again for this test alone.
     #[test]
     fn a_shared_repository_forces_the_lock_mode() {
         if let Some(marker) = std::env::var_os(UMASK_ENV) {
@@ -479,8 +496,8 @@ mod tests {
             .status()
             .expect("re-execute this test binary");
         assert!(status.success(), "the child failed: {status}");
-        // A name the child's filter does not match runs nothing and still
-        // exits 0, so the marker is what proves the check ran.
+        // If the filter of the child matches no test name, the child runs
+        // nothing and exits 0. The marker shows that the check ran.
         assert!(marker.exists(), "the child ran no check");
     }
 
@@ -634,7 +651,8 @@ mod tests {
         let lock = lock_of(&repo);
         let long = Some(Duration::from_secs(10));
         ostrya_rt::block_on(async {
-            // A head dropped after the release woke it hands the turn on.
+            // If the head drops after the release wakes it, the next waiter
+            // gets the turn.
             let holder = repo.lock_update().await.unwrap();
             let mut head = waiter(&lock, None);
             assert!(poll_once(&mut head).await.is_none());
@@ -755,10 +773,11 @@ mod tests {
         );
     }
 
-    /// The lock-holder half of [`two_processes_serialize`], run only when this
-    /// test binary is re-executed with the environment set. It takes the
-    /// update lock, states that it holds it, and keeps it until its
-    /// standard input closes.
+    /// The lock-holder half of [`two_processes_serialize`].
+    ///
+    /// It runs only if this test binary runs again with [`HOLDER_ENV`] set. It
+    /// takes the update lock and writes `.held`. When its standard input
+    /// closes, it writes `.releasing` and releases the lock.
     #[test]
     #[ignore = "helper process for two_processes_serialize"]
     fn update_lock_holder_subprocess() {
@@ -791,9 +810,10 @@ mod tests {
             assert!(matches!(err, Error::Io(_)), "{err:?}");
 
             // The kernel still records the shared lock of this process on the
-            // inode of `.lock`. The fdinfo of the descriptor that set the lock
-            // lists only the locks this process set through that descriptor,
-            // and it is a consistent snapshot, which `/proc/locks` is not.
+            // inode of `.lock`. The check reads the fdinfo of the descriptor
+            // that set the lock. It lists only the locks that this process set
+            // through that descriptor. It is a consistent snapshot, and
+            // `/proc/locks` gives no consistent snapshot.
             let (lock, _) = guard.hold.as_ref().unwrap();
             let path = format!("/proc/self/fdinfo/{}", lock.fd().as_raw_fd());
             let info = std::fs::read_to_string(path).unwrap();

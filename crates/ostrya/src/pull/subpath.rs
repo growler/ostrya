@@ -1,29 +1,14 @@
-//! The subpaths an HTTP pull fetches a commit's tree under.
+//! The subpaths that select the parts of a commit tree that a pull from a
+//! remote fetches.
 //!
-//! [`PullOptions::subpaths`](crate::PullOptions::subpaths) names the parts of a
-//! commit's tree a pull fetches. Each value is an absolute path, split on `/`
-//! after its leading `/` with every component kept, empty ones included. The
-//! walk descends from the root dirtree along each path one component at a time:
+//! [`PullOptions::subpaths`](crate::PullOptions::subpaths) states the rules of
+//! a value. The walk descends from the root dirtree along each path, one
+//! component at a time.
 //!
-//! - a directory entry named by a component that is not the path's last is
-//!   fetched with its dirmeta, and the walk goes on inside it with the next
-//!   component;
-//! - an entry named by the path's last component is fetched whole: a file, or a
-//!   directory with its dirmeta and everything under it;
-//! - a file named by a component that is not the last, and a name the dirtree
-//!   does not hold, end the path there.
-//!
-//! No other entry is fetched: not a sibling, not its dirmeta, and not a file in
-//! a directory the path only passes through. The root dirtree and dirmeta are
-//! always fetched. `/` is the one empty component, which names nothing, so it
-//! fetches the root dirtree and dirmeta and nothing under them, and `/sub/`
-//! fetches the `sub` dirtree and dirmeta and nothing in them. A component `.` or `..`, or an empty one from a
-//! doubled `/`, matches no entry, since no dirtree entry has such a name. Several
-//! values fetch the union of what each fetches on its own.
-//!
-//! A dirtree is walked under a [`Scope`]: every path position that reaches it,
-//! as the path's index and the number of components matched on the way. One
-//! dirtree checksum reached at two positions is walked under the union of both.
+//! The walk of each dirtree has a [`Scope`]. The scope lists each path position
+//! that reaches the dirtree: the index of the path and the number of components
+//! that the walk matched. If the walk reaches one dirtree checksum at two
+//! positions, it walks that dirtree under the union of the two scopes.
 
 use std::collections::HashMap;
 
@@ -37,10 +22,16 @@ pub(crate) struct Subpaths {
 }
 
 impl Subpaths {
-    /// Parse the values of [`PullOptions::subpaths`](crate::PullOptions::subpaths).
+    /// Parses the values of [`PullOptions::subpaths`](crate::PullOptions::subpaths).
     ///
-    /// An empty list is `None`, which fetches the whole tree. A value that does
-    /// not start with `/`, the empty value included, is refused.
+    /// If the list is empty, returns `None`, and the pull fetches the whole
+    /// tree.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Pull`] if a value does not start with `/`. The empty value is
+    ///   such a value.
+    /// - [`Error::Pull`] if the list holds more than `u32::MAX` values.
     pub(crate) fn parse(values: &[String]) -> Result<Option<Subpaths>> {
         if values.is_empty() {
             return Ok(None);
@@ -60,18 +51,20 @@ impl Subpaths {
         Ok(Some(Subpaths { paths }))
     }
 
-    /// The scope the root dirtree of every commit is walked under: each path at
-    /// its first component.
+    /// Returns the scope of the walk of the root dirtree of each commit.
+    ///
+    /// The scope holds each path at its first component.
     pub(crate) fn root(&self) -> Scope {
         // `parse` bounds the count by `u32`.
         Scope::Along((0..self.paths.len() as u32).map(|i| (i, 0)).collect())
     }
 
-    /// The objects `dirtree` references that a walk under `scope` fetches, each
-    /// with the scope a dirtree among them is walked under.
+    /// Returns the objects that `dirtree` references and that a walk under
+    /// `scope` fetches.
     ///
-    /// Several positions naming one entry yield it once, under the union of
-    /// their scopes.
+    /// Each object comes with a scope. The walk of a dirtree object uses this
+    /// scope. If several positions name one entry, the list holds the entry
+    /// once, under the union of their scopes.
     pub(crate) fn children(&self, dirtree: &DirTree, scope: &Scope) -> Vec<(ObjectName, Scope)> {
         let Scope::Along(positions) = scope else {
             return all_children(dirtree);
@@ -82,7 +75,7 @@ impl Subpaths {
             Some(&at) => match (&mut out[at].1, scope) {
                 (Scope::All, _) => {}
                 (held, Scope::All) => *held = Scope::All,
-                // Sorted and deduplicated once, below.
+                // The loop at the end sorts and deduplicates each list once.
                 (Scope::Along(held), Scope::Along(more)) => held.extend(more),
             },
             None => {
@@ -96,7 +89,7 @@ impl Subpaths {
                 continue;
             };
             let last = matched as usize + 1 == components.len();
-            // Both lists are name-sorted, which the dirtree parse validates.
+            // The dirtree parse checks that both lists are sorted by name.
             if let Ok(at) = dirtree
                 .files
                 .binary_search_by(|(name, _)| name.as_str().cmp(component))
@@ -133,19 +126,22 @@ impl Subpaths {
     }
 }
 
-/// Where a walk of one dirtree stands against the subpaths.
+/// The progress of the walk of one dirtree along the subpaths.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Scope {
-    /// Everything under the dirtree is fetched.
+    /// The walk fetches everything under the dirtree.
     #[default]
     All,
-    /// The path positions that reach the dirtree: a path's index and how many of
-    /// its components the walk matched to get here. Sorted, with no duplicate.
+    /// The path positions that reach the dirtree.
+    ///
+    /// Each position is the index of a path and the number of its components
+    /// that the walk matched. The list is sorted and holds no duplicate.
     Along(Vec<(u32, u32)>),
 }
 
 impl Scope {
-    /// Whether a walk under `self` fetches everything a walk under `other` does.
+    /// Returns `true` if a walk under `self` fetches each object that a walk
+    /// under `other` fetches.
     pub(crate) fn covers(&self, other: &Scope) -> bool {
         match (self, other) {
             (Scope::All, _) => true,
@@ -156,7 +152,7 @@ impl Scope {
         }
     }
 
-    /// Widen `self` to cover `other` as well.
+    /// Widens `self` so that it also covers `other`.
     pub(crate) fn widen(&mut self, other: &Scope) {
         match (&mut *self, other) {
             (Scope::All, _) => {}
@@ -182,8 +178,10 @@ impl Scope {
     }
 }
 
-/// Every object a dirtree references: its files, and the dirmeta and dirtree of
-/// each subdirectory, each walked whole.
+/// Returns each object that a dirtree references, with the scope [`Scope::All`].
+///
+/// The objects are the files, and the dirmeta and the dirtree of each
+/// subdirectory.
 fn all_children(dirtree: &DirTree) -> Vec<(ObjectName, Scope)> {
     let mut out = Vec::with_capacity(dirtree.files.len() + 2 * dirtree.dirs.len());
     for (_, file) in &dirtree.files {
@@ -211,8 +209,8 @@ mod tests {
         Subpaths::parse(&values).unwrap().unwrap()
     }
 
-    /// A root holding the file `a` (1), the directory `sub` (dirtree 2, dirmeta
-    /// 3), and the directory `other` (dirtree 4, dirmeta 5).
+    /// Returns a root that holds the file `a` (1), the directory `sub` (dirtree
+    /// 2, dirmeta 3), and the directory `other` (dirtree 4, dirmeta 5).
     fn root() -> DirTree {
         DirTree {
             files: vec![("a".into(), cs(1))],

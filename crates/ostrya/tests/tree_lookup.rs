@@ -1,14 +1,16 @@
-//! `RepoTree::lookup` path-component tests.
+//! Tests of the path components of `RepoTree::lookup`.
 //!
-//! A commit-tree path names entries. A `..` component is an entry name that no
-//! directory holds, so the lookup reports it absent. This file builds a commit
-//! holding `a/b` and a top-level `c` and states the outcome for each `..`
-//! position, together with the plain path that still resolves.
+//! A path in a commit tree names entries. A `..` component is an entry name
+//! that no directory holds, so the lookup reports the path absent. These tests
+//! build a commit with `a/b` and a top-level `c`. They state the result for
+//! each position of `..`, and for the plain paths that resolve.
 //!
-//! The shapes are split by which component the walk stops at: a `..` the walk
-//! reaches, and a `..` that stands behind a component naming nothing or naming
-//! a file. Both report the path absent, and the second group holds the same
-//! answer the split before this one gave.
+//! The paths fall in two groups, by the component where the walk stops:
+//!
+//! - a `..` that the walk reaches
+//! - a `..` after a component that names nothing or names a file
+//!
+//! In both groups, the lookup reports the path absent.
 
 mod common;
 
@@ -22,7 +24,7 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// Commit a tree holding `a/b` and `c`, and return its root tree handle.
+/// Commits a tree with `a/b` and `c`, and returns the handle of its root tree.
 async fn commit_ab_c(repo: &Repo, base: &Path) -> ostrya::RepoTree {
     let src = base.join("src");
     std::fs::create_dir_all(src.join("a")).unwrap();
@@ -63,13 +65,15 @@ fn lookup_reports_a_parent_component_absent() {
         let repo = Repo::open(&root_dir).await.unwrap();
         let root = commit_ab_c(&repo, base).await;
 
-        // Each path here reaches the `..` with the components before it
-        // resolved, so the `..` is the component the lookup stops at. In
-        // order: a `..` after a directory that resolves; a `..` as the first
-        // component; a `..` as the last one; a path that is nothing but a
-        // `..`; a `..` the walk reaches twice over; a `.` ahead of the `..`,
-        // which the split drops; and a root with a trailing separator around
-        // the `..`.
+        // In each path, the components before the `..` resolve, so the
+        // lookup stops at the `..`. The paths are, in order:
+        // - a `..` after a directory that resolves
+        // - a `..` as the first component
+        // - a `..` as the last component
+        // - a path that is only `..`
+        // - two `..` components after a directory
+        // - a `.` before the `..` (the split drops the `.`)
+        // - a root and a trailing separator around the `..`
         for path in ["a/../c", "../c", "a/..", "..", "a/../..", "./..", "//../"] {
             assert!(
                 root.lookup(Path::new(path)).await.unwrap().is_none(),
@@ -77,14 +81,14 @@ fn lookup_reports_a_parent_component_absent() {
             );
         }
 
-        // A `..` behind a component that names nothing. The walk stops at the
-        // absent component, reports the path absent, and does not fail.
+        // A `..` after a component that names nothing. The walk stops at the
+        // absent component and reports the path absent. It returns no error.
         let absent = root.lookup(Path::new("nope/../c")).await;
         assert!(absent.unwrap().is_none());
 
-        // A `..` behind a file in a non-final position. The file is not a
-        // directory, so the walk stops one component ahead of the `..` and
-        // reports the path absent. `c/..` is the same shape with the file in
+        // A `..` after a file that is not the last component. The file is not
+        // a directory, so the walk stops one component before the `..` and
+        // reports the path absent. `c/..` has the same shape, with the file in
         // the commit root.
         for path in ["a/b/../c", "a/b/../../c", "c/.."] {
             assert!(
@@ -93,7 +97,7 @@ fn lookup_reports_a_parent_component_absent() {
             );
         }
 
-        // The plain path still resolves.
+        // The plain paths resolve.
         assert!(matches!(
             root.lookup(Path::new("a/b")).await.unwrap(),
             Some(TreeEntry::File { name, .. }) if name == "b"
@@ -106,7 +110,7 @@ fn lookup_reports_a_parent_component_absent() {
             root.lookup(Path::new("a")).await.unwrap(),
             Some(TreeEntry::Dir { name, .. }) if name == "a"
         ));
-        // A leading `/` and a `.` component are still dropped.
+        // The lookup drops a leading `/` and a `.` component.
         assert!(matches!(
             root.lookup(Path::new("/./a/./b")).await.unwrap(),
             Some(TreeEntry::File { name, .. }) if name == "b"

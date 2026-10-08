@@ -1,6 +1,8 @@
-//! The `Commit` message that ends a push session: the checks of the ref
-//! updates, the server signatures, the hook of the host, the update lock, the
-//! ref writes, the transaction commit, and the summary.
+//! The `Commit` message that ends a push session.
+//!
+//! This module holds the checks of the ref updates and the server
+//! signatures. It also holds the hooks of the host, the update lock, the ref
+//! writes, the transaction commit, and the summary.
 
 use std::any::Any;
 use std::collections::hash_map::Entry;
@@ -35,8 +37,10 @@ use crate::summary::{
 use crate::transaction::Transaction;
 use crate::write::flat_name;
 
-/// The detached-metadata key of GPG signatures. The summary signatures of
-/// this key come first in `summary.sig`, where the tool writes them.
+/// The detached-metadata key of GPG signatures. The `ostree` command writes
+/// the summary signatures of this key first in `summary.sig`, and ostrya does
+/// the same. `docs/format-reference.md`, "Summary signature", records this
+/// order.
 const GPG_KEY: &str = "ostree.gpgsigs";
 
 type Checked<T> = std::result::Result<T, Failure>;
@@ -76,8 +80,8 @@ struct Edit<'a> {
     /// The commit bytes, the payload of its signatures. A commit that no
     /// update names gets no signature, and its payload is empty.
     payload: &'a [u8],
-    /// The dict the repository held when the plan was made, `None` for no
-    /// dict.
+    /// The dict that the repository held at the time of the plan, `None` for
+    /// no dict.
     stored: Option<Bytes>,
     /// The filtered incoming dict, with the entries of the host in place of
     /// each client entry of the same key.
@@ -96,79 +100,122 @@ struct Edit<'a> {
     oversize: Option<u64>,
 }
 
-/// Run the checks of the ref updates of `request`, then write the refs and
-/// commit `txn` under the update lock.
+/// Runs the checks of the ref updates of `request`, then writes the refs and
+/// commits `txn` under the update lock.
 ///
-/// `named` holds the refs of `Hello`, and `commit_meta` the detached metadata
-/// dicts of the session. The checks run in this order, and the first failure
-/// ends the session with nothing published:
+/// `named` holds the refs of `Hello`. `commit_meta` holds the detached
+/// metadata dicts of the session.
 ///
-/// - each ref name is valid, and no update writes a commit to a ref name of
-///   64 lowercase hex characters (`invalid-ref`), the message holds one
-///   update at least, and each update names a ref of `Hello` once
-///   (`protocol`). A delete of a ref name of 64 lowercase hex characters
-///   passes;
-/// - the `CommitReply` of the updates fits in a frame of [`MAX_FRAME`] with
-///   the longest outcome of each update (`limit-exceeded`), so the reply of
-///   a commit that wrote its refs is never one the server cannot send;
-/// - each detached metadata dict belongs to a commit of the session: a
-///   staged commit, or the new commit of an update (`protocol`);
-/// - the rule of each update accepts it, and no update names the collection
-///   anchor ref of a repository with a collection id (`ref-denied`);
-/// - each new commit is staged or present (`missing-objects`), and each commit
-///   of the session parses;
-/// - the tree of each commit of the session is complete (`missing-objects`);
-/// - the ref and collection bindings of each new commit name its refs and the
-///   repository (`binding-mismatch`);
-/// - each new commit passes the signature check of each of its rules, over the
-///   union of the stored and the incoming detached metadata
-///   (`signature-required`).
+/// # Checks
 ///
-/// The staged objects are then made durable. At the same time the incoming
-/// detached metadata is filtered, and each new commit gets a signature from
-/// each server key of its rules, unless the key already signed it in the
-/// merge of the filtered incoming dict into the stored dict, or in a
-/// signature kept before it. The size of each dict the commit is to write is
-/// found then too, unless `hooks` are given. The fast-forward walk of each update reads the parent
-/// chain as far as the ref tips read before the lock, unless the client sent
-/// `force` and the rule allows a non-fast-forward update.
+/// The checks run in this order. The first failure ends the session, and the
+/// session publishes nothing.
 ///
-/// Where `hooks` are given, [`ReceiveHooks::before_update`] runs next, just
-/// before the update lock. A refusal of the hook ends the session with its
-/// code. The plan of the hook is checked, and a plan the checks refuse is a
-/// failure on the server side. The entries of the host are merged into the
-/// incoming dicts, and an edit is added for each commit with host entries and
-/// no edit. The size of each dict the commit is to write is then found, and a
-/// dict with host entries over the size limit is `limit-exceeded`. On a
-/// failure after the hook, the carried value of the plan drops once, after
-/// the update lock is released, and `after_update` does not run.
+/// - Each ref name is valid, and no update writes a commit to a ref name of
+///   64 lowercase hex characters (`invalid-ref`). A delete of such a ref
+///   passes. The message holds one update at least, and each update names a
+///   ref of `Hello` once (`protocol`).
+/// - The `CommitReply` of the updates fits in a frame of [`MAX_FRAME`], with
+///   the longest outcome of each update (`limit-exceeded`). Because of this
+///   check, the server can always send the reply of a commit that wrote its
+///   refs.
+/// - Each detached metadata dict belongs to a commit of the session: a staged
+///   commit, or the new commit of an update (`protocol`).
+/// - The rule of each update accepts it, and no update names the collection
+///   anchor ref of a repository with a collection id (`ref-denied`).
+/// - Each new commit is staged or present (`missing-objects`), and each
+///   commit of the session parses.
+/// - The tree of each commit of the session is complete (`missing-objects`).
+/// - The ref binding and the collection binding of each new commit name its
+///   refs and the repository (`binding-mismatch`).
+/// - Each new commit passes the signature verification of each of its rules
+///   (`signature-required`). The verification reads the union of the stored
+///   and the incoming detached metadata.
 ///
-/// Under the lock the refs are read again. A ref that is an alias, a path
-/// that a ref write cannot replace, and two updates of which one names a
-/// directory of the other are `ref-denied`. Each update is then checked
-/// against the state it expects (`ref-mismatch`), for a delete
-/// (`delete-denied`), and for a fast-forward (`non-fast-forward`). The stored
-/// detached metadata is read again: where it changed since the plan, the
-/// signatures of each prepared key are checked again over the new merge, and
-/// the size is found again, with the keys of the host entries that keep a
-/// stored value. A dict over the size limit is `limit-exceeded`.
-/// The merges, the signatures, and the refs that change are queued, and so is
-/// the anchor commit of a repository with a collection id where the summary
-/// is regenerated. The transaction then commits. The partial marker of each
-/// commit of the session is removed, and the summary is regenerated and signed
-/// where the policy asks for it. A failure of these last steps is a warning of
-/// the report.
+/// # Before the update lock
 ///
-/// The transaction commit is not atomic. A failure of a detached-metadata
-/// write, of a ref write, or of the `fsync` of a ref directory can leave the
-/// detached metadata and some refs written. The commit then returns the
-/// error, and `after_update` does not run.
+/// After the checks, the incoming detached metadata goes through the filter.
+/// Then the staged objects become durable. At the same time, each new commit
+/// gets a signature from each server key of its rules. A key makes no
+/// signature if it already signed the commit in one of these places:
 ///
-/// The update lock is then released. Where `hooks` are given,
+/// - The merge of the filtered incoming dict into the stored dict.
+/// - A signature that a key before it made.
+///
+/// If no `hooks` are given, this step also finds the size of each dict that
+/// the commit writes. Then the fast-forward walk of each update reads the
+/// parent chain as far as the ref tip that this function read before the
+/// lock. If the client sent `force` and the rule allows a non-fast-forward
+/// update, no walk runs.
+///
+/// # Hooks
+///
+/// If `hooks` are given, [`ReceiveHooks::before_update`] runs next,
+/// immediately before the update lock. If the hook refuses, the session ends
+/// with the code of the refusal. This function then checks the plan of the
+/// hook. If the checks refuse the plan, the failure is on the server side.
+///
+/// The entries of the host merge into the incoming dicts. Each commit with
+/// host entries and no edit gets a new edit. Then this function finds the
+/// size of each dict that the commit writes. If a dict with host entries is
+/// over the size limit, the failure is `limit-exceeded`.
+///
+/// If a failure occurs after the hook, the carried value of the plan drops
+/// once, after the release of the update lock. `after_update` does not run.
+///
+/// # Under the update lock
+///
+/// Under the lock, this function reads the refs again. These cases are
+/// `ref-denied`:
+///
+/// - A ref that is an alias.
+/// - A path that a ref write cannot replace.
+/// - Two updates where one update names a directory of the other.
+///
+/// Each update then gets these checks:
+///
+/// - The ref is in the state that the update expects (`ref-mismatch`).
+/// - The rule allows the delete of a present ref (`delete-denied`).
+/// - The new commit is a fast-forward (`non-fast-forward`).
+///
+/// This function then reads the stored detached metadata again. If it changed
+/// after the plan, this function drops each prepared signature whose key
+/// signed the commit in the new merge. The size is also found again, with the
+/// keys of the host entries that keep a stored value. Then each dict over the
+/// size limit is `limit-exceeded`. Only a dict with host entries can fail the
+/// size check before the lock.
+///
+/// The merges, the signatures, and the refs that change go into the queue of
+/// the transaction. If the repository has a collection id, the policy
+/// regenerates the summary, and a ref changes, the anchor commit also goes
+/// into the queue. Then the transaction commits.
+///
+/// After the transaction commit, this function removes the partial marker of
+/// each commit of the session. If the policy regenerates the summary and a ref
+/// changed, it builds, signs, and writes the summary. A failure of these last
+/// steps is a warning of the report.
+///
+/// # Failure of the transaction commit
+///
+/// The transaction commit is not atomic. These failures can leave the
+/// detached metadata and some refs written:
+///
+/// - A failure of a detached-metadata write.
+/// - A failure of a ref write.
+/// - A failure of the `fsync` of a ref directory.
+///
+/// In this case, this function returns the error, and `after_update` does not
+/// run.
+///
+/// # After the update lock
+///
+/// This function then releases the update lock. If `hooks` are given,
 /// [`ReceiveHooks::after_update`] runs next with the report and the carried
-/// value, also when no ref changes. An error of the hook is `internal`, with
-/// the message cut at 4096 bytes at a character boundary. The refs and the
-/// detached metadata stay written.
+/// value. It runs also when no ref changes.
+///
+/// An error of the hook is `internal`, with the message cut at 4096 bytes at a
+/// character boundary. After an error of the hook, the refs and the detached
+/// metadata stay written.
 pub(super) async fn finish(
     repo: &Repo,
     policy: &ReceivePolicy,
@@ -325,9 +372,12 @@ pub(super) async fn finish(
     Ok(report)
 }
 
-/// Each ref name is valid, no update writes a commit to a ref name of 64
-/// lowercase hex characters, the message holds one update at least, and each
-/// update names a ref of `Hello`, once.
+/// Checks the ref names of the updates against the refs of `Hello`.
+///
+/// - Each ref name is valid.
+/// - No update writes a commit to a ref name of 64 lowercase hex characters.
+/// - The message holds one update at least.
+/// - Each update names a ref of `Hello`, once.
 fn check_names(named: &[String], updates: &[RefUpdate]) -> Checked<()> {
     for update in updates {
         crate::validate_refspec(&update.name).map_err(|e| match e {
@@ -368,12 +418,16 @@ fn check_names(named: &[String], updates: &[RefUpdate]) -> Checked<()> {
     Ok(())
 }
 
-/// The `CommitReply` of `updates` fits in a frame of [`MAX_FRAME`], with the
-/// longest outcome each update can get: the name and the new commit of the
-/// update, and an old commit for each ref. An update that expects its ref
-/// absent, or that takes any state, does not state the old commit, and the
-/// ref can hold one when the refs are read under the lock. A reply over the
-/// limit is `limit-exceeded`, and the check runs before any ref is written.
+/// Checks that the `CommitReply` of `updates` fits in a frame of
+/// [`MAX_FRAME`].
+///
+/// The check uses the longest outcome that each update can get. That
+/// outcome holds the name and the new commit of the update, and an old
+/// commit. An update that expects its ref absent, or that takes any state,
+/// does not state the old commit. Under the lock, the ref can still hold one.
+///
+/// A reply over the limit is `limit-exceeded`. The check runs before any ref
+/// write.
 fn check_reply_fits(updates: &[RefUpdate]) -> Checked<()> {
     let any_commit = Checksum::from_bytes([0; 32]);
     let longest = Message::CommitReply(
@@ -398,10 +452,12 @@ fn check_reply_fits(updates: &[RefUpdate]) -> Checked<()> {
     Ok(())
 }
 
-/// Each detached metadata dict of the session belongs to a commit of the
-/// session: a commit the session staged, or the new commit of an update. A
-/// dict for any other commit would edit the detached metadata of a commit
-/// that no rule of the message covers.
+/// Checks that each detached metadata dict of the session belongs to a commit
+/// of the session.
+///
+/// A commit of the session is a commit that the session staged, or the new
+/// commit of an update. Without this check, a dict for any other commit can
+/// edit the detached metadata of a commit that no rule of the message covers.
 fn check_commit_meta_commits(
     txn: &Transaction,
     updates: &[RefUpdate],
@@ -419,9 +475,13 @@ fn check_commit_meta_commits(
     Ok(())
 }
 
-/// The rule of each update, in order. An update that no rule covers, one whose
-/// rule refuses it, and one of the anchor ref of a repository with a
-/// collection id are `ref-denied`.
+/// Returns the rule of each update, in order.
+///
+/// These updates are `ref-denied`:
+///
+/// - An update that no rule covers.
+/// - An update whose rule refuses it.
+/// - An update of the anchor ref of a repository with a collection id.
 fn select_rules<'a>(
     repo: &Repo,
     policy: &'a ReceivePolicy,
@@ -463,7 +523,7 @@ struct Loaded {
     parents: Parents,
 }
 
-/// One commit as [`read_commits`] gives it.
+/// One commit as [`read_commits`] returns it.
 enum ReadCommit {
     /// A new commit that neither the session nor the repository holds.
     Absent,
@@ -475,14 +535,15 @@ enum ReadCommit {
     Other((Checksum, Checksum), Option<Checksum>),
 }
 
-/// Read and parse the commits of the session: the new commit of each update,
-/// and each staged commit. The reads and the parses run in one trip to the
-/// blocking pool, and a commit is read from the staging directory before
-/// `objects/`.
+/// Reads and parses the commits of the session.
+///
+/// The commits of the session are the new commit of each update and each
+/// staged commit. The reads and the parses run in one trip to the blocking
+/// pool. The read of a commit tries the staging directory before `objects/`.
 ///
 /// A new commit that is neither staged nor present is `missing-objects`. A
-/// staged commit that does not parse is `protocol`, and a stored one that does
-/// not parse fails on the server side.
+/// staged commit that does not parse is `protocol`. A stored commit that does
+/// not parse is a failure on the server side.
 async fn load_commits(txn: &Transaction, updates: &[RefUpdate]) -> Checked<Loaded> {
     let mut news: Vec<(Checksum, Vec<usize>)> = Vec::new();
     let mut index: HashMap<Checksum, usize> = HashMap::new();
@@ -568,9 +629,12 @@ async fn load_commits(txn: &Transaction, updates: &[RefUpdate]) -> Checked<Loade
     Ok(loaded)
 }
 
-/// Read and parse `reads`, each a commit and whether the session staged it,
-/// on the blocking pool. The first `targets` are new commits, which keep their
-/// bytes and read as absent where the repository does not hold them.
+/// Reads and parses `reads` on the blocking pool.
+///
+/// Each entry of `reads` is a commit and a flag that is `true` if the session
+/// staged the commit. The first `targets` entries are new commits. A new
+/// commit keeps its bytes, and it reads as absent if the repository does not
+/// hold it.
 async fn read_commits(
     txn: &Transaction,
     reads: Vec<(Checksum, bool)>,
@@ -610,7 +674,9 @@ async fn read_commits(
     .await
 }
 
-/// The `missing-objects` failure for `missing`, the objects `what`.
+/// Returns the `missing-objects` failure for `missing`.
+///
+/// `what` completes the phrase "objects that ..." of the message.
 fn missing_objects(missing: Missing, what: &str) -> Failure {
     let mut message = format!(
         "{} objects that {what} are neither staged nor present",
@@ -625,10 +691,12 @@ fn missing_objects(missing: Missing, what: &str) -> Failure {
     })
 }
 
-/// The `ostree.ref-binding` of each new commit lists each ref whose new value
-/// it is, the remote part of a remote ref left out. Where the repository has a
-/// collection id, the `ostree.collection-binding` of each new commit is that
-/// id. A commit without the key passes.
+/// Checks the ref binding and the collection binding of each new commit.
+///
+/// The `ostree.ref-binding` of each new commit lists each ref that the commit
+/// is the new value of, without the remote part of a remote ref. If the
+/// repository has a collection id, the `ostree.collection-binding` of each new
+/// commit is that id. A commit without the key passes.
 fn check_bindings(repo: &Repo, updates: &[RefUpdate], targets: &[Target]) -> Checked<()> {
     let collection = repo.config().collection_id();
     for target in targets {
@@ -657,7 +725,8 @@ fn check_bindings(repo: &Repo, updates: &[RefUpdate], targets: &[Target]) -> Che
     Ok(())
 }
 
-/// The trusted keys of the rules of the updates of `target`, each set once.
+/// Returns the trusted keys of the rules of the updates of `target`, each set
+/// once.
 fn target_keys<'a>(rules: &[&'a ReceiveRule], target: &Target) -> Vec<&'a Arc<TrustedKeys>> {
     let mut keys: Vec<&Arc<TrustedKeys>> = Vec::new();
     for &i in &target.updates {
@@ -670,8 +739,8 @@ fn target_keys<'a>(rules: &[&'a ReceiveRule], target: &Target) -> Vec<&'a Arc<Tr
     keys
 }
 
-/// The union of the server keys of the rules of the updates of `target`, each
-/// key once.
+/// Returns the union of the server keys of the rules of the updates of
+/// `target`, each key once.
 fn target_signers<'a>(rules: &[&'a ReceiveRule], target: &Target) -> Vec<&'a Arc<ServerSigner>> {
     let mut signers: Vec<&Arc<ServerSigner>> = Vec::new();
     for &i in &target.updates {
@@ -684,8 +753,10 @@ fn target_signers<'a>(rules: &[&'a ReceiveRule], target: &Target) -> Vec<&'a Arc
     signers
 }
 
-/// Read the detached metadata the repository holds for each commit whose
-/// dict a later step reads: each new commit with a signature check or a
+/// Reads the stored detached metadata of each commit whose dict a later step
+/// reads.
+///
+/// These commits are each new commit with a signature verification or a
 /// server key, and each commit with an incoming dict.
 async fn read_stored_for(
     repo: &Repo,
@@ -708,9 +779,11 @@ async fn read_stored_for(
     Ok(commits.into_iter().zip(stored).collect())
 }
 
-/// The detached metadata dict the repository holds for each of `commits`, in
-/// order, read in one trip to the blocking pool: `None` for no file and for
-/// the zero-length "no metadata" marker.
+/// Reads the detached metadata dict that the repository holds for each of
+/// `commits`, in order.
+///
+/// The reads run in one trip to the blocking pool. The result is `None` for no
+/// file and for the zero-length "no metadata" marker.
 async fn read_stored(repo: &Repo, commits: Vec<Checksum>) -> Checked<Vec<Option<Bytes>>> {
     let mode = repo.mode();
     let objects = repo
@@ -735,9 +808,10 @@ async fn read_stored(repo: &Repo, commits: Vec<Checksum>) -> Checked<Vec<Option<
     .map_err(Failure::Internal)
 }
 
-/// The merge of `incoming` into `stored`, each a serialized dict, or `None`
-/// where neither holds a dict. Under a key of `keep` that `stored` holds, the
-/// stored value stays.
+/// Returns the merge of `incoming` into `stored`, each a serialized dict.
+///
+/// The result is `None` if neither holds a dict. Under a key of `keep` that
+/// `stored` holds, the stored value stays.
 fn merged_dict(
     stored: Option<&[u8]>,
     incoming: Option<&[u8]>,
@@ -750,16 +824,17 @@ fn merged_dict(
     }
 }
 
-/// An empty `a{sv}` dict.
+/// Returns an empty `a{sv}` dict.
 fn empty_dict() -> Value {
     Value::Array(Vec::new())
 }
 
-/// Each new commit passes the signature check of each rule of its updates,
-/// once for each set of trusted keys. The check reads the union of the
-/// detached metadata the repository holds for the commit and the incoming
-/// dict, before the detached-metadata filter. The union is built on the
-/// blocking pool.
+/// Verifies the signatures of each new commit against each rule of its
+/// updates, once for each set of trusted keys.
+///
+/// The verification reads the union of the stored detached metadata of the
+/// commit and the incoming dict, before the detached-metadata filter. This
+/// function builds the union on the blocking pool.
 async fn check_signatures(
     rules: &[&ReceiveRule],
     commit_meta: &HashMap<Checksum, Bytes>,
@@ -797,11 +872,18 @@ async fn check_signatures(
     Ok(())
 }
 
-/// The state of each ref under the lock, as the commit it names. A ref that
-/// is an alias, a path that a ref write cannot replace, and two updates that
-/// write refs of which one names a directory of the other are `ref-denied`.
-/// No ref write could then complete, and the check runs before anything is
-/// queued.
+/// Checks the ref paths under the lock and returns the commit that each ref
+/// names.
+///
+/// These cases are `ref-denied`:
+///
+/// - A ref that is an alias.
+/// - A path that a ref write cannot replace.
+/// - Two updates that write refs, where one ref names a directory of the
+///   other.
+///
+/// In these cases no ref write can complete, so the check runs before any
+/// write goes into the queue.
 fn check_ref_paths(
     updates: &[RefUpdate],
     states: &[RefFileState],
@@ -846,15 +928,18 @@ fn check_ref_paths(
     Ok(current)
 }
 
-/// Check one update against the state of its ref under the lock, and tell
-/// whether the update changes the ref.
+/// Checks one update against the state of its ref under the lock.
 ///
-/// The ref must be in the state the update expects, also for `Any`. A delete of
-/// a ref that is present needs `allow_delete`. A new commit that differs from
-/// the current one must have it in its parent chain, unless the client sent
-/// `force` and the rule has `allow_non_fast_forward`. `chain` is the walk made
-/// before the lock, where one was made. A delete of an absent ref and an update
-/// to the current commit change nothing.
+/// The result is `true` if the update changes the ref. A delete of an absent
+/// ref and an update to the current commit change nothing.
+///
+/// - The ref must be in the state that the update expects, also for `Any`.
+/// - A delete of a ref that is present needs `allow_delete`.
+/// - If a new commit differs from the current commit, the current commit must
+///   be in the parent chain of the new commit. If the client sent `force` and
+///   the rule has `allow_non_fast_forward`, this check does not apply.
+///
+/// `chain` is the walk made before the lock, if one was made.
 async fn check_ref(
     txn: &Transaction,
     update: &RefUpdate,
@@ -905,8 +990,10 @@ async fn check_ref(
     }
 }
 
-/// Each incoming detached metadata dict, with the keys the filter excludes
-/// removed, on the blocking pool. A dict the filter empties is left out.
+/// Removes the keys that the filter excludes from each incoming detached
+/// metadata dict, on the blocking pool.
+///
+/// The result leaves out a dict that the filter empties.
 async fn filter_detached(
     policy: &ReceivePolicy,
     commit_meta: HashMap<Checksum, Bytes>,
@@ -932,9 +1019,11 @@ async fn filter_detached(
     .map_err(Failure::Internal)
 }
 
-/// The detached-metadata edits of the session: one for each new commit with a
-/// server key or a filtered incoming dict, and one for each other commit with
-/// a filtered incoming dict. Each takes its stored dict out of `stored`.
+/// Returns the detached-metadata edits of the session.
+///
+/// A new commit gets an edit if it has a server key or a filtered incoming
+/// dict. Each other commit with a filtered incoming dict also gets an edit.
+/// Each edit takes its stored dict out of `stored`.
 fn plan<'a>(
     rules: &[&'a ReceiveRule],
     targets: &'a [Target],
@@ -965,7 +1054,7 @@ fn plan<'a>(
     edits
 }
 
-/// The keys of [`SIGNATURE_KEYS`] among `keys`, as the flags of
+/// Returns the keys of [`SIGNATURE_KEYS`] among `keys`, as the flags of
 /// [`check_stored`].
 fn flagged<'k>(keys: impl IntoIterator<Item = &'k str>) -> [bool; SIGNATURE_KEYS.len()] {
     let mut flags = [false; SIGNATURE_KEYS.len()];
@@ -977,10 +1066,12 @@ fn flagged<'k>(keys: impl IntoIterator<Item = &'k str>) -> [bool; SIGNATURE_KEYS
     flags
 }
 
-/// Check on the blocking pool that an edit accepts `stored`, with signatures
-/// appended under `keys`, and give the merge of `incoming` into it, with the
-/// stored value kept under each key of `keep`, where `build` asks for the
-/// merged dict. A stored dict the edit refuses fails on the server side.
+/// Checks on the blocking pool that an edit accepts `stored`, with signatures
+/// appended under `keys`.
+///
+/// If `build` is `true`, this function also returns the merge of `incoming`
+/// into `stored`, with the stored value kept under each key of `keep`. If the
+/// edit refuses a stored dict, the failure is on the server side.
 async fn check_edit(
     stored: Option<Bytes>,
     incoming: Option<Bytes>,
@@ -1012,22 +1103,33 @@ async fn check_edit(
     .map_err(Failure::Internal)
 }
 
-/// The size of the dict an edit writes, where it is over `limit` bytes: the
-/// merge of `incoming` into `stored`, each a serialized dict, with the stored
-/// value kept under each key of `keep`, and `signatures` appended.
-/// `written`, where given, is that dict already built.
+/// Returns the size of the dict that an edit writes, if the size is over
+/// `limit` bytes.
 ///
-/// A bound from the sizes of the inputs skips the serialization where it
-/// shows the dict fits. Each entry and each blob of the written dict is a
-/// stored or an incoming one, or a new signature. Relative to its place in
-/// its source, an entry gains at most 7 bytes of padding and 7 bytes of
-/// framing offset, and a blob at most 7 bytes of framing offset. Each such
-/// element holds at least one byte of framing offset in its source, so the
-/// copied elements come to at most 15 times the source bytes. A new signature
-/// adds its bytes and at most 8 bytes of offset. A signature list that no
-/// source holds adds its key, its type, and their padding and offsets, at
-/// most 64 bytes for each of the four keys. Above the bound the dict is
-/// built and serialized, so the check is exact.
+/// The dict is the merge of `incoming` into `stored`, each a serialized dict.
+/// The stored value stays under each key of `keep`, and `signatures` are
+/// appended. If `written` is given, it is that dict, already built.
+///
+/// # Bound
+///
+/// A bound from the sizes of the inputs skips the serialization if the bound
+/// shows that the dict fits. Each entry and each blob of the written dict
+/// comes from the stored dict, from the incoming dict, or from a new
+/// signature.
+///
+/// Relative to its place in its source, an entry gains at most 7 bytes of
+/// padding and 7 bytes of framing offset. A blob gains at most 7 bytes of
+/// framing offset. Each such element holds at least one byte of framing
+/// offset in its source. As a result, the copied elements come to at most 15
+/// times the source bytes.
+///
+/// A new signature adds its bytes and at most 8 bytes of offset. A signature
+/// list that no source holds adds its key, its type, and their padding and
+/// offsets. That is at most 64 bytes for each of the four keys.
+///
+/// The bound uses 16 times the source bytes, more than these 15 times. If the
+/// bound is more than `limit`, this function builds and serializes the dict,
+/// so the check is exact.
 fn size_over(
     limit: u64,
     stored: Option<&[u8]>,
@@ -1060,8 +1162,10 @@ fn size_over(
     Ok((size > limit).then_some(size))
 }
 
-/// [`size_over`] for `edit`, with `MAX_METADATA_SIZE`, the kept signatures,
-/// and the keys of the edit that keep a stored value, on the blocking pool.
+/// Calls [`size_over`] for `edit` on the blocking pool.
+///
+/// The call uses `MAX_METADATA_SIZE`, the kept signatures, and the keys of the
+/// edit that keep a stored value.
 async fn oversize(edit: &Edit<'_>, written: Option<Value>) -> Checked<Option<u64>> {
     let stored = edit.stored.clone();
     let incoming = edit.incoming.clone();
@@ -1094,7 +1198,7 @@ async fn oversize(edit: &Edit<'_>, written: Option<Value>) -> Checked<Option<u64
     .map_err(Failure::Internal)
 }
 
-/// The `limit-exceeded` failure of a merged dict of `size` bytes for
+/// Returns the `limit-exceeded` failure of a merged dict of `size` bytes for
 /// `commit`.
 fn oversize_failure(commit: &Checksum, size: u64) -> Failure {
     Failure::Wire(push::Error::LimitExceeded(format!(
@@ -1103,12 +1207,17 @@ fn oversize_failure(commit: &Checksum, size: u64) -> Failure {
     )))
 }
 
-/// Sign each new commit with each server key of its rules, before the
-/// update lock. A key that already signed the commit in the merge of the
-/// filtered incoming dict into the stored dict, or in a signature made before
-/// it, makes no signature, so two keys that hold one secret sign once. Where
-/// `size` is true, the size of the dict each edit writes is then found. A
-/// session with hooks finds it after the merge of the host entries.
+/// Signs each new commit with each server key of its rules, before the update
+/// lock.
+///
+/// A key makes no signature if it already signed the commit. The signature
+/// can be in the merge of the filtered incoming dict into the stored dict.
+/// It can also be a signature that a key before it made. As a result, two
+/// keys that hold one secret sign once.
+///
+/// If `size` is `true`, this function then finds the size of the dict that
+/// each edit writes. A session with hooks finds the size after the merge of
+/// the host entries.
 async fn prepare_signatures(mut edits: Vec<Edit<'_>>, size: bool) -> Checked<Vec<Edit<'_>>> {
     for edit in &mut edits {
         let signers = std::mem::take(&mut edit.signers);
@@ -1147,32 +1256,42 @@ async fn prepare_signatures(mut edits: Vec<Edit<'_>>, size: bool) -> Checked<Vec
     Ok(edits)
 }
 
-/// A refusal of the plan of the host: a failure on the server side. The
-/// message is cut to the length of a hook refusal message, at a character
-/// boundary.
+/// Returns the failure for a refusal of the plan of the host, a failure on
+/// the server side.
+///
+/// This function cuts the message to the length of a hook refusal message, at
+/// a character boundary.
 fn invalid_plan(mut message: String) -> Failure {
     hooks::cut(&mut message);
     Failure::Internal(Error::InvalidInput(message))
 }
 
-/// A key of the host as a refusal quotes it: cut to the length of a hook
-/// refusal message, at a character boundary.
+/// Returns a key of the host in the form that a refusal quotes.
+///
+/// This function cuts the key to the length of a hook refusal message, at a
+/// character boundary.
 fn quoted(key: &str) -> String {
     let mut key = key.to_owned();
     hooks::cut(&mut key);
     key
 }
 
-/// Check the detached-metadata entries of the host, with no encode and no
-/// I/O, and give the entries of each tuple with the index of its target in
-/// `targets`, the new commits of the updates. A tuple with no entry is left
-/// out.
+/// Checks the detached-metadata entries of the host, with no encode and no
+/// I/O.
 ///
-/// Each tuple is checked in order: its commit is the new commit of an
-/// update, and no tuple before it names the commit. Each entry is then
-/// checked in order: its key is not a signature key, no entry before it in
-/// the tuple has the key, and its value is a variant. The first failure is
-/// the refusal.
+/// The result holds the entries of each tuple with the index of its target in
+/// `targets`, the new commits of the updates. The result leaves out a tuple
+/// with no entry.
+///
+/// The checks of each tuple run in order. Its commit must be the new commit
+/// of an update, and no tuple before it can name the commit. Then the checks
+/// of each entry of the tuple run in order:
+///
+/// - Its key is not a signature key.
+/// - No entry before it in the tuple has the key.
+/// - Its value is a variant.
+///
+/// The first failure is the refusal.
 fn check_plan(
     targets: &[Checksum],
     metadata: Vec<(Checksum, Vec<HostEntry>)>,
@@ -1226,8 +1345,8 @@ fn check_plan(
     Ok(plan)
 }
 
-/// The key of the one entry of `dict`, a dict built from one host entry,
-/// moved out of it.
+/// Takes the key of the one entry of `dict`, a dict built from one host
+/// entry.
 fn into_key(dict: Value) -> String {
     if let Value::Array(entries) = dict
         && let Some(Value::Tuple(fields)) = entries.into_iter().next()
@@ -1238,29 +1357,40 @@ fn into_key(dict: Value) -> String {
     String::new()
 }
 
-/// One commit with host entries: the index of its target, its incoming dict
-/// with the host entries merged in, and the keys whose stored value stays.
+/// One commit with host entries.
+///
+/// The tuple holds these values:
+///
+/// - the index of the target of the commit
+/// - its incoming dict with the host entries merged in
+/// - the keys whose stored value stays
 type HostMerge = (usize, Vec<u8>, Arc<Vec<String>>);
 
-/// Add the detached-metadata entries of the plan of the host to `edits`, and
-/// find the size of the dict of each edit.
+/// Adds the host entries of the plan to `edits` and finds the size of each
+/// dict.
 ///
 /// One trip to the blocking pool runs the checks of [`check_plan`] over the
-/// whole plan, and then drops each dict of `leftover` whose commit the plan
-/// does not name. Each entry is then serialized as a dict of one entry and
-/// checked as an `a{sv}` in normal form, and an entry that does not encode is
-/// refused. Each commit with entries then gets the merge of its incoming dict
-/// with the host entries in place of each client entry of the same key, with
-/// no value tree. A commit that has an edit takes the merged dict as its
-/// incoming dict. A commit with no edit gets a new edit, with no signer: its
-/// stored dict comes from `leftover`, the dicts that the plan read and no
-/// edit took, or from one read for the commits it does not hold. The stored
-/// dict of each new edit is checked.
+/// whole plan. The same trip then drops each dict of `leftover` whose commit
+/// the plan does not name. It serializes each entry as a dict of one entry and
+/// checks it as an `a{sv}` in normal form. It refuses an entry that does not
+/// encode.
 ///
-/// The size of the dict of each edit is then found, once, which the plan of
-/// a session with hooks leaves to this step. A dict with host entries over
-/// the size limit is `limit-exceeded`, before the update lock. An empty plan
-/// changes no edit and reads nothing.
+/// Each commit with entries then gets the merge of its incoming dict with the
+/// host entries. A host entry replaces each client entry of the same key. The
+/// merge builds no value tree.
+///
+/// A commit that has an edit takes the merged dict as its incoming dict. A
+/// commit with no edit gets a new edit with no signer. Its stored dict comes
+/// from `leftover`, the dicts that the plan read and no edit took. For a
+/// commit that `leftover` does not hold, this function reads the stored dict.
+///
+/// This function checks the stored dict of each new edit. Then it finds the
+/// size of the dict of each edit, once. The plan of a session with hooks
+/// leaves this step to this function. A dict with host entries over the size
+/// limit is `limit-exceeded`, before the update lock.
+///
+/// An empty plan adds no host entry and reads no stored dict. This function
+/// still finds the size of the dict of each edit.
 async fn add_host_entries<'a>(
     repo: &Repo,
     targets: &'a [Target],
@@ -1304,8 +1434,8 @@ async fn add_host_entries<'a>(
             {
                 let dict = Value::Array(vec![Value::Tuple(vec![Value::Str(key), value])]);
                 // The serializer writes the signature of a variant as the
-                // type gives it, so the check of the bytes refuses a type
-                // that the parser does not read.
+                // type gives it. As a result, the check of the bytes refuses
+                // a type that the parser does not read.
                 let bytes = match to_bytes(&ty, &dict)
                     .and_then(|bytes| validate(&ty, &bytes).map(|()| bytes))
                 {
@@ -1388,10 +1518,10 @@ async fn add_host_entries<'a>(
     }
     for (edit, host) in edits.iter_mut().zip(host) {
         edit.oversize = match &edit.incoming {
-            // With no stored dict and no signature, the written dict is the
-            // merged dict, less each blob of a signature list that is
-            // byte-equal to one before it. So a merged dict that fits gives a
-            // written dict that fits.
+            // If no stored dict and no signature exist, the written dict is
+            // the merged dict less some blobs. It drops each blob of a
+            // signature list that is byte-equal to a blob before it. As a
+            // result, a merged dict that fits gives a written dict that fits.
             Some(merged)
                 if host
                     && edit.stored.is_none()
@@ -1409,16 +1539,20 @@ async fn add_host_entries<'a>(
     Ok(edits)
 }
 
-/// Queue the detached metadata of the session under the update lock.
+/// Queues the detached metadata of the session under the update lock.
 ///
-/// The stored dict of each edit is read again, in one trip to the blocking
-/// pool. Where it holds the bytes the plan read, the plan stands: the kept
-/// signatures and the size need no second check. Where it changed, each
-/// prepared signature whose key signed the commit in the new merge, or in a
-/// signature kept before it, is dropped, and the size is found again. A dict
-/// over the size limit is `limit-exceeded`. The merge of each filtered
-/// incoming dict, with the keys of the host entries that keep a stored value,
-/// and the kept signatures are then queued.
+/// This function reads the stored dict of each edit again, in one trip to the
+/// blocking pool. If the dict holds the bytes that the plan read, the plan
+/// stands. The kept signatures and the size then need no second check.
+///
+/// If the dict changed, this function drops some prepared signatures. It
+/// drops each one whose key signed the commit in the new merge, or in a
+/// signature kept before it. It then finds the size again. A dict over the
+/// size limit is `limit-exceeded`.
+///
+/// Last, it queues the merge of each filtered incoming dict, with the keys of
+/// the host entries that keep a stored value. It also queues the kept
+/// signatures.
 async fn queue_detached(repo: &Repo, txn: &Transaction, edits: Vec<Edit<'_>>) -> Checked<()> {
     let stored = read_stored(repo, edits.iter().map(|e| e.commit).collect()).await?;
     for (mut edit, stored) in edits.into_iter().zip(stored) {
@@ -1468,12 +1602,14 @@ async fn queue_detached(repo: &Repo, txn: &Transaction, edits: Vec<Edit<'_>>) ->
     Ok(())
 }
 
-/// Regenerate the summary and sign it with `signers`, GPG keys first. Each
-/// signature is made from the bytes just built, before any write, so a failed
-/// signature leaves the old `summary` and `summary.sig`. `summary.sig` is then
-/// removed before `summary` is written, so a failed write never pairs the new
-/// summary with the old signatures. Where the policy names a summary signer,
-/// `summary.sig` is then written with the new signatures.
+/// Regenerates the summary and signs it with `signers`, GPG keys first.
+///
+/// This function makes each signature from the new bytes before any write,
+/// so a failed signature leaves the old `summary` and `summary.sig`. It then
+/// removes `summary.sig` before it writes `summary`. As a result, a failed
+/// write never pairs the new summary with the old signatures. If the policy
+/// names a summary signer, it then writes `summary.sig` with the new
+/// signatures.
 async fn write_summary(
     repo: &Repo,
     signers: &[Arc<ServerSigner>],
@@ -1532,8 +1668,8 @@ mod tests {
 
     const KEY: &str = "ostree.sign.ed25519";
 
-    /// `count` updates that expect their refs absent: the request does not
-    /// state an old commit, and the reply can.
+    /// Returns `count` updates that expect their refs absent. The request does
+    /// not state an old commit, and the reply can.
     fn absent_updates(count: usize) -> Vec<RefUpdate> {
         (0..count)
             .map(|i| RefUpdate {
@@ -1544,9 +1680,9 @@ mod tests {
             .collect()
     }
 
-    /// A `Commit` that fits in a frame, whose reply with an old commit for
-    /// each ref does not, is refused as `limit-exceeded`. A reply that fits
-    /// passes, and the check is exact at the limit.
+    /// The check refuses a `Commit` that fits in a frame if its reply, with an
+    /// old commit for each ref, does not fit (`limit-exceeded`). A reply that
+    /// fits passes, and the check is exact at the limit.
     #[test]
     fn a_commit_whose_reply_cannot_fit_is_refused() {
         let updates = absent_updates(15_000);
@@ -1600,7 +1736,7 @@ mod tests {
         serialize_signature_dict(dict).unwrap()
     }
 
-    /// A dict with the blobs `blobs` under [`KEY`].
+    /// Returns a dict with the blobs `blobs` under [`KEY`].
     fn signed(blobs: &[&[u8]]) -> Value {
         let mut dict = Value::Array(Vec::new());
         for blob in blobs {
@@ -1609,9 +1745,9 @@ mod tests {
         dict
     }
 
-    /// The size check is exact at its limit: a dict of `n` bytes is over a
+    /// The size check is exact at its limit. A dict of `n` bytes is over a
     /// limit of `n - 1` and not over a limit of `n`. The dict it measures is
-    /// the merge with the appended signatures, and a limit above the bound of
+    /// the merge with the appended signatures. A limit more than the bound of
     /// the input sizes needs no serialization.
     #[test]
     fn the_size_check_is_exact_at_the_limit() {
@@ -1742,8 +1878,8 @@ mod tests {
         }
     }
 
-    /// The bound of the input sizes is not below the written size, for dicts
-    /// whose framing offsets grow in the merge.
+    /// The bound of the input sizes is not less than the written size, for
+    /// dicts whose framing offsets grow in the merge.
     #[test]
     fn the_size_bound_holds_when_the_offsets_grow() {
         let blobs: Vec<Vec<u8>> = (0..200u32).map(|i| i.to_le_bytes().to_vec()).collect();

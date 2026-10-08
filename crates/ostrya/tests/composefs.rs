@@ -2,39 +2,49 @@
 
 //! Composefs export tests.
 //!
-//! The tree the composefs fixture was exported from is the same source tree the
-//! bare-user fixture commits, so [`Repo::export_composefs`] over the bare-user
-//! fixture commit, and over the archive fixture that holds the same commit,
-//! must reproduce the golden image `tree.cfs` byte-for-byte and
-//! the fs-verity digest the tool recorded in the MANIFEST. A second test drives
-//! the digest into a commit's metadata and reads it back.
+//! The `ostree` command exported the composefs fixture from the source tree
+//! that the bare-user fixture commits. [`Repo::export_composefs`] over the
+//! bare-user fixture commit must reproduce the golden image `tree.cfs` byte for
+//! byte. The archive fixture holds the same commit, and its export must give
+//! the same bytes.
 //!
-//! [`VerityPolicy::Disabled`] is checked the same way against
-//! `tree-noverity.cfs`, and one further test shows that policy reads no
-//! payload: a content object's bytes are rewritten in place at their existing
-//! length, which leaves the `Disabled` image unchanged and changes the
-//! `Computed` one.
+//! Each export must also give the fs-verity digest in the MANIFEST. The
+//! fixture generator measured this digest with `composefs-info measure-file`
+//! on the image of the `ostree` command. A second test writes the digest into
+//! the metadata of a commit and reads it back.
+//!
+//! The tests check [`VerityPolicy::Disabled`] the same way against
+//! `tree-noverity.cfs`. One more test shows that this policy reads no payload.
+//! The test rewrites the bytes of a content object in place at the same
+//! length. The `Disabled` image stays the same, and the `Computed` image
+//! changes.
 //!
 //! Each golden check also exports through a file descriptor with
-//! [`Repo::export_composefs_to`] and requires the file to hold the same bytes
-//! and the returned digest to equal the fs-verity digest of the file's content.
-//! A further test requires [`Transaction::composefs_digest`] over the same tree
-//! to reach the digest the tool recorded.
+//! [`Repo::export_composefs_to`]. The file must hold the same bytes, and the
+//! returned digest must equal the fs-verity digest of the file content. One
+//! more test requires that [`Transaction::composefs_digest`] over the same tree
+//! gives the recorded digest.
 //!
-//! Two tests build their own tree, owned by the running user. In the first, a
-//! `bare` and a `bare-user` repository that hold the tree export the same
-//! bytes and the same digest under each verity policy. The `bare` export reads
-//! the owner, the mode, and the xattrs from the object inode, and the
-//! `bare-user` export reads them from `user.ostreemeta`. The mtime is not an
-//! input to the image. In the second, a `bare` repository seals its objects,
-//! and the kernel measures the image exported with
-//! [`ComposefsOptions::RECORDED`] to the digest the commit records.
+//! Two tests build their own tree, which the running user owns. In the first
+//! test, a `bare` and a `bare-user` repository hold the tree. The two
+//! repositories export the same bytes and the same digest under each verity
+//! policy.
 //!
-//! The tests that compare against a golden image or the tool's recorded digest
-//! skip when the composefs fixture is absent (a checkout produced by an
-//! `ostree` without composefs support, or without `composefs-info`). The tests
-//! that seal objects also skip when the filesystem has no fs-verity. All other
-//! tests read no composefs fixture and always run.
+//! The `bare` export reads the owner, the mode, and the xattrs from the object
+//! inode. The `bare-user` export reads them from `user.ostreemeta`. The mtime
+//! is not an input to the image.
+//!
+//! In the second test, a `bare` repository seals its objects. The kernel
+//! measures the image that the export writes with
+//! [`ComposefsOptions::RECORDED`], and gets the digest that the commit records.
+//!
+//! The tests that compare against a golden image or against the recorded
+//! digest skip if the composefs fixture is absent. The fixture generator
+//! writes no composefs fixture if its `ostree` command has no composefs
+//! support, or if `composefs-info` is not available.
+//!
+//! The tests that seal objects also skip if the file system has no fs-verity.
+//! All other tests read no composefs fixture and always run.
 
 mod common;
 
@@ -52,12 +62,12 @@ use ostrya_rt::block_on;
 
 use common::{COMMIT, HELLO_TXT, TmpDir, fixture_repo, fixture_root};
 
-/// The directory holding the checked-in composefs golden fixtures.
+/// The directory that holds the checked-in composefs golden fixtures.
 fn composefs_dir() -> PathBuf {
     fixture_root().join("composefs")
 }
 
-/// Read a `key=value` entry from the fixture MANIFEST.
+/// Reads a `key=value` entry from the fixture MANIFEST.
 fn manifest_value(key: &str) -> Option<String> {
     let text = std::fs::read_to_string(fixture_root().join("MANIFEST")).ok()?;
     text.lines()
@@ -65,14 +75,17 @@ fn manifest_value(key: &str) -> Option<String> {
         .map(|v| v.trim().to_owned())
 }
 
-/// The composefs image digest the tool recorded under `key`, or `None` when the
-/// fixture is absent (so the test skips).
+/// Returns the composefs image digest under `key` in the MANIFEST.
+///
+/// The fixture generator measured the digest with
+/// `composefs-info measure-file` on the image that the `ostree` command wrote.
+/// If the fixture is absent, the value is `None`, and the test skips.
 fn manifest_digest(key: &str) -> Option<String> {
     manifest_value(key).filter(|s| !s.is_empty())
 }
 
-/// Copy the `mode` fixture repository into `scratch` and return its path.
-/// `cp -a` preserves the `user.ostreemeta` xattrs the objects carry.
+/// Copies the `mode` fixture repository into `scratch` and returns its path.
+/// `cp -a` preserves the `user.ostreemeta` xattrs that the objects carry.
 fn scratch_fixture_repo(scratch: &TmpDir, mode: &str) -> PathBuf {
     let src = fixture_repo(mode);
     let dst = scratch.path().join("repo");
@@ -87,8 +100,8 @@ fn scratch_fixture_repo(scratch: &TmpDir, mode: &str) -> PathBuf {
 }
 
 /// The loose path of the content object `checksum` in the bare-user repository
-/// at `repo_dir`. Naming the object keeps it inside `COMMIT`'s tree, which is
-/// what makes the `Computed` image depend on its payload.
+/// at `repo_dir`. The object that the caller names is in the tree of `COMMIT`,
+/// so the `Computed` image depends on its payload.
 fn content_object(repo_dir: &Path, checksum: &str) -> PathBuf {
     repo_dir.join("objects").join(loose_path(
         &Checksum::from_hex(checksum).unwrap(),
@@ -97,8 +110,8 @@ fn content_object(repo_dir: &Path, checksum: &str) -> PathBuf {
     ))
 }
 
-/// Flip one byte of `path`'s payload in place, leaving the object's length and
-/// its `user.ostreemeta` attribute untouched.
+/// Flips one byte of the payload at `path` in place. The length of the object
+/// and its `user.ostreemeta` attribute do not change.
 fn rewrite_payload(path: &Path) {
     use std::io::Write;
 
@@ -117,14 +130,16 @@ fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Export the fixture commit under `verity`, and require the image to equal
-/// `<stem>.cfs` byte-for-byte and its fs-verity digest to equal the MANIFEST
-/// value at `digest_key`. The fd form is held to the same bytes and the same
-/// digest. The `bare-user` and `archive` fixtures hold the same commit, so the
-/// export from each is held to the golden image the tool exported from
-/// `bare-user`. That the tool writes the same image from `archive` is the
-/// observation `format-reference.md`, "composefs", records.
-/// Skips when the golden fixture is absent.
+/// Exports the fixture commit under `verity`. The image must equal
+/// `<stem>.cfs` byte for byte, and its fs-verity digest must equal the MANIFEST
+/// value at `digest_key`. The fd form must give the same bytes and the same
+/// digest.
+///
+/// Both the `bare-user` and the `archive` fixture hold the same commit, so
+/// each export must equal the golden image from `bare-user`. The `ostree`
+/// command 2026.1 writes the same image from `archive` (observed).
+///
+/// Skips if the golden fixture is absent.
 fn check_export(stem: &str, digest_key: &str, verity: VerityPolicy) {
     for mode in ["bare-user", "archive"] {
         check_export_from(mode, stem, digest_key, verity);
@@ -219,8 +234,8 @@ fn stores_digest_in_commit_metadata() {
         return;
     };
 
-    // Copy the fixture repo so the transaction publishes into a throwaway,
-    // leaving the shared unpacked fixture untouched.
+    // Copy the fixture repository, so that the transaction publishes into a
+    // throwaway copy. The shared unpacked fixture stays unchanged.
     let scratch = TmpDir::new("composefs-meta");
     let dst = scratch_fixture_repo(&scratch, "bare-user");
 
@@ -254,9 +269,10 @@ fn stores_digest_in_commit_metadata() {
     });
 }
 
-/// `Transaction::composefs_digest` reaches the digest the tool recorded for the
-/// fixture tree. The transaction stages nothing, so every object comes from the
-/// repository, and the value is the one the buffered export returns.
+/// `Transaction::composefs_digest` gives the recorded digest of the fixture
+/// tree. The transaction stages nothing, so each
+/// object comes from the repository. The value equals the digest that the
+/// buffered export returns.
 #[test]
 fn transaction_digest_matches_recorded_digest() {
     let Some(digest) = manifest_digest("composefs_digest") else {
@@ -295,9 +311,10 @@ fn transaction_digest_matches_recorded_digest() {
     });
 }
 
-/// Seal every regular `.file` object under `repo_dir/objects` with the
-/// parameters ostree uses, and return how many were sealed. Returns `None`
-/// when the filesystem refuses the first seal, so the caller skips.
+/// Seals each regular `.file` object under `repo_dir/objects` with the
+/// parameters that the `ostree` command uses, and returns the number of sealed
+/// objects. If the file system refuses the first seal, returns `None`, so that
+/// the caller skips.
 fn seal_file_objects(repo_dir: &Path) -> Option<usize> {
     let mut sealed = 0;
     for fanout in std::fs::read_dir(repo_dir.join("objects")).unwrap() {
@@ -325,13 +342,15 @@ fn seal_file_objects(repo_dir: &Path) -> Option<usize> {
     Some(sealed)
 }
 
-/// `Transaction::composefs_digest` over the fixture tree in a bare-user
-/// repository whose objects are sealed reaches the digest of the same tree in
-/// the unsealed fixture and the digest the tool recorded. In the sealed copy
-/// the digest of each backing object comes from the kernel; the unit test
-/// `every_sealed_fixture_object_yields_the_kernel_digest` in `src/file.rs`
-/// shows that each sealed fixture object gives it. Skips when the fixture is
-/// absent or the filesystem lacks fs-verity.
+/// In a bare-user repository with sealed objects,
+/// `Transaction::composefs_digest` over the fixture tree gives the digest of
+/// the unsealed fixture. It also gives the recorded digest.
+///
+/// In the sealed copy, the kernel supplies the digest of each backing object.
+/// The unit test `every_sealed_fixture_object_yields_the_kernel_digest` in
+/// `src/file.rs` shows that each sealed fixture object gives that digest.
+///
+/// Skips if the fixture is absent or if the file system has no fs-verity.
 #[test]
 fn sealed_repository_digest_matches_recorded_digest() {
     let Some(digest) = manifest_digest("composefs_digest") else {
@@ -374,12 +393,18 @@ fn sealed_repository_digest_matches_recorded_digest() {
     });
 }
 
-/// Build a source tree under `base/src` that the running user owns, and set
-/// fixed modes and `user.*` xattrs on it. The tree holds a regular file of each
-/// mode class, a file that spans more than one fs-verity block, an empty file,
-/// a nested directory, and a symlink. Linux refuses a `user.*` xattr on a
-/// symlink, so the symlink carries none. Each xattr is set before the chmod,
-/// because a `user.*` xattr needs write access to the inode.
+/// Builds a source tree under `base/src` that the running user owns, with fixed
+/// modes and `user.*` xattrs. The tree holds:
+///
+/// - a regular file of each mode class,
+/// - a file that spans more than one fs-verity block,
+/// - an empty file,
+/// - a nested directory,
+/// - a symlink.
+///
+/// Linux refuses a `user.*` xattr on a symlink, so the symlink carries none.
+/// The function sets each xattr before the chmod, because a `user.*` xattr
+/// needs write access to the inode.
 fn build_owned_source(base: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let chmod = |p: &Path, m: u32| {
@@ -415,9 +440,9 @@ fn build_owned_source(base: &Path) {
     chmod(&src, 0o755);
 }
 
-/// Create a repository at `root` in `mode`. A non-empty `config` is appended
-/// to the repository's config file, and the repository is opened again so
-/// that the text is parsed.
+/// Creates a repository at `root` in `mode`. If `config` is not empty, appends
+/// it to the config file of the repository. Then opens the repository again,
+/// so that it parses the text.
 async fn new_repo(root: &Path, mode: RepoMode, config: &str) -> Repo {
     let repo = Repo::create(root, CreateOptions::new(mode)).await.unwrap();
     if config.is_empty() {
@@ -431,9 +456,9 @@ async fn new_repo(root: &Path, mode: RepoMode, config: &str) -> Repo {
     Repo::open(root).await.unwrap()
 }
 
-/// Walk `base/src` into `repo` with no modifier, so the commit records the
-/// owner, mode, and xattrs of each source inode, and commit the tree at
-/// timestamp 0. Returns the commit checksum.
+/// Walks `base/src` into `repo` with no modifier, so that the commit records
+/// the owner, the mode, and the xattrs of each source inode. Commits the tree
+/// at timestamp 0, and returns the commit checksum.
 async fn commit_owned(repo: &Repo, base: &Path) -> Checksum {
     let txn = repo.transaction().await.unwrap();
     let mut mtree = MutableTree::new();
@@ -475,13 +500,16 @@ fn expected_xattrs(pairs: &[(&str, &[u8])]) -> Xattrs {
     .unwrap()
 }
 
-/// A `bare` and a `bare-user` repository that hold one tree the running user
-/// owns export the same image and the same digest under each verity policy.
+/// A `bare` and a `bare-user` repository hold one tree that the running user
+/// owns. Under each verity policy, the two repositories export the same image
+/// and the same digest.
+///
 /// The `bare` export reads the owner, the mode, and the xattrs of a file from
-/// the object inode, and the `bare-user` export reads them from
-/// `user.ostreemeta`. A content object stores no mtime, and the export sets the
-/// mtime of every inode to 0, so mtime is not an input to the image. A host
-/// that adds xattrs to a new file makes the commit or the xattr check fail.
+/// the object inode. The `bare-user` export reads them from `user.ostreemeta`.
+/// A content object stores no mtime. The export sets the mtime of each inode to
+/// 0, so the mtime is not an input to the image.
+///
+/// If the host adds xattrs to a new file, the commit or the xattr check fails.
 #[test]
 fn bare_and_bare_user_export_the_same_image() {
     use std::os::unix::fs::MetadataExt;
@@ -612,11 +640,11 @@ fn bare_and_bare_user_export_the_same_image() {
     });
 }
 
-/// Enable fs-verity on `fd`, and try again on `ETXTBSY`. The kernel refuses to
-/// seal an inode that a writable descriptor still holds. A child that another
-/// test forks holds a copy of each open descriptor until its `exec`, so the
-/// refusal stops when that window closes. A refusal that lasts for all
-/// attempts is returned.
+/// Enables fs-verity on `fd`, and tries again on `ETXTBSY`. The kernel refuses
+/// to seal an inode that a writable descriptor still holds. A child that
+/// another test forks holds a copy of each open descriptor until its `exec`, so
+/// the refusal stops when that window closes. If the refusal lasts for all
+/// attempts, the function returns it.
 fn enable_verity_retrying(fd: std::os::fd::BorrowedFd<'_>) -> rustix::io::Result<()> {
     let mut attempts = 0;
     loop {
@@ -630,9 +658,9 @@ fn enable_verity_retrying(fd: std::os::fd::BorrowedFd<'_>) -> rustix::io::Result
     }
 }
 
-/// In a `bare` repository that seals its objects, the kernel measures the image
-/// exported with [`ComposefsOptions::RECORDED`] to the digest the commit
-/// records. Skips when the filesystem has no fs-verity.
+/// A `bare` repository seals its objects and exports an image with
+/// [`ComposefsOptions::RECORDED`]. The kernel measures this image and gets the
+/// digest that the commit records. Skips if the file system has no fs-verity.
 #[test]
 fn a_sealed_bare_export_measures_the_recorded_digest() {
     let scratch = TmpDir::new("composefs-sealed-bare");
@@ -707,11 +735,13 @@ fn a_sealed_bare_export_measures_the_recorded_digest() {
     });
 }
 
-/// A content object's payload decides the `Computed` image and nothing in the
-/// `Disabled` one. Rewriting it in place at its existing length keeps every
-/// inode's metadata, so the object still loads under both policies and the two
-/// images part on the payload alone. The bare-user fixture and the library are
-/// the whole input, so this runs whatever the host's `ostree` supports.
+/// The payload of a content object is an input to the `Computed` image and has
+/// no effect on the `Disabled` image. The test rewrites the payload in place at
+/// the same length. The metadata of each inode stays the same, so the object
+/// loads under both policies. The payload is the only input that changes.
+///
+/// The bare-user fixture and the library are the only inputs, so this test
+/// runs whatever composefs support the `ostree` command on the host has.
 #[test]
 fn disabled_policy_reads_no_payload() {
     let computed = ComposefsOptions {
@@ -751,24 +781,25 @@ fn disabled_policy_reads_no_payload() {
     });
 }
 
-/// Which inode of the helper's tree carries the attributes under test.
+/// The inode of the helper tree that carries the attributes under test.
 #[derive(Clone, Copy)]
 enum Carrier {
     /// The root directory, through its dirmeta object.
     Root,
-    /// A regular file in the root. The export adds `overlay.redirect` and
-    /// `trusted.overlay.metacopy` to this inode on top of what it carries, so
-    /// the case also holds that those additions sit outside the budget.
+    /// A regular file in the root. The export adds `trusted.overlay.redirect`
+    /// and `trusted.overlay.metacopy` to this inode, in addition to its own
+    /// attributes. This case also checks that these two are outside the budget.
     File,
 }
 
-/// Export the composefs image of a tree whose `carrier` inode holds `xattrs`, in a
-/// repository of its own in `mode`. The dirmeta object is built directly rather
-/// than by setting the attributes on a real directory, because a host
-/// filesystem's own ceiling decides whether they can be set at all. `mode` is
-/// `Archive` where the attributes go on a file object large enough to meet that
-/// ceiling in a bare-user repository, since an archive object carries its
-/// metadata in its own header.
+/// Exports the composefs image of a tree whose `carrier` inode holds `xattrs`.
+/// The tree is in a new repository of its own in `mode`.
+///
+/// The function builds the dirmeta object directly, because the limit of the
+/// host file system decides if a real directory can hold the attributes. If
+/// the attributes on a file object reach that limit in a bare-user repository,
+/// `mode` is `Archive`. An archive object carries its metadata in its own
+/// header.
 async fn export_xattrs(
     repo_dir: &Path,
     mode: RepoMode,
@@ -824,12 +855,12 @@ async fn export_xattrs(
         )
         .await
         .unwrap();
-    // The staged digest path reads the objects through the transaction, so it
-    // is held to the outcome the export reaches over the published commit.
+    // The staged digest path reads the objects through the transaction. It must
+    // reach the same outcome as the export over the published commit.
     let staged = txn.composefs_digest(&root).await.map(|_| ());
     txn.commit().await.unwrap();
 
-    // `Image` holds no `Debug`, so each value is dropped rather than matched on.
+    // `Image` does not implement `Debug`, so the code maps each value to `()`.
     let exported = repo
         .export_composefs(&commit, &ComposefsOptions::default())
         .await
@@ -842,9 +873,9 @@ async fn export_xattrs(
     exported
 }
 
-/// One xattr spends its name, its value, and 7 bytes from the inode's budget of
-/// 32755 bytes. At the budget the export builds the image, and one byte past it
-/// the export refuses and names the attribute.
+/// One xattr takes its name, its value, and 7 bytes from the budget of the
+/// inode, which is 32755 bytes. At the budget, the export builds the image. One
+/// byte past the budget, the export refuses and names the attribute.
 #[test]
 fn holds_an_inode_to_the_composefs_xattr_budget() {
     let scratch = TmpDir::new("composefs-xattr-budget");
@@ -881,8 +912,9 @@ fn holds_an_inode_to_the_composefs_xattr_budget() {
     });
 }
 
-/// The budget covers the inode, so two attributes that each fit spend it
-/// together. The refusal names the attribute that takes the inode past it.
+/// The budget applies to the whole inode, so two attributes that each fit
+/// alone share one budget. The refusal names the attribute that takes the
+/// inode past the budget.
 #[test]
 fn the_composefs_xattr_budget_covers_the_inode() {
     let scratch = TmpDir::new("composefs-xattr-budget-sum");
@@ -913,11 +945,11 @@ fn the_composefs_xattr_budget_covers_the_inode() {
     });
 }
 
-/// A regular file is held to the same budget, and the `overlay.redirect` and
-/// `trusted.overlay.metacopy` attributes the export adds to that inode sit
-/// outside it: the walk accepts the file at the budget. An archive repository
-/// carries the attribute, which a bare-user object's `user.ostreemeta` cannot
-/// at this size.
+/// A regular file has the same budget. The `trusted.overlay.redirect` and
+/// `trusted.overlay.metacopy` attributes that the export adds to the inode are
+/// outside the budget, so the walk accepts the file at the budget. The test
+/// uses an archive repository, because the `user.ostreemeta` attribute of a
+/// bare-user object cannot hold the attribute at this size.
 #[test]
 fn the_composefs_xattr_budget_covers_a_regular_file() {
     let scratch = TmpDir::new("composefs-xattr-budget-file");
@@ -948,8 +980,8 @@ fn the_composefs_xattr_budget_covers_a_regular_file() {
     });
 }
 
-/// Commit a tree holding one symlink whose target is `len` bytes, in a
-/// repository of its own under `dir`, and walk it into the image.
+/// Commits a tree that holds one symlink whose target is `len` bytes, in a
+/// repository of its own under `dir`. Then walks the tree into the image.
 async fn export_symlink(dir: &Path, len: usize) -> Result<(), Error> {
     let repo = Repo::create(dir, CreateOptions::new(RepoMode::BareUser))
         .await
@@ -993,16 +1025,16 @@ async fn export_symlink(dir: &Path, len: usize) -> Result<(), Error> {
         .await
         .unwrap();
     txn.commit().await.unwrap();
-    // `Image` holds no `Debug`, so the value is dropped rather than matched on.
+    // `Image` does not implement `Debug`, so the code maps the value to `()`.
     repo.export_composefs(&commit, &ComposefsOptions::default())
         .await
         .map(|_| ())
 }
 
-/// A symlink states its target inline, beside a 32-byte compact inode header,
-/// so a target carrying no attributes fits at 4063 bytes and does not at 4064.
-/// The tool aborts on the same pair, which `format-reference.md`, "composefs",
-/// records.
+/// A symlink stores its target inline, next to a 32-byte compact inode header,
+/// so a target with no attributes fits at 4063 bytes. At 4064 bytes, the
+/// target does not fit. The `ostree` command 2026.1 writes the image at 4063
+/// bytes and aborts at 4064 bytes (observed).
 #[test]
 fn holds_a_symlink_target_to_its_inode_block() {
     let scratch = TmpDir::new("composefs-symlink-block");
@@ -1026,8 +1058,8 @@ fn holds_a_symlink_target_to_its_inode_block() {
     });
 }
 
-/// Commit a tree holding one regular file whose name is `len` bytes, in a
-/// repository of its own under `dir`, and walk it into the image.
+/// Commits a tree that holds one regular file whose name is `len` bytes, in a
+/// repository of its own under `dir`. Then walks the tree into the image.
 async fn export_child_name(dir: &Path, len: usize) -> Result<(), Error> {
     let repo = Repo::create(dir, CreateOptions::new(RepoMode::BareUser))
         .await
@@ -1071,15 +1103,14 @@ async fn export_child_name(dir: &Path, len: usize) -> Result<(), Error> {
         .await
         .unwrap();
     txn.commit().await.unwrap();
-    // `Image` holds no `Debug`, so the value is dropped rather than matched on.
+    // `Image` does not implement `Debug`, so the code maps the value to `()`.
     repo.export_composefs(&commit, &ComposefsOptions::default())
         .await
         .map(|_| ())
 }
 
-/// The image holds a child name of at most 255 bytes. The tool refuses a
-/// 256-byte name with `File name too long`, which `format-reference.md`,
-/// "composefs", records.
+/// The image holds a child name of at most 255 bytes. The `ostree` command
+/// 2026.1 refuses a 256-byte name with `File name too long` (observed).
 #[test]
 fn holds_a_child_name_to_255_bytes() {
     let scratch = TmpDir::new("composefs-child-name");
@@ -1103,9 +1134,9 @@ fn holds_a_child_name_to_255_bytes() {
     });
 }
 
-/// A stored name goes into a one-byte length field, so a name above 255 bytes
-/// has no place in the image whatever the budget says. At 255 bytes the walk
-/// accepts the attribute, and at 256 it refuses and names it.
+/// An xattr name has a one-byte length field in the image, so a name of more
+/// than 255 bytes does not fit at any budget. At 255 bytes, the walk
+/// accepts the attribute. At 256 bytes, the walk refuses and names it.
 #[test]
 fn holds_an_xattr_name_to_the_erofs_length_field() {
     let scratch = TmpDir::new("composefs-xattr-name");
@@ -1146,7 +1177,7 @@ fn holds_an_xattr_name_to_the_erofs_length_field() {
 }
 
 /// `commit_add_composefs_metadata` runs in an `archive` repository and records
-/// the digest a `bare-user` repository records for the same tree.
+/// the digest that a `bare-user` repository records for the same tree.
 #[test]
 fn digest_metadata_runs_in_an_archive_repository() {
     let Some(digest) = manifest_digest("composefs_digest") else {
@@ -1154,7 +1185,7 @@ fn digest_metadata_runs_in_an_archive_repository() {
         return;
     };
 
-    // The transaction publishes, so the archive fixture is copied first.
+    // The transaction publishes, so the test copies the archive fixture first.
     let scratch = TmpDir::new("composefs-archive-meta");
     let dst = scratch_fixture_repo(&scratch, "archive");
 

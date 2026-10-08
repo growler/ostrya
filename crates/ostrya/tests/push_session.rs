@@ -1,5 +1,6 @@
-//! `PushSession` against `Repo::receive` over two in-process pipes: the
-//! fixture commit, pushed from a source over the archive fixture.
+//! Tests of `PushSession` against `Repo::receive` over two in-process pipes.
+//!
+//! A source over the archive fixture pushes the fixture commit.
 
 #![cfg(feature = "receive")]
 
@@ -30,12 +31,13 @@ fn fixture_commit() -> Checksum {
     Checksum::from_hex(COMMIT).unwrap()
 }
 
-/// How the source gives a content object the session asks for in `deflate`.
+/// The form in which the source gives a content object that the session asks
+/// for in `deflate`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Filez {
-    /// As its header and payload, for the session to deflate.
+    /// The header and the payload, which the session compresses.
     Encode,
-    /// As the stored `.filez` bytes of the archive fixture.
+    /// The stored `.filez` bytes of the archive fixture.
     Stored,
 }
 
@@ -137,8 +139,9 @@ fn update(expected: Expected) -> RefUpdate {
     }
 }
 
-/// A writer that passes frames through until the `CommitReply` frame, and then
-/// drops that frame and every later byte and closes the stream under it.
+/// A writer that passes frames through until the `CommitReply` frame.
+///
+/// It drops that frame and every later byte, and closes the inner stream.
 struct DropCommitReply {
     inner: Option<PipeWriter>,
     /// Bytes of a frame that is not complete yet.
@@ -168,7 +171,7 @@ impl DropCommitReply {
             self.forward.drain(..n);
         }
         if self.closing {
-            // Dropping the pipe writer gives the client end of file.
+            // When the pipe writer drops, the client reads end of file.
             self.inner = None;
         }
         Poll::Ready(Ok(()))
@@ -217,12 +220,15 @@ impl AsyncWrite for DropCommitReply {
     }
 }
 
-/// What the client of one session found: the names `missing` gave, and the
-/// result of the commit.
+/// The result of the client in one session: the names that `missing`
+/// returned, and the result of the commit.
 type Client = ostrya::push::Result<(Vec<ObjectName>, PushOutcome)>;
 
-/// One push of the fixture commit from `source` into `repo`. With
-/// `drop_reply` set, the server's `CommitReply` does not reach the client.
+/// Pushes the fixture commit from `source` into `repo` one time.
+///
+/// Returns the result of the server and the result of the client. If
+/// `drop_reply` is `true`, the `CommitReply` of the server does not reach the
+/// client.
 fn push(
     repo: &Repo,
     source: &FixtureSource,

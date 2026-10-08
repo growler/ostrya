@@ -1,12 +1,14 @@
-//! GPG verification during a pull.
+//! Tests of GPG verification in a pull.
 //!
-//! The GPG axis is the same whichever source a pull reads, so these run over a
-//! local pull, which needs no server: what they cover is where the trusted
-//! keyrings come from and what each refusal reports. A throwaway signing key is
-//! generated in a private GnuPG home directory under the test's scratch tree,
-//! the port signs a commit through the `gpg` binary, and the pull verifies it
-//! in the process over the exported keyring. The user's GnuPG home and any
-//! agent of theirs are never touched.
+//! GPG verification is the same for each source of a pull. These tests use a
+//! local pull, which needs no server. They test the sources of the trusted
+//! keyrings and the error that each refusal reports.
+//!
+//! Each test generates a temporary signing key in a private GnuPG home
+//! directory under its scratch tree. ostrya signs a commit through the `gpg`
+//! binary. The pull verifies the signature in the process against the
+//! exported keyring. The tests do not use the GnuPG home or the agent of the
+//! user.
 
 #![cfg(feature = "sign-gpg")]
 
@@ -23,25 +25,29 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// A fixed timestamp, so a source repository's commit is reproducible.
+/// A fixed timestamp that makes the commit of a source repository
+/// reproducible.
 const FIXED_TS: u64 = 1_700_000_000;
 
-/// Whether the gpg binary is available. The GnuPG cases build their fixtures
-/// with it, so a harness without it skips them rather than passing them, and
-/// [`common::REQUIRE_GNUPG`] turns that skip into a failure.
+/// Returns `true` if the `gpg` binary is available.
+///
+/// The GnuPG tests build their fixtures with `gpg`. If it is absent, these
+/// tests skip: they return before an assertion runs.
+/// [`common::REQUIRE_GNUPG`] changes the skip into a failure.
 fn gpg_available() -> bool {
     common::gnupg_available(&["gpg"])
 }
 
-/// A private GnuPG home directory holding one freshly generated,
-/// passphrase-free ed25519 signing key. Dropping the fixture stops the
-/// GnuPG daemons of the directory and removes their socket directory.
+/// A private GnuPG home directory with one new ed25519 signing key.
+///
+/// The key has no passphrase. A drop of the fixture stops the GnuPG daemons
+/// of the directory and removes their socket directory.
 struct GpgHome {
     dir: PathBuf,
 }
 
 impl GpgHome {
-    /// Generate a signing key for `uid` in a new home directory under `base`.
+    /// Generates a signing key for `uid` in a new home directory under `base`.
     fn create(base: &Path, name: &str, uid: &str) -> GpgHome {
         use std::os::unix::fs::DirBuilderExt;
         let dir = base.join(name);
@@ -57,14 +63,14 @@ impl GpgHome {
         home
     }
 
-    /// A gpg command bound to this home directory, batch mode.
+    /// Returns a `gpg` command in batch mode for this home directory.
     fn gpg(&self) -> Command {
         let mut cmd = Command::new("gpg");
         cmd.arg("--homedir").arg(&self.dir).arg("--batch");
         cmd
     }
 
-    /// The primary-key fingerprint, as uppercase hex.
+    /// Returns the fingerprint of the primary key as uppercase hex.
     fn fingerprint(&self) -> String {
         let out = self
             .gpg()
@@ -81,14 +87,14 @@ impl GpgHome {
             .expect("a fpr record in the key listing")
     }
 
-    /// Write the exported public keyring to `path`.
+    /// Writes the exported public keyring to `path`.
     fn export_to(&self, path: &Path) {
         let out = self.gpg().arg("--export").output().unwrap();
         assert!(out.status.success() && !out.stdout.is_empty());
         std::fs::write(path, out.stdout).unwrap();
     }
 
-    /// A signer for this key.
+    /// Returns a signer for this key.
     fn signer(&self) -> GpgSigner {
         GpgSigner::new(self.fingerprint()).with_homedir(&self.dir)
     }
@@ -100,7 +106,9 @@ impl Drop for GpgHome {
     }
 }
 
-/// A source repository under `base/src` holding `main`, over a one-file tree.
+/// Creates a source repository under `base/src` with the ref `main`.
+///
+/// The commit of `main` holds a tree with one file.
 async fn source_repo(base: &Path) -> (Repo, Checksum) {
     let tree = base.join("tree");
     std::fs::create_dir_all(&tree).unwrap();
@@ -138,8 +146,10 @@ async fn source_repo(base: &Path) -> (Repo, Checksum) {
     (repo, commit)
 }
 
-/// A destination repository under `base/<name>` whose config names the remote
-/// `origin`, with the `[remote]` keys `extra` supplies.
+/// Creates a destination repository under `base/<name>` with the remote
+/// `origin`.
+///
+/// The `[remote "origin"]` group of the config gets the keys in `extra`.
 async fn dest_with_remote(base: &Path, name: &str, extra: &str) -> (PathBuf, Repo) {
     let path = base.join(name);
     let repo = Repo::create(&path, CreateOptions::new(RepoMode::Archive))
@@ -156,7 +166,7 @@ async fn dest_with_remote(base: &Path, name: &str, extra: &str) -> (PathBuf, Rep
     (path, repo)
 }
 
-/// Pull `main` from `src` into `dst`, asking for the GPG check.
+/// Pulls `main` from `src` into `dst` with GPG verification turned on.
 async fn gpg_pull(dst: &Repo, src: &Repo) -> Result<(), Error> {
     dst.pull_local(
         src,
@@ -174,10 +184,14 @@ async fn gpg_pull(dst: &Repo, src: &Repo) -> Result<(), Error> {
     .map(|_| ())
 }
 
-/// The trusted set a pull reads for a remote starts with the repository's own
-/// `<remote>.trustedkeys.gpg`: a commit that keyring's key signed passes, the
-/// same commit against a destination holding another key is refused, and an
-/// unsigned commit is refused for carrying nothing to check.
+/// The trusted set of a remote starts with `<remote>.trustedkeys.gpg` in the
+/// repository.
+///
+/// - A commit that the key of this keyring signed passes.
+/// - If the keyring of the destination holds a different key, the pull
+///   refuses the same commit.
+/// - The pull refuses an unsigned commit, because it has no signature to
+///   verify.
 #[test]
 fn the_repository_keyring_is_what_a_remote_trusts() {
     if !gpg_available() {
@@ -191,7 +205,7 @@ fn the_repository_keyring_is_what_a_remote_trusts() {
     block_on(async {
         let (src, commit) = source_repo(base).await;
 
-        // An unsigned commit carries nothing the check can read.
+        // An unsigned commit has no signature to verify.
         let (path, dst) = dest_with_remote(base, "dst-unsigned", "").await;
         signer_home.export_to(&path.join("origin.trustedkeys.gpg"));
         let err = gpg_pull(&dst, &src).await.unwrap_err();
@@ -205,7 +219,7 @@ fn the_repository_keyring_is_what_a_remote_trusts() {
             .await
             .unwrap();
 
-        // The keyring holding the signing key accepts it.
+        // A keyring with the signing key accepts the commit.
         let (path, dst) = dest_with_remote(base, "dst-trusted", "").await;
         signer_home.export_to(&path.join("origin.trustedkeys.gpg"));
         gpg_pull(&dst, &src).await.unwrap();
@@ -214,7 +228,7 @@ fn the_repository_keyring_is_what_a_remote_trusts() {
             Some(commit)
         );
 
-        // A keyring holding another key does not.
+        // A keyring with a different key refuses the commit.
         let (path, dst) = dest_with_remote(base, "dst-other", "").await;
         other_home.export_to(&path.join("origin.trustedkeys.gpg"));
         let err = gpg_pull(&dst, &src).await.unwrap_err();
@@ -226,10 +240,12 @@ fn the_repository_keyring_is_what_a_remote_trusts() {
     });
 }
 
-/// A symlink at `<remote>.trustedkeys.gpg` is followed, so the keyring it names
-/// is what the remote trusts. The tool was observed to do the same: a
-/// destination whose `origin.trustedkeys.gpg` is a symlink to an exported
-/// keyring accepts the commit that keyring's key signed.
+/// The pull follows a symlink at `<remote>.trustedkeys.gpg`.
+///
+/// The remote trusts the keyring that the symlink names. The `ostree` command
+/// does the same in observation. If `origin.trustedkeys.gpg` is a symlink to
+/// an exported keyring, the pull accepts a commit that the key of this keyring
+/// signed.
 #[test]
 fn a_symlinked_repository_keyring_is_followed() {
     if !gpg_available() {
@@ -258,9 +274,10 @@ fn a_symlinked_repository_keyring_is_followed() {
     });
 }
 
-/// `gpgkeypath` adds keyrings to that set, by file and by directory, and an
-/// entry that names neither fails the pull rather than quietly reducing what is
-/// trusted.
+/// `gpgkeypath` adds keyrings to the trusted set, as a file or as a directory.
+///
+/// If an entry names no file and no directory, the pull fails. The trusted
+/// set does not silently become smaller.
 #[test]
 fn gpgkeypath_adds_keyrings_and_a_missing_entry_fails() {
     if !gpg_available() {
@@ -281,8 +298,8 @@ fn gpgkeypath_adds_keyrings_and_a_missing_entry_fails() {
         let keydir = base.join("keydir");
         std::fs::create_dir(&keydir).unwrap();
         signer_home.export_to(&keydir.join("pull.gpg"));
-        // A file the directory scan passes over, so the scan is what selects
-        // the keyrings rather than the pull reading whatever is there.
+        // The directory scan reads only regular files that end in `.gpg`, so
+        // it skips this file. This shows that the scan selects the keyrings.
         std::fs::write(keydir.join("notes.txt"), b"not a keyring\n").unwrap();
 
         for (name, entry) in [
@@ -317,11 +334,13 @@ fn gpgkeypath_adds_keyrings_and_a_missing_entry_fails() {
     });
 }
 
-/// A fifo at a `gpgkeypath` entry is refused by that entry's name. What a fifo
-/// answers a read with is what its writers sent, so a pull reading one would
-/// take its trusted set from them. This test returns only because the read
-/// refuses the kind before it reads; no gpg binary runs, since the trusted set
-/// is built before any signature is examined.
+/// The pull refuses a fifo at a `gpgkeypath` entry, and the error names the
+/// entry.
+///
+/// A read of a fifo returns the data that its writers sent. If the pull read
+/// a fifo, its writers set the trusted set. This test returns only
+/// because the pull refuses the file type before a read. No `gpg` binary runs,
+/// because the pull builds the trusted set before it examines a signature.
 #[test]
 fn a_fifo_gpgkeypath_entry_is_refused_by_name() {
     let tmp = TmpDir::new("pull-verify-gpg-keypath-fifo");
@@ -355,12 +374,14 @@ fn a_fifo_gpgkeypath_entry_is_refused_by_name() {
     });
 }
 
-/// A `gpgkeypath` entry over the keyring ceiling is refused by that entry's
-/// name. Reading the part the ceiling admits would hand the pull a trusted set
-/// the operator never placed there, with nothing said about it.
+/// The pull refuses a `gpgkeypath` entry that is larger than the keyring
+/// ceiling, and the error names the entry.
+///
+/// A read of only the part under the ceiling gives a trusted set that the
+/// operator did not put there, and no message reports it.
 #[test]
 fn an_oversized_gpgkeypath_entry_is_refused_by_name() {
-    /// The keyring ceiling `gpg.rs` holds every keyring source to.
+    /// The keyring ceiling that `src/gpg.rs` applies to each keyring source.
     const MAX_KEYRING: u64 = 4 * 1024 * 1024;
 
     let tmp = TmpDir::new("pull-verify-gpg-keypath-size");

@@ -1,6 +1,8 @@
-//! `ArchiveView` over a repository of each mode: the built `config`, the
-//! stored files, the `.filez` objects built on request, and the paths it
-//! refuses or does not find.
+//! Integration tests for `ArchiveView` over a repository of each mode.
+//!
+//! The tests cover the built `config` and the stored files. They also cover
+//! the `.filez` objects that the view builds on request, and the paths that the
+//! view refuses or does not find.
 
 mod common;
 
@@ -40,7 +42,7 @@ async fn get(view: &ArchiveView, path: &str) -> (Option<u64>, Vec<u8>) {
     read_all(view.get(path).await.unwrap()).await
 }
 
-/// Split a `.filez` into its header, its declared size, and its inflated
+/// Splits a `.filez` into its header, its declared size, and its inflated
 /// payload.
 async fn parse_filez(bytes: &[u8]) -> (FileHeader, u64, Vec<u8>) {
     let header_len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
@@ -59,9 +61,10 @@ async fn parse_filez(bytes: &[u8]) -> (FileHeader, u64, Vec<u8>) {
     (header, size, payload)
 }
 
-/// The served `config` is the archive one in every mode, and it carries the
-/// collection id and `indexed-deltas` of the repository once they are set. A
-/// change to the repository `config` shows in the next answer.
+/// In every mode, the view serves the `config` of an `archive` repository.
+/// After the repository sets the collection id and `indexed-deltas`, the served
+/// `config` carries them. A change to the repository `config` shows in the next
+/// answer.
 #[test]
 fn the_config_is_built_in_every_mode() {
     let tmp = TmpDir::new("view-config");
@@ -110,8 +113,8 @@ fn the_config_is_built_in_every_mode() {
     });
 }
 
-/// A `config` past the 1 MiB cap is refused, by the open of a handle and by
-/// the read of the view.
+/// The open of a handle and the read of the view each refuse a `config` larger
+/// than the 1 MiB cap.
 #[test]
 fn a_config_past_the_cap_is_refused() {
     let tmp = TmpDir::new("view-config-cap");
@@ -143,8 +146,8 @@ fn a_config_past_the_cap_is_refused() {
     });
 }
 
-/// A write of a `config` over the cap is refused and leaves the file as it
-/// was, through the repository and through the update guard.
+/// The repository and the update guard each refuse a write of a `config` larger
+/// than the cap. The file stays unchanged.
 #[test]
 fn a_config_write_past_the_cap_is_refused() {
     let tmp = TmpDir::new("view-config-write-cap");
@@ -169,8 +172,9 @@ fn a_config_write_past_the_cap_is_refused() {
     });
 }
 
-/// Refs, metadata objects, the summary, extensions, and in `archive` the
-/// stored `.filez`, come out byte for byte, with the length of the file.
+/// The view serves refs, metadata objects, the summary, and extensions byte for
+/// byte, with the length of the file. In `archive` mode, the view serves the
+/// stored `.filez` the same way.
 #[test]
 fn stored_files_are_served_as_stored() {
     let tmp = TmpDir::new("view-stored");
@@ -210,10 +214,11 @@ fn stored_files_are_served_as_stored() {
     });
 }
 
-/// A `.filez` built on request has no known length, carries the header the
-/// repository content reader gives, and inflates to the payload. Its bytes
-/// are those of the stored `.filez` of an `archive` repository with the same
-/// objects, and a symlink object is its header alone.
+/// A `.filez` that the view builds on request has no known length. It carries
+/// the header from the content reader of the repository and inflates to the
+/// payload. Its bytes are the bytes of the stored `.filez` of an `archive`
+/// repository with the same objects. The `.filez` of a symlink object holds
+/// only its header.
 #[test]
 fn a_built_filez_matches_the_archive_object() {
     let tmp = TmpDir::new("view-built");
@@ -248,8 +253,8 @@ fn a_built_filez_matches_the_archive_object() {
                     symlinks += 1;
                     assert_eq!(target, "hello");
                 }
-                // The objects of a mode that keeps the owner are those of the
-                // archive repository.
+                // In a mode that keeps the owner, the objects are identical to
+                // the objects of the archive repository.
                 if commit == archive_commit {
                     compared += 1;
                     let stored =
@@ -260,14 +265,14 @@ fn a_built_filez_matches_the_archive_object() {
             }
             assert_eq!(symlinks, 1);
         }
-        // `bare`, `bare-user`, and `bare-user-shared` keep the owner, so their
-        // five objects each are compared.
+        // `bare`, `bare-user`, and `bare-user-shared` keep the owner, so the
+        // test compares the five objects of each of these modes.
         assert_eq!(compared, 15);
     });
 }
 
-/// `[archive] zlib-level` of the repository `config` sets the level of the
-/// next `.filez` built, with no new view.
+/// The key `[archive] zlib-level` of the repository `config` sets the level of
+/// the next `.filez` that the view builds. The same view applies the new level.
 #[test]
 fn the_zlib_level_of_the_config_applies_to_the_next_filez() {
     let tmp = TmpDir::new("view-level");
@@ -311,9 +316,9 @@ fn the_zlib_level_of_the_config_applies_to_the_next_filez() {
     });
 }
 
-/// In `bare-split-xattrs` the header carries the owner and the mode of the
-/// inode and the extended attributes of the split object. The config is the
-/// archive one.
+/// In `bare-split-xattrs` mode, the header carries the owner and the mode of
+/// the inode and the extended attributes of the split object. The served
+/// `config` is the `config` of an `archive` repository.
 #[test]
 fn a_built_filez_carries_the_split_xattrs() {
     let tmp = TmpDir::new("view-split");
@@ -351,8 +356,8 @@ fn a_built_filez_carries_the_split_xattrs() {
             );
         }
 
-        // A `HEAD` reads no xattr: a link whose bytes do not parse fails the
-        // `GET` and leaves the `HEAD` found.
+        // A `HEAD` reads no xattr. A link with bytes that do not parse fails
+        // the `GET`, and the `HEAD` still answers found.
         let other = write_split_object(
             &root,
             0o100644,
@@ -374,8 +379,8 @@ fn a_built_filez_carries_the_split_xattrs() {
             ArchiveHead::Found { len: None }
         );
 
-        // A symlink at the link object is refused, and the payload of the
-        // file it names is not served.
+        // The view refuses a symlink at the link object. It does not serve
+        // the payload of the file that the symlink names.
         let link_path = root.join("objects").join(loose_path(
             &regular,
             ObjectType::FileXattrsLink,
@@ -398,7 +403,8 @@ fn assert_answer(answer: ArchiveAnswer, refused: bool, path: &str) {
     }
 }
 
-/// [`assert_answer`] for the `GET` and the `HEAD` of `path`.
+/// Checks the answers to the `GET` and the `HEAD` of `path`, as
+/// [`assert_answer`] does.
 async fn assert_both(view: &ArchiveView, path: &str, refused: bool) {
     assert_answer(view.get(path).await.unwrap(), refused, path);
     let expected = if refused {
@@ -409,8 +415,8 @@ async fn assert_both(view: &ArchiveView, path: &str, refused: bool) {
     assert_eq!(view.head(path).await.unwrap(), expected, "HEAD {path}");
 }
 
-/// The paths the view refuses and the paths it does not find, each by its own
-/// answer.
+/// The view answers `Refused` for each path that it refuses and `NotFound` for
+/// each path that it does not find.
 #[test]
 fn private_and_absent_paths_are_refused_or_not_found() {
     let tmp = TmpDir::new("view-refuse");
@@ -477,7 +483,7 @@ fn private_and_absent_paths_are_refused_or_not_found() {
             let long_ref = format!("refs/heads/{long}");
             let long_dir = format!("refs/{long}/x");
             let long_extension = format!("extensions/{long}");
-            // Deep paths: an absent directory, and a file at an inner
+            // Deep paths: an absent directory and a file at an inner
             // component.
             let deep_absent = format!("refs/heads/{}x", "a/".repeat(10_000));
             let deep_under_file = format!("refs/heads/main/{}x", "a/".repeat(10_000));
@@ -511,7 +517,7 @@ fn private_and_absent_paths_are_refused_or_not_found() {
     });
 }
 
-/// Move the fan-out directory of `checksum` aside and put a symlink to it in
+/// Moves the fan-out directory of `checksum` aside and puts a symlink to it in
 /// its place.
 fn symlink_fanout(repo: &Path, checksum: &Checksum) -> String {
     let fanout = &checksum.to_hex()[..2];
@@ -521,8 +527,8 @@ fn symlink_fanout(repo: &Path, checksum: &Checksum) -> String {
     fanout.to_owned()
 }
 
-/// A symlink at the fan-out directory is refused for a stored object and for
-/// a `.filez` built on request.
+/// The view refuses a symlink at the fan-out directory, for a stored object and
+/// for a `.filez` built on request.
 #[test]
 fn a_symlinked_fanout_is_refused() {
     let tmp = TmpDir::new("view-fanout");
@@ -545,8 +551,8 @@ fn a_symlinked_fanout_is_refused() {
     });
 }
 
-/// A symlink at the path of a `bare-user` object is refused, and none of the
-/// bytes it leads to are served.
+/// The view refuses a symlink at the path of a `bare-user` object. It serves
+/// none of the bytes that the symlink leads to.
 #[test]
 fn a_symlink_at_a_bare_user_object_is_refused() {
     let tmp = TmpDir::new("view-bare-user-link");

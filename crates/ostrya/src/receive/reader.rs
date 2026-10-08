@@ -2,12 +2,15 @@
 //! `[ex-ostrya receive "PATTERN"]`, `[ex-ostrya trust "NAME"]`, and
 //! `[ex-ostrya key "NAME"]`.
 //!
-//! The reader makes two passes. The first reads every group, refuses each key
-//! and each value outside the syntax, and resolves each reference to a trust
-//! group, a key group, or a remote section. It reads no file and runs no
-//! program. The second builds each key group and each trust group once, in
-//! file order, also a group that no rule names, then the pull trust of each
-//! remote a rule names, and gives the rules shared handles to them.
+//! The reader makes two passes. The first pass reads each group and refuses
+//! each key and each value outside the syntax. It also resolves each reference
+//! to a trust group, a key group, or a remote section. This pass reads no file
+//! and runs no program.
+//!
+//! The second pass builds each key group and each trust group once, in file
+//! order. It also builds a group that no rule names. Then it builds the pull
+//! trust of each remote that a rule names. The rules get shared handles to
+//! these objects.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -27,14 +30,16 @@ use super::{ReceivePolicy, ReceiveRule, ReceiveVerify, RefPattern, ServerSigner,
 
 /// The name of the default rule group.
 const DEFAULT_GROUP: &str = "ex-ostrya receive";
-/// The start of a pattern rule group name, before the quoted pattern.
+/// The name prefix of a pattern rule group, before the quoted pattern.
 const RULE_PREFIX: &str = "ex-ostrya receive \"";
-/// The start of a trust group name, before the quoted name.
+/// The name prefix of a trust group, before the quoted name.
 const TRUST_PREFIX: &str = "ex-ostrya trust \"";
-/// The start of a key group name, before the quoted name.
+/// The name prefix of a key group, before the quoted name.
 const KEY_PREFIX: &str = "ex-ostrya key \"";
-/// The start every receive group name has. A group name that has it and no
-/// shape of the receive groups is refused.
+/// The name prefix of every receive group.
+///
+/// If a group name has this prefix and no shape of a receive group, the
+/// reader refuses the group.
 const RESERVED_PREFIX: &str = "ex-ostrya ";
 
 /// The keys of a rule, valid in each receive group.
@@ -45,22 +50,22 @@ const RULE_KEYS: &[&str] = &[
     "allow-delete",
     "sign",
 ];
-/// The keys of a rule that have no effect when the rule refuses its refs.
+/// The keys of a rule that have no effect if the rule refuses its refs.
 const ACCEPT_ONLY_KEYS: &[&str] = &["verify", "sign", "allow-non-fast-forward", "allow-delete"];
 /// The keys that cover the whole session, valid in `[ex-ostrya receive]`
 /// alone.
 const SESSION_KEYS: &[&str] = &["allow-privileged", "sign-summary"];
-/// The sign-api engines a trust group can name.
+/// The sign-api engines that a trust group can name.
 const TRUST_ENGINES: &[&str] = &["ed25519", "spki"];
 
-/// Where the receive groups come from.
+/// The source of the receive groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Origin {
-    /// The repository config. Groups other than the receive groups belong to
-    /// the repository and are passed over.
+    /// The repository config. The groups other than the receive groups
+    /// belong to the repository, so the reader skips them.
     Config,
     /// A policy file. It holds the receive groups and remote sections, and
-    /// no other group. A remote section here reads no keyring
+    /// no other group. A remote section in a policy file reads no keyring
     /// inside the repository.
     File,
 }
@@ -84,7 +89,8 @@ enum VerifySpec {
     Remote(String),
 }
 
-/// One rule as the first pass reads it, before any key source is built.
+/// One rule as the first pass reads it, before the second pass builds the key
+/// sources.
 struct RuleSpec {
     accept: bool,
     verify: VerifySpec,
@@ -109,11 +115,12 @@ enum KeySpec {
     },
 }
 
-/// The receive policy that the receive groups of `keyfile` state.
-/// `update_summary` and the detached-metadata filter come from the repository
-/// config for both origins.
+/// Returns the receive policy that the receive groups of `keyfile` state.
+///
+/// For both origins, `update_summary` and the detached-metadata filter come
+/// from the repository config.
 pub(crate) async fn read(repo: &Repo, keyfile: &KeyFile, origin: Origin) -> Result<ReceivePolicy> {
-    // The first pass: every group by its shape, in file order.
+    // The first pass reads each group by its shape, in file order.
     let mut default = None;
     let mut rule_groups: Vec<(RefPattern, &str)> = Vec::new();
     let mut trust_groups: Vec<(&str, &str)> = Vec::new();
@@ -173,8 +180,8 @@ pub(crate) async fn read(repo: &Repo, keyfile: &KeyFile, origin: Origin) -> Resu
         None => (false, Vec::new()),
     };
 
-    // The second pass: each key group and each trust group once, in file
-    // order, then each remote a rule names.
+    // The second pass builds each key group and each trust group once, in
+    // file order. Then it builds the trust of each remote that a rule names.
     let mut signers: HashMap<&str, Arc<ServerSigner>> = HashMap::new();
     let mut trusts: HashMap<&str, Arc<TrustedKeys>> = HashMap::new();
     for (build, group) in builds {
@@ -240,10 +247,21 @@ pub(crate) async fn read(repo: &Repo, keyfile: &KeyFile, origin: Origin) -> Resu
     })
 }
 
-/// Read the policy file at `path`: a regular file alone, up to
-/// [`MAX_KEY_FILE`], in UTF-8, read and parsed on the blocking pool. A file that cannot be
-/// opened or read, and one of another kind, over the ceiling, or not UTF-8, is
-/// refused as [`Error::InvalidFormat`] by its path.
+/// Reads the policy file at `path` and parses it as a key file.
+///
+/// The file must be a regular file of at most [`MAX_KEY_FILE`] bytes, in
+/// UTF-8. The read and the parse run on the blocking pool.
+///
+/// The function returns [`Error::InvalidFormat`], with the path in the
+/// message, if the file:
+///
+/// - cannot be opened or read,
+/// - is not a regular file,
+/// - is larger than [`MAX_KEY_FILE`] bytes,
+/// - is not valid UTF-8.
+///
+/// If the text is not a valid key file, the function returns the key-file
+/// error [`Error::Core`].
 pub(crate) async fn read_policy_file(path: &Path) -> Result<KeyFile> {
     let path = path.to_owned();
     ostrya_rt::unblock(move || {
@@ -252,8 +270,9 @@ pub(crate) async fn read_policy_file(path: &Path) -> Result<KeyFile> {
             Error::Signature(message) => Error::InvalidFormat(message),
             other => other,
         };
-        // `NONBLOCK` so a fifo answers the open rather than waiting for a
-        // writer. On a regular file the flag has no effect on the read.
+        // With `NONBLOCK`, the open of a fifo returns at once. Without the
+        // flag, the open waits for a writer. On a regular file, the flag has
+        // no effect on the read.
         let fd = rustix::fs::open(
             &path,
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
@@ -268,9 +287,11 @@ pub(crate) async fn read_policy_file(path: &Path) -> Result<KeyFile> {
     .await
 }
 
-/// The receive group `group` names, `None` for a group outside the receive
-/// groups. A name that starts with `ex-ostrya ` and has no shape of a receive
-/// group is refused.
+/// Returns the receive group that `group` names, or `None` for a group
+/// outside the receive groups.
+///
+/// If the name starts with `ex-ostrya ` and has no shape of a receive group,
+/// the function returns [`Error::InvalidFormat`].
 fn classify(group: &str) -> Result<Option<Group<'_>>> {
     if group == DEFAULT_GROUP {
         return Ok(Some(Group::Default));
@@ -292,9 +313,11 @@ fn classify(group: &str) -> Result<Option<Group<'_>>> {
     Ok(None)
 }
 
-/// The quoted part of a group name, `rest` being the text after the opening
-/// `"`. The part ends the name, is not empty, and holds no `"` and no control
-/// character.
+/// Returns the quoted part of a group name.
+///
+/// `rest` is the text after the opening `"`. If the part does not end the
+/// name, is empty, or holds a `"` or a control character, the function
+/// returns [`Error::InvalidFormat`].
 fn quoted<'a>(group: &str, rest: &'a str) -> Result<&'a str> {
     match rest.strip_suffix('"') {
         Some(name)
@@ -309,7 +332,7 @@ fn quoted<'a>(group: &str, rest: &'a str) -> Result<&'a str> {
     }
 }
 
-/// The groups a rule can name, for the checks of its references.
+/// The groups that a rule can name, for the checks of its references.
 struct Names<'a> {
     keyfile: &'a KeyFile,
     trusts: HashSet<&'a str>,
@@ -328,8 +351,10 @@ impl Default for RuleSpec {
     }
 }
 
-/// Read the rule keys of the receive group `group`. `session` is true for
-/// `[ex-ostrya receive]`, which also holds the session keys.
+/// Reads the rule keys of the receive group `group`.
+///
+/// `session` is `true` for `[ex-ostrya receive]`, which also holds the
+/// session keys.
 fn parse_rule(names: &Names<'_>, group: &str, session: bool) -> Result<RuleSpec> {
     let keyfile = names.keyfile;
     for key in keyfile.keys(group) {
@@ -369,8 +394,10 @@ fn parse_rule(names: &Names<'_>, group: &str, session: bool) -> Result<RuleSpec>
     })
 }
 
-/// Read the `verify` key of `group`: `off` (the default), `trust:NAME` for a
-/// trust group, or `remote:NAME` for a remote section of the same file.
+/// Reads the `verify` key of `group`.
+///
+/// The value is `off` (the default), `trust:NAME` for a trust group, or
+/// `remote:NAME` for a remote section of the same file.
 fn parse_verify(names: &Names<'_>, group: &str) -> Result<VerifySpec> {
     let Some(raw) = names.keyfile.get_string(group, "verify")? else {
         return Ok(VerifySpec::Off);
@@ -387,8 +414,8 @@ fn parse_verify(names: &Names<'_>, group: &str) -> Result<VerifySpec> {
         return Ok(VerifySpec::Trust(name.to_owned()));
     }
     if let Some(name) = raw.strip_prefix("remote:").filter(|name| !name.is_empty()) {
-        // The name reaches the path of the remote's keyrings, so it is one
-        // path component.
+        // The name is part of the path of the keyrings of the remote, so it
+        // must be one path component.
         if !is_component(name) || name.contains(char::is_control) {
             return Err(Error::InvalidFormat(format!(
                 "malformed [{group}] verify value '{raw}': the remote name is one path \
@@ -408,8 +435,10 @@ fn parse_verify(names: &Names<'_>, group: &str) -> Result<VerifySpec> {
     )))
 }
 
-/// Read a list of key group names, `sign` or `sign-summary`, of `group`. Each
-/// name has to name a key group, and a name given twice counts once.
+/// Reads the list of key group names in the key `key` of `group`.
+///
+/// `key` is `sign` or `sign-summary`. Each entry must name a key group. An
+/// entry that occurs twice counts once.
 fn key_list(names: &Names<'_>, group: &str, key: &str) -> Result<Vec<String>> {
     let mut kept: Vec<String> = Vec::new();
     for name in names
@@ -430,8 +459,10 @@ fn key_list(names: &Names<'_>, group: &str, key: &str) -> Result<Vec<String>> {
     Ok(kept)
 }
 
-/// Check the trust group `group`: each key is one an axis reads, and the
-/// group turns on one axis at least.
+/// Checks the trust group `group`.
+///
+/// Each key must be one that an axis reads. The group must turn on at least
+/// one axis.
 fn check_trust(keyfile: &KeyFile, group: &str) -> Result<()> {
     let mut engine_keys: Vec<(&str, &str)> = Vec::new();
     for key in keyfile.keys(group) {
@@ -519,15 +550,15 @@ fn check_trust(keyfile: &KeyFile, group: &str) -> Result<()> {
     Ok(())
 }
 
-/// The engine a `verification-ENGINE-key` or `verification-ENGINE-file` key
-/// names, `None` for another key.
+/// Returns the engine that a `verification-ENGINE-key` or
+/// `verification-ENGINE-file` key names, or `None` for another key.
 fn verification_engine(key: &str) -> Option<&str> {
     let rest = key.strip_prefix("verification-")?;
     rest.strip_suffix("-key")
         .or_else(|| rest.strip_suffix("-file"))
 }
 
-/// Read the key group `group`.
+/// Reads the key group `group`.
 fn parse_key(keyfile: &KeyFile, group: &str) -> Result<KeySpec> {
     for key in keyfile.keys(group) {
         if !matches!(key, "type" | "secret-key-file" | "gpg-key" | "gpg-homedir") {
@@ -582,14 +613,17 @@ fn parse_key(keyfile: &KeyFile, group: &str) -> Result<KeySpec> {
     }
 }
 
-/// An spki key group whose keys passed their checks.
+/// Returns the spec of an spki key group whose keys passed their checks.
 #[cfg(feature = "sign-spki")]
 fn spki_key(_group: &str, file: String) -> Result<KeySpec> {
     Ok(KeySpec::Spki { file })
 }
 
-/// A build without the spki engine refuses an spki key group, rather than
-/// accept a session it would not sign.
+/// Refuses an spki key group with [`Error::Unsupported`] in a build without
+/// the spki engine.
+///
+/// The build cannot sign with the key, so the refusal stops the policy before
+/// it accepts a session.
 #[cfg(not(feature = "sign-spki"))]
 fn spki_key(group: &str, _file: String) -> Result<KeySpec> {
     Err(Error::Unsupported(format!(
@@ -598,14 +632,17 @@ fn spki_key(group: &str, _file: String) -> Result<KeySpec> {
     )))
 }
 
-/// A GPG key group whose keys passed their checks.
+/// Returns the spec of a GPG key group whose keys passed their checks.
 #[cfg(feature = "sign-gpg")]
 fn gpg_key(_group: &str, key: String, homedir: Option<String>) -> Result<KeySpec> {
     Ok(KeySpec::Gpg { key, homedir })
 }
 
-/// A build without GPG signing refuses a GPG key group, rather than accept a
-/// session it would not sign.
+/// Refuses a GPG key group with [`Error::Unsupported`] in a build without
+/// GPG signing.
+///
+/// The build cannot sign with the key, so the refusal stops the policy before
+/// it accepts a session.
 #[cfg(not(feature = "sign-gpg"))]
 fn gpg_key(group: &str, _key: String, _homedir: Option<String>) -> Result<KeySpec> {
     Err(Error::Unsupported(format!(
@@ -614,7 +651,7 @@ fn gpg_key(group: &str, _key: String, _homedir: Option<String>) -> Result<KeySpe
     )))
 }
 
-/// Build the signer of the key group `name`.
+/// Builds the signer of the key group `name`.
 async fn build_signer(name: &str, spec: &KeySpec) -> Result<ServerSigner> {
     let label = format!("[{KEY_PREFIX}{name}\"]");
     let in_group = |e: Error| match e {
@@ -642,18 +679,21 @@ async fn build_signer(name: &str, spec: &KeySpec) -> Result<ServerSigner> {
     }
 }
 
-/// The one secret key the file at `path` holds, as its base64 line, read on
-/// the blocking pool.
+/// Returns the one secret key that the file at `path` holds, as its base64
+/// line.
+///
+/// The read runs on the blocking pool.
 async fn secret_key_line(path: &str) -> Result<String> {
     let path = path.to_owned();
     ostrya_rt::unblock(move || read_secret_key_line(&path)).await
 }
 
-/// The blocking half of [`secret_key_line`].
+/// Reads the one secret key line of the file at `path`, the blocking half of
+/// `secret_key_line`.
 ///
-/// The file is read under the rule every key source is read under: a regular
-/// file alone, up to [`MAX_KEY_FILE`]. Blank lines are skipped, and the file
-/// has to hold exactly one other line.
+/// The read obeys the rule of every key source: a regular file alone, of at
+/// most [`MAX_KEY_FILE`] bytes. The function skips blank lines. The file must
+/// hold exactly one other line.
 fn read_secret_key_line(path: &str) -> Result<String> {
     let subject = format!("the secret key file '{path}'");
     let Some(bytes) = read_key_path(Path::new(path), &subject, MAX_KEY_FILE)? else {
@@ -670,7 +710,7 @@ fn read_secret_key_line(path: &str) -> Result<String> {
     }
 }
 
-/// The refusal of a key that `group` does not take.
+/// Returns the error for a key that `group` does not take.
 fn unknown_key(group: &str, key: &str) -> Error {
     Error::InvalidFormat(format!("[{group}] holds the unknown key '{key}'"))
 }
@@ -679,8 +719,8 @@ fn unknown_key(group: &str, key: &str) -> Error {
 mod tests {
     use super::*;
 
-    /// The four shapes are read, and the groups outside the receive groups
-    /// pass through.
+    /// `classify` tells the four shapes apart, and the groups outside the
+    /// receive groups pass through.
     #[test]
     fn the_group_shapes_are_told_apart() {
         assert!(matches!(
@@ -704,8 +744,8 @@ mod tests {
         }
     }
 
-    /// Each name that starts with `ex-ostrya ` and has no shape of a receive
-    /// group is refused.
+    /// `classify` refuses each name that starts with `ex-ostrya ` and has no
+    /// shape of a receive group.
     #[test]
     fn the_other_reserved_names_are_refused() {
         for group in [
@@ -731,7 +771,8 @@ mod tests {
         }
     }
 
-    /// The engine a verification key names.
+    /// `verification_engine` returns the engine that a verification key
+    /// names.
     #[test]
     fn verification_keys_name_their_engine() {
         assert_eq!(

@@ -1,92 +1,16 @@
-//! composefs / EROFS image export.
+//! Export of a commit as a composefs EROFS image.
 //!
-//! [`Repo::export_composefs`] builds the composefs EROFS image for a commit's
-//! tree. It reads the commit's [`RepoTree`], turns each directory, symlink, and
-//! regular file into the tree model the [`ostrya_composefs`] writer consumes,
-//! injects the five top-level directories the tool adds (`boot`, `etc`,
-//! `sysroot`, `usr`, `var`), and drives the writer. Each regular file with
-//! content redirects to its `.file` loose path and, under the default verity
-//! policy, carries the fs-verity digest of that content. When the object file
-//! is the raw payload and `statx` reports its inode as sealed, the export reads
-//! that digest from the kernel in the same blocking-pool call that loads the
-//! object's metadata. The seal must name SHA-256, 4096-byte blocks, no salt,
-//! and the payload size, the parameters a repository with `[ex-integrity]
-//! fsverity` seals with. The kernel read takes no payload byte, so it does not
-//! find damage to a sealed object's data or verity metadata; `fsck` is the
-//! check for object integrity. An `archive` object is never read this way,
-//! because the digest of a `.filez` file is not the digest of its content. In
-//! all other cases, and when a kernel read fails, the digest is computed by
-//! streaming the object's payload through the fs-verity primitive in bounded
-//! chunks, so no unconstrained blob is buffered. The synchronous image assembly
-//! runs on the blocking pool.
+//! - [`Repo::export_composefs`] builds the image in memory and returns its
+//!   bytes and its fs-verity digest.
+//! - [`Repo::export_composefs_to`] writes the image through a file
+//!   descriptor.
+//! - [`Repo::commit_add_composefs_metadata`] stages a new commit that records
+//!   the image digest under `ostree.composefs.digest.v0`.
+//! - [`Transaction::composefs_digest`] returns the image digest of a staged
+//!   tree.
 //!
-//! [`Repo::export_composefs_to`] writes the same image through a file
-//! descriptor and returns its fs-verity digest. Emission is append-only, so
-//! the image reaches the descriptor as it is serialized and no image-sized
-//! buffer is held. [`Repo::export_composefs`] returns the bytes for a caller
-//! that wants them in memory.
-//!
-//! [`ComposefsOptions`] carries the verity policy. Under
-//! [`VerityPolicy::Computed`], the default, each backed file carries the
-//! 36-byte metacopy record holding its content's fs-verity digest. Under
-//! [`VerityPolicy::Disabled`] the metacopy xattr is present with an empty
-//! value, no payload is streamed, and the image the export writes has its own
-//! fs-verity digest, distinct from the value a commit records under
-//! `ostree.composefs.digest.v0`. The recorded value is the digest of the
-//! verity-form image, which is what a target machine reproduces at boot, so
-//! the two are not compared. [`ComposefsOptions::RECORDED`] holds the options
-//! of the image whose digest a commit records. Every backing object is still
-//! opened under both policies, because the inode's mode, ownership, size, and
-//! xattrs come from the file object.
-//!
-//! [`Repo::commit_add_composefs_metadata`] computes the image digest for an
-//! existing commit and writes a new commit whose metadata dict carries
-//! `ostree.composefs.digest.v0`, the value the tool stores and verifies at boot.
-//! [`Transaction::composefs_digest`] computes the same digest over a tree the
-//! transaction has staged and not yet published, which is what a commit
-//! carrying the key in its own metadata needs. Both write the image through
-//! [`std::io::sink`], so neither holds an image.
-//!
-//! The image derives from the committed tree alone. Each regular file redirects
-//! to the `.file` loose path, the form the composefs backing modes store, and
-//! carries the fs-verity digest of the file's content, so a repository holding
-//! the same tree produces the same image and the same digest whatever its mode.
-//!
-//! Every path here runs in every repository mode. The EROFS metadata of each
-//! file comes from the file object as [`Repo::load_file`] reads it in the
-//! repository's mode. Ownership is presented through composefs uid mapping at
-//! mount, so the stored uid/gid are the logical owners regardless of who runs
-//! the export. An `archive` repository holds its content objects in `.filez`
-//! form, so an image exported from it mounts over a store that holds the same
-//! objects in `.file` form, such as a `bare-user` repository the tree is pulled
-//! into.
-//!
-//! One tree fact has no place in the image: an inode that spends too much on
-//! extended attributes. Each attribute spends its name, its value, and 7 bytes
-//! from a budget of 32755 bytes for the inode. The tool refuses a tree that
-//! spends more, so every path here refuses it with [`Error::Unsupported`] where
-//! the tree's bytes enter the image model. A commit past the budget would carry
-//! a composefs digest no `ostree` reproduces at boot. The budget sits under the
-//! 65535 bytes an EROFS xattr entry states its value length in, so that field
-//! never binds first. A name is held there as well, at the 255 bytes the
-//! entry's name-length field states, which the budget leaves unbound.
-//! `docs/format-reference.md`, "composefs", records the observation the budget
-//! comes from and the width of each field.
-//!
-//! A symlink target that fills its inode's block has no place there either. The
-//! image states a target inline, beside the inode header and the inode's
-//! extended attributes, so the writer refuses a target above what those two
-//! leave in a block: 4063 bytes for a symlink carrying no attributes. Every
-//! path here reports that refusal as [`Error::Unsupported`]. The tool aborts on
-//! the same trees, which `docs/format-reference.md`, "composefs", records.
-//! `PATH_MAX` keeps a target that long out of a tree a checkout produces; a tar
-//! import reaches it.
-//!
-//! A child name above 255 bytes has no place there either. The writer refuses
-//! it, and every path here reports that refusal as [`Error::Unsupported`]. The
-//! tool refuses the same trees with `File name too long`, which
-//! `docs/format-reference.md`, "composefs", records. A filesystem holds no name
-//! that long; a tar import reaches it.
+//! [`ComposefsOptions`] and [`VerityPolicy`] select the verity form of the
+//! image.
 
 use std::future::Future;
 use std::io::BufWriter;
@@ -108,41 +32,44 @@ use crate::repo::Repo;
 use crate::transaction::Transaction;
 use crate::tree::RepoTree;
 
-/// The empty top-level directories the tool injects into every exported image.
+/// The empty top-level directories that the `ostree` command adds to each
+/// exported image.
 const INJECTED_DIRS: [&str; 5] = ["boot", "etc", "sysroot", "usr", "var"];
-/// The mode the tool gives each injected top-level directory (`040755`).
+/// The mode that the `ostree` command gives each added top-level directory
+/// (`040755`).
 const INJECTED_DIR_MODE: u32 = 0o040755;
-/// The commit metadata key holding the image's fs-verity digest.
+/// The commit metadata key that holds the fs-verity digest of the image.
 const COMPOSEFS_DIGEST_KEY: &str = "ostree.composefs.digest.v0";
 /// The GVariant type of the digest value, a 32-byte `ay`.
 const DIGEST_SIGNATURE: &str = "ay";
-/// The chunk size used to stream a backing object through the digester.
+/// The size of each chunk that the hasher reads from a backing object.
 const DIGEST_CHUNK: usize = 128 * 1024;
-/// The bytes one xattr spends from an inode's composefs xattr budget, on top of
-/// its name and its value.
+/// The bytes that one xattr spends from the composefs xattr budget of an
+/// inode, in addition to its name and its value.
 const XATTR_ENTRY_COST: usize = 7;
 /// The composefs xattr budget of one inode, in bytes.
 const MAX_XATTR_TOTAL: usize = 32755;
-/// The longest xattr name an EROFS entry states its length in. The stored name
-/// is the prefix-stripped suffix, which is no longer than the full name, so the
-/// full name is held to this bound and the prefix table stays in the writer.
+/// The longest xattr name that the length field of an EROFS entry can state.
+/// The entry stores the name without its prefix, and this suffix is not longer
+/// than the full name. The check holds the full name to this bound, so the
+/// prefix table stays in the writer.
 const MAX_XATTR_NAME: usize = u8::MAX as usize;
-/// The repository mode whose loose-path form each backing redirect names. The
-/// image points at the `.file` objects a composefs backing store holds, whatever
-/// mode the repository the image was built from uses.
+/// The repository mode of the loose path that each backing redirect names. The
+/// image points at the `.file` objects of a composefs backing store, whatever
+/// the mode of the repository that the image comes from.
 const BACKING_MODE: RepoMode = RepoMode::BareUser;
 
-/// A boxed, `Send` future, used for the recursive tree walk (async recursion
-/// needs indirection).
+/// A boxed `Send` future for the recursive tree walk. Async recursion needs
+/// this indirection.
 type TreeFuture<'a> = Pin<Box<dyn Future<Output = Result<Directory>> + Send + 'a>>;
 
-/// Where the composefs walk reads the tree's objects.
+/// The place where the composefs walk reads the objects of the tree.
 #[derive(Clone, Copy)]
 enum ObjectSource<'a> {
-    /// A published repository: every object is a loose object under `objects/`.
+    /// A published repository: each object is a loose object under `objects/`.
     Repo(&'a Repo),
-    /// A transaction: an object it staged is read from the staging directory,
-    /// and one that deduplicated from `objects/`.
+    /// A transaction: an object that it staged comes from the staging
+    /// directory. An object that deduplicated comes from `objects/`.
     Staged(&'a Transaction),
 }
 
@@ -161,8 +88,8 @@ impl ObjectSource<'_> {
         }
     }
 
-    /// Load a file object. `measure` also reads the kernel's fs-verity digest
-    /// of a sealed raw-payload object in the same load.
+    /// Loads a file object. If `measure` is set, the same load also reads the
+    /// fs-verity digest that the kernel holds for a sealed raw-payload object.
     async fn file(&self, checksum: &Checksum, measure: bool) -> Result<FileObject> {
         match self {
             ObjectSource::Repo(repo) => repo.load_file_with(checksum, measure).await,
@@ -171,24 +98,42 @@ impl ObjectSource<'_> {
     }
 }
 
-/// Whether an exported image carries the backing objects' fs-verity digests.
+/// The verity form of an exported composefs image.
+///
+/// The policy selects if each backed file carries the fs-verity digest of its
+/// content. The export opens each backing object under both policies. The
+/// mode, the owner, the size, and the xattrs of the inode come from the file
+/// object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VerityPolicy {
-    /// Each backed file carries the 36-byte metacopy record holding the
-    /// fs-verity digest of its content. A backing object sealed with the
-    /// parameters ostree uses gives the digest the kernel holds. The payload of
-    /// every other backing object is streamed to compute it.
+    /// Each backed file carries the 36-byte metacopy record with the fs-verity
+    /// digest of its content.
+    ///
+    /// This policy is the default.
+    ///
+    /// If a backing object is sealed with the parameters that
+    /// [`Repo::export_composefs`] states, the export reads the digest from the
+    /// kernel. For each other backing object, the export streams the payload
+    /// to compute the digest.
     #[default]
     Computed,
-    /// Each backed file carries the metacopy xattr with an empty value. No
-    /// payload is read.
+    /// Each backed file carries the metacopy xattr with an empty value.
+    ///
+    /// The export reads no payload.
+    ///
+    /// The image has its own fs-verity digest. This digest is different from
+    /// the value that a commit records under `ostree.composefs.digest.v0`.
+    /// The recorded value is the digest of the image with verity digests.
+    /// [`ComposefsOptions::RECORDED`] gives the options of that image.
     Disabled,
 }
 
-/// Options for a composefs export.
+/// The options of a composefs export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ComposefsOptions {
-    /// The verity policy the image is written under.
+    /// The verity policy of the image.
+    ///
+    /// The default is [`VerityPolicy::Computed`].
     pub verity: VerityPolicy,
 }
 
@@ -197,30 +142,52 @@ impl ComposefsOptions {
     ///
     /// `ostree.composefs.digest.v0` holds the fs-verity digest of the image
     /// that [`Repo::export_composefs`] and [`Repo::export_composefs_to`] write
-    /// with these options. The policy is [`VerityPolicy::Computed`]. Under it,
-    /// each backed file in the image carries the fs-verity digest of its
-    /// content, so the image digest covers the content of each backed file.
+    /// with these options. A target machine computes the same digest at boot.
+    ///
+    /// The policy is [`VerityPolicy::Computed`]. Each backed file in the image
+    /// carries the fs-verity digest of its content, so the image digest covers
+    /// the content of each backed file.
     /// [`Repo::commit_add_composefs_metadata`] and
-    /// [`Transaction::composefs_digest`] use these options and not the
-    /// default, so a change of the default does not change the recorded
-    /// digest.
+    /// [`Transaction::composefs_digest`] use these options, so a change of the
+    /// default does not change the recorded digest.
     pub const RECORDED: ComposefsOptions = ComposefsOptions {
         verity: VerityPolicy::Computed,
     };
 }
 
+/// Methods that compute the composefs digest of a staged tree.
 impl Transaction {
-    /// The fs-verity digest of the composefs image for a tree this transaction
-    /// has staged, the value `ostree.composefs.digest.v0` holds.
+    /// Returns the composefs image digest of a tree that this transaction
+    /// staged.
     ///
-    /// The digest is that of the image an export with
+    /// The value is the one that `ostree.composefs.digest.v0` holds: the
+    /// fs-verity digest of the image that an export with
     /// [`ComposefsOptions::RECORDED`] writes for the same tree.
-    /// The image is built from the staged objects, so the digest is available
-    /// before the transaction publishes and can go into the metadata of the
-    /// commit the tree belongs to. The value depends on the tree alone, so a
-    /// repository of any mode holding that tree reaches the same digest.
-    /// The image is written through [`std::io::sink`], so the digest costs no
-    /// image-sized buffer.
+    /// [`Repo::export_composefs`] describes the image.
+    ///
+    /// The call reads each object that this transaction staged from the
+    /// staging directory, and each other object from `objects/`. The digest is
+    /// available before the transaction commit, so it can go into the metadata
+    /// of the commit that the tree belongs to. The value depends on the tree
+    /// alone, so a repository of any mode that holds the tree gives the same
+    /// digest.
+    ///
+    /// The image goes to [`std::io::sink`], so the digest needs no image-sized
+    /// buffer.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if a dirtree, dirmeta, or file object of the
+    ///   tree is in neither the staging directory nor the object store.
+    /// - [`Error::Core`] if a dirtree object, a dirmeta object, or the header
+    ///   of a file object does not parse.
+    /// - [`Error::InvalidFormat`] if a file object does not have the form of
+    ///   the repository mode. [`Repo::load_file`] lists the cases.
+    /// - [`Error::Unsupported`] if the tree does not fit a limit of the image.
+    ///   [`Repo::export_composefs`] lists the limits.
+    /// - [`Error::Io`] if a file system operation fails, if a metadata object
+    ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if
+    ///   an `archive` payload does not inflate.
     pub async fn composefs_digest(&self, root: &RepoTree) -> Result<[u8; 32]> {
         let dir = composefs_model(
             ObjectSource::Staged(self),
@@ -232,21 +199,117 @@ impl Transaction {
     }
 }
 
+/// Methods that export a commit as a composefs image.
 impl Repo {
-    /// Build the composefs EROFS image for `commit` and return its bytes and
-    /// fs-verity digest.
+    /// Builds the composefs EROFS image of `commit` in memory.
     ///
-    /// The export runs in every repository mode. Each regular file redirects
-    /// to its `.file` loose path, which an `archive` repository does not hold,
-    /// so an image built there mounts over a store that holds the same objects
-    /// in `.file` form.
+    /// The returned [`Image`] holds the bytes of the image and its fs-verity
+    /// digest. With [`ComposefsOptions::RECORDED`], the digest is the value
+    /// that [`commit_add_composefs_metadata`](Repo::commit_add_composefs_metadata)
+    /// records for the tree of the commit. Under [`VerityPolicy::Disabled`],
+    /// the digest is different from that value. The image assembly runs on the
+    /// blocking pool.
     ///
-    /// `opts.verity` decides whether each backed file carries the fs-verity
-    /// digest of its content. Under [`VerityPolicy::Disabled`] the image's own
-    /// digest differs from the value a commit records under
-    /// `ostree.composefs.digest.v0`. With [`ComposefsOptions::RECORDED`] the
-    /// image's digest is the value [`Repo::commit_add_composefs_metadata`]
-    /// records for the tree of the commit.
+    /// # Tree model
+    ///
+    /// The export reads the root tree of the commit. It turns each entry into
+    /// a node of the image:
+    ///
+    /// - A directory gets the mode, the owner, and the xattrs of its dirmeta
+    ///   object.
+    /// - A symlink stores its target inline.
+    /// - An empty regular file has no backing.
+    /// - A regular file with content redirects to the loose path of its
+    ///   `.file` object, with a leading `/`. Under
+    ///   [`VerityPolicy::Computed`], it also carries the fs-verity digest of
+    ///   its content.
+    ///
+    /// The export sets the mtime of each inode to 0, as the `ostree` command
+    /// does. It adds the five empty top-level directories that the `ostree`
+    /// command adds: `boot`, `etc`, `sysroot`, `usr`, and `var`. Each one has
+    /// the mode `040755` and the uid and gid 0. If the root of the commit
+    /// already holds one of these names, the entry of the commit stays.
+    ///
+    /// # Verity digests
+    ///
+    /// Under [`VerityPolicy::Computed`], the export gets the fs-verity digest
+    /// of each backed file in one of two ways:
+    ///
+    /// - If the object file is the raw payload and `statx` reports its inode
+    ///   as sealed, the export reads the digest from the kernel. The seal must
+    ///   name SHA-256, 4096-byte blocks, no salt, and the payload size. A
+    ///   repository with `[ex-integrity] fsverity` seals with these parameters.
+    ///   The read occurs in the blocking-pool call that loads the metadata of
+    ///   the object.
+    /// - In all other cases, and if the kernel read fails, the export streams
+    ///   the payload through the fs-verity hasher in chunks of 128 KiB. It
+    ///   buffers no unconstrained blob.
+    ///
+    /// The export never reads the digest of an `archive` object from the
+    /// kernel. The digest of a `.filez` file covers the stored form of the
+    /// object, and the image needs the digest of the content.
+    ///
+    /// The kernel read takes no payload byte, so it does not find damage to
+    /// the data or the verity metadata of a sealed object. [`Repo::fsck`] is
+    /// the check for object integrity.
+    ///
+    /// # Repository modes
+    ///
+    /// The export runs in every repository mode. The EROFS metadata of each
+    /// file comes from the file object, as [`Repo::load_file`] reads it in the
+    /// mode of the repository. The image stores the logical uid and gid of
+    /// each file, whoever runs the export. composefs presents the ownership
+    /// through uid mapping at mount.
+    ///
+    /// The image depends on the committed tree alone. Each regular file
+    /// redirects to its `.file` loose path, the form that a composefs backing
+    /// store holds. Each digest covers the content of the file, so a
+    /// repository of any mode that holds the tree gives the same image and
+    /// digest.
+    ///
+    /// An `archive` repository holds its content objects in `.filez` form. An
+    /// image exported from it mounts over a store that holds the same objects
+    /// in `.file` form. A `bare-user` repository that pulls the tree is an
+    /// example.
+    ///
+    /// # Limits
+    ///
+    /// The image cannot hold some trees. The export refuses each of these trees
+    /// with [`Error::Unsupported`]:
+    ///
+    /// - An inode with too many bytes of extended attributes. Each attribute
+    ///   spends its name, its value, and 7 bytes from a budget of 32755 bytes
+    ///   for the inode. The `ostree` command refuses a tree that spends more.
+    ///   At boot, the `ostree` command cannot reproduce a composefs digest of
+    ///   such a tree.
+    ///   The budget is less than the 65535 bytes that the value-length field
+    ///   of an EROFS xattr entry can state, so that field never limits first.
+    /// - An xattr name longer than 255 bytes, the limit of the name-length
+    ///   field of an EROFS xattr entry. The budget alone does not hold a name
+    ///   to this length.
+    /// - A symlink target that does not fit in the block of its inode. The
+    ///   image stores the target inline, next to the inode header and the
+    ///   xattrs of the inode. For a symlink with no xattrs, the limit is 4063
+    ///   bytes. The `ostree` command aborts on the same trees. `PATH_MAX` keeps
+    ///   a target this long out of a tree that a checkout produces. A tar
+    ///   import can produce one.
+    /// - A child name longer than 255 bytes. The `ostree` command refuses the
+    ///   same trees with `File name too long`. A file system holds no name
+    ///   this long. A tar import can produce one.
+    /// - A child name that is empty, is `.` or `..`, or holds `/`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if the commit object, or a dirtree,
+    ///   dirmeta, or file object of its tree, is not in the object store.
+    /// - [`Error::Core`] if the commit object, a dirtree object, a dirmeta
+    ///   object, or the header of a file object does not parse.
+    /// - [`Error::InvalidFormat`] if a file object does not have the form of
+    ///   the repository mode. [`Repo::load_file`] lists the cases.
+    /// - [`Error::Unsupported`] if the tree does not fit a limit of the image.
+    /// - [`Error::Io`] if a file system operation fails, if a metadata object
+    ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if
+    ///   an `archive` payload does not inflate.
     pub async fn export_composefs(
         &self,
         commit: &Checksum,
@@ -258,14 +321,32 @@ impl Repo {
             .map_err(writer_error)
     }
 
-    /// Write the composefs EROFS image for `commit` through `out` and return the
-    /// image's fs-verity digest.
+    /// Writes the composefs image of `commit` to `out` and returns its digest.
     ///
-    /// The image goes to the file descriptor as it is serialized, so no
-    /// image-sized buffer is held. `out` is written from its current offset
-    /// onward and is never seeked, and a call that fails leaves the prefix it
-    /// had already written. The mode scope and `opts.verity` are those of
-    /// [`Repo::export_composefs`].
+    /// The image and its fs-verity digest are the same as those of
+    /// [`export_composefs`](Repo::export_composefs), with the same options,
+    /// the same repository modes, and the same limits.
+    ///
+    /// The call writes the image to the file descriptor as it serializes it.
+    /// The output is append-only, so the call holds no image-sized buffer. It
+    /// writes `out` from its current offset and never seeks it. If the call
+    /// fails, the bytes that it already wrote stay in `out`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if the commit object, or a dirtree,
+    ///   dirmeta, or file object of its tree, is not in the object store.
+    /// - [`Error::Core`] if the commit object, a dirtree object, a dirmeta
+    ///   object, or the header of a file object does not parse.
+    /// - [`Error::InvalidFormat`] if a file object does not have the form of
+    ///   the repository mode. [`Repo::load_file`] lists the cases.
+    /// - [`Error::Unsupported`] if the tree does not fit a limit of the image.
+    ///   [`export_composefs`](Repo::export_composefs) lists the limits.
+    /// - [`Error::Io`] if the duplicate of `out` fails, or if a write to `out`
+    ///   or its flush fails.
+    /// - [`Error::Io`] if another file system operation fails, if a metadata
+    ///   object is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE),
+    ///   or if an `archive` payload does not inflate.
     pub async fn export_composefs_to(
         &self,
         commit: &Checksum,
@@ -273,16 +354,16 @@ impl Repo {
         out: BorrowedFd<'_>,
     ) -> Result<[u8; 32]> {
         let dir = self.composefs_export_model(commit, opts).await?;
-        // The blocking pool needs an owned handle, so the caller's descriptor is
-        // duplicated for the closure to move.
+        // The blocking pool needs an owned handle, so the call duplicates the
+        // descriptor of the caller for the closure to move.
         let fd = out.try_clone_to_owned()?;
         ostrya_rt::unblock(move || write_image_to_fd(&dir, fd))
             .await
             .map_err(writer_error)
     }
 
-    /// The composefs tree model for `commit`'s root, the step the two export
-    /// entry points share.
+    /// Returns the composefs tree model of the root of `commit`. The two
+    /// export entry points share this step.
     async fn composefs_export_model(
         &self,
         commit: &Checksum,
@@ -292,7 +373,7 @@ impl Repo {
         self.composefs_commit_model(&commit_obj, opts).await
     }
 
-    /// The composefs tree model for the root of a commit already loaded.
+    /// Returns the composefs tree model of the root of a loaded commit.
     async fn composefs_commit_model(
         &self,
         commit_obj: &Commit,
@@ -306,18 +387,48 @@ impl Repo {
         composefs_model(ObjectSource::Repo(self), &tree, opts).await
     }
 
-    /// Compute the composefs image digest for `commit` and stage a new commit
-    /// whose metadata carries `ostree.composefs.digest.v0`, returning the new
-    /// commit's checksum. The new commit is published when `txn` commits.
+    /// Stages a new commit that records the composefs image digest of
+    /// `commit`.
     ///
-    /// The digest is that of the image [`Repo::export_composefs`] writes with
-    /// [`ComposefsOptions::RECORDED`].
-    /// The image derives from the commit's tree alone, so the digest is
-    /// independent of the metadata it is stored in and of the repository's mode;
-    /// every mode holding that tree reaches the same value. The digest key is
-    /// appended to the commit's existing metadata dict; a commit that already
-    /// carries it is [`Error::InvalidFormat`]. The image is written through
-    /// [`std::io::sink`], so the digest costs no image-sized buffer.
+    /// The digest is the fs-verity digest of the image that
+    /// [`export_composefs`](Repo::export_composefs) writes with
+    /// [`ComposefsOptions::RECORDED`]. The `ostree` command stores this value
+    /// and verifies it at boot.
+    ///
+    /// The call appends the key `ostree.composefs.digest.v0` to the metadata
+    /// dict of `commit`, with the 32-byte digest as an `ay` value. The other
+    /// fields of the commit stay the same. The call stages the new commit in
+    /// `txn` and returns its checksum. The new commit publishes when `txn`
+    /// commits.
+    ///
+    /// The image depends on the tree of the commit alone, so the metadata of
+    /// the commit and the repository mode do not change the digest. The image
+    /// goes to [`std::io::sink`], so the digest needs no image-sized buffer.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if `commit` already carries
+    ///   `ostree.composefs.digest.v0`.
+    /// - [`Error::ObjectNotFound`] if the commit object, or a dirtree,
+    ///   dirmeta, or file object of its tree, is not in the object store.
+    /// - [`Error::Core`] if the commit object, a dirtree object, a dirmeta
+    ///   object, or the header of a file object does not parse.
+    /// - [`Error::InvalidFormat`] if a file object does not have the form of
+    ///   the repository mode. [`Repo::load_file`] lists the cases.
+    /// - [`Error::Unsupported`] if the tree does not fit a limit of the image.
+    ///   [`export_composefs`](Repo::export_composefs) lists the limits.
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`,
+    ///   or if `[ex-integrity] fsverity` is `yes` and the fs-verity seal of
+    ///   the new commit object fails.
+    /// - [`Error::InsufficientFreeSpace`] if the new commit object needs more
+    ///   space than the free-space budget of the transaction holds.
+    /// - [`Error::Core`] if `[core] fsync` or `[core] per-object-fsync` in the
+    ///   repository config is malformed.
+    /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
+    ///   `[ex-integrity] composefs` in the repository config is malformed.
+    /// - [`Error::Io`] if a file system operation fails, if a metadata object
+    ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if
+    ///   an `archive` payload does not inflate.
     pub async fn commit_add_composefs_metadata(
         &self,
         txn: &Transaction,
@@ -341,9 +452,9 @@ impl Repo {
     }
 }
 
-/// Build the composefs tree model for `root`, reading the tree's objects from
-/// `source`. The model holds each file's metadata and its backing redirect, and
-/// no file content, so it is bounded by the tree's shape.
+/// Builds the composefs tree model of `root` from the objects in `source`.
+/// The model holds the metadata and the backing redirect of each file, and no
+/// file content, so the shape of the tree bounds its size.
 async fn composefs_model(
     source: ObjectSource<'_>,
     root: &RepoTree,
@@ -360,25 +471,26 @@ async fn composefs_model(
     Ok(dir)
 }
 
-/// Serialize `dir` through `fd` and return the image's fs-verity digest. The
-/// descriptor is buffered, because the writer emits the image in many small
-/// writes.
+/// Serializes `dir` through `fd` and returns the fs-verity digest of the
+/// image. A buffer wraps the descriptor, because the writer emits the image in
+/// many small writes.
 fn write_image_to_fd(dir: &Directory, fd: OwnedFd) -> std::result::Result<[u8; 32], WriterError> {
     let mut out = BufWriter::new(std::fs::File::from(fd));
     write_image_to(dir, &mut out)
 }
 
-/// The fs-verity digest of the image for `dir`, for a caller that wants the
-/// digest and not the image. The image goes through [`std::io::sink`], so it is
-/// never held.
+/// Returns the fs-verity digest of the image of `dir`, for a caller that needs
+/// the digest alone. The image goes to [`std::io::sink`], so the call never
+/// holds it.
 async fn image_digest(dir: Directory) -> Result<[u8; 32]> {
     ostrya_rt::unblock(move || write_image_to(&dir, &mut std::io::sink()))
         .await
         .map_err(writer_error)
 }
 
-/// The library error for a writer refusal. The writer holds the bounds the
-/// image itself states, which the tree reaches, so its refusal is the tree's.
+/// Returns the library error for an error of the writer. The writer holds the
+/// bounds that the image format states. The tree reaches these bounds, so a
+/// refusal of the writer is a refusal of the tree.
 fn writer_error(err: WriterError) -> Error {
     match err {
         WriterError::Unsupported(msg) => Error::Unsupported(msg),
@@ -386,8 +498,9 @@ fn writer_error(err: WriterError) -> Error {
     }
 }
 
-/// Build the composefs [`Directory`] model for one directory of a committed
-/// tree, recursing into subdirectories. Boxed because the recursion is async.
+/// Builds the composefs [`Directory`] model of one directory of a committed
+/// tree, and recurses into its subdirectories. The future is boxed because the
+/// recursion is async.
 fn build_directory(
     source: ObjectSource<'_>,
     dirtree: Checksum,
@@ -410,11 +523,16 @@ fn build_directory(
     })
 }
 
-/// Build the composefs [`Node`] for a file object: a symlink stores its target
-/// inline, an empty regular file has no backing, and a regular file with
-/// content redirects to its `.file` loose path and carries the fs-verity digest
-/// of its content under [`VerityPolicy::Computed`]. The file object is read
-/// under either policy, because the inode's metadata comes from it.
+/// Builds the composefs [`Node`] of a file object.
+///
+/// - A symlink stores its target inline.
+/// - An empty regular file has no backing.
+/// - A regular file with content redirects to its `.file` loose path. Under
+///   [`VerityPolicy::Computed`], it carries the fs-verity digest of its
+///   content.
+///
+/// The call reads the file object under both policies, because the metadata
+/// of the inode comes from it.
 async fn file_node(
     source: ObjectSource<'_>,
     checksum: &Checksum,
@@ -448,12 +566,15 @@ async fn file_node(
     }
 }
 
-/// The fs-verity digest of a regular file's content. When the object file is
-/// the raw payload and is sealed with SHA-256, 4096-byte blocks, and no salt,
-/// the digest the kernel gave at load is the value, and no payload byte is
-/// read. Otherwise the object's payload is streamed through the digester in
-/// bounded chunks. The content is what the digest covers, so a repository
-/// storing the object compressed reaches the same value as one storing it raw.
+/// Returns the fs-verity digest of the content of a regular file.
+///
+/// If the object file is a sealed raw payload, the value is the digest that
+/// the kernel gave at load. The call then reads no payload byte. The seal must
+/// name SHA-256, 4096-byte blocks, no salt, and the payload size. In all other
+/// cases, the call streams the payload of the object through the hasher in
+/// bounded chunks. The digest
+/// covers the content, so a repository that stores the object compressed gives
+/// the same value as one that stores it raw.
 async fn content_fs_verity(file: &FileObject) -> Result<[u8; 32]> {
     use futures_lite::AsyncReadExt;
 
@@ -473,8 +594,8 @@ async fn content_fs_verity(file: &FileObject) -> Result<[u8; 32]> {
     Ok(hasher.finalize())
 }
 
-/// Insert the five top-level directories the tool injects, skipping any name the
-/// commit's own root already holds.
+/// Inserts the five top-level directories that the `ostree` command adds. If
+/// the root of the commit already holds one of these names, its entry stays.
 fn inject_top_level_dirs(root: &mut Directory) {
     for name in INJECTED_DIRS {
         let key = name.as_bytes().to_vec();
@@ -490,8 +611,8 @@ fn inject_top_level_dirs(root: &mut Directory) {
     }
 }
 
-/// The composefs [`Metadata`] for a directory. The tool sets every exported
-/// inode's mtime to 0.
+/// Returns the composefs [`Metadata`] of a directory. The `ostree` command
+/// sets the mtime of each exported inode to 0.
 fn dirmeta_to_metadata(dirmeta: &DirMeta) -> Result<Metadata> {
     Ok(Metadata {
         mode: dirmeta.mode,
@@ -502,8 +623,8 @@ fn dirmeta_to_metadata(dirmeta: &DirMeta) -> Result<Metadata> {
     })
 }
 
-/// The composefs [`Metadata`] for a file object. The tool sets every exported
-/// inode's mtime to 0.
+/// Returns the composefs [`Metadata`] of a file object. The `ostree` command
+/// sets the mtime of each exported inode to 0.
 fn file_to_metadata(file: &FileObject) -> Result<Metadata> {
     Ok(Metadata {
         mode: file.mode,
@@ -514,15 +635,15 @@ fn file_to_metadata(file: &FileObject) -> Result<Metadata> {
     })
 }
 
-/// Convert an [`Xattrs`] set to the writer's `(name, value)` pairs. Stored
-/// names carry a terminating NUL; the writer indexes raw names, so the NUL is
-/// dropped.
+/// Converts an [`Xattrs`] set to the `(name, value)` pairs of the writer. A
+/// stored name ends in a NUL byte. The writer indexes raw names, so the call
+/// drops the NUL.
 ///
 /// Each attribute spends its name, its value, and [`XATTR_ENTRY_COST`] bytes
-/// from the inode's budget of [`MAX_XATTR_TOTAL`] bytes, and an inode that
-/// spends more is refused. Each name is held to [`MAX_XATTR_NAME`] bytes, the
-/// one EROFS length field the budget does not bind. This is where the tree's
-/// own bytes enter the image model, so the refusals belong here.
+/// from the budget of [`MAX_XATTR_TOTAL`] bytes of the inode. The call refuses
+/// an inode that spends more. It holds each name to [`MAX_XATTR_NAME`] bytes,
+/// the one EROFS length field that the budget does not bind. The bytes of the
+/// tree enter the image model here, so the refusals are here.
 fn xattrs_to_model(xattrs: &Xattrs) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut spent = 0usize;
     xattrs

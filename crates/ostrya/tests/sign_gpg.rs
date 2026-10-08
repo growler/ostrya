@@ -1,18 +1,23 @@
-//! GPG commit-signing integration tests.
+//! Integration tests for GPG commit signing.
 //!
-//! These exercise [`GpgSigner`] / [`GpgVerifier`] against the system GnuPG
-//! installation: a throwaway signing key is generated in a private GnuPG home
-//! directory under the test's scratch tree, the port signs a commit through
-//! the `gpg` binary, and verification runs in the process over exported
-//! keyrings (binary and armored). Every gpg invocation passes an explicit
-//! `--homedir`; the user's GnuPG home and any running agent of theirs are
-//! never touched, and the agent GnuPG auto-starts for the scratch home is
-//! killed when the fixture drops.
+//! These tests use [`GpgSigner`] and [`GpgVerifier`] with the GnuPG
+//! installation of the system:
 //!
-//! Every case here signs, so each needs the `gpg` binary and skips itself
-//! where it is absent. Tool cross-verification against `ostree gpg-sign` is
-//! stated by `docs/conformance/m10-cli-behavior.matrix`,
-//! `commit/gpg-sign-round-trip`.
+//! - Each test generates a temporary signing key in a private GnuPG home
+//!   directory under its scratch tree.
+//! - ostrya signs a commit through the `gpg` binary.
+//! - Verification runs in the process over exported keyrings, in binary and
+//!   in armored form.
+//!
+//! Each `gpg` run gives an explicit `--homedir`. The tests never touch the
+//! GnuPG home of the user or an agent that the user runs. GnuPG starts an
+//! agent for the scratch home automatically. The fixture kills this agent
+//! when it drops.
+//!
+//! Each test signs, so each test needs the `gpg` binary. If the binary is
+//! absent, the test skips itself. The conformance record
+//! `commit/gpg-sign-round-trip` verifies signatures across ostrya and the
+//! `ostree gpg-sign` command.
 
 #![cfg(feature = "sign-gpg")]
 
@@ -29,22 +34,25 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// Whether the gpg binary is available. The GnuPG cases build their fixtures
-/// with it, so a harness without it skips them rather than passing them, and
-/// [`common::REQUIRE_GNUPG`] turns that skip into a failure.
+/// Returns `true` if the `gpg` binary is available.
+///
+/// The GnuPG tests build their fixtures with this binary. If it is absent,
+/// the harness skips these tests. [`common::REQUIRE_GNUPG`] changes the skip
+/// into a failure.
 fn gpg_available() -> bool {
     common::gnupg_available(&["gpg"])
 }
 
-/// A private GnuPG home directory holding one freshly generated,
-/// passphrase-free ed25519 signing key. Dropping the fixture stops the
-/// GnuPG daemons of the directory and removes their socket directory.
+/// A private GnuPG home directory with one new ed25519 signing key.
+///
+/// The key has no passphrase. When the fixture drops, it stops the GnuPG
+/// daemons of the directory and removes their socket directory.
 struct GpgHome {
     dir: PathBuf,
 }
 
 impl GpgHome {
-    /// A new home directory under `base` holding no key.
+    /// Creates a new home directory under `base` with no key.
     fn empty(base: &Path, name: &str) -> GpgHome {
         use std::os::unix::fs::DirBuilderExt;
         let dir = base.join(name);
@@ -52,7 +60,7 @@ impl GpgHome {
         GpgHome { dir }
     }
 
-    /// Generate a signing key for `uid` in a new home directory under `base`.
+    /// Creates a new home directory under `base` with a signing key for `uid`.
     fn create(base: &Path, name: &str, uid: &str) -> GpgHome {
         let home = GpgHome::empty(base, name);
         let status = home
@@ -65,14 +73,14 @@ impl GpgHome {
         home
     }
 
-    /// A gpg command bound to this home directory, batch mode.
+    /// Returns a `gpg` command in batch mode for this home directory.
     fn gpg(&self) -> Command {
         let mut cmd = Command::new("gpg");
         cmd.arg("--homedir").arg(&self.dir).arg("--batch");
         cmd
     }
 
-    /// The primary-key fingerprint, as uppercase hex.
+    /// Returns the fingerprint of the primary key as uppercase hex.
     fn fingerprint(&self) -> String {
         let out = self
             .gpg()
@@ -89,25 +97,26 @@ impl GpgHome {
             .expect("a fpr record in the key listing")
     }
 
-    /// The exported public keyring, binary.
+    /// Returns the exported public keyring in binary form.
     fn export(&self) -> Vec<u8> {
         let out = self.gpg().arg("--export").output().unwrap();
         assert!(out.status.success() && !out.stdout.is_empty());
         out.stdout
     }
 
-    /// The exported public keyring, ASCII-armored.
+    /// Returns the exported public keyring with ASCII armor.
     fn export_armored(&self) -> Vec<u8> {
         let out = self.gpg().args(["--export", "--armor"]).output().unwrap();
         assert!(out.status.success() && !out.stdout.is_empty());
         out.stdout
     }
 
-    /// Revoke the primary key by importing the revocation certificate `gpg`
-    /// stored when it generated the key. The stored file carries prose before
-    /// the armored block, and a colon before the block's first dash so that an
-    /// accidental import does nothing. The import therefore runs over the
-    /// armored block alone.
+    /// Revokes the primary key with an import of its revocation certificate.
+    ///
+    /// `gpg` stored this certificate when it generated the key. The stored
+    /// file has text before the armored block. It also has a colon before the
+    /// first dash of the block, so an accidental import does nothing. The
+    /// import in this function reads the armored block alone.
     fn revoke_primary(&self) {
         let stored = self
             .dir
@@ -128,7 +137,7 @@ impl Drop for GpgHome {
     }
 }
 
-/// Build a tiny source tree under `base/src`.
+/// Builds a small source tree under `base/src`.
 fn build_source(base: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let src = base.join("src");
@@ -142,7 +151,8 @@ fn build_source(base: &Path) {
     std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// Create an archive repo, ingest `base/src`, and commit it on `test/main`.
+/// Creates an archive repository, ingests `base/src`, and commits it on
+/// `test/main`.
 async fn build_committed_repo(base: &Path) -> (Repo, Checksum) {
     build_source(base);
     let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Archive))
@@ -188,7 +198,7 @@ fn gpg_round_trip_within_the_port() {
         let signer = GpgSigner::new(&fpr).with_homedir(&home.dir);
         repo.sign_commit(&commit, &signer).await.unwrap();
 
-        // The trusted keyring accepts the signature and reports its detail.
+        // The trusted keyring accepts the signature and reports its details.
         let verifier = GpgVerifier::from_keyring_bytes([home.export()]).unwrap();
         let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
         assert!(outcome.valid);
@@ -202,7 +212,7 @@ fn gpg_round_trip_within_the_port() {
         assert_eq!(info.user_name.as_deref(), Some("Ostrya Test"));
         assert_eq!(info.user_email.as_deref(), Some("gpg-test@ostrya.example"));
 
-        // An empty trusted set reports the key missing.
+        // With an empty trusted set, the verifier reports the key as missing.
         let untrusted = GpgVerifier::from_keyring_bytes(Vec::<Vec<u8>>::new()).unwrap();
         let outcome = repo.verify_commit(&commit, &[&untrusted]).await.unwrap();
         assert!(!outcome.valid);
@@ -225,12 +235,14 @@ fn armored_and_file_keyrings_load() {
         let signer = GpgSigner::new(&fpr).with_homedir(&home.dir);
         repo.sign_commit(&commit, &signer).await.unwrap();
 
-        // The armored export decodes on load and verifies.
+        // The verifier decodes the armored export when it loads it. The
+        // signature verifies.
         let armored = GpgVerifier::from_keyring_bytes([home.export_armored()]).unwrap();
         let outcome = repo.verify_commit(&commit, &[&armored]).await.unwrap();
         assert!(outcome.valid);
 
-        // Keyring files load from disk; missing paths are skipped.
+        // The verifier loads keyring files from disk. It skips a path that
+        // does not exist.
         let ring_path = base.join("trusted.gpg");
         std::fs::write(&ring_path, home.export()).unwrap();
         let files =
@@ -288,12 +300,13 @@ fn unknown_signer_key_is_an_error() {
     });
 }
 
-/// The key selector reaches gpg as a key name, never as one of gpg's options.
+/// The key selector goes to `gpg` as a key name, never as a `gpg` option.
 ///
-/// `secret_key_fingerprints` puts the selector after `--`. An option-shaped
-/// selector therefore names no key in the home directory the signer carries, and
-/// it does not move the lookup to a home directory of its own choosing, where gpg
-/// would create a keybox and a trust database as a side effect of a read.
+/// `secret_key_fingerprints` puts the selector after `--`, so a selector with
+/// the shape of an option is a key name. No key in the home directory of the
+/// signer has this name. The selector does not move the lookup to a home
+/// directory that the selector names. A read in such a directory makes `gpg`
+/// create a keybox and a trust database as a side effect.
 #[test]
 fn an_option_shaped_selector_is_a_key_name() {
     if !gpg_available() {
@@ -301,16 +314,17 @@ fn an_option_shaped_selector_is_a_key_name() {
     }
     let tmp = TmpDir::new("gpg-selector");
     let base = tmp.path();
-    // The home directory holding the key, and the empty one the lookups run in.
+    // The home directory with the key, and the empty home directory where the
+    // lookups run.
     let keyed = GpgHome::create(base, "gnupghome", "Selector <selector@ostrya.example>");
     let lookup = GpgHome::empty(base, "lookup-home");
-    // A home directory no lookup may reach, kept as a home directory so any
-    // agent a failure starts for it is killed with the fixture.
+    // A home directory that the lookups must not reach. It is a `GpgHome`, so
+    // if a failure starts an agent for it, the fixture kills this agent.
     let elsewhere = GpgHome::empty(base, "elsewhere");
 
     block_on(async {
-        // A selector naming the keyed home directory does not re-home the
-        // lookup, so the key it holds is not found.
+        // A selector that names the keyed home directory does not move the
+        // lookup to that directory, so the lookup does not find its key.
         let redirect = format!("--homedir={}", keyed.dir.display());
         let signer = GpgSigner::new(&redirect).with_homedir(&lookup.dir);
         assert!(
@@ -318,7 +332,7 @@ fn an_option_shaped_selector_is_a_key_name() {
             "the selector re-homed the lookup onto the keyed home directory"
         );
 
-        // A selector naming an untouched directory leaves it untouched.
+        // A selector that names an unused directory does not change it.
         let side_effect = format!("--homedir={}", elsewhere.dir.display());
         let signer = GpgSigner::new(&side_effect).with_homedir(&lookup.dir);
         assert!(signer.secret_key_fingerprints().await.unwrap().is_empty());
@@ -332,8 +346,8 @@ fn an_option_shaped_selector_is_a_key_name() {
         );
     });
 
-    // The keyed home directory keeps its own key: the lookups read nothing out
-    // of it and wrote nothing into it.
+    // The keyed home directory keeps its key. The lookups read nothing from it
+    // and wrote nothing to it.
     assert!(!keyed.fingerprint().is_empty());
 }
 
@@ -366,16 +380,21 @@ fn gpg_coexists_with_the_dummy_engine() {
     });
 }
 
-/// A revoked re-export of a key a remote's keyring already holds revokes that
-/// key: the import reports no key added, and the signature that key made is no
-/// longer valid.
+/// A revoked re-export of a key in the keyring of a remote revokes that key.
 ///
-/// `ostree remote gpg-import` merges the offered signatures into the held
-/// certificate and reports `Imported 0 GPG keys` while doing so. Measured
-/// against `ostree` 2026.1 over the re-export of a revoked RSA key: the
-/// keyring grew from 690 to 1053 bytes, the merged run carried the key
-/// revocation right after the primary key packet, and `ostree show` moved from
-/// `Good signature from "..."` to `Key revoked`.
+/// The import reports that it added no key. After the import, the signature
+/// of that key is not valid.
+///
+/// `ostree remote gpg-import` merges the offered signatures into the
+/// certificate in the keyring. For this import, it reports `Imported 0 GPG
+/// keys`. Observed with `ostree` 2026.1 and the re-export of a revoked RSA
+/// key:
+///
+/// - The keyring grew from 690 to 1053 bytes.
+/// - In the merged run of packets, the key revocation came directly after the
+///   primary key packet.
+/// - The output of `ostree show` changed from `Good signature from "..."` to
+///   `Key revoked`.
 #[test]
 fn a_revoked_re_export_revokes_the_held_key() {
     if !gpg_available() {
@@ -391,8 +410,8 @@ fn a_revoked_re_export_revokes_the_held_key() {
         let signer = GpgSigner::new(&fpr).with_homedir(&home.dir);
         repo.sign_commit(&commit, &signer).await.unwrap();
 
-        // The unrevoked certificate reaches the remote's keyring, and the
-        // signature it made is good.
+        // The certificate without the revocation goes into the keyring of the
+        // remote. The signature of its key is good.
         let count = repo
             .gpg_import_keys("origin", &home.export(), &[])
             .await
@@ -403,8 +422,8 @@ fn a_revoked_re_export_revokes_the_held_key() {
         assert!(outcome.valid);
         assert!(!outcome.signatures[0].revoked);
 
-        // The re-export of the revoked key adds no key and carries the
-        // revocation into the keyring.
+        // The re-export of the revoked key adds no key. It puts the revocation
+        // into the keyring.
         home.revoke_primary();
         let count = repo
             .gpg_import_keys("origin", &home.export(), &[])
@@ -423,15 +442,18 @@ fn a_revoked_re_export_revokes_the_held_key() {
     });
 }
 
-/// A remote keyring carrying bytes past its last framed packet is refused by
-/// the name of the keyring: the key listing reports it, every import reports
-/// it, and the file keeps the bytes it held.
+/// A remote keyring with bytes after its last framed packet gets a refusal
+/// that names the keyring.
 ///
-/// One reader reads the keyring for every path, so the refusal covers the whole
-/// file: a revoked re-export of a key it holds and a certificate for a key it
-/// does not hold are refused alike. Over a keyring with one `0xff` byte
-/// appended, the `ostree` tool reads no certificate either: its own import
-/// reports a count of zero and writes nothing (`cli-surface.md`, "P3").
+/// - The key listing reports the refusal.
+/// - Each import reports the refusal.
+/// - The file keeps its bytes.
+///
+/// One reader reads the keyring for each path, so the refusal applies to the
+/// whole file. A revoked re-export of a key in the file and a certificate for
+/// a key that is not in the file get the same refusal. The `ostree` command
+/// also reads no certificate from a keyring with one `0xff` byte at the end.
+/// Its import reports a count of zero and writes nothing (divergence P3).
 #[test]
 fn an_unframeable_remote_keyring_is_refused() {
     if !gpg_available() {
@@ -450,7 +472,7 @@ fn an_unframeable_remote_keyring_is_refused() {
             .unwrap();
         assert_eq!(count, 1);
 
-        // One byte past the last packet the walk frames.
+        // One byte after the last packet that the walk frames.
         let mut tailed = std::fs::read(&keyring).unwrap();
         tailed.push(0xff);
         std::fs::write(&keyring, &tailed).unwrap();
@@ -459,8 +481,8 @@ fn an_unframeable_remote_keyring_is_refused() {
         assert!(refusal.contains("origin.trustedkeys.gpg"), "{refusal}");
         assert!(refusal.contains("OpenPGP keyring"), "{refusal}");
 
-        // The revoked re-export of the key the file holds, and a certificate
-        // for a key it does not hold, are refused alike.
+        // The revoked re-export of the key in the file and a certificate for
+        // a key that is not in the file get the same refusal.
         home.revoke_primary();
         for offered in [home.export(), other.export()] {
             let refusal = repo

@@ -17,30 +17,33 @@ use crate::repo::Repo;
 /// The buffer size of each direction of the session stream.
 const STREAM_BUFFER: usize = 64 * 1024;
 
-/// The payload of each chunk of a body but the last. A full chunk and its
-/// 4-byte length fill the output buffer, so each write to the output is at
-/// most [`STREAM_BUFFER`] bytes, and no write holds a chunk length alone.
+/// The payload size of each chunk of a body, except the last chunk.
+///
+/// Each write to the output is at most [`STREAM_BUFFER`] bytes, because a
+/// full chunk and its 4-byte length fill the output buffer. No write holds a
+/// chunk length alone.
 const CHUNK: usize = STREAM_BUFFER - 4;
 
-/// How a session failed.
+/// The kind of failure that ends a session.
 enum Failure {
-    /// A failure with a wire code. The session sends it to the peer, and the
+    /// A failure with a wire code. The session sends it to the peer. The
     /// caller gets it as [`Error::Push`].
     Wire(push::Error),
     /// A failure on the server side. The session sends it to the peer as
-    /// `internal`, and the caller gets it as it is.
+    /// `internal`. The caller gets the error unchanged.
     Internal(Error),
-    /// A body that failed after its reply. The session already wrote the
-    /// abandon marker and the `Error` frame, and the caller gets the error as
-    /// it is.
+    /// A body that failed after its reply. The session wrote the abandon
+    /// marker and the `Error` frame before it made this value. The caller
+    /// gets the error unchanged.
     Abandoned(Error),
     /// A failure of the output. The session sends nothing.
     Silent(Error),
 }
 
-/// A codec error of the reader. An end of file inside a frame is
-/// `protocol`, and another error of the input stream is a failure of the
-/// server. Every other error carries its wire code.
+/// Maps a codec error of the reader to a failure.
+///
+/// An end of file inside a frame is `protocol`. Another error of the input
+/// stream is a failure of the server. Every other error keeps its wire code.
 fn input(error: push::Error) -> Failure {
     match error {
         push::Error::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof => Failure::Wire(
@@ -51,9 +54,11 @@ fn input(error: push::Error) -> Failure {
     }
 }
 
-/// An error of the writer. An error of the output stream is silent. A
-/// message the codec refuses is a fault of the server, whatever code the
-/// codec gives it.
+/// Maps an error of the writer to a failure.
+///
+/// An error of the output stream is silent. If the codec refuses a message,
+/// the failure is `internal`, whatever code the codec gives. The refusal is a
+/// fault of the server.
 fn output(error: push::Error) -> Failure {
     match error {
         push::Error::Io(e) => Failure::Silent(Error::Io(e)),
@@ -68,8 +73,9 @@ fn out_of_order(msg: &Message) -> Failure {
     )))
 }
 
-/// Whether `buf` starts with a whole frame: its 4-byte length and that
-/// number of bytes.
+/// Returns `true` if `buf` starts with a whole frame.
+///
+/// A whole frame is its 4-byte length and that number of bytes.
 fn complete_frame(buf: &[u8]) -> bool {
     match buf.first_chunk::<4>() {
         Some(prefix) => buf.len() - 4 >= u32::from_be_bytes(*prefix) as usize,
@@ -77,54 +83,92 @@ fn complete_frame(buf: &[u8]) -> bool {
     }
 }
 
+/// Methods that serve a pull session.
 impl Repo {
-    /// Serve one pull session: read the `PullHello` and the `Get` messages of
-    /// a client from `input`, and write the replies and the bodies to
+    /// Serves one pull session over the streams `input` and `output`.
+    ///
+    /// The session reads a `PullHello` message and then `Get` messages of a
+    /// client from `input`. It writes the replies and the bodies to `output`.
+    /// This method is the serving side of a pull over ssh. It does not close
     /// `output`.
     ///
+    /// # Requests
+    ///
     /// The session answers each `Get` through one [`ArchiveView`] of this
-    /// repository, so the requests share the parsed `config` and the idle
-    /// compressors of the view. A path the view does not find and a path it
-    /// refuses get the same reply, `GetReply` with found false, and the
-    /// session goes on. A served path gets `GetReply` with found true and the
-    /// length when the view knows it, and then the body as chunks. The
-    /// session reads one `Get`, answers it to the end of its body, and then
-    /// reads the next. It opens no transaction and takes no lock. Read access
-    /// to the repository is sufficient for an `archive`, `bare-user`,
-    /// `bare-user-only`, or `bare-user-shared` repository. A `bare` or
-    /// `bare-split-xattrs` repository needs an account that can read every
+    /// repository. All requests of the session share the parsed `config` and
+    /// the idle compressors of the view. The session reads one `Get`, answers
+    /// it to the end of its body, and then reads the next `Get`.
+    ///
+    /// - If the view does not find the path, or refuses it, the reply is a
+    ///   `GetReply` with `found` set to `false`. The session continues.
+    /// - If the view serves the path, the reply is a `GetReply` with `found`
+    ///   set to `true`. The reply holds the length if the view knows it. The
+    ///   body follows as chunks.
+    ///
+    /// # Access
+    ///
+    /// The session opens no transaction and takes no lock. For an `archive`,
+    /// `bare-user`, `bare-user-only`, or `bare-user-shared` repository, read
+    /// access to the repository is sufficient. For a `bare` or
+    /// `bare-split-xattrs` repository, the account must be able to read every
     /// object and its extended attributes.
     ///
+    /// # Framing and memory
+    ///
     /// The frame limit is [`MIN_FRAME_LIMIT`](crate::push::proto::MIN_FRAME_LIMIT)
-    /// in both directions. Each direction goes through a buffer of 64 KiB,
-    /// and each chunk of a body but the last holds 64 KiB less 4 bytes. A
-    /// body streams through one chunk buffer, so no content object is whole
-    /// in memory. The session flushes `output` when its input buffer holds no
-    /// whole frame, before a read that can wait, and after an `Error`.
+    /// in the two directions. Each direction goes through a buffer of 64 KiB.
+    /// Each chunk of a body, except the last chunk, holds 64 KiB less 4 bytes.
     ///
-    /// The call returns `Ok` at an end of file of `input` at a frame
-    /// boundary, an empty `input` included. Each other end is an error:
+    /// A body streams through one chunk buffer, so no content object is whole
+    /// in memory. For a stored file, the session reads at most one byte past
+    /// the stated length.
     ///
-    /// - A failure with a wire code goes to the peer as an `Error` message
-    ///   and returns as [`Error::Push`]: `version-unsupported` for a
-    ///   `PullHello` of version 0, `protocol` for a message out of order, a
-    ///   kind of the push, a malformed frame, or an end of file inside a
-    ///   frame, and `limit-exceeded` for a frame over the limit.
-    /// - A failure of the view before the reply, for example a file that
-    ///   cannot be read, goes to the peer as `internal` in place of the reply
-    ///   and returns as the error it is. An error of `input` other than an
-    ///   end of file does the same.
-    /// - A body that fails after its reply ends with the abandon marker and
-    ///   an `Error` with `internal`. The call returns the error of the read,
-    ///   or an [`Error::Io`] of kind `UnexpectedEof` for a stored file that
-    ///   ends before its stated length, or of kind `InvalidData` for one that
-    ///   holds more. The session reads at most one byte past the stated
-    ///   length.
-    /// - A failed write of a reply or of a body to `output` sends nothing
-    ///   more and returns as an [`Error::Io`]. A failure to deliver the
-    ///   `Error` message does not change the returned error.
+    /// If the input buffer holds no whole frame, the next read can wait. The
+    /// session flushes `output` before that read. It also flushes `output`
+    /// after each `Error` message.
     ///
-    /// The call does not close `output`.
+    /// # End of a session
+    ///
+    /// At an end of file of `input` at a frame boundary, the method returns
+    /// `Ok`. An empty `input` also gives `Ok`. Every other end of the session
+    /// is an error. The session tells the peer about the failure:
+    ///
+    /// - If the failure has a wire code, the session sends an `Error` message
+    ///   with that code.
+    /// - If the view fails before the reply, the session sends an `Error`
+    ///   message with the code `internal` in place of the reply. A file that
+    ///   the process cannot read is an example.
+    /// - If a read of `input` fails with an error other than an end of file,
+    ///   the session sends an `Error` message with the code `internal`.
+    /// - If a body fails after its reply, the session ends the body with the
+    ///   abandon marker and an `Error` message with the code `internal`.
+    /// - If a write of a reply or of a body to `output` fails, the session
+    ///   sends nothing more.
+    ///
+    /// If the session cannot deliver the `Error` message, the returned error
+    /// does not change.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Push`] with the code `version-unsupported` if the
+    ///   `PullHello` states version 0.
+    /// - [`Error::Push`] with the code `protocol` if a message is out of
+    ///   order or is a kind of the push.
+    /// - [`Error::Push`] with the code `protocol` if a frame is malformed, or
+    ///   if `input` ends inside a frame.
+    /// - [`Error::Push`] with the code `limit-exceeded` if a frame is larger
+    ///   than the limit.
+    /// - [`Error::Push`] with the code `internal` if the codec refuses a
+    ///   message that the session writes.
+    /// - Each error of [`ArchiveView::get`] if the view fails before the
+    ///   reply.
+    /// - [`Error::Io`] if a read of `input` fails with an error other than an
+    ///   end of file.
+    /// - [`Error::Io`] with the error of the read if a body fails after its
+    ///   reply. For a stored file that ends before its stated length, the
+    ///   kind is `UnexpectedEof`. For a stored file that holds more, the kind
+    ///   is `InvalidData`.
+    /// - [`Error::Io`] if a write of a reply or of a body to `output` fails.
     pub async fn send<R, W>(&self, input: R, output: W) -> Result<()>
     where
         R: AsyncRead + Unpin + Send,
@@ -164,7 +208,7 @@ struct Session<R, W> {
     view: ArchiveView,
     reader: FrameReader<BufReader<R>>,
     writer: FrameWriter<BufWriter<W>>,
-    /// The chunk buffer of the bodies, shared by every body of the session.
+    /// The chunk buffer of the bodies. Every body of the session uses it.
     chunk: Vec<u8>,
 }
 
@@ -173,7 +217,7 @@ where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
-    /// Run the session until the input ends or the session fails.
+    /// Runs the session until the input ends or the session fails.
     async fn run(&mut self) -> std::result::Result<(), Failure> {
         match self.next().await? {
             Some(Message::PullHello(hello)) => self.hello(hello).await?,
@@ -181,9 +225,8 @@ where
             None => return Ok(()),
         }
         loop {
-            // The futures of the reader are not cancel-safe, so the buffer
-            // is inspected and no read is polled to learn whether the next
-            // read can wait.
+            // The futures of the reader are not cancel-safe. To learn if the
+            // next read can wait, the loop reads the buffer and polls no read.
             if !complete_frame(self.reader.get_ref().buffer()) {
                 self.writer.flush().await.map_err(output)?;
             }
@@ -199,13 +242,15 @@ where
         self.reader.read_message().await.map_err(input)
     }
 
-    /// Write one message. The flush rule of the loop flushes it.
+    /// Writes one message. The flush rule of the loop in `run` flushes it.
     async fn reply(&mut self, msg: &Message) -> std::result::Result<(), Failure> {
         self.writer.write_message(msg).await.map_err(output)
     }
 
-    /// Send an `Error` message and flush. A failure to send it is ignored,
-    /// because the peer can be gone.
+    /// Sends an `Error` message and flushes the output.
+    ///
+    /// The method ignores a failure to send the message, because the peer can
+    /// be gone.
     async fn send_error(&mut self, error: &push::Error) {
         let msg = Message::Error(error.to_message());
         if self.writer.write_message(&msg).await.is_ok() {
@@ -213,8 +258,10 @@ where
         }
     }
 
-    /// Reply with the lower of the version of the client and the highest
-    /// version of the server. The server speaks each version from 1 up.
+    /// Replies with the lower of the client version and the highest server
+    /// version.
+    ///
+    /// The server speaks each version from 1 up.
     async fn hello(&mut self, hello: PullHello) -> std::result::Result<(), Failure> {
         if hello.version == 0 {
             return Err(Failure::Wire(push::Error::VersionUnsupported(format!(
@@ -226,8 +273,10 @@ where
             .await
     }
 
-    /// Answer one `Get`. The body is dropped before the next `Get`, so a
-    /// built `.filez` gives its compressor back to the view first.
+    /// Answers one `Get`.
+    ///
+    /// The method drops the body before the next `Get`, so a built `.filez`
+    /// gives its compressor back to the view first.
     async fn get(&mut self, path: &str) -> std::result::Result<(), Failure> {
         let answer = self.view.get(path).await.map_err(Failure::Internal)?;
         let found = |len| Message::GetReply(GetReply { found: true, len });
@@ -251,8 +300,9 @@ where
     }
 }
 
-/// Write `bytes` as the chunks of a pull body, and end it. The chunks have
-/// the shape that [`write_body`] gives.
+/// Writes `bytes` as the chunks of a pull body, and ends the body.
+///
+/// The chunks have the shape that [`write_body`] gives.
 async fn write_bytes<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     bytes: &[u8],
@@ -263,9 +313,11 @@ async fn write_bytes<W: AsyncWrite + Unpin>(
     writer.end_object().await.map_err(output)
 }
 
-/// Write `body` as the chunks of a pull body, and end it. Each chunk but the
-/// last is full. With a stated `len`, at most `len + 1` bytes are read, and a
-/// body that ends sooner or holds more is abandoned.
+/// Writes `body` as the chunks of a pull body, and ends the body.
+///
+/// Each chunk except the last chunk is full. If `len` is set, the function
+/// reads at most `len + 1` bytes. It abandons a body that ends sooner or
+/// holds more.
 async fn write_body<W, B>(
     writer: &mut FrameWriter<W>,
     chunk: &mut Vec<u8>,
@@ -315,9 +367,11 @@ where
     }
 }
 
-/// Read from `body` until `chunk` is full or the body ends. A built `.filez`
-/// gives its header alone in the first read, and the deflate stream gives its
-/// output in bursts, so one read seldom fills the chunk.
+/// Reads from `body` until `chunk` is full or the body ends.
+///
+/// A built `.filez` gives its header alone in the first read. Its deflate
+/// stream gives the output in bursts. Because of this, one read seldom fills
+/// the chunk.
 async fn fill<B: AsyncRead + Unpin>(body: &mut B, chunk: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
     while filled < chunk.len() {
@@ -329,7 +383,7 @@ async fn fill<B: AsyncRead + Unpin>(body: &mut B, chunk: &mut [u8]) -> io::Resul
     Ok(filled)
 }
 
-/// Abandon the body with the abandon marker and an `Error` with `internal`.
+/// Abandons the body with the abandon marker and an `Error` with `internal`.
 async fn abandon<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     error: Error,
@@ -339,7 +393,9 @@ async fn abandon<W: AsyncWrite + Unpin>(
     Err(Failure::Abandoned(error))
 }
 
-/// The future of a session can run on a thread pool.
+/// A compile-time check that the future of a session is `Send`.
+///
+/// The future can run on a thread pool.
 const _: fn() = || {
     fn assert_send<T: Send>(_: T) {}
     let _ =
@@ -357,8 +413,10 @@ mod tests {
     use crate::push::ErrorCode;
     use crate::push::proto::ObjectRead;
 
-    /// A reader of `ok` bytes of `0x5a` that then fails, or with `ok` of
-    /// `None` never ends. `read` counts the bytes it gave.
+    /// A reader that gives `ok` bytes of `0x5a` and then fails.
+    ///
+    /// If `ok` is `None`, the reader never ends. `read` counts the bytes that
+    /// the reader gave.
     struct Source {
         ok: Option<usize>,
         read: usize,
@@ -382,8 +440,10 @@ mod tests {
         }
     }
 
-    /// Write one found reply of `len` and its body from `body` into a
-    /// buffer, and return the result and the bytes written.
+    /// Writes one found reply of `len` and its body from `body` into a
+    /// buffer.
+    ///
+    /// Returns the result and the bytes written.
     fn serve<B: AsyncRead + Unpin>(
         len: Option<u64>,
         body: B,
@@ -401,8 +461,10 @@ mod tests {
         (result, writer.into_inner())
     }
 
-    /// The chunk lengths after the reply frame at the start of `bytes`, up to
-    /// the chunk of length 0 or the abandon marker, which is the last entry.
+    /// Returns the chunk lengths after the reply frame at the start of
+    /// `bytes`.
+    ///
+    /// The list ends with the chunk of length 0 or the abandon marker.
     fn chunk_lengths(bytes: &[u8]) -> Vec<u32> {
         let frame = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
         let mut at = 4 + frame;
@@ -418,8 +480,8 @@ mod tests {
     }
 
     /// A reader that fails partway ends the body with the abandon marker
-    /// and an `Error` with `internal`. The full chunk before the failure is
-    /// written, and the bytes after it are not.
+    /// and an `Error` with `internal`. The session writes the full chunk
+    /// before the failure and no byte after it.
     #[test]
     fn a_reader_that_fails_partway_abandons_the_body() {
         let (result, bytes) = serve(
@@ -464,7 +526,7 @@ mod tests {
         });
     }
 
-    /// Each chunk but the last is full, and a body of a whole number of
+    /// Each chunk except the last chunk is full. A body of a whole number of
     /// chunks ends with the chunk of length 0 alone.
     #[test]
     fn each_chunk_but_the_last_is_full() {
@@ -505,8 +567,9 @@ mod tests {
         }
     }
 
-    /// A stored length bounds the read to one byte past it. A body that ends
-    /// sooner or holds more is abandoned with the error of its kind.
+    /// A stated length limits the read to one byte past it. The session
+    /// abandons a body that ends sooner or holds more, with the error of its
+    /// kind.
     #[test]
     fn a_stated_length_bounds_the_read() {
         let mut source = Source { ok: None, read: 0 };
@@ -525,8 +588,7 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
         assert_eq!(chunk_lengths(&bytes), [crate::push::proto::ABANDON]);
 
-        // A body that falls short at a chunk boundary is found at the next
-        // read.
+        // The next read finds a body that falls short at a chunk boundary.
         let (result, bytes) = serve(Some(CHUNK as u64 + 1), &vec![1u8; CHUNK][..]);
         assert!(matches!(result, Err(Failure::Abandoned(_))));
         assert_eq!(
@@ -547,8 +609,8 @@ mod tests {
         assert!(complete_frame(&[0, 0, 0, 0]));
     }
 
-    /// The chunk payload equals that of the push, so both directions write
-    /// the same shape.
+    /// The chunk payload is equal to the chunk payload of the push, so the
+    /// two directions write the same shape.
     #[test]
     fn the_chunk_and_the_buffer_fill_one_write() {
         assert_eq!(CHUNK, 65_532);

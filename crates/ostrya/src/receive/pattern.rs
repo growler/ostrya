@@ -3,7 +3,7 @@
 use crate::error::{Error, Result};
 use crate::refs::{is_component, is_ref_path};
 
-/// The refs one receive rule applies to.
+/// A pattern that names the refs of one receive rule.
 ///
 /// A pattern has one of these forms:
 ///
@@ -15,15 +15,23 @@ use crate::refs::{is_component, is_ref_path};
 /// - `*:NAME`, `*:PREFIX/*`, and `*:*` -- the same, for the remote refs of
 ///   every remote.
 ///
-/// `NAME` and `PREFIX` are ref names, and `REMOTE` is one component of a ref
-/// path. [`RefPattern::parse`] refuses every other form: a `*` in another
-/// place, a second `*`, an empty part, a `.` or `..` component, and a control
-/// character.
+/// `NAME` and `PREFIX` are ref names. `REMOTE` is one component of a ref
+/// path. [`RefPattern::parse`] refuses each other form:
+///
+/// - A `*` in another place. This includes `*` alone, with no remote part.
+/// - A second `*`.
+/// - An empty part.
+/// - A `.` or `..` component.
+/// - A control character.
+///
+/// If more than one pattern matches a ref,
+/// [`ReceivePolicy::rule_for`](super::ReceivePolicy::rule_for) states which
+/// rule applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefPattern {
     /// The pattern as written.
     text: String,
-    /// The remote part, `None` for a pattern of plain refs.
+    /// The remote part. It is `None` for a pattern of plain refs.
     remote: Option<RemotePart>,
     /// The name part.
     name: NamePart,
@@ -49,10 +57,10 @@ enum NamePart {
     All,
 }
 
-/// How closely a pattern matches a ref. A larger value wins.
+/// The strength of the match of a pattern on a ref. A larger value wins.
 ///
-/// The fields compare in order: a literal remote part wins over `*:`, then an
-/// exact name wins over a prefix, and then a longer prefix wins over a shorter
+/// The fields compare in order. A literal remote part wins over `*:`. Then an
+/// exact name wins over a prefix. Then a longer prefix wins over a shorter
 /// one. `REMOTE:*` and `*:*` are prefixes of length zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Specificity {
@@ -62,8 +70,12 @@ pub(crate) struct Specificity {
 }
 
 impl RefPattern {
-    /// Parse a pattern, refusing a form outside the syntax as
-    /// [`Error::InvalidFormat`].
+    /// Parses a ref pattern of a receive rule.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFormat`] if `pattern` is empty, holds a control
+    /// character, or has a form outside the syntax of [`RefPattern`].
     pub fn parse(pattern: &str) -> Result<RefPattern> {
         let malformed = |why: &str| {
             Error::InvalidFormat(format!("malformed receive pattern '{pattern}': {why}"))
@@ -114,15 +126,17 @@ impl RefPattern {
         })
     }
 
-    /// The pattern as written.
+    /// Returns the pattern as written.
     pub fn as_str(&self) -> &str {
         &self.text
     }
 
-    /// How closely this pattern matches the ref `name` of the remote `remote`,
-    /// or of no remote where `remote` is `None`. `None` is a pattern that does
-    /// not match: a pattern with a remote part matches remote refs alone, and
-    /// one without matches plain refs alone.
+    /// Returns the strength of the match of this pattern on the ref `name` of
+    /// the remote `remote`.
+    ///
+    /// `remote` is `None` for a plain ref. The result is `None` if the pattern
+    /// does not match. A pattern with a remote part matches only remote refs.
+    /// A pattern with no remote part matches only plain refs.
     pub(crate) fn specificity(&self, remote: Option<&str>, name: &str) -> Option<Specificity> {
         let literal_remote = match (&self.remote, remote) {
             (None, None) => false,
@@ -178,7 +192,7 @@ mod tests {
         }
     }
 
-    /// Each form outside the syntax is refused as malformed.
+    /// The parser refuses each form outside the syntax as malformed.
     #[test]
     fn the_other_forms_are_refused() {
         for pattern in [
@@ -220,8 +234,8 @@ mod tests {
         }
     }
 
-    /// A prefix matches the refs below it at any depth, and not the prefix
-    /// itself or a longer component.
+    /// A prefix matches the refs under it at any depth. It does not match the
+    /// prefix itself or a name whose component is longer.
     #[test]
     fn a_prefix_matches_below_it() {
         assert!(matches("a/*", None, "a/b"));

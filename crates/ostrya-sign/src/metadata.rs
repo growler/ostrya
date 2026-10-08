@@ -8,9 +8,58 @@ use crate::{Error, Result};
 /// dict: an array of signature blobs.
 const SIGNATURE_ARRAY_SIGNATURE: &str = "aay";
 
-/// Append `signature` to the `metadata_key` engine's `aay` array in the `a{sv}`
-/// dict `dict`, creating the entry when absent and preserving insertion order.
-/// Other entries, including other engines' signature arrays, are left in place.
+/// Appends a signature to the array of an engine in a detached-metadata dict.
+///
+/// The function adds `signature` at the end of the array under the key
+/// `metadata_key` in `dict`. The other entries of `dict` stay unchanged. This
+/// includes the signature arrays of the other engines.
+///
+/// # Layout
+///
+/// The dict is an `a{sv}`. It is the detached metadata of a commit (the
+/// `.commitmeta` object) or of a summary. Each engine owns one key in the
+/// dict. The value of the key is a variant that holds an `aay`, with one `ay`
+/// element for each signature.
+///
+/// The function finds the entry of the engine in this way:
+///
+/// - It skips each entry that is not a tuple of two elements.
+/// - It uses the first entry whose key is equal to `metadata_key`.
+/// - It accepts an existing value that is a variant that holds an array, or
+///   an array with no variant.
+/// - If no entry has the key, it adds a new entry at the end of the dict.
+///
+/// # Errors
+///
+/// - [`Error::InvalidFormat`] with the message
+///   `detached metadata must be an a{sv} dict` if `dict` is not an array.
+/// - [`Error::InvalidFormat`] with the message
+///   `detached-metadata signature value is not an array` if the existing
+///   value of the engine is not an array.
+///
+/// # Examples
+///
+/// ```
+/// use ostrya_core::Value;
+/// use ostrya_sign::append_signature;
+///
+/// let mut dict = Value::Array(Vec::new());
+/// append_signature(&mut dict, "ostree.sign.dummy", b"one".to_vec())?;
+/// append_signature(&mut dict, "ostree.sign.ed25519", b"other".to_vec())?;
+/// append_signature(&mut dict, "ostree.sign.dummy", b"two".to_vec())?;
+///
+/// // The value of each engine is a variant that holds an `aay`.
+/// let (ty, blobs) = dict.dict_get("ostree.sign.dummy").unwrap().as_variant().unwrap();
+/// assert_eq!(ty.signature(), "aay");
+/// let blobs = blobs.as_array().unwrap();
+/// assert_eq!(blobs.len(), 2);
+/// assert_eq!(blobs[0].as_bytes(), Some(&b"one"[..]));
+/// assert_eq!(blobs[1].as_bytes(), Some(&b"two"[..]));
+///
+/// let (_, blobs) = dict.dict_get("ostree.sign.ed25519").unwrap().as_variant().unwrap();
+/// assert_eq!(blobs.as_array().unwrap().len(), 1);
+/// # Ok::<(), ostrya_sign::Error>(())
+/// ```
 pub fn append_signature(dict: &mut Value, metadata_key: &str, signature: Vec<u8>) -> Result<()> {
     let entries = match dict {
         Value::Array(entries) => entries,
@@ -37,8 +86,8 @@ pub fn append_signature(dict: &mut Value, metadata_key: &str, signature: Vec<u8>
     Ok(())
 }
 
-/// Push a signature blob onto an existing engine value, an `aay` wrapped in the
-/// `a{sv}` variant.
+/// Pushes a signature blob onto an existing engine value. The value is an `aay`
+/// in the variant of the `a{sv}`, or an array with no variant.
 fn push_blob(value: &mut Value, signature: Vec<u8>) -> Result<()> {
     let array = match value {
         Value::Variant(inner) => &mut inner.1,

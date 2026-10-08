@@ -1,15 +1,7 @@
-//! fs-verity digest computation in userspace.
+//! The fs-verity hasher, which runs in user space.
 //!
-//! The digest is the fs-verity measurement with SHA-256, 4096-byte blocks, and
-//! a zero-length salt. It is a Merkle tree over the data: each 4096-byte block
-//! (the final block zero-padded) is hashed; block hashes are packed into
-//! parent blocks (128 hashes per block) and hashed recursively up to a single
-//! root hash. The digest is the SHA-256 of a 256-byte descriptor carrying the
-//! root hash and the total data size.
-//!
-//! The hasher is streaming: feed data with [`FsVerityHasher::update`] in any
-//! chunking, then call [`FsVerityHasher::finalize`]. This is reused for the
-//! whole composefs image and, by the ostree layer, for each backing object.
+//! The image writer uses it for the whole composefs image. The `ostrya` crate
+//! uses it for each backing object.
 
 use sha2::{Digest, Sha256};
 
@@ -17,10 +9,10 @@ use sha2::{Digest, Sha256};
 const LG_BLOCK: u32 = 12;
 /// The fs-verity block size in bytes.
 const BLOCK: usize = 1 << LG_BLOCK;
-/// SHA-256 kernel algorithm identifier for the fs-verity descriptor.
+/// The kernel identifier of SHA-256 in the fs-verity descriptor.
 const ALGORITHM_SHA256: u8 = 1;
 
-/// One level of the Merkle tree: a SHA-256 context filling one block.
+/// One level of the Merkle tree: a SHA-256 context for one block.
 struct Layer {
     context: Sha256,
     remaining: usize,
@@ -39,8 +31,8 @@ impl Layer {
         self.remaining -= data.len();
     }
 
-    /// Zero-pad to a full block and finalize, returning the block hash and
-    /// resetting for reuse.
+    /// Pads the block with zeros to 4096 bytes, empties the layer, and returns
+    /// the hash of the block.
     fn complete(&mut self) -> [u8; 32] {
         let pad = self.remaining;
         self.context.update(vec![0u8; pad]);
@@ -52,7 +44,45 @@ impl Layer {
     }
 }
 
-/// Streaming fs-verity digest hasher (SHA-256, 4096-byte blocks, zero salt).
+/// A streaming fs-verity hasher (SHA-256, 4096-byte blocks, no salt).
+///
+/// A caller gives the data to [`update`](FsVerityHasher::update) in chunks of
+/// any size, then calls [`finalize`](FsVerityHasher::finalize). The chunk
+/// sizes do not change the digest. [`hash`](FsVerityHasher::hash) returns the
+/// digest of one buffer.
+///
+/// # Digest
+///
+/// The digest is the fs-verity measurement of the data. The hasher makes a
+/// Merkle tree over the data:
+///
+/// - Each 4096-byte block of the data gets a SHA-256 hash.
+/// - A block of the next level holds 128 hashes of the level under it. The
+///   hasher hashes each level in the same way until one root hash is left.
+/// - Zero bytes pad the last block of each level to 4096 bytes.
+/// - If the data is empty, the root hash is 32 zero bytes.
+///
+/// The digest is the SHA-256 hash of a 256-byte descriptor. The descriptor
+/// holds the root hash and the size of the data in bytes.
+///
+/// # Examples
+///
+/// ```
+/// use ostrya_composefs::FsVerityHasher;
+///
+/// let data = vec![0x5a_u8; 5000];
+/// let mut hasher = FsVerityHasher::new();
+/// hasher.update(&data[..1000]);
+/// hasher.update(&data[1000..]);
+/// assert_eq!(hasher.finalize(), FsVerityHasher::hash(&data));
+///
+/// // The fs-verity digest of empty data.
+/// let hex: String = FsVerityHasher::hash(b"")
+///     .iter()
+///     .map(|b| format!("{b:02x}"))
+///     .collect();
+/// assert_eq!(hex, "3d248ca542a24fc62d1c43b916eae5016878e2533c88238480b26128a1f1af95");
+/// ```
 pub struct FsVerityHasher {
     layers: Vec<Layer>,
     value: Option<[u8; 32]>,
@@ -68,7 +98,7 @@ impl Default for FsVerityHasher {
 }
 
 impl FsVerityHasher {
-    /// Create a new hasher.
+    /// Creates a hasher with no data.
     pub fn new() -> Self {
         Self {
             layers: Vec::new(),
@@ -79,14 +109,14 @@ impl FsVerityHasher {
         }
     }
 
-    /// Hash a complete buffer and return the digest.
+    /// Returns the fs-verity digest of `buffer`.
     pub fn hash(buffer: &[u8]) -> [u8; 32] {
         let mut hasher = Self::new();
         hasher.update(buffer);
         hasher.finalize()
     }
 
-    /// Feed data into the hasher.
+    /// Adds `data` to the end of the hashed data.
     pub fn update(&mut self, mut data: &[u8]) {
         while !data.is_empty() {
             let want = BLOCK - self.partial.len();
@@ -100,7 +130,7 @@ impl FsVerityHasher {
         }
     }
 
-    /// Finalize and return the fs-verity digest.
+    /// Returns the fs-verity digest of all data that the hasher received.
     pub fn finalize(mut self) -> [u8; 32] {
         if !self.partial.is_empty() {
             let block = std::mem::take(&mut self.partial);
@@ -214,7 +244,7 @@ mod tests {
 
     #[test]
     fn streaming_matches_oneshot() {
-        // Feeding data in small, block-unaligned chunks yields the same digest.
+        // Small chunks that do not align with the blocks give the same digest.
         let data: Vec<u8> = (0..20_000).map(|i| (i * 7 % 253) as u8).collect();
         let oneshot = FsVerityHasher::hash(&data);
         let mut streamed = FsVerityHasher::new();

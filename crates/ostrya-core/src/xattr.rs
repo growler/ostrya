@@ -1,33 +1,60 @@
-//! Extended-attribute sets.
+//! Extended-attribute sets, owned and borrowed.
 //!
-//! The storage form is GVariant `a(ayay)`: an array of (name-bytes,
-//! value-bytes), sorted by name with byte-wise comparison. A stored name
-//! carries its namespace prefix and a single terminating NUL, with a non-empty
-//! prefix and no interior NUL, matching the form the tool writes.
-//! Canonicalization -- the sort plus the reject-duplicate and name-form checks
-//! -- is applied before every serialization and hash, because the xattr bytes
-//! feed the object checksum.
+//! The `Xattrs` type doc states the storage form and the canonical-form
+//! rules.
 
 use ostrya_gvariant::{ArrayIter, GvDecode, GvEncode, GvType, encode_to_vec, write_array};
 
 use crate::error::{Error, Result};
 use crate::valiter::ValidatedIter;
 
-/// A canonical, sorted xattr set.
+/// A sorted set of extended attributes, in canonical form.
 ///
-/// The set is canonical, so equal sets hold equal bytes in equal order and
-/// hashing agrees with equality: a set serves as a lookup key.
+/// Equal sets hold equal bytes in equal order. Hashing agrees with equality,
+/// so a set can be a lookup key.
+///
+/// # Storage form
+///
+/// The GVariant type is `a(ayay)`. Each element is a pair of byte strings:
+/// the name and the value. The pairs are sorted by name in byte order.
+///
+/// A stored name is the attribute name with its namespace prefix, followed by
+/// one NUL byte. The text before the NUL is not empty and holds no NUL. The
+/// `ostree` command writes names in this form.
+///
+/// The xattr bytes are part of the object checksum, so each constructor
+/// makes a canonical set. Each serialization and each hash of a set uses
+/// this form.
+///
+/// [`new`](Xattrs::new) sorts the pairs.
+/// [`from_gvariant`](Xattrs::from_gvariant) refuses pairs that are not
+/// sorted. Each constructor refuses a duplicate name and checks each name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Xattrs(Vec<(Vec<u8>, Vec<u8>)>);
 
 impl Xattrs {
-    /// The empty xattr set.
+    /// Creates an empty set.
     pub fn empty() -> Xattrs {
         Xattrs(Vec::new())
     }
 
-    /// Build a canonical set from arbitrary (name, value) pairs: sort by name,
-    /// then reject duplicate names and names not in stored NUL-terminated form.
+    /// Creates a canonical set from (name, value) pairs in any order.
+    ///
+    /// The function sorts the pairs by name. Each name must be a stored name
+    /// of the [storage form](Xattrs#storage-form), with one NUL byte at the
+    /// end.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidXattrs`] with one of these reasons:
+    ///
+    /// - `duplicate xattr name` if two pairs have the same name.
+    /// - `empty xattr name` if a name is empty.
+    /// - `xattr name is missing its terminating NUL` if the last byte of a
+    ///   name is not NUL.
+    /// - `xattr name is empty before its NUL` if a name is one NUL byte only.
+    /// - `xattr name has an interior NUL` if a name holds a NUL byte before
+    ///   its last byte.
     pub fn new(pairs: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>) -> Result<Xattrs> {
         let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = pairs.into_iter().collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -42,37 +69,54 @@ impl Xattrs {
         Ok(Xattrs(pairs))
     }
 
-    /// Whether the set has no entries.
+    /// Returns `true` if the set has no entries.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    /// The number of entries.
+    /// Returns the number of entries.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// Iterate entries in canonical order.
+    /// Returns an iterator over the (name, value) entries, sorted by name.
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
         self.0.iter().map(|(n, v)| (n.as_slice(), v.as_slice()))
     }
 
-    /// Serialize as normal-form GVariant `a(ayay)`.
+    /// Serializes the set as normal-form GVariant `a(ayay)`.
+    ///
+    /// # Errors
+    ///
+    /// The function returns no error for any set. The encoder of `a(ayay)`
+    /// has no failure case.
     pub fn to_gvariant(&self) -> Result<Vec<u8>> {
         Ok(encode_to_vec(&self)?)
     }
 
-    /// Parse normal-form GVariant `a(ayay)`, requiring the on-disk canonical
-    /// order: names strictly increasing (which rejects both unsorted input and
-    /// duplicates) and non-empty.
+    /// Parses a normal-form GVariant `a(ayay)` set.
+    ///
+    /// Each name must be greater than the name before it, in byte order. This
+    /// check refuses unsorted input and duplicate names.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Gvariant`] if `bytes` is not a normal-form `a(ayay)` array.
+    /// - [`Error::InvalidXattrs`] with the reason `xattr names are not
+    ///   strictly sorted` if a name is not greater than the name before it.
+    /// - [`Error::InvalidXattrs`] if a name is not in the stored form. The
+    ///   reasons are `empty xattr name`, `xattr name is missing its
+    ///   terminating NUL`, `xattr name is empty before its NUL`, and `xattr
+    ///   name has an interior NUL`, as for [`new`](Xattrs::new).
     pub fn from_gvariant(bytes: &[u8]) -> Result<Xattrs> {
         XattrsRef::parse(bytes)?.to_owned()
     }
 }
 
-/// Encode the canonical set as `a(ayay)` directly from the owned entries, so a
-/// caller that holds an [`Xattrs`] (a dirmeta or file header) can splice it into
-/// a larger tuple without first collecting a slice of borrowed pairs.
+/// The `a(ayay)` encoding of a set, written from the owned entries.
+///
+/// A dirmeta or a file header encodes its set as a member of a larger tuple
+/// with this impl. The encoder needs no list of borrowed pairs.
 impl GvType for &Xattrs {
     const SIGNATURE: &'static str = "a(ayay)";
     const ALIGNMENT: usize = 1;
@@ -96,10 +140,12 @@ impl GvEncode for &Xattrs {
     }
 }
 
-/// Validate a stored xattr name: non-empty, ending in a single NUL, with no
-/// interior NUL and a non-empty prefix. Confirmed by reading the
-/// `user.ostreemeta` blob of a committed file, where the name `user.demo` is
-/// followed by one `\0`.
+/// Checks a stored xattr name.
+///
+/// The name ends in one NUL byte. The text before the NUL is not empty and
+/// holds no NUL. The `ostree` command writes names in this form: in the
+/// `user.ostreemeta` blob of a committed file, one `\0` follows the name
+/// `user.demo`.
 fn check_name(name: &[u8]) -> Result<()> {
     let Some((&last, rest)) = name.split_last() else {
         return Err(Error::InvalidXattrs("empty xattr name"));
@@ -120,9 +166,9 @@ fn check_name(name: &[u8]) -> Result<()> {
 
 /// A borrowed view of a serialized `a(ayay)` xattr set.
 ///
-/// `parse` validates the array framing; the canonical-order checks (names
-/// strictly increasing, non-empty) run as entries are visited, which is why
-/// [`iter`](XattrsRef::iter) yields `Result`. After an error the iterator is
+/// [`parse`](XattrsRef::parse) checks the framing of the array. The name
+/// checks and the order check run when [`iter`](XattrsRef::iter) visits each
+/// entry, so the iterator yields `Result`. After an error, the iterator is
 /// exhausted.
 #[derive(Clone, Copy)]
 pub struct XattrsRef<'a> {
@@ -130,14 +176,21 @@ pub struct XattrsRef<'a> {
 }
 
 impl<'a> XattrsRef<'a> {
-    /// Wrap the slice covering exactly a serialized `a(ayay)`.
+    /// Creates a view of a slice that holds exactly one serialized `a(ayay)`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Gvariant`] if the framing of the array is not normal form.
     pub fn parse(data: &'a [u8]) -> Result<XattrsRef<'a>> {
         Ok(XattrsRef {
             entries: ArrayIter::decode(data)?,
         })
     }
 
-    /// Iterate (name, value) entries, validating canonical order as visited.
+    /// Returns an iterator over the (name, value) entries.
+    ///
+    /// The iterator checks each entry when it visits it. The error items are
+    /// the errors of [`to_owned`](XattrsRef::to_owned).
     pub fn iter(&self) -> impl Iterator<Item = Result<(&'a [u8], &'a [u8])>> + use<'a> {
         ValidatedIter::new(
             self.entries,
@@ -155,7 +208,14 @@ impl<'a> XattrsRef<'a> {
         )
     }
 
-    /// Collect into an owned, canonical [`Xattrs`].
+    /// Collects the entries into an owned, canonical [`Xattrs`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Gvariant`] if an entry is not a normal-form `(ayay)` pair.
+    /// - [`Error::InvalidXattrs`] if a name is not in the stored form, or with
+    ///   the reason `xattr names are not strictly sorted`.
+    ///   [`Xattrs::from_gvariant`] lists the reasons.
     pub fn to_owned(&self) -> Result<Xattrs> {
         let mut pairs = Vec::new();
         for item in self.iter() {
@@ -262,7 +322,8 @@ mod tests {
 
     #[test]
     fn from_gvariant_rejects_unsorted_bytes() {
-        // Encode an out-of-order a(ayay) directly, bypassing canonicalization.
+        // The test encodes an out-of-order a(ayay) with no sort, so the bytes
+        // are not in canonical form.
         let unsorted: Vec<(&[u8], &[u8])> = vec![(b"user.z\0", b"1"), (b"user.a\0", b"2")];
         let bytes = encode_to_vec(&Slice(&unsorted)).unwrap();
         assert!(matches!(

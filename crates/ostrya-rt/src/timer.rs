@@ -1,44 +1,42 @@
 //! Async delays.
 //!
-//! [`Timer::after`] resolves once a duration has elapsed, using the compiled
-//! backend's timer (`smol::Timer` under smol, `tokio::time::sleep` under
-//! tokio). The repository lock-acquisition loop waits on it between contended
-//! attempts, turning the tool's retry-until-timeout behavior into an async
-//! sleep.
+//! [`Timer::after`] uses the timer of the backend (`smol::Timer` or
+//! `tokio::time::sleep`). The `ostree` command tries a held repository lock
+//! again until a timeout. The lock loop of the repository waits on
+//! [`Timer::after`] between two attempts, so the wait is an async sleep.
 //!
-//! [`Deadline`] is the same timer in a form a `poll_*` method can use: a window
-//! that is restarted when work makes progress and reports the window running
-//! out. The fetcher's response body holds one to bound how long a peer may stay
-//! silent mid-stream, and one to sample the rate of its low-speed rule.
+//! [`Deadline`] is the same timer for a `poll_*` method. The work restarts the
+//! window when it makes progress, and the poll reports the end of the window.
+//! The response body of the fetcher holds one to limit how long a peer can
+//! stay silent in a stream. It holds one more to sample the rate for its
+//! low-speed rule.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-/// A one-shot async delay over the compiled runtime backend.
+/// A one-shot async delay.
 pub struct Timer;
 
 impl Timer {
-    /// Complete after `duration` has elapsed.
+    /// Waits until `duration` elapses.
     #[cfg(feature = "tokio")]
     pub async fn after(duration: Duration) {
         tokio::time::sleep(duration).await;
     }
 
-    /// Complete after `duration` has elapsed.
+    /// Waits until `duration` elapses.
     #[cfg(all(feature = "smol", not(feature = "tokio")))]
     pub async fn after(duration: Duration) {
         smol::Timer::after(duration).await;
     }
 }
 
-/// A restartable window, polled from inside a `poll_*` method.
+/// A restartable time window, polled from inside a `poll_*` method.
 ///
-/// [`restart`](Deadline::restart) moves the window to one full length from now,
-/// and [`poll_expired`](Deadline::poll_expired) reports it running out. Expiry
-/// sticks until the next restart, so every poll after the first expiry reports
-/// it too, on either backend.
+/// An expiry sticks until the next [`restart`](Deadline::restart). Each poll
+/// after the first expiry also reports it.
 pub struct Deadline {
     window: Duration,
     expired: bool,
@@ -49,10 +47,10 @@ pub struct Deadline {
 }
 
 impl Deadline {
-    /// A window of `window` starting now.
+    /// Creates a window of length `window` that starts now.
     ///
-    /// Under the tokio backend this must be called from within a runtime
-    /// context, as tokio's timer requires.
+    /// With the `tokio` feature, the call must run inside a tokio runtime
+    /// context.
     pub fn new(window: Duration) -> Deadline {
         Deadline {
             window,
@@ -64,16 +62,17 @@ impl Deadline {
         }
     }
 
-    /// The length of the window.
+    /// Returns the length of the window.
     pub fn window(&self) -> Duration {
         self.window
     }
 
-    /// Start the window again from now.
+    /// Starts the window again from now.
     pub fn restart(&mut self) {
         self.expired = false;
-        // A window whose end is past the clock's range takes a new sleep, the
-        // way `new` arms one, where adding the window to the clock would panic.
+        // If the end of the window is past the range of the clock, the addition
+        // of the window to the clock panics. In that case, the code arms a new
+        // sleep, as `new` does.
         #[cfg(feature = "tokio")]
         match tokio::time::Instant::now().checked_add(self.window) {
             Some(end) => self.sleep.as_mut().reset(end),
@@ -83,7 +82,7 @@ impl Deadline {
         self.timer.set_after(self.window);
     }
 
-    /// Ready once the window has elapsed without a restart.
+    /// Returns `Poll::Ready` if the window ended with no restart.
     pub fn poll_expired(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         if self.expired {
             return Poll::Ready(());
@@ -99,7 +98,8 @@ impl Deadline {
     }
 }
 
-/// The deadline travels with the streams that hold it.
+// The streams that hold a `Deadline` move between threads, so it must be
+// `Send` and `Sync`.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Deadline>();
@@ -120,7 +120,7 @@ mod tests {
         });
     }
 
-    /// Poll `deadline` once, from inside a task the backend is driving.
+    /// Polls `deadline` once, from inside a task that the backend drives.
     async fn poll_once(deadline: &mut Deadline) -> Poll<()> {
         std::future::poll_fn(|cx| Poll::Ready(deadline.poll_expired(cx))).await
     }
@@ -131,8 +131,8 @@ mod tests {
             let mut deadline = Deadline::new(Duration::from_millis(100));
             assert!(poll_once(&mut deadline).await.is_pending());
 
-            // Half the window in, a restart pushes expiry out by a full window,
-            // so the original window elapsing is not enough.
+            // Half the window in, a restart moves the end out by a full
+            // window. The end of the first window does not expire the deadline.
             Timer::after(Duration::from_millis(50)).await;
             deadline.restart();
             Timer::after(Duration::from_millis(50)).await;
@@ -143,15 +143,15 @@ mod tests {
             // The second poll reports the same expiry.
             assert!(poll_once(&mut deadline).await.is_ready());
 
-            // A restart after expiry opens a fresh window.
+            // A restart after expiry opens a new window.
             deadline.restart();
             assert!(poll_once(&mut deadline).await.is_pending());
         });
     }
 
-    /// A window as long as a C `int` of seconds, and the longest duration, is
-    /// armed, restarted, and polled on either backend without a panic, and
-    /// stays open.
+    /// The test uses two windows: one as long as a C `int` of seconds, and one
+    /// of the longest duration. Each window arms, restarts, and polls with no
+    /// panic on each backend. Both windows stay open.
     #[test]
     fn a_window_of_the_largest_int_seconds_is_armed() {
         block_on(async {

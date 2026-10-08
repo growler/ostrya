@@ -2,38 +2,93 @@ use crate::codec::{ArrayReader, TupleReader};
 use crate::ser::offset_max;
 use crate::{Error, GvDecode, Result, Type, Value};
 
-/// Maximum value nesting depth. Nested variants let value nesting exceed the
-/// static depth of the type signature, so the parser and the serializer carry
-/// their own limit.
+/// The maximum nesting depth of a value.
+///
+/// A nested variant lets the nesting of a value exceed the static depth of the
+/// type signature. For this reason, the parser and the serializer apply their
+/// own limit.
 pub(crate) const MAX_VALUE_DEPTH: usize = 128;
 
-/// Deserialize normal-form GVariant bytes as `ty`.
+/// Deserializes normal-form GVariant bytes of type `ty` into a [`Value`].
 ///
-/// The parser is strict: any deviation from normal form (nonzero padding,
-/// unterminated or non-UTF-8 strings, out-of-order framing offsets, trailing
-/// bytes) is an error. A successful parse therefore re-serializes to the
-/// identical bytes, which is what object checksumming relies on.
+/// The parser accepts normal form only, so a value that it returns
+/// re-serializes to the identical bytes. The object checksum depends on this
+/// property. The parser preallocates at most 4096 elements for an array, so
+/// hostile input cannot force an allocation proportional to its length.
+///
+/// # Depth limit
+///
+/// A leaf can sit under at most 128 levels of containers. Each variant, array,
+/// maybe, tuple, and dict entry adds one level. The bytes of an `ay` add no
+/// level. A `v` that holds 128 nested variants decodes, and a `v` that holds
+/// 129 returns [`Error::DepthExceeded`].
+///
+/// # Errors
+///
+/// - [`Error::NotNormal`] if `data` deviates from normal form in any way. The
+///   variant carries a reason that names the deviation. These are the
+///   deviations:
+///   - a scalar of the wrong size, or a boolean byte that is not 0 or 1
+///   - a string with no NUL terminator, with an interior NUL byte, or with
+///     bytes that are not UTF-8
+///   - padding bytes that are not zero
+///   - framing offsets that are out of bounds, out of order, or wider than
+///     normal form needs
+///   - an array of fixed-size elements whose size is not a multiple of the
+///     element size
+///   - a fixed-size tuple of the wrong size, or tuple members that do not fill
+///     the tuple
+///   - an empty tuple `()` that is not a single zero byte
+///   - a maybe of a variable-size element with no terminating zero byte
+///   - a variant with no type separator, or with a type signature that is not
+///     UTF-8 or not valid
+/// - [`Error::DepthExceeded`] if the value nests deeper than the
+///   [depth limit](from_bytes#depth-limit).
 pub fn from_bytes(ty: &Type, data: &[u8]) -> Result<Value> {
     parse(ty, data, 0)
 }
 
-/// Check that `data` is normal-form GVariant bytes of `ty`, building no value.
+/// Checks that `data` is normal-form GVariant bytes of type `ty`.
 ///
-/// The check accepts exactly the input [`from_bytes`] accepts and applies the
-/// same limits, but keeps no decoded value, so its memory does not grow with
-/// the element count of the input.
+/// The check accepts exactly the input that [`from_bytes`] accepts, with the
+/// same [depth limit](from_bytes#depth-limit) of 128 levels. It keeps no
+/// decoded value, so its memory does not grow with the element count of the
+/// input.
+///
+/// # Errors
+///
+/// For each input that [`from_bytes`] rejects, this function returns the same
+/// error:
+///
+/// - [`Error::NotNormal`] if `data` deviates from normal form. The
+///   [`from_bytes` errors](from_bytes#errors) list the deviations.
+/// - [`Error::DepthExceeded`] if the value nests deeper than 128 levels.
 pub fn validate(ty: &Type, data: &[u8]) -> Result<()> {
     check(ty, data, 0)
 }
 
-/// Deserialize one member of a tuple, leaving the other members undecoded.
+/// Deserializes one member of a serialized tuple into a [`Value`].
 ///
-/// `ty` is the type of the whole tuple and `index` names the member to decode,
-/// counting from zero. The framing of every member is checked the way
-/// [`from_bytes`] checks it, so a document that is not in normal form fails
-/// here as it fails there; only the decode of the members the caller does not
-/// name is skipped. A reader of one member of a document whose other members
-/// are large pays for the framing alone.
+/// `ty` is the type of the whole tuple. `index` is the zero-based position of
+/// the member to decode.
+///
+/// The function checks the framing of every member the way [`from_bytes`]
+/// checks it: the framing offsets, the padding, and the size of the tuple. It
+/// does not decode the other members, so it does not detect a fault inside
+/// them. If the other members of a serialized value are large, a reader of one
+/// member pays only for their framing.
+///
+/// # Errors
+///
+/// - [`Error::NotNormal`] with the reason "the type is not a tuple" if `ty` is
+///   not a tuple.
+/// - [`Error::NotNormal`] with the reason "the tuple holds no member of that
+///   index" if `index` is not less than the member count.
+/// - [`Error::NotNormal`] if the framing of the tuple is not normal form, or
+///   if the member at `index` is not normal form. The
+///   [`from_bytes` errors](from_bytes#errors) list the deviations.
+/// - [`Error::DepthExceeded`] if the member nests deeper than the
+///   [depth limit](from_bytes#depth-limit). The tuple counts as one level.
 pub fn tuple_field_from_bytes(ty: &Type, data: &[u8], index: usize) -> Result<Value> {
     let Type::Tuple(members) = ty else {
         return Err(Error::NotNormal("the type is not a tuple"));
@@ -65,8 +120,8 @@ fn parse(ty: &Type, data: &[u8], depth: usize) -> Result<Value> {
         return Err(Error::DepthExceeded);
     }
     match ty {
-        // Scalar and string leaves share the strict checks with the typed
-        // decoders; the `Value` path only wraps their results.
+        // Scalar and string leaves use the strict checks of the typed
+        // decoders. The `Value` path only wraps their results.
         Type::Bool => Ok(Value::Bool(bool::decode(data)?)),
         Type::Byte => Ok(Value::Byte(u8::decode(data)?)),
         Type::I16 => Ok(Value::I16(i16::from_le_bytes(exact::<2>(data)?))),
@@ -94,7 +149,7 @@ fn parse(ty: &Type, data: &[u8], depth: usize) -> Result<Value> {
     }
 }
 
-/// The checks of [`parse`], with no value built.
+/// Applies the checks of [`parse`] and builds no value.
 fn check(ty: &Type, data: &[u8], depth: usize) -> Result<()> {
     if depth > MAX_VALUE_DEPTH {
         return Err(Error::DepthExceeded);
@@ -139,7 +194,7 @@ fn check(ty: &Type, data: &[u8], depth: usize) -> Result<()> {
     }
 }
 
-/// The checks of [`parse_struct`], with no value built.
+/// Applies the checks of [`parse_struct`] and builds no value.
 fn check_struct<'t>(
     whole: &Type,
     members: impl ExactSizeIterator<Item = &'t Type> + Clone,
@@ -167,16 +222,21 @@ fn check_struct<'t>(
     reader.finish()
 }
 
-/// Upper bound on the element count preallocated for an array before any
-/// element is validated. The count comes straight from the input length (one
-/// element per byte for fixed-size elements), so capping it keeps hostile
-/// input from forcing an allocation proportional to its own size; a genuinely
-/// large valid array still grows amortized past the cap.
+/// The maximum element count that the parser preallocates for an array.
+///
+/// The parser preallocates before it checks any element. The count comes
+/// directly from the input length (one element per byte for fixed-size
+/// elements). With the cap, hostile input cannot force an allocation
+/// proportional to its own size. A large valid array still grows past the cap,
+/// with amortized cost.
 const ARRAY_PREALLOC_CAP: usize = 4096;
 
-/// Parse `m<T>`: no bytes is `Nothing`, and any other input is `Just`, whose
-/// element bytes are the whole input for a fixed-size element and the input
-/// less its trailing zero byte for a variable-size one.
+/// Parses `m<T>`.
+///
+/// If the input has no bytes, the value is `Nothing`. Any other input is
+/// `Just`. For a fixed-size element, the element bytes are the whole input.
+/// For a variable-size element, the element bytes are the input less its
+/// trailing zero byte.
 fn parse_maybe(elem: &Type, data: &[u8], depth: usize) -> Result<Value> {
     if data.is_empty() {
         return Ok(Value::Maybe(None));
@@ -214,7 +274,7 @@ fn parse_struct<'t>(
         }
         return Ok(Value::Tuple(Vec::new()));
     }
-    // Framing offsets cover variable-size members other than the last member.
+    // Framing offsets cover each variable-size member except the last member.
     let n_offsets = members
         .clone()
         .take(n - 1)
@@ -236,8 +296,11 @@ pub(crate) fn exact<const N: usize>(data: &[u8]) -> Result<[u8; N]> {
         .map_err(|_| Error::NotNormal("scalar has the wrong size"))
 }
 
-/// Split a serialized variant into its child bytes, the borrowed signature
-/// bytes, and the parsed child type. Shared by the `Value` and typed decoders.
+/// Splits a serialized variant into its parts.
+///
+/// The parts are the child bytes, the borrowed signature bytes, and the parsed
+/// child type. The `Value` decoder and the typed decoders both use this
+/// function.
 pub(crate) fn split_variant(data: &[u8]) -> Result<(&[u8], &[u8], Type)> {
     let Some(sep) = data.iter().rposition(|&b| b == 0) else {
         return Err(Error::NotNormal("variant lacks a type separator"));
@@ -256,12 +319,23 @@ pub(crate) fn check_padding(padding: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// The framing-offset size implied by a container's total serialized size.
+/// Returns the framing-offset size for a container of `len` serialized bytes.
 ///
-/// Public alongside [`choose_offset_size`](crate::choose_offset_size) so a
-/// reader of a container too large to buffer -- a static-delta part payload,
-/// read as a stream -- can locate the framing offsets at the end of the
-/// container once it knows the total length, the same way this parser does.
+/// The result is the smallest size whose range covers `len`:
+///
+/// - 1 if `len` is at most `0xFF`.
+/// - 2 if `len` is more than `0xFF` and at most `0xFFFF`.
+/// - 4 if `len` is more than `0xFFFF` and at most `0xFFFF_FFFF`.
+/// - 8 if `len` is more than `0xFFFF_FFFF`.
+///
+/// [`choose_offset_size`] picks the size on the encode side.
+///
+/// A reader of a container too large to buffer uses this function to find the
+/// framing offsets at the end from the total length. A static-delta part
+/// payload, read as a stream, is such a container. [`from_bytes`] finds the
+/// offsets the same way.
+///
+/// [`choose_offset_size`]: crate::choose_offset_size
 pub fn offset_size_for(len: usize) -> usize {
     for z in [1usize, 2, 4] {
         if len <= offset_max(z) {
@@ -298,9 +372,10 @@ mod tests {
         Value::Bytes((0..32).map(|i| seed.wrapping_add(i)).collect())
     }
 
-    /// One member of a tuple decodes to the value the whole parse gives it, the
-    /// framing of every member is still checked, and an index outside the tuple
-    /// is refused.
+    /// One member of a tuple decodes to the value that the whole parse gives it.
+    ///
+    /// The decode still checks the framing of every member. The function
+    /// refuses an index outside the tuple.
     #[test]
     fn decodes_one_tuple_member() {
         let ty = Type::parse("(asa{sv}t)").unwrap();
@@ -325,7 +400,7 @@ mod tests {
         }
         assert!(tuple_field_from_bytes(&ty, &bytes, 3).is_err());
         assert!(tuple_field_from_bytes(&Type::Str, &bytes, 0).is_err());
-        // The framing the other members carry is read whichever member is named.
+        // For each index, the decode reads the framing of every member.
         let mut torn = bytes.clone();
         let last = torn.len() - 1;
         torn[last] = 0xff;
@@ -358,8 +433,10 @@ mod tests {
         );
     }
 
-    /// The types outside the on-disk format, which `commit --add-metadata`
-    /// writes into a commit's metadata dict.
+    /// The types outside the on-disk format round-trip.
+    ///
+    /// The `ostree commit --add-metadata` command writes these types into the
+    /// metadata dict of a commit.
     #[test]
     fn round_trips_the_metadata_only_types() {
         round_trip("n", &Value::I16(-5));
@@ -395,8 +472,9 @@ mod tests {
         );
     }
 
-    /// A maybe of a variable-size element ends in one zero byte, which is what
-    /// tells `Just ""` from `Nothing`.
+    /// A maybe of a variable-size element ends in one zero byte.
+    ///
+    /// This byte tells `Just ""` apart from `Nothing`.
     #[test]
     fn maybe_framing() {
         let ty = Type::parse("ms").unwrap();
@@ -512,10 +590,10 @@ mod tests {
     #[test]
     fn array_length_does_not_drive_preallocation() {
         // A large all-0xFF `ab` buffer names one bool element per byte. The
-        // first element fails to decode, so parsing returns an error; the
+        // first element fails to decode, so the parse returns an error. The
         // untrusted element count must not drive a preallocation proportional
-        // to it before any element is validated (bound checked in
-        // `parse_array`; the ratio is enforced by inspection there).
+        // to it before the parser checks any element. `parse_array` applies
+        // the bound. Only an inspection of `parse_array` enforces the ratio.
         let data = vec![0xffu8; 1 << 20];
         assert_eq!(
             from_bytes(&Type::parse("ab").unwrap(), &data),
@@ -523,8 +601,10 @@ mod tests {
         );
     }
 
-    /// `validate` accepts exactly what `from_bytes` accepts, with the same
-    /// error, over valid and malformed inputs of every shape.
+    /// `validate` accepts exactly the input that `from_bytes` accepts.
+    ///
+    /// For each rejected input, both return the same error. The cases are
+    /// valid and malformed inputs of every shape.
     #[test]
     fn validate_agrees_with_from_bytes() {
         let dict = Value::Array(vec![
@@ -625,7 +705,7 @@ mod tests {
         let ty = Type::parse("as").unwrap();
         // Framing offset points past the framing area.
         assert!(from_bytes(&ty, &[b'a', 0, 3]).is_err());
-        // Element without a NUL terminator carved out by the offsets.
+        // The offsets carve out an element without a NUL terminator.
         assert!(from_bytes(&ty, &[b'a', 0, 1, 2]).is_err());
         // Fixed-element array with a partial element.
         let au = Type::parse("au").unwrap();
@@ -658,8 +738,9 @@ mod tests {
 
     #[test]
     fn rejects_variant_depth_bomb() {
-        // 129 nested variants, built by hand since the serializer rejects
-        // values this deep: innermost byte, then one signature per wrapper.
+        // Build 129 nested variants by hand, because the serializer rejects
+        // values this deep. The bytes are the innermost byte, then one
+        // signature for each wrapper.
         let ty = Type::parse("v").unwrap();
         let mut bytes = vec![1u8, 0, b'y'];
         for _ in 0..128 {
@@ -668,8 +749,8 @@ mod tests {
         }
         assert_eq!(from_bytes(&ty, &bytes), Err(Error::DepthExceeded));
 
-        // 128 nested variants sit exactly at the limit and round-trip; one
-        // more wrapper fails identically on the encode path.
+        // 128 nested variants sit exactly at the limit and round-trip. One
+        // more wrapper fails with the same error on the encode path.
         let mut value = Value::variant(Type::Byte, Value::Byte(1));
         for _ in 0..127 {
             value = Value::variant(Type::Variant, value);

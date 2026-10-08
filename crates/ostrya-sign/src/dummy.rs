@@ -2,16 +2,22 @@
 
 use crate::{SignFuture, SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome};
 
-/// The test-only dummy signer. Its signature is the raw bytes of its key
-/// identifier and does not depend on the payload; the secret and public key are
-/// the same byte string (`format-reference.md`, "Signing details").
+/// A signer of the dummy engine, for tests.
+///
+/// The engine name is `dummy`, and the metadata key is `ostree.sign.dummy`.
+/// The signature is the bytes of the key and does not depend on the payload.
+/// The secret key and the public key are the same byte string.
+///
+/// The engine does no cryptography. Tests use it to check the signing
+/// framework and to cross-check against the dummy engine of the `ostree`
+/// command.
 #[derive(Debug, Clone)]
 pub struct DummySigner {
     key: Vec<u8>,
 }
 
 impl DummySigner {
-    /// A dummy signer whose signature is the bytes of `key`.
+    /// Creates a dummy signer whose signature is the bytes of `key`.
     pub fn new(key: impl Into<Vec<u8>>) -> DummySigner {
         DummySigner { key: key.into() }
     }
@@ -32,15 +38,18 @@ impl Signer for DummySigner {
     }
 }
 
-/// The test-only dummy verifier. A signature verifies when its bytes equal one
-/// of the trusted key byte strings.
+/// A verifier of the dummy engine, for tests.
+///
+/// If the bytes of a signature equal one of the trusted keys, the signature
+/// verifies. The verifier does not read the payload. The metadata key is
+/// `ostree.sign.dummy`.
 #[derive(Debug, Clone)]
 pub struct DummyVerifier {
     trusted: Vec<Vec<u8>>,
 }
 
 impl DummyVerifier {
-    /// A dummy verifier trusting each key in `keys`.
+    /// Creates a dummy verifier that trusts each key in `keys`.
     pub fn new<K, I>(keys: I) -> DummyVerifier
     where
         K: Into<Vec<u8>>,

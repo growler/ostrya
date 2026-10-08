@@ -1,16 +1,17 @@
-//! Big-endian value-level scalars.
+//! Big-endian scalars at the GVariant value level.
 //!
-//! A handful of on-disk fields (uid, gid, mode, rdev, timestamp, and the
-//! archive uncompressed size) are stored big-endian at the GVariant value
-//! level while the rest of the format is little-endian. These newtypes carry
-//! the host-order value and (de)serialize the big-endian wire form, so the
-//! object structs hold plain integers and the byte-order conversion lives in
-//! one place instead of a per-field swap at every serialize and parse site.
+//! Some on-disk fields are big-endian at the GVariant value level: uid, gid,
+//! mode, rdev, the timestamp, and the uncompressed size of the archive form. The
+//! rest of the format is little-endian. The newtypes of this module hold the
+//! value in host order and encode and decode the big-endian wire form. The
+//! object structs hold plain integers, and each serialize and parse site uses
+//! these newtypes for the byte-order conversion.
 
 use ostrya_gvariant::{GvDecode, GvEncode, GvType};
 
-/// A `u32` stored big-endian on the wire (GVariant signature `u`). The wrapped
-/// value is host order.
+/// A `u32` that is big-endian on the wire, with the GVariant signature `u`.
+///
+/// The wrapped value is in host order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Be32(pub u32);
 
@@ -36,8 +37,9 @@ impl<'a> GvDecode<'a> for Be32 {
     }
 }
 
-/// A `u64` stored big-endian on the wire (GVariant signature `t`). The wrapped
-/// value is host order.
+/// A `u64` that is big-endian on the wire, with the GVariant signature `t`.
+///
+/// The wrapped value is in host order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Be64(pub u64);
 

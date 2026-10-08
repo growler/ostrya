@@ -13,6 +13,9 @@ default = ["smol"]
 smol = ["ostrya-rt/smol"]
 tokio = ["ostrya-rt/tokio"]
 
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 ostrya-core = { workspace = true }
 ostrya-rt = { workspace = true }

@@ -1,31 +1,37 @@
 #![forbid(unsafe_code)]
 
-//! Byte-exact GVariant codec for the ostree on-disk format.
+//! A byte-exact GVariant codec for the ostree on-disk format.
 //!
-//! This crate has no ostree knowledge. It serializes and deserializes the
-//! fixed set of GVariant type signatures ostree uses, in GVariant normal
-//! form. The checksum of every metadata object is the hash of these bytes,
-//! so every metadata checksum the port computes depends on the byte
-//! exactness of this crate.
+//! A caller writes values as GVariant bytes in normal form and reads them
+//! back. The checksum of each ostree metadata object is the hash of these
+//! bytes, so each metadata checksum of ostrya depends on this crate. The
+//! typed codec reads fields in place with no allocation. The crate has no
+//! ostree knowledge.
 //!
-//! The on-disk format uses booleans (`b`), bytes (`y`), 32- and 64-bit
-//! unsigned integers (`u`, `t`), strings (`s`), variants (`v`), arrays,
-//! tuples, and dict entries. The rest of the GVariant type alphabet -- the
-//! signed and the narrow integers, the handle, the double, the object path, the
-//! signature, and the maybe -- reaches a repository through
-//! `commit --add-metadata`, so the codec carries it too.
-//! [`Type::parse`] rejects everything outside the alphabet.
+//! # Entry points
 //!
-//! [`to_text`] writes the GVariant text form and [`from_text`] reads it back.
+//! - [`Type::parse`] reads a type signature.
+//! - [`to_bytes`] writes a [`Value`] as normal-form bytes.
+//! - [`from_bytes`] reads normal-form bytes as a [`Value`].
+//! - [`GvEncode`] writes a Rust type as normal-form bytes.
+//! - [`GvDecode`] reads a Rust type in place from normal-form bytes.
+//! - [`to_text`] writes the GVariant text form of a value.
+//! - [`from_text`] reads the GVariant text form.
+//! - [`DictBuilder`] builds an `a{sv}` dict.
 //!
-//! Byte order: framing offsets and multi-byte scalars are written
-//! little-endian, the normal-form byte order on the little-endian targets
-//! ostree supports. The fields the on-disk format defines as big-endian
-//! (uids, gids, modes, timestamps, sizes) are value-level conversions
-//! performed by the caller before serialization and after deserialization.
+//! # Examples
 //!
-//! [`from_bytes`] is strict: it accepts only normal-form input, so a
-//! successful parse re-serializes with [`to_bytes`] to the identical bytes.
+//! ```
+//! use ostrya_gvariant::{Type, Value, from_bytes, to_bytes};
+//!
+//! let ty = Type::parse("(su)")?;
+//! let value = Value::Tuple(vec![Value::from("ostree"), Value::from(7u32)]);
+//! let bytes = to_bytes(&ty, &value)?;
+//! // The string, one padding byte, the `u`, and the framing offset 7.
+//! assert_eq!(bytes, b"ostree\0\0\x07\0\0\0\x07");
+//! assert_eq!(from_bytes(&ty, &bytes)?, value);
+//! # Ok::<(), ostrya_gvariant::Error>(())
+//! ```
 
 mod codec;
 mod de;

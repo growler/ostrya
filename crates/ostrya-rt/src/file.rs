@@ -1,13 +1,10 @@
-//! Async files over an already-open descriptor.
+//! Async files over a descriptor that is already open.
 //!
-//! Opens are performed elsewhere through `rustix` (fd-relative `openat`);
-//! [`File`] and [`FileReader`] only stream over a descriptor they are handed.
-//! [`File`] wraps the backend's async file (`smol::fs::File` or
-//! `tokio::fs::File`) and presents the `futures-io` traits under both
-//! backends, so core code stays generic. Under the `tokio` feature it
-//! additionally implements the tokio I/O traits for tokio-native callers.
-//! [`FileReader`] is the read-only form with a bounded read-ahead, and it
-//! presents the `futures-io` read trait alone.
+//! Other code opens the files through `rustix` (fd-relative `openat`).
+//! [`File`] and [`FileReader`] only stream over the descriptor that they get.
+//! [`File`] wraps the async file of the backend (`smol::fs::File` or
+//! `tokio::fs::File`). The `futures-io` traits on it keep the code of a caller
+//! the same with each backend.
 
 use std::io;
 #[cfg(unix)]
@@ -20,21 +17,56 @@ type Backend = smol::fs::File;
 #[cfg(feature = "tokio")]
 type Backend = tokio::fs::File;
 
-/// An async file over an already-open descriptor.
+/// An async file over a descriptor that is already open.
 ///
-/// Constructed from a `std::fs::File` or, on Unix, an `OwnedFd`; both take
-/// ownership of the descriptor. The current descriptor offset is preserved, so
-/// a caller that seeked before wrapping (past a framed header, for instance)
-/// streams from that offset.
+/// `File::from` takes a `std::fs::File` or, on Unix, an `OwnedFd`. Both forms
+/// take ownership of the descriptor. The file keeps the current offset of the
+/// descriptor. If a caller seeks before the wrap, for example past a framed
+/// header, the stream starts at that offset.
+///
+/// `File` implements the `AsyncRead`, `AsyncWrite`, and `AsyncSeek` traits of
+/// `futures-io` with each backend. With the `tokio` feature, it also
+/// implements the same three traits of `tokio`, which `tokio_io` re-exports.
+///
+/// # Examples
+///
+/// ```
+/// use futures_lite::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+/// use std::io::SeekFrom;
+///
+/// let name = format!("ostrya-rt-doc-{}.tmp", std::process::id());
+/// let path = std::env::temp_dir().join(name);
+/// let std_file = std::fs::OpenOptions::new()
+///     .read(true)
+///     .write(true)
+///     .create(true)
+///     .truncate(true)
+///     .open(&path)?;
+///
+/// let out = ostrya_rt::block_on(async {
+///     let mut file = ostrya_rt::File::from(std_file);
+///     file.write_all(b"hello ostrya").await?;
+///     file.flush().await?;
+///     file.seek(SeekFrom::Start(6)).await?;
+///     let mut out = Vec::new();
+///     file.read_to_end(&mut out).await?;
+///     Ok::<_, std::io::Error>(out)
+/// })?;
+///
+/// std::fs::remove_file(&path)?;
+/// assert_eq!(out, b"ostrya");
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub struct File {
     inner: Backend,
-    /// The `futures-io` seek shim under the tokio backend must remember that a
-    /// seek is in flight across polls, because tokio's `AsyncSeek` is a
-    /// two-step (`start_seek` then `poll_complete`) API.
+    /// Records a seek that is in flight across polls. The `futures-io` seek
+    /// impl needs it with the tokio backend, because the tokio `AsyncSeek`
+    /// trait has two steps: `start_seek`, then `poll_complete`.
     #[cfg(feature = "tokio")]
     seeking: bool,
 }
 
+/// Wraps a `std::fs::File`.
 impl From<std::fs::File> for File {
     fn from(file: std::fs::File) -> File {
         #[cfg(all(feature = "smol", not(feature = "tokio")))]
@@ -53,6 +85,7 @@ impl From<std::fs::File> for File {
     }
 }
 
+/// Wraps an `OwnedFd`.
 #[cfg(unix)]
 impl From<OwnedFd> for File {
     fn from(fd: OwnedFd) -> File {
@@ -61,14 +94,17 @@ impl From<OwnedFd> for File {
 }
 
 impl File {
-    /// Settle queued writes into the descriptor.
+    /// Writes the queued bytes to the descriptor.
     ///
-    /// The backend hands a write to a blocking worker and holds what the worker
-    /// has not taken yet, so a file dropped at process exit loses that tail.
-    /// This asks for the held bytes and nothing further, which is what a
-    /// descriptor that refuses a sync -- a pipe, a terminal -- accepts;
-    /// [`sync_all`](File::sync_all) and [`sync_data`](File::sync_data) ask for
-    /// durability as well.
+    /// A write to a `File` can complete before its bytes reach the descriptor.
+    /// If the file drops at process exit, the queued bytes are lost.
+    ///
+    /// `flush` asks for no durability, so a descriptor that refuses a sync, for
+    /// example a pipe or a terminal, accepts it.
+    ///
+    /// # Errors
+    ///
+    /// The function returns an I/O error of the file if a queued write fails.
     pub async fn flush(&mut self) -> io::Result<()> {
         #[cfg(feature = "tokio")]
         {
@@ -84,22 +120,46 @@ impl File {
         }
     }
 
-    /// Flush queued writes and durably sync contents and metadata.
+    /// Writes the queued bytes and makes the contents and the metadata durable.
+    ///
+    /// # Errors
+    ///
+    /// The function returns an I/O error of the file.
     pub async fn sync_all(&mut self) -> io::Result<()> {
         self.inner.sync_all().await
     }
 
-    /// Flush queued writes and durably sync contents; metadata may lag.
+    /// Writes the queued bytes and makes the contents durable.
+    ///
+    /// The metadata of the file does not always become durable with the
+    /// contents.
+    ///
+    /// # Errors
+    ///
+    /// The function returns an I/O error of the file.
     pub async fn sync_data(&mut self) -> io::Result<()> {
         self.inner.sync_data().await
     }
 
-    /// Recover an owned `std::fs::File`, settling pending writes first.
+    /// Returns this file as an owned `std::fs::File`.
     ///
-    /// Under the tokio backend this returns the file tokio was driving. Under
-    /// the smol backend the async file holds its descriptor behind an `Arc`,
-    /// so this flushes and then duplicates the descriptor (the handle on
-    /// Windows); the returned file shares the same open file description.
+    /// The function first writes the queued bytes. It does not report a
+    /// failure of that write.
+    ///
+    /// With the `smol` feature, the function then duplicates the descriptor
+    /// (the handle on Windows). The returned file shares the open file
+    /// description of the original descriptor.
+    ///
+    /// With the `tokio` feature, the function returns the file that the
+    /// backend drives.
+    ///
+    /// # Panics
+    ///
+    /// With the `smol` feature, the function panics if the operating system
+    /// refuses the duplicate, for example at the limit of open descriptors.
+    //
+    // With smol, the async file holds its descriptor behind an `Arc`, so the
+    // function duplicates the descriptor.
     pub async fn into_std(self) -> std::fs::File {
         #[cfg(feature = "tokio")]
         {
@@ -126,13 +186,14 @@ impl File {
     }
 }
 
-// --- smol backend: delegate to the futures-io impls async-fs provides ---
+// The smol backend: each impl calls the `futures-io` impl of the smol file.
 
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
 mod smol_impls {
     use super::*;
     use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 
+    /// The read trait of `futures-io`.
     impl AsyncRead for File {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -143,6 +204,7 @@ mod smol_impls {
         }
     }
 
+    /// The write trait of `futures-io`.
     impl AsyncWrite for File {
         fn poll_write(
             self: Pin<&mut Self>,
@@ -161,6 +223,7 @@ mod smol_impls {
         }
     }
 
+    /// The seek trait of `futures-io`.
     impl AsyncSeek for File {
         fn poll_seek(
             self: Pin<&mut Self>,
@@ -172,8 +235,8 @@ mod smol_impls {
     }
 }
 
-// --- tokio backend: present futures-io over the tokio file, and the tokio
-// traits natively for tokio-native callers ---
+// The tokio backend: the `futures-io` impls over the tokio file, and the
+// tokio traits for callers that use tokio.
 
 #[cfg(feature = "tokio")]
 mod tokio_impls {
@@ -182,6 +245,7 @@ mod tokio_impls {
         AsyncRead as TokioRead, AsyncSeek as TokioSeek, AsyncWrite as TokioWrite, ReadBuf,
     };
 
+    /// The read trait of `futures-io`.
     impl futures_io::AsyncRead for File {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -197,6 +261,7 @@ mod tokio_impls {
         }
     }
 
+    /// The write trait of `futures-io`.
     impl futures_io::AsyncWrite for File {
         fn poll_write(
             self: Pin<&mut Self>,
@@ -215,6 +280,7 @@ mod tokio_impls {
         }
     }
 
+    /// The seek trait of `futures-io`.
     impl futures_io::AsyncSeek for File {
         fn poll_seek(
             self: Pin<&mut Self>,
@@ -238,6 +304,7 @@ mod tokio_impls {
         }
     }
 
+    /// The read trait of `tokio`, also in [`tokio_io`](crate::tokio_io).
     impl TokioRead for File {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -248,6 +315,7 @@ mod tokio_impls {
         }
     }
 
+    /// The write trait of `tokio`, also in [`tokio_io`](crate::tokio_io).
     impl TokioWrite for File {
         fn poll_write(
             self: Pin<&mut Self>,
@@ -266,6 +334,7 @@ mod tokio_impls {
         }
     }
 
+    /// The seek trait of `tokio`, also in [`tokio_io`](crate::tokio_io).
     impl TokioSeek for File {
         fn start_seek(self: Pin<&mut Self>, pos: io::SeekFrom) -> io::Result<()> {
             TokioSeek::start_seek(Pin::new(&mut self.get_mut().inner), pos)
@@ -284,40 +353,53 @@ const READ_AHEAD: usize = 256 * 1024;
 /// The least read-ahead a length hint can give.
 const MIN_READ_AHEAD: usize = 4 * 1024;
 
+// With smol, `smol::Unblock` runs the reads on the blocking pool through a
+// ring buffer of the read-ahead size. It allocates the ring when the first
+// read starts, and it zeroes the ring in parts as it fills, up to its size.
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
 type ReaderBackend = smol::Unblock<std::fs::File>;
 #[cfg(feature = "tokio")]
 type ReaderBackend = tokio::fs::File;
 
-/// A read-only async file over an already-open descriptor.
+/// A read-only async file over a descriptor that is already open.
 ///
-/// The reader streams from the current descriptor offset to the end of the
-/// file and reads ahead by at most 256 KiB. It does no seek, so a reader over
-/// a pipe or over a descriptor positioned past a header costs no extra
-/// syscall. Use [`File`] for a descriptor that must also be written, sought,
-/// or recovered as a `std::fs::File`.
+/// The reader streams from the current offset of the descriptor to the end of
+/// the file. It does no seek, so a reader over a pipe or over a descriptor
+/// positioned past a header costs no extra syscall. [`File`] can also write,
+/// seek, and return a `std::fs::File`.
 ///
-/// Under the smol backend the reads run on the blocking pool through a ring
-/// buffer of the read-ahead size. The ring is allocated when the first read
-/// starts, and it is zeroed in parts as it fills, up to its size.
-/// [`FileReader::with_len_hint`] bounds the ring by the length the caller
-/// already knows, so a small file costs a small buffer. Under the tokio
-/// backend each read is one blocking-pool read of at most the caller's buffer;
-/// a length hint below the read-ahead also bounds that read. A dropped reader
-/// closes its descriptor on the pool thread after the read in flight returns.
+/// `FileReader` implements the `AsyncRead` trait of `futures-io` alone. A read
+/// into an empty buffer returns 0 and does not end the stream.
+///
+/// # Read-ahead
+///
+/// The read-ahead is 256 KiB by default, and no read-ahead is larger.
+/// [`with_len_hint`](FileReader::with_len_hint) gives a smaller read-ahead
+/// for a file of known length, so a small file costs a small buffer.
+///
+/// With the `smol` feature, the reads run on the blocking pool and fill a
+/// buffer of the read-ahead size.
+///
+/// With the `tokio` feature, each read is one read on the blocking pool of at
+/// most the length of the buffer of the caller. A length hint below 256 KiB
+/// also bounds that read.
+///
+/// If a read is in flight when the reader drops, the descriptor closes on the
+/// pool thread after that read returns.
 pub struct FileReader {
     inner: ReaderBackend,
 }
 
 impl FileReader {
-    /// Wrap `file`, with a read-ahead of `len + 1` bytes, held between
-    /// 4 KiB and 256 KiB.
+    /// Creates a reader over `file` with a read-ahead for `len` bytes.
     ///
-    /// `len` is the number of bytes the caller expects to read. The extra
+    /// `len` is the number of bytes that the caller expects to read. The
+    /// read-ahead is `len + 1` bytes, held between 4 KiB and 256 KiB. The extra
     /// byte lets a read of exactly `len` bytes see the end of the file in the
-    /// same run of reads. A `len` below the real length gives a smaller
-    /// read-ahead, and the reader still streams to the end of the file, in
-    /// runs of at least 4 KiB.
+    /// same run of reads.
+    ///
+    /// If `len` is less than the real length, the read-ahead is smaller. The
+    /// reader still streams to the end of the file.
     pub fn with_len_hint(file: std::fs::File, len: u64) -> FileReader {
         let cap = read_ahead_for(len);
         #[cfg(all(feature = "smol", not(feature = "tokio")))]
@@ -343,6 +425,7 @@ fn read_ahead_for(len: u64) -> usize {
         .map_or(READ_AHEAD, |n| n.clamp(MIN_READ_AHEAD, READ_AHEAD))
 }
 
+/// Wraps a `std::fs::File` and takes ownership of its descriptor.
 impl From<std::fs::File> for FileReader {
     fn from(file: std::fs::File) -> FileReader {
         #[cfg(all(feature = "smol", not(feature = "tokio")))]
@@ -360,6 +443,7 @@ impl From<std::fs::File> for FileReader {
     }
 }
 
+/// Wraps an `OwnedFd` and takes ownership of the descriptor.
 #[cfg(unix)]
 impl From<OwnedFd> for FileReader {
     fn from(fd: OwnedFd) -> FileReader {
@@ -367,6 +451,7 @@ impl From<OwnedFd> for FileReader {
     }
 }
 
+/// The read trait of `futures-io`.
 impl futures_io::AsyncRead for FileReader {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -374,7 +459,7 @@ impl futures_io::AsyncRead for FileReader {
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         // The smol backend takes a read into an empty buffer for the end of
-        // the stream and drops the bytes it has read ahead.
+        // the stream and drops the bytes that it read ahead.
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -398,7 +483,7 @@ impl futures_io::AsyncRead for FileReader {
     }
 }
 
-/// `File` and `FileReader` move freely across tasks and threads.
+// `File` and `FileReader` move freely across tasks and threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<File>();

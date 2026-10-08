@@ -1,10 +1,9 @@
-//! Shared fixture-walking helpers for the golden-object tests.
+//! Fixture helpers for the golden-object tests.
 //!
-//! The golden tests live in two crates (`ostrya-gvariant` and `ostrya-core`),
-//! and integration tests in different crates cannot share an ordinary module,
-//! so each test file includes this one with a `#[path]` module declaration.
-//! Because each test binary uses only part of the module, the whole file
-//! carries a `dead_code` allowance.
+//! The golden tests are in two crates, `ostrya-gvariant` and `ostrya-core`.
+//! Integration tests in different crates cannot share a normal module, so each
+//! test file includes this file with a `#[path]` module declaration. Each test
+//! binary uses only a part of this file, so the file allows `dead_code`.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -15,16 +14,18 @@ use std::sync::{Mutex, OnceLock};
 
 use ostrya_gvariant::{ArrayIter, Variant};
 
-/// GVariant signatures of the metadata objects the `ostree` tool writes.
+/// The GVariant signatures of the metadata objects that the `ostree` command
+/// writes.
 pub const COMMIT_SIG: &str = "(a{sv}aya(say)sstayay)";
 pub const DIRTREE_SIG: &str = "(a(say)a(sayay))";
 pub const DIRMETA_SIG: &str = "(uuua(ayay))";
 pub const ARCHIVE_FILE_HEADER_SIG: &str = "(tuuuusa(ayay))";
 
-/// The ostree object shapes as borrowed views: strings and checksums borrow
-/// the object buffer, arrays decode lazily. These are the tuple shapes behind
-/// the `ostrya-core` object structs; the golden tests decode into them and
-/// re-encode to check byte identity.
+/// The ostree object shapes as borrowed views.
+///
+/// Strings and checksums borrow the object buffer. Arrays decode lazily. These
+/// tuple shapes are the shapes of the `ostrya-core` object structs. The golden
+/// tests decode into them and re-encode them to check byte identity.
 pub type DirMetaView<'a> = (u32, u32, u32, ArrayIter<'a, (&'a [u8], &'a [u8])>);
 pub type DirTreeView<'a> = (
     ArrayIter<'a, (&'a str, &'a [u8])>,
@@ -51,24 +52,32 @@ pub type CommitView<'a> = (
     &'a [u8],
 );
 
-/// A 32-byte checksum payload seeded deterministically, for building fixture
-/// values whose exact bytes do not matter.
+/// Returns a deterministic 32-byte checksum payload made from `seed`.
+///
+/// The tests use it for fixture values whose exact bytes are not important.
 pub fn checksum(seed: u8) -> Vec<u8> {
     (0..32).map(|i| seed.wrapping_add(i)).collect()
 }
 
-/// Root of the tool-generated fixture repositories, one subdirectory per mode.
+/// Returns the root directory of the fixture repositories.
+///
+/// The `ostree` command generated the fixtures. The root holds the fixture
+/// repositories, as directories and as tarballs, and other fixture files.
 pub fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/generated")
 }
 
-/// Unpack the xattr-preserving fixture tarball `<fixture_root>/<name>.tar` once
-/// per test process and return the directory holding its `repo/`.
+/// Unpacks the fixture tarball `<fixture_root>/<name>.tar` and returns its
+/// directory.
 ///
-/// The bare-user-family fixtures store each file's logical metadata in a
-/// `user.ostreemeta` xattr, which git does not track, so they ship as tarballs
-/// (see tests/fixtures/generate.sh). The unpack is memoized and persists for the
-/// process, so the returned paths stay valid for the whole test run.
+/// The returned directory holds the `repo/` of the fixture. The unpack keeps
+/// the xattrs and runs one time for each test process.
+///
+/// The bare-user family fixtures store the logical metadata of each file in a
+/// `user.ostreemeta` xattr. Git does not track xattrs, so these fixtures ship
+/// as tarballs (see tests/fixtures/generate.sh). The function memoizes the
+/// unpack. The unpacked files stay for the life of the process, so the
+/// returned paths stay valid for the whole test run.
 pub fn unpack_fixture(name: &str) -> PathBuf {
     static REGISTRY: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
@@ -94,40 +103,43 @@ pub fn unpack_fixture(name: &str) -> PathBuf {
     dir
 }
 
-/// A loose object located at `<mode>/repo/objects/<prefix>/<stem>.<ext>`.
+/// A loose object at `<mode>/repo/objects/<prefix>/<stem>.<ext>`.
 pub struct LooseObject {
-    /// Repository-mode directory name, for example `archive` or `bare-user`.
+    /// The directory name of the repository mode, for example `archive` or
+    /// `bare-user`.
     pub mode: String,
-    /// Two-character fanout prefix (the first checksum byte in hex).
+    /// The two-character fanout prefix (the first checksum byte in hex).
     pub prefix: String,
-    /// Filename without the extension (the remaining checksum hex).
+    /// The file name with no extension (the remaining checksum hex).
     pub stem: String,
-    /// Extension without the leading dot.
+    /// The extension with no leading dot.
     pub ext: String,
-    /// Absolute path to the object file.
+    /// The absolute path of the object file.
     pub path: PathBuf,
 }
 
 impl LooseObject {
-    /// The full checksum hex, reassembled from the fanout prefix and the stem.
+    /// Returns the full checksum hex, made from the fanout prefix and the stem.
     pub fn hex(&self) -> String {
         format!("{}{}", self.prefix, self.stem)
     }
 }
 
-/// Walk the deterministic golden fixture repositories and return each loose
-/// object they hold.
+/// Returns each loose object of the deterministic golden fixture repositories.
 ///
-/// The golden data these walkers compare against lives in two fixtures: the
-/// `archive` plain tree and the `bare-user` tarball (unpacked on demand, so its
-/// `user.ostreemeta` xattrs are present). The other fixtures are cross-checked
-/// elsewhere: `bare` is owned by the invoking user (see the `bare_owner` note in
-/// MANIFEST) and the write-path test checks it against the tool at runtime, and
-/// `canon`/`xattr` are ingest fixtures with a different tree shape, checked by
-/// the `ostrya` crate's ingest tests.
+/// The golden data is in two fixtures: the `archive` plain tree and the
+/// `bare-user` tarball. The function unpacks the tarball on demand, so its
+/// `user.ostreemeta` xattrs are present.
 ///
-/// This is the single fixture-directory traversal for the golden tests: a
-/// broken layout surfaces here in one place rather than in each test.
+/// Other tests cross-check the other fixtures:
+///
+/// - The invoking user owns `bare` (see the `bare_owner` note in MANIFEST).
+///   The write-path test checks it against the `ostree` command at runtime.
+/// - `canon` and `xattr` are ingest fixtures with a different tree shape. The
+///   ingest tests of the `ostrya` crate check them.
+///
+/// The golden tests walk the fixture directories only through this function,
+/// so a broken layout shows in one place.
 pub fn loose_objects() -> Vec<LooseObject> {
     let sources = [
         ("archive".to_owned(), fixture_root().join("archive")),
@@ -166,11 +178,11 @@ pub fn loose_objects() -> Vec<LooseObject> {
     found
 }
 
-/// Every loose object whose extension is `extension`, with its bytes read.
-/// When `mode` is `Some`, only objects from that repository mode are returned.
+/// Returns each loose object with the extension `extension`, and its bytes.
 ///
-/// Panics if none are present, guarding against a silently empty walk masking
-/// a regression.
+/// If `mode` is `Some`, the function returns only the objects of that
+/// repository mode. If no object matches, the function panics, because a
+/// silent empty walk can hide a regression.
 pub fn objects_with_extension(extension: &str, mode: Option<&str>) -> Vec<(LooseObject, Vec<u8>)> {
     let found: Vec<(LooseObject, Vec<u8>)> = loose_objects()
         .into_iter()
@@ -185,13 +197,15 @@ pub fn objects_with_extension(extension: &str, mode: Option<&str>) -> Vec<(Loose
     found
 }
 
-/// Split a `.filez` object's framing envelope and return the GVariant file
-/// header slice.
+/// Returns the GVariant file header of a `.filez` object.
 ///
-/// The envelope is
+/// The framing envelope of the object is
 /// `[4-byte big-endian header length][4 zero bytes][header][deflate payload]`.
-/// This asserts the object holds the envelope, the four padding bytes are
-/// zero, and the header length stays within the object.
+/// The function asserts these conditions:
+///
+/// - The object holds at least the 8 bytes of the length and the padding.
+/// - The four padding bytes are zero.
+/// - The header length stays within the object.
 pub fn filez_header<'a>(bytes: &'a [u8], context: &Path) -> &'a [u8] {
     assert!(
         bytes.len() >= 8,

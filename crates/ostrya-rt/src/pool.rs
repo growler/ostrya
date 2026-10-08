@@ -1,18 +1,24 @@
-//! The blocking-pool entry points and a test-oriented executor driver.
+//! The blocking pool and a driver for tests.
 //!
-//! [`unblock`] is the door to the backend's blocking thread pool
-//! (`smol::unblock` or `tokio::task::spawn_blocking`) for work whose result is
-//! awaited, and [`unblock_detached`] for work that runs detached; every
-//! synchronous syscall offload in the library goes through one of the two.
-//! [`blocking_threads`] gives the size of that pool. [`block_on`] drives a
-//! future to completion on the backend's executor and exists for tests and
-//! doctests -- the library's real entry points are `async fn` driven by the
-//! caller's runtime.
+//! [`unblock`] runs a closure on the blocking pool of the backend
+//! (`smol::unblock` or `tokio::task::spawn_blocking`) and awaits its result.
+//! [`unblock_detached`] runs a closure on the same pool and does not wait.
+//! Each synchronous system call that the library moves off its async tasks
+//! goes through one of the two. [`blocking_threads`] gives the size of the
+//! pool.
+//!
+//! [`block_on`] exists for tests and doctests. The entry points of the library
+//! are `async fn` items that the runtime of the caller drives.
 
 use std::future::Future;
 
-/// Run a blocking closure on the backend's blocking thread pool, awaiting its
-/// result. A panic in the closure propagates to the awaiting task.
+/// Runs a closure on the blocking pool and returns its result.
+///
+/// # Panics
+///
+/// - If the closure panics, the awaiting task panics with the same payload.
+/// - With the `tokio` feature, if the runtime cancels the closure before the
+///   closure starts, for example at a shutdown, the awaiting task panics.
 #[cfg(feature = "tokio")]
 pub async fn unblock<T, F>(f: F) -> T
 where
@@ -25,8 +31,13 @@ where
     }
 }
 
-/// Run a blocking closure on the backend's blocking thread pool, awaiting its
-/// result. A panic in the closure propagates to the awaiting task.
+/// Runs a closure on the blocking pool and returns its result.
+///
+/// # Panics
+///
+/// - If the closure panics, the awaiting task panics with the same payload.
+/// - With the `tokio` feature, if the runtime cancels the closure before the
+///   closure starts, for example at a shutdown, the awaiting task panics.
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
 pub async fn unblock<T, F>(f: F) -> T
 where
@@ -36,12 +47,16 @@ where
     smol::unblock(f).await
 }
 
-/// Run a blocking closure on the backend's blocking thread pool as a detached
-/// task, with no result to await. The call returns at once.
+/// Runs a closure on the blocking pool and does not wait for it.
 ///
-/// Under tokio, a call outside the context of a runtime has no pool to reach,
-/// so the closure runs inline on the calling thread before the call returns.
-/// A panic in a detached closure is not seen by the caller.
+/// With the `smol` feature, the closure always runs on the pool, because the
+/// pool needs no runtime context. A panic of the closure does not reach the
+/// caller.
+///
+/// With the `tokio` feature, the closure runs on the pool if the call is inside
+/// a tokio runtime context. A panic of the closure then does not reach the
+/// caller. Outside a runtime context, the closure runs on the calling thread
+/// before the function returns, so a panic of the closure reaches the caller.
 #[cfg(feature = "tokio")]
 pub fn unblock_detached<F>(f: F)
 where
@@ -53,11 +68,16 @@ where
     }
 }
 
-/// Run a blocking closure on the backend's blocking thread pool as a detached
-/// task, with no result to await. The call returns at once.
+/// Runs a closure on the blocking pool and does not wait for it.
 ///
-/// The pool of `smol` needs no runtime context, so the closure always runs
-/// on the pool. A panic in a detached closure is not seen by the caller.
+/// With the `smol` feature, the closure always runs on the pool, because the
+/// pool needs no runtime context. A panic of the closure does not reach the
+/// caller.
+///
+/// With the `tokio` feature, the closure runs on the pool if the call is inside
+/// a tokio runtime context. A panic of the closure then does not reach the
+/// caller. Outside a runtime context, the closure runs on the calling thread
+/// before the function returns, so a panic of the closure reaches the caller.
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
 pub fn unblock_detached<F>(f: F)
 where
@@ -66,24 +86,31 @@ where
     smol::unblock(f).detach();
 }
 
-/// The most closures the blocking thread pool of the backend runs at the same
-/// time.
+/// Returns how many closures the blocking pool runs at the same time.
 ///
-/// The value is the limit of `tokio`'s default runtime, 512. A runtime that the
-/// caller builds with another `max_blocking_threads` is not seen.
+/// With the `smol` feature, the function reads `BLOCKING_MAX_THREADS` at each
+/// call and clamps the value to 1 through 10,000. If the variable is absent or
+/// is not a number, the function returns 500.
+///
+/// With the `tokio` feature, the function returns 512, the limit of the default
+/// tokio runtime. It does not read the limit of a runtime that the caller
+/// builds with another `max_blocking_threads`.
 #[cfg(feature = "tokio")]
 pub fn blocking_threads() -> usize {
     512
 }
 
-/// The most closures the blocking thread pool of the backend runs at the same
-/// time.
+/// Returns how many closures the blocking pool runs at the same time.
 ///
-/// The value follows the rule of the `blocking` crate, which runs the pool of
-/// `smol`: `BLOCKING_MAX_THREADS` gives the limit, clamped to 1 through
-/// 10,000, and a variable that is absent or is not a number gives 500. The
-/// function reads the variable at each call. The pool reads it once, when it
-/// first starts a thread.
+/// With the `smol` feature, the function reads `BLOCKING_MAX_THREADS` at each
+/// call and clamps the value to 1 through 10,000. If the variable is absent or
+/// is not a number, the function returns 500.
+///
+/// With the `tokio` feature, the function returns 512, the limit of the default
+/// tokio runtime. It does not read the limit of a runtime that the caller
+/// builds with another `max_blocking_threads`.
+// The value follows the rule of the `blocking` crate, which runs the pool of
+// `smol`. The pool reads the variable once, when it starts its first thread.
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
 pub fn blocking_threads() -> usize {
     parse_max(std::env::var("BLOCKING_MAX_THREADS").ok().as_deref())
@@ -97,8 +124,20 @@ fn parse_max(value: Option<&str>) -> usize {
         .map_or(500, |v| v.clamp(1, 10_000))
 }
 
-/// Drive `future` to completion on the backend's executor. Intended for tests
-/// and doctests; production callers await inside their own runtime.
+/// Runs a future to completion on the current thread and returns its output.
+///
+/// The function serves tests and doctests. A library caller awaits the future
+/// in its own runtime. With the `tokio` feature, each call builds a new
+/// current-thread runtime with the time and I/O drivers.
+///
+/// # Panics
+///
+/// With the `tokio` feature, the function panics in these conditions:
+///
+/// - The runtime does not build.
+/// - The call runs on a thread that drives a tokio runtime, for example
+///   inside another `block_on` call or inside a task of
+///   [`spawn`](crate::spawn).
 #[cfg(feature = "tokio")]
 pub fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -109,8 +148,20 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Drive `future` to completion on the backend's executor. Intended for tests
-/// and doctests; production callers await inside their own runtime.
+/// Runs a future to completion on the current thread and returns its output.
+///
+/// The function serves tests and doctests. A library caller awaits the future
+/// in its own runtime. With the `tokio` feature, each call builds a new
+/// current-thread runtime with the time and I/O drivers.
+///
+/// # Panics
+///
+/// With the `tokio` feature, the function panics in these conditions:
+///
+/// - The runtime does not build.
+/// - The call runs on a thread that drives a tokio runtime, for example
+///   inside another `block_on` call or inside a task of
+///   [`spawn`](crate::spawn).
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
 pub fn block_on<F: Future>(future: F) -> F::Output {
     smol::block_on(future)

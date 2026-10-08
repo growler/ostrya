@@ -1,15 +1,13 @@
-//! General standard-alphabet base64 for arbitrary-length byte strings.
+//! Standard base64 (RFC 4648) for byte strings of any length.
 //!
-//! The [`Checksum`](crate::Checksum) codec is fixed to 32-byte digests; sign-api
-//! keys and signature blobs are arbitrary-length, so this module carries a
-//! standard-alphabet (RFC 4648) encoder and decoder over any byte string. The
-//! spki engine reuses it to decode PEM key bodies.
+//! [`encode`] writes padded base64, and [`decode`] reads it. The codecs of
+//! [`Checksum`](crate::Checksum) accept 32-byte digests only.
 
 use crate::error::{Error, Result};
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// Encode `input` as standard, padded base64.
+/// Encodes `input` as standard base64 with `=` padding.
 pub fn encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
@@ -37,9 +35,21 @@ pub fn encode(input: &[u8]) -> String {
     out
 }
 
-/// Decode standard base64. Trailing `=` padding is optional; every other
-/// character must be in the alphabet, and a group of one leftover character is
-/// rejected as truncated.
+/// Decodes standard base64.
+///
+/// The function removes all trailing `=` characters before the decode, so the
+/// padding is optional. It does not check the unused low bits of the last
+/// character.
+///
+/// # Errors
+///
+/// - [`Error::InvalidBase64`] with the reason `truncated base64 group` if one
+///   character is left after the last full group of four characters. The
+///   function counts the characters after it removes the trailing `=`.
+/// - [`Error::InvalidBase64`] with the reason `invalid base64 character` if a
+///   character is outside the standard alphabet `A`-`Z`, `a`-`z`, `0`-`9`, `+`,
+///   and `/`. This includes white space, the URL-safe characters `-` and `_`,
+///   and an `=` that is not at the end.
 pub fn decode(s: &str) -> Result<Vec<u8>> {
     let bytes = s.trim_end_matches('=').as_bytes();
     let full = bytes.len() / 4;
@@ -77,7 +87,7 @@ pub fn decode(s: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Map one base64 character to its 6-bit value.
+/// Maps one base64 character to its 6-bit value.
 fn val(c: u8) -> Result<u8> {
     match c {
         b'A'..=b'Z' => Ok(c - b'A'),

@@ -70,15 +70,18 @@ pub mod transport;
 pub mod tree;
 
 pub use error::{Error, ErrorCode, Result};
+#[doc(hidden)]
 pub use proto::{Encoding, Expected, RefOutcome, RefState, RefUpdate};
 pub use push_tree::{
     ParentPolicy, TreePushOptions, push_tree, push_tree_over_stream, push_tree_prepared,
 };
+#[doc(hidden)]
 pub use session::{
     BoxFuture, Compression, ObjectData, ObjectReader, ObjectSource, PullBody, PullSession,
     PullSessionOptions, PushOutcome, PushPhase, PushProgress, PushProgressFn, PushProgressSnapshot,
     PushSession, PushStats, ServerInfo, SessionOptions,
 };
+#[doc(hidden)]
 pub use transport::{ConnectOptions, PreparedSession, PullConnectOptions, PushRemote};
 
 /// The public types of the protocol move freely across tasks and threads.

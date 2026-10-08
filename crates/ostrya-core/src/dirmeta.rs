@@ -1,10 +1,4 @@
-//! Dirmeta objects: directory uid/gid/mode/xattrs.
-//!
-//! Wire form `(uuua(ayay))`: uid, gid, and the full `st_mode` (all big-endian
-//! at the value level) plus the sorted xattr array. The mode must carry the
-//! directory file-type bits. The same layout serves the `user.ostreemeta`
-//! xattr of bare-user file objects, but this type models `.dirmeta` objects
-//! and therefore requires a directory mode.
+//! Dirmeta objects: the owner, the mode, and the xattrs of a directory.
 
 use ostrya_gvariant::{GvDecode, GvEncode, GvType};
 
@@ -13,16 +7,33 @@ use crate::error::{Error, Result};
 use crate::filehdr::{S_IFDIR, S_IFMT};
 use crate::xattr::{Xattrs, XattrsRef};
 
-/// An owned dirmeta object. Scalar fields are host-order.
+/// An owned dirmeta object: the owner, the mode, and the xattrs of a directory.
+///
+/// The scalar fields are in host byte order.
+///
+/// # Wire form
+///
+/// The GVariant type is `(uuua(ayay))`. The members are:
+///
+/// - the uid
+/// - the gid
+/// - the full `st_mode`, with the directory type bits
+/// - the xattrs, sorted by name, in the storage form of [`Xattrs`]
+///
+/// The three `u` values are big-endian. The mode must be a directory mode, so
+/// this type holds only `.dirmeta` objects. The same layout is the
+/// `user.ostreemeta` xattr of a bare-user file object.
+/// [`FileHeader::parse_stat_metadata`](crate::filehdr::FileHeader::parse_stat_metadata)
+/// reads that xattr.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirMeta {
     /// The owner uid.
     pub uid: u32,
     /// The owner gid.
     pub gid: u32,
-    /// Full `st_mode` including the directory file-type bits.
+    /// The full `st_mode`, with the directory type bits.
     pub mode: u32,
-    /// The directory's extended attributes.
+    /// The extended attributes of the directory.
     pub xattrs: Xattrs,
 }
 
@@ -35,12 +46,29 @@ fn check_dir_mode(mode: u32) -> Result<()> {
 }
 
 impl DirMeta {
-    /// Parse a serialized dirmeta object.
+    /// Parses a serialized dirmeta object.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Gvariant`] if `data` is not a normal-form `(uuua(ayay))`
+    ///   tuple, or if an xattr entry is not a normal-form `(ayay)` pair.
+    /// - [`Error::InvalidDirMeta`] with the reason `mode is not a directory
+    ///   mode` if the type bits of the mode are not the directory type.
+    /// - [`Error::InvalidXattrs`] if an xattr name is not in the stored form,
+    ///   or if the names are not strictly sorted.
+    ///   [`Xattrs::from_gvariant`] lists the reasons.
     pub fn parse(data: &[u8]) -> Result<DirMeta> {
         DirMetaRef::parse(data)?.to_owned()
     }
 
-    /// Serialize to normal-form bytes; their SHA-256 is the object identity.
+    /// Serializes the object to normal-form bytes.
+    ///
+    /// The SHA-256 of these bytes is the checksum of the object.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidDirMeta`] with the reason `mode is not a directory mode`
+    /// if the type bits of `mode` are not the directory type.
     pub fn serialize(&self) -> Result<Vec<u8>> {
         check_dir_mode(self.mode)?;
         Ok(ostrya_gvariant::encode_to_vec(self)?)
@@ -54,8 +82,9 @@ impl GvType for DirMeta {
     const FIXED_SIZE: Option<usize> = None;
 }
 
-/// The encode path is purely mechanical: the directory-mode check runs in
-/// [`DirMeta::serialize`], the only caller.
+/// The `(uuua(ayay))` encoding, with no check of the mode.
+///
+/// [`DirMeta::serialize`] checks that the mode is a directory mode.
 impl GvEncode for DirMeta {
     fn encode(&self, out: &mut Vec<u8>) -> ostrya_gvariant::Result<()> {
         (
@@ -68,8 +97,10 @@ impl GvEncode for DirMeta {
     }
 }
 
-/// A borrowed view of a serialized dirmeta object. The scalar fields decode
-/// on parse; the xattrs stay lazy.
+/// A borrowed view of a serialized dirmeta object.
+///
+/// [`parse`](DirMetaRef::parse) decodes the scalar fields and checks the mode.
+/// The xattrs stay serialized until a caller reads them.
 #[derive(Clone, Copy)]
 pub struct DirMetaRef<'a> {
     uid: u32,
@@ -79,7 +110,18 @@ pub struct DirMetaRef<'a> {
 }
 
 impl<'a> DirMetaRef<'a> {
-    /// Parse the slice covering exactly a serialized dirmeta object.
+    /// Parses a slice that holds exactly one serialized dirmeta object.
+    ///
+    /// The function does not check the xattr names.
+    /// [`to_owned`](DirMetaRef::to_owned) and the iterator of
+    /// [`xattrs`](DirMetaRef::xattrs) check them.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Gvariant`] if `data` is not a normal-form `(uuua(ayay))`
+    ///   tuple, or if the framing of the xattr array is not normal form.
+    /// - [`Error::InvalidDirMeta`] with the reason `mode is not a directory
+    ///   mode` if the type bits of the mode are not the directory type.
     pub fn parse(data: &'a [u8]) -> Result<DirMetaRef<'a>> {
         let (uid, gid, mode, xattrs): (Be32, Be32, Be32, &[u8]) = GvDecode::decode(data)?;
         let mode = mode.0;
@@ -92,27 +134,35 @@ impl<'a> DirMetaRef<'a> {
         })
     }
 
-    /// The owner uid, host-order.
+    /// Returns the owner uid, in host byte order.
     pub fn uid(&self) -> u32 {
         self.uid
     }
 
-    /// The owner gid, host-order.
+    /// Returns the owner gid, in host byte order.
     pub fn gid(&self) -> u32 {
         self.gid
     }
 
-    /// Full `st_mode`, host-order.
+    /// Returns the full `st_mode`, in host byte order.
     pub fn mode(&self) -> u32 {
         self.mode
     }
 
-    /// A borrowed view of the directory's extended attributes.
+    /// Returns a borrowed view of the extended attributes of the directory.
     pub fn xattrs(&self) -> XattrsRef<'a> {
         self.xattrs
     }
 
-    /// Collect into an owned [`DirMeta`].
+    /// Collects the view into an owned [`DirMeta`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Gvariant`] if an xattr entry is not a normal-form `(ayay)`
+    ///   pair.
+    /// - [`Error::InvalidXattrs`] if an xattr name is not in the stored form,
+    ///   or if the names are not strictly sorted.
+    ///   [`Xattrs::from_gvariant`] lists the reasons.
     pub fn to_owned(&self) -> Result<DirMeta> {
         Ok(DirMeta {
             uid: self.uid,

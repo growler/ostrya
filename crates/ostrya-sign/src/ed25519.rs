@@ -10,30 +10,44 @@ use crate::{
     VerifyOutcome,
 };
 
-/// The ed25519 sign-type name, used both as the engine name and as the base
-/// name of its key-store files (`trusted.ed25519`, `revoked.ed25519`).
+/// The ed25519 sign type. It is the engine name and the base name of the
+/// key-store files (`trusted.ed25519`, `revoked.ed25519`).
 const ED25519_SIGN_TYPE: &str = "ed25519";
-/// The ed25519 engine's detached-metadata dict key.
+/// The key of the ed25519 engine in the detached-metadata dict.
 const ED25519_METADATA_KEY: &str = "ostree.sign.ed25519";
 /// The raw byte length of an ed25519 public key.
 const ED25519_PUBLIC_KEY_LEN: usize = 32;
 /// The raw byte length of an ed25519 secret key (seed followed by public key).
 const ED25519_SECRET_KEY_LEN: usize = 64;
 
-/// The ed25519 commit-signing engine.
+/// The signer of the ed25519 engine.
 ///
-/// The secret key is the 64-byte seed-plus-public-key form the tool uses;
-/// [`from_keypair_bytes`](SigningKey::from_keypair_bytes) checks that the stored
-/// public half matches the seed. Signing is deterministic (RFC 8032), so it
-/// needs no RNG and completes in-task without offloading to the blocking pool.
+/// The engine name is `ed25519`. The key of the engine in the detached
+/// metadata is `ostree.sign.ed25519`. A signature is 64 bytes.
+///
+/// The secret key is 64 bytes: the 32-byte seed, then the 32-byte public key.
+/// The `ostree` command uses the same form. The signer refuses a secret key
+/// whose public half does not match the seed.
+///
+/// Signing is deterministic (RFC 8032), so it needs no random number
+/// generator. The signer signs in the call to [`Signer::sign`] and does not
+/// use the blocking pool. The same key over the same commit gives
+/// byte-identical detached metadata.
 #[derive(Debug, Clone)]
 pub struct Ed25519Signer {
     signing_key: SigningKey,
 }
 
 impl Ed25519Signer {
-    /// Build a signer from a 64-byte secret key (32-byte seed followed by the
-    /// 32-byte public key). Accepts the raw bytes or an `ay` payload.
+    /// Creates a signer from a 64-byte secret key.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] with the message
+    ///   `ed25519 secret key must be 64 bytes, got <n>` if `secret` is not 64
+    ///   bytes long.
+    /// - [`Error::Signature`] with a message that starts with
+    ///   `ed25519 secret key:` if the public half does not match the seed.
     pub fn from_secret_key(secret: &[u8]) -> Result<Ed25519Signer> {
         let bytes: [u8; ED25519_SECRET_KEY_LEN] = secret.try_into().map_err(|_| {
             Error::Signature(format!(
@@ -46,8 +60,16 @@ impl Ed25519Signer {
         Ok(Ed25519Signer { signing_key })
     }
 
-    /// Build a signer from a base64-encoded 64-byte secret key. Surrounding
-    /// whitespace (a trailing newline from a key file) is ignored.
+    /// Creates a signer from a base64-encoded 64-byte secret key.
+    ///
+    /// The function first removes the leading and trailing white space of
+    /// `secret_b64`, for example the newline at the end of a key file.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Core`] if the text is not valid base64.
+    /// - The errors of [`from_secret_key`](Self::from_secret_key) for the
+    ///   decoded bytes.
     pub fn from_base64(secret_b64: &str) -> Result<Ed25519Signer> {
         Ed25519Signer::from_secret_key(&base64::decode(secret_b64.trim())?)
     }
@@ -68,22 +90,37 @@ impl Signer for Ed25519Signer {
     }
 }
 
-/// The ed25519 commit-verifying engine, holding the effective trusted key set.
+/// The verifier of the ed25519 engine, with its set of trusted keys.
 ///
-/// A signature verifies when any trusted key accepts it. Verification uses the
-/// lenient (cofactored) equation, matching the acceptance the tool's libsodium
-/// backend applies, so a valid signature written by either side verifies on the
-/// other.
+/// The verifier reads the signatures under the key `ostree.sign.ed25519` of
+/// the detached metadata. A signature verifies if a trusted key accepts it. A
+/// blob that is not 64 bytes does not verify.
+///
+/// The `ostree` command verifies the signatures of [`Ed25519Signer`]. This
+/// verifier verifies the signatures that the `ostree` command writes.
 #[derive(Debug, Clone)]
 pub struct Ed25519Verifier {
     trusted: Vec<VerifyingKey>,
 }
 
 impl Ed25519Verifier {
-    /// Build a verifier trusting each key in `trusted` except those also in
-    /// `revoked`. Keys are 32-byte public keys, as raw bytes or `ay` payloads.
-    /// A trusted key that is not a valid curve point is an error; a revoked key
-    /// need only match by bytes and is not validated as a point.
+    /// Creates a verifier that trusts each key in `trusted` that is not in
+    /// `revoked`.
+    ///
+    /// Each key in the two sets must be a 32-byte public key. A key in
+    /// `revoked` matches a trusted key by its bytes, and `new` does not check
+    /// it as a curve point. `new` skips a trusted key that is also in
+    /// `revoked` before the point check. Each other trusted key must be a
+    /// valid curve point.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] with the message
+    ///   `ed25519 public key must be 32 bytes, got <n>` if a key in `trusted`
+    ///   or in `revoked` is not 32 bytes long.
+    /// - [`Error::Signature`] with a message that starts with
+    ///   `ed25519 public key:` if a trusted key that is not revoked is not a
+    ///   valid curve point.
     pub fn new<T, R>(trusted: T, revoked: R) -> Result<Ed25519Verifier>
     where
         T: IntoIterator,
@@ -108,13 +145,22 @@ impl Ed25519Verifier {
         Ok(Ed25519Verifier { trusted: keys })
     }
 
-    /// Build a verifier from a loaded [`SignKeys`] set (trusted minus revoked).
+    /// Creates a verifier from a loaded [`SignKeys`] set.
+    ///
+    /// The function gives `keys.trusted` and `keys.revoked` to
+    /// [`new`](Self::new), which states the rules for the keys.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] for a key that [`new`](Self::new) refuses.
     pub fn from_sign_keys(keys: SignKeys) -> Result<Ed25519Verifier> {
         Ed25519Verifier::new(keys.trusted, keys.revoked)
     }
 
-    /// Whether the effective trusted set is empty: no key was given, or the
-    /// revoked set removed every one. Such a verifier refuses every signature.
+    /// Returns `true` if the set of trusted keys is empty.
+    ///
+    /// The set is empty if no trusted key was given, or if the revoked set
+    /// removed each trusted key. An empty verifier refuses every signature.
     pub fn is_empty(&self) -> bool {
         self.trusted.is_empty()
     }
@@ -147,7 +193,7 @@ impl Verifier for Ed25519Verifier {
     }
 }
 
-/// Interpret a byte slice as a 32-byte ed25519 public key.
+/// Reads a byte slice as a 32-byte ed25519 public key.
 fn ed25519_public_bytes(key: &[u8]) -> Result<[u8; ED25519_PUBLIC_KEY_LEN]> {
     key.try_into().map_err(|_| {
         Error::Signature(format!(

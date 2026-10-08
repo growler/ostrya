@@ -1,35 +1,44 @@
 #![forbid(unsafe_code)]
 
-//! Byte-exact EROFS/composefs image writer and fs-verity digest.
+//! A byte-exact writer of composefs EROFS images, with an fs-verity hasher.
 //!
-//! This crate has no ostree or repository knowledge. It is the composefs
-//! counterpart to `ostrya-gvariant`: it takes a tree model -- directories,
-//! symlinks, and regular-file entries carrying logical metadata, extended
-//! attributes, a backing loose path, and an optional backing fs-verity
-//! digest -- and emits the EROFS image bytes plus the image's fs-verity
-//! digest.
+//! A caller builds a tree of directories, symlinks, and regular files. The
+//! crate writes the EROFS image of the tree and returns the fs-verity digest of
+//! the image. The image is byte-identical to the composefs image of the
+//! `ostree` command, format version 0. The crate is synchronous and does not
+//! read a repository.
 //!
-//! The output reproduces the composefs project's EROFS layout, format version
-//! 0, the format the `ostree` tool writes when it exports a commit with
-//! composefs support. The writer reproduces only the metadata subset composefs
-//! uses: the superblock, compact and extended inodes, tail-packed directory
-//! blocks, inline symlink targets, chunk-based backing files, and the
-//! trusted-namespace overlay xattrs (`overlay.redirect`, `overlay.metacopy`,
-//! `overlay.opaque`) with the shared-xattr area and the EROFS xattr name
-//! filter. There is no EROFS compression, no fragments, and no multi-device
-//! support. The crate is synchronous and takes no runtime dependency.
+//! # Entry points
 //!
-//! Emission is append-only, so [`write_image_to`] serializes the image straight
-//! through a [`std::io::Write`] sink and returns the digest without holding the
-//! image. [`build_image`] runs the same emission into a buffer for a caller
-//! that wants the bytes.
+//! - [`Directory`] is the root of a tree, and [`Node`] is one entry of it.
+//! - [`Metadata`] holds the mode, the owner, the mtime, and the xattrs of a node.
+//! - [`Content`] is the content of a [`Regular`] file: empty or a loose object.
+//! - [`build_image`] writes the image into an [`Image`] in memory.
+//! - [`write_image_to`] writes the image through a sink and does not keep it.
+//! - [`FsVerityHasher`] calculates an fs-verity digest of a byte stream.
+//! - [`Error`] is the error of the two image writers.
 //!
-//! A symlink target sits inline in its inode, so a target that does not fit the
-//! inode's block has no place in the image and both forms refuse it with
-//! [`Error::Unsupported`].
+//! # Examples
 //!
-//! The field-level layout is documented in `docs/format-reference.md`,
-//! "composefs", and pinned by the golden-image test.
+//! ```
+//! use ostrya_composefs::{Content, Directory, FsVerityHasher, Metadata, Node, Regular};
+//!
+//! let mut root = Directory::new(Metadata { mode: 0o755, ..Metadata::default() });
+//! let meta = Metadata { mode: 0o644, ..Metadata::default() };
+//! root.insert("empty", Node::Regular(Regular { meta, content: Content::Empty }));
+//!
+//! let image = ostrya_composefs::build_image(&root)?;
+//! assert_eq!(FsVerityHasher::hash(&image.bytes), image.fs_verity);
+//!
+//! // The streaming writer writes the same bytes and returns the same digest.
+//! let mut sink = Vec::new();
+//! assert_eq!(ostrya_composefs::write_image_to(&root, &mut sink)?, image.fs_verity);
+//! assert_eq!(sink, image.bytes);
+//! # Ok::<(), ostrya_composefs::Error>(())
+//! ```
+
+// tests/golden.rs compares the output byte for byte with images that the
+// `ostree` command wrote.
 
 mod fsverity;
 mod tree;
@@ -42,13 +51,14 @@ pub use fsverity::FsVerityHasher;
 pub use tree::{Content, Directory, Metadata, Node, Regular, Symlink};
 pub use writer::write_image_to;
 
-/// A tree the writer has no image for, or a sink that failed.
+/// The error of [`build_image`] and [`write_image_to`].
 #[derive(Debug)]
 pub enum Error {
-    /// The tree carries something the image has no place for. The message
-    /// names it.
+    /// A tree item that the image cannot hold.
+    ///
+    /// The message names the item.
     Unsupported(String),
-    /// The sink returned an error.
+    /// An I/O error from the sink.
     Io(std::io::Error),
 }
 
@@ -76,27 +86,31 @@ impl From<std::io::Error> for Error {
     }
 }
 
-/// A generated composefs EROFS image and its fs-verity digest.
+/// A composefs EROFS image in memory, with its fs-verity digest.
 pub struct Image {
-    /// The complete EROFS image bytes.
+    /// The bytes of the complete EROFS image.
     pub bytes: Vec<u8>,
-    /// The image's fs-verity digest (SHA-256, 4096-byte blocks, zero salt).
+    /// The fs-verity digest of the image (SHA-256, 4096-byte blocks, no salt).
     ///
-    /// This is the value the `ostree` tool stores in a commit's
-    /// `ostree.composefs.digest.v0` metadata key.
+    /// The `ostree` command stores this value in the
+    /// `ostree.composefs.digest.v0` key of the commit metadata.
     pub fs_verity: [u8; 32],
 }
 
-/// Build the composefs EROFS image for the tree rooted at `root`.
+/// Writes the composefs EROFS image of the tree at `root` into memory.
 ///
-/// The writer injects the composefs overlay-whiteout table (256 char-device
-/// stubs named `00`..`ff`) into the root directory and marks the root opaque,
-/// as the composefs image writer does; those entries are format mechanics and
-/// are not part of the caller's tree.
+/// The bytes and the digest are the same as the result of [`write_image_to`].
+/// [Image format](write_image_to#image-format) gives the layout of the image.
 ///
-/// A symlink whose target does not fit its inode's block is
-/// [`Error::Unsupported`], as [`Symlink`] states. Panics when an xattr name or
-/// a value exceeds what [`Metadata`] states.
+/// # Errors
+///
+/// - [`Error::Unsupported`] if a symlink target is too long for its inode
+///   block. [`Symlink::target`] gives the limit.
+///
+/// # Panics
+///
+/// Panics if an xattr name, an xattr value, or the xattr area of one node is
+/// larger than the limits on [`Metadata::xattrs`].
 pub fn build_image(root: &Directory) -> Result<Image, Error> {
     let plan = writer::plan(root)?;
     let mut bytes = Vec::with_capacity(plan.size);
@@ -109,7 +123,7 @@ pub fn build_image(root: &Directory) -> Result<Image, Error> {
 mod send_sync {
     use super::*;
 
-    // The public writer types move freely across tasks and threads.
+    // The public types are `Send` and `Sync`.
     fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]

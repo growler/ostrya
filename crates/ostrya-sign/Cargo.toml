@@ -17,10 +17,11 @@ tokio = ["ostrya-rt?/tokio"]
 sign-spki = ["dep:p256"]
 sign-gpg = ["dep:ostrya-rt"]
 
-# The crate documentation links items that a feature gates. docs.rs adds
-# these two features to the default set, and the links then resolve.
+# docs.rs adds these two features to the default set, so the pages show the
+# items that a feature gates, with a feature badge on each.
 [package.metadata.docs.rs]
 features = ["sign-spki", "sign-gpg"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 ostrya-core = { workspace = true }

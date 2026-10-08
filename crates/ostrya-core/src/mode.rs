@@ -1,30 +1,44 @@
 //! Repository storage modes.
-//!
-//! The mode determines how a `File` object is materialized on disk and how the
-//! loose-path extension is chosen. The mode strings here are the exact tokens
-//! the `ostree` tool writes to `config` under `[core] mode=`.
 
 /// The on-disk storage mode of a repository.
+///
+/// The mode decides how a repository stores a [`File`] object and which
+/// loose-path extension the object gets. The mode strings are the tokens
+/// that the `ostree` command writes to `config` under `[core] mode=`.
+///
+/// [`File`]: crate::ObjectType::File
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RepoMode {
-    /// Real files with real uid/gid/mode/xattrs on the inode.
+    /// Real files, with the uid, gid, mode, and xattrs on the inode.
     Bare,
-    /// Metadata carried in the `user.ostreemeta` xattr; unprivileged-writable.
+    /// Files with the metadata in the `user.ostreemeta` xattr.
+    ///
+    /// A process with no privileges can write a repository of this mode.
     BareUser,
-    /// No xattr metadata; uid/gid discarded, canonical mode on the inode.
+    /// Files with no xattr metadata.
+    ///
+    /// This mode drops the uid and the gid. The inode holds the canonical mode.
     BareUserOnly,
-    /// Like bare-user, but xattrs live in separate `.file-xattrs` objects.
+    /// Storage as in [`BareUser`](Self::BareUser), with the xattrs in
+    /// separate `.file-xattrs` objects.
     BareSplitXattrs,
-    /// Content zlib-RAW-compressed as `.filez`; HTTP-servable.
+    /// File content in `.filez` objects, compressed with raw DEFLATE.
+    ///
+    /// An HTTP server can serve a repository of this mode.
     Archive,
-    /// Port extension (development-only): `bare-user` storage with the logical
-    /// mode never applied to the inode, for group-shared repositories.
+    /// Storage as in [`BareUser`](Self::BareUser), for a repository that a
+    /// group shares.
+    ///
+    /// This mode never applies the logical mode to the inode. It is an ostrya
+    /// extension for development only.
     BareUserShared,
 }
 
 impl RepoMode {
-    /// Parse a `[core] mode=` string. `archive` is an accepted alias for
-    /// `archive-z2`.
+    /// Parses a `[core] mode=` string.
+    ///
+    /// Returns `None` for an unknown string. `archive` is an accepted alias
+    /// for `archive-z2`.
     pub fn from_mode_str(s: &str) -> Option<RepoMode> {
         Some(match s {
             "bare" => RepoMode::Bare,
@@ -37,8 +51,9 @@ impl RepoMode {
         })
     }
 
-    /// The canonical `[core] mode=` string. Archive always serializes back as
-    /// `archive-z2`.
+    /// Returns the canonical `[core] mode=` string.
+    ///
+    /// [`Archive`](Self::Archive) always gives `archive-z2`.
     pub fn as_mode_str(self) -> &'static str {
         match self {
             RepoMode::Bare => "bare",
@@ -50,9 +65,14 @@ impl RepoMode {
         }
     }
 
-    /// Whether `File` content objects are stored compressed. The `z`
-    /// loose-path suffix applies only to a `File` content object in this mode;
-    /// the auxiliary non-meta objects carry no suffix.
+    /// Returns `true` if the mode stores [`File`] content objects compressed.
+    ///
+    /// The `z` loose-path suffix applies only to a [`File`] content object in
+    /// this mode. The auxiliary non-meta objects carry no suffix.
+    /// [`ObjectType::extension`] gives each extension.
+    ///
+    /// [`File`]: crate::ObjectType::File
+    /// [`ObjectType::extension`]: crate::ObjectType::extension
     pub fn is_archive(self) -> bool {
         matches!(self, RepoMode::Archive)
     }

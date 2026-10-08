@@ -1,22 +1,9 @@
-//! File content-object headers and the content checksum.
+//! The header of a content object, its framing, and the content checksum.
 //!
-//! A content object (`.file` / `.filez`) is a header GVariant followed by the
-//! payload. Two header wire forms exist:
-//!
-//! - uncompressed `(uuuusa(ayay))` -- bare-mode streams and checksum
-//!   computation;
-//! - archive `(tuuuusa(ayay))` -- stored on disk in archive mode, with the
-//!   uncompressed payload size prepended.
-//!
-//! The scalar fields (uid, gid, mode, rdev, size) are big-endian at the value
-//! level; [`FileHeader`] holds them in host order and the (de)serializers
-//! convert. On parse, a nonzero rdev and a mode that is neither a regular
-//! file nor a symlink are rejected.
-//!
-//! The on-disk framing of a content stream prefixes the header variant with
-//! its length: `[4 bytes BE u32 length][4 NUL bytes][header variant]`. The
-//! object checksum is SHA-256 over the framed uncompressed header followed by
-//! the raw payload; [`ContentHasher`] computes it.
+//! A content object (a `.file` or a `.filez` object) holds a framed header and
+//! then the payload. [`FileHeader`] reads and writes the header. [`frame`] and
+//! [`split_framed`] add and remove the framing. [`ContentHasher`] computes the
+//! checksum of a content object.
 
 use ostrya_gvariant::{GvDecode, GvEncode, GvType};
 use sha2::{Digest, Sha256};
@@ -32,23 +19,45 @@ pub(crate) const S_IFREG: u32 = 0o100000;
 pub(crate) const S_IFLNK: u32 = 0o120000;
 
 /// The metadata of one file content object, common to all header wire forms.
+///
+/// # Wire forms
+///
+/// The header has two GVariant forms:
+///
+/// - The uncompressed form `(uuuusa(ayay))` holds the uid, the gid, the mode,
+///   the rdev, the symlink target, and the xattrs. The content stream of a
+///   bare mode holds this form. The content checksum uses this form.
+/// - The archive form `(tuuuusa(ayay))` holds the uncompressed payload size
+///   first, then the fields of the uncompressed form. This form is the on-disk
+///   form of `archive` mode.
+///
+/// The scalar fields (uid, gid, mode, rdev, and size) are big-endian in the
+/// serialized bytes. A `FileHeader` holds them in host order, and the parse and
+/// serialize functions convert them. The serialize functions write an rdev of
+/// 0, and the parse functions refuse an rdev that is not 0.
+///
+/// [`parse_stat_metadata`](FileHeader::parse_stat_metadata) reads a third
+/// layout, the `user.ostreemeta` xattr of a `bare-user` file object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
     /// The owner uid.
     pub uid: u32,
     /// The owner gid.
     pub gid: u32,
-    /// Full logical `st_mode`; the file-type bits must name a regular file or
-    /// a symlink.
+    /// The full logical `st_mode`.
+    ///
+    /// The file-type bits must name a regular file or a symlink.
     pub mode: u32,
-    /// Symlink target; must be empty for regular files.
+    /// The target of a symlink.
+    ///
+    /// A regular file must have an empty target.
     pub symlink_target: String,
-    /// The file's extended attributes.
+    /// The extended attributes of the file.
     pub xattrs: Xattrs,
 }
 
 impl FileHeader {
-    /// Whether the mode names a symlink.
+    /// Returns `true` if the mode names a symlink.
     pub fn is_symlink(&self) -> bool {
         self.mode & S_IFMT == S_IFLNK
     }
@@ -93,37 +102,94 @@ impl FileHeader {
         Ok(header)
     }
 
-    /// Parse the uncompressed header form `(uuuusa(ayay))`.
+    /// Parses the uncompressed header form `(uuuusa(ayay))`.
+    ///
+    /// `data` holds the header bytes with no framing. [`split_framed`] removes
+    /// the framing.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Gvariant`] if `data` is not a normal-form GVariant of type
+    ///   `(uuuusa(ayay))`, or if the xattr array is not in normal form.
+    /// - [`Error::InvalidFileHeader`] with the reason "rdev is not zero" if
+    ///   the rdev field is not 0.
+    /// - [`Error::InvalidXattrs`] if an xattr name is not in the stored form,
+    ///   or if the names are not in strictly increasing byte order. The stored
+    ///   form has one trailing NUL, no interior NUL, and a prefix that is not
+    ///   empty.
+    /// - [`Error::InvalidFileHeader`] with the reason "mode is not a regular
+    ///   file or symlink" if the file-type bits of the mode name a different
+    ///   type.
+    /// - [`Error::InvalidFileHeader`] with the reason "regular file with a
+    ///   symlink target" if a regular file has a symlink target that is not
+    ///   empty.
     pub fn parse(data: &[u8]) -> Result<FileHeader> {
         let (uid, gid, mode, rdev, target, xattrs): (Be32, Be32, Be32, Be32, &str, &[u8]) =
             GvDecode::decode(data)?;
         FileHeader::build(uid.0, gid.0, mode.0, rdev.0, target, xattrs)
     }
 
-    /// Serialize the uncompressed header form `(uuuusa(ayay))`.
+    /// Serializes the uncompressed header form `(uuuusa(ayay))`.
+    ///
+    /// The output has no framing.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFileHeader`] with the reason "mode is not a regular
+    ///   file or symlink" if the file-type bits of [`mode`](Self::mode) name a
+    ///   different type.
+    /// - [`Error::InvalidFileHeader`] with the reason "regular file with a
+    ///   symlink target" if a regular file has a symlink target that is not
+    ///   empty.
+    /// - [`Error::Gvariant`] if the symlink target holds a NUL byte.
     pub fn serialize(&self) -> Result<Vec<u8>> {
         self.validate()?;
         Ok(ostrya_gvariant::encode_to_vec(self)?)
     }
 
-    /// Parse the stat-metadata form `(uuua(ayay))` -- the layout dirmeta uses,
-    /// and the layout stored in the `user.ostreemeta` xattr of a bare-user
-    /// `.file` object. The three scalar fields are uid, gid, and the full
-    /// `st_mode` (big-endian); there is no rdev and no symlink-target field, so
-    /// the returned header has an empty target. A bare-user symlink carries a
-    /// symlink `st_mode` here and keeps its target in the file content, which
-    /// the caller supplies separately.
+    /// Parses the stat-metadata form `(uuua(ayay))`.
+    ///
+    /// The form holds the uid, the gid, and the full `st_mode`, big-endian,
+    /// then the sorted xattr array. It is the layout of a dirmeta object. It is
+    /// also the layout of the `user.ostreemeta` xattr of a `.file` object in
+    /// `bare-user` mode.
+    ///
+    /// The form has no rdev field and no symlink-target field, so the returned
+    /// header has an empty target. A `bare-user` symlink has a symlink
+    /// `st_mode` in this form and keeps its target in the file content. The
+    /// caller reads the target from the file content.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Gvariant`] if `data` is not a normal-form GVariant of type
+    ///   `(uuua(ayay))`, or if the xattr array is not in normal form.
+    /// - [`Error::InvalidXattrs`] if an xattr name is not in the stored form,
+    ///   or if the names are not in strictly increasing byte order. The stored
+    ///   form has one trailing NUL, no interior NUL, and a prefix that is not
+    ///   empty.
+    /// - [`Error::InvalidFileHeader`] with the reason "mode is not a regular
+    ///   file or symlink" if the file-type bits of the mode name a different
+    ///   type. The function refuses a directory mode, so it does not read a
+    ///   dirmeta object.
     pub fn parse_stat_metadata(data: &[u8]) -> Result<FileHeader> {
         let (uid, gid, mode, xattrs): (Be32, Be32, Be32, &[u8]) = GvDecode::decode(data)?;
         FileHeader::build(uid.0, gid.0, mode.0, 0, "", xattrs)
     }
 
-    /// Serialize the stat-metadata form `(uuua(ayay))` -- uid, gid, and the
-    /// full `st_mode` (big-endian) followed by the sorted xattr array. This is
-    /// the layout stored in the `user.ostreemeta` xattr of a bare-user `.file`
-    /// object; a bare-user symlink carries its `S_IFLNK` mode here and keeps its
-    /// target in the file content. There is no rdev or symlink-target field.
-    /// The inverse of [`parse_stat_metadata`](Self::parse_stat_metadata).
+    /// Serializes the stat-metadata form `(uuua(ayay))`.
+    ///
+    /// [`parse_stat_metadata`](Self::parse_stat_metadata) describes the form
+    /// and reads the output back. The output holds no symlink target, so a
+    /// symlink keeps only its `S_IFLNK` mode here.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFileHeader`] with the reason "mode is not a regular
+    ///   file or symlink" if the file-type bits of [`mode`](Self::mode) name a
+    ///   different type.
+    /// - [`Error::InvalidFileHeader`] with the reason "regular file with a
+    ///   symlink target" if a regular file has a symlink target that is not
+    ///   empty.
     pub fn serialize_stat_metadata(&self) -> Result<Vec<u8>> {
         self.validate()?;
         Ok(ostrya_gvariant::encode_to_vec(&(
@@ -134,8 +200,25 @@ impl FileHeader {
         ))?)
     }
 
-    /// Parse the archive header form `(tuuuusa(ayay))`, returning the header
-    /// and the uncompressed payload size.
+    /// Parses the archive header form `(tuuuusa(ayay))`.
+    ///
+    /// The function returns the header and the uncompressed payload size.
+    /// `data` holds the header bytes with no framing.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Gvariant`] if `data` is not a normal-form GVariant of type
+    ///   `(tuuuusa(ayay))`, or if the xattr array is not in normal form.
+    /// - [`Error::InvalidFileHeader`] with the reason "rdev is not zero" if
+    ///   the rdev field is not 0.
+    /// - [`Error::InvalidXattrs`] if an xattr name is not in the stored form,
+    ///   or if the names are not in strictly increasing byte order.
+    /// - [`Error::InvalidFileHeader`] with the reason "mode is not a regular
+    ///   file or symlink" if the file-type bits of the mode name a different
+    ///   type.
+    /// - [`Error::InvalidFileHeader`] with the reason "regular file with a
+    ///   symlink target" if a regular file has a symlink target that is not
+    ///   empty.
     pub fn parse_archive(data: &[u8]) -> Result<(FileHeader, u64)> {
         let (size, uid, gid, mode, rdev, target, xattrs): (
             Be64,
@@ -152,7 +235,20 @@ impl FileHeader {
         ))
     }
 
-    /// Serialize the archive header form `(tuuuusa(ayay))`.
+    /// Serializes the archive header form `(tuuuusa(ayay))`.
+    ///
+    /// `uncompressed_size` is the size of the payload before compression. The
+    /// output has no framing.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFileHeader`] with the reason "mode is not a regular
+    ///   file or symlink" if the file-type bits of [`mode`](Self::mode) name a
+    ///   different type.
+    /// - [`Error::InvalidFileHeader`] with the reason "regular file with a
+    ///   symlink target" if a regular file has a symlink target that is not
+    ///   empty.
+    /// - [`Error::Gvariant`] if the symlink target holds a NUL byte.
     pub fn serialize_archive(&self, uncompressed_size: u64) -> Result<Vec<u8>> {
         self.validate()?;
         Ok(ostrya_gvariant::encode_to_vec(
@@ -160,19 +256,45 @@ impl FileHeader {
         )?)
     }
 
-    /// Write the framed uncompressed form into `out`: the bytes of
-    /// `frame(&self.serialize()?)`. The call clears `out` first, so a caller
-    /// that uses one buffer for all its headers grows `out` only for a header
-    /// longer than each header before it. After an error the content of `out`
-    /// is unspecified.
+    /// Writes the framed uncompressed header form into `out`.
+    ///
+    /// The bytes equal `frame(&self.serialize()?)`. The function clears `out`
+    /// first. A caller that uses one buffer for all its headers grows `out`
+    /// only for a header that is longer than each header before it. After an
+    /// error, the content of `out` is unspecified.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFileHeader`] with the reason "mode is not a regular
+    ///   file or symlink" if the file-type bits of [`mode`](Self::mode) name a
+    ///   different type.
+    /// - [`Error::InvalidFileHeader`] with the reason "regular file with a
+    ///   symlink target" if a regular file has a symlink target that is not
+    ///   empty.
+    /// - [`Error::Gvariant`] if the symlink target holds a NUL byte.
+    /// - [`Error::InvalidFileHeader`] with the reason "header exceeds the
+    ///   framing length limit" if the header is longer than `u32::MAX` bytes.
     pub fn write_framed(&self, out: &mut Vec<u8>) -> Result<()> {
         self.validate()?;
         write_framed_with(out, |out| self.encode(out))
     }
 
-    /// Write the framed archive form into `out`: the bytes of
-    /// `frame(&self.serialize_archive(uncompressed_size)?)`, with the rules of
-    /// [`write_framed`](Self::write_framed).
+    /// Writes the framed archive header form into `out`.
+    ///
+    /// The bytes equal `frame(&self.serialize_archive(uncompressed_size)?)`.
+    /// The buffer rules of [`write_framed`](Self::write_framed) apply.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFileHeader`] with the reason "mode is not a regular
+    ///   file or symlink" if the file-type bits of [`mode`](Self::mode) name a
+    ///   different type.
+    /// - [`Error::InvalidFileHeader`] with the reason "regular file with a
+    ///   symlink target" if a regular file has a symlink target that is not
+    ///   empty.
+    /// - [`Error::Gvariant`] if the symlink target holds a NUL byte.
+    /// - [`Error::InvalidFileHeader`] with the reason "header exceeds the
+    ///   framing length limit" if the header is longer than `u32::MAX` bytes.
     pub fn write_framed_archive(&self, uncompressed_size: u64, out: &mut Vec<u8>) -> Result<()> {
         self.validate()?;
         write_framed_with(out, |out| {
@@ -180,7 +302,8 @@ impl FileHeader {
         })
     }
 
-    /// The fields of the archive header form `(tuuuusa(ayay))`.
+    /// Returns the fields of the archive header form `(tuuuusa(ayay))`, with
+    /// an rdev of 0.
     fn archive_fields(
         &self,
         uncompressed_size: u64,
@@ -197,9 +320,15 @@ impl FileHeader {
     }
 }
 
-/// Clear `out`, write the framing prefix with a placeholder length, append the
-/// header variant that `encode` writes, and patch the length. The variant
-/// starts at offset 8, so its alignment in `out` is its own alignment.
+/// Writes a framed header into `out` in four steps:
+///
+/// 1. Clears `out`.
+/// 2. Writes the framing prefix with a placeholder length.
+/// 3. Appends the header variant that `encode` writes.
+/// 4. Writes the length into the prefix.
+///
+/// The variant starts at offset 8, so its alignment in `out` is its own
+/// alignment.
 fn write_framed_with(
     out: &mut Vec<u8>,
     encode: impl FnOnce(&mut Vec<u8>) -> ostrya_gvariant::Result<()>,
@@ -213,7 +342,7 @@ fn write_framed_with(
     Ok(())
 }
 
-/// The uncompressed header form, `(uuuusa(ayay))`.
+/// The GVariant type of the uncompressed header form, `(uuuusa(ayay))`.
 impl GvType for FileHeader {
     const SIGNATURE: &'static str = "(uuuusa(ayay))";
     // Greatest member alignment: the u32 fields.
@@ -221,8 +350,12 @@ impl GvType for FileHeader {
     const FIXED_SIZE: Option<usize> = None;
 }
 
-/// The encode path is purely mechanical: domain validation runs in the
-/// `serialize*` and `write_framed*` entry points, which are the only callers.
+/// Writes the uncompressed header form with an rdev of 0.
+///
+/// The encoder does not check the mode or the symlink target.
+/// [`FileHeader::serialize`] and [`FileHeader::write_framed`] check them.
+// The `serialize*` and `write_framed*` functions are the only callers in this
+// crate, and each one checks the header before it encodes.
 impl GvEncode for FileHeader {
     fn encode(&self, out: &mut Vec<u8>) -> ostrya_gvariant::Result<()> {
         (
@@ -237,8 +370,15 @@ impl GvEncode for FileHeader {
     }
 }
 
-/// Prefix serialized header bytes with the content-stream framing:
-/// `[4 bytes BE u32 length][4 NUL bytes][header]`.
+/// Adds the content-stream framing in front of serialized header bytes.
+///
+/// The framed bytes are `[4 bytes BE u32 length][4 NUL bytes][header]`. The
+/// length is the byte count of `header`.
+///
+/// # Errors
+///
+/// - [`Error::InvalidFileHeader`] with the reason "header exceeds the framing
+///   length limit" if `header` is longer than `u32::MAX` bytes.
 pub fn frame(header: &[u8]) -> Result<Vec<u8>> {
     let len = u32::try_from(header.len())
         .map_err(|_| Error::InvalidFileHeader("header exceeds the framing length limit"))?;
@@ -249,8 +389,19 @@ pub fn frame(header: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Split a framed content stream into the header variant bytes and the
-/// remainder (the payload, where present).
+/// Splits a framed content stream into the header bytes and the rest.
+///
+/// The header bytes have no framing. The rest is the payload, if the stream
+/// has one. [`frame`] describes the framing.
+///
+/// # Errors
+///
+/// - [`Error::InvalidFileHeader`] with the reason "framed stream is shorter
+///   than its length prefix" if `data` is shorter than 8 bytes.
+/// - [`Error::InvalidFileHeader`] with the reason "framing padding is not
+///   zero" if one of the bytes 4 to 7 is not 0.
+/// - [`Error::InvalidFileHeader`] with the reason "framed header length is out
+///   of bounds" if the length in the prefix points past the end of `data`.
 pub fn split_framed(data: &[u8]) -> Result<(&[u8], &[u8])> {
     if data.len() < 8 {
         return Err(Error::InvalidFileHeader(
@@ -270,18 +421,63 @@ pub fn split_framed(data: &[u8]) -> Result<(&[u8], &[u8])> {
     Ok((&data[8..end], &data[end..]))
 }
 
-/// Computes a content-object checksum: SHA-256 over the framed uncompressed
-/// header followed by the raw (uncompressed) payload. Symlinks carry no
-/// payload, so their checksum is [`finish`](ContentHasher::finish) right
-/// after construction.
+/// A streaming hasher for the checksum of a content object.
+///
+/// The checksum is the SHA-256 digest of the framed uncompressed header, then
+/// the raw payload. The raw payload is the payload before compression. A
+/// symlink has no payload, so its checksum is the result of
+/// [`finish`](ContentHasher::finish) directly after
+/// [`new`](ContentHasher::new).
+///
+/// # Examples
+///
+/// ```
+/// use ostrya_core::filehdr::{ContentHasher, FileHeader, frame};
+/// use ostrya_core::{Checksum, Xattrs};
+///
+/// // A regular file: uid 0, gid 0, mode 0644, no xattrs.
+/// let header = FileHeader {
+///     uid: 0,
+///     gid: 0,
+///     mode: 0o100644,
+///     symlink_target: String::new(),
+///     xattrs: Xattrs::empty(),
+/// };
+/// let payload = b"hello, world\n";
+///
+/// let mut hasher = ContentHasher::new(&header)?;
+/// for chunk in payload.chunks(4) {
+///     hasher.update(chunk);
+/// }
+/// let checksum = hasher.finish();
+///
+/// // The same digest over the framed header and the payload in one buffer.
+/// let mut stream = frame(&header.serialize()?)?;
+/// stream.extend_from_slice(payload);
+/// assert_eq!(checksum, Checksum::sha256(&stream));
+/// # Ok::<(), ostrya_core::Error>(())
+/// ```
 pub struct ContentHasher {
     hasher: Sha256,
 }
 
 impl ContentHasher {
-    /// Start a checksum with the framed uncompressed form of `header`. The
-    /// framing prefix and the header bytes are fed to the hasher directly,
-    /// without materializing the framed buffer.
+    /// Creates a hasher and feeds it the framed uncompressed form of `header`.
+    ///
+    /// The function feeds the framing prefix and the header bytes to the
+    /// hasher one after the other. It builds no framed buffer.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFileHeader`] with the reason "mode is not a regular
+    ///   file or symlink" if the file-type bits of the mode name a different
+    ///   type.
+    /// - [`Error::InvalidFileHeader`] with the reason "regular file with a
+    ///   symlink target" if a regular file has a symlink target that is not
+    ///   empty.
+    /// - [`Error::Gvariant`] if the symlink target holds a NUL byte.
+    /// - [`Error::InvalidFileHeader`] with the reason "header exceeds the
+    ///   framing length limit" if the header is longer than `u32::MAX` bytes.
     pub fn new(header: &FileHeader) -> Result<ContentHasher> {
         let serialized = header.serialize()?;
         let len = u32::try_from(serialized.len())
@@ -293,12 +489,12 @@ impl ContentHasher {
         Ok(ContentHasher { hasher })
     }
 
-    /// Feed the next chunk of raw payload.
+    /// Feeds the next chunk of the raw payload to the hasher.
     pub fn update(&mut self, payload: &[u8]) {
         self.hasher.update(payload);
     }
 
-    /// The content-object checksum.
+    /// Returns the checksum of the content object.
     pub fn finish(self) -> Checksum {
         Checksum::from_bytes(self.hasher.finalize().into())
     }
@@ -350,9 +546,9 @@ mod tests {
         assert_eq!(FileHeader::parse_archive(&bytes).unwrap(), (header, 1234));
     }
 
-    /// The framed forms equal the framing of the serialized forms, for a
-    /// regular file with xattrs and for a symlink, also into a buffer that
-    /// holds bytes of an earlier call. A header that fails validation is
+    /// Checks that the framed forms equal the framing of the serialized forms.
+    /// The test uses a regular file with xattrs and a symlink, and a buffer
+    /// that holds bytes of an earlier call. A header that fails a check is
     /// refused.
     #[test]
     fn the_framed_forms_equal_the_framed_serialization() {
@@ -386,9 +582,10 @@ mod tests {
 
     #[test]
     fn stat_metadata_decodes_the_bare_user_ostreemeta_form() {
-        // The exact `user.ostreemeta` bytes a bare-user `.file` carries for a
-        // 0644 root-owned regular file, recovered from a tool-created repo:
-        // uid 0, gid 0, mode 0o100644 (all big-endian), no xattrs.
+        // The exact `user.ostreemeta` bytes of a bare-user `.file` object for
+        // a 0644 regular file that root owns. The bytes come from a repository
+        // that the `ostree` command created: uid 0, gid 0, mode 0o100644 (all
+        // big-endian), no xattrs.
         let regular = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x81, 0xa4];
         let hdr = FileHeader::parse_stat_metadata(&regular).unwrap();
         assert_eq!((hdr.uid, hdr.gid, hdr.mode), (0, 0, 0o100644));
@@ -396,17 +593,17 @@ mod tests {
         assert_eq!(hdr.symlink_target, "");
         assert!(hdr.xattrs.is_empty());
 
-        // The symlink form carries an S_IFLNK mode; the target lives in the
-        // file content, so the parsed header's target stays empty.
+        // The symlink form holds an S_IFLNK mode. The target is in the file
+        // content, so the target of the parsed header stays empty.
         let symlink = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xa1, 0xff];
         let hdr = FileHeader::parse_stat_metadata(&symlink).unwrap();
         assert_eq!((hdr.uid, hdr.gid, hdr.mode), (0, 0, 0o120777));
         assert!(hdr.is_symlink());
         assert_eq!(hdr.symlink_target, "");
 
-        // The wire layout is exactly dirmeta's, but a directory mode names
-        // neither a regular file nor a symlink, so it is rejected: this
-        // decoder only describes `.file` objects.
+        // The wire layout is the dirmeta layout. A directory mode names no
+        // regular file and no symlink, so the parse refuses it. This decoder
+        // reads `.file` objects only.
         let dir_meta = crate::DirMeta {
             uid: 1000,
             gid: 100,
@@ -433,8 +630,8 @@ mod tests {
         assert_eq!(hdr.xattrs.len(), 1);
     }
 
-    /// Serialize an arbitrary uncompressed-form header through the `Value`
-    /// tree, bypassing the struct's validation.
+    /// Serializes any uncompressed-form header through the `Value` tree. The
+    /// checks of `FileHeader` do not run.
     fn craft(uid: u32, gid: u32, mode: u32, rdev: u32, target: &str) -> Vec<u8> {
         let ty = Type::parse("(uuuusa(ayay))").unwrap();
         let value = Value::Tuple(vec![
@@ -450,8 +647,9 @@ mod tests {
 
     #[test]
     fn stat_metadata_serialize_round_trips_and_matches_the_tool_bytes() {
-        // A 0644 root-owned regular file: the exact `user.ostreemeta` bytes a
-        // bare-user `.file` carries, recovered from a tool-created repo.
+        // A 0644 regular file that root owns. These are the exact
+        // `user.ostreemeta` bytes of a bare-user `.file` object, from a
+        // repository that the `ostree` command created.
         let header = regular(0o100644);
         let header = FileHeader {
             uid: 0,
@@ -463,8 +661,9 @@ mod tests {
             [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x81, 0xa4]
         );
 
-        // A symlink stored as a regular file keeps mode S_IFLNK|0777 here; the
-        // tool writes these 12 bytes for a 1000:100 symlink's user.ostreemeta.
+        // A symlink stored as a regular file keeps mode S_IFLNK|0777 here. The
+        // `ostree` command writes these 12 bytes to the user.ostreemeta xattr
+        // of a symlink with uid 1000 and gid 100.
         let link = FileHeader {
             uid: 1000,
             gid: 100,
@@ -475,7 +674,7 @@ mod tests {
             [0u8, 0, 3, 0xe8, 0, 0, 0, 0x64, 0, 0, 0xa1, 0xff]
         );
 
-        // Round-trips through parse for a header bearing xattrs.
+        // A header with xattrs round-trips through parse.
         let with_xattr = FileHeader {
             xattrs: Xattrs::new([(b"user.a\0".to_vec(), b"1".to_vec())]).unwrap(),
             ..regular(0o100600)
@@ -567,8 +766,9 @@ mod tests {
 
     #[test]
     fn scalar_fields_are_big_endian_on_the_wire() {
-        // uid/gid/mode/rdev are the first four u32 members of (uuuusa(ayay))
-        // and are stored big-endian; a missed or asymmetric swap shows here.
+        // The uid, gid, mode, and rdev are the first four u32 members of
+        // (uuuusa(ayay)), stored big-endian. A missing or asymmetric byte
+        // swap fails this test.
         let header = regular(0o100644); // uid 1000, gid 1000
         let bytes = header.serialize().unwrap();
         assert_eq!(&bytes[0..4], &1000u32.to_be_bytes());

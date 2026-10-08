@@ -1,32 +1,45 @@
 #![forbid(unsafe_code)]
 
-//! The runtime abstraction the rest of ostrya is written against.
+//! The async runtime layer of ostrya, over a `smol` or a `tokio` backend.
 //!
-//! This crate is the only place that knows which async backend is compiled.
-//! It exposes [`unblock`] and [`unblock_detached`] (the entries to the
-//! blocking pool, for awaited and for detached work) with
-//! [`blocking_threads`] (the size of that pool), [`File`]
-//! (an async file over an already-open descriptor) with [`FileReader`] (its
-//! read-only form, which reads ahead by at most 256 KiB and never seeks),
-//! [`Timer`] (a one-shot
-//! async delay for retry loops) with [`Deadline`] (a restartable window a
-//! `poll_*` method can check), [`Command`] (a short-lived helper process
-//! with piped standard streams; [`Command::spawn`] starts a long-lived
-//! [`Child`] with piped standard input and standard output), [`spawn`]
-//! (concurrent tasks, with the [`JoinHandle`] they return), [`TcpStream`] and
-//! [`TcpListener`] (async TCP), and [`block_on`] (a convenience driver used by
-//! tests and doctests). The wider library is written against these plus the
-//! `futures-io` traits, so it stays runtime-neutral.
+//! The other ostrya crates run tasks, blocking work, file I/O, TCP, timers,
+//! and helper processes through this crate. It is the only ostrya crate that
+//! names the backend. Its stream types implement the `futures-io` traits with
+//! each backend, so the code of a caller does not change with the backend.
+//! The crate compiles on Unix and Windows.
 //!
-//! The crate compiles on Unix and Windows. `File::from(OwnedFd)` and
-//! `FileReader::from(OwnedFd)` are Unix-only.
+//! # Entry points
 //!
-//! Backend selection is feature-gated and additive-safe:
+//! - [`spawn`] starts a task and returns a [`JoinHandle`].
+//! - [`unblock`] and [`unblock_detached`] run a closure on the blocking pool.
+//! - [`File`] and [`FileReader`] stream over an open file descriptor.
+//! - [`TcpStream`] and [`TcpListener`] carry async TCP.
+//! - [`Command`] runs a helper process.
+//! - [`Timer`] and [`Deadline`] measure a time window.
+//! - [`block_on`] runs a future to completion on the current thread.
 //!
-//! - `smol` (default) selects the `smol` backend.
-//! - `tokio` selects the `tokio` backend and takes precedence when both
-//!   features are enabled, so Cargo feature unification cannot break a build.
-//! - enabling neither is a compile error.
+//! # Features
+//!
+//! - `smol` (default): the `smol` backend.
+//! - `tokio`: the `tokio` backend. It adds the `tokio_io` module, and
+//!   [`File`] and [`TcpStream`] also implement the tokio I/O traits.
+//!
+//! If both features are on, `tokio` selects the backend, so a build in which
+//! Cargo unifies the two features still compiles. If neither feature is on,
+//! the build stops with a compile error. With the `tokio` feature, the I/O,
+//! the timers, and the tasks of this crate need a tokio runtime context.
+//! [`block_on`] gives one.
+//!
+//! # Examples
+//!
+//! ```
+//! let total = ostrya_rt::block_on(async {
+//!     let task = ostrya_rt::spawn(async { 6 * 7 });
+//!     let sum = ostrya_rt::unblock(|| (1..=4).sum::<u32>()).await;
+//!     task.await + sum
+//! });
+//! assert_eq!(total, 52);
+//! ```
 
 #[cfg(not(any(feature = "smol", feature = "tokio")))]
 compile_error!(
@@ -47,10 +60,12 @@ pub use process::{Child, ChildStdin, ChildStdout, Command};
 pub use task::{JoinHandle, spawn};
 pub use timer::{Deadline, Timer};
 
-/// The tokio I/O trait surface the public stream types in `ostrya` implement
-/// under the `tokio` feature. Re-exported here so `ostrya` needs no direct
-/// tokio dependency to name these traits.
+/// The tokio I/O traits, for a crate with no direct `tokio` dependency.
+///
+/// [`File`] implements `AsyncRead`, `AsyncWrite`, and `AsyncSeek`.
+/// [`TcpStream`] implements `AsyncRead` and `AsyncWrite`.
 #[cfg(feature = "tokio")]
 pub mod tokio_io {
+    #[doc(no_inline)]
     pub use tokio::io::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 }

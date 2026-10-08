@@ -1,19 +1,23 @@
 use crate::{Error, Result};
 
-/// Maximum container nesting depth accepted in a type signature. It is the
-/// depth the value parser and the serializer carry, so a value either of them
-/// accepts names a type this parser accepts back.
+/// The maximum container nesting depth in a type signature.
+///
+/// The value parser and the serializer use the same depth limit, so this
+/// parser accepts the type of each value that one of them accepts.
 const MAX_TYPE_DEPTH: usize = crate::de::MAX_VALUE_DEPTH;
 
 /// A GVariant type.
 ///
-/// The ostree on-disk format uses booleans, bytes, u32, u64, strings, variants,
-/// arrays, tuples, and dict entries. The remaining GVariant types -- the signed
-/// and the narrow integers, the handle, the double, the object path, the
-/// signature, and the maybe -- reach a repository through
-/// `commit --add-metadata`, which takes any value the GVariant text form states
-/// (`docs/format-reference.md`, "CLI output formats"). Any character outside the
-/// GVariant type alphabet is rejected by [`Type::parse`].
+/// The ostree on-disk format uses booleans, bytes, `u32`, `u64`, strings,
+/// variants, arrays, tuples, and dict entries. The other GVariant types are
+/// the signed and the 16-bit integers, the handle, the double, the object
+/// path, the signature, and the maybe.
+///
+/// The other types get into a repository through the `ostree commit
+/// --add-metadata` command. That command accepts a value of any type in the
+/// GVariant text form, which [`from_text`] reads.
+///
+/// [`from_text`]: crate::from_text
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     /// `b`
@@ -50,12 +54,49 @@ pub enum Type {
     Array(Box<Type>),
     /// `(<T>...)`
     Tuple(Vec<Type>),
-    /// `{<K><V>}`; the key must be a basic (non-container) type.
+    /// `{<K><V>}`
+    ///
+    /// The key `K` must be a [basic type](Type::is_basic).
     DictEntry(Box<Type>, Box<Type>),
 }
 
 impl Type {
-    /// Parse a complete type signature such as `(a{sv}aya(say)sstayay)`.
+    /// Parses a complete type signature.
+    ///
+    /// The string must hold exactly one complete type. For example,
+    /// `(a{sv}aya(say)sstayay)` is the signature of an ostree commit.
+    ///
+    /// # Errors
+    ///
+    /// The function returns [`Error::InvalidTypeString`] if the parse fails.
+    /// Its `offset` is the byte offset of the failure. Its `reason` is one of
+    /// these:
+    ///
+    /// - `unexpected end of signature` if the string ends before a complete
+    ///   type, for example `""`, `"a"`, or `"(s"`.
+    /// - `unsupported type character` if a character is outside the GVariant
+    ///   type alphabet.
+    /// - `trailing characters after a complete type` if characters follow
+    ///   the first complete type, for example `"ss"`.
+    /// - `dict-entry key must be a basic type` if the key of a dict entry is
+    ///   not a [basic type](Type::is_basic), for example `"{vs}"`.
+    /// - `expected '}' after the dict-entry value` if a dict entry holds more
+    ///   than two types or has no `}`.
+    /// - `nesting exceeds the supported depth` if the signature nests more
+    ///   than 128 levels of containers.
+    ///
+    /// # Depth limit
+    ///
+    /// A type can nest at most 128 levels of containers. Each `m`, `a`, `(`,
+    /// and `{` adds one level to the types inside it. The signature of 128
+    /// `a` characters and one `y` parses. With 129 `a` characters, the parse
+    /// fails with the reason `nesting exceeds the supported depth`.
+    ///
+    /// [`from_bytes`] and [`to_bytes`] apply the same limit of 128 levels to a
+    /// value.
+    ///
+    /// [`from_bytes`]: crate::from_bytes
+    /// [`to_bytes`]: crate::to_bytes
     pub fn parse(signature: &str) -> Result<Type> {
         let sig = signature.as_bytes();
         let mut pos = 0;
@@ -71,7 +112,7 @@ impl Type {
         Ok(ty)
     }
 
-    /// The signature string for this type.
+    /// Returns the signature string of this type.
     pub fn signature(&self) -> String {
         let mut out = String::new();
         self.write_signature(&mut out);
@@ -118,7 +159,7 @@ impl Type {
         }
     }
 
-    /// The alignment requirement of the serialized form, in bytes.
+    /// Returns the alignment requirement of the serialized form, in bytes.
     pub fn alignment(&self) -> usize {
         match self {
             Type::Bool | Type::Byte | Type::Str | Type::ObjectPath | Type::Signature => 1,
@@ -131,7 +172,11 @@ impl Type {
         }
     }
 
-    /// The serialized size if this type is fixed-size, else `None`.
+    /// Returns the serialized size, or `None` if the type has a variable size.
+    ///
+    /// The size of a tuple or a dict entry includes the padding at its end to
+    /// its alignment, so `(ty)` has the size 16. The empty tuple `()` has the
+    /// fixed size 1.
     pub fn fixed_size(&self) -> Option<usize> {
         match self {
             Type::Bool | Type::Byte => Some(1),
@@ -151,8 +196,10 @@ impl Type {
         }
     }
 
-    /// Whether this is a basic type: a scalar or a string, the types a dict
-    /// entry accepts as its key.
+    /// Returns `true` if this type is a scalar or a string.
+    ///
+    /// These types are the basic types. The key of a dict entry must be a
+    /// basic type.
     pub fn is_basic(&self) -> bool {
         matches!(
             self,
@@ -173,8 +220,10 @@ impl Type {
     }
 }
 
-/// Combined fixed size of a struct's members, or `None` if any is variable.
-/// The empty structure has fixed size 1.
+/// Returns the combined fixed size of the members of a structure.
+///
+/// If a member has a variable size, this function returns `None`. The empty
+/// structure has the fixed size 1.
 fn fixed_size_of<'a>(members: impl Iterator<Item = &'a Type>, alignment: usize) -> Option<usize> {
     let mut size = 0;
     let mut any = false;
@@ -248,7 +297,7 @@ fn parse_one(sig: &[u8], pos: &mut usize, depth: usize) -> std::result::Result<T
 mod tests {
     use super::*;
 
-    /// Every type string the ostree on-disk format uses (format-reference.md).
+    /// The type strings that the ostree on-disk format uses.
     const OSTREE_SIGNATURES: &[&str] = &[
         "(a{sv}aya(say)sstayay)",                                 // commit
         "(a(say)a(sayay))",                                       // dirtree
@@ -270,8 +319,10 @@ mod tests {
         "as",
     ];
 
-    /// The type characters outside the on-disk format, which reach a
-    /// repository through `commit --add-metadata`.
+    /// Type strings that use the type characters outside the on-disk format.
+    ///
+    /// These types get into a repository through the `ostree commit
+    /// --add-metadata` command.
     const METADATA_SIGNATURES: &[&str] = &[
         "n", "q", "i", "x", "h", "d", "o", "g", "ms", "mi", "ami", "a{sd}", "(sid)", "mmy",
     ];
@@ -331,8 +382,8 @@ mod tests {
 
     #[test]
     fn rejects_overdeep_nesting() {
-        // The depth the value parser and the serializer accept, the first depth
-        // past it, and one further.
+        // The three cases are the depth limit of the value parser and the
+        // serializer, the first depth past that limit, and the depth after that.
         let sig = format!("{}y", "a".repeat(MAX_TYPE_DEPTH));
         assert!(Type::parse(&sig).is_ok());
         let sig = format!("{}y", "a".repeat(MAX_TYPE_DEPTH + 1));

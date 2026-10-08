@@ -45,6 +45,7 @@ lzma-static = ["liblzma/static"]
 # list omits them.
 [package.metadata.docs.rs]
 features = ["sign-spki", "verify-gpg", "sign-gpg", "receive", "push"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 ostrya-core = { workspace = true }

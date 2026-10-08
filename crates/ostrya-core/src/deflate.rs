@@ -1,14 +1,8 @@
-//! A streaming raw-DEFLATE encoder over an async writer, and the same encoder
-//! over an async reader.
+//! The raw-DEFLATE encoders of archive-mode content objects.
 //!
-//! [`DeflateSink`] is the encoder behind archive-mode content objects: the
-//! stored `.filez` payload is its output. It compresses into one output
-//! buffer of a fixed size, so a payload of any size goes through in bounded
-//! pieces. [`DeflateSink::reset`] starts a new stream in the same compressor
-//! and buffer.
-//!
-//! [`DeflateReader`] reads uncompressed bytes from a source and gives the
-//! bytes a [`DeflateSink`] writes for the same input at the same level.
+//! `DeflateSink` and `DeflateReader` use the same compressor setup and the
+//! same `compress` step. Both give the same bytes for the same input at the
+//! same level. The golden hashes of the tests hold this output fixed.
 
 use std::io;
 use std::pin::Pin;
@@ -19,43 +13,52 @@ use miniz_oxide::deflate::core::CompressorOxide;
 use miniz_oxide::deflate::stream::deflate;
 use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
 
-/// The size of the output buffer [`DeflateSink`] compresses into before it
-/// writes the compressed bytes through to the writer under it.
+/// The size of the output buffer of [`DeflateSink`], and of the input buffer
+/// and the output buffer of [`DeflateReader`].
 const DEFLATE_CHUNK: usize = 64 * 1024;
 
 /// A streaming raw-DEFLATE encoder over an async writer.
 ///
-/// Each `poll_write` compresses the caller's chunk into a bounded output
-/// buffer and passes that buffer on to the writer under it, so a payload of
-/// any size goes through in fixed-size pieces. `poll_flush` ends the current
-/// DEFLATE block with a sync flush. `poll_close` ends the stream and leaves
-/// the writer under it open, so a caller can still write to it, for example to
-/// patch a header in front of the stream.
+/// The sink is the encoder of archive-mode content objects. The stored
+/// `.filez` payload is its output.
+///
+/// Each `poll_write` compresses the chunk of the caller into an output buffer
+/// of 64 KiB. The sink writes this buffer to the inner writer, so a payload of
+/// any size goes through in pieces of a fixed size.
+///
+/// `poll_flush` ends the current DEFLATE block with a sync flush, so a flush
+/// changes the compressed bytes. `poll_close` ends the stream, flushes the
+/// inner writer, and leaves it open. A caller can then still write to the
+/// inner writer, for example to patch a header in front of the stream.
 ///
 /// [`reset`](DeflateSink::reset) starts a new stream in the same compressor
 /// and output buffer, so one sink can encode many objects in turn.
 pub struct DeflateSink<W> {
     inner: W,
     compressor: Box<CompressorOxide>,
-    /// The compressed bytes the compressor has produced.
+    /// The output buffer that the compressor fills.
     out: Vec<u8>,
-    /// How many bytes of `out` have reached `inner`.
+    /// The number of bytes of `out` that `inner` took.
     sent: usize,
-    /// How many bytes of `out` the compressor filled.
+    /// The number of bytes of `out` that the compressor filled.
     filled: usize,
-    /// Whether a sync flush is under way, so the sequence resumes with the
-    /// drain steps that follow the sync step rather than a second sync step.
+    /// `true` while a sync flush is under way. A resumed `poll_flush` then
+    /// runs only the steps that take the remaining output, with no second
+    /// sync step.
     syncing: bool,
-    /// Whether the current DEFLATE block is closed and no input has arrived
-    /// since.
+    /// `true` if the current DEFLATE block is closed and no input arrived
+    /// after the close.
     flushed: bool,
-    /// Whether the compressor has reached the end of the stream.
+    /// `true` if the compressor reached the end of the stream.
     done: bool,
 }
 
 impl<W> DeflateSink<W> {
-    /// A raw-DEFLATE encoder over `inner` at `level`, which the format holds to
-    /// 1 through 9.
+    /// Creates a raw-DEFLATE encoder that writes to `inner` at `level`.
+    ///
+    /// An archive-mode repository uses a level from 1 through 9. The sink
+    /// passes `level` to the encoder with no check, and no level causes a
+    /// panic.
     pub fn new(inner: W, level: u8) -> DeflateSink<W> {
         DeflateSink {
             inner,
@@ -69,14 +72,16 @@ impl<W> DeflateSink<W> {
         }
     }
 
-    /// Start a new stream into `inner` at `level`, and return the writer the
-    /// sink held until now.
+    /// Starts a new stream into `inner` at `level` and returns the previous
+    /// writer.
     ///
-    /// The compressor is reset in place and takes `level`, and the output
-    /// buffer is kept, so a caller that compresses many objects keeps one sink
-    /// and allocates neither again. Compressed bytes that the sink holds and
-    /// has not written to the old writer are discarded: a caller that needs
-    /// the whole old stream closes the sink before the reset.
+    /// The sink resets the compressor in place with `level` and keeps the
+    /// output buffer. A caller that compresses many objects can keep one sink
+    /// with no new allocation.
+    ///
+    /// The sink discards the compressed bytes that it holds and did not write
+    /// to the previous writer. A caller that needs the whole previous stream
+    /// closes the sink before the reset.
     pub fn reset(&mut self, inner: W, level: u8) -> W {
         restart(&mut self.compressor, level);
         self.sent = 0;
@@ -87,14 +92,16 @@ impl<W> DeflateSink<W> {
         std::mem::replace(&mut self.inner, inner)
     }
 
-    /// The writer under the encoder.
+    /// Returns the inner writer.
+    ///
+    /// The sink discards the compressed bytes that it holds and did not write.
     pub fn into_inner(self) -> W {
         self.inner
     }
 }
 
 impl<W: AsyncWrite + Unpin> DeflateSink<W> {
-    /// Pass the compressed bytes held in `out` on to `inner`.
+    /// Writes the compressed bytes in `out` to `inner`.
     fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.sent < self.filled {
             let n = std::task::ready!(
@@ -113,14 +120,21 @@ impl<W: AsyncWrite + Unpin> DeflateSink<W> {
         Poll::Ready(Ok(()))
     }
 
-    /// Run the compressor once over `input` under `flush`, into an empty output
-    /// buffer. The step drains first, so a `Pending` return leaves the
-    /// compressor untouched and the caller repeats the same step.
+    /// Runs the compressor once over `input` with `flush`, into an empty
+    /// output buffer.
     ///
-    /// Returns the bytes of `input` the compressor took, the bytes it produced,
-    /// and whether it reached the end of the stream. A `Buf` result reports
-    /// that the compressor made no progress, which the flush and close
-    /// sequences read as the end of the output they wait for.
+    /// The step drains the buffer first, so a `Pending` return leaves the
+    /// compressor untouched. The caller then repeats the same step.
+    ///
+    /// Returns three values:
+    ///
+    /// - the number of bytes of `input` that the compressor took
+    /// - the number of bytes that it produced
+    /// - `true` if it reached the end of the stream
+    ///
+    /// A `Buf` result reports that the compressor made no progress. The flush
+    /// and close sequences read this result as the end of the output that
+    /// they wait for.
     fn poll_step(
         &mut self,
         cx: &mut Context<'_>,
@@ -134,24 +148,28 @@ impl<W: AsyncWrite + Unpin> DeflateSink<W> {
     }
 }
 
-/// A raw-DEFLATE compressor at `level`.
+/// Creates a raw-DEFLATE compressor at `level`.
 fn compressor(level: u8) -> Box<CompressorOxide> {
     let mut compressor = Box::<CompressorOxide>::default();
     compressor.set_format_and_level(DataFormat::Raw, level);
     compressor
 }
 
-/// Start a new stream in `compressor` at `level`.
+/// Starts a new stream in `compressor` at `level`.
 fn restart(compressor: &mut CompressorOxide, level: u8) {
     compressor.reset();
     compressor.set_format_and_level(DataFormat::Raw, level);
 }
 
-/// Run `compressor` once over `input` under `flush` into `out`.
+/// Runs `compressor` once over `input` with `flush` into `out`.
 ///
-/// Returns the bytes of `input` the compressor took, the bytes it wrote to
-/// `out`, and whether it reached the end of the stream. A `Buf` result
-/// reports that the compressor made no progress.
+/// Returns three values:
+///
+/// - the number of bytes of `input` that the compressor took
+/// - the number of bytes that it wrote to `out`
+/// - `true` if it reached the end of the stream
+///
+/// A `Buf` result reports that the compressor made no progress.
 fn compress(
     compressor: &mut CompressorOxide,
     input: &[u8],
@@ -183,9 +201,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for DeflateSink<W> {
         let me = self.get_mut();
         loop {
             let (taken, produced, _) = std::task::ready!(me.poll_step(cx, buf, MZFlush::None))?;
-            // The compressor has now run over the caller's chunk, so the block
-            // is open and a flush sequence that was under way is abandoned. A
-            // `Pending` return above leaves both flags as they stood.
+            // The compressor ran over the chunk of the caller, so the block is
+            // open, and the sink abandons a flush that was under way. A
+            // `Pending` return from the step leaves both flags unchanged.
             me.flushed = false;
             me.syncing = false;
             if taken > 0 {
@@ -201,8 +219,8 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for DeflateSink<W> {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let me = self.get_mut();
-        // End the block with a sync step, then take the rest of the output the
-        // compressor still holds until a step produces nothing.
+        // A sync step ends the block. The next steps take the remaining
+        // output of the compressor, until a step produces nothing.
         while !me.flushed {
             let flush = if me.syncing {
                 MZFlush::None
@@ -227,8 +245,8 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for DeflateSink<W> {
             me.done = end;
         }
         std::task::ready!(me.poll_drain(cx))?;
-        // The stream ends here; the writer under the encoder stays open, so a
-        // caller can still patch a header in front of the stream.
+        // The stream ends here. The inner writer stays open, so a caller can
+        // still patch a header in front of the stream.
         Pin::new(&mut me.inner).poll_flush(cx)
     }
 }
@@ -239,18 +257,20 @@ fn stalled() -> io::Error {
 
 /// A raw-DEFLATE encoder that reads uncompressed bytes from a source.
 ///
-/// A read gives the compressed form of the source bytes, and end of file
-/// follows the end of the stream. The output is the bytes a [`DeflateSink`]
-/// writes for the same input at the same level: the reader runs the
-/// compressor in the same sequence of steps, each into an empty output
-/// buffer. The reader never flushes the stream before its end, because a
-/// flush changes the bytes.
+/// A read returns the compressed form of the source bytes. End of file comes
+/// after the end of the stream.
+///
+/// If the caller of a [`DeflateSink`] does not flush, the sink and the reader
+/// give the same bytes for one input and level. The reader
+/// runs the compressor in the same sequence of steps, each into an empty
+/// output buffer. The reader does not flush the stream before its end,
+/// because a flush changes the bytes.
 ///
 /// The reader holds one compressor, an input buffer of 64 KiB, and an output
-/// buffer of 64 KiB, so a source of any size goes through in bounded memory.
-/// It gives the compressed bytes it holds before it reads the source again.
-/// [`reset`](DeflateReader::reset) starts a new stream in the same compressor
-/// and buffers, so one reader can encode many objects in turn.
+/// buffer of 64 KiB. Its memory does not grow with the size of the source.
+/// The reader returns the compressed bytes that it holds before it reads the
+/// source again. [`reset`](DeflateReader::reset) starts a new stream in the
+/// same compressor and buffers, so one reader can encode many objects in turn.
 ///
 /// The reader implements `AsyncBufRead`. A caller that reads through
 /// `poll_fill_buf` and `consume` takes the compressed bytes from the output
@@ -258,23 +278,26 @@ fn stalled() -> io::Error {
 pub struct DeflateReader<R> {
     source: R,
     compressor: Box<CompressorOxide>,
-    /// The source bytes read and not yet compressed: `input[pos..len]`.
+    /// The source bytes that the reader read and did not compress yet:
+    /// `input[pos..len]`.
     input: Box<[u8]>,
     pos: usize,
     len: usize,
-    /// The compressed bytes not yet read: `out[out_pos..out_len]`.
+    /// The compressed bytes that the caller did not read yet:
+    /// `out[out_pos..out_len]`.
     out: Box<[u8]>,
     out_pos: usize,
     out_len: usize,
-    /// Whether the source has reached end of file.
+    /// `true` if the source reached end of file.
     eof: bool,
-    /// Whether the compressor has reached the end of the stream.
+    /// `true` if the compressor reached the end of the stream.
     done: bool,
 }
 
 impl<R> DeflateReader<R> {
-    /// A raw-DEFLATE encoder over `source` at `level`, which the format holds
-    /// to 1 through 9.
+    /// Creates a raw-DEFLATE encoder that reads from `source` at `level`.
+    ///
+    /// `level` has the meaning that [`DeflateSink::new`] states.
     pub fn new(source: R, level: u8) -> DeflateReader<R> {
         DeflateReader {
             source,
@@ -290,12 +313,12 @@ impl<R> DeflateReader<R> {
         }
     }
 
-    /// Start a new stream over `source` at `level`, and return the source the
-    /// reader held until now.
+    /// Starts a new stream over `source` at `level` and returns the previous
+    /// source.
     ///
-    /// The compressor is reset in place and takes `level`, and the buffers
-    /// are kept. Source bytes and compressed bytes of the old stream that the
-    /// reader holds are discarded.
+    /// The reader resets the compressor in place with `level` and keeps the
+    /// buffers. The reader discards the source bytes and the compressed bytes
+    /// of the previous stream that it holds.
     pub fn reset(&mut self, source: R, level: u8) -> R {
         restart(&mut self.compressor, level);
         self.pos = 0;
@@ -307,25 +330,31 @@ impl<R> DeflateReader<R> {
         std::mem::replace(&mut self.source, source)
     }
 
-    /// The source.
+    /// Returns a shared reference to the source.
     pub fn get_ref(&self) -> &R {
         &self.source
     }
 
-    /// The source. Bytes read from it here do not reach the stream.
+    /// Returns a mutable reference to the source.
+    ///
+    /// Bytes that a caller reads from the source through this reference do
+    /// not reach the stream.
     pub fn get_mut(&mut self) -> &mut R {
         &mut self.source
     }
 
-    /// The source.
+    /// Returns the source.
+    ///
+    /// The reader discards the source bytes and the compressed bytes that it
+    /// holds.
     pub fn into_inner(self) -> R {
         self.source
     }
 }
 
 impl<R: AsyncRead + Unpin> DeflateReader<R> {
-    /// Run the encoder until the output buffer holds unread bytes or the
-    /// stream has ended.
+    /// Runs the encoder until the output buffer holds unread bytes or the
+    /// stream ends.
     fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
             if self.out_pos < self.out_len || self.done {
@@ -422,10 +451,9 @@ mod tests {
     /// A mismatch states that the encoder output changed, which changes the
     /// bytes stored in every archive-mode content object at that level. Find
     /// the cause -- a `miniz_oxide` release, or an edit to [`DeflateSink`].
-    /// Then check the stored bytes against the tool's own with
-    /// `archive_objects_are_byte_identical_to_the_fixture` in
-    /// `crates/ostrya/tests/write.rs` before you record a constant here
-    /// again.
+    /// Then check the stored bytes against the bytes of the `ostree` command
+    /// with `archive_objects_are_byte_identical_to_the_fixture` in
+    /// `crates/ostrya/tests/write.rs` before you record a constant here again.
     const GOLDEN: [&str; 9] = [
         "a1fd96479b110a51c3b9c333da0ff6879cd295fc27a98b48c88b70a0ea558bb4",
         "7964fd5c5e4ffb18bf953852b31704681eaf7a4590d488a01be5f213978c0876",
@@ -441,11 +469,12 @@ mod tests {
     /// The SHA-256 of the encoder output over [`golden_payload`] at the
     /// default level 6 when the caller flushes once, at the halfway point of
     /// the payload. The content writer of `ostrya` passes a flush on to the
-    /// encoder, which ends the DEFLATE block with a sync flush, so a caller
-    /// that flushes stores different bytes for the same content. The identity
-    /// of the object is over the uncompressed bytes, so both forms carry the
-    /// same checksum and the tool reads both. The ingest paths of `ostrya`
-    /// write straight through and reach [`GOLDEN`] instead.
+    /// encoder, and the encoder ends the DEFLATE block with a sync flush. A
+    /// caller that flushes then stores different bytes for the same content.
+    ///
+    /// The identity of the object is over the uncompressed bytes, so both
+    /// forms carry the same checksum and the `ostree` command reads both. The
+    /// ingest paths of `ostrya` write straight through and reach [`GOLDEN`].
     const GOLDEN_FLUSHED: &str = "009e2fd466deb6af8f1828281fccd0a7be5fef1356215f1eaa10708a86caa4b3";
 
     /// One xorshift32 step.
@@ -457,11 +486,12 @@ mod tests {
     }
 
     /// A payload of one and a half [`DEFLATE_CHUNK`] in three half-chunk
-    /// blocks: one block over a four-symbol alphabet, whose long match chains
-    /// let the search depth of a level change the output, then two blocks of
-    /// an xorshift32 stream the encoder cannot compress. The output holds
-    /// literal and match coding, spans more than one [`DEFLATE_CHUNK`], and
-    /// takes nine distinct forms over the nine levels.
+    /// blocks. The first block uses a four-symbol alphabet. Its long match
+    /// chains let the search depth of a level change the output. The other
+    /// two blocks hold an xorshift32 stream that the encoder cannot compress.
+    ///
+    /// The output holds literal and match coding, spans more than one
+    /// [`DEFLATE_CHUNK`], and takes nine distinct forms over the nine levels.
     fn golden_payload() -> Vec<u8> {
         const BLOCK: usize = DEFLATE_CHUNK / 2;
         let mut out = Vec::with_capacity(3 * BLOCK);
@@ -558,8 +588,8 @@ mod tests {
                 level % 9 + 1,
             );
             // The compressor holds its output back until its own buffer is
-            // full, so the first stream takes the payload twice to produce
-            // bytes before its input ends.
+            // full. The first stream takes the payload twice, so that it
+            // produces bytes before its input ends.
             let first = data.repeat(2);
             assert!(
                 futures_lite::future::poll_once(sink.write_all(&first))
@@ -634,10 +664,11 @@ mod tests {
                 out.len() > DEFLATE_CHUNK,
                 "level {level}: output spans more than one chunk"
             );
-            // The write sizes the ingest path gives the encoder do not change
-            // its output: one byte at a time, an odd size that divides neither
-            // the payload nor the chunk, and the whole payload in one write
-            // all agree.
+            // The write sizes of the ingest path do not change the output of
+            // the encoder. These sizes all give the same bytes:
+            // - one byte at a time
+            // - an odd size that divides neither the payload nor the chunk
+            // - the whole payload in one write
             for chunk in [4093, data.len()] {
                 assert_eq!(
                     encode(&data, level, chunk),

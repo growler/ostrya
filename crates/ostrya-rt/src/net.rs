@@ -1,23 +1,9 @@
 //! Async TCP over the selected backend.
 //!
-//! [`TcpStream`] and [`TcpListener`] wrap the backend's TCP types
-//! (`smol::net` or `tokio::net`) and present the `futures-io` traits under both
-//! backends, so the fetcher and the TLS layer stay runtime-neutral. Under the
-//! `tokio` feature the stream additionally implements the tokio I/O traits.
-//!
-//! [`TcpStream::connect`] takes a host that parses as an IP address as the one
-//! address to reach. Every other host goes to the resolver on the blocking
-//! pool, and the addresses the resolver answers with are raced. The resolver's
-//! order is kept, except that when the list holds both address families, the
-//! first address whose family differs from the family of the first address
-//! moves to second place, so the first two attempts reach different families.
-//! The first attempt starts at once. Each later attempt starts 250 ms after
-//! the attempt before it, and an attempt that fails starts the next attempt at
-//! once. Every started attempt stays in flight, the first attempt to complete
-//! wins, and the rest are dropped. Every address in the answer can hold an
-//! attempt at the same time, so a caller sizes its descriptor budget by the
-//! largest answer it expects. A `connect_timeout` in the caller bounds the
-//! whole open.
+//! [`TcpStream`] and [`TcpListener`] wrap `smol::net` or `tokio::net`. The
+//! fetcher and the TLS layer use them through the `futures-io` traits, so
+//! these layers do not name the backend. The doc of [`TcpStream::connect`]
+//! holds the rules of the connect race.
 
 use std::fmt;
 use std::future::Future;
@@ -42,32 +28,88 @@ const ATTEMPT_STAGGER: Duration = Duration::from_millis(250);
 
 /// A connected TCP stream.
 ///
-/// Nagle's algorithm is disabled on connect: request and response bodies are
-/// written in bounded chunks, and delaying a short final write stalls the
-/// exchange.
+/// [`connect`](TcpStream::connect) and [`TcpListener::accept`] turn off
+/// Nagle's algorithm on the socket. Request and response bodies go out in
+/// bounded chunks, and a delay of a short last write stalls the exchange.
+///
+/// The stream implements `AsyncRead` and `AsyncWrite` of `futures-io` with
+/// each backend. With the `tokio` feature, it also implements `AsyncRead` and
+/// `AsyncWrite` of `tokio_io`.
 #[derive(Debug)]
 pub struct TcpStream {
     inner: backend::TcpStream,
 }
 
 impl TcpStream {
-    /// Resolve `host` and connect to the address whose attempt completes
-    /// first.
+    /// Resolves `host` and returns the first connection that completes.
     ///
-    /// A host that parses as an IP address is the one address the connect
-    /// reaches. Every other host goes to the resolver on the blocking pool.
-    /// The addresses are then raced as the module doc states: both families
-    /// are reached first, a further attempt starts every 250 ms, an attempt
-    /// that fails starts the next attempt at once, and the first attempt to
-    /// complete wins.
+    /// If `host` parses as an [`IpAddr`], that address is the one address to
+    /// reach. Every other host goes to the resolver on the blocking pool. An
+    /// IPv6 address in brackets, for example `[::1]`, does not parse as an
+    /// [`IpAddr`]. A caller gives an IPv6 address with no brackets.
     ///
-    /// A resolver failure is reported as the resolver gave it. An answer
-    /// holding no address fails with [`io::ErrorKind::NotFound`].
+    /// # Connect race
     ///
-    /// A connect failure carries the address it came from in its message and
-    /// the failure the backend gave as its
-    /// [`source`](std::error::Error::source), so a caller reads the
-    /// operating-system error by downcasting that source to [`io::Error`].
+    /// The attempts keep the order of the resolver. If the answer holds IPv4
+    /// and IPv6 addresses, the first address of the other family moves to the
+    /// second place. The addresses that this address moves past keep their
+    /// order behind it. As a result, the first two attempts reach different
+    /// families.
+    ///
+    /// The first attempt starts at once. Each later attempt starts 250 ms
+    /// after the start of the attempt before it. If an attempt fails, the next
+    /// attempt starts at once.
+    ///
+    /// All started attempts stay in flight. The first attempt that completes
+    /// wins, and the function drops the other attempts. At one time, an
+    /// attempt can be in flight to each address of the answer. A caller sizes
+    /// its descriptor budget for the largest answer that it expects.
+    ///
+    /// The function has no time limit of its own. A caller that needs a time
+    /// limit puts it around the whole call.
+    ///
+    /// # Errors
+    ///
+    /// - The I/O error of the resolver, unchanged, if the resolution fails.
+    /// - An error of kind [`io::ErrorKind::NotFound`] if the answer holds no
+    ///   address.
+    /// - The error of the attempt to the first address in the attempt order,
+    ///   if all attempts fail. Its kind is the kind of that failure, and its
+    ///   message names the address. Its [`source`](std::error::Error::source)
+    ///   is the backend error. A caller downcasts the source to [`io::Error`]
+    ///   to read the operating-system error.
+    /// - An I/O error of the socket if the function cannot turn off Nagle's
+    ///   algorithm on the connected socket.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+    /// use ostrya_rt::{TcpListener, TcpStream};
+    ///
+    /// ostrya_rt::block_on(async {
+    ///     let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).await?;
+    ///     let port = listener.local_addr()?.port();
+    ///     let server = ostrya_rt::spawn(async move {
+    ///         let (mut stream, _peer) = listener.accept().await?;
+    ///         let mut request = [0u8; 4];
+    ///         stream.read_exact(&mut request).await?;
+    ///         stream.write_all(b"pong").await?;
+    ///         stream.flush().await?;
+    ///         std::io::Result::Ok(request)
+    ///     });
+    ///
+    ///     let mut client = TcpStream::connect("127.0.0.1", port).await?;
+    ///     client.write_all(b"ping").await?;
+    ///     client.flush().await?;
+    ///     let mut reply = Vec::new();
+    ///     client.read_to_end(&mut reply).await?;
+    ///     assert_eq!(reply, b"pong");
+    ///     assert_eq!(&server.await?, b"ping");
+    ///     std::io::Result::Ok(())
+    /// })?;
+    /// # std::io::Result::Ok(())
+    /// ```
     pub async fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
         let mut addrs = if let Ok(ip) = host.parse::<IpAddr>() {
             vec![SocketAddr::new(ip, port)]
@@ -90,20 +132,35 @@ impl TcpStream {
         connect_addrs(addrs, ATTEMPT_STAGGER).await
     }
 
-    /// The local address the socket is bound to.
+    /// Returns the local address of the socket.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error of the socket if the address query fails.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
     }
 
-    /// The address of the peer.
+    /// Returns the address of the peer.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error of the socket if the address query fails.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.inner.peer_addr()
     }
 
-    /// Whether `poll_write_vectored` writes more than the first slice. The
-    /// `futures-io` write trait carries no such query, so a caller deciding
-    /// whether to hand over several slices or coalesce them itself asks here.
-    /// Both backends write the slices in one syscall.
+    /// Returns `true` if `poll_write_vectored` writes more than the first slice.
+    ///
+    /// The `futures-io` write trait has no such query. A caller asks here
+    /// before it gives several slices to one write or joins them itself. With
+    /// each backend, one `poll_write_vectored` call gives all the slices to the
+    /// socket.
+    ///
+    /// With the `smol` feature, the function returns `true`.
+    ///
+    /// With the `tokio` feature, the function returns the answer of the tokio
+    /// stream.
     pub fn is_write_vectored(&self) -> bool {
         #[cfg(feature = "tokio")]
         {
@@ -111,8 +168,8 @@ impl TcpStream {
         }
         #[cfg(all(feature = "smol", not(feature = "tokio")))]
         {
-            // async-net answers the vectored write with `write_vectored` on the
-            // underlying socket; it offers no query of its own to forward to.
+            // async-net answers a vectored write with `write_vectored` on the
+            // socket. It has no query of its own to forward to.
             true
         }
     }
@@ -142,12 +199,11 @@ impl std::error::Error for AddrError {
     }
 }
 
-/// Order `addrs` so the first two hold different address families.
+/// Orders `addrs` so that the first two addresses hold different families.
 ///
-/// The resolver's order is kept. When the list holds both an IPv4 and an IPv6
-/// address, the first address whose family differs from the family of the
-/// first address moves to second place, and the addresses it moves past keep
-/// their order behind it.
+/// The order of the resolver stays. If the list holds an IPv4 and an IPv6
+/// address, the first address of the other family moves to the second place.
+/// The addresses that it moves past keep their order behind it.
 fn order_families(addrs: &mut [SocketAddr]) {
     let Some(head) = addrs.first() else {
         return;
@@ -158,17 +214,13 @@ fn order_families(addrs: &mut [SocketAddr]) {
     }
 }
 
-/// Race a connect attempt to each address in `addrs`, in the order given.
+/// Races a connect attempt to each address in `addrs`, in the given order.
 ///
-/// The first attempt starts at once. Each later attempt starts `stagger` after
-/// the attempt before it, and an attempt that fails starts the next attempt at
-/// once. Every started attempt stays in flight; the first attempt to complete
-/// wins and the rest are dropped. When every attempt fails, the failure
-/// reported is the one from the address earliest in `addrs`. It names that
-/// address in its message and holds the backend's failure as its
-/// [`source`](std::error::Error::source), which a caller downcasts to
-/// [`io::Error`] to read the operating-system error. An empty list fails with
-/// [`io::ErrorKind::NotFound`].
+/// [`TcpStream::connect`] states the rules of the race and of the error. Here
+/// the wait between two starts is `stagger`. If all attempts fail, the error
+/// names the address that comes first in `addrs`. If `addrs` is empty, the
+/// error has the kind [`io::ErrorKind::NotFound`]. The function uses the
+/// timer only if `addrs` holds more than one address.
 async fn connect_addrs(addrs: Vec<SocketAddr>, stagger: Duration) -> io::Result<TcpStream> {
     if addrs.is_empty() {
         return Err(io::Error::new(
@@ -209,7 +261,7 @@ async fn connect_addrs(addrs: Vec<SocketAddr>, stagger: Duration) -> io::Result<
             while slot < pending.len() {
                 match pending[slot].1.as_mut().poll(cx) {
                     Poll::Ready(Ok(stream)) => {
-                        // Dropping the losers cancels them.
+                        // The drop of the other attempts cancels them.
                         pending.clear();
                         return Poll::Ready(Ok(stream));
                     }
@@ -261,19 +313,35 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
-    /// Bind to `addr`. Passing port 0 lets the kernel choose a free port,
-    /// which [`local_addr`](TcpListener::local_addr) then reports.
+    /// Binds a listener to `addr`.
+    ///
+    /// If the port of `addr` is 0, the operating system selects a free port.
+    /// [`local_addr`](TcpListener::local_addr) returns the selected port.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error of the socket if the bind fails.
     pub async fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
         let inner = backend::TcpListener::bind(addr).await?;
         Ok(TcpListener { inner })
     }
 
-    /// The address the socket is bound to.
+    /// Returns the address that the socket is bound to.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error of the socket if the address query fails.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
     }
 
-    /// Accept the next connection.
+    /// Accepts the next connection and returns the stream and the peer address.
+    ///
+    /// # Errors
+    ///
+    /// - An I/O error of the socket if the accept fails.
+    /// - An I/O error of the socket if the function cannot turn off Nagle's
+    ///   algorithm on the new stream.
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let (stream, peer) = self.inner.accept().await?;
         stream.set_nodelay(true)?;
@@ -281,13 +349,14 @@ impl TcpListener {
     }
 }
 
-// --- smol backend: the async-net stream already speaks futures-io ---
+// --- smol backend: the async-net stream implements futures-io ---
 
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
 mod smol_impls {
     use super::*;
     use futures_io::{AsyncRead, AsyncWrite};
 
+    /// The read trait of `futures-io`.
     impl AsyncRead for TcpStream {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -298,6 +367,7 @@ mod smol_impls {
         }
     }
 
+    /// The write trait of `futures-io`.
     impl AsyncWrite for TcpStream {
         fn poll_write(
             self: Pin<&mut Self>,
@@ -325,14 +395,15 @@ mod smol_impls {
     }
 }
 
-// --- tokio backend: present futures-io over the tokio stream, and the tokio
-// traits natively for tokio-native callers ---
+// --- tokio backend: futures-io over the tokio stream, and the tokio traits
+// for callers that use tokio ---
 
 #[cfg(feature = "tokio")]
 mod tokio_impls {
     use super::*;
     use tokio::io::{AsyncRead as TokioRead, AsyncWrite as TokioWrite, ReadBuf};
 
+    /// The read trait of `futures-io`.
     impl futures_io::AsyncRead for TcpStream {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -348,6 +419,7 @@ mod tokio_impls {
         }
     }
 
+    /// The write trait of `futures-io`.
     impl futures_io::AsyncWrite for TcpStream {
         fn poll_write(
             self: Pin<&mut Self>,
@@ -374,6 +446,7 @@ mod tokio_impls {
         }
     }
 
+    /// The read trait of `tokio`, also in [`tokio_io`](crate::tokio_io).
     impl TokioRead for TcpStream {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -384,6 +457,7 @@ mod tokio_impls {
         }
     }
 
+    /// The write trait of `tokio`, also in [`tokio_io`](crate::tokio_io).
     impl TokioWrite for TcpStream {
         fn poll_write(
             self: Pin<&mut Self>,
@@ -415,7 +489,7 @@ mod tokio_impls {
     }
 }
 
-/// The TCP types move freely across tasks and threads.
+// The TCP types are `Send` and `Sync`, so they move across tasks and threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<TcpStream>();
@@ -456,9 +530,9 @@ mod tests {
         });
     }
 
-    /// A vectored write hands every slice to the socket in one call, which is
-    /// what a caller that asked `is_write_vectored` is promised. The default
-    /// `futures-io` implementation would take the first slice alone.
+    /// A vectored write gives every slice to the socket in one call.
+    /// `is_write_vectored` promises this to a caller. The default `futures-io`
+    /// implementation takes the first slice alone.
     #[test]
     fn a_vectored_write_takes_every_slice() {
         block_on(async {
@@ -509,29 +583,30 @@ mod tests {
         });
     }
 
-    /// Parse a socket address a test states literally.
+    /// Parses a socket address that a test states as text.
     fn at(text: &str) -> SocketAddr {
         text.parse().unwrap()
     }
 
-    /// The stagger the timing tests run with. It is long enough to measure and
-    /// short enough to keep the suite quick.
+    /// The stagger of the timing tests. It is long enough to measure and short
+    /// enough to keep the suite quick.
     const TEST_STAGGER: Duration = Duration::from_millis(10);
 
-    /// The upper bound a timing test holds a completed open to. A race that
-    /// runs the shipped 250 ms window in place of [`TEST_STAGGER`] takes
-    /// longer than this.
+    /// The upper limit of a timing test on the time of a completed open. A race
+    /// with the 250 ms window of the library in place of [`TEST_STAGGER`] takes
+    /// more time.
     const TIMING_CEILING: Duration = Duration::from_millis(200);
 
-    /// Whether a connect attempt to `addr` is still pending after a short
-    /// probe.
+    /// Returns `true` if a connect attempt to `addr` is still pending after a
+    /// short probe.
     ///
-    /// A TEST-NET-1 address carries no host, and a network that drops the
-    /// packet leaves the attempt pending for as long as the operating system
-    /// retries. A network that answers with an ICMP refusal instead fails the
-    /// attempt at once. The failure starts the next attempt, so the stagger
-    /// window never runs and a measured window has no lower bound to hold.
-    /// [`answers_now`] reads this to tell the two networks apart.
+    /// A TEST-NET-1 address has no host. If a network drops the packet, the
+    /// attempt stays pending while the operating system retries. If a network
+    /// answers with an ICMP refusal, the attempt fails at once.
+    ///
+    /// The failure starts the next attempt, so the stagger window never runs
+    /// and a measured window has no lower bound to hold. [`answers_now`] reads
+    /// this to tell the two networks apart.
     async fn stays_pending(addr: SocketAddr) -> bool {
         let mut attempt = Box::pin(backend::TcpStream::connect(addr));
         for _ in 0..5 {
@@ -544,15 +619,15 @@ mod tests {
         true
     }
 
-    /// Whether any address in `addrs` answers a connect attempt now.
+    /// Returns `true` if an address in `addrs` answers a connect attempt now.
     ///
-    /// The addresses are read in the order given, and the read stops at the
-    /// first address that answers. The name of that address goes to the
+    /// The function probes the addresses in the given order and stops at the
+    /// first address that answers. It writes the name of that address to the
     /// standard error stream.
     ///
-    /// A test reads this only after the race, and only once the race has
-    /// already missed the timing it states. An address that answered during
-    /// the race and holds the attempt pending again afterwards reads the same
+    /// A test calls this only after the race, and only if the race misses the
+    /// timing that the test states. An address can answer during the race and
+    /// hold the attempt pending again after it. Such an address reads the same
     /// as a race that ran at the wrong time.
     async fn answers_now(addrs: &[SocketAddr]) -> bool {
         for addr in addrs {
@@ -564,9 +639,10 @@ mod tests {
         false
     }
 
-    /// Two loopback addresses that refuse a connection. Both ports are held at
-    /// once, so the kernel hands out two different ones, and both sockets close
-    /// as this returns.
+    /// Returns two loopback addresses that refuse a connection.
+    ///
+    /// The function holds both ports at the same time, so the kernel gives two
+    /// different ports. Both sockets close when the function returns.
     async fn two_closed_ports() -> (SocketAddr, SocketAddr) {
         let first = TcpListener::bind(at("127.0.0.1:0")).await.unwrap();
         let second = TcpListener::bind(at("127.0.0.1:0")).await.unwrap();
@@ -574,7 +650,7 @@ mod tests {
     }
 
     /// A list that starts with IPv4 and holds IPv6 puts the first IPv6
-    /// address second and keeps every other address in the resolver's order.
+    /// address second. Every other address keeps the order of the resolver.
     #[test]
     fn ordering_moves_the_other_family_to_second_place() {
         let mut addrs = vec![
@@ -610,8 +686,8 @@ mod tests {
         );
     }
 
-    /// A list of one family keeps the resolver's order, and so does a list
-    /// whose first two addresses already hold both families.
+    /// A list of one family keeps the order of the resolver. A list whose first
+    /// two addresses hold both families also keeps it.
     #[test]
     fn ordering_leaves_a_list_that_needs_no_move_alone() {
         for mut addrs in [
@@ -631,10 +707,10 @@ mod tests {
     /// window alone. The next address takes the connection, and the open ends
     /// one window in.
     ///
-    /// A network that answers the TEST-NET-1 address with an ICMP refusal
-    /// fails the first attempt at once, and that failure starts the second
-    /// attempt inside the window. The lower bound is left out on such a
-    /// network, which [`answers_now`] identifies.
+    /// If a network answers the TEST-NET-1 address with an ICMP refusal, the
+    /// first attempt fails at once. That failure starts the second attempt
+    /// inside the window. On such a network the test leaves out the lower
+    /// bound. [`answers_now`] identifies such a network.
     #[test]
     fn a_black_holed_address_gives_way_to_the_next_one() {
         block_on(async {
@@ -663,10 +739,10 @@ mod tests {
     /// Two black-holed addresses hold the race for two stagger windows, so the
     /// third attempt starts two windows in and takes the connection.
     ///
-    /// A network that answers a TEST-NET-1 address with an ICMP refusal fails
-    /// the attempt at once, and that failure starts the attempt behind it
-    /// inside the window. The lower bound is left out on such a network, which
-    /// [`answers_now`] identifies.
+    /// If a network answers a TEST-NET-1 address with an ICMP refusal, the
+    /// attempt fails at once. That failure starts the attempt behind it inside
+    /// the window. On such a network the test leaves out the lower bound.
+    /// [`answers_now`] identifies such a network.
     #[test]
     fn a_second_window_starts_the_third_attempt() {
         block_on(async {
@@ -692,15 +768,14 @@ mod tests {
         });
     }
 
-    /// Every attempt failing reports the failure of the address the list names
-    /// first, which is the address the report has to name however the failures
-    /// fall out in time. The failure the operating system gave stays reachable
+    /// If every attempt fails, the race reports the failure of the first
+    /// address in the list. The report names this address in each time order
+    /// of the failures. The failure from the operating system stays reachable
     /// under it, with its error number.
     ///
-    /// A port the pair names is free, so a test running beside this one in the
-    /// same process can bind it between the pair coming back and the race
-    /// starting. A pair that answers is dropped and a fresh one takes its
-    /// place.
+    /// The ports of the pair are free. A test that runs in parallel in the same
+    /// process can bind one of them after the pair returns and before the race
+    /// starts. If a pair answers, the test drops it and takes a new pair.
     #[test]
     fn every_attempt_failing_reports_the_first_address() {
         block_on(async {
@@ -728,14 +803,14 @@ mod tests {
         });
     }
 
-    /// An attempt that fails starts the next attempt at once. Two addresses
-    /// that refuse the attempt therefore hand the connection to the third
-    /// address inside the first stagger window.
+    /// An attempt that fails starts the next attempt at once. If two addresses
+    /// refuse the attempt, the third address gets the connection inside the
+    /// first stagger window.
     ///
-    /// A port the pair names is free, so a test running beside this one in the
-    /// same process can bind it between the pair coming back and the race
-    /// starting. A race that lands on such a port is dropped and a fresh pair
-    /// takes its place.
+    /// The ports of the pair are free. A test that runs in parallel in the same
+    /// process can bind one of them after the pair returns and before the race
+    /// starts. If the race connects to such a port, the test drops it and takes
+    /// a new pair.
     #[test]
     fn a_failed_attempt_starts_the_next_one_at_once() {
         block_on(async {
@@ -763,12 +838,12 @@ mod tests {
         });
     }
 
-    /// Dropping the race while attempts are in flight cancels them, and the
-    /// runtime opens the next connection afterwards.
+    /// A drop of the race while attempts are in flight cancels them. After the
+    /// drop, the runtime opens the next connection.
     ///
-    /// A network that answers a TEST-NET-1 address ends the race before the
-    /// drop. The race then carries no attempt to cancel, and the cancellation
-    /// half of the test is left out, which [`answers_now`] identifies.
+    /// If a network answers a TEST-NET-1 address, the race ends before the
+    /// drop. The race then has no attempt to cancel, and the test leaves out
+    /// the cancellation half. [`answers_now`] identifies such a network.
     #[test]
     fn dropping_the_race_mid_flight_leaves_the_runtime_working() {
         block_on(async {

@@ -1,15 +1,8 @@
-//! `ostree.sizes` packed entries.
+//! The packed entries of the `ostree.sizes` commit metadata.
 //!
-//! The commit-metadata key `ostree.sizes` has value type `aay`: an array of
-//! packed byte buffers, one per object, sorted by ASCII checksum. Each buffer
-//! is:
-//!
-//! ```text
-//! [32 bytes checksum][varuint64 compressed size][varuint64 unpacked size][1 byte objtype]
-//! ```
-//!
-//! The trailing objtype byte is present on newer commits; a parser tolerates
-//! its absence.
+//! The commit metadata key `ostree.sizes` holds a value of type `aay`, with
+//! one packed entry for each object. [`SizeEntry`] is one decoded entry.
+//! [`pack_sizes`] writes the array, and [`unpack_entry`] reads one entry.
 
 use crate::checksum::Checksum;
 use crate::error::{Error, Result};
@@ -17,19 +10,31 @@ use crate::objtype::ObjectType;
 use crate::varint;
 
 /// One decoded `ostree.sizes` entry.
+///
+/// # Packed form
+///
+/// ```text
+/// [32 bytes checksum][varuint64 compressed size][varuint64 unpacked size][1 byte objtype]
+/// ```
+///
+/// The two sizes are LEB128 varints ([`varint`]). The last
+/// byte is the numeric value of the [`ObjectType`]. Newer commits write this
+/// byte. [`unpack_entry`] also accepts an entry with no type byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SizeEntry {
-    /// The object identity.
+    /// The checksum of the object.
     pub checksum: Checksum,
-    /// On-disk (compressed) size in bytes.
+    /// The compressed size on disk, in bytes.
     pub compressed: u64,
-    /// Uncompressed size in bytes.
+    /// The uncompressed size, in bytes.
     pub unpacked: u64,
-    /// Object type, absent on older commits that omit the trailing byte.
+    /// The object type, or `None` if the entry has no type byte.
+    ///
+    /// Older commits omit the type byte.
     pub objtype: Option<ObjectType>,
 }
 
-/// Append the packed form of one entry to `out`.
+/// Appends the [packed form](SizeEntry#packed-form) of `entry` to `out`.
 pub fn pack_entry(entry: &SizeEntry, out: &mut Vec<u8>) {
     out.extend_from_slice(entry.checksum.as_bytes());
     varint::encode(entry.compressed, out);
@@ -39,7 +44,19 @@ pub fn pack_entry(entry: &SizeEntry, out: &mut Vec<u8>) {
     }
 }
 
-/// Decode one packed entry from exactly `buf`.
+/// Decodes one packed entry from `buf`.
+///
+/// `buf` must hold exactly one entry.
+///
+/// # Errors
+///
+/// - [`Error::InvalidSizeEntry`] with the reason `entry is shorter than a
+///   checksum` if `buf` is shorter than 32 bytes.
+/// - [`Error::InvalidVarint`] if a size is not a valid varint.
+///   [`varint::decode`] lists the reasons.
+/// - [`Error::InvalidObjectType`] if the type byte is not in the range 1 to 9.
+/// - [`Error::InvalidSizeEntry`] with the reason `entry has trailing bytes` if
+///   more than one byte follows the two sizes.
 pub fn unpack_entry(buf: &[u8]) -> Result<SizeEntry> {
     if buf.len() < 32 {
         return Err(Error::InvalidSizeEntry("entry is shorter than a checksum"));
@@ -63,9 +80,11 @@ pub fn unpack_entry(buf: &[u8]) -> Result<SizeEntry> {
     })
 }
 
-/// Pack a set of entries into the `aay` element buffers, sorted by ASCII
-/// checksum. Byte-wise `Checksum` ordering equals lexicographic ordering of
-/// the hex form, which is the required entry order.
+/// Packs a set of entries into the element buffers of the `aay` array.
+///
+/// The array holds the entries sorted by the hex form of the checksum, in
+/// ASCII order. The function sorts by [`Checksum`] value, because the
+/// [order of `Checksum` values](Checksum#order) is the same order.
 pub fn pack_sizes(mut entries: Vec<SizeEntry>) -> Vec<Vec<u8>> {
     entries.sort_by(|a, b| a.checksum.cmp(&b.checksum));
     entries

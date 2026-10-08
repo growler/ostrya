@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! The async HTTP fetcher pull is built on.
 //!
@@ -436,9 +437,12 @@ mod tls;
 pub use self::error::{Error, Result};
 
 use gate::{Gate, Permit};
+#[doc(hidden)]
 pub use io::{FuturesIo, RtExecutor, RtTimer, WriteVectored};
+#[doc(hidden)]
+pub use tls::server_config;
 use tls::{ClientConfigs, client_config};
-pub use tls::{ClientIdentity, TlsOptions, TrustRoots, server_config};
+pub use tls::{ClientIdentity, TlsOptions, TrustRoots};
 
 /// The user agent a request carries, which a `User-Agent` header the fetcher or
 /// the request sets replaces.

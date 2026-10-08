@@ -1,18 +1,22 @@
-//! The EROFS/composefs V0 image serializer.
+//! The writer of composefs EROFS images, format version 0.
 //!
-//! The image is built in two passes over one inode list. The sizing pass counts
-//! bytes and records the offset of every inode, the end of the inode table,
-//! every shared-xattr entry, and every inode's block-data region. EROFS node
-//! ids and shared-xattr references derive from those offsets, so the emitting
-//! pass resolves them from the sizing pass's layout.
+//! The writer makes two passes over one inode list. The sizing pass counts the
+//! bytes and records these offsets:
 //!
-//! The emitting pass appends and patches nothing after the fact, so it writes
-//! straight through to any [`std::io::Write`] sink and needs no seek. It keeps
-//! its own byte counter and feeds the fs-verity hasher as it goes, so the
-//! image's digest is available without holding the image.
+//! - the offset of each inode
+//! - the end of the inode table
+//! - the offset of each shared-xattr entry
+//! - the offset of the block data of each inode.
 //!
-//! A symlink states its target inline in its inode, so the sizing pass refuses
-//! a target that does not fit the inode's block.
+//! The EROFS node ids and the shared-xattr references come from these
+//! offsets. The emitting pass reads them from the layout of the sizing pass.
+//!
+//! The emitting pass only appends and patches no byte that it wrote. It writes
+//! each byte to the [`std::io::Write`] sink, gives it to the fs-verity hasher,
+//! and counts it. The sink needs no seek, and the writer gets the digest
+//! without a copy of the image.
+//!
+//! The sizing pass refuses a symlink target that does not fit its inode block.
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
@@ -54,9 +58,9 @@ const FT_CHR: u8 = 3;
 const FT_LNK: u8 = 7;
 
 // EROFS xattr name prefixes indexed by name_index. Index 0 is the empty
-// fallback; 2 and 3 are full POSIX ACL names, not prefixes; 5 (lustre.) is
-// absent from the composefs V0 prefix table and is skipped so lustre.* names
-// fall through to the empty fallback.
+// fallback. Indexes 2 and 3 are full POSIX ACL names. Index 5 (`lustre.`) is
+// not in the composefs V0 prefix table. The writer skips it, so a `lustre.*`
+// name takes the empty fallback.
 const XATTR_PREFIXES: [&[u8]; 7] = [
     b"",
     b"user.",
@@ -69,9 +73,10 @@ const XATTR_PREFIXES: [&[u8]; 7] = [
 const XATTR_INDEX_ACL_ACCESS: u8 = 2;
 const XATTR_INDEX_ACL_DEFAULT: u8 = 3;
 
-/// The most shared-xattr references one inode holds. An inode whose repeated
-/// attributes exceed this keeps the remainder inline. `docs/format-reference.md`,
-/// "composefs", records the observation this comes from.
+/// The maximum number of shared-xattr references in one inode.
+///
+/// If an inode has more repeated xattrs, it keeps the rest inline. The cap
+/// comes from an observation of the images that the `ostree` command writes.
 const MAX_SHARED_XATTRS: usize = 128;
 
 const XATTR_METACOPY: &[u8] = b"trusted.overlay.metacopy";
@@ -122,7 +127,7 @@ fn chunk_count(size: u64) -> u32 {
     size.div_ceil(1u64 << bits) as u32
 }
 
-/// The 36-byte overlay metacopy record carrying a backing object's digest.
+/// Returns the 36-byte overlay metacopy record for the digest `verity`.
 fn metacopy_record(verity: &[u8; 32]) -> Vec<u8> {
     let mut v = Vec::with_capacity(36);
     v.push(0); // version
@@ -147,8 +152,10 @@ impl LocalXattr {
         [XATTR_PREFIXES[self.prefix as usize], &self.suffix].concat()
     }
 
-    /// Order by full key name, then by value length, then value bytes, matching
-    /// the composefs sort.
+    /// Compares two xattrs in the sort order of composefs.
+    ///
+    /// The order is by full key name, then by value length, then by value
+    /// bytes.
     fn cmp_by_full_key(&self, other: &Self) -> std::cmp::Ordering {
         self.full_key().cmp(&other.full_key()).then_with(|| {
             self.value
@@ -178,10 +185,10 @@ impl XattrSet {
                 continue;
             }
             if let Some(suffix) = name.strip_prefix(XATTR_PREFIXES[idx]) {
-                // The EROFS length fields are a `u16` for the value and a `u8`
-                // for the name, so a longer name or value would be written in
-                // full behind a truncated length. Both preconditions are
-                // documented on `Metadata`.
+                // The EROFS length field is a `u16` for the value and a `u8`
+                // for the name. A longer value or name gets a truncated length
+                // in front of its full bytes, so the writer panics on it.
+                // `Metadata::xattrs` states both limits.
                 assert!(
                     value.len() <= u16::MAX as usize,
                     "an xattr value of {} bytes exceeds the EROFS length field",
@@ -204,7 +211,8 @@ impl XattrSet {
         unreachable!("empty prefix matches every name");
     }
 
-    /// Serialized byte size of this inode's xattr block, zero when empty.
+    /// Returns the byte size of the xattr area of the inode, or 0 if it has no
+    /// xattrs.
     fn byte_size(&self) -> usize {
         if self.filter == 0 {
             return 0;
@@ -218,9 +226,9 @@ impl XattrSet {
             0 => 0,
             n => {
                 let icount = 1 + (n - 12) / 4;
-                // The EROFS field is a `u16`, so a larger area would be written
-                // behind a truncated count. The precondition is documented on
-                // `Metadata`.
+                // The EROFS count field is a `u16`. A larger area gets a
+                // truncated count, so the writer panics on it.
+                // `Metadata::xattrs` states the limit.
                 assert!(
                     icount <= u16::MAX as usize,
                     "an xattr area of {n} bytes exceeds the EROFS count field"
@@ -234,8 +242,8 @@ impl XattrSet {
         if self.filter == 0 {
             return;
         }
-        // `share_xattrs` holds the list to MAX_SHARED_XATTRS, which keeps the
-        // count inside the one byte the format states it in.
+        // `share_xattrs` caps the list at `MAX_SHARED_XATTRS`, so the count
+        // fits in its one-byte field.
         debug_assert!(self.shared.len() <= MAX_SHARED_XATTRS);
         out.write(&(!self.filter).to_le_bytes()); // name filter
         out.write(&[self.shared.len() as u8]); // shared count
@@ -291,7 +299,8 @@ impl DirData {
             }
         }
 
-        // Do not keep more than 2048 bytes of tail inline.
+        // The inline tail holds at most 2048 bytes. A longer tail goes into a
+        // block of its own.
         if n_bytes > 2048 {
             blocks.push(std::mem::take(&mut rest));
             n_bytes = 0;
@@ -338,8 +347,8 @@ impl Inode {
         self.type_bits() | (self.perms & PERM_MASK)
     }
 
-    /// `(datalayout, i_u, size, nlink)` for this inode given the byte offset of
-    /// its block-data region.
+    /// Returns `(datalayout, i_u, size, nlink)` of the inode for the block-data
+    /// offset `block_start`.
     fn meta(&self, block_start: usize) -> (u16, u32, u64, usize) {
         match &self.kind {
             Kind::Dir(dir) => {
@@ -377,7 +386,8 @@ impl Inode {
 
         out.pad_to(SLOT);
 
-        // Chunk-based inline chunk index gets the same tail padding as inline data.
+        // The inline chunk index of a chunk-based file gets the same tail
+        // padding as inline data.
         if let Kind::Backed { inline_tail, .. } = &self.kind
             && *inline_tail > 0
         {
@@ -459,8 +469,10 @@ impl Inode {
         }
     }
 
-    /// A directory is the one inode that owns block data. Every other inode
-    /// states its content inline.
+    /// Writes the block data of the inode.
+    ///
+    /// A directory is the only inode with block data. Every other inode holds
+    /// its content inline.
     fn write_blocks(&self, out: &mut dyn Output) {
         if let Kind::Dir(dir) = &self.kind {
             for block in &dir.blocks {
@@ -492,7 +504,11 @@ enum Source<'a> {
     Whiteout,
 }
 
-/// Root's children merged with the 256 overlay whiteout stubs, name-sorted.
+/// Returns the children of `dir` in name order, with the root whiteout stubs.
+///
+/// If `is_root` is `true`, the list gets the 256 overlay whiteout stubs `00` to
+/// `ff`. A child with a stub name stays, and the function adds no stub for that
+/// name.
 fn merged_children(dir: &Directory, is_root: bool) -> Vec<(Vec<u8>, Source<'_>)> {
     let mut out: Vec<(Vec<u8>, Source)> = dir
         .children
@@ -543,12 +559,12 @@ impl<'a> Collector<'a> {
                 };
                 xattrs.add(XATTR_METACOPY, &record);
                 xattrs.add(XATTR_REDIRECT, redirect.as_bytes());
-                // Chunk indices are always written inline. A single chunk
-                // covers files up to 8 TiB (chunk size caps at 2^43), so
-                // chunk_count is 1 for every file ostree produces. Larger
-                // files would need more inline indices, and files whose index
-                // list overflowed a block would require promotion to a data
-                // block, which is not supported.
+                // The writer always writes the chunk index inline. One chunk
+                // covers a file of up to 8 TiB, because the chunk size is at
+                // most 2^43 bytes. For each file that ostree produces,
+                // `chunk_count` is 1. A larger file needs more inline
+                // indexes. An index list larger than a block needs a move to
+                // a data block, and the writer does not support that move.
                 Kind::Backed {
                     size: *size,
                     inline_tail: chunk_count(*size) as usize * 4,
@@ -571,8 +587,9 @@ impl<'a> Collector<'a> {
     }
 
     fn push_whiteout(&mut self) -> usize {
-        // A whiteout stub inherits only security.selinux from the root and is
-        // mode 0644, owned like the root, char-device 0:0.
+        // A whiteout stub is a character device 0:0 with mode 0644. It has the
+        // owner and the mtime of the root. Of the root xattrs, it gets only
+        // `security.selinux`.
         let mut xattrs = XattrSet::default();
         for (name, value) in &self.root.meta.xattrs {
             if name.as_slice() == b"security.selinux" {
@@ -670,12 +687,15 @@ fn collect(root: &Directory) -> Vec<Inode> {
 
 // --- Shared-xattr promotion ------------------------------------------------
 
-/// Promote xattrs shared by more than one inode into a shared table written
-/// after the inode table, returning the table in on-disk order.
+/// Moves each xattr that two or more inodes hold into the shared table.
 ///
-/// The table holds every repeated entry. One inode references at most
-/// [`MAX_SHARED_XATTRS`] of them, taking the lowest keys first and keeping the
-/// rest inline.
+/// Two xattrs are the same if the names and the values are the same. The
+/// function returns the table in on-disk order. The writer writes the table
+/// after the inode table.
+///
+/// The table holds each repeated entry. One inode references at most
+/// `MAX_SHARED_XATTRS` of them, the lowest keys first. The inode keeps the rest
+/// inline.
 fn share_xattrs(inodes: &mut [Inode]) -> Vec<LocalXattr> {
     use std::collections::BTreeMap;
 
@@ -691,8 +711,9 @@ fn share_xattrs(inodes: &mut [Inode]) -> Vec<LocalXattr> {
         }
     }
 
-    // Keep only shared entries; order them by full key ascending, then write
-    // them descending, so the largest key gets reference index 0.
+    // `shared_keys` holds only the shared entries, in ascending order of full
+    // key. The table holds them in descending order, so the largest key gets
+    // reference index 0.
     let mut shared_keys: Vec<(Vec<u8>, Vec<u8>)> = counts
         .into_iter()
         .filter(|(_, n)| *n > 1)
@@ -708,8 +729,8 @@ fn share_xattrs(inodes: &mut [Inode]) -> Vec<LocalXattr> {
         index.insert(k.clone(), (n - 1 - i) as u32);
     }
 
-    // Extract representative LocalXattr for each shared key (from any inode) in
-    // descending on-disk order.
+    // For each shared key, take one `LocalXattr` from any inode. The table
+    // gets them in descending on-disk order.
     let mut repr: BTreeMap<(Vec<u8>, Vec<u8>), LocalXattr> = BTreeMap::new();
     for inode in inodes.iter() {
         for attr in &inode.xattrs.local {
@@ -725,8 +746,8 @@ fn share_xattrs(inodes: &mut [Inode]) -> Vec<LocalXattr> {
 
     for inode in inodes.iter_mut() {
         let mut promoted = Vec::new();
-        // `local` is sorted by full key, so `retain` reaches the lowest key
-        // first and the cap leaves the highest keys inline.
+        // `local` is in full-key order, so `retain` reaches the lowest key
+        // first. After the cap, the highest keys stay inline.
         inode.xattrs.local.retain(|attr| {
             if promoted.len() == MAX_SHARED_XATTRS {
                 return true;
@@ -745,12 +766,11 @@ fn share_xattrs(inodes: &mut [Inode]) -> Vec<LocalXattr> {
     table
 }
 
-/// Refuse a symlink whose inode header, xattrs, and target fill a block.
+/// Refuses a symlink whose inode header, xattrs, and target fill a block.
 ///
-/// The image states a symlink's target inline in its inode, so a target that
-/// does not fit the inode's block has no place in it. The bound is stated on
-/// [`Symlink`], and `docs/format-reference.md`, "composefs", records the
-/// observation it comes from.
+/// The image holds the target of a symlink inline in its inode. A target that
+/// does not fit the inode block has no place in the image. [`Symlink::target`]
+/// states the limit, which comes from an observation of the `ostree` command.
 fn check_symlinks(inodes: &[Inode], min_mtime: (u64, u32)) -> Result<(), Error> {
     for inode in inodes {
         let Kind::Symlink { target } = &inode.kind else {
@@ -876,16 +896,21 @@ impl Output for SizingPass {
     }
 }
 
-/// The block of zeros the padding writes are taken from, so a pad emits no
-/// allocation whatever its length.
+/// A block of zeros for the padding writes.
+///
+/// A pad of any length takes its bytes from this block and allocates nothing.
 static ZEROS: [u8; BLOCK] = [0u8; BLOCK];
 
-/// The emitting pass. It writes each byte through to `sink`, feeds `hasher` the
-/// same bytes, and counts them in `offset`, which the layout arithmetic reads
-/// through [`Output::len`]. The first sink error is held in `error`; after it
-/// the pass keeps counting, because the layout arithmetic needs the counter,
-/// and stops writing and hashing, because the caller discards the digest and
-/// sees the error once.
+/// The emitting pass.
+///
+/// The pass writes each byte to `sink`, gives the same bytes to `hasher`, and
+/// counts them in `offset`. The layout arithmetic reads the count through
+/// `Output::len`.
+///
+/// The pass keeps the first sink error in `error`. After that error, it stops
+/// the writes and the hash updates, because the caller discards the digest and
+/// sees the error once. It continues to count, because the layout arithmetic
+/// needs the count.
 struct EmitPass<'a, W: Write> {
     sink: W,
     hasher: FsVerityHasher,
@@ -1014,28 +1039,31 @@ fn write_erofs(
     out.note_end();
 }
 
-/// Everything the emitting pass needs: the inode list, the shared-xattr table,
-/// the layout the sizing pass recorded, and the image's total length.
+/// The input of the emitting pass.
+///
+/// It holds the inode list, the shared-xattr table, the layout from the sizing
+/// pass, and the total length of the image.
 pub(crate) struct Plan {
     inodes: Vec<Inode>,
     shared: Vec<LocalXattr>,
     min_mtime: (u64, u32),
     header_flags: u32,
     layout: Layout,
-    /// The length of the image the plan emits, in bytes.
+    /// The length in bytes of the image that the plan emits.
     pub(crate) size: usize,
 }
 
-/// Build the inode list for `root` and run the sizing pass over it.
+/// Builds the inode list of the tree at `root` and runs the sizing pass.
 pub(crate) fn plan(root: &Directory) -> Result<Plan, Error> {
     let mut inodes = collect(root);
 
-    // Mark the root opaque, matching the composefs image writer.
+    // The root is opaque, as in the images of the composefs image writer.
     inodes[0].xattrs.add(XATTR_OPAQUE_ROOT, b"y");
 
-    // Detect ACLs before share_xattrs runs. It moves shared entries out of
-    // each inode's .local list into the shared table, after which a shared ACL
-    // xattr would no longer be visible here and the flag would be dropped.
+    // Look for ACLs before `share_xattrs` runs. That function moves the shared
+    // entries out of the `local` list of each inode into the shared table.
+    // After the move, this check does not see a shared ACL xattr and loses the
+    // flag.
     let has_acl = inodes.iter().any(|inode| {
         inode
             .xattrs
@@ -1062,8 +1090,8 @@ pub(crate) fn plan(root: &Directory) -> Result<Plan, Error> {
     })
 }
 
-/// Run the emitting pass of `plan` through `out`, returning the image's
-/// fs-verity digest.
+/// Runs the emitting pass of `plan` through `out` and returns the fs-verity
+/// digest.
 pub(crate) fn emit(plan: &Plan, out: &mut impl Write) -> io::Result<[u8; 32]> {
     let mut pass = EmitPass {
         sink: out,
@@ -1079,9 +1107,9 @@ pub(crate) fn emit(plan: &Plan, out: &mut impl Write) -> io::Result<[u8; 32]> {
         plan.min_mtime,
         plan.header_flags,
     );
-    // A disagreement means the image is malformed and the digest is a digest of
-    // malformed bytes, so the check holds in every build. It is one comparison
-    // per image.
+    // If the two lengths differ, the image is malformed and the digest is of
+    // malformed bytes. The check is one comparison for each image, so it runs
+    // in every build.
     assert_eq!(
         pass.offset, plan.size,
         "the emitting pass wrote a different length than the sizing pass"
@@ -1099,21 +1127,64 @@ pub(crate) fn emit(plan: &Plan, out: &mut impl Write) -> io::Result<[u8; 32]> {
     Ok(hasher.finalize())
 }
 
-/// Serialize the tree at `root` through `out` and return the image's fs-verity
-/// digest.
+/// Writes the composefs EROFS image of the tree at `root` through `out`.
 ///
-/// The sink receives the image in the order EROFS lays it out, in many small
-/// writes; a caller whose sink is a file wraps it in a
-/// [`std::io::BufWriter`]. The image never exists as a whole in memory. One
-/// write carries at most one field, and the largest field is an xattr value,
-/// which the EROFS length field caps at 65535 bytes; padding is written in
-/// 4096-byte blocks. A call that succeeds flushes the sink before it returns;
-/// a call that fails returns the sink's first error and does not flush, though
-/// a sink that flushes on drop, such as a [`std::io::BufWriter`], still does.
+/// The function returns the fs-verity digest of the image. This digest is the
+/// value of [`FsVerityHasher::hash`] for the image bytes.
 ///
-/// A symlink whose target does not fit its inode's block is
-/// [`Error::Unsupported`], as [`Symlink`](crate::Symlink) states. Panics when
-/// an xattr name or a value exceeds what [`Metadata`](crate::Metadata) states.
+/// # Image format
+///
+/// The image has the EROFS layout of composefs, format version 0. The `ostree`
+/// command writes this format when it exports a commit with composefs support.
+/// The image holds only the parts that composefs uses:
+///
+/// - the superblock
+/// - compact and extended inodes
+/// - tail-packed directory blocks
+/// - inline symlink targets
+/// - chunk-based backing files
+/// - the overlay xattrs `trusted.overlay.redirect`, `trusted.overlay.metacopy`,
+///   and `trusted.overlay.opaque`, with the shared-xattr area and the EROFS
+///   xattr name filter.
+///
+/// The image has no EROFS compression, no fragments, and no multi-device
+/// support.
+///
+/// The writer adds two things to the root directory, as the image writer of the
+/// composefs project does. It adds the overlay whiteout table: 256 character-device stubs
+/// named `00` to `ff`. A child of the root with one of these names stays, and
+/// the writer adds no stub for that name. It also sets the xattr
+/// `trusted.overlay.opaque` to `y` on the root.
+///
+/// # Writes
+///
+/// The sink receives the image in the order of the EROFS layout. The writer
+/// passes each field to `write_all` of the sink, so a file with no buffer makes
+/// one system call for each field. A caller can wrap a file in a
+/// [`std::io::BufWriter`]. The writer only appends, so the sink needs no seek.
+/// The image never exists as a whole in memory.
+///
+/// If each child name is at most 65535 bytes, one write holds at most 65535
+/// bytes. This limit is the range of the EROFS length field of an xattr value.
+/// The superblock is one write of 128 bytes. The writer writes padding in
+/// pieces of at most 4096 bytes.
+///
+/// If the call succeeds, it flushes the sink before it returns. If a write
+/// fails, the writer makes no more writes and does not flush the sink. A sink
+/// that flushes on drop, such as a [`std::io::BufWriter`], still flushes when
+/// the caller drops it.
+///
+/// # Errors
+///
+/// - [`Error::Unsupported`] if a symlink target is too long for its inode
+///   block. [`Symlink::target`] gives the limit.
+/// - [`Error::Io`] with the first error of `out`, if a write or the flush
+///   fails.
+///
+/// # Panics
+///
+/// Panics if an xattr name, an xattr value, or the xattr area of one node is
+/// larger than the limits on [`Metadata::xattrs`].
 pub fn write_image_to(root: &Directory, out: &mut impl Write) -> Result<[u8; 32], Error> {
     Ok(emit(&plan(root)?, out)?)
 }
@@ -1149,8 +1220,9 @@ mod tests {
         }
     }
 
-    /// One directory holding one empty regular file, which is enough tree to
-    /// carry an image past the first block.
+    /// Returns a root directory with one empty regular file.
+    ///
+    /// The image of this tree goes past the first block.
     fn small_tree() -> Directory {
         let mut root = Directory::new(Metadata {
             mode: 0o040755,
@@ -1169,9 +1241,9 @@ mod tests {
         root
     }
 
-    /// A sink that fails partway through gets one failed write, takes nothing
-    /// after it, and is not flushed. The pass still runs to the end, so the
-    /// padding arithmetic keeps reading a counter that advances.
+    /// If the sink fails partway, it gets one failed write, takes no more
+    /// bytes, and gets no flush. The pass still runs to the end, so the padding
+    /// arithmetic reads a counter that advances.
     #[test]
     fn a_failing_sink_reports_its_error_once() {
         let mut sink = FailingSink {
@@ -1188,8 +1260,8 @@ mod tests {
         assert_eq!(sink.flushes, 0, "a failed emission flushed the sink");
     }
 
-    /// A tree holding one symlink whose target is `len` bytes and which carries
-    /// `xattrs`.
+    /// Returns `small_tree` plus one symlink with a target of `len` bytes and
+    /// the xattrs `xattrs`.
     fn tree_with_symlink(len: usize, xattrs: Vec<(Vec<u8>, Vec<u8>)>) -> Directory {
         let mut root = small_tree();
         root.insert(
@@ -1206,15 +1278,15 @@ mod tests {
         root
     }
 
-    /// The image states a symlink's target inline, so a target that fills the
-    /// inode's block has no place in it. A compact inode header is 32 bytes, so
-    /// a target with no xattrs fits at 4063 bytes and does not at 4064.
+    /// The image holds a symlink target inline, so a target that fills the
+    /// inode block has no place in it. A compact inode header is 32 bytes. A
+    /// target with no xattrs fits at 4063 bytes and does not fit at 4064 bytes.
     #[test]
     fn a_symlink_target_that_fills_its_block_is_refused() {
         plan(&tree_with_symlink(BLOCK - 33, Vec::new())).expect("4063 bytes fit");
 
-        // `Plan` holds no `Debug`, so the value is dropped rather than matched
-        // on.
+        // `expect_err` needs `Debug` on the value, and `Plan` has no `Debug`,
+        // so the test maps the value to `()`.
         let err = plan(&tree_with_symlink(BLOCK - 32, Vec::new()))
             .map(|_| ())
             .expect_err("4064 bytes do not fit");
@@ -1229,13 +1301,13 @@ mod tests {
         );
     }
 
-    /// The inode's xattrs take from the same block, so an attribute moves the
-    /// bound down by what it spends there.
+    /// The xattrs of the inode use the same block, so an xattr lowers the
+    /// bound by its size in the xattr area.
     #[test]
     fn a_symlink_xattr_moves_the_target_bound_down() {
-        // The area spends a 12-byte header, and one `user.k` entry spends a
-        // 4-byte entry header, a 1-byte suffix, and a 1-byte value, rounded up
-        // to 4: 20 in all.
+        // The area uses a 12-byte header. One `user.k` entry uses a 4-byte
+        // entry header, a 1-byte suffix, and a 1-byte value, rounded up to a
+        // multiple of 4. The total is 20 bytes.
         let xattrs = vec![(b"user.k".to_vec(), b"v".to_vec())];
         plan(&tree_with_symlink(BLOCK - 33 - 20, xattrs.clone())).expect("4043 bytes fit");
         plan(&tree_with_symlink(BLOCK - 32 - 20, xattrs))
@@ -1243,10 +1315,10 @@ mod tests {
             .expect_err("4044 bytes do not fit");
     }
 
-    /// An inode whose repeated attributes exceed the cap references the lowest
-    /// keys through the shared table and keeps the highest keys inline. The
-    /// table still holds every repeated entry. The golden fixture holds the
-    /// bytes; this holds the rule the fixture is built on.
+    /// If an inode has more repeated xattrs than the cap, it references the
+    /// lowest keys through the shared table. It keeps the highest keys inline.
+    /// The table still holds each repeated entry. The golden fixture holds the
+    /// bytes, and this test checks the rule behind those bytes.
     #[test]
     fn the_shared_xattr_list_caps_and_spills_the_highest_keys() {
         const N: usize = MAX_SHARED_XATTRS + 20;

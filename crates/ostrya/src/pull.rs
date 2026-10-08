@@ -197,6 +197,7 @@ use crate::write::FileMeta;
 mod address;
 mod delta;
 mod drive;
+#[doc(hidden)]
 pub mod http;
 mod source;
 mod subpath;

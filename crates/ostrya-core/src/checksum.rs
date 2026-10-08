@@ -1,21 +1,34 @@
-//! The 32-byte SHA-256 object identity and its representations.
+//! The 32-byte SHA-256 object checksum and its forms.
 //!
-//! ostree names objects by a SHA-256 digest rendered several ways: 64-char
-//! lowercase hex (refs, loose paths, object strings), the raw 32-byte `ay`
-//! (inside commit and dirtree variants), and modified-base64 (static-delta
-//! directory names). The hex, standard base64, and modified base64 codecs are
-//! hand-rolled to the RFC 4648 alphabet; the digest itself is computed with
-//! the `sha2` crate.
+//! The hex, standard base64, and modified base64 codecs are hand-written to
+//! the RFC 4648 alphabet. The `sha2` crate computes the digest.
 
 use ostrya_gvariant::{GvEncode, GvType};
 
 use crate::error::{Error, Result};
 
-/// A 32-byte SHA-256 object id.
+/// A 32-byte SHA-256 checksum that names an object.
 ///
-/// Byte-wise ordering matches lexicographic ordering of the lowercase hex
-/// form, so sorting `Checksum` values reproduces the ASCII-checksum sort order
-/// the on-disk format uses (for example `ostree.sizes` entry order).
+/// # Forms
+///
+/// A checksum has these forms:
+///
+/// - 64 lowercase hex characters, in refs, loose paths, and object names. See
+///   [`to_hex`](Checksum::to_hex) and [`from_hex`](Checksum::from_hex).
+/// - The raw 32-byte `ay`, inside commit and dirtree objects. See
+///   [`as_bytes`](Checksum::as_bytes) and [`from_ay`](Checksum::from_ay).
+/// - Modified base64, in static-delta directory names. See
+///   [`to_base64_modified`](Checksum::to_base64_modified) and
+///   [`from_base64_modified`](Checksum::from_base64_modified).
+/// - Standard padded base64. See [`to_base64`](Checksum::to_base64) and
+///   [`from_base64`](Checksum::from_base64).
+///
+/// # Order
+///
+/// `Checksum` values compare byte-wise. The byte order equals the order of
+/// the lowercase hex strings. A sort of `Checksum` values gives the ASCII
+/// checksum order of the on-disk format, for example the order of the
+/// `ostree.sizes` entries.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Checksum([u8; 32]);
 
@@ -23,31 +36,45 @@ const STD_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst
 const MOD_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+_";
 
 impl Checksum {
-    /// Wrap raw digest bytes.
+    /// Creates a checksum from the raw digest bytes.
     pub fn from_bytes(b: [u8; 32]) -> Checksum {
         Checksum(b)
     }
 
-    /// The SHA-256 digest of `data`. This is the object identity of a
-    /// metadata object, whose hashed bytes are its serialized GVariant form.
+    /// Returns the SHA-256 digest of `data`.
+    ///
+    /// This digest is the checksum of a metadata object, where `data` is the
+    /// serialized GVariant form of the object.
     pub fn sha256(data: &[u8]) -> Checksum {
         use sha2::{Digest, Sha256};
         Checksum(Sha256::digest(data).into())
     }
 
-    /// The raw digest bytes.
+    /// Returns the raw digest bytes.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
-    /// Parse 64 hex chars in the lowercase rendering [`to_hex`](Checksum::to_hex)
-    /// emits, refusing an uppercase character.
+    /// Parses 64 lowercase hex characters.
     ///
-    /// This is the rule a revision is read by: a 64-character name is a
-    /// checksum in lowercase hex alone, and an uppercase or mixed-case name of
-    /// that length is a ref name (`docs/format-reference.md`, "Revision
-    /// syntax"). The lenient [`from_hex`](Checksum::from_hex) stays where a
-    /// checksum arrives as stored bytes rather than as a name.
+    /// This is the form that [`to_hex`](Checksum::to_hex) writes. The rule
+    /// applies to a revision: a name of 64 characters is a checksum only if
+    /// it is lowercase hex. An uppercase or mixed-case name of that length is
+    /// a ref name.
+    ///
+    /// For a checksum from stored bytes, [`from_hex`](Checksum::from_hex) is
+    /// the parser. It accepts both cases.
+    ///
+    /// # Errors
+    ///
+    /// The function returns [`Error::InvalidChecksum`] with one of these
+    /// messages:
+    ///
+    /// - `hex checksum is not lowercase` if `s` holds an uppercase character.
+    ///   This check comes first.
+    /// - `hex checksum is not 64 characters` if `s` is not 64 bytes long.
+    /// - `hex checksum has a non-hex character` if a character is not in
+    ///   `0-9` or `a-f`.
     pub fn from_hex_lower(s: &str) -> Result<Checksum> {
         if s.bytes().any(|b| b.is_ascii_uppercase()) {
             return Err(Error::InvalidChecksum("hex checksum is not lowercase"));
@@ -55,7 +82,18 @@ impl Checksum {
         Checksum::from_hex(s)
     }
 
-    /// Parse 64 hex chars. Accepts either case; emits lowercase.
+    /// Parses 64 hex characters in uppercase, lowercase, or mixed case.
+    ///
+    /// [`to_hex`](Checksum::to_hex) writes the result in lowercase.
+    ///
+    /// # Errors
+    ///
+    /// The function returns [`Error::InvalidChecksum`] with one of these
+    /// messages:
+    ///
+    /// - `hex checksum is not 64 characters` if `s` is not 64 bytes long.
+    /// - `hex checksum has a non-hex character` if a character is not in
+    ///   `0-9`, `a-f`, or `A-F`.
     pub fn from_hex(s: &str) -> Result<Checksum> {
         let bytes = s.as_bytes();
         if bytes.len() != 64 {
@@ -70,7 +108,7 @@ impl Checksum {
         Ok(Checksum(out))
     }
 
-    /// Render as 64 lowercase hex chars.
+    /// Returns the checksum as 64 lowercase hex characters.
     pub fn to_hex(&self) -> String {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut s = String::with_capacity(64);
@@ -81,8 +119,12 @@ impl Checksum {
         s
     }
 
-    /// Interpret a GVariant `ay` payload as a checksum; the array must be
-    /// exactly 32 bytes.
+    /// Creates a checksum from the payload of a GVariant `ay` value.
+    ///
+    /// # Errors
+    ///
+    /// The function returns [`Error::InvalidChecksum`] with the message
+    /// `ay checksum is not 32 bytes` if `b` is not exactly 32 bytes long.
     pub fn from_ay(b: &[u8]) -> Result<Checksum> {
         let arr: [u8; 32] = b
             .try_into()
@@ -90,23 +132,59 @@ impl Checksum {
         Ok(Checksum(arr))
     }
 
-    /// Render as standard, padded base64 (44 chars).
+    /// Returns the checksum as standard padded base64 of 44 characters.
+    ///
+    /// The string holds 43 data characters and one `=` pad.
     pub fn to_base64(&self) -> String {
         base64_encode(&self.0, STD_ALPHABET, true)
     }
 
-    /// Parse standard, padded base64 (exactly 44 chars ending in `=`).
+    /// Parses standard padded base64 of exactly 44 characters.
+    ///
+    /// The string must hold 43 data characters and one `=` pad. Each checksum
+    /// has exactly one accepted spelling.
+    ///
+    /// # Errors
+    ///
+    /// The function returns [`Error::InvalidChecksum`] with one of these
+    /// messages:
+    ///
+    /// - `base64 checksum has the wrong length` if `s` is not 44 bytes long.
+    /// - `base64 checksum is missing its pad` if the last character is not
+    ///   `=`.
+    /// - `base64 has an invalid character` if a data character is not in the
+    ///   standard alphabet. The modified character `_` is not in this
+    ///   alphabet.
+    /// - `base64 checksum has nonzero trailing bits` if the two unused low
+    ///   bits of the last data character are not zero.
     pub fn from_base64(s: &str) -> Result<Checksum> {
         Ok(Checksum(base64_decode_checksum(s, STD_ALPHABET, true)?))
     }
 
-    /// Render as modified base64 (standard base64 with `/` replaced by `_` and
-    /// trailing `=` dropped, 43 chars), used for static-delta directory names.
+    /// Returns the checksum as modified base64 of 43 characters.
+    ///
+    /// Modified base64 is standard base64 with `_` in the place of `/` and
+    /// with no trailing `=`.
     pub fn to_base64_modified(&self) -> String {
         base64_encode(&self.0, MOD_ALPHABET, false)
     }
 
-    /// Parse modified base64 (exactly 43 unpadded chars).
+    /// Parses modified base64 of exactly 43 characters with no pad.
+    ///
+    /// Each checksum has exactly one accepted spelling.
+    ///
+    /// # Errors
+    ///
+    /// The function returns [`Error::InvalidChecksum`] with one of these
+    /// messages:
+    ///
+    /// - `base64 checksum has the wrong length` if `s` is not 43 bytes long.
+    ///   A stray trailing `=` makes the string 44 bytes long.
+    /// - `base64 has an invalid character` if a character is not in the
+    ///   modified alphabet. The standard character `/` and the pad `=` are
+    ///   not in this alphabet.
+    /// - `base64 checksum has nonzero trailing bits` if the two unused low
+    ///   bits of the last character are not zero.
     pub fn from_base64_modified(s: &str) -> Result<Checksum> {
         Ok(Checksum(base64_decode_checksum(s, MOD_ALPHABET, false)?))
     }
@@ -154,15 +232,19 @@ fn base64_encode(input: &[u8], alphabet: &[u8; 64], pad: bool) -> String {
     out
 }
 
-/// Decode exactly one 32-byte checksum, reading sextets against `alphabet`.
+/// Decodes exactly one 32-byte checksum, with the sextets read from `alphabet`.
 ///
-/// A 32-byte digest is 43 significant base64 characters: ten 4-char groups
-/// (30 bytes) followed by a 3-char group (2 bytes). The standard form appends
-/// one `=` pad for a total of 44 characters; the modified form is the bare 43.
-/// Decoding is strict: length is exact, every character must be in `alphabet`
-/// (so the standard `/` and modified `_` do not alias), and the two unused low
-/// bits of the final significant sextet must be zero, so each distinct
-/// checksum has exactly one accepted spelling.
+/// A 32-byte digest is 43 significant base64 characters: ten groups of 4
+/// characters (30 bytes) and then one group of 3 characters (2 bytes). The
+/// standard form adds one `=` pad, for a total of 44 characters. The modified
+/// form is the 43 characters alone.
+///
+/// The decoder is strict, so each checksum has exactly one accepted spelling:
+///
+/// - The length must be exact.
+/// - Each character must be in `alphabet`, so the standard `/` and the
+///   modified `_` do not alias.
+/// - The two unused low bits of the last significant sextet must be zero.
 fn base64_decode_checksum(s: &str, alphabet: &[u8; 64], padded: bool) -> Result<[u8; 32]> {
     let bytes = s.as_bytes();
     let expected = if padded { 44 } else { 43 };
@@ -204,8 +286,9 @@ fn base64_val(c: u8, alphabet: &[u8; 64]) -> Result<u8> {
         b'a'..=b'z' => Ok(c - b'a' + 26),
         b'0'..=b'9' => Ok(c - b'0' + 52),
         b'+' => Ok(62),
-        // The only alphabet-specific glyph is index 63: `/` (standard) or `_`
-        // (modified). Accept whichever this call was given, rejecting the other.
+        // Index 63 is the only character that differs between the alphabets:
+        // `/` in the standard alphabet, `_` in the modified alphabet. Accept
+        // the character of `alphabet` and refuse the other one.
         _ if c == alphabet[63] => Ok(63),
         _ => Err(Error::InvalidChecksum("base64 has an invalid character")),
     }
@@ -236,9 +319,11 @@ impl GvType for Checksum {
     const FIXED_SIZE: Option<usize> = None;
 }
 
-/// A checksum encodes as its raw 32-byte `ay`. Decoding is done through
-/// [`Checksum::from_ay`], which reports [`Error::InvalidChecksum`] on a wrong
-/// width, so no `GvDecode` impl is provided.
+/// Encodes the checksum as its raw 32 bytes, the GVariant `ay` form.
+///
+/// [`Checksum::from_ay`] decodes this form.
+// There is no `GvDecode` impl. `from_ay` returns `Error::InvalidChecksum` if
+// the width is wrong, and the decoder path goes through it.
 impl GvEncode for Checksum {
     fn encode(&self, out: &mut Vec<u8>) -> ostrya_gvariant::Result<()> {
         out.extend_from_slice(&self.0);
@@ -250,7 +335,7 @@ impl GvEncode for Checksum {
 mod tests {
     use super::*;
 
-    // The commit checksum the fixture generator recorded in
+    // The commit checksum that the fixture generator recorded in
     // tests/fixtures/generated/MANIFEST.
     const FIXTURE_COMMIT: &str = "b3c8e8525e8a5c3409bf6e6db5f5d656da77ae76d08cbc4f8b75b71879757a89";
 
@@ -295,9 +380,9 @@ mod tests {
         assert_eq!(zero.to_base64_modified(), "A".repeat(43));
         assert_eq!(zero.to_base64(), format!("{}=", "A".repeat(43)));
 
-        // 32 0xff bytes exercise the high sextets and the '_'-for-'/' swap.
+        // 32 0xff bytes test the high sextets and the '_' for '/' swap.
         // Ten full 0xffffff groups give index-63 sextets ('_' modified, '/'
-        // standard); the trailing two bytes give '_' '_' '8'.
+        // standard). The last two bytes give '_' '_' '8'.
         let ones = Checksum::from_bytes([0xffu8; 32]);
         assert_eq!(ones.to_base64_modified(), format!("{}8", "_".repeat(42)));
         assert_eq!(ones.to_base64(), format!("{}8=", "/".repeat(42)));
@@ -359,8 +444,8 @@ mod tests {
         let modified = Checksum::from_bytes([0xffu8; 32]).to_base64_modified();
         assert!(modified.contains('_'));
         assert!(Checksum::from_base64(&modified).is_err());
-        // The standard rendering carries '/', invalid in the modified alphabet;
-        // trim its pad first so only the alphabet mismatch is under test.
+        // The standard form holds '/', which is not in the modified alphabet.
+        // Trim its pad first, so that the test covers only the alphabet.
         let std = Checksum::from_bytes([0xffu8; 32]).to_base64();
         assert!(std.contains('/'));
         assert!(Checksum::from_base64_modified(std.trim_end_matches('=')).is_err());
@@ -368,8 +453,9 @@ mod tests {
 
     #[test]
     fn base64_rejects_nonzero_trailing_bits() {
-        // The final significant sextet of a 32-byte checksum has two unused low
-        // bits; a glyph that sets them ('9' = sextet 61) must be rejected.
+        // The last significant sextet of a 32-byte checksum has two unused low
+        // bits. The parsers must refuse a character that sets them ('9' is
+        // sextet 61).
         let mut modified = Checksum::from_bytes([0xffu8; 32]).to_base64_modified();
         modified.pop();
         modified.push('9');
@@ -384,12 +470,12 @@ mod tests {
     #[test]
     fn base64_rejects_wrong_length_and_stray_padding() {
         let c = Checksum::from_hex(FIXTURE_COMMIT).unwrap();
-        // Standard requires the single trailing pad; the unpadded 43-char form
-        // and a double-padded 45-char form are both rejected.
+        // The standard form requires one trailing pad. The parser refuses the
+        // unpadded form of 43 characters and a double-padded form of 45.
         assert!(Checksum::from_base64(c.to_base64().trim_end_matches('=')).is_err());
         assert!(Checksum::from_base64(&format!("{}=", c.to_base64())).is_err());
-        // Modified takes exactly 43 unpadded chars; a stray pad or a padded
-        // standard-length string is rejected.
+        // The modified form takes exactly 43 characters with no pad. The
+        // parser refuses a stray pad and a padded string of standard length.
         assert!(Checksum::from_base64_modified(&format!("{}=", c.to_base64_modified())).is_err());
         assert!(Checksum::from_base64_modified(&c.to_base64()).is_err());
     }

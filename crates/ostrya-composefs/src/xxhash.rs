@@ -1,11 +1,13 @@
-//! xxHash32, the hash behind the EROFS xattr name filter.
+//! xxHash32, the hash of the EROFS xattr name filter.
 //!
-//! The EROFS xattr name filter is a 32-bit Bloom filter over the xattr names
-//! present on an inode. Each name contributes the bit `xxh32(suffix, seed) %
-//! 32`, where `suffix` is the name with its prefix stripped and `seed` is
-//! `XATTR_FILTER_SEED + prefix_index`. A cleared bit in the stored
-//! `!filter` word means "definitely absent". This is a single fixed use of
-//! xxHash32, so it is hand-rolled here rather than pulling a dependency.
+//! The name filter of an inode is a 32-bit Bloom filter over the names of its
+//! xattrs. Each name sets the bit `xxh32(suffix, seed) % 32`. `suffix` is the
+//! name without its prefix, and `seed` is `XATTR_FILTER_SEED + prefix_index`.
+//! The inode stores the inverted word `!filter`. A set bit in the stored word
+//! means that no xattr name of the inode has that bit.
+//!
+//! The name filter is the one use of xxHash32. The crate computes it itself, so
+//! it needs no dependency.
 
 const PRIME1: u32 = 0x9E37_79B1;
 const PRIME2: u32 = 0x85EB_CA77;
@@ -23,7 +25,7 @@ fn round(acc: u32, lane: u32) -> u32 {
         .wrapping_mul(PRIME1)
 }
 
-/// Compute the 32-bit xxHash of `data` with the given `seed`.
+/// Returns the 32-bit xxHash of `data` with the seed `seed`.
 pub fn xxh32(data: &[u8], seed: u32) -> u32 {
     let len = data.len();
     let mut i = 0;
@@ -79,8 +81,8 @@ pub fn xxh32(data: &[u8], seed: u32) -> u32 {
 mod tests {
     use super::xxh32;
 
-    // The filter seed EROFS uses; the golden image's cleared name-filter bits
-    // pin these results (see docs/format-reference.md, "composefs").
+    // The name-filter seed of EROFS. The golden images pin these results: each
+    // bit is clear in the stored filter word of an inode with that xattr.
     const SEED: u32 = 0x25BB_E08F;
 
     fn bit(name: &[u8], prefix_index: u32) -> u32 {

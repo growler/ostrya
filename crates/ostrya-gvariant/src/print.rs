@@ -2,63 +2,106 @@ use std::fmt::Write as _;
 
 use crate::{Error, Result, Type, Value};
 
-/// Render `value` of type `ty` in the GVariant text form.
+/// Renders `value` of type `ty` in the GVariant text form.
 ///
-/// The text form is the one GLib's own printer produces, recovered by
-/// observation against `ostree show --raw`, `ostree show --print-metadata-key`,
-/// and `ostree show --print-variant-type` (`docs/format-reference.md`, "The
-/// GVariant text form"). The rules:
+/// The text form is the form that the GLib printer writes, and [`from_text`]
+/// reads it back. The rules come from observation of `ostree show --raw`,
+/// `ostree show --print-metadata-key`, and `ostree show --print-variant-type`.
 ///
-/// - A value whose literal does not state its own type carries a type
-///   annotation: `byte 0x2a`, `uint32 42`, `uint64 42`. A boolean and a string
-///   are unambiguous and carry none.
-/// - A container that holds at least one element delegates its annotation to
-///   its first element, and the elements after it print unannotated. A tuple
-///   annotates every member, since a tuple's members do not share a type.
-/// - A container that holds no element has nowhere to delegate to, so it
-///   carries its own signature: `@ay []`, `@a(say) []`, `@a{sv} {}`.
-/// - A byte array whose last byte is the only NUL it holds prints as a
-///   bytestring literal, `b'user.foo'`, which states its own type and so carries
-///   no annotation. Every other byte array prints as `[byte 0x01, 0x02]`.
-/// - An array of dict entries prints as one brace-enclosed list of `key: value`
-///   pairs. A dict entry outside an array prints `{key, value}`, with a comma.
-/// - A variant prints as `<child>`, and the child is always annotated, since a
-///   variant states no child type of its own.
-/// - A maybe prints the value it holds and nothing else, since its type states
-///   how many maybe levels that value sits under. A chain of nested maybes that
-///   ends at `nothing` states how many of its levels are set instead, with one
-///   `just ` for each set level: `@mmi nothing`, `@mmi just nothing`,
+/// # Type annotations
+///
+/// - If the literal of a value does not state its type, the value carries a
+///   type annotation: `byte 0x2a`, `uint32 42`, `uint64 42`. A boolean, an `i`
+///   integer, a double, and a string state their own type and carry no
+///   annotation.
+/// - If a container holds one or more elements, its first element carries the
+///   annotation. The elements after the first element print with no
+///   annotation. A tuple annotates every member, because the members of a
+///   tuple do not share a type.
+/// - An empty container carries its own signature, because no element can
+///   carry the annotation: `@ay []`, `@a(say) []`, `@a{sv} {}`.
+/// - A variant prints as `<child>`. The child always carries an annotation,
+///   because a variant states no child type of its own.
+/// - An annotated maybe carries its whole signature, because neither literal
+///   of a maybe states a type. The value in the maybe then prints with no
+///   annotation: `@mmay [0x01]`.
+///
+/// # Containers
+///
+/// - If the last byte of a byte array is the only NUL in the array, the array
+///   prints as a bytestring literal, `b'user.foo'`. This literal states its own
+///   type, so it carries no annotation. Every other byte array prints as
+///   `[byte 0x01, 0x02]`.
+/// - An array of dict entries prints as one list of `key: value` pairs in
+///   braces. A dict entry outside an array prints as `{key, value}`, with a
+///   comma.
+/// - A tuple with one member keeps a trailing comma: `(byte 0x01,)`.
+/// - A maybe prints the value that it holds and nothing else. The type of the
+///   maybe states how many maybe levels enclose that value. If a
+///   chain of nested maybes ends at `nothing`, the text has one `just ` for
+///   each set level of the chain: `@mmi nothing`, `@mmi just nothing`,
 ///   `@mmi 5`.
 ///
-/// Returns [`Error::TypeMismatch`] when `value` does not match `ty`, the same
-/// pairing [`crate::to_bytes`] requires.
+/// # Literals
+///
+/// - A double prints as the C `%.17g` rendering. If that text holds none of
+///   `.`, `e`, `n`, and `N`, a `.0` suffix follows, so the literal reads back
+///   as a double.
+/// - A string prints in single quotes, or in double quotes if it holds a single
+///   quote. Of the printable characters, only the backslash and the quote in
+///   use get an escape. A control character prints as `\a`, `\b`, `\f`, `\n`,
+///   `\r`, `\t`, or `\v` if it has that short form, and as `\uXXXX` otherwise.
+///   All other characters, ASCII or not, print unchanged.
+/// - A bytestring literal uses the C escape rules. The backslash and the double
+///   quote always get an escape. `\b`, `\f`, `\n`, `\r`, `\t`, and `\v` use
+///   their short form, and every other byte outside printable ASCII gets a
+///   three-digit octal escape: `b'\377'`. A single quote gets no escape, and
+///   the literal uses double quotes if the content holds one.
+///
+/// # Errors
+///
+/// - [`Error::TypeMismatch`] if `value` does not match `ty`. The pairing rules
+///   are the rules of [`to_bytes`].
+///
+/// [`from_text`]: crate::from_text
+/// [`to_bytes`]: crate::to_bytes
 pub fn to_text(ty: &Type, value: &Value) -> Result<String> {
     let mut out = String::new();
     write_value(&mut out, ty, value, true)?;
     Ok(out)
 }
 
-/// Render `value` of type `ty` in the GVariant text form, with no type
-/// annotations.
+/// Renders `value` of type `ty` in the GVariant text form with no annotations.
 ///
-/// The rules are [`to_text`]'s with every annotation left out: a byte and an
-/// unsigned integer print bare, an empty container prints `[]` or `{}` rather
-/// than its signature, and a tuple's members print bare. A variant child still
-/// carries an annotation, a variant stating no child type of its own. The
-/// `just ` prefixes of a nested maybe are part of the value rather than an
-/// annotation, so they stay.
+/// This function uses the rules of [`to_text`] and leaves out every
+/// annotation:
 ///
-/// This is the form a report that names the value itself uses, where the reader
-/// already knows what it is looking at (`docs/format-reference.md`, "The
-/// GVariant text form").
+/// - A byte, an integer, a handle, an object path, and a signature print with
+///   no type keyword.
+/// - An empty container prints as `[]` or `{}`, with no signature.
+/// - The members of a tuple print with no annotation.
+/// - A maybe prints with no signature.
+///
+/// The child of a variant still carries an annotation, because a variant
+/// states no child type of its own. The `just ` prefixes of a nested maybe are
+/// part of the value, so this form keeps them.
+///
+/// A report that names the value before it prints the value uses this form.
+/// `ostree summary -v` prints metadata values in this form.
+///
+/// # Errors
+///
+/// - [`Error::TypeMismatch`] if `value` does not match `ty`.
 pub fn to_text_unannotated(ty: &Type, value: &Value) -> Result<String> {
     let mut out = String::new();
     write_value(&mut out, ty, value, false)?;
     Ok(out)
 }
 
-/// Write one value, annotating it when `annotate` is set and its literal does
-/// not state its type.
+/// Writes one value.
+///
+/// If `annotate` is set and the literal does not state its type, the value
+/// carries an annotation.
 fn write_value(out: &mut String, ty: &Type, value: &Value, annotate: bool) -> Result<()> {
     match (ty, value) {
         (Type::Bool, Value::Bool(b)) => out.push_str(if *b { "true" } else { "false" }),
@@ -91,18 +134,18 @@ fn write_value(out: &mut String, ty: &Type, value: &Value, annotate: bool) -> Re
             write_string(out, s);
         }
         (Type::Maybe(elem), Value::Maybe(inner)) => {
-            // A maybe states no type of its own in either literal it has, so an
-            // annotated one carries its whole signature and its child then
-            // prints bare.
+            // Neither literal of a maybe states a type, so an annotated maybe
+            // carries its whole signature. Its child then prints with no
+            // annotation.
             if annotate {
                 out.push('@');
                 out.push_str(&ty.signature());
                 out.push(' ');
             }
-            // Walk the chain of nested maybes to its end. A chain that reaches a
-            // value prints that value alone, since the type states how many
-            // levels are set. A chain that ends at `nothing` states the set
-            // levels itself, with one `just ` for each of them.
+            // The loop walks the chain of nested maybes to its end. If the
+            // chain reaches a value, it prints that value alone, because the
+            // type states how many levels are set. If the chain ends at
+            // `nothing`, it writes one `just ` for each set level.
             let mut set = 0usize;
             let mut elem: &Type = elem;
             let mut inner: &Option<Box<Value>> = inner;
@@ -203,7 +246,9 @@ fn write_value(out: &mut String, ty: &Type, value: &Value, annotate: bool) -> Re
     Ok(())
 }
 
-/// Write an integer, prefixed by `keyword` when annotated.
+/// Writes an integer.
+///
+/// If `annotate` is set, `keyword` comes before the integer.
 fn write_number(out: &mut String, annotate: bool, keyword: &str, value: impl std::fmt::Display) {
     if annotate {
         out.push_str(keyword);
@@ -212,12 +257,16 @@ fn write_number(out: &mut String, annotate: bool, keyword: &str, value: impl std
     write!(out, "{value}").expect("writing to a String cannot fail");
 }
 
-/// Write a `d` value. The literal states its own type, so it carries no
-/// keyword: it is the `%.17g` rendering of the double, with `.0` appended when
-/// that rendering holds none of `.`, `e`, `n`, and `N`, so the literal always
-/// reads back as a double. The `n` withholds the suffix from `nan`, `-nan`,
-/// `inf`, and `-inf`, the four renderings that carry one; `N` appears in no
-/// rendering `format_g17` writes.
+/// Writes a `d` value.
+///
+/// The literal states its own type, so it carries no keyword. The literal is
+/// the `%.17g` rendering of the double. If that rendering holds none of `.`,
+/// `e`, `n`, and `N`, the function appends `.0`, so the literal always reads
+/// back as a double.
+///
+/// The `n` in the check keeps the suffix off `nan`, `-nan`, `inf`, and `-inf`.
+/// These four renderings are the renderings that hold an `n`. No rendering
+/// that `format_g17` writes holds an `N`.
 fn write_double(out: &mut String, value: f64) {
     let text = format_g17(value);
     if !text.contains(['.', 'e', 'n', 'N']) {
@@ -228,16 +277,19 @@ fn write_double(out: &mut String, value: f64) {
     out.push_str(&text);
 }
 
-/// The C `%.17g` rendering of a double, which is the shortest of a fixed-point
-/// and an exponent form at 17 significant digits, with the trailing zeros of the
-/// fraction removed. The exponent form carries a sign and at least two digits.
+/// Returns the C `%.17g` rendering of a double.
+///
+/// The rendering has 17 significant digits. If the decimal exponent is in the
+/// range `-4..17`, the rendering uses the fixed-point form. Otherwise, it uses
+/// the exponent form. The function removes the trailing zeros of the fraction.
+/// The exponent carries a sign and at least two digits.
 fn format_g17(value: f64) -> String {
-    /// The significant-digit count `%.17g` asks for.
+    /// The number of significant digits that `%.17g` asks for.
     const PRECISION: i32 = 17;
 
     if value.is_nan() {
-        // The sign bit is printed, so a not-a-number whose bits carry one comes
-        // out as `-nan`.
+        // The rendering prints the sign bit. If the sign bit of a
+        // not-a-number is set, the rendering is `-nan`.
         return if value.is_sign_negative() {
             "-nan".to_owned()
         } else {
@@ -263,7 +315,7 @@ fn format_g17(value: f64) -> String {
         .split_once('e')
         .expect("Rust's `e` format writes an exponent");
     let exponent: i32 = exponent.parse().expect("the exponent is an integer");
-    /// The exponent range `%g` renders in fixed-point form.
+    /// The range of exponents that `%g` renders in fixed-point form.
     const FIXED_POINT: std::ops::Range<i32> = -4..PRECISION;
 
     if !FIXED_POINT.contains(&exponent) {
@@ -278,8 +330,10 @@ fn format_g17(value: f64) -> String {
     trim_fraction(&format!("{value:.places$}"))
 }
 
-/// Remove a fixed-point rendering's trailing fraction zeros, and the decimal
-/// point with them where nothing of the fraction is left.
+/// Removes the trailing zeros of the fraction in a fixed-point rendering.
+///
+/// If no digit of the fraction is left, the function also removes the decimal
+/// point.
 fn trim_fraction(text: &str) -> String {
     if !text.contains('.') {
         return text.to_owned();
@@ -287,8 +341,11 @@ fn trim_fraction(text: &str) -> String {
     text.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
-/// Write an empty container: `literal` alone, or `@signature literal` when the
-/// container has to carry the annotation its absent elements cannot.
+/// Writes an empty container.
+///
+/// If `annotate` is set, the output is `@signature literal`, because no element
+/// can carry the annotation. If `annotate` is not set, the output is `literal`
+/// alone.
 fn write_empty(out: &mut String, ty: &Type, annotate: bool, literal: &str) {
     if annotate {
         out.push('@');
@@ -298,10 +355,11 @@ fn write_empty(out: &mut String, ty: &Type, annotate: bool, literal: &str) {
     out.push_str(literal);
 }
 
-/// Write a dict entry's key and value joined by `separator`, without the braces
-/// the caller supplies: an array of entries brackets the whole list once and
-/// joins each pair with `": "`, a lone entry brackets itself and joins with
-/// `", "`.
+/// Writes the key and the value of a dict entry, with `separator` between them.
+///
+/// The caller writes the braces. An array of entries puts one pair of braces
+/// around the whole list and uses `": "` as the separator. A lone entry puts
+/// braces around itself and uses `", "`.
 fn write_entry(
     out: &mut String,
     ty: &Type,
@@ -324,8 +382,10 @@ fn write_entry(
     write_value(out, value_ty, val, annotate)
 }
 
-/// Whether a byte array prints as a bytestring literal: it ends in a NUL and
-/// holds no other one, so the bytes before that NUL are the literal's content.
+/// Returns `true` if a byte array prints as a bytestring literal.
+///
+/// The array must end in a NUL and hold no other NUL. The bytes before that
+/// NUL are the content of the literal.
 fn is_bytestring(bytes: &[u8]) -> bool {
     match bytes.split_last() {
         Some((0, rest)) => !rest.contains(&0),
@@ -333,12 +393,19 @@ fn is_bytestring(bytes: &[u8]) -> bool {
     }
 }
 
-/// Write a bytestring literal, `b'...'`, over `content` -- the byte array
-/// without its terminating NUL. The escaping is C's rather than the string
-/// form's: a backslash and a double quote are always escaped, `\b`, `\f`, `\n`,
-/// `\r`, `\t`, and `\v` take their short form, and every other byte outside the
-/// printable ASCII range takes a three-digit octal escape. A single quote is
-/// never escaped, so a content byte holding one selects double quotes.
+/// Writes a bytestring literal, `b'...'`, from `content`.
+///
+/// `content` is the byte array without its terminating NUL. The bytestring
+/// form uses the C escape rules. The string form uses other rules (see
+/// `write_string`). The C escape rules are:
+///
+/// - A backslash and a double quote always get an escape.
+/// - `\b`, `\f`, `\n`, `\r`, `\t`, and `\v` use their short form.
+/// - Every other byte outside the printable ASCII range gets a three-digit
+///   octal escape.
+///
+/// A single quote never gets an escape. If `content` holds a single quote, the
+/// literal uses double quotes.
 fn write_bytestring(out: &mut String, content: &[u8]) {
     let quote = if content.contains(&b'\'') { '"' } else { '\'' };
     out.push('b');
@@ -360,12 +427,15 @@ fn write_bytestring(out: &mut String, content: &[u8]) {
     out.push(quote);
 }
 
-/// Write a string literal. Single quotes are the default; a string that holds a
-/// single quote is written in double quotes instead, so the quote it holds needs
-/// no escape. Only the quote in use is escaped, so `"` stays literal inside
-/// single quotes. Control characters take their short escape where one exists
-/// and `\uXXXX` otherwise, and every other character, ASCII or not, is written
-/// through.
+/// Writes a string literal.
+///
+/// The literal uses single quotes by default. If the string holds a single
+/// quote, the literal uses double quotes, and that quote needs no escape. Of
+/// the printable characters, only the backslash and the quote in use get an
+/// escape, so `"` stays literal inside single quotes.
+/// If a control character has a short escape, it uses that escape. Every other
+/// control character uses `\uXXXX`. All other characters, ASCII or not, go
+/// into the output unchanged.
 fn write_string(out: &mut String, s: &str) {
     let quote = if s.contains('\'') { '"' } else { '\'' };
     out.push(quote);
@@ -396,7 +466,9 @@ fn write_string(out: &mut String, s: &str) {
 mod tests {
     use super::*;
 
-    /// Print a value described by its signature, panicking on a mismatch.
+    /// Prints a value of the type that `signature` names.
+    ///
+    /// A mismatch causes a panic.
     fn text(signature: &str, value: Value) -> String {
         to_text(&Type::parse(signature).unwrap(), &value).unwrap()
     }
@@ -405,14 +477,14 @@ mod tests {
         Value::Bytes(b.to_vec())
     }
 
-    /// Each case is one form of `ostree show --print-variant-type=TYPE`,
-    /// `show --raw`, or `show --print-metadata-key` observed against `ostree`
-    /// 2026.1 (`docs/format-reference.md`, "The GVariant text form").
+    /// Each case is one form that `ostree` 2026.1 writes for
+    /// `ostree show --print-variant-type=TYPE`, `show --raw`, or
+    /// `show --print-metadata-key`.
     #[test]
     fn prints_the_forms_recovered_from_the_tool() {
         let cases: &[(&str, Value, &str)] = &[
-            // Scalars carry an annotation where the literal does not state the
-            // type; a boolean and a string state their own.
+            // If the literal of a scalar does not state the type, the scalar
+            // carries an annotation. A boolean and a string state their own.
             ("b", Value::Bool(false), "false"),
             ("b", Value::Bool(true), "true"),
             ("y", Value::Byte(0x2a), "byte 0x2a"),
@@ -420,8 +492,9 @@ mod tests {
             ("u", Value::U32(16909060), "uint32 16909060"),
             ("t", Value::U64(1700000000), "uint64 1700000000"),
             ("s", Value::Str("abc".into()), "'abc'"),
-            // Byte arrays: the bytestring form for a lone trailing NUL, the
-            // element list otherwise, and the signature when empty.
+            // Byte arrays. If the only NUL is the last byte, the array prints
+            // as a bytestring. An empty array prints its signature. Any other
+            // array prints as a list of elements.
             ("ay", bytes(&[]), "@ay []"),
             ("ay", bytes(&[0x01, 0x02, 0xff]), "[byte 0x01, 0x02, 0xff]"),
             ("ay", bytes(&[0x62]), "[byte 0x62]"),
@@ -441,7 +514,7 @@ mod tests {
             ("ay", bytes(b"a\"b\0"), "b'a\\\"b'"),
             ("ay", bytes(b"a'\"b\0"), "b\"a'\\\"b\""),
             ("ay", bytes("hé\0".as_bytes()), "b'h\\303\\251'"),
-            // A container delegates its annotation to its first element alone.
+            // Only the first element of a container carries the annotation.
             (
                 "aay",
                 Value::Array(vec![bytes(&[0x62, 0x00]), bytes(&[0x63])]),
@@ -476,8 +549,8 @@ mod tests {
                 ]),
                 "[[true], [false]]",
             ),
-            // A dict prints its entries as one brace-enclosed list; a lone
-            // entry joins its pair with a comma.
+            // A dict prints its entries as one list in braces. A lone entry
+            // puts a comma between its key and its value.
             (
                 "a{sy}",
                 Value::Array(vec![
@@ -492,7 +565,8 @@ mod tests {
                 Value::Tuple(vec!["a".into(), Value::Byte(1)]),
                 "{'a', byte 0x01}",
             ),
-            // A tuple annotates every member; one member keeps a trailing comma.
+            // A tuple annotates every member. A one-member tuple keeps a
+            // trailing comma.
             ("(y)", Value::Tuple(vec![Value::Byte(1)]), "(byte 0x01,)"),
             ("()", Value::Tuple(vec![]), "()"),
             (
@@ -505,7 +579,8 @@ mod tests {
                 Value::Tuple(vec!["a".into(), "b".into()]),
                 "('a', 'b')",
             ),
-            // A variant states no child type, so the child is always annotated.
+            // A variant states no child type, so the child always carries an
+            // annotation.
             (
                 "v",
                 Value::variant(Type::Byte, Value::Byte(0x2a)),
@@ -526,7 +601,7 @@ mod tests {
         }
     }
 
-    /// The string escapes, each recovered from `show --print-variant-type=s`.
+    /// The string escapes, each observed in `show --print-variant-type=s`.
     #[test]
     fn escapes_strings_the_way_the_tool_does() {
         let cases: &[(&str, &str)] = &[
@@ -575,8 +650,10 @@ mod tests {
         );
     }
 
-    /// A byteswap turns the big-endian fields the on-disk format states into
-    /// the numbers they name, and leaves everything else alone.
+    /// A byteswap changes the big-endian fields of the on-disk format into the
+    /// numbers that they name.
+    ///
+    /// The byteswap does not change other fields.
     #[test]
     fn byteswap_reaches_every_numeric_field() {
         let value = Value::Tuple(vec![
@@ -596,8 +673,10 @@ mod tests {
         );
     }
 
-    /// The unannotated form, observed against `ostree summary -v`, which reports
-    /// a metadata value the reader has already been told the name of.
+    /// The unannotated form, observed in `ostree summary -v`.
+    ///
+    /// That command reports a metadata value after it gives the name of the
+    /// value to the reader.
     #[test]
     fn prints_the_unannotated_forms_recovered_from_the_tool() {
         let bare = |signature: &str, value: Value| {
@@ -607,8 +686,8 @@ mod tests {
         assert_eq!(bare("y", Value::Byte(0x2a)), "0x2a");
         assert_eq!(bare("b", Value::Bool(true)), "true");
         assert_eq!(bare("s", Value::Str("str".into())), "'str'");
-        // An empty container prints its brackets alone, where the annotated form
-        // carries the signature.
+        // An empty container prints its brackets alone. The annotated form
+        // adds the signature.
         assert_eq!(bare("ay", bytes(&[])), "[]");
         assert_eq!(bare("a{sv}", Value::Array(Vec::new())), "{}");
         assert_eq!(bare("ay", bytes(&[0x01, 0x02])), "[0x01, 0x02]");
@@ -626,8 +705,8 @@ mod tests {
             ),
             "(1, 's')"
         );
-        // A variant child states no type of its own, so it is annotated even
-        // inside an unannotated value.
+        // A variant child states no type of its own, so it carries an
+        // annotation even inside an unannotated value.
         let deltas = Value::Array(vec![Value::Tuple(vec![
             Value::Str("from-to".into()),
             Value::variant(Type::parse("ay").unwrap(), bytes(&[0xeb, 0x57])),
@@ -635,8 +714,10 @@ mod tests {
         assert_eq!(bare("a{sv}", deltas), "{'from-to': <[byte 0xeb, 0x57]>}");
     }
 
-    /// Build a maybe chain of `set` set levels over `inner`, or over `nothing`
-    /// when `inner` is `None`. `maybe_chain(1, None)` is `just nothing`.
+    /// Builds a maybe chain of `set` set levels over `inner`.
+    ///
+    /// If `inner` is `None`, the chain ends at `nothing`.
+    /// `maybe_chain(1, None)` is `just nothing`.
     fn maybe_chain(set: usize, inner: Option<Value>) -> Value {
         let mut value = inner.unwrap_or(Value::Maybe(None));
         for _ in 0..set {
@@ -645,10 +726,10 @@ mod tests {
         value
     }
 
-    /// The maybe forms, each recovered from
-    /// `ostree commit --add-metadata="k=@TYPE VALUE"` read back through
-    /// `ostree show -B --print-metadata-key=k` against `ostree` 2026.1
-    /// (`docs/format-reference.md`, "The GVariant text form").
+    /// The maybe forms, each observed in `ostree` 2026.1.
+    ///
+    /// Each form comes from `ostree commit --add-metadata="k=@TYPE VALUE"`,
+    /// and `ostree show -B --print-metadata-key=k` reads it back.
     #[test]
     fn prints_the_just_prefix_of_a_nested_maybe() {
         let int = || Value::I32(5);
@@ -656,8 +737,8 @@ mod tests {
             // One level: the value alone, or `nothing`.
             ("mi", maybe_chain(1, Some(int())), "@mi 5"),
             ("mi", maybe_chain(0, None), "@mi nothing"),
-            // Two levels. A set chain prints the value alone; a chain that ends
-            // at `nothing` counts its set levels.
+            // Two levels. A set chain prints the value alone. A chain that
+            // ends at `nothing` counts its set levels.
             ("mmi", maybe_chain(2, Some(int())), "@mmi 5"),
             ("mmi", maybe_chain(1, None), "@mmi just nothing"),
             ("mmi", maybe_chain(0, None), "@mmi nothing"),
@@ -689,8 +770,8 @@ mod tests {
                 "@mmv <5>",
             ),
             ("mmv", maybe_chain(1, None), "@mmv just nothing"),
-            // The maybe consumed the annotation, so the array it holds prints
-            // unannotated and its first byte carries no keyword.
+            // The maybe carries the annotation, so the array in the maybe
+            // prints with no annotation and its first byte carries no keyword.
             ("mmay", maybe_chain(2, Some(bytes(&[0x01]))), "@mmay [0x01]"),
             ("mmay", maybe_chain(1, None), "@mmay just nothing"),
             (
@@ -788,8 +869,9 @@ mod tests {
         }
     }
 
-    /// The `just ` prefixes are part of the value, so the unannotated form keeps
-    /// them and drops only the signature.
+    /// The unannotated form keeps the `just ` prefixes.
+    ///
+    /// The prefixes are part of the value. The form drops only the signature.
     #[test]
     fn keeps_the_just_prefix_in_the_unannotated_form() {
         let bare = |signature: &str, value: Value| {
@@ -810,7 +892,7 @@ mod tests {
         // A plain element where the type states another maybe.
         let ty = Type::parse("mmi").unwrap();
         assert!(to_text(&ty, &maybe_chain(1, Some(Value::I32(5)))).is_err());
-        // A mismatched leaf below a set chain.
+        // A mismatched leaf under a set chain.
         let ty = Type::parse("mms").unwrap();
         assert!(to_text(&ty, &maybe_chain(2, Some(Value::I32(5)))).is_err());
     }

@@ -1,21 +1,26 @@
-//! A fused, validating adapter over a borrowed [`ArrayIter`].
+//! An adapter that checks each entry of a borrowed [`ArrayIter`].
 //!
-//! Several object views iterate a serialized array while applying value-level
-//! checks per entry: dirtree names must be traversal-safe and strictly sorted,
-//! xattr names must be in stored form and strictly increasing. The checks
-//! differ, but the control flow is identical: decode the next raw element, run
-//! a validation step that threads state (the previous name) across entries, and
-//! fuse on the first error so a later caller cannot resume past a malformed
-//! entry.
+//! Some object views read a serialized array and check each entry. A dirtree
+//! name must be safe for traversal, and the names must be in strict ascending
+//! order. An xattr name must be in stored form, and the names must be in strict
+//! ascending order. The checks are different, but the control flow is the same:
+//!
+//! 1. The adapter decodes the next raw element.
+//! 2. It runs a check step. The step carries state (the previous name) from one
+//!    entry to the next.
+//! 3. After the first error, the adapter is exhausted, so that a later caller
+//!    cannot resume after a malformed entry.
 
 use ostrya_gvariant::{ArrayIter, GvDecode};
 
 use crate::error::{Error, Result};
 
-/// Wraps an [`ArrayIter`] and runs `step` on each decoded element, yielding
-/// `Result<T>`. `state` carries context between entries (typically the previous
-/// name); after the first `Err` -- a framing error from the inner iterator or a
-/// rejected element -- the adapter is exhausted.
+/// An iterator that runs `step` on each decoded element of an [`ArrayIter`].
+///
+/// Each item is a `Result<T>`. `state` carries context from one entry to the
+/// next, usually the previous name. After the first `Err`, the adapter is
+/// exhausted. The `Err` is a framing error from the inner iterator or an
+/// element that `step` refuses.
 pub(crate) struct ValidatedIter<'a, E, T, S> {
     inner: ArrayIter<'a, E>,
     state: S,

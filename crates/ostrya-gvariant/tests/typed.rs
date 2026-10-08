@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 
-//! For every metadata object the `ostree` tool wrote into
-//! tests/fixtures/generated/, the typed codec must decode borrow-first,
-//! re-encode to identical bytes, and agree field-for-field with the `Value`
-//! path.
+//! Golden-fixture tests for the typed codec.
+//!
+//! The `ostree` command wrote each metadata object in tests/fixtures/generated/.
+//! For each object, the typed codec must pass these checks:
+//!
+//! - It decodes the object borrow-first.
+//! - It re-encodes the object to identical bytes.
+//! - It agrees field-for-field with the `Value` path.
 
 use std::path::Path;
 
@@ -17,7 +21,7 @@ use support::{
     DirMetaView, DirTreeView, filez_header, objects_with_extension,
 };
 
-/// Assert typed re-encoding reproduces the input bytes exactly.
+/// Checks that the typed re-encoding `typed` equals the input `bytes` exactly.
 fn assert_byte_identical(context: &Path, typed: &[u8], bytes: &[u8]) {
     assert_eq!(
         typed,
@@ -27,7 +31,7 @@ fn assert_byte_identical(context: &Path, typed: &[u8], bytes: &[u8]) {
     );
 }
 
-/// Compare an `a{sv}`-shaped typed iterator with the `Value` array it decodes.
+/// Checks that an `a{sv}`-shaped typed iterator agrees with `value_array`.
 fn assert_metadata_agrees(typed: ArrayIter<(&str, Variant)>, value_array: &[Value]) {
     let pairs: Vec<(&str, Value)> = typed
         .map(|entry| {
@@ -123,7 +127,7 @@ fn dirmeta_objects_round_trip() {
 #[test]
 fn archive_file_headers_round_trip() {
     // A .filez object is [4-byte BE u32 header length][4 zero bytes]
-    // [header variant][raw-deflate payload]; the header round-trips here.
+    // [header variant][raw-deflate payload]. This test round-trips the header.
     for (object, bytes) in objects_with_extension("filez", None) {
         let header = filez_header(&bytes, &object.path);
 

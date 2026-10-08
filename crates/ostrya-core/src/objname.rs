@@ -1,33 +1,38 @@
-//! An object name: a checksum paired with its object type.
+//! The name of an object: a checksum and an object type.
 //!
-//! Reachability traversal, prune, and fsck work over sets of object names, so
-//! the two coordinates that identify a loose object travel together. The string
-//! form is `<hexchecksum>.<typestr>` (the tool's object reference), where the
-//! type string is mode-independent -- a content object is `file` even in
-//! archive mode, where its loose path carries the `z` suffix.
+//! Traversal, prune, and fsck use sets of object names, so the checksum and the
+//! type of a loose object stay together.
 
 use crate::checksum::Checksum;
 use crate::loosepath::loose_path;
 use crate::mode::RepoMode;
 use crate::objtype::ObjectType;
 
-/// A checksum together with the object type it identifies.
+/// A checksum and the type of the object that it identifies.
+///
+/// The [`Display`](std::fmt::Display) form is `<hexchecksum>.<typestr>`. The
+/// `ostree` command prints an object reference in this form. The type string
+/// comes from [`ObjectType::type_str`] and does not depend on the repository
+/// mode. In archive mode, a content object is also `file`, and its loose path
+/// has the `z` suffix that [`ObjectType::extension`] adds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectName {
-    /// The object's SHA-256 identity.
+    /// The SHA-256 checksum of the object.
     pub checksum: Checksum,
     /// The object type.
     pub ty: ObjectType,
 }
 
 impl ObjectName {
-    /// Pair a checksum with its type.
+    /// Creates an object name from a checksum and an object type.
     pub fn new(checksum: Checksum, ty: ObjectType) -> ObjectName {
         ObjectName { checksum, ty }
     }
 
-    /// The loose path of this object relative to `objects/`, for the given
-    /// repository mode.
+    /// Returns the loose path of this object for a repository mode.
+    ///
+    /// The path is relative to the `objects/` directory and has the layout of
+    /// [`loose_path`].
     pub fn loose_path(&self, mode: RepoMode) -> String {
         loose_path(&self.checksum, self.ty, mode)
     }

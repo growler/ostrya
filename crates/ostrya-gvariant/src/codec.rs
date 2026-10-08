@@ -1,23 +1,5 @@
-//! Typed codec layer over the serialized bytes.
-//!
-//! [`GvDecode`] reads fields in place from a serialized buffer and [`GvEncode`]
-//! writes normal-form bytes directly, without going through the [`Value`] tree.
-//! Decode is borrow-first: strings and byte arrays decode as `&str` and
-//! `&[u8]` borrowing the input, and arrays decode as [`ArrayIter`], a lazy
-//! iterator over the framing offsets. Traversing a read-heavy object -- a
-//! dirtree walk, an xattr scan -- therefore performs no heap allocation.
-//!
-//! The framing is driven entirely by two associated constants,
-//! [`GvType::ALIGNMENT`] and [`GvType::FIXED_SIZE`], which compose in
-//! `const` context, so no type signature is parsed on the traversal path. The
-//! reader and writer primitives reuse the same offset and padding helpers as
-//! [`from_bytes`](crate::from_bytes) and [`to_bytes`](crate::to_bytes), so a
-//! value decoded here re-encodes to the identical bytes.
-//!
-//! This crate stays free of ostree knowledge. The impls here cover the scalar
-//! and container building blocks. The ostree object structs in `ostrya-core`
-//! implement the traits and apply the value-level conventions (big-endian
-//! scalars, checksum-length and sort-order validation).
+//! The typed codec. It shares the offset and padding helpers of `de` and
+//! `ser` with the `Value` codec.
 
 use std::marker::PhantomData;
 
@@ -26,51 +8,147 @@ use crate::ser::{choose_offset_size, write_offset};
 use crate::ty::align_up;
 use crate::{Error, Result, Type, Value};
 
-/// Type-level facts about a GVariant-encodable type: its signature, alignment,
-/// and fixed size. [`GvEncode`] and [`GvDecode`] both require it, so a type
-/// states these three constants once for both directions.
+/// The type-level facts of a type that encodes as GVariant.
 ///
-/// The framing on the traversal path is driven entirely by [`ALIGNMENT`] and
-/// [`FIXED_SIZE`], which compose in `const` context, so no type signature is
-/// parsed while reading.
+/// The facts are the signature, the alignment, and the fixed size.
+/// [`GvEncode`] and [`GvDecode`] both require this trait, so a type states
+/// the three constants once for both directions.
+///
+/// The framing of a traversal uses only [`ALIGNMENT`] and [`FIXED_SIZE`].
+/// These two constants compose in `const` context, so the read path parses
+/// no type signature.
+///
+/// # Implementations
+///
+/// This crate implements the traits for the scalar and container building
+/// blocks:
+///
+/// - `bool`, `u8`, `u32`, `u64`, `&str`, and `&[u8]` implement all three
+///   traits.
+/// - `String` and [`Slice`] implement [`GvType`] and [`GvEncode`].
+/// - [`ArrayIter`], [`Variant`], and [`VariantBytes`] implement all three
+///   traits.
+/// - A tuple of 2 to 8 members implements each trait that all of its members
+///   implement. A one-member tuple implements none of them.
+///
+/// The ostree object structs in `ostrya-core` implement the traits. These
+/// impls apply the value-level conventions: big-endian scalars,
+/// checksum-length checks, and sort-order checks.
 ///
 /// [`ALIGNMENT`]: GvType::ALIGNMENT
 /// [`FIXED_SIZE`]: GvType::FIXED_SIZE
 pub trait GvType {
-    /// The GVariant type signature, for the nameable leaf and object types.
-    /// Composite container impls (tuples, arrays) leave it empty: their
-    /// signature is compositional and is not needed to encode.
+    /// The GVariant type signature, or `""` for a container type.
+    ///
+    /// The impls for scalars, strings, byte arrays, and variants set it. The
+    /// object structs of `ostrya-core` set it too. The impls for tuples,
+    /// [`ArrayIter`], and [`Slice`] leave it empty, because their element
+    /// types give the signature. The encoder does not read it.
     const SIGNATURE: &'static str = "";
-    /// Alignment of the serialized form, in bytes.
+    /// The alignment of the serialized form, in bytes.
     const ALIGNMENT: usize;
-    /// Serialized size if fixed-size, else `None`.
+    /// The serialized size, or `None` for a variable-size type.
     const FIXED_SIZE: Option<usize>;
 }
 
-/// Encode a value into normal-form GVariant bytes.
+/// A type that writes itself as normal-form GVariant bytes.
 ///
-/// `encode` appends this value at the current end of `out`; container impls
-/// pad each member to its alignment before delegating, so the top-level call
-/// only needs an empty (or already-aligned) buffer.
+/// [`encode`](GvEncode::encode) writes the bytes directly and builds no
+/// [`Value`] tree. The bytes equal the output of [`to_bytes`] for the same
+/// type and value. The tests in `tests/differential.rs` check this for each
+/// ostree object shape.
+///
+/// `encode` appends the value at the current end of `out`. A container impl
+/// pads each member to its alignment, so the top-level call needs only an
+/// empty or already-aligned buffer.
+///
+/// [`to_bytes`]: crate::to_bytes
 pub trait GvEncode: GvType {
-    /// Append the normal-form serialization of `self` to `out`.
+    /// Appends the normal-form bytes of `self` to `out`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidValue`] if a `&str` or a `String` holds an interior
+    ///   NUL byte.
+    /// - For a tuple or a [`Slice`], the first error of a member.
+    ///
+    /// The other impls of this crate return no error.
     fn encode(&self, out: &mut Vec<u8>) -> Result<()>;
 }
 
-/// Decode normal-form GVariant bytes, borrowing from `data` where possible.
+/// A type that reads itself from normal-form GVariant bytes.
 ///
-/// Scalar, string, tuple, and variant decoders reject any deviation from
-/// normal form (nonzero padding, out-of-order offsets, unterminated or
-/// non-UTF-8 strings, wrong sizes) at decode time. [`ArrayIter`]'s decode
-/// checks the array's outer framing and defers the per-element checks to
-/// iteration; draining the iterator applies the same checks as
-/// [`from_bytes`](crate::from_bytes).
+/// [`decode`](GvDecode::decode) reads the fields in place and builds no
+/// [`Value`] tree. A value that decodes encodes again to the input bytes,
+/// because the typed path shares the offset and padding helpers of
+/// [`from_bytes`] and [`to_bytes`].
+///
+/// The decode of an [`ArrayIter`] checks only the outer framing of the array.
+/// The iterator checks each element when it visits the element. A full drain
+/// of the iterator applies the same checks as [`from_bytes`].
+///
+/// # Allocation
+///
+/// A decode borrows from `data`:
+///
+/// - A string decodes as `&str`.
+/// - A byte array decodes as `&[u8]`.
+/// - An array decodes as [`ArrayIter`], a lazy iterator over the framing
+///   offsets.
+/// - A variant decodes as [`VariantBytes`], the borrowed child bytes and
+///   signature.
+///
+/// With these types, the traversal of a read-heavy object does no heap
+/// allocation. A dirtree walk and an xattr scan are such traversals. The test
+/// `tests/alloc.rs` checks this property.
+///
+/// [`Variant`] is the exception. Its decode parses the child into a [`Value`],
+/// and this allocates.
+///
+/// # Examples
+///
+/// ```
+/// use ostrya_gvariant::{ArrayIter, GvDecode, Slice, encode_to_vec};
+///
+/// let bytes = encode_to_vec(&(7u32, Slice(&["a", "bc"])))?;
+/// let (n, names) = <(u32, ArrayIter<&str>)>::decode(&bytes)?;
+/// assert_eq!(n, 7);
+/// let names: Vec<&str> = names.collect::<Result<_, _>>()?;
+/// assert_eq!(names, ["a", "bc"]);
+/// # Ok::<(), ostrya_gvariant::Error>(())
+/// ```
+///
+/// [`from_bytes`]: crate::from_bytes
+/// [`to_bytes`]: crate::to_bytes
 pub trait GvDecode<'a>: GvType + Sized {
-    /// Decode a value from the slice covering exactly its serialized form.
+    /// Decodes a value from the slice that covers exactly its serialized form.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotNormal`] if `data` is not in normal form:
+    ///   - a scalar of the wrong size, or a boolean that is not 0 or 1
+    ///   - a string that is not NUL-terminated, that holds an interior NUL
+    ///     byte, or that is not UTF-8
+    ///   - an array or a tuple with a wrong size or nonzero padding
+    ///   - framing offsets out of order or out of bounds, or an offset size
+    ///     that is not the smallest that fits
+    ///   - a variant with no type separator, or with a signature that is not
+    ///     UTF-8 or not a valid type
+    /// - [`Error::DepthExceeded`] if the child of a [`Variant`] exceeds the
+    ///   [depth limit](crate::from_bytes#depth-limit) of [`from_bytes`].
+    ///
+    /// An [`ArrayIter`] returns the error of an element from
+    /// [`next`](Iterator::next), when it visits that element.
+    ///
+    /// [`from_bytes`]: crate::from_bytes
     fn decode(data: &'a [u8]) -> Result<Self>;
 }
 
-/// Encode a top-level value to a fresh byte vector.
+/// Encodes a top-level value into a new byte vector.
+///
+/// # Errors
+///
+/// The errors of [`GvEncode::encode`].
 pub fn encode_to_vec<T: GvEncode>(value: &T) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     value.encode(&mut out)?;
@@ -197,9 +275,11 @@ impl GvType for String {
     const FIXED_SIZE: Option<usize> = None;
 }
 
-/// Encode an owned string by delegating to the `&str` path, so an owned value
-/// (a dirtree entry name, say) can be a tuple or array member without first
-/// being reborrowed into a temporary slice of references.
+/// Writes the same bytes as `&str`.
+///
+/// An owned string can be a tuple or array member. An owned value, for
+/// example a dirtree entry name, needs no reborrow into a temporary slice of
+/// references.
 impl GvEncode for String {
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         self.as_str().encode(out)
@@ -227,23 +307,30 @@ impl<'a> GvDecode<'a> for &'a [u8] {
 
 // -- arrays ----------------------------------------------------------------
 
-/// A lazy reader over the elements of a serialized array. Holds only the
-/// backing slice and a cursor, so iteration allocates nothing.
+/// A lazy reader over the elements of a serialized array.
+///
+/// It holds only the backing slice and a cursor, so iteration allocates
+/// nothing.
 #[derive(Clone, Copy)]
 pub(crate) struct ArrayReader<'a> {
     data: &'a [u8],
     elem_alignment: usize,
-    /// `Some` for a fixed-size element type; drives the packing/framing split.
+    /// `Some` for a fixed-size element type.
+    ///
+    /// If `Some`, the elements pack back to back. If `None`, framing offsets
+    /// delimit the elements.
     elem_size: Option<usize>,
-    /// Framing-offset size (variable-element arrays only).
+    /// The framing-offset size, for variable-element arrays only.
     z: usize,
-    /// End of the element data, where the framing area begins (variable only).
+    /// The end of the element data, where the framing area starts.
+    ///
+    /// It applies to variable-element arrays only.
     data_end: usize,
     /// Element count.
     n: usize,
     /// Next element index.
     i: usize,
-    /// Current data position (variable-element cursor).
+    /// The current data position, which is the cursor for variable elements.
     pos: usize,
 }
 
@@ -291,8 +378,8 @@ impl<'a> ArrayReader<'a> {
         r.data_end = data_end;
         r.n = offsets_len / z;
         // Normal form uses the smallest offset size that fits the element data
-        // plus its own offsets. A wider size re-encodes to fewer bytes, so a
-        // buffer that would not survive re-encode is rejected here.
+        // plus its own offsets. A wider size re-encodes to fewer bytes, so
+        // this check rejects a buffer that does not re-encode to its bytes.
         if choose_offset_size(data_end, r.n) != z {
             return Err(Error::NotNormal(
                 "array framing offset size is not normal-form",
@@ -301,7 +388,7 @@ impl<'a> ArrayReader<'a> {
         Ok(r)
     }
 
-    /// The full serialized array slice, including the framing area.
+    /// The full serialized array slice, with the framing area.
     fn bytes(&self) -> &'a [u8] {
         self.data
     }
@@ -325,7 +412,7 @@ impl<'a> ArrayReader<'a> {
         let end = read_offset(&self.data[off_at..off_at + self.z], self.z);
         let start = align_up(self.pos, self.elem_alignment);
         if start > end || end > self.data_end {
-            // A framing error leaves `pos` unusable; fuse the reader.
+            // A framing error leaves `pos` unusable. Fuse the reader.
             self.i = self.n;
             return Some(Err(Error::NotNormal(
                 "array element offsets are out of order",
@@ -341,13 +428,18 @@ impl<'a> ArrayReader<'a> {
     }
 }
 
-/// A decoded array: a lazy iterator that decodes one element per step.
+/// A lazy iterator over the elements of a serialized array.
 ///
-/// `ArrayIter` borrows the source buffer and yields `Result<E>`, so
-/// per-element normal-form checks surface as the elements are visited. It is
-/// `Copy`, so it can be re-iterated from the start. A framing error fuses the
-/// iterator: the `Err` is yielded once and every following call returns
-/// `None`.
+/// `ArrayIter` borrows the source buffer and yields `Result<E>`. It decodes
+/// one element in each step, so the normal-form check of an element runs when
+/// the iterator visits it. It is `Copy`, so a caller can iterate it again from
+/// the start.
+///
+/// A framing error fuses the iterator. The iterator yields the `Err` once,
+/// and every later call returns `None`.
+///
+/// Its [`SIGNATURE`](GvType::SIGNATURE) is `""`, because the signature of an
+/// array comes from its element type.
 #[derive(Clone, Copy)]
 pub struct ArrayIter<'a, E> {
     reader: ArrayReader<'a>,
@@ -379,8 +471,10 @@ impl<'a, E: GvDecode<'a>> GvDecode<'a> for ArrayIter<'a, E> {
 }
 
 impl<'a, E: GvDecode<'a>> GvEncode for ArrayIter<'a, E> {
-    /// Re-emit the borrowed array. The reader's backing slice is already
-    /// normal-form and, re-placed at the same alignment, reproduces its bytes.
+    /// Writes the bytes of the borrowed array again.
+    ///
+    /// The backing slice of the reader is already in normal form. At the same
+    /// alignment, the slice gives its original bytes.
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         out.extend_from_slice(self.reader.bytes());
         Ok(())
@@ -388,6 +482,9 @@ impl<'a, E: GvDecode<'a>> GvEncode for ArrayIter<'a, E> {
 }
 
 /// An array to encode from a Rust slice of encodable elements.
+///
+/// Its [`SIGNATURE`](GvType::SIGNATURE) is `""`, because the signature of an
+/// array comes from its element type.
 pub struct Slice<'s, E>(pub &'s [E]);
 
 impl<'s, E: GvEncode> GvType for Slice<'s, E> {
@@ -407,12 +504,30 @@ impl<'s, E: GvEncode> GvEncode for Slice<'s, E> {
     }
 }
 
-/// Append `n` array elements with normal-form framing. `write_elem(out, i)`
-/// appends element `i`; the caller supplies the element encoding while this
-/// function owns the padding and the framing-offset area, so the array rule
-/// exists once for both the typed and the `Value` encoders. It is public so a
-/// caller with its own element storage (an ostree object's owned field arrays)
-/// can emit array framing without first collecting element references.
+/// Appends `n` array elements with normal-form framing to `out`.
+///
+/// `write_elem(out, i)` appends element `i`. This function writes the padding
+/// and the framing-offset area. The framing is the same as the framing that
+/// [`to_bytes`] writes.
+///
+/// The other parameters describe the element type:
+///
+/// - `elem_alignment`: the alignment of the element type, in bytes. If
+///   `elem_fixed` is `false`, the function pads to it before each element.
+/// - `elem_fixed`: `true` if the element type has a fixed size. Fixed-size
+///   elements pack back to back with no padding and no framing offsets.
+/// - `n`: the number of elements.
+///
+/// A caller with its own element storage can write the array framing with
+/// this function. An example is the owned field arrays of an ostree object.
+/// The caller needs no collected element references.
+///
+/// # Errors
+///
+/// The first error that `write_elem` returns, unchanged. The function has no
+/// error of its own.
+///
+/// [`to_bytes`]: crate::to_bytes
 pub fn write_array<F>(
     out: &mut Vec<u8>,
     elem_alignment: usize,
@@ -425,8 +540,8 @@ where
 {
     let start = out.len();
     if elem_fixed {
-        // Fixed sizes are multiples of the element alignment, so elements pack
-        // back to back with no padding and no framing offsets.
+        // A fixed size is a multiple of the element alignment, so the
+        // elements pack back to back with no padding and no framing offsets.
         for i in 0..n {
             write_elem(out, i)?;
         }
@@ -449,16 +564,19 @@ where
 
 // -- variant ---------------------------------------------------------------
 
-/// A decoded variant: the child's type and value together with the borrowed
-/// child bytes and signature.
+/// A decoded variant that holds the type and the value of its child.
 ///
-/// Variants carry a dynamic child type, so [`decode`](GvDecode::decode) parses
-/// the child into a [`Value`] once and keeps it; [`Variant::value`] borrows
-/// that value without re-walking the bytes or cloning. This is the one building
-/// block that allocates on decode; it sits off the traversal hot path (variants
-/// appear only inside `a{sv}` metadata). [`encode`](GvEncode::encode) re-emits the
-/// borrowed child bytes and signature, so it reproduces the input byte-for-byte
-/// without rebuilding the signature string.
+/// A variant carries a dynamic child type, so [`decode`](GvDecode::decode)
+/// parses the child into a [`Value`] once and keeps it. [`Variant::value`]
+/// borrows that value. It walks no bytes again and clones nothing.
+///
+/// `Variant` is the one building block that allocates on decode. Variants
+/// occur only inside `a{sv}` metadata, so a dirtree walk or an xattr scan does
+/// not decode one.
+///
+/// A `Variant` also keeps the borrowed child bytes and signature.
+/// [`encode`](GvEncode::encode) writes them again, so the output equals the
+/// input byte for byte. The encode builds no signature string.
 pub struct Variant<'a> {
     ty: Type,
     child: &'a [u8],
@@ -467,13 +585,13 @@ pub struct Variant<'a> {
 }
 
 impl<'a> Variant<'a> {
-    /// The child's GVariant type.
+    /// Returns the type of the child.
     pub fn ty(&self) -> &Type {
         &self.ty
     }
 
-    /// The child payload as a [`Value`], borrowed from the value parsed at
-    /// decode time.
+    /// Returns the child as a [`Value`] that [`decode`](GvDecode::decode)
+    /// parsed once.
     pub fn value(&self) -> &Value {
         &self.value
     }
@@ -508,13 +626,16 @@ impl<'a> GvEncode for Variant<'a> {
     }
 }
 
-/// A variant read in place: the borrowed child bytes and the borrowed child
-/// type signature.
+/// A variant read in place, as borrowed child bytes and signature.
 ///
 /// [`decode`](GvDecode::decode) splits the variant at its type separator and
-/// checks that the signature is UTF-8. It parses neither the signature nor the
-/// child, so it allocates nothing. A caller that needs the child checked runs
-/// [`validate`](crate::validate) over the whole document first.
+/// checks that the signature is UTF-8. It parses neither the signature nor
+/// the child, so it allocates nothing.
+///
+/// If a caller needs a checked child, the caller runs [`validate`] over the
+/// whole serialized value first.
+///
+/// [`validate`]: crate::validate
 #[derive(Clone, Copy)]
 pub struct VariantBytes<'a> {
     child: &'a [u8],
@@ -522,12 +643,15 @@ pub struct VariantBytes<'a> {
 }
 
 impl<'a> VariantBytes<'a> {
-    /// The serialized child.
+    /// Returns the serialized child.
     pub fn child(&self) -> &'a [u8] {
         self.child
     }
 
-    /// The type signature of the child, as the variant spells it.
+    /// Returns the type signature of the child, as the variant spells it.
+    ///
+    /// The decode checks only that the signature is UTF-8. It does not parse
+    /// the signature, so the signature can be an invalid type string.
     pub fn signature(&self) -> &'a str {
         self.signature
     }
@@ -540,8 +664,9 @@ impl<'a> GvType for VariantBytes<'a> {
 }
 
 impl<'a> GvEncode for VariantBytes<'a> {
-    /// Re-emit the borrowed child bytes, the type separator, and the child
-    /// signature, so the variant reproduces the bytes it was read from.
+    /// Writes the child bytes, the type separator, and the signature again.
+    ///
+    /// The output equals the bytes that decode read.
     fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         out.extend_from_slice(self.child);
         out.push(0);
@@ -579,8 +704,11 @@ pub(crate) const fn max_align(aligns: &[usize]) -> usize {
     m
 }
 
-/// The fixed size of a struct given each member's `(alignment, fixed_size)`,
-/// or `None` if any member is variable-size. Matches `Type::fixed_size`.
+/// The fixed size of a struct from the `(alignment, fixed_size)` of each
+/// member.
+///
+/// If any member is variable-size, the result is `None`. The result matches
+/// `Type::fixed_size`.
 pub(crate) const fn struct_fixed_size(
     members: &[(usize, Option<usize>)],
     whole_align: usize,
@@ -601,8 +729,10 @@ pub(crate) const fn struct_fixed_size(
     Some(align_up(size, whole_align))
 }
 
-/// A cursor that carves a serialized tuple/dict-entry body into member slices,
-/// applying the same framing and padding checks as `from_bytes`.
+/// A cursor that splits a serialized tuple or dict-entry body into member
+/// slices.
+///
+/// It applies the same framing and padding checks as `from_bytes`.
 pub(crate) struct TupleReader<'a> {
     data: &'a [u8],
     framing_start: usize,
@@ -624,10 +754,11 @@ impl<'a> TupleReader<'a> {
             .len()
             .checked_sub(n_offsets * z)
             .ok_or(Error::NotNormal("tuple is too small for its framing"))?;
-        // With framing offsets present, the offset size must be the one the
-        // encoder would pick for this member area; a wider size re-encodes to
-        // fewer bytes and is rejected. Fully fixed and last-member-only tuples
-        // carry no offsets, so `z` is irrelevant there.
+        // If framing offsets are present, the offset size must be the size
+        // that the encoder picks for this member area. A wider size re-encodes
+        // to fewer bytes, so this check rejects it. A tuple carries no offsets
+        // if all of its members are fixed-size, or if its last member is the
+        // only variable-size member. For such a tuple, `z` has no effect.
         if n_offsets > 0 && choose_offset_size(framing_start, n_offsets) != z {
             return Err(Error::NotNormal(
                 "tuple framing offset size is not normal-form",
@@ -681,16 +812,22 @@ impl<'a> TupleReader<'a> {
 }
 
 /// A writer that appends tuple members with correct alignment, padding, and
-/// framing offsets, producing the same bytes as `to_bytes`.
+/// framing offsets.
+///
+/// It writes the same bytes as `to_bytes`.
 pub(crate) struct TupleWriter<'b> {
     out: &'b mut Vec<u8>,
     start: usize,
-    /// End offsets of variable-size members other than the last, in member
-    /// order; emitted in reverse by [`finish`](Self::finish).
+    /// The end offsets of the variable-size members other than the last, in
+    /// member order.
+    ///
+    /// [`finish`](Self::finish) writes them in reverse order.
     offsets: Vec<usize>,
 }
 
 impl<'b> TupleWriter<'b> {
+    /// Creates a writer that appends members at the end of `out`.
+    ///
     /// The offsets buffer starts empty and grows only for variable-size
     /// members, so a fully fixed-size tuple allocates nothing.
     pub(crate) fn new(out: &'b mut Vec<u8>) -> Self {
@@ -702,9 +839,10 @@ impl<'b> TupleWriter<'b> {
         }
     }
 
-    /// Append a member with runtime alignment and fixed-size, delegating the
-    /// member encoding to `write`. The framing rule lives here for both the
-    /// typed and the `Value` encoders.
+    /// Appends a member with a runtime alignment and fixed size.
+    ///
+    /// `write` encodes the member. The framing rule exists here once for the
+    /// typed encoder and the `Value` encoder.
     pub(crate) fn field_dyn(
         &mut self,
         alignment: usize,
@@ -797,15 +935,16 @@ mod tests {
     /// The `(uuua(ayay))` dirmeta shape as a borrowed view.
     type DirMetaView<'a> = (u32, u32, u32, ArrayIter<'a, (&'a [u8], &'a [u8])>);
 
-    /// Round-trip a typed value against `to_bytes`/`from_bytes` for the given
-    /// signature: the typed encoding must equal the `Value` encoding, `Value`
-    /// decode of those bytes must reproduce `expected_value`, and typed decode
-    /// must re-encode to the same bytes.
+    /// Round-trips a typed value against `to_bytes`/`from_bytes` for a signature.
     ///
-    /// The decode-and-re-encode step is supplied as `decode_reencode` so the
-    /// borrowed view binds to the locally produced buffer: a borrowed type
-    /// such as `&str` cannot be decoded into a fixed lifetime chosen by the
-    /// caller, so the closure decodes and re-encodes within a single call.
+    /// The typed encoding must equal the `Value` encoding. The `Value` decode
+    /// of those bytes must give `expected_value`. The typed decode must
+    /// re-encode to the same bytes.
+    ///
+    /// The caller supplies the decode-and-re-encode step as `decode_reencode`,
+    /// so the borrowed view binds to the buffer that this function makes. A
+    /// borrowed type such as `&str` cannot decode into a fixed lifetime that
+    /// the caller chooses, so the closure decodes and re-encodes in one call.
     fn check<T, F>(sig: &str, value: &T, expected_value: &Value, decode_reencode: F)
     where
         T: GvEncode,
@@ -896,7 +1035,7 @@ mod tests {
 
     #[test]
     fn variable_tuple_with_fixed_final_member() {
-        // (su): string needs a framing offset, the trailing u32 does not.
+        // (su): the string needs a framing offset. The trailing u32 needs none.
         let value: (&str, u32) = ("abc", 5);
         check(
             "(su)",
@@ -923,7 +1062,7 @@ mod tests {
 
     #[test]
     fn variant_round_trips_via_value() {
-        // A dict entry {sv} carrying a string value, the a{sv} building block.
+        // A dict entry {sv} with a string value. It is the a{sv} building block.
         let child = to_bytes(&Type::parse("s").unwrap(), &Value::Str("1".into())).unwrap();
         let mut variant_bytes = child.clone();
         variant_bytes.push(0);
@@ -982,9 +1121,11 @@ mod tests {
         );
     }
 
-    /// The entries of an `a{sv}` read as `(&str, VariantBytes)` and written
-    /// again with [`write_array`] give the bytes of the dict, and one
-    /// variant encodes to the bytes it was read from.
+    /// The entries of an `a{sv}`, read and written again, give the dict bytes.
+    ///
+    /// The test reads the entries as `(&str, VariantBytes)` and writes them
+    /// again with [`write_array`]. One variant encodes to the bytes that
+    /// decode read.
     #[test]
     fn variant_bytes_encode_the_bytes_they_were_read_from() {
         let ty = Type::parse("a{sv}").unwrap();
@@ -1062,8 +1203,9 @@ mod tests {
 
     #[test]
     fn aligned_array_behind_unaligned_member_reencodes_identically() {
-        // (ya(uu)): the leading byte leaves the 4-aligned array preceded by
-        // padding, which the re-encode of the borrowed array must reproduce.
+        // (ya(uu)): padding follows the leading byte and precedes the
+        // 4-aligned array. The re-encode of the borrowed array must reproduce
+        // this padding.
         let ty = Type::parse("(ya(uu))").unwrap();
         let value = Value::Tuple(vec![
             Value::Byte(7),
@@ -1118,8 +1260,8 @@ mod tests {
 
     #[test]
     fn array_iter_fuses_after_framing_error() {
-        // Two-element "as" whose first framing offset exceeds the data area:
-        // the framing error surfaces once, then iteration ends.
+        // A two-element "as" whose first framing offset exceeds the data area.
+        // The iterator yields the framing error once. Then iteration ends.
         let data = [b'a', 0, b'b', 0, 5, 4];
         let mut it = <ArrayIter<&str> as GvDecode>::decode(&data).unwrap();
         assert_eq!(
@@ -1134,8 +1276,8 @@ mod tests {
 
     #[test]
     fn array_decode_defers_element_checks_to_iteration() {
-        // Valid outer framing around a corrupt element: decode succeeds and
-        // the element error surfaces when the element is visited.
+        // Valid outer framing around a corrupt element. Decode succeeds. The
+        // iterator yields the element error at the visit of that element.
         let data = [0xff, 0, 2];
         let mut it = <ArrayIter<&str> as GvDecode>::decode(&data).unwrap();
         assert_eq!(
@@ -1163,10 +1305,10 @@ mod tests {
 
     #[test]
     fn rejects_non_normal_array_offset_size() {
-        // A 256-byte `as` with one 254-byte string element framed by a 2-byte
-        // offset. Normal form uses a 1-byte offset (255 bytes total), so the
-        // wider encoding must be rejected rather than decoded and silently
-        // re-serialized to shorter, differently-checksummed bytes.
+        // A 256-byte `as` with one 254-byte string element and a 2-byte
+        // framing offset. Normal form uses a 1-byte offset, 255 bytes in
+        // total, so decode must reject the wider encoding. If decode accepts
+        // it, a re-serialize silently gives shorter bytes with another checksum.
         let mut data = vec![b'x'; 253];
         data.push(0); // NUL terminator -> 254-byte element data area
         data.extend_from_slice(&254u16.to_le_bytes());
@@ -1181,10 +1323,10 @@ mod tests {
 
     #[test]
     fn rejects_non_normal_tuple_offset_size() {
-        // A 256-byte `(ss)` whose single framing offset is 2 bytes; normal
-        // form uses a 1-byte offset (255 bytes total). The member area is the
-        // two NUL-terminated strings; the trailing offset points to the end
-        // of the first.
+        // A 256-byte `(ss)` whose single framing offset is 2 bytes. Normal
+        // form uses a 1-byte offset, 255 bytes in total. The member area holds
+        // the two NUL-terminated strings. The trailing offset points to the end
+        // of the first string.
         let mut data = Vec::new();
         data.extend_from_slice(b"a\0"); // first string, 2 bytes
         data.extend_from_slice(&vec![b'b'; 251]);

@@ -1,40 +1,65 @@
-//! The error type for the format-primitive layer.
+//! The error type of the format primitives.
 //!
-//! Hand-rolled with a manual [`Display`] and [`std::error::Error`] impl, the
-//! same style as the sibling `ostrya-gvariant` crate, so this crate pulls in
-//! no derive dependency. The higher-level `ostrya` crate wraps these in its
-//! own `thiserror`-based error.
+//! This module implements `Display` and `std::error::Error` by hand, as
+//! `ostrya-gvariant` does, so this crate needs no derive dependency. The
+//! `ostrya` crate wraps this type in its own error, which uses `thiserror`.
 
 use std::fmt;
 
-/// Errors produced by the core format primitives.
+/// An error of the format primitives.
+///
+/// Each fallible function of this crate returns it, except
+/// [`commit_timestamp`](crate::commit_timestamp). The I/O trait methods of
+/// [`DeflateSink`](crate::DeflateSink) and
+/// [`DeflateReader`](crate::DeflateReader) return [`std::io::Error`]. Most
+/// variants hold a fixed message that names the reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// A GVariant (de)serialization error from the codec layer.
+    /// An encode or decode error of the GVariant codec.
     Gvariant(ostrya_gvariant::Error),
-    /// A checksum string or byte sequence was malformed.
+    /// A checksum in hex, base64, or byte form that is not valid.
     InvalidChecksum(&'static str),
-    /// A base64 string was malformed (invalid character or truncated group).
+    /// A base64 string with an invalid character or a truncated group.
     InvalidBase64(&'static str),
-    /// An object-type numeric tag did not name a known type.
+    /// An object-type number that names no known type.
     InvalidObjectType(u32),
-    /// A LEB128 varint was truncated or overflowed 64 bits.
+    /// A LEB128 varint that is truncated, overflows 64 bits, or is not minimal.
     InvalidVarint(&'static str),
-    /// An xattr set failed validation (empty, duplicate, or unsorted name).
+    /// An xattr set with a name that is not valid.
+    ///
+    /// The name is empty, a duplicate, out of sort order, or has a missing
+    /// terminating NUL or an interior NUL.
     InvalidXattrs(&'static str),
-    /// An `ostree.sizes` entry was malformed.
+    /// An `ostree.sizes` entry that is too short or has trailing bytes.
     InvalidSizeEntry(&'static str),
-    /// A GKeyFile/INI document or a typed lookup was malformed.
+    /// A key file error.
+    ///
+    /// These are the causes:
+    ///
+    /// - The text does not parse.
+    /// - A value does not convert to the requested type.
+    /// - A set refuses a group name, a key, or a value.
     KeyFile(String),
-    /// A commit object violated a value-level convention.
+    /// A commit object with a parent or root checksum of an invalid length.
     InvalidCommit(&'static str),
-    /// A dirtree object violated a value-level convention (bad file name,
-    /// checksum length, or sort order).
+    /// A dirtree object that breaks an entry rule.
+    ///
+    /// These are the causes:
+    ///
+    /// - An entry name is not valid.
+    /// - An entry checksum is not 32 bytes.
+    /// - The names are not sorted.
+    /// - A name is in both the file and directory lists.
     InvalidDirTree(&'static str),
-    /// A dirmeta object violated a value-level convention.
+    /// A dirmeta object with a mode that is not a directory mode.
     InvalidDirMeta(&'static str),
-    /// A file content-object header violated a value-level convention
-    /// (nonzero rdev, non-REG/non-LNK mode, or a malformed blob reference).
+    /// A file header or a framed content stream that is not valid.
+    ///
+    /// The header has a nonzero rdev, a mode that is not a regular file or a
+    /// symlink, or a regular file with a symlink target. The framed stream is
+    /// too short, has nonzero padding, or has a header length out of bounds.
+    /// A header that is longer than the framing length limit also gives this
+    /// error.
     InvalidFileHeader(&'static str),
 }
 
@@ -72,5 +97,5 @@ impl From<ostrya_gvariant::Error> for Error {
     }
 }
 
-/// Result alias for the core format primitives.
+/// The result type of the format primitives.
 pub type Result<T> = std::result::Result<T, Error>;

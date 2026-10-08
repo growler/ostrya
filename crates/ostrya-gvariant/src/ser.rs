@@ -2,35 +2,61 @@ use crate::codec::{TupleWriter, write_array};
 use crate::de::MAX_VALUE_DEPTH;
 use crate::{Error, GvEncode, Result, Type, Value};
 
-/// Serialize `value` as type `ty` in GVariant normal form.
+/// Serializes `value` as type `ty` in GVariant normal form.
 ///
-/// Framing offsets and multi-byte scalars are written little-endian, the
-/// normal-form byte order on the little-endian targets ostree supports.
-/// Fields the on-disk format defines as big-endian (uids, modes, timestamps)
-/// are value-level conversions done by the caller before serialization.
+/// The serializer writes framing offsets and multi-byte scalars in
+/// little-endian byte order. This is the normal-form byte order on the
+/// little-endian targets that ostree supports.
+///
+/// The on-disk format defines some fields as big-endian: uids, gids, modes,
+/// timestamps, and sizes. The caller converts the values of these fields
+/// before serialization.
+///
+/// # Errors
+///
+/// - [`Error::TypeMismatch`] if `value` does not match `ty`. This includes a
+///   tuple or a dict entry with a different number of members. It also
+///   includes a [`Value::Array`] of [`Value::Byte`] for the type `ay`, which
+///   needs [`Value::Bytes`].
+/// - [`Error::InvalidValue`] if a [`Value::Str`] holds an interior NUL byte.
+/// - [`Error::DepthExceeded`] if `value` nests deeper than the
+///   [depth limit](#depth-limit).
+///
+/// # Depth limit
+///
+/// A leaf can sit under at most 128 levels of containers. Each variant,
+/// array, maybe, tuple, and dict entry adds one level. A value of type `v`
+/// with 128 nested variants serializes. A value with 129 nested variants
+/// returns [`Error::DepthExceeded`].
+///
+/// [`from_bytes`] has the same limit, so it accepts each value that
+/// `to_bytes` accepts.
+///
+/// [`from_bytes`]: crate::from_bytes
 pub fn to_bytes(ty: &Type, value: &Value) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     serialize(&mut buf, ty, value, 0)?;
     Ok(buf)
 }
 
-/// Serialize one value at the current buffer position.
+/// Serializes one value at the current buffer position.
 ///
-/// Alignment is computed on absolute buffer positions: the top-level value
-/// starts at 0 and every container is placed at a multiple of its own
-/// alignment, which is at least each member's alignment, so absolute and
-/// container-relative padding coincide.
+/// The function computes alignment from absolute buffer positions. The
+/// top-level value starts at 0. Each container starts at a multiple of its
+/// own alignment. That alignment is at least the alignment of each member,
+/// so the absolute padding and the container-relative padding are equal.
 ///
-/// `depth` counts container nesting as in the parser, sharing
-/// [`MAX_VALUE_DEPTH`], so a value the serializer accepts is one the parser
-/// accepts back.
+/// `depth` counts container nesting the same way as the parser. Both use
+/// [`MAX_VALUE_DEPTH`], so the parser accepts each value that the serializer
+/// accepts.
 fn serialize(buf: &mut Vec<u8>, ty: &Type, value: &Value, depth: usize) -> Result<()> {
     if depth > MAX_VALUE_DEPTH {
         return Err(Error::DepthExceeded);
     }
     match (ty, value) {
-        // Scalar and string leaves share the encoding (and the interior-NUL
-        // check) with the typed encoders; the `Value` path only unwraps.
+        // Scalar and string leaves use the encoding of the typed encoders.
+        // That encoding includes the interior-NUL check. The `Value` path
+        // only unwraps the leaf.
         (Type::Bool, Value::Bool(b)) => b.encode(buf)?,
         (Type::Byte, Value::Byte(b)) => b.encode(buf)?,
         (Type::I16, Value::I16(x)) => buf.extend_from_slice(&x.to_le_bytes()),
@@ -44,9 +70,9 @@ fn serialize(buf: &mut Vec<u8>, ty: &Type, value: &Value, depth: usize) -> Resul
             s.as_str().encode(buf)?;
         }
         (Type::Maybe(elem), Value::Maybe(inner)) => {
-            // `Nothing` is the empty byte sequence. `Just` is the element's own
-            // bytes, followed by one zero byte when the element is
-            // variable-size, which is what tells the two apart.
+            // `Nothing` is the empty byte sequence. `Just` is the bytes of the
+            // element. If the element is variable-size, one zero byte follows
+            // the element bytes. This byte tells `Nothing` and `Just` apart.
             if let Some(child) = inner {
                 serialize(buf, elem, child, depth + 1)?;
                 if elem.fixed_size().is_none() {
@@ -68,8 +94,8 @@ fn serialize(buf: &mut Vec<u8>, ty: &Type, value: &Value, depth: usize) -> Resul
         }
         (Type::Variant, Value::Variant(inner)) => {
             let (child_ty, child) = &**inner;
-            // The buffer is 8-aligned here (variant alignment), which
-            // satisfies any child alignment.
+            // The buffer is 8-aligned here because the alignment of a variant
+            // is 8. This alignment satisfies the alignment of any child.
             serialize(buf, child_ty, child, depth + 1)?;
             buf.push(0);
             buf.extend_from_slice(child_ty.signature().as_bytes());
@@ -94,7 +120,7 @@ fn serialize_array(buf: &mut Vec<u8>, elem: &Type, items: &[Value], depth: usize
     )
 }
 
-/// Serialize a tuple or dict entry.
+/// Serializes a tuple or a dict entry.
 fn serialize_struct<'t>(
     buf: &mut Vec<u8>,
     whole: &Type,
@@ -127,14 +153,26 @@ fn serialize_struct<'t>(
     Ok(())
 }
 
-/// The smallest offset size whose representable range covers the container's
-/// total size (data plus the framing offsets themselves). The parser derives
-/// the same size from the total, so both sides agree.
+/// Returns the size in bytes of each framing offset of a container.
 ///
-/// Public alongside [`write_offset`] so a caller that emits a container too
-/// large to buffer -- a static-delta part payload, whose two trailing byte
-/// arrays stream from disk -- can write the same framing this serializer does
-/// once it knows each member's length.
+/// `data_len` is the size of the container data, and `n_offsets` is the
+/// number of framing offsets. The result is the smallest size `z` whose range
+/// covers the total size of the container, `data_len + n_offsets * z`:
+///
+/// - 1 covers it if `data_len + n_offsets` is at most `0xFF`.
+/// - 2 covers it if `data_len + n_offsets * 2` is at most `0xFFFF`.
+/// - 4 covers it if `data_len + n_offsets * 4` is at most `0xFFFF_FFFF`.
+/// - 8 covers every other total size.
+///
+/// A reader derives the same size from the total size with
+/// [`offset_size_for`], so the writer and the reader agree.
+///
+/// With this function and [`write_offset`], a caller can write the framing of
+/// a container that is too large to buffer. An example is a static-delta part
+/// payload, whose two trailing byte arrays stream from disk. When the caller
+/// knows the length of each member, it can write the framing.
+///
+/// [`offset_size_for`]: crate::offset_size_for
 pub fn choose_offset_size(data_len: usize, n_offsets: usize) -> usize {
     for z in [1usize, 2, 4] {
         if data_len + n_offsets * z <= offset_max(z) {
@@ -153,9 +191,19 @@ pub(crate) fn offset_max(z: usize) -> usize {
     }
 }
 
-/// Append one framing offset of width `z` (as chosen by
-/// [`choose_offset_size`]). A container's offsets are written after its data,
-/// in reverse member order for a tuple and in member order for an array.
+/// Appends one framing offset of width `z`.
+///
+/// `value` is the end of a member, counted from the start of the container.
+/// The function writes the low `z` bytes of `value` in little-endian byte
+/// order. [`choose_offset_size`] gives the width `z`.
+///
+/// The offsets of a container follow its data. A tuple has its offsets in
+/// reverse member order. An array has its offsets in member order.
+///
+/// # Panics
+///
+/// Panics if `z` is more than the size of `usize` in bytes: 8 on a 64-bit
+/// target, 4 on a 32-bit target.
 pub fn write_offset(buf: &mut Vec<u8>, value: usize, z: usize) {
     buf.extend_from_slice(&value.to_le_bytes()[..z]);
 }
@@ -183,9 +231,10 @@ mod tests {
 
     #[test]
     fn dirmeta_layout() {
-        // (uuua(ayay)) with uid 0, gid 0, mode big-endian 0o40755, no xattrs:
-        // three fixed u32 members and an empty final array -- 12 bytes, no
-        // framing offsets. Matches the golden dirmeta fixture bytes.
+        // (uuua(ayay)) with uid 0, gid 0, mode 0o40755 in big-endian, and no
+        // xattrs. The value has three fixed u32 members and an empty final
+        // array. It is 12 bytes and has no framing offsets. The bytes match
+        // the golden dirmeta fixture.
         let value = Value::Tuple(vec![
             Value::U32(0),
             Value::U32(0),
@@ -214,10 +263,10 @@ mod tests {
 
     #[test]
     fn dict_with_one_entry() {
-        // {"version": <"1">}: key "version\0" fills bytes 0..8 (the variant
-        // member is 8-aligned), the variant is "1\0" + NUL + "s", the entry
-        // framing offset is the key's end (8), and the array framing offset
-        // is the entry's end (13).
+        // {"version": <"1">}: the key "version\0" fills bytes 0..8. The
+        // variant member is 8-aligned. The variant is "1\0" + NUL + "s". The
+        // framing offset of the entry is the end of the key (8). The framing
+        // offset of the array is the end of the entry (13).
         let entry = Value::Tuple(vec![
             "version".into(),
             Value::variant(Type::Str, "1".into()),
@@ -230,8 +279,9 @@ mod tests {
 
     #[test]
     fn variable_tuple_with_fixed_final_member() {
-        // (su): the string end needs a framing offset, the trailing u32 does
-        // not; padding to the u32 alignment separates them.
+        // (su): the end of the string needs a framing offset. The trailing
+        // u32 needs no framing offset. Padding to the u32 alignment separates
+        // the two members.
         let value = Value::Tuple(vec!["abc".into(), Value::U32(5)]);
         assert_eq!(ser("(su)", &value), b"abc\0\x05\0\0\0\x04");
     }
@@ -261,23 +311,24 @@ mod tests {
 
     #[test]
     fn two_byte_offsets_past_255_bytes() {
-        // 30 nine-byte strings: 270 data bytes force 2-byte framing offsets,
-        // so the array is 270 + 30 * 2 bytes.
+        // 30 nine-byte strings give 270 data bytes. This size forces 2-byte
+        // framing offsets, so the array is 270 + 30 * 2 bytes.
         let items: Vec<Value> = (0..30)
             .map(|i| Value::Str(format!("string{i:02}")))
             .collect();
         let bytes = ser("as", &Value::Array(items));
         assert_eq!(bytes.len(), 270 + 60);
-        // First framing offset: end of the first 9-byte element, 2 bytes LE.
+        // The first framing offset is the end of the first 9-byte element.
+        // It is 2 bytes little-endian.
         assert_eq!(&bytes[270..272], &9u16.to_le_bytes());
-        // Last framing offset: end of the data area.
+        // The last framing offset is the end of the data area.
         assert_eq!(&bytes[328..330], &270u16.to_le_bytes());
     }
 
     #[test]
     fn rejects_value_depth_bomb() {
-        // 128 nested variants are the deepest the encode path takes, and 129
-        // exceed MAX_VALUE_DEPTH.
+        // The encode path accepts at most 128 nested variants. 129 nested
+        // variants exceed MAX_VALUE_DEPTH.
         let mut value = Value::variant(Type::Byte, Value::Byte(1));
         for _ in 0..127 {
             value = Value::variant(Type::Variant, value);
@@ -301,7 +352,7 @@ mod tests {
     fn rejects_mismatched_value() {
         let err = to_bytes(&Type::parse("u").unwrap(), &Value::Str("x".into())).unwrap_err();
         assert!(matches!(err, Error::TypeMismatch { .. }));
-        // ay must be Bytes, not Array of Byte.
+        // A value of type ay must be Bytes. An Array of Byte is a mismatch.
         let err = to_bytes(
             &Type::parse("ay").unwrap(),
             &Value::Array(vec![Value::Byte(1)]),

@@ -1,18 +1,25 @@
 #![forbid(unsafe_code)]
 
-//! Differential test: the `Value` path (`from_bytes`/`to_bytes`) and
-//! the typed path (`GvDecode`/`GvEncode`) share one framing engine, so for
-//! generated values across every ostree object shape the two must agree
-//! byte-for-byte. Each case checks, on the same generated value:
+//! Differential tests for the `Value` path and the typed path of the codec.
 //!
-//! - `to_bytes` (Value encode) equals `encode_to_vec` of the typed value;
-//! - `from_bytes` (Value decode) reproduces the value;
-//! - typed decode of those bytes re-encodes byte-identically.
+//! The `Value` path is `from_bytes` and `to_bytes`. The typed path is
+//! `GvDecode` and `GvEncode`. The two paths share one framing engine, so they
+//! must agree byte-for-byte on generated values of each ostree object shape.
+//! Each case does these checks on one generated value:
 //!
-//! The generated values sweep the framing branches: empty, single, and
-//! many-element arrays; element and container sizes that cross the 1-, 2-, and
-//! 4-byte framing-offset boundaries; fixed- and variable-size elements; and
-//! variants carrying each child type.
+//! - `to_bytes` (the `Value` encoder) gives the same bytes as `encode_to_vec`
+//!   of the typed value.
+//! - `from_bytes` (the `Value` decoder) gives the value again.
+//! - The typed decoder reads these bytes, and the typed encoder writes them
+//!   again byte-identically.
+//!
+//! The generated values cover these framing branches:
+//!
+//! - arrays with zero elements, one element, and many elements
+//! - element and container sizes that cross the 1-, 2-, and 4-byte
+//!   framing-offset boundaries
+//! - elements of fixed size and elements of variable size
+//! - variants that carry each child type
 
 use ostrya_gvariant::{
     ArrayIter, GvDecode, GvEncode, Slice, Type, Value, encode_to_vec, from_bytes, to_bytes,
@@ -29,10 +36,11 @@ use support::{
 /// An archive-header case: size, mode, symlink target, and xattr pairs.
 type ArchiveCase<'a> = (u64, u32, &'a str, &'a [(&'a [u8], &'a [u8])]);
 
-/// The Value path and typed re-encode must both reproduce `bytes`.
+/// Checks that the `Value` path and the typed path both reproduce `bytes`.
 ///
-/// `bytes` is produced by the Value encoder from `value`; the typed decoder
-/// reads those same bytes and must re-emit them unchanged.
+/// The `Value` encoder makes `bytes` from `value`. The `Value` decoder must
+/// give `value` again. The typed decoder reads the same bytes, and the typed
+/// encoder must write them again unchanged.
 fn assert_paths_agree<'a, T>(sig: &str, value: &Value, bytes: &'a [u8])
 where
     T: GvDecode<'a> + GvEncode,
@@ -51,7 +59,7 @@ where
     );
 }
 
-/// `encode_to_vec` of a typed value must equal `to_bytes` of the Value.
+/// Checks that `encode_to_vec` of `typed` equals `to_bytes` of `value`.
 fn assert_typed_encode<T: GvEncode>(sig: &str, typed: &T, value: &Value) -> Vec<u8> {
     let ty = Type::parse(sig).unwrap();
     let value_bytes = to_bytes(&ty, value).unwrap();
@@ -65,8 +73,9 @@ fn assert_typed_encode<T: GvEncode>(sig: &str, typed: &T, value: &Value) -> Vec<
 
 #[test]
 fn dirmeta_shape_agrees() {
-    // xattr sets sweeping count and the total size that flips the array's
-    // framing offsets from 1 byte to 2 bytes (a >255-byte value).
+    // The xattr sets vary the entry count. The last set holds a value of more
+    // than 255 bytes, so the framing offsets of the array grow from 1 byte to
+    // 2 bytes.
     let sets: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![
         vec![],
         vec![(b"user.one".to_vec(), b"x".to_vec())],
@@ -106,7 +115,7 @@ fn dirmeta_shape_agrees() {
 
 #[test]
 fn dirtree_shape_agrees() {
-    // (file count, dir count), including a large file list that crosses the
+    // Each pair is (file count, dir count). The large file list crosses the
     // 2-byte framing-offset boundary.
     for (n_files, n_dirs) in [(0, 0), (1, 0), (3, 1), (40, 5)] {
         let files: Vec<(String, Vec<u8>)> = (0..n_files)
@@ -191,9 +200,10 @@ fn archive_header_shape_agrees() {
 
 #[test]
 fn metadata_variants_agree() {
-    // a{sv} carrying each supported child type; decode-only, since a variant
-    // has no from-scratch typed encoder. The typed decoder must reproduce the
-    // Value-encoded bytes, and every variant value must match field-for-field.
+    // The a{sv} value carries each supported child type. The typed path only
+    // decodes here, because a variant has no from-scratch typed encoder. The
+    // typed decoder must reproduce the Value-encoded bytes. Each variant value
+    // must match field-for-field.
     const SIG: &str = "a{sv}";
     let ty = Type::parse(SIG).unwrap();
     let entries = vec![
@@ -251,7 +261,7 @@ fn metadata_variants_agree() {
 
 #[test]
 fn byte_array_offset_boundaries_agree() {
-    // aay: an outer array of byte arrays whose total size crosses the 1-, 2-,
+    // aay: an outer array of byte arrays. The total size crosses the 1-, 2-,
     // and 4-byte framing-offset boundaries.
     const SIG: &str = "aay";
     for n in [0usize, 1, 250, 255, 256, 300, 70_000] {
@@ -301,7 +311,7 @@ fn string_array_and_fixed_tuple_arrays_agree() {
 
 #[test]
 fn variable_tuple_with_trailing_fixed_member_agrees() {
-    // (su): the string needs a framing offset, the trailing u32 does not.
+    // (su): the string needs a framing offset. The trailing u32 needs none.
     const SIG: &str = "(su)";
     for (s, u) in [("", 0u32), ("abc", 5), ("a longer string", 0xffff_ffff)] {
         let value = Value::Tuple(vec![Value::from(s), Value::U32(u)]);
@@ -313,7 +323,8 @@ fn variable_tuple_with_trailing_fixed_member_agrees() {
 
 #[test]
 fn commit_shape_agrees() {
-    // Full commit (a{sv}aya(say)sstayay); decode-only for the a{sv} member.
+    // A full commit (a{sv}aya(say)sstayay). The a{sv} member makes this case
+    // decode-only.
     let ty = Type::parse(COMMIT_SIG).unwrap();
     let metadata = Value::Array(vec![
         Value::Tuple(vec![

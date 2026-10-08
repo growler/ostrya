@@ -2,12 +2,12 @@
 
 //! Golden loose paths.
 //!
-//! For every loose object the `ostree` tool wrote into
-//! tests/fixtures/generated/, reconstruct the loose path from the checksum
-//! parsed out of the filename plus the object type and repository mode, and
-//! require it to equal the path the tool actually used. This exercises the
-//! fanout split and the mode-aware extension selection (the `z` suffix on
-//! archive content objects) against real tool output.
+//! One test reads each loose object that the `ostree` command wrote into
+//! `tests/fixtures/generated/`. It builds the loose path from the checksum
+//! in the file name, the object type, and the repository mode. The path must
+//! equal the path that the `ostree` command used. The tests cover the fan-out
+//! split and the extension for each mode, with the `z` suffix on archive
+//! content objects.
 
 use ostrya_core::{Checksum, ObjectType, RepoMode, loose_path};
 
@@ -31,22 +31,24 @@ fn reconstructs_every_fixture_loose_path() {
         checked += 1;
     }
 
-    // The fixtures contain several objects across two modes; guard against a
-    // silently empty walk masking a regression.
+    // The fixtures hold several objects in two modes. If the walk finds fewer
+    // than 8 objects, the test fails, so an empty walk cannot hide a
+    // regression.
     assert!(
         checked >= 8,
         "expected multiple fixture objects, saw {checked}"
     );
 }
 
-/// The `z` suffix appears only on a `File` object in archive mode. The
-/// auxiliary non-meta types (payload-link, file-xattrs, file-xattrs-link) are
-/// stored uncompressed, so their loose-path extension is fixed and
-/// mode-independent and never gains a trailing `z`.
+/// The `z` suffix appears only on a `File` object in archive mode.
 ///
-/// Black-box observation supports this rule: an archive repo populated by
-/// commit or `pull-local` holds only `.filez` content objects, and the tool
-/// refuses every write to `bare-split-xattrs`, so it never materializes those
+/// ostrya stores the auxiliary non-meta types (payload-link, file-xattrs,
+/// file-xattrs-link) uncompressed. Their loose-path extension is the same in
+/// every mode and never ends in `z`.
+///
+/// Black-box observation supports this rule. A commit or a `pull-local` into
+/// an archive repository writes only `.filez` content objects. The `ostree`
+/// command refuses every write to `bare-split-xattrs`, so it never writes the
 /// auxiliary types in archive mode.
 #[test]
 fn z_suffix_is_file_and_archive_only() {
@@ -62,7 +64,7 @@ fn z_suffix_is_file_and_archive_only() {
         RepoMode::BareUserShared,
     ];
 
-    // Auxiliary non-meta types keep a fixed extension in every mode.
+    // The auxiliary non-meta types have the same extension in every mode.
     let aux = [
         (ObjectType::PayloadLink, "payload-link"),
         (ObjectType::FileXattrs, "file-xattrs"),
@@ -78,7 +80,7 @@ fn z_suffix_is_file_and_archive_only() {
         }
     }
 
-    // `File` is the only type that gains the `z` suffix, and only in archive.
+    // Only the `File` type gets the `z` suffix, and only in archive mode.
     for mode in modes {
         let ends_z = ObjectType::File.extension(mode).ends_with('z');
         assert_eq!(

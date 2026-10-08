@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! Golden-fixture tests: every metadata object the `ostree` tool wrote into
-//! tests/fixtures/generated/ must deserialize and re-serialize to identical
-//! bytes.
+//! Golden-fixture tests for the `Value` codec.
+//!
+//! The `ostree` command wrote each metadata object in tests/fixtures/generated/.
+//! Each object must deserialize and re-serialize to identical bytes.
 
 use std::path::Path;
 
@@ -16,7 +17,7 @@ use support::{
     objects_with_extension,
 };
 
-/// Deserialize strictly, re-serialize, and require byte identity.
+/// Checks that `bytes` makes a strict, byte-identical round trip as `sig`.
 fn round_trip(sig: &str, bytes: &[u8], context: &Path) -> Value {
     let ty = Type::parse(sig).unwrap();
     let value = from_bytes(&ty, bytes)
@@ -36,8 +37,9 @@ fn commit_objects_round_trip() {
     for (object, bytes) in objects_with_extension("commit", None) {
         let commit = round_trip(COMMIT_SIG, &bytes, &object.path);
         let fields = commit.as_tuple().unwrap();
-        // Deterministic fixture inputs: root commit, subject "fixture
-        // commit", empty body, timestamp 1700000000 stored big-endian.
+        // The fixture inputs are deterministic: a root commit, the subject
+        // "fixture commit", an empty body, and the timestamp 1700000000. The
+        // commit stores the timestamp big-endian.
         assert_eq!(fields[1].as_bytes().unwrap(), b"", "parent");
         assert_eq!(fields[3].as_str().unwrap(), "fixture commit", "subject");
         assert_eq!(fields[4].as_str().unwrap(), "", "body");
@@ -70,9 +72,9 @@ fn dirtree_objects_round_trip() {
             .iter()
             .map(|d| d.as_tuple().unwrap()[0].as_str().unwrap())
             .collect();
-        // The generator commits a fixed tree: the root holds three file
-        // entries (the symlink is a file object) and one subdir; the subdir
-        // holds one file. Both lists are sorted by name.
+        // The generator commits a fixed tree. The root holds one subdir and
+        // three file entries, and one file entry is the symlink. The subdir
+        // holds one file. Both lists are in name order.
         if dir_names == ["subdir"] {
             assert_eq!(file_names, ["empty.txt", "hello.txt", "link"]);
             saw_root = true;
@@ -92,7 +94,8 @@ fn dirmeta_objects_round_trip() {
         let fields = dirmeta.as_tuple().unwrap();
         assert_eq!(fields[0].as_u32().unwrap(), 0, "uid");
         assert_eq!(fields[1].as_u32().unwrap(), 0, "gid");
-        // Directories were committed 0755; the mode is stored big-endian.
+        // The generator commits directories with mode 0755. The dirmeta
+        // stores the mode big-endian.
         assert_eq!(fields[2].as_u32().unwrap(), 0o40755u32.swap_bytes(), "mode");
         assert!(fields[3].as_array().unwrap().is_empty(), "xattrs");
     }
@@ -101,7 +104,7 @@ fn dirmeta_objects_round_trip() {
 #[test]
 fn archive_file_headers_round_trip() {
     // A .filez object is [4-byte BE u32 header length][4 zero bytes]
-    // [header variant][raw-deflate payload]; the header round-trips here.
+    // [header variant][raw-deflate payload]. This test round-trips the header.
     let mut symlink_targets = Vec::new();
     let mut sizes = Vec::new();
     for (object, bytes) in objects_with_extension("filez", None) {
@@ -124,8 +127,8 @@ fn archive_file_headers_round_trip() {
         }
         assert!(fields[6].as_array().unwrap().is_empty(), "xattrs");
     }
-    // The fixture tree: hello.txt (13 bytes), empty.txt (0), subdir/nested.txt
-    // (7), and a symlink to hello.txt.
+    // The fixture tree holds hello.txt (13 bytes), empty.txt (0),
+    // subdir/nested.txt (7), and a symlink to hello.txt.
     sizes.sort_unstable();
     assert_eq!(sizes, [0, 0, 7, 13]);
     assert_eq!(symlink_targets, ["hello.txt"]);

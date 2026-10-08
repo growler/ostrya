@@ -1,20 +1,14 @@
 //! The ref-name rule.
 //!
-//! A ref name is a path below `refs/heads`: one or more components joined
-//! with `/`. A component is not empty, is not `.` or `..`, and holds no NUL.
-//! A refspec is a ref name, or `REMOTE:NAME`, split at the first `:`, where
-//! `REMOTE` is one component and `NAME` is a ref name. A refspec of the
-//! second form names a path below `refs/remotes/REMOTE`. The rule keeps
-//! each name inside the `refs/` tree.
-//!
-//! A name of 64 lowercase hex characters passes the rule. A revision reads
-//! such a name as a commit checksum, so [`is_checksum_shaped`] marks it, and
-//! a push refuses to write a commit to a ref of that name.
+//! Each of the first three functions checks one level of the rule: a
+//! component, a ref name, or a refspec. `is_checksum_shaped` marks a valid
+//! ref name that a revision reads as a checksum.
 
 use crate::Checksum;
 
-/// Whether `component` is one component of a ref name: not empty, not `.` or
-/// `..`, and with no `/` and no NUL.
+/// Returns `true` if `component` is one valid component of a ref name.
+///
+/// A component is not empty, is not `.` or `..`, and holds no `/` and no NUL.
 pub fn is_ref_component(component: &str) -> bool {
     !(component.is_empty()
         || component == "."
@@ -23,15 +17,21 @@ pub fn is_ref_component(component: &str) -> bool {
         || component.contains('\0'))
 }
 
-/// Whether `name` is a ref name: not empty, and each of its `/`-separated
-/// components passes [`is_ref_component`].
+/// Returns `true` if `name` is a valid ref name.
+///
+/// A ref name is a path below `refs/heads`. It is not empty, and each of its
+/// `/`-separated components passes [`is_ref_component`]. The rule keeps each
+/// name inside the `refs/` tree.
 pub fn is_ref_name(name: &str) -> bool {
     !name.is_empty() && name.split('/').all(is_ref_component)
 }
 
-/// Whether `refspec` passes the ref-name rule: a ref name, or `REMOTE:NAME`
-/// split at the first `:`, with `REMOTE` one component and `NAME` a ref
-/// name.
+/// Returns `true` if `refspec` is a valid refspec.
+///
+/// A refspec is a ref name, or `REMOTE:NAME` split at the first `:`. In the
+/// second form, `REMOTE` must pass [`is_ref_component`] and `NAME` must pass
+/// [`is_ref_name`]. Such a refspec names a path below `refs/remotes/REMOTE`,
+/// so it stays inside the `refs/` tree.
 pub fn is_refspec(refspec: &str) -> bool {
     match refspec.split_once(':') {
         Some((remote, name)) => is_ref_component(remote) && is_ref_name(name),
@@ -39,8 +39,11 @@ pub fn is_refspec(refspec: &str) -> bool {
     }
 }
 
-/// Whether `name` is 64 lowercase hex characters, which a revision reads
-/// as a commit checksum and not as a ref name.
+/// Returns `true` if `name` is 64 lowercase hex characters.
+///
+/// Such a name passes [`is_ref_name`]. A revision reads it as a commit
+/// checksum. A push refuses to write a commit to a ref of that name. A name
+/// with an uppercase hex character gives `false`.
 pub fn is_checksum_shaped(name: &str) -> bool {
     Checksum::from_hex_lower(name).is_ok()
 }

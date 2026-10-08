@@ -1,12 +1,13 @@
-//! Protobuf-style LEB128 varints.
+//! The LEB128 varints of the format, as protobuf writes them.
 //!
-//! Little-endian base-128: each byte carries seven value bits, and the high
-//! bit is the continuation flag. This is the encoding used for the sizes in
-//! `ostree.sizes` packed entries and for static-delta operation operands.
+//! Each byte holds seven value bits, the low bits first. The high bit of a
+//! byte is set if another byte follows. The format uses these varints for the
+//! sizes in an `ostree.sizes` entry and for the operands of a static-delta
+//! operation.
 
 use crate::error::{Error, Result};
 
-/// Append the LEB128 encoding of `value` to `out`.
+/// Appends the LEB128 encoding of `value` to `out`.
 pub fn encode(mut value: u64, out: &mut Vec<u8>) {
     loop {
         let byte = (value & 0x7f) as u8;
@@ -19,15 +20,26 @@ pub fn encode(mut value: u64, out: &mut Vec<u8>) {
     }
 }
 
-/// Decode a LEB128 varint from the front of `input`, returning the value and
-/// the number of bytes consumed.
+/// Decodes a LEB128 varint at the start of `input`.
 ///
-/// Rejects a truncated sequence (a continuation bit with no following byte),
-/// any encoding whose value does not fit in 64 bits, and any non-minimal
-/// encoding (a multi-byte sequence whose terminating byte is `0x00`, which
-/// contributes no value bits and so has a shorter canonical form). Rejecting
-/// non-minimal forms keeps unpack-then-pack of an `ostree.sizes` entry
-/// byte-identical.
+/// The function returns the value and the number of bytes that it read. It
+/// ignores the bytes after the varint.
+///
+/// The function accepts only the minimal encoding of a value. If an encoding
+/// has more than one byte and its last byte is `0x00`, the encoding is not
+/// minimal. That byte adds no value bits. With this rule, an unpack
+/// and a pack of an `ostree.sizes` entry give the same bytes.
+///
+/// # Errors
+///
+/// [`Error::InvalidVarint`] with one of these reasons:
+///
+/// - `varint is truncated` if `input` is empty, or if its last byte has the
+///   continuation bit set.
+/// - `varint overflows 64 bits` if the value does not fit in a `u64`, or if
+///   the encoding has more than ten bytes.
+/// - `varint is not minimally encoded` if the encoding has more than one byte
+///   and its last byte is `0x00`.
 pub fn decode(input: &[u8]) -> Result<(u64, usize)> {
     let mut value: u64 = 0;
     let mut shift: u32 = 0;

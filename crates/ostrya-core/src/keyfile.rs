@@ -1,35 +1,75 @@
-//! A GKeyFile/INI subset parser for the repository `config` file.
+//! A parser and writer for a subset of the GLib key file format.
 //!
-//! The repository config is a GLib key file: `[group]` headers, `key=value`
-//! entries, `#` comment lines, and blank lines. Parsing keeps the group and
-//! key order and the raw value text, so a parsed file re-serializes in the
-//! order the `ostree` tool wrote it. Line classification, the whitespace
-//! trimmed around a key, and a value's leading-whitespace trim all use ASCII
-//! space and tab only; a value's trailing whitespace and any non-ASCII
-//! whitespace such as a non-breaking space are kept. A group header names the
-//! text from `[` to the first `]`, with only whitespace allowed after it.
-//! Comment and blank lines are dropped, and a repeated group header merges
-//! into the existing group; [`Display`](std::fmt::Display) output reparses to
-//! an equal [`KeyFile`].
-//!
-//! [`KeyFile::get_value`] returns the raw value; the typed accessors apply
-//! the GLib string-unescaping and list-splitting rules on read.
-//! [`KeyFile::set_value`] takes a raw value and rejects group names, keys, and
-//! values whose structural characters would not survive a re-parse;
-//! [`KeyFile::set_string`] escapes a value the way the tool does on write;
-//! [`KeyFile::set_string_list`] escapes each item of a list the same way and
-//! writes the `;` separators. [`KeyFile::remove_key`] and
-//! [`KeyFile::remove_group`] are the write side's other half: a rewritten
-//! document keeps the groups and keys the caller did not touch, in the order
-//! it read them, and drops the comment and blank lines the input carried,
-//! which is what the tool's own rewrite does.
+//! The parse rules and the write rules are on the [`KeyFile`] type doc. The
+//! parse rules, the escape rules of `set_string`, and the removal rules come
+//! from the observation of `ostree config` with crafted config files. The
+//! tests record each observed case.
 
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
 
-/// A parsed key file: an ordered list of groups, each an ordered list of
-/// (key, raw value) entries.
+/// A parsed key file, such as the repository `config` file.
+///
+/// A key file is an ordered list of groups. Each group is an ordered list of
+/// entries, and each entry is a key and its raw value text.
+///
+/// # Syntax
+///
+/// [`parse`](KeyFile::parse) reads a subset of the GLib key file format:
+///
+/// - A `[group]` line starts a group. The group name is the text from `[` to
+///   the first `]`. Only white space can follow the `]`.
+/// - A `key=value` line is an entry of the current group. The key is the text
+///   before the first `=`.
+/// - A line that starts with `#` is a comment line. Only `#` starts a comment.
+///   A `#` in a value is part of the value.
+/// - A blank line has no text or only white space.
+/// - A line ends with LF or with CRLF. The parser removes one carriage return
+///   at the end of a line.
+///
+/// The parser uses ASCII space and tab as white space:
+///
+/// - It ignores this white space around a blank line, a comment line, and a
+///   group header.
+/// - It removes this white space around a key and at the start of a value.
+/// - It keeps the white space at the end of a value.
+/// - It keeps a non-breaking space (U+00A0) and all other non-ASCII white
+///   space everywhere.
+///
+/// The parser keeps the group order, the key order, and the raw value text.
+/// It drops comment lines and blank lines. A repeated group header merges into
+/// the group of the first header. A repeated key keeps its first position and
+/// takes the last value.
+///
+/// # Writes
+///
+/// [`get_value`](KeyFile::get_value) returns the raw value text. The typed
+/// getters unescape the value on read, and
+/// [`get_string_list`](KeyFile::get_string_list) also splits it into items.
+///
+/// The [`Display`](std::fmt::Display) output parses to an equal `KeyFile`. A
+/// rewritten file keeps the groups and the keys that the caller did not
+/// change, in their order and with their value text. It does not keep the
+/// comment lines and the blank lines of the input. The `ostree` command
+/// rewrites a `config` file in the same way.
+///
+/// # Examples
+///
+/// ```
+/// use ostrya_core::KeyFile;
+///
+/// let mut config = KeyFile::parse("[core]\nrepo_version=1\nmode=archive-z2\n")?;
+/// assert_eq!(config.get_value("core", "mode"), Some("archive-z2"));
+/// assert_eq!(config.get_integer("core", "repo_version")?, Some(1));
+///
+/// config.set_string("core", "fsync", "false")?;
+/// assert_eq!(
+///     config.to_string(),
+///     "[core]\nrepo_version=1\nmode=archive-z2\nfsync=false\n",
+/// );
+/// # Ok::<(), ostrya_core::Error>(())
+/// ```
 #[derive(Clone, Default)]
 pub struct KeyFile {
     groups: Vec<Group>,
@@ -61,17 +101,36 @@ struct Group {
 }
 
 impl KeyFile {
-    /// Parse a key file from text.
+    /// Parses a key file from text.
+    ///
+    /// The rules are in [`KeyFile` syntax](KeyFile#syntax).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::KeyFile`] with one of these reasons, after a "line N:" prefix:
+    ///
+    /// - "group header is not closed with ']'" if a line starts with `[` and
+    ///   has no `]`.
+    /// - "group header has trailing text after ']'" if text other than white
+    ///   space follows the first `]`.
+    /// - "empty group name" if the group name is empty.
+    /// - "group name 'NAME' contains '[' or ']'" if the group name contains
+    ///   a `[`.
+    /// - "expected a key=value pair" if a line is not blank, not a comment,
+    ///   not a group header, and has no `=`.
+    /// - "empty key" if the text before the `=` is empty or only white space.
+    /// - "key 'KEY' precedes any group" if an entry comes before the first
+    ///   group header.
     pub fn parse(input: &str) -> Result<KeyFile> {
         let mut keyfile = KeyFile::default();
         let mut current: Option<usize> = None;
-        // The position of each key within its group, by group position and
-        // key, so a repeated key does not scan the group's entries.
+        // The position of each key in its group, by group position and key.
+        // With this map, a repeated key needs no scan of the group entries.
         let mut keys: HashMap<(usize, String), usize> = HashMap::new();
 
-        // Split on '\n'; a trailing newline leaves a final empty segment that
-        // is not a line. One trailing carriage return is stripped per raw
-        // line, so CRLF input is accepted and a doubled CR keeps one.
+        // Split on '\n'. A trailing newline leaves a final empty segment that
+        // is not a line. The loop removes one trailing carriage return from
+        // each raw line, so CRLF input parses and a doubled CR keeps one CR.
         let body = input.strip_suffix('\n').unwrap_or(input);
         for (n, raw) in body.split('\n').enumerate() {
             let lineno = n + 1;
@@ -81,10 +140,10 @@ impl KeyFile {
                 continue;
             }
             if let Some(rest) = trimmed.strip_prefix('[') {
-                // The group name runs from '[' to the first ']'; only
-                // whitespace may follow the ']', and the name may not contain
-                // '[' or ']'. This mirrors [`validate_group`] so a header the
-                // tool rejects does not parse cleanly here either.
+                // The group name runs from '[' to the first ']'. Only white
+                // space can follow the ']', and the name cannot contain '[' or
+                // ']'. These are the rules of `validate_group`, so a header
+                // that the `ostree` command refuses does not parse here.
                 let Some(close) = rest.find(']') else {
                     return Err(Error::KeyFile(format!(
                         "line {lineno}: group header is not closed with ']'"
@@ -113,8 +172,8 @@ impl KeyFile {
                 )));
             };
             let key = line[..eq].trim_matches(ASCII_WS);
-            // The tool trims leading whitespace after `=` and keeps trailing
-            // whitespace as part of the value.
+            // The `ostree` command removes the leading white space after `=`
+            // and keeps the trailing white space as part of the value.
             let value = line[eq + 1..].trim_start_matches(ASCII_WS);
             if key.is_empty() {
                 return Err(Error::KeyFile(format!("line {lineno}: empty key")));
@@ -136,8 +195,8 @@ impl KeyFile {
         Ok(keyfile)
     }
 
-    /// The position of `name` in `groups`, a new empty group at the end where
-    /// it is absent.
+    /// Returns the position of `name` in `groups`. If the group is absent,
+    /// adds a new empty group at the end.
     fn group_index_or_insert(&mut self, name: &str) -> usize {
         if let Some(&i) = self.index.get(name) {
             return i;
@@ -154,18 +213,19 @@ impl KeyFile {
         self.index.get(name).map(|&i| &self.groups[i])
     }
 
-    /// Whether a group is present.
+    /// Returns `true` if the key file has the group `group`.
     pub fn has_group(&self, group: &str) -> bool {
         self.index.contains_key(group)
     }
 
-    /// Iterate group names in file order.
+    /// Returns an iterator over the group names in file order.
     pub fn groups(&self) -> impl Iterator<Item = &str> {
         self.groups.iter().map(|g| g.name.as_str())
     }
 
-    /// Iterate the keys of one group in file order. An absent group has no
-    /// keys.
+    /// Returns an iterator over the keys of one group in file order.
+    ///
+    /// If the group is absent, the iterator is empty.
     pub fn keys(&self, group: &str) -> impl Iterator<Item = &str> {
         self.group(group)
             .into_iter()
@@ -180,17 +240,47 @@ impl KeyFile {
             .map(|(_, v)| v.as_str())
     }
 
-    /// The raw (still-escaped) value for a key, or `None` if absent.
+    /// Returns the raw value text of a key.
+    ///
+    /// The text keeps its escape sequences. If the group or the key is absent,
+    /// the method returns `None`.
     pub fn get_value(&self, group: &str, key: &str) -> Option<&str> {
         self.find(group, key)
     }
 
-    /// The unescaped string value for a key.
+    /// Returns the unescaped string value of a key.
+    ///
+    /// The method replaces each escape sequence with its character:
+    ///
+    /// - `\s` with a space
+    /// - `\t` with a tab
+    /// - `\n` with a newline
+    /// - `\r` with a carriage return
+    /// - `\\` with a backslash
+    /// - `\;` with a `;`
+    ///
+    /// If the group or the key is absent, the method returns `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::KeyFile`] with the reason "invalid escape '\X'" if a
+    ///   backslash comes before a character `X` that is not in the list.
+    /// - [`Error::KeyFile`] with the reason "value ends with a lone backslash"
+    ///   if the value ends with a backslash that starts no escape sequence.
     pub fn get_string(&self, group: &str, key: &str) -> Result<Option<String>> {
         self.find(group, key).map(unescape).transpose()
     }
 
-    /// A boolean value: one of `true`, `false`, `1`, or `0`, matched exactly.
+    /// Returns the boolean value of a key.
+    ///
+    /// The value text `true` or `1` gives `true`, and `false` or `0` gives
+    /// `false`. The match is exact. If the group or the key is absent, the
+    /// method returns `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::KeyFile`] with the reason "value 'VALUE' for GROUP.KEY is not a
+    /// boolean" if the value text is not one of the four values.
     pub fn get_bool(&self, group: &str, key: &str) -> Result<Option<bool>> {
         match self.find(group, key) {
             None => Ok(None),
@@ -202,7 +292,16 @@ impl KeyFile {
         }
     }
 
-    /// A signed integer value.
+    /// Returns the signed integer value of a key.
+    ///
+    /// The value text is a decimal `i64` with an optional `+` or `-` sign. If
+    /// the group or the key is absent, the method returns `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::KeyFile`] with the reason "value 'VALUE' for GROUP.KEY is not
+    /// an integer" if the value text is not a decimal `i64`. White space in
+    /// the text causes this error.
     pub fn get_integer(&self, group: &str, key: &str) -> Result<Option<i64>> {
         match self.find(group, key) {
             None => Ok(None),
@@ -212,8 +311,21 @@ impl KeyFile {
         }
     }
 
-    /// A `;`-separated list of unescaped strings. A trailing separator does not
-    /// produce a final empty element.
+    /// Returns the list value of a key as unescaped strings.
+    ///
+    /// A `;` separates two items, and `\;` is a `;` in an item. The text after
+    /// the last `;` is an item only if it is not empty, so a trailing `;` adds
+    /// no empty item. The method unescapes each item as
+    /// [`get_string`](KeyFile::get_string) does. If the group or the key is
+    /// absent, the method returns `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::KeyFile`] with the reason "invalid escape '\X'" if a
+    ///   backslash comes before a character `X` that `get_string` does not
+    ///   accept.
+    /// - [`Error::KeyFile`] with the reason "value ends with a lone backslash"
+    ///   if the value ends with a backslash that starts no escape sequence.
     pub fn get_string_list(&self, group: &str, key: &str) -> Result<Option<Vec<String>>> {
         match self.find(group, key) {
             None => Ok(None),
@@ -221,14 +333,32 @@ impl KeyFile {
         }
     }
 
-    /// Set a key's raw value, creating the group if needed and preserving the
-    /// position of an existing key.
+    /// Sets the raw value text of a key.
     ///
-    /// The group name, key, and value are validated so the serialized form
-    /// reparses to an equal `KeyFile`: a group name may not be empty or
-    /// contain `[`, `]`, or a newline; a key may not be empty, contain `=` or
-    /// a newline, carry leading or trailing whitespace, or begin with `#` or
-    /// `[`; a value may not contain a newline or begin with whitespace.
+    /// If the group is absent, the method adds it at the end of the file. If
+    /// the key is present, the new value replaces the old value at the same
+    /// position. If the key is absent, the method adds it at the end of the
+    /// group.
+    ///
+    /// The method does not escape the value.
+    /// [`set_string`](KeyFile::set_string) escapes it.
+    ///
+    /// The method checks the group name, the key, and the value, so that the
+    /// [`Display`](std::fmt::Display) output parses to an equal `KeyFile`. If
+    /// a check fails, the key file does not change.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::KeyFile`] if one of these conditions is true:
+    ///
+    /// - The group name is empty.
+    /// - The group name contains `[`, `]`, a newline, or a carriage return.
+    /// - The key is empty.
+    /// - The key starts or ends with a space or a tab.
+    /// - The key contains `=`, a newline, or a carriage return.
+    /// - The key starts with `#` or `[`.
+    /// - The value contains a newline or a carriage return.
+    /// - The value starts with a space or a tab.
     pub fn set_value(&mut self, group: &str, key: &str, value: &str) -> Result<()> {
         validate_group(group)?;
         validate_key(key)?;
@@ -242,25 +372,48 @@ impl KeyFile {
         Ok(())
     }
 
-    /// Set a key to a string value, applying the escaping the tool uses on
-    /// write so a value that contains a newline, carriage return, backslash,
-    /// or leading whitespace is stored in a form that reparses. This is the
-    /// inverse of [`get_string`](KeyFile::get_string). Use
-    /// [`set_value`](KeyFile::set_value) to store an already-escaped raw value.
+    /// Sets the string value of a key and escapes the value.
+    ///
+    /// The method escapes the value as the `ostree` command does when it
+    /// writes a value:
+    ///
+    /// - A backslash becomes `\\`, a newline `\n`, and a carriage return `\r`,
+    ///   at each position in the value.
+    /// - In the run of white space at the start of the value, each space
+    ///   becomes `\s` and each tab `\t`.
+    /// - A space or a tab after that run, and a `;`, stay as they are.
+    ///
+    /// The escaped value parses again to the same text, and
+    /// [`get_string`](KeyFile::get_string) returns the original value. The
+    /// method places the group and the key as
+    /// [`set_value`](KeyFile::set_value) does. `set_value` stores a value
+    /// that is already escaped.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::KeyFile`] if the group name or the key fails a check of
+    /// [`set_value`](KeyFile::set_value). The escaped value always passes the
+    /// checks.
     pub fn set_string(&mut self, group: &str, key: &str, value: &str) -> Result<()> {
         self.set_value(group, key, &escape(value))
     }
 
-    /// Set a key to a list of string values. This is the inverse of
-    /// [`get_string_list`](KeyFile::get_string_list).
+    /// Sets the list value of a key and escapes each item.
     ///
-    /// Each item is escaped as [`set_string`](KeyFile::set_string) escapes a
-    /// value, so each space and tab at the start of each item is written
-    /// `\s` or `\t`. A `;` in an item is written `\;`. A `;` follows each
-    /// item, the last item included, and an empty list writes an empty value.
-    /// Because the last item always has a separator, an empty item reads back:
-    /// `["a", ""]` writes `a;;`, and `[""]` writes `;`. The group name and key
-    /// are validated as [`set_value`](KeyFile::set_value) validates them.
+    /// [`get_string_list`](KeyFile::get_string_list) returns the same list.
+    /// The method escapes each item as [`set_string`](KeyFile::set_string)
+    /// escapes a value, so each space and tab at the start of an item becomes
+    /// `\s` or `\t`. A `;` in an item becomes `\;`.
+    ///
+    /// A `;` follows each item, also the last item. An empty list gives an
+    /// empty value. Because the last item always has a separator, an empty
+    /// item reads back: `["a", ""]` gives `a;;`, and `[""]` gives `;`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::KeyFile`] if the group name or the key fails a check of
+    /// [`set_value`](KeyFile::set_value). The escaped value always passes the
+    /// checks.
     pub fn set_string_list(
         &mut self,
         group: &str,
@@ -270,9 +423,9 @@ impl KeyFile {
         let mut value = String::new();
         for item in items {
             // `escape` writes a backslash only as the first character of a
-            // two-character sequence whose second character is never `;`, so
-            // each `;` it writes stands alone and the `\;` added here stays a
-            // single escape.
+            // two-character sequence. The second character is never `;`, so
+            // each `;` that `escape` writes stands alone. The `\;` added here
+            // stays a single escape sequence.
             for c in escape(item.as_ref()).chars() {
                 if c == ';' {
                     value.push('\\');
@@ -284,11 +437,11 @@ impl KeyFile {
         self.set_value(group, key, &value)
     }
 
-    /// Remove one key, reporting whether it was there.
+    /// Removes one key and returns `true` if the key was present.
     ///
-    /// The group stays, even when the removed key was its last: the tool leaves
-    /// the header of an emptied group in place, and
-    /// [`Display`](std::fmt::Display) writes it back with no entries.
+    /// The group stays, also when it loses its last key. The `ostree` command
+    /// keeps the header of an empty group in the same way.
+    /// [`Display`](std::fmt::Display) writes the header with no entries.
     pub fn remove_key(&mut self, group: &str, key: &str) -> bool {
         let Some(entries) = self.index.get(group).map(|&i| &mut self.groups[i].entries) else {
             return false;
@@ -300,9 +453,10 @@ impl KeyFile {
         true
     }
 
-    /// Remove a group and every key in it, reporting whether it was there.
+    /// Removes a group and its keys, and returns `true` if the group was
+    /// present.
     ///
-    /// The remaining groups keep their order.
+    /// The other groups keep their order.
     pub fn remove_group(&mut self, group: &str) -> bool {
         let Some(index) = self.index.remove(group) else {
             return false;
@@ -317,15 +471,21 @@ impl KeyFile {
     }
 }
 
-/// The whitespace the tool trims: ASCII space and tab only. Recovered by
-/// feeding the tool crafted config files -- a line of only spaces or only tabs
-/// is ignored, a leading space or tab before a header or comment is stripped,
-/// and a surrounding space or tab is removed from a key, while a non-breaking
-/// space (U+00A0) or other non-ASCII whitespace is preserved everywhere.
+/// The white space that the `ostree` command trims: ASCII space and tab.
+///
+/// These facts come from crafted config files that the `ostree` command read:
+///
+/// - It ignores a line of only spaces or only tabs.
+/// - It removes a leading space or tab before a group header or a comment.
+/// - It removes a space or a tab around a key.
+/// - It keeps a non-breaking space (U+00A0) and all other non-ASCII white
+///   space everywhere.
 const ASCII_WS: [char; 2] = [' ', '\t'];
 
-/// A structural character must not appear where it would change how the text
-/// reparses.
+/// Checks that a group name is not empty and has no structural character.
+///
+/// A structural character changes how the `Display` output parses. The
+/// checks of `validate_key` and `validate_value` have the same purpose.
 fn validate_group(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::KeyFile("group name is empty".into()));
@@ -374,8 +534,11 @@ fn validate_value(value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Serialize in file order, matching GLib's layout: a blank line separates
-/// groups, each entry is `key=value`. Use `.to_string()` (via `Display`).
+/// Writes the groups and the keys in file order, in the GLib key file layout.
+///
+/// Each group starts with a `[name]` line, and each entry is a `key=value`
+/// line. A blank line separates two groups. `to_string` gives the text of
+/// the whole file.
 impl std::fmt::Display for KeyFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for (i, group) in self.groups.iter().enumerate() {
@@ -391,12 +554,18 @@ impl std::fmt::Display for KeyFile {
     }
 }
 
-/// Apply the tool's write escaping to a string value. Recovered by driving
-/// `ostree config set` with crafted values and reading the raw config bytes:
-/// a backslash becomes `\\`, a newline `\n`, and a carriage return `\r`
-/// anywhere in the value; within the leading whitespace run each space becomes
-/// `\s` and each tab `\t`; a space or tab elsewhere, and a `;`, are written
-/// literally. [`unescape`] reverses each of these sequences.
+/// Escapes a string value as the `ostree` command does when it writes a value.
+///
+/// The rules come from `ostree config set` with crafted values and a read of
+/// the raw config bytes:
+///
+/// - A backslash becomes `\\`, a newline `\n`, and a carriage return `\r`, at
+///   each position in the value.
+/// - In the run of white space at the start of the value, each space becomes
+///   `\s` and each tab `\t`.
+/// - A space or a tab after that run, and a `;`, stay as they are.
+///
+/// [`unescape`] reverses each of these sequences.
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut leading = true;
@@ -454,7 +623,8 @@ fn split_list(raw: &str) -> Result<Vec<String>> {
     while let Some(c) = chars.next() {
         match c {
             '\\' => match chars.next() {
-                // Keep the escape intact; unescape resolves it below.
+                // The escape sequence stays as it is. `unescape` resolves it
+                // after the split.
                 Some(next) => {
                     current.push('\\');
                     current.push(next);
@@ -477,7 +647,8 @@ fn split_list(raw: &str) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
-    // The exact bytes the `ostree` tool wrote for an archive repo config.
+    // The exact bytes that the `ostree` command wrote for the config of an
+    // archive repo.
     const ARCHIVE_CONFIG: &str = "[core]\nrepo_version=1\nmode=archive-z2\n";
 
     #[test]
@@ -498,8 +669,9 @@ mod tests {
 
     #[test]
     fn drops_comments_and_blanks_and_trims_leading_value_whitespace() {
-        // Leading whitespace on a line, around a key, and after `=` is
-        // removed; trailing whitespace in a value is kept, matching the tool.
+        // The parser removes the leading white space of a line, the white
+        // space around a key, and the white space after `=`. It keeps the
+        // trailing white space of a value, as the `ostree` command does.
         let text = "# a comment\n\n[core]\n  repo_version = 1\n\n# trailing\nmode=bare \n";
         let kf = KeyFile::parse(text).unwrap();
         assert_eq!(kf.get_value("core", "repo_version"), Some("1"));
@@ -528,9 +700,9 @@ mod tests {
 
     #[test]
     fn strips_one_trailing_cr_per_line() {
-        // The tool strips a single trailing carriage return from a raw line.
-        // A doubled CR before the newline keeps one CR in the value; stripping
-        // twice would drop the byte.
+        // The `ostree` command removes one trailing carriage return from a
+        // raw line. A doubled CR before the newline keeps one CR in the value.
+        // A second removal drops that byte.
         let kf = KeyFile::parse("[g]\r\nk=v\r\r\n").unwrap();
         assert_eq!(kf.get_value("g", "k"), Some("v\r"));
     }
@@ -552,7 +724,8 @@ mod tests {
     #[test]
     fn rejects_empty_group_and_semicolon_line() {
         assert!(KeyFile::parse("[]\nk=v\n").is_err());
-        // A line starting with `;` is not a comment; with no `=` it is an error.
+        // A line that starts with `;` is not a comment. With no `=`, it is an
+        // error.
         assert!(KeyFile::parse("[core]\n;not a comment\nk=v\n").is_err());
     }
 
@@ -592,7 +765,8 @@ mod tests {
         assert_eq!(kf.get_bool("core", "f").unwrap(), Some(false));
         assert_eq!(kf.get_bool("core", "one").unwrap(), Some(true));
         assert_eq!(kf.get_bool("core", "zero").unwrap(), Some(false));
-        // The tool accepts only true/false/1/0, matched exactly.
+        // The `ostree` command accepts only `true`, `false`, `1`, and `0`,
+        // matched exactly.
         assert!(kf.get_bool("core", "bad").is_err());
         assert!(kf.get_bool("core", "yes").is_err());
         assert!(kf.get_bool("core", "case").is_err());
@@ -670,10 +844,11 @@ mod tests {
     #[test]
     fn set_value_rejects_keys_that_would_not_reparse() {
         let mut kf = KeyFile::default();
-        // A '#'-leading key serializes to a line the parser drops as a comment.
+        // A key that starts with '#' gives a line that the parser drops as a
+        // comment.
         assert!(kf.set_value("core", "#weird", "v").is_err());
-        // A '['-leading key serializes to a line the parser reads as a group
-        // header.
+        // A key that starts with '[' gives a line that the parser reads as a
+        // group header.
         assert!(kf.set_value("core", "[k", "v").is_err());
         // A '#' or '[' elsewhere in the key is ordinary content that reparses.
         assert!(kf.set_value("core", "a#b", "v").is_ok());
@@ -703,31 +878,31 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    // ---- B3: group-header bracket handling (observed via `ostree config`) ----
+    // ---- group-header brackets (observed with `ostree config`) -------------
 
     #[test]
     fn group_name_runs_to_first_bracket() {
-        // Each of these whole files is rejected by the tool; the parser
-        // matches by erroring rather than reading a stray group name.
+        // The `ostree` command refuses each of these whole files. The parser
+        // returns an error for each file and reads no stray group name.
         // `[a]b]`: text follows the first ']'.
         assert!(KeyFile::parse("[a]b]\nk=v\n").is_err());
         // `[a]b]c`: trailing non-']' text after the first ']'.
         assert!(KeyFile::parse("[a]b]c\nk=v\n").is_err());
-        // `[a[b]`: the group name would contain '['.
+        // `[a[b]`: the group name contains '['.
         assert!(KeyFile::parse("[a[b]\nk=v\n").is_err());
         // `[]x]`: empty name plus trailing text.
         assert!(KeyFile::parse("[]x]\nk=v\n").is_err());
-        // Trailing ASCII whitespace after the ']' is allowed.
+        // Trailing ASCII white space after the ']' is allowed.
         let kf = KeyFile::parse("[grp]  \nk=v\n").unwrap();
         assert_eq!(kf.get_value("grp", "k"), Some("v"));
     }
 
-    // ---- B4: ASCII-only whitespace trimming (observed via `ostree config`) --
+    // ---- ASCII-only white space trim (observed with `ostree config`) -------
 
     #[test]
     fn non_ascii_whitespace_is_preserved() {
-        // A line that is only a non-breaking space is not blank; with no '='
-        // it is a parse error, matching the tool.
+        // A line that is only a non-breaking space is not blank. With no '=',
+        // it is a parse error, as in the `ostree` command.
         assert!(KeyFile::parse("[g]\n\u{a0}\nk=v\n").is_err());
         // A non-breaking space around a key stays part of the key name.
         let kf = KeyFile::parse("[g]\n\u{a0}k\u{a0}=v\n").unwrap();
@@ -740,8 +915,8 @@ mod tests {
 
     #[test]
     fn ascii_whitespace_lines_and_keys_are_trimmed() {
-        // A line of only spaces or only tabs is ignored; a leading tab before
-        // a header or comment is stripped; a tab-wrapped key trims to bare.
+        // The parser ignores a line of only spaces or only tabs. It removes a
+        // leading tab before a header or a comment, and the tabs around a key.
         let kf = KeyFile::parse("[g]\n   \n\t\n\t[h]\n\t#c\n\tk\t=v\n").unwrap();
         assert_eq!(kf.get_value("h", "k"), Some("v"));
     }
@@ -749,21 +924,22 @@ mod tests {
     #[test]
     fn set_value_allows_non_ascii_whitespace_in_key() {
         let mut kf = KeyFile::default();
-        // ASCII whitespace around a key would not reparse and is rejected.
+        // ASCII white space around a key does not parse back, so `set_value`
+        // refuses it.
         assert!(kf.set_value("g", " k", "v").is_err());
         assert!(kf.set_value("g", "k\t", "v").is_err());
-        // A trailing non-breaking space reparses and is accepted.
+        // A trailing non-breaking space parses back, so `set_value` accepts it.
         assert!(kf.set_value("g", "k\u{a0}", "v").is_ok());
         let reparsed = KeyFile::parse(&kf.to_string()).unwrap();
         assert_eq!(kf, reparsed);
     }
 
-    // ---- B5: value escaping on write (observed via `ostree config set`) ----
+    // ---- value escape on write (observed with `ostree config set`) ---------
 
     #[test]
     fn set_string_escapes_like_the_tool() {
-        // (input, stored form) pairs read back from the raw config bytes the
-        // tool wrote for `ostree config set core.<k> <input>`.
+        // (input, stored form) pairs, read back from the raw config bytes that
+        // the `ostree` command wrote for `ostree config set core.<k> <input>`.
         for (input, stored) in [
             ("a\nb", "a\\nb"),
             ("a\tb", "a\tb"), // interior tab is literal
@@ -799,7 +975,7 @@ mod tests {
             kf.set_string("core", "k", v).unwrap();
             // The stored value carries no raw newline, so it is a single line.
             assert!(!kf.get_value("core", "k").unwrap().contains(['\n', '\r']));
-            // get_string reverses the escaping.
+            // get_string reverses the escape sequences.
             assert_eq!(kf.get_string("core", "k").unwrap().as_deref(), Some(v));
             // The serialized file reparses to an equal KeyFile.
             let reparsed = KeyFile::parse(&kf.to_string()).unwrap();
@@ -933,7 +1109,7 @@ mod tests {
         assert_eq!(kf, before);
     }
 
-    // ---- B6: removal (observed via `ostree config unset`) -------------------
+    // ---- removal (observed with `ostree config unset`) ----------------------
 
     #[test]
     fn remove_key_keeps_the_group_header() {
@@ -984,9 +1160,9 @@ mod tests {
 
     #[test]
     fn a_rewrite_keeps_untouched_groups_and_drops_comments() {
-        // The tool's own rewrite: the groups and keys it did not touch keep
-        // their order and their bytes, and the comment and blank lines the
-        // input carried are gone.
+        // This is the rewrite of the `ostree` command. The groups and keys
+        // that the caller did not change keep their order and their bytes. The
+        // comment lines and the blank lines of the input are gone.
         let text = "# leading comment\n[core]\nrepo_version=1\nmode=archive-z2\n\
                     # inner comment\nfoo=bar\n\n[other]\nx=1\n";
         let mut kf = KeyFile::parse(text).expect("the file parses");

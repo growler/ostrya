@@ -1,20 +1,26 @@
 #![forbid(unsafe_code)]
 
-//! Golden-image test for the composefs image writer.
+//! Golden-image test of the composefs image writer.
 //!
-//! The tree model is reconstructed from a `composefs-info dump` and serialized.
-//! The result must be byte-identical to the tool's image, and its fs-verity
-//! digest must equal the digest recorded in the fixture MANIFEST (the value the
-//! tool stored in `ostree.composefs.digest.v0`).
+//! The test builds the tree from a `composefs-info dump` and writes its image.
+//! The image must be byte-identical to the image of the `ostree` command. Its
+//! fs-verity digest must equal the digest in the fixture MANIFEST, which is the
+//! value that the `ostree` command stored in `ostree.composefs.digest.v0`.
 //!
-//! Four fixtures are checked. `tree.cfs` is a minimal tree. `tree-rich.cfs`
-//! exercises shared xattrs, inline xattrs, a multi-block directory, and a long
-//! inline symlink, so a regression in those paths fails a committed test. Each
-//! has a `-noverity` counterpart, the image the tool writes with
-//! `checkout --composefs-noverity`: every backed file takes an empty
-//! `trusted.overlay.metacopy` value, so the one shared value moves into the
-//! shared-xattr table and the inode and xattr offsets shift. A dump prints the
-//! digest column as `-` for those files.
+//! The test checks four fixtures:
+//!
+//! - `tree.cfs` is a minimal tree.
+//! - `tree-rich.cfs` has shared xattrs, inline xattrs, a multi-block
+//!   directory, and a long inline symlink. A fault in one of these paths makes
+//!   a committed test fail.
+//! - `tree-noverity.cfs` and `tree-rich-noverity.cfs` are the images that the
+//!   `ostree` command writes for the same trees with
+//!   `checkout --composefs-noverity`.
+//!
+//! In a `-noverity` image, each backed file has an empty
+//! `trusted.overlay.metacopy` value. This one value is shared, so it moves into
+//! the shared-xattr table and the inode and xattr offsets change. A dump prints
+//! `-` in the digest column for these files.
 
 use std::path::{Path, PathBuf};
 
@@ -23,9 +29,10 @@ use ostrya_composefs::{
     write_image_to,
 };
 
-/// A sink that records what it received: the total byte count and the largest
-/// single write. The emitting pass is append-only, so the largest write bounds
-/// what the writer holds at once.
+/// A sink that records the total byte count and the largest single write.
+///
+/// The emitting pass only appends, so the largest write is the upper limit of
+/// the data that the writer holds at one time.
 #[derive(Default)]
 struct CountingSink {
     total: usize,
@@ -46,9 +53,11 @@ impl std::io::Write for CountingSink {
     }
 }
 
-/// The largest single write the emitting pass makes. One write carries at most
-/// one field, and the largest field is an xattr value, which the EROFS
-/// value-length field states in two bytes.
+/// The largest single write of the emitting pass.
+///
+/// If each child name is at most 65535 bytes, no write is larger than the
+/// largest xattr value. The EROFS value-length field holds that length in two
+/// bytes.
 const MAX_WRITE: usize = u16::MAX as usize;
 
 fn fixture_dir() -> PathBuf {
@@ -83,9 +92,11 @@ const S_IFDIR: u32 = 0o040000;
 const S_IFLNK: u32 = 0o120000;
 const S_IFREG: u32 = 0o100000;
 
-/// Parse the trailing `name=value` xattr tokens (fields 11 onward) of a dump
-/// line. The fixture uses only simple ASCII values with no spaces or `=`, so
-/// each token splits on its first `=` and both halves are taken verbatim.
+/// Returns the `name=value` xattr tokens at the end of a dump line.
+///
+/// The tokens are the fields from index 11 on. The fixture values are ASCII
+/// with no space and no `=`, so the function splits each token at its first
+/// `=` and keeps both halves unchanged.
 fn parse_xattrs(fields: &[&str]) -> Vec<(Vec<u8>, Vec<u8>)> {
     fields
         .iter()
@@ -95,7 +106,7 @@ fn parse_xattrs(fields: &[&str]) -> Vec<(Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-/// Build a node from one `composefs-info dump` line's fields.
+/// Builds a node from the fields of one `composefs-info dump` line.
 fn node_from_fields(fields: &[&str]) -> Node {
     let size: u64 = fields[1].parse().unwrap();
     let mode = u32::from_str_radix(fields[2], 8).unwrap();
@@ -147,7 +158,7 @@ fn insert_at(root: &mut Directory, path: &str, node: Node) {
     cur.children.insert(name.as_bytes().to_vec(), node);
 }
 
-/// Reconstruct the tree model from a `composefs-info dump`.
+/// Builds the tree from a `composefs-info dump`.
 fn tree_from_dump(dump: &str) -> Directory {
     let mut root: Option<Directory> = None;
     for line in dump.lines() {
@@ -173,9 +184,11 @@ fn tree_from_dump(dump: &str) -> Directory {
     root.expect("dump had a root")
 }
 
-/// Reconstruct the tree from `<stem>.dump`, serialize it, and require the bytes
-/// to equal `<stem>.cfs` and the fs-verity digest to equal the MANIFEST value at
-/// `digest_key`. Skips when the fixtures are absent (a checkout without ostree).
+/// Builds the tree from `<stem>.dump` and checks its image against the fixtures.
+///
+/// The image bytes must equal `<stem>.cfs`. The fs-verity digest must equal the
+/// MANIFEST value at `digest_key`. If the fixtures are absent, the function
+/// returns at once. This occurs in a checkout without the `ostree` command.
 fn check_fixture(stem: &str, digest_key: &str) {
     let dir = fixture_dir();
     let (Ok(dump), Ok(golden)) = (
@@ -196,7 +209,7 @@ fn check_fixture(stem: &str, digest_key: &str) {
         image.bytes.len(),
         golden.len()
     );
-    // Locate the first divergence to make failures debuggable.
+    // The failure message gives the offset of the first different byte.
     if let Some(pos) = image.bytes.iter().zip(&golden).position(|(a, b)| a != b) {
         panic!(
             "{stem}: image diverges from golden at byte {pos:#x}: got {:#04x}, want {:#04x}",
@@ -204,8 +217,8 @@ fn check_fixture(stem: &str, digest_key: &str) {
         );
     }
 
-    // The streaming form emits the same image and reaches the same digest, and
-    // it passes the image through field by field, never as one buffer.
+    // The streaming writer writes the same image and returns the same digest.
+    // It writes the image in small pieces, with no buffer of the image.
     let mut sink = CountingSink::default();
     let streamed = write_image_to(&root, &mut sink).expect("stream the image");
     assert_eq!(
@@ -213,10 +226,10 @@ fn check_fixture(stem: &str, digest_key: &str) {
         image.bytes.len(),
         "{stem}: streamed length differs from the buffered image"
     );
-    // One write carries at most one field. Two bounds hold that, and both are
-    // needed: MAX_WRITE is the bound for any tree, and it sits above every
-    // fixture image, so on these fixtures the image length is the bound that
-    // binds.
+    // The test checks the largest write against two limits. MAX_WRITE is the
+    // limit for a tree with short child names. Each fixture image is smaller
+    // than MAX_WRITE, so on these fixtures the image length is the limit that
+    // applies.
     assert!(
         sink.largest <= MAX_WRITE,
         "{stem}: one write of {} bytes exceeds the largest field",

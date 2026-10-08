@@ -1,47 +1,56 @@
-//! Object types.
-//!
-//! The numeric values are wire-significant: they appear in the `(su)`
-//! object-name serialization and in the `ostree.sizes` packed entries. The
-//! `is-meta` predicate (types 2..=6) drives the checksum rules. The `z`
-//! loose-path suffix applies only to a `File` object in archive mode
-//! (`.filez`); the auxiliary non-meta objects (`payload-link`, `file-xattrs`,
-//! `file-xattrs-link`) are stored uncompressed and carry no suffix.
+//! Object types and their loose-path extensions.
 
 use crate::error::{Error, Result};
 use crate::mode::RepoMode;
 
 /// A repository object type.
+///
+/// The numeric value of each variant is part of the wire format. It is the
+/// `u` member of the `(su)` serialization of an object name and the type byte
+/// of an `ostree.sizes` entry ([`SizeEntry`](crate::sizes::SizeEntry)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum ObjectType {
-    /// Content: a file header plus payload (`.file` / `.filez`).
+    /// A content object: a file header and the payload (`.file` or `.filez`).
     File = 1,
-    /// Sorted lists of child files and subdirs (`.dirtree`).
+    /// The sorted lists of the files and subdirectories of a directory
+    /// (`.dirtree`).
     DirTree = 2,
-    /// Directory uid/gid/mode/xattrs (`.dirmeta`).
+    /// The uid, gid, mode, and xattrs of a directory (`.dirmeta`).
     DirMeta = 3,
-    /// Commit metadata plus root tree/meta references (`.commit`).
+    /// A commit: the metadata and the root checksums (`.commit`).
+    ///
+    /// The root checksums name the root dirtree and the root dirmeta.
     Commit = 4,
-    /// Marks a deleted commit (`.tombstone-commit`).
+    /// A marker of a deleted commit (`.tombstone-commit`).
     TombstoneCommit = 5,
-    /// Detached, mutable commit metadata (`.commitmeta`).
+    /// The detached metadata of a commit (`.commitmeta`).
+    ///
+    /// It can change after the commit.
     CommitMeta = 6,
-    /// Symlink to a `.file`, keyed by payload-only checksum (`.payload-link`).
+    /// A symlink to a `.file` object (`.payload-link`).
+    ///
+    /// Its name is the checksum of the payload only.
     PayloadLink = 7,
-    /// Detached xattrs blob (`.file-xattrs`).
+    /// A detached xattrs blob (`.file-xattrs`).
     FileXattrs = 8,
-    /// Hardlink to a `.file-xattrs`, keyed by the `.file` checksum
-    /// (`.file-xattrs-link`).
+    /// A hardlink to a `.file-xattrs` object (`.file-xattrs-link`).
+    ///
+    /// Its name is the checksum of the `.file` object.
     FileXattrsLink = 9,
 }
 
 impl ObjectType {
-    /// The wire-significant numeric tag.
+    /// Returns the numeric value of the type, as the wire format writes it.
     pub fn as_u32(self) -> u32 {
         self as u32
     }
 
-    /// Recover the type from its numeric tag.
+    /// Returns the type of a numeric value.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidObjectType`] if `v` is not in the range 1 to 9.
     pub fn from_u32(v: u32) -> Result<ObjectType> {
         Ok(match v {
             1 => ObjectType::File,
@@ -57,8 +66,14 @@ impl ObjectType {
         })
     }
 
-    /// The is-meta predicate: types 2..=6. Metadata objects are stored
-    /// uncompressed and never carry the `z` suffix.
+    /// Returns `true` if the type is a metadata type.
+    ///
+    /// The metadata types are [`DirTree`](Self::DirTree),
+    /// [`DirMeta`](Self::DirMeta), [`Commit`](Self::Commit),
+    /// [`TombstoneCommit`](Self::TombstoneCommit), and
+    /// [`CommitMeta`](Self::CommitMeta), with the numeric values `2..=6`. The
+    /// checksum rules of an object depend on this property. A metadata object
+    /// is stored uncompressed, and its loose path never has the `z` suffix.
     pub fn is_meta(self) -> bool {
         matches!(
             self,
@@ -70,9 +85,16 @@ impl ObjectType {
         )
     }
 
-    /// The loose-path extension (without the leading dot) for this type in the
-    /// given mode. Mode-aware for `File`: `file` (bare family) or `filez`
-    /// (archive).
+    /// Returns the loose-path extension of the type in `mode`.
+    ///
+    /// The extension has no leading dot. The extension of a
+    /// [`File`](Self::File) object depends on the mode. It is `filez` in
+    /// archive mode and `file` in each bare mode. The `z` suffix occurs only
+    /// on a `File` object in archive mode.
+    ///
+    /// The extensions of the other types do not depend on the mode. The
+    /// non-metadata types `payload-link`, `file-xattrs`, and
+    /// `file-xattrs-link` are stored uncompressed and have no `z` suffix.
     pub fn extension(self, mode: RepoMode) -> &'static str {
         match self {
             ObjectType::File => match mode {
@@ -94,20 +116,24 @@ impl ObjectType {
         }
     }
 
-    /// The mode-independent type string used in an object's string form
-    /// (`<hexchecksum>.<typestr>`). A `File` object is always `file` here,
-    /// including in archive mode where the loose path carries the `z` suffix;
-    /// the tool prints the `z`-less form in its object references.
+    /// Returns the type string, as the string form of an object name uses it.
+    ///
+    /// The string form is `<hexchecksum>.<typestr>`. The type string does not
+    /// depend on the mode. A `File` object has the type string `file`, also in
+    /// archive mode, where its loose path has the `z` suffix. The `ostree`
+    /// command prints the form with no `z` in its object references.
     pub fn type_str(self) -> &'static str {
         // Every extension but the archive `File` suffix is mode-independent,
         // so the bare-mode extension is the canonical type string.
         self.extension(RepoMode::Bare)
     }
 
-    /// Recover the type from a loose-path extension (without the leading dot),
-    /// or `None` for an unrecognized extension. The inverse of
-    /// [`extension`](Self::extension): both mode-specific `File` spellings
-    /// (`file`, `filez`) map back to `File`.
+    /// Returns the type of a loose-path extension.
+    ///
+    /// The extension has no leading dot. This function is the inverse of
+    /// [`extension`](Self::extension), so both `file` and `filez` give
+    /// [`File`](Self::File). If the extension is not known, the function
+    /// returns `None`.
     pub fn from_extension(ext: &str) -> Option<ObjectType> {
         Some(match ext {
             "file" | "filez" => ObjectType::File,

@@ -1,15 +1,7 @@
 //! Commit objects.
 //!
-//! Wire form `(a{sv}aya(say)sstayay)`: the metadata dict, the parent commit
-//! checksum (an empty `ay` for a root commit), the related-objects array
-//! (written empty, retained verbatim on parse), subject, body, the big-endian
-//! timestamp, and the root dirtree and dirmeta checksums.
-//!
-//! There is no borrowed view type: [`Commit::parse`] produces the owned
-//! struct. The dynamic `a{sv}` metadata is held as a [`Value`] tree, which
-//! round-trips byte-identically because both codec paths emit normal form.
-//! A walk of a long parent chain reads [`Commit::parse_link`], which parses
-//! the parent and the root checksums alone.
+//! This module has no borrowed view type. `Commit::parse` returns the owned
+//! struct.
 
 use std::sync::LazyLock;
 
@@ -21,22 +13,46 @@ use crate::be::Be64;
 use crate::checksum::Checksum;
 use crate::error::{Error, Result};
 
-/// The `a{sv}` metadata dict type, parsed once and shared. `Type` is
-/// `Send + Sync`, so the same value serves every parse and serialize call.
+/// The type `a{sv}` of the metadata dict, parsed one time and shared. `Type`
+/// is `Send + Sync`, so each parse call and each serialize call use this value.
 static METADATA_TYPE: LazyLock<Type> =
     LazyLock::new(|| Type::parse("a{sv}").expect("a{sv} is a valid signature"));
 
-/// An owned commit object. The timestamp is host-order seconds since the
-/// Unix epoch, UTC.
+/// An owned commit object.
+///
+/// # Wire form
+///
+/// A commit object is the GVariant tuple `(a{sv}aya(say)sstayay)`. It holds
+/// these members, in this order:
+///
+/// 1. `a{sv}`: the metadata dict
+/// 2. `ay`: the checksum of the parent commit, empty for a root commit
+/// 3. `a(say)`: the related objects
+/// 4. `s`: the subject
+/// 5. `s`: the body
+/// 6. `t`: the timestamp, big-endian
+/// 7. `ay`: the checksum of the root dirtree
+/// 8. `ay`: the checksum of the root dirmeta
+///
+/// The struct holds the timestamp in host byte order.
+///
+/// The metadata is a [`Value`] tree. It writes back to the same bytes,
+/// because [`from_bytes`] accepts only normal form and [`to_bytes`] writes
+/// normal form.
+///
+/// A walk of a long parent chain uses [`Commit::parse_link`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
-    /// The `a{sv}` metadata dict as a [`Value`] tree (an array of two-element
-    /// tuples, in on-disk order).
+    /// The `a{sv}` metadata dict as a [`Value`] tree.
+    ///
+    /// The tree is an array of two-element tuples, in on-disk order.
     pub metadata: Value,
-    /// Parent commit, `None` for a root commit (an empty `ay` on the wire).
+    /// The checksum of the parent commit, or `None` for a root commit.
     pub parent: Option<Checksum>,
-    /// Related objects: written as an empty array by the tool; parsed
-    /// entries are retained verbatim for byte-exact reserialization.
+    /// The related objects.
+    ///
+    /// The `ostree` command writes an empty array. A parse keeps the entries
+    /// as read, so the commit serializes to the same bytes.
     pub related: Vec<(String, Vec<u8>)>,
     /// The commit subject, the first line of its message.
     pub subject: String,
@@ -44,26 +60,25 @@ pub struct Commit {
     pub body: String,
     /// The commit time, in seconds since the Unix epoch, UTC.
     pub timestamp: u64,
-    /// The checksum of the root directory's dirtree object.
+    /// The checksum of the dirtree object of the root directory.
     pub root_dirtree: Checksum,
-    /// The checksum of the root directory's dirmeta object.
+    /// The checksum of the dirmeta object of the root directory.
     pub root_dirmeta: Checksum,
 }
 
-/// The parent and the root checksums of a commit, as
-/// [`Commit::parse_link`] reads them.
+/// The parent and the root checksums of a commit, from [`Commit::parse_link`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitLink {
-    /// Parent commit, `None` for a root commit.
+    /// The checksum of the parent commit, or `None` for a root commit.
     pub parent: Option<Checksum>,
-    /// The checksum of the root directory's dirtree object.
+    /// The checksum of the dirtree object of the root directory.
     pub root_dirtree: Checksum,
-    /// The checksum of the root directory's dirmeta object.
+    /// The checksum of the dirmeta object of the root directory.
     pub root_dirmeta: Checksum,
 }
 
-/// The commit shape with the metadata and checksum fields as raw slices; the
-/// value-level conventions are applied on top of this view.
+/// The commit tuple with the metadata and the checksums as raw slices. The
+/// parse functions apply the value checks to this view.
 type CommitView<'a> = (
     &'a [u8],
     &'a [u8],
@@ -76,7 +91,23 @@ type CommitView<'a> = (
 );
 
 impl Commit {
-    /// Parse a serialized commit object.
+    /// Parses a serialized commit object.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Gvariant`] with [`NotNormal`] if `data`, the metadata dict,
+    ///   or an entry of the related objects is not in normal form.
+    /// - [`Error::Gvariant`] with [`DepthExceeded`] if the metadata dict nests
+    ///   deeper than the depth limit of [`from_bytes`].
+    /// - [`Error::InvalidCommit`] with "parent checksum is neither empty nor
+    ///   32 bytes" if the parent checksum has a length other than 0 or 32.
+    /// - [`Error::InvalidCommit`] with "root dirtree checksum is not 32 bytes"
+    ///   if the root dirtree checksum has a length other than 32.
+    /// - [`Error::InvalidCommit`] with "root dirmeta checksum is not 32 bytes"
+    ///   if the root dirmeta checksum has a length other than 32.
+    ///
+    /// [`NotNormal`]: ostrya_gvariant::Error::NotNormal
+    /// [`DepthExceeded`]: ostrya_gvariant::Error::DepthExceeded
     pub fn parse(data: &[u8]) -> Result<Commit> {
         let (metadata, parent, related, subject, body, timestamp, root_dirtree, root_dirmeta): CommitView = GvDecode::decode(data)?;
         let metadata = from_bytes(&METADATA_TYPE, metadata)?;
@@ -96,12 +127,21 @@ impl Commit {
         })
     }
 
-    /// Parse the parent and the root checksums of a serialized commit
-    /// object. The metadata, the related objects, the subject, and the body
-    /// are not parsed.
+    /// Parses the parent and the root checksums of a serialized commit object.
     ///
-    /// The frame of the object and the three checksums get the checks of
-    /// [`Commit::parse`], with the same errors.
+    /// The function does not decode the metadata dict or the entries of the
+    /// related objects. It checks the tuple frame, the subject, the body, and
+    /// the three checksums as [`Commit::parse`] does.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Gvariant`] with [`NotNormal`] if the tuple frame, the
+    ///   subject, or the body is not in normal form.
+    /// - [`Error::InvalidCommit`] with the messages of [`Commit::parse`] if
+    ///   the parent, the root dirtree, or the root dirmeta checksum has a
+    ///   wrong length.
+    ///
+    /// [`NotNormal`]: ostrya_gvariant::Error::NotNormal
     pub fn parse_link(data: &[u8]) -> Result<CommitLink> {
         let (_, parent, _, _, _, _, root_dirtree, root_dirmeta): CommitView =
             GvDecode::decode(data)?;
@@ -112,19 +152,42 @@ impl Commit {
         })
     }
 
-    /// Serialize to normal-form bytes; their SHA-256 is the commit checksum.
+    /// Serializes the commit to normal-form bytes.
+    ///
+    /// The SHA-256 of these bytes is the commit checksum, which
+    /// [`checksum`](Commit::checksum) returns.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Gvariant`] with [`TypeMismatch`] if
+    ///   [`metadata`](Commit::metadata) is not a value of type `a{sv}`.
+    /// - [`Error::Gvariant`] with [`InvalidValue`] if a string holds an
+    ///   interior NUL byte. This applies to the strings in the metadata, the
+    ///   subject, the body, and the names of the related objects.
+    /// - [`Error::Gvariant`] with [`DepthExceeded`] if the metadata nests
+    ///   deeper than the depth limit of [`to_bytes`].
+    ///
+    /// [`TypeMismatch`]: ostrya_gvariant::Error::TypeMismatch
+    /// [`InvalidValue`]: ostrya_gvariant::Error::InvalidValue
+    /// [`DepthExceeded`]: ostrya_gvariant::Error::DepthExceeded
     pub fn serialize(&self) -> Result<Vec<u8>> {
         Ok(ostrya_gvariant::encode_to_vec(self)?)
     }
 
-    /// The commit checksum: SHA-256 of the serialized bytes.
+    /// Returns the commit checksum, the SHA-256 of the serialized bytes.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`serialize`](Commit::serialize).
     pub fn checksum(&self) -> Result<Checksum> {
         Ok(Checksum::sha256(&self.serialize()?))
     }
 
-    /// The commit content checksum: SHA-256 over the binary root dirtree and
-    /// dirmeta checksums, a content identity independent of commit metadata
-    /// and timestamp.
+    /// Returns the content checksum of the commit.
+    ///
+    /// The content checksum is the SHA-256 of the 32-byte root dirtree
+    /// checksum followed by the 32-byte root dirmeta checksum. The metadata
+    /// and the timestamp of the commit do not change it.
     pub fn content_checksum(&self) -> Checksum {
         let mut buf = [0u8; 64];
         buf[..32].copy_from_slice(self.root_dirtree.as_bytes());
@@ -132,7 +195,10 @@ impl Commit {
         Checksum::sha256(&buf)
     }
 
-    /// The variant value stored under `key` in the metadata dict.
+    /// Returns the child of the variant under `key` in the metadata dict.
+    ///
+    /// If `key` occurs in more than one entry, the first entry applies. If no
+    /// entry has `key`, or if its value is not a variant, the result is `None`.
     pub fn metadata_value(&self, key: &str) -> Option<&Value> {
         self.metadata
             .dict_get(key)?
@@ -140,13 +206,19 @@ impl Commit {
             .map(|(_, value)| value)
     }
 
-    /// The `version` metadata key (the only well-known key without the
-    /// `ostree.` prefix).
+    /// Returns the value of the `version` metadata key.
+    ///
+    /// `version` is the only well-known key without the `ostree.` prefix. If
+    /// the key is absent, or if its value is not a string, the result is
+    /// `None`.
     pub fn version(&self) -> Option<&str> {
         self.metadata_value("version")?.as_str()
     }
 
-    /// The refs named by `ostree.ref-binding`, empty when unbound.
+    /// Returns the ref names in the `ostree.ref-binding` metadata key.
+    ///
+    /// If the key is absent, or if the commit is bound to no ref, the list is
+    /// empty.
     pub fn ref_bindings(&self) -> Vec<&str> {
         self.metadata_value("ostree.ref-binding")
             .and_then(Value::as_array)
@@ -154,7 +226,10 @@ impl Commit {
             .unwrap_or_default()
     }
 
-    /// The `ostree.collection-binding` metadata key.
+    /// Returns the value of the `ostree.collection-binding` metadata key.
+    ///
+    /// If the key is absent, or if its value is not a string, the result is
+    /// `None`.
     pub fn collection_binding(&self) -> Option<&str> {
         self.metadata_value("ostree.collection-binding")?.as_str()
     }
@@ -236,10 +311,11 @@ const REF_BINDING_KEY: &str = "ostree.ref-binding";
 /// The metadata key that holds the collection id a commit is bound to.
 const COLLECTION_BINDING_KEY: &str = "ostree.collection-binding";
 
-/// The `ostree.ref-binding` value for `refs`: the names sorted byte-wise
-/// ascending, duplicates kept, as a variant of type `as`. An empty list gives
-/// the empty array, which is the value of a commit bound to no ref
-/// (`docs/format-reference.md`, "CLI output formats").
+/// Returns the `ostree.ref-binding` value for `refs`.
+///
+/// The value is a variant of type `as`. It holds the names sorted byte-wise
+/// in ascending order, with duplicates kept. An empty list gives the empty
+/// array, which is the value of a commit bound to no ref.
 pub fn ref_binding(refs: &[&str]) -> Value {
     let mut names = refs.to_vec();
     names.sort_unstable();
@@ -254,13 +330,20 @@ pub fn ref_binding(refs: &[&str]) -> Value {
     )
 }
 
-/// The `a{sv}` metadata dict of a new commit.
+/// Returns the `a{sv}` metadata dict of a new commit.
 ///
-/// The entry order is part of the commit checksum: `entries` in the order
-/// given, with duplicate keys kept, then `ostree.ref-binding` for `refs`, then
-/// `ostree.collection-binding` when `collection_id` is set. With `refs` set to
-/// `None` the dict holds neither binding key, and `collection_id` is not used.
-/// Each value in `entries` is a variant.
+/// The entry order is part of the commit checksum. The dict holds these
+/// entries, in this order:
+///
+/// 1. `entries`, in the order given, with duplicate keys kept
+/// 2. `ostree.ref-binding` with the [`ref_binding`] value for `refs`, if
+///    `refs` is set
+/// 3. `ostree.collection-binding` with `collection_id`, if `collection_id` is
+///    set
+///
+/// If `refs` is `None`, the dict holds neither binding key, and the function
+/// ignores `collection_id`. Each value in `entries` must be a
+/// [`Value::Variant`], or [`Commit::serialize`] returns an error.
 pub fn commit_metadata(
     entries: impl IntoIterator<Item = (String, Value)>,
     refs: Option<&[&str]>,
@@ -285,11 +368,12 @@ pub fn commit_metadata(
     Value::Array(dict)
 }
 
-/// Why [`commit_timestamp`] gave no timestamp.
+/// An error of [`commit_timestamp`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimestampError {
-    /// `SOURCE_DATE_EPOCH` is set and is not a count of seconds. Holds the
-    /// value.
+    /// A `SOURCE_DATE_EPOCH` value that is not a count of seconds.
+    ///
+    /// The variant holds the value as read, before the trim.
     SourceDateEpoch(String),
     /// The system clock is before the Unix epoch.
     ClockBeforeEpoch,
@@ -310,12 +394,27 @@ impl std::fmt::Display for TimestampError {
 
 impl std::error::Error for TimestampError {}
 
-/// The timestamp of a new commit, in seconds since the Unix epoch, UTC:
-/// `explicit` when given, else `SOURCE_DATE_EPOCH`, else the current time.
+/// Returns the timestamp of a new commit.
 ///
-/// A malformed `SOURCE_DATE_EPOCH` is an error and not a fallback, as the
-/// reproducible-build convention requires. The value is trimmed before it is
-/// parsed. A `SOURCE_DATE_EPOCH` that is not valid Unicode counts as unset.
+/// The timestamp is in seconds since the Unix epoch, UTC. The function takes
+/// it from the first of these sources that is set:
+///
+/// 1. `explicit`
+/// 2. the `SOURCE_DATE_EPOCH` environment variable
+/// 3. the system clock
+///
+/// The function trims white space from `SOURCE_DATE_EPOCH` before it parses
+/// the value. If `SOURCE_DATE_EPOCH` is not valid Unicode, the function
+/// treats it as unset.
+///
+/// # Errors
+///
+/// - [`TimestampError::SourceDateEpoch`] if `explicit` is `None` and
+///   `SOURCE_DATE_EPOCH` is set to a value that is not a count of seconds.
+///   The function does not use the clock in this case, as the
+///   reproducible-build convention requires.
+/// - [`TimestampError::ClockBeforeEpoch`] if the function reads the system
+///   clock and the clock is before the Unix epoch.
 pub fn commit_timestamp(explicit: Option<u64>) -> std::result::Result<u64, TimestampError> {
     timestamp_from(explicit, std::env::var("SOURCE_DATE_EPOCH").ok())
 }
@@ -386,13 +485,14 @@ mod tests {
         assert_eq!(parsed.parent, None);
     }
 
-    /// Serialize a commit through the `Value` tree with an arbitrary parent
-    /// and root checksum widths, bypassing the struct's validation.
+    /// Serializes a commit through the `Value` tree with any width of the
+    /// parent and the root dirtree checksums. The `Commit` struct cannot hold
+    /// such widths.
     fn craft(parent: &[u8], root_dirtree: &[u8]) -> Vec<u8> {
         craft_with(parent, root_dirtree, &[2; 32])
     }
 
-    /// [`craft`] with an arbitrary root dirmeta width as well.
+    /// [`craft`] with any width of the root dirmeta checksum.
     fn craft_with(parent: &[u8], root_dirtree: &[u8], root_dirmeta: &[u8]) -> Vec<u8> {
         let ty = Type::parse(<Commit as GvType>::SIGNATURE).unwrap();
         let value = Value::Tuple(vec![

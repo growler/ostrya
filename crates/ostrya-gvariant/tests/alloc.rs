@@ -1,13 +1,14 @@
 #![deny(unsafe_code)]
 
-//! Borrowed dirtree and xattr traversal must perform zero heap allocations.
+//! Checks that borrowed dirtree and xattr traversal does zero heap allocations.
 //!
-//! This is the one test binary that installs a global allocator, so nothing
-//! else runs concurrently to perturb the count. The allocator wraps the system
-//! allocator and tallies allocations only while `ACTIVE` is set. `GlobalAlloc`
-//! cannot be implemented in safe Rust, so the single `impl` below carries a
-//! scoped `allow(unsafe_code)`; this is the allocation-test exception recorded
-//! in CLAUDE.md.
+//! This test binary is the only one that installs a global allocator, so
+//! nothing else runs concurrently to change the count. The allocator wraps the
+//! system allocator and counts allocations only while `ACTIVE` is set.
+//!
+//! Safe Rust cannot implement `GlobalAlloc`, so `unsafe impl GlobalAlloc for
+//! Counting` carries a scoped `allow(unsafe_code)`. CLAUDE.md records this
+//! allocation-test exception.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -56,7 +57,7 @@ fn checksum(seed: u8) -> Value {
     Value::Bytes(support::checksum(seed))
 }
 
-/// A `(a(say)a(sayay))` dirtree with several file and directory entries.
+/// Builds a `(a(say)a(sayay))` dirtree with several file and directory entries.
 fn build_dirtree() -> Vec<u8> {
     let files = Value::Array(vec![
         Value::Tuple(vec!["alpha.txt".into(), checksum(1)]),
@@ -74,7 +75,7 @@ fn build_dirtree() -> Vec<u8> {
     .unwrap()
 }
 
-/// A `(uuua(ayay))` dirmeta with several xattrs.
+/// Builds a `(uuua(ayay))` dirmeta with several xattrs.
 fn build_dirmeta() -> Vec<u8> {
     let xattr =
         |k: &str, v: &str| Value::Tuple(vec![Value::from(k.as_bytes()), Value::from(v.as_bytes())]);

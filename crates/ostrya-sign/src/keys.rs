@@ -1,6 +1,4 @@
 //! Key sets and the reader of key files.
-//!
-//! The reader is synchronous. An async caller runs it on the blocking pool.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
@@ -8,8 +6,12 @@ use std::path::Path;
 
 use crate::{Error, Result};
 
-/// The trusted and revoked key sets loaded from a sign-api key store, as raw
-/// decoded key bytes. The engine that consumes them validates their length.
+/// The trusted keys and the revoked keys of a key store, as decoded bytes.
+///
+/// The key store holds the `trusted.<type>` and `revoked.<type>` files and
+/// directories of the ed25519 and spki engines. A verifier trusts each key in
+/// `trusted` that is not in `revoked`. The engine that uses the keys checks
+/// their length.
 #[derive(Debug, Clone, Default)]
 pub struct SignKeys {
     /// Keys from the `trusted.<type>` files and directories.
@@ -18,17 +20,36 @@ pub struct SignKeys {
     pub revoked: Vec<Vec<u8>>,
 }
 
-/// The ceiling on one key file, whose whole content is read into memory. A
-/// mebibyte holds some twenty thousand base64 ed25519 keys.
+/// The ceiling for one key file, in bytes.
+///
+/// A key reader reads the whole file into memory. An ed25519 key is 44 base64
+/// characters and a newline, so 1 MiB holds 23,301 keys.
 pub const MAX_KEY_FILE: u64 = 1024 * 1024;
 
-/// The most a read reserves before it reads, whatever length the source states.
-/// A larger source grows the buffer as it is read.
+/// The largest capacity that a read reserves before it starts. The length that
+/// the source states does not change this limit. For a larger source, the
+/// buffer grows during the read.
 const MAX_RESERVE: usize = 16 * 1024 * 1024;
 
-/// Read the key source at `path` whole, up to `ceiling`, or `None` where no file
-/// is there. `subject` is what a refusal names the source by, so an operator can
-/// find the entry that named it.
+/// Reads the whole key file at `path`, up to `ceiling` bytes.
+///
+/// If no file is at `path`, the function returns `None`. Each error message
+/// names the source with `subject`, so that an operator can find the entry
+/// that named the source. [`MAX_KEY_FILE`] is the ceiling for one key file.
+///
+/// On Unix, the open uses `O_NONBLOCK`. As a result, the open of a fifo does
+/// not wait for a writer, and the function refuses the fifo at once.
+/// [`read_key_source`] states the ceiling rule and the regular-file rule.
+///
+/// The read is synchronous, over `std::fs`. An async caller runs it on the
+/// blocking pool.
+///
+/// # Errors
+///
+/// - [`Error::Signature`] with the message `<subject> cannot be opened: <e>`
+///   if the open fails for a cause other than a missing file. `<e>` is the
+///   I/O error.
+/// - The errors of [`read_key_source`].
 pub fn read_key_file(path: &Path, subject: &str, ceiling: u64) -> Result<Option<Vec<u8>>> {
     let file = match open_key_file(path) {
         Ok(file) => file,
@@ -38,9 +59,9 @@ pub fn read_key_file(path: &Path, subject: &str, ceiling: u64) -> Result<Option<
     read_key_source(file, subject, ceiling).map(Some)
 }
 
-/// Open `path` for reading. On Unix the open carries `O_NONBLOCK`, so a fifo
-/// answers the open rather than waiting for a writer. On a regular file the flag
-/// has no effect on the read [`read_key_source`] makes.
+/// Opens `path` for reading. On Unix the open uses `O_NONBLOCK`, so the open
+/// of a fifo returns at once and does not wait for a writer. On a regular file,
+/// the flag has no effect on the read of [`read_key_source`].
 fn open_key_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -49,16 +70,36 @@ fn open_key_file(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
-/// Read an opened key source whole, holding it to its kind and to `ceiling`.
-/// This is the reader every keyring and every key file reaches a trusted set
-/// through, whichever source names it.
+/// Reads the whole key source in `file`, up to `ceiling` bytes.
 ///
-/// A source over the ceiling is refused by its own name: reading the part the
-/// ceiling admits would leave the trusted set smaller than the one the operator
-/// placed there, with nothing said about it. Only a regular file is read: what a
-/// fifo answers a read with is what its writers sent, which for key material is
-/// a trusted set of their own making, and an open fifo holds the reading thread
-/// until a writer arrives.
+/// Each keyring and each key file goes through this function before its keys
+/// get into a trusted set, whatever source names the file. Each error message
+/// names the source with `subject`.
+///
+/// # Ceiling and file type
+///
+/// If the source holds more than `ceiling` bytes, the function refuses the
+/// whole source by its name. A read of only the first `ceiling` bytes gives a
+/// trusted set that is smaller than the set that the operator supplied. No
+/// message tells the operator about this difference.
+///
+/// The function reads only a regular file. A fifo gives the bytes that its
+/// writers send. For key material, the writers of a fifo can supply a trusted
+/// set of their own. An open fifo also holds the reading thread until a writer
+/// arrives.
+///
+/// The read is synchronous, over `std::fs`. An async caller runs it on the
+/// blocking pool.
+///
+/// # Errors
+///
+/// - [`Error::Signature`] with the message `<subject> cannot be read: <e>` if
+///   the metadata query or the read fails. `<e>` is the I/O error.
+/// - [`Error::Signature`] with the message `<subject> is not a regular file`
+///   if `file` is a directory, a fifo, or another file type.
+/// - [`Error::Signature`] with the message
+///   `<subject> is over the <ceiling>-byte ceiling` if the source holds more
+///   than `ceiling` bytes.
 pub fn read_key_source(file: File, subject: &str, ceiling: u64) -> Result<Vec<u8>> {
     let refuse = |what: &str| Error::Signature(format!("{subject} {what}"));
     let metadata = file
@@ -67,8 +108,9 @@ pub fn read_key_source(file: File, subject: &str, ceiling: u64) -> Result<Vec<u8
     if !metadata.file_type().is_file() {
         return Err(refuse("is not a regular file"));
     }
-    // The length the handle states sizes the buffer, so the read and its probe
-    // for the end fit with no growth. The take bound stays the limit.
+    // The length that the handle states sets the capacity of the buffer, so the
+    // read and its probe for the end need no growth. The `take` bound stays the
+    // limit.
     let hint = metadata.len().min(ceiling).saturating_add(1);
     let capacity = usize::try_from(hint).map_or(MAX_RESERVE, |n| n.min(MAX_RESERVE));
     let mut bytes = Vec::with_capacity(capacity);
@@ -81,8 +123,14 @@ pub fn read_key_source(file: File, subject: &str, ceiling: u64) -> Result<Vec<u8
     Ok(bytes)
 }
 
-/// The text of a key source read under [`read_key_source`], for a source whose
-/// keys are base64 lines.
+/// Returns the text of a key source that [`read_key_source`] read.
+///
+/// The function is for a source that holds one base64 key on each line.
+///
+/// # Errors
+///
+/// - [`Error::Signature`] with the message `<subject> is not valid UTF-8` if
+///   `bytes` is not valid UTF-8.
 pub fn key_text(bytes: Vec<u8>, subject: &str) -> Result<String> {
     String::from_utf8(bytes).map_err(|_| Error::Signature(format!("{subject} is not valid UTF-8")))
 }
@@ -94,11 +142,11 @@ mod tests {
 
     use super::*;
 
-    /// The ceiling the tests hold their key files to.
+    /// The ceiling of the key files in the tests.
     const CEILING: u64 = 8;
 
-    /// A process-unique scratch path, removed with everything under it when the
-    /// guard drops.
+    /// A scratch path that is unique in the process. When the guard drops, it
+    /// removes the path and all of its contents.
     struct Scratch {
         path: PathBuf,
     }
@@ -122,7 +170,8 @@ mod tests {
         }
     }
 
-    /// The signature message of `err`, which every reader refusal is.
+    /// Returns the message of `err`. Each refusal of a reader is an
+    /// `Error::Signature`.
     fn message(err: Error) -> String {
         match err {
             Error::Signature(m) => m,
@@ -179,8 +228,7 @@ mod tests {
     }
 
     /// A fifo is refused, and the open does not wait for a writer. The read runs
-    /// on a thread of its own, so an open that waits fails the test rather than
-    /// holding it.
+    /// on its own thread. If the open waits, the test fails after 10 seconds.
     #[cfg(unix)]
     #[test]
     fn a_fifo_is_refused_without_waiting_for_a_writer() {

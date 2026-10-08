@@ -1,26 +1,8 @@
 //! Dirtree objects: the sorted lists of child files and subdirectories.
 //!
-//! Wire form `(a(say)a(sayay))`: file entries (name, content checksum) and
-//! directory entries (name, dirtree checksum, dirmeta checksum). Both lists
-//! are sorted by name with byte-wise comparison; the sort order is mandatory
-//! for reproducible checksums, so it is validated on both paths. Each entry
-//! name is validated as a single path component (not `.` or `..`, no `/`,
-//! non-empty; UTF-8 is enforced by the string decoder): this is the
-//! path-traversal defense.
-//!
-//! No name may appear in both lists: the two entries would claim the same
-//! checkout path. This is checked on the write path and when materializing an
-//! owned [`DirTree`] (via [`DirTree::parse`]). The borrowed [`DirTreeRef`]
-//! iterators stay per-list and allocation-free, matching the tool, which reads
-//! such an object without a cross-list check (`ostree fsck` accepts it and
-//! `ostree ls` lists both entries) and aborts only when it later resolves the
-//! name as a directory.
-//!
-//! [`DirTreeRef`] is the borrowed read-path view: `parse` validates the
-//! container framing, and the entry-level checks (name, checksum length,
-//! sort order) run as entries are visited, which is why the iterators yield
-//! `Result`. After an error an iterator is exhausted. A full dirtree walk
-//! borrows the object buffer throughout.
+//! The owned [`DirTree`] checks all rules of the object when it parses and
+//! when it serializes. The borrowed [`DirTreeRef`] checks each entry when an
+//! iterator visits it, and does no check across the two lists.
 
 use ostrya_gvariant::{ArrayIter, GvDecode, GvEncode, GvType, Slice};
 
@@ -28,19 +10,44 @@ use crate::checksum::Checksum;
 use crate::error::{Error, Result};
 use crate::valiter::ValidatedIter;
 
-/// An owned dirtree object. Both lists must be name-sorted (byte-wise,
-/// strictly increasing) and no name may appear in both lists; `serialize`
-/// validates this.
+/// An owned dirtree object: the lists of child files and subdirectories.
+///
+/// # Wire form
+///
+/// The GVariant type is `(a(say)a(sayay))`. It holds two lists:
+///
+/// - the file entries `(say)`: the name and the checksum of the content object
+/// - the directory entries `(sayay)`: the name, the checksum of the dirtree
+///   object, and the checksum of the dirmeta object
+///
+/// Each checksum is a raw 32-byte `ay`.
+///
+/// # Rules
+///
+/// - Each list is sorted by name in byte-wise order. A name occurs at most
+///   once in a list. The sort order makes the checksum of a tree
+///   reproducible.
+/// - Each name is one path component, as [`check_name`](Self::check_name)
+///   states.
+/// - No name is in both lists, because the two entries have the same
+///   checkout path.
+///
+/// [`serialize`](Self::serialize) and [`parse`](Self::parse) check all three
+/// rules. [`DirTreeRef`] checks the first two rules only.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DirTree {
-    /// (file name, content checksum), name-sorted.
+    /// The file entries: the name and the content checksum, sorted by name.
     pub files: Vec<(String, Checksum)>,
-    /// (dir name, dirtree checksum, dirmeta checksum), name-sorted.
+    /// The directory entries, sorted by name.
+    ///
+    /// Each entry holds the name, the dirtree checksum, and the dirmeta
+    /// checksum.
     pub dirs: Vec<(String, Checksum, Checksum)>,
 }
 
-/// Validate one visited name against the previous one: valid component,
-/// byte-wise strictly increasing (which rejects duplicates).
+/// Checks one visited name against the previous name of the same list. The
+/// name must be a valid component and must sort strictly after the previous
+/// name in byte-wise order, so a duplicate name is refused.
 fn check_entry<'a>(prev: &mut Option<&'a str>, name: &'a str) -> Result<()> {
     DirTree::check_name(name)?;
     if let Some(prev) = prev
@@ -57,8 +64,19 @@ fn entry_checksum(bytes: &[u8]) -> Result<Checksum> {
 }
 
 impl DirTree {
-    /// Check that `name` is one path component: not empty, not `.` or `..`,
-    /// and with no `/`. This is the path-traversal defense of a dirtree entry.
+    /// Checks that `name` is one path component.
+    ///
+    /// A valid name is not empty, is not `.` or `..`, and holds no `/`. This
+    /// check is the defense against path traversal through a dirtree entry.
+    /// The string decoder of the read path refuses a name that is not UTF-8.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidDirTree`] with one of these reasons:
+    ///
+    /// - `"empty entry name"` if `name` is empty
+    /// - `"entry name is a directory traversal"` if `name` is `.` or `..`
+    /// - `"entry name contains a slash"` if `name` holds a `/`
     pub fn check_name(name: &str) -> Result<()> {
         if name.is_empty() {
             return Err(Error::InvalidDirTree("empty entry name"));
@@ -72,16 +90,50 @@ impl DirTree {
         Ok(())
     }
 
-    /// Parse a serialized dirtree object into an owned, structurally sound
-    /// tree: the per-list checks run as entries are collected, then the
-    /// cross-list duplicate-name check runs over the materialized lists.
+    /// Parses a serialized dirtree object into an owned tree.
+    ///
+    /// The parse checks each entry when it collects the lists, as
+    /// [`DirTreeRef::to_owned`] does. Then it checks that no name is in both
+    /// lists. A tree that this function returns obeys all
+    /// [rules](DirTree#rules).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Gvariant`] if `data` is not a normal-form value of type
+    ///   `(a(say)a(sayay))`.
+    /// - [`Error::InvalidDirTree`] if an entry breaks a rule. These are the
+    ///   reasons:
+    ///   - a reason of [`check_name`](Self::check_name) if a name is not one
+    ///     path component
+    ///   - `"entry names are not sorted"` if a name does not sort strictly
+    ///     after the previous name of its list
+    ///   - `"entry checksum is not 32 bytes"` if a checksum has a different
+    ///     length
+    ///   - `"a name appears in both the file and directory lists"` if a name
+    ///     is in both lists
     pub fn parse(data: &[u8]) -> Result<DirTree> {
         let tree = DirTreeRef::parse(data)?.to_owned()?;
         tree.check_no_shared_names()?;
         Ok(tree)
     }
 
-    /// Serialize to normal-form bytes; their SHA-256 is the object identity.
+    /// Serializes the tree to normal-form bytes.
+    ///
+    /// The SHA-256 of these bytes is the checksum of the dirtree object.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidDirTree`] if the tree breaks a
+    ///   [rule](DirTree#rules). These are the reasons:
+    ///   - a reason of [`check_name`](Self::check_name) if a name is not one
+    ///     path component
+    ///   - `"entry names are not sorted"` if a name does not sort strictly
+    ///     after the previous name of its list
+    ///   - `"a name appears in both the file and directory lists"` if a name
+    ///     is in both lists
+    /// - [`Error::Gvariant`] with
+    ///   [`InvalidValue`](ostrya_gvariant::Error::InvalidValue) if a name
+    ///   holds a NUL byte.
     pub fn serialize(&self) -> Result<Vec<u8>> {
         self.validate()?;
         Ok(ostrya_gvariant::encode_to_vec(self)?)
@@ -99,9 +151,10 @@ impl DirTree {
         self.check_no_shared_names()
     }
 
-    /// No name may appear in both lists. Both lists are name-sorted by the
-    /// time this runs (validated per list above, or by `to_owned` on the read
-    /// path), so a merge-style walk finds any shared name without allocating.
+    /// Checks that no name is in both lists. Both lists are sorted when this
+    /// function runs: `validate` checks the order on the write path, and
+    /// `to_owned` checks it on the read path. For this reason, one merge walk
+    /// over the two lists finds a shared name with no allocation.
     fn check_no_shared_names(&self) -> Result<()> {
         let mut files = self.files.iter().map(|(n, _)| n.as_str());
         let mut dirs = self.dirs.iter().map(|(n, _, _)| n.as_str());
@@ -128,16 +181,45 @@ impl GvType for DirTree {
     const FIXED_SIZE: Option<usize> = None;
 }
 
-/// The encode path is purely mechanical: sort and cross-list validation runs in
-/// [`DirTree::serialize`], the only caller. The owned entry vectors encode
-/// directly, since `String` and `Checksum` are themselves encodable.
+/// The encoder writes the two lists as they are and checks no
+/// [rule](DirTree#rules). [`DirTree::serialize`] checks the rules before it
+/// encodes.
 impl GvEncode for DirTree {
+    // `DirTree::serialize` is the only caller in this crate. `String` and
+    // `Checksum` implement `GvEncode`, so the owned entry vectors encode with
+    // no conversion.
     fn encode(&self, out: &mut Vec<u8>) -> ostrya_gvariant::Result<()> {
         (Slice(&self.files), Slice(&self.dirs)).encode(out)
     }
 }
 
 /// A borrowed view of a serialized dirtree object.
+///
+/// A full walk of a dirtree borrows the object buffer for the whole walk and
+/// does not allocate.
+///
+/// # Checks
+///
+/// [`parse`](Self::parse) checks the container framing only. The iterators
+/// [`files`](Self::files) and [`dirs`](Self::dirs) check each entry when they
+/// visit it, so they yield `Result`. These are the checks:
+///
+/// - The name is one path component, as [`DirTree::check_name`] states.
+/// - Each checksum is 32 bytes long.
+/// - The name sorts strictly after the previous name of the same list, in
+///   byte-wise order.
+///
+/// After an error, an iterator is exhausted and returns `None`.
+///
+/// # Names in both lists
+///
+/// The view checks each list alone, because a check across the two lists
+/// needs an allocation. [`DirTree::parse`] refuses an object with a name in
+/// both lists.
+///
+/// The `ostree` command reads such an object in the same way as the view.
+/// `ostree fsck` accepts it, and `ostree ls` lists both entries. The `ostree`
+/// command aborts only when it resolves the name as a directory.
 #[derive(Clone, Copy)]
 pub struct DirTreeRef<'a> {
     files: ArrayIter<'a, (&'a str, &'a [u8])>,
@@ -145,13 +227,26 @@ pub struct DirTreeRef<'a> {
 }
 
 impl<'a> DirTreeRef<'a> {
-    /// Parse the slice covering exactly a serialized dirtree object.
+    /// Parses a serialized dirtree object into a borrowed view.
+    ///
+    /// `data` must cover exactly one serialized dirtree object. The parse
+    /// checks the container framing only. The iterators check the entries,
+    /// as the [checks](DirTreeRef#checks) state.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Gvariant`] if the framing of the tuple or of one of its two
+    /// arrays is not in normal form.
     pub fn parse(data: &'a [u8]) -> Result<DirTreeRef<'a>> {
         let (files, dirs) = GvDecode::decode(data)?;
         Ok(DirTreeRef { files, dirs })
     }
 
-    /// Iterate file entries, validating each as visited.
+    /// Returns an iterator over the file entries.
+    ///
+    /// The iterator checks each entry when it visits it, as the
+    /// [checks](DirTreeRef#checks) state. An item is an error if the entry
+    /// fails a check or if its framing is not in normal form.
     pub fn files(&self) -> impl Iterator<Item = Result<(&'a str, Checksum)>> + use<'a> {
         ValidatedIter::new(
             self.files,
@@ -163,7 +258,11 @@ impl<'a> DirTreeRef<'a> {
         )
     }
 
-    /// Iterate directory entries, validating each as visited.
+    /// Returns an iterator over the directory entries.
+    ///
+    /// The iterator checks each entry when it visits it, as the
+    /// [checks](DirTreeRef#checks) state. An item is an error if the entry
+    /// fails a check or if its framing is not in normal form.
     pub fn dirs(&self) -> impl Iterator<Item = Result<(&'a str, Checksum, Checksum)>> + use<'a> {
         ValidatedIter::new(
             self.dirs,
@@ -175,7 +274,22 @@ impl<'a> DirTreeRef<'a> {
         )
     }
 
-    /// Collect into an owned [`DirTree`].
+    /// Collects the entries into an owned [`DirTree`].
+    ///
+    /// The result can hold a name in both lists, because this function does
+    /// no check across the two lists. [`DirTree::parse`] adds that check.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Gvariant`] if the framing of an entry is not in normal form.
+    /// - [`Error::InvalidDirTree`] if an entry fails a
+    ///   [check](DirTreeRef#checks). These are the reasons:
+    ///   - a reason of [`DirTree::check_name`] if a name is not one path
+    ///     component
+    ///   - `"entry names are not sorted"` if a name does not sort strictly
+    ///     after the previous name of its list
+    ///   - `"entry checksum is not 32 bytes"` if a checksum has a different
+    ///     length
     pub fn to_owned(&self) -> Result<DirTree> {
         let mut owned = DirTree::default();
         for item in self.files() {
@@ -258,8 +372,8 @@ mod tests {
         }
     }
 
-    /// Serialize an arbitrary dirtree through the `Value` tree, bypassing the
-    /// struct's validation.
+    /// Serializes a dirtree with file entries only through the `Value` tree,
+    /// with none of the checks of `DirTree::serialize`.
     fn craft(files: &[(&str, &[u8])]) -> Vec<u8> {
         let ty = Type::parse("(a(say)a(sayay))").unwrap();
         let value = Value::Tuple(vec![
@@ -305,8 +419,8 @@ mod tests {
         );
     }
 
-    /// Serialize an arbitrary dirtree with both lists populated, bypassing the
-    /// struct's validation.
+    /// Serializes a dirtree with entries in both lists through the `Value`
+    /// tree, with none of the checks of `DirTree::serialize`.
     fn craft2(files: &[(&str, &[u8])], dirs: &[(&str, &[u8], &[u8])]) -> Vec<u8> {
         let ty = Type::parse("(a(say)a(sayay))").unwrap();
         let value = Value::Tuple(vec![
@@ -340,19 +454,20 @@ mod tests {
     fn rejects_a_name_shared_across_file_and_dir_lists() {
         let shared = Error::InvalidDirTree("a name appears in both the file and directory lists");
 
-        // Writer: minting such an object fails.
+        // Write path: the serialization of such an object fails.
         let tree = DirTree {
             files: vec![("x".to_owned(), csum(1))],
             dirs: vec![("x".to_owned(), csum(2), csum(3))],
         };
         assert_eq!(tree.serialize(), Err(shared.clone()));
 
-        // Owned read path: materializing the crafted object fails the same way.
+        // Owned read path: the parse of the crafted object fails with the
+        // same error.
         let bytes = craft2(&[("x", &[1; 32])], &[("x", &[2; 32], &[3; 32])]);
         assert_eq!(DirTree::parse(&bytes), Err(shared));
 
-        // Borrowed traversal stays per-list: each list yields the shared name
-        // with no cross-list check, matching what the tool reads.
+        // Borrowed view: each list yields the shared name, because the view
+        // checks each list alone. The `ostree` command reads it the same way.
         let view = DirTreeRef::parse(&bytes).unwrap();
         assert_eq!(view.files().next().unwrap().unwrap().0, "x");
         assert_eq!(view.dirs().next().unwrap().unwrap().0, "x");
@@ -360,7 +475,8 @@ mod tests {
 
     #[test]
     fn distinct_names_across_lists_are_accepted() {
-        // A file and a directory with different names round-trip cleanly.
+        // A file and a directory with different names make a round trip with
+        // no change.
         let bytes = craft2(&[("a", &[1; 32])], &[("b", &[2; 32], &[3; 32])]);
         let tree = DirTree::parse(&bytes).unwrap();
         assert_eq!(tree.files.len(), 1);

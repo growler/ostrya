@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! Pure-Rust, async reimplementation of the ostree repository library.
 //!
@@ -237,6 +238,9 @@
 //! [`Remote::push_user`], are read in every build, and so are the pull keys
 //! of the port, [`Remote::pull_url`] and [`Remote::send_command`].
 
+pub mod repo;
+pub mod transaction;
+
 pub mod archive;
 pub mod bootable;
 mod bspatch;
@@ -271,7 +275,6 @@ pub mod read;
 #[cfg(feature = "receive")]
 pub mod receive;
 pub mod refs;
-pub mod repo;
 mod rollsum;
 mod send;
 pub mod sign;
@@ -285,18 +288,23 @@ pub mod staging_tree;
 pub mod summary;
 pub mod tar;
 mod tombstone;
-pub mod transaction;
 pub mod traverse;
 pub mod tree;
 pub mod update;
 mod verify;
 mod write;
 
+#[doc(hidden)]
 pub use archive::{ArchiveAnswer, ArchiveHead, ArchiveView};
+#[doc(hidden)]
 pub use bootable::{BootableMetadata, BootableRefusal};
+#[doc(hidden)]
 pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMode};
+#[doc(hidden)]
 pub use commit::CommitOptions;
+#[doc(hidden)]
 pub use composefs::{ComposefsOptions, VerityPolicy};
+#[doc(hidden)]
 pub use config::{
     MinFreeSpace, Remote, RepoConfig, SignVerify, SizeSpec, SizeUnit, Tristate, valid_remote_name,
 };
@@ -304,28 +312,37 @@ pub use delta::{
     DeltaEndianness, DeltaFallback, DeltaOpCounts, DeltaPart, DeltaPartStats, DeltaSuperblock,
 };
 pub use deltagen::{DeltaOptions, static_delta_relative_dir};
+#[doc(hidden)]
 pub use diff::{DiffChange, DiffEntry, DiffOptions, DiffSide, DiffStats};
+#[doc(hidden)]
 pub use error::{Error, Result};
+#[doc(hidden)]
 pub use fetch::{
     BasicAuth, BearerToken, Body, ClientIdentity, FetchRequest, Fetched, Fetcher, FetcherOptions,
     LowSpeed, Priority, Protocol, Proxy, Target, TlsOptions, TrustRoots, UploadBody, UploadMethod,
     UploadRequest, UploadWriter, Uploaded, Validators,
 };
+#[doc(hidden)]
 pub use file::{ContentReader, FileKind, FileObject};
+#[doc(hidden)]
 pub use fsck::{
     FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
     FsckPhase, FsckReport,
 };
 #[cfg(feature = "sign-gpg")]
+#[doc(hidden)]
 pub use gpg::GpgSigner;
 #[cfg(feature = "verify-gpg")]
+#[doc(hidden)]
 pub use gpg::{GpgKey, GpgVerifier};
 pub use hashing::{HashingReader, HashingWriter, VerifyingReader};
 pub use lock::LockKind;
+#[doc(hidden)]
 pub use modifier::{
     CommitModifier, CommitModifierFlags, DevInoCache, FilterFn, FilterResult, LabelFn, ModeFn,
     XattrFn,
 };
+#[doc(hidden)]
 pub use mtree::MutableTree;
 pub use object::MAX_METADATA_SIZE;
 pub use ostrya_composefs::Image;
@@ -335,36 +352,50 @@ pub use ostrya_core::{
     TextError, Type, Value, Xattrs, from_bytes, from_text, is_checksum_shaped, loose_path, to_text,
     to_text_unannotated,
 };
+#[doc(hidden)]
 pub use prune::{PruneOptions, PruneStats, WeakRefFilter, WeakRefFilterFn};
+#[doc(hidden)]
 pub use pull::{
     DetachedMetadataFilter, DetachedMetadataFilterFn, PullFlags, PullOptions, PullProgress,
     PullProgressSnapshot, PullStats, PullVerify, TimestampCheck,
 };
 #[cfg(feature = "push")]
 pub use push_repo::{ExportStreamOptions, RepoPushOptions, is_push_address, resolve_push_remote};
+#[doc(hidden)]
 pub use read::{CommitSizes, CommitState, MetadataReader};
 #[cfg(feature = "receive")]
+#[doc(hidden)]
 pub use receive::{
     HookFuture, HookRefusal, HostEntry, ReceiveHooks, ReceivePolicy, ReceiveReport, ReceiveRule,
     ReceiveService, ReceiveStep, ReceiveVerify, ReceiveWarning, RefPattern, ServerSigner,
     TrustedKeys, UpdatePlan,
 };
+#[doc(hidden)]
 pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
+#[doc(hidden)]
 pub use repo::{CreateOptions, Repo};
+#[doc(hidden)]
 pub use sign::{
     DummySigner, DummyVerifier, Ed25519Signer, Ed25519Verifier, FromSystemKeys, SignFuture,
     SignKeys, SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome, load_sign_keys,
     load_sign_keys_from,
 };
 #[cfg(feature = "sign-spki")]
+#[doc(hidden)]
 pub use spki::{SpkiSigner, SpkiVerifier};
+#[doc(hidden)]
 pub use staging_tree::{
     MergeOptions, RootDirmeta, StagedFileWriter, StagingEntry, StagingLookup, StagingTree,
 };
+#[doc(hidden)]
 pub use summary::{Summary, SummaryOptions, SummaryRef};
+#[doc(hidden)]
 pub use tar::{TarExportOptions, TarImportOptions, TarRename};
+#[doc(hidden)]
 pub use transaction::{ContentWriter, FileMeta, Transaction, TransactionStats};
+#[doc(hidden)]
 pub use tree::{RepoTree, TreeEntry};
+#[doc(hidden)]
 pub use update::UpdateGuard;
 
 /// Remove the staging directories the live transactions of this process own.

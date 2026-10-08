@@ -1,17 +1,22 @@
-//! Ordered `a{sv}` dict construction.
+//! The builder of `a{sv}` dict values, `DictBuilder`.
 
 use crate::{Type, Value};
 
-/// Builds an `a{sv}` dict value one entry at a time.
+/// A builder for an `a{sv}` dict value.
 ///
-/// An `a{sv}` is an array of key-value tuples whose value member is a variant,
-/// so the dict holds whatever order its writer produced. The builder appends,
-/// and [`build`](DictBuilder::build) hands back the entries in insertion order.
-/// A key inserted twice yields two entries of that name, which the commit
-/// metadata dict allows (`docs/format-reference.md`, "Commit").
+/// An `a{sv}` is an array of key-value tuples. The value member of each tuple
+/// is a variant. Because the dict is an array, it keeps the entry order that
+/// its writer gives it.
 ///
-/// Every insert returns `&mut Self`, so a chain of them reads as the dict it
-/// produces:
+/// The builder appends each entry. [`build`](DictBuilder::build) returns the
+/// entries in insertion order. If the caller inserts a key twice, the dict
+/// holds two entries with that key. The commit metadata dict of ostree
+/// accepts two entries with one key.
+///
+/// Each insert method returns `&mut Self`, so a chain of inserts reads as the
+/// dict that it produces.
+///
+/// # Examples
 ///
 /// ```
 /// use ostrya_gvariant::DictBuilder;
@@ -30,15 +35,21 @@ pub struct DictBuilder {
 }
 
 impl DictBuilder {
-    /// An empty dict.
+    /// Creates a builder that holds an empty dict.
     pub fn new() -> DictBuilder {
         DictBuilder {
             entries: Vec::new(),
         }
     }
 
-    /// Append `key` holding `value` of type `ty`, wrapped as the `v` the dict's
-    /// value member carries.
+    /// Appends the entry `key` with `value` of type `ty`.
+    ///
+    /// The builder wraps `value` in a `v`, which is the type of the value
+    /// member of the dict. The builder does not check `value` against `ty`.
+    /// If they do not match, [`to_bytes`] returns [`Error::TypeMismatch`].
+    ///
+    /// [`to_bytes`]: crate::to_bytes
+    /// [`Error::TypeMismatch`]: crate::Error::TypeMismatch
     pub fn insert(&mut self, key: &str, ty: Type, value: Value) -> &mut Self {
         self.entries.push(Value::Tuple(vec![
             Value::Str(key.to_owned()),
@@ -47,28 +58,28 @@ impl DictBuilder {
         self
     }
 
-    /// Append `key` holding an `s`.
+    /// Appends the entry `key` with an `s` value.
     pub fn insert_str(&mut self, key: &str, value: &str) -> &mut Self {
         self.insert(key, Type::Str, Value::Str(value.to_owned()))
     }
 
-    /// Append `key` holding a `t`.
+    /// Appends the entry `key` with a `t` value.
     pub fn insert_u64(&mut self, key: &str, value: u64) -> &mut Self {
         self.insert(key, Type::U64, Value::U64(value))
     }
 
-    /// Append `key` holding a `b`.
+    /// Appends the entry `key` with a `b` value.
     pub fn insert_bool(&mut self, key: &str, value: bool) -> &mut Self {
         self.insert(key, Type::Bool, Value::Bool(value))
     }
 
-    /// Append `key` holding an `as`.
+    /// Appends the entry `key` with an `as` value.
     pub fn insert_strv(&mut self, key: &str, values: &[String]) -> &mut Self {
         let items = values.iter().map(|v| Value::Str(v.clone())).collect();
         self.insert(key, Type::Array(Box::new(Type::Str)), Value::Array(items))
     }
 
-    /// Append `key` holding an `ay`.
+    /// Appends the entry `key` with an `ay` value.
     pub fn insert_bytes(&mut self, key: &str, value: &[u8]) -> &mut Self {
         self.insert(
             key,
@@ -77,7 +88,7 @@ impl DictBuilder {
         )
     }
 
-    /// The assembled `a{sv}`, its entries in insertion order.
+    /// Returns the assembled `a{sv}` with its entries in insertion order.
     pub fn build(self) -> Value {
         Value::Array(self.entries)
     }
@@ -88,7 +99,8 @@ mod tests {
     use super::*;
     use crate::{from_bytes, to_bytes};
 
-    /// The `a{sv}` signature the commit metadata dict and its relatives carry.
+    /// Returns the `a{sv}` type of the commit metadata dict and of related
+    /// dicts.
     fn dict_type() -> Type {
         Type::parse("a{sv}").unwrap()
     }
@@ -97,8 +109,9 @@ mod tests {
         Value::Tuple(vec![Value::Str(key.to_owned()), Value::variant(ty, value)])
     }
 
-    /// A dict the builder produces equals, value for value and byte for byte,
-    /// the same dict assembled by hand out of `Value::Array` and `Value::Tuple`.
+    /// A dict from the builder equals the same dict that the test assembles by
+    /// hand from `Value::Array` and `Value::Tuple`. The test compares the
+    /// values and the serialized bytes.
     #[test]
     fn builds_the_hand_assembled_value() {
         let mut builder = DictBuilder::new();
@@ -139,10 +152,10 @@ mod tests {
         );
     }
 
-    /// The serialized dict holds the keys in the order they were inserted, and
-    /// a parse of those bytes gives that order back, value model included: an
-    /// `ay` parses back as [`Value::Bytes`] and an `as` as an array of strings,
-    /// which are the spellings the builder produces.
+    /// The serialized dict holds the keys in insertion order. A parse of those
+    /// bytes returns the same order and the same value model. An `ay` parses
+    /// back as [`Value::Bytes`], and an `as` parses back as an array of
+    /// strings. The builder produces these same forms.
     #[test]
     fn round_trips_with_insertion_order_intact() {
         let mut builder = DictBuilder::new();
@@ -166,7 +179,8 @@ mod tests {
         assert_eq!(keys, ["zulu", "alpha", "mike"]);
     }
 
-    /// A key inserted twice stands twice, and a lookup by name reads the first.
+    /// If the builder inserts a key twice, the dict holds two entries for it.
+    /// A lookup by name returns the first entry.
     #[test]
     fn keeps_a_repeated_key() {
         let mut builder = DictBuilder::new();

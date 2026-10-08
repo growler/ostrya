@@ -1,43 +1,32 @@
-//! The GVariant text form, read back into a [`Type`] and a [`Value`].
+//! The reader of the GVariant text form.
 //!
-//! [`crate::to_text`] writes this form; [`from_text`] reads it. The rules and
-//! every refusal message below were recovered by running `ostree commit
-//! --add-metadata=KEY=VALUE` as a black box and reading the stored value back
-//! with `ostree show -B --print-metadata-key`
-//! (`docs/format-reference.md`, "The GVariant text form").
-//!
-//! A value states its own type where its literal can, and takes one from a
-//! declaration (`@ms 'x'`) or a keyword (`uint32 42`) where it cannot. A
-//! container with no declaration takes one common type over its elements, so
-//! `[2, 1.5]` is an array of doubles and `['a', @ms 'b']` an array of maybe
-//! strings. A literal that states nothing and has no context -- `[]`, `{}`,
-//! `nothing` -- is refused.
-//!
-//! A declaration drives the check downwards: `@as [1]` names the element `1`
-//! against `s`. A container with no declaration unifies its elements and names
-//! the two that disagree.
-//!
-//! A value may nest inside at most [`MAX_NESTING`] minus one containers. The
-//! parser refuses the level past that, which bounds the depth of the node tree
-//! and so bounds the recursion of type inference, of value construction, and of
-//! the tree's own drop.
+//! `MAX_NESTING` bounds the depth of the node tree. This limit also bounds the
+//! recursion of type inference, of value construction, and of the drop of the
+//! tree.
 
 use std::fmt;
 
 use crate::{Type, Value};
 
-/// The nesting level a value is refused at. A container, a `just`, a variant,
-/// a type declaration and a type keyword each add one level, and the value at
-/// this level is refused with `variant nested too deeply`.
+/// The nesting level at which the parser refuses a value.
+///
+/// A container, a `just`, a variant, a type declaration, and a type keyword
+/// each add one level. The parser refuses the value at this level with
+/// `variant nested too deeply`.
 const MAX_NESTING: usize = 128;
 
-/// A half-open byte range of the input text, as the refusal messages report it.
+/// A half-open byte range of the input text that a [`TextError`] names.
+///
+/// [`fmt::Display`] writes `start` for a zero-width span, and `start-end`
+/// for every other span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
-    /// The byte offset the range starts at.
+    /// The byte offset at which the range starts.
     pub start: usize,
-    /// The byte offset one past the range. It equals [`start`](Span::start)
-    /// for the zero-width position an `expected ...` refusal reports.
+    /// The byte offset one past the end of the range.
+    ///
+    /// It equals [`start`](Span::start) for the zero-width position that an
+    /// `expected ...` refusal reports.
     pub end: usize,
 }
 
@@ -46,8 +35,9 @@ impl Span {
         Span { start, end }
     }
 
-    /// The zero-width position ahead of a token, which is what an
-    /// `expected ...` refusal reports.
+    /// The zero-width position ahead of a token.
+    ///
+    /// An `expected ...` refusal reports this position.
     fn point(at: usize) -> Span {
         Span { start: at, end: at }
     }
@@ -63,15 +53,18 @@ impl fmt::Display for Span {
     }
 }
 
-/// Why a GVariant text form was refused: the spans of the input it names, and
-/// the reason. [`fmt::Display`] renders the pair the way the tool reports it,
-/// `<spans>:<reason>`, with the spans separated by commas.
+/// The error for a GVariant text form that [`from_text`] refuses.
+///
+/// It holds the spans of the input that the refusal names, and the reason.
+/// [`fmt::Display`] writes the pair as `<spans>:<reason>`, the form that the
+/// `ostree` command reports. A comma separates two spans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextError {
-    /// The ranges of the input the refusal names, in the order the message
-    /// reports them. It holds one span for most refusals, and two where the
-    /// reason names a pair that disagrees, such as the two elements a
-    /// container cannot unify.
+    /// The ranges of the input that the refusal names.
+    ///
+    /// The ranges are in the order of the message. Most refusals hold one
+    /// span. If the reason names a pair that disagrees, the field holds two
+    /// spans, for example the two elements that a container cannot unify.
     pub spans: Vec<Span>,
     /// The refusal text, without the spans and without the separating colon.
     pub reason: String,
@@ -102,15 +95,64 @@ impl std::error::Error for TextError {}
 
 type TextResult<T> = std::result::Result<T, TextError>;
 
-/// The reason a literal that states nothing is refused. The span it carries is
-/// widened to the whole value being typed, which is where the tool reports it.
+/// The reason for the refusal of a literal that states no type.
+///
+/// [`value_type`] widens the span of this error to the whole value. The
+/// `ostree` command reports the refusal at that span.
 const CANNOT_INFER: &str = "unable to infer type";
 
-/// Read one GVariant text form, returning the type it states and the value.
+/// Reads one GVariant text form and returns the type it states and the value.
 ///
-/// The first value is parsed, typed and built before the text is checked for
-/// trailing input, so `nothing 5` reports the type it could not infer and
-/// `@i 'x' 5` the member that does not fit, rather than the trailing token.
+/// [`to_text`](crate::to_text) writes this form. The reader parses, types, and builds the
+/// first value. Then it checks the text for trailing input.
+///
+/// The rules and every refusal message come from the `ostree` command, run as
+/// a black box. `ostree commit --add-metadata=KEY=VALUE` stored each value,
+/// and `ostree show -B --print-metadata-key` read it back.
+///
+/// # Type inference
+///
+/// - A value takes its type from its literal. An integer literal with no
+///   other context is `i`, and a literal with a fraction is `d`.
+/// - If the literal cannot state the type, a declaration (`@ms 'x'`) or a
+///   keyword (`uint32 42`) states it.
+/// - A container with no declaration unifies the types of its elements.
+///   `[2, 1.5]` is `ad`, and `['a', @ms 'b']` is `ams`.
+/// - A declaration drives the check down into the members. The error for
+///   `@as [1]` names the element `1` and the type `s`.
+/// - The reader refuses a literal that states no type and has no context,
+///   for example `[]`, `{}`, or `nothing`. The reason is
+///   `unable to infer type`.
+///
+/// # Depth limit
+///
+/// A container, a `just`, a variant, a type declaration, and a type keyword
+/// each add one level. A value can nest inside at most 127 levels. If the
+/// text reaches level 128, the reader refuses it with
+/// `variant nested too deeply`.
+///
+/// A declared type counts its own levels, with the leaf as one level, from
+/// the level of the declaration. The empty tuple `()` holds no leaf, so it
+/// counts as zero levels. If the sum is more than 128, the reader
+/// refuses the declaration with `type declaration recurses too deeply`.
+///
+/// # Errors
+///
+/// If the reader refuses the text, it returns a [`TextError`]. The error for
+/// a fault in the first value has priority over the error for trailing input.
+/// For example, `nothing 5` reports the type that the reader cannot infer.
+/// `@i 'x' 5` reports the member that does not fit.
+///
+/// # Examples
+///
+/// ```
+/// use ostrya_gvariant::{from_text, to_text};
+///
+/// let (ty, value) = from_text("{'version': <'1'>}")?;
+/// assert_eq!(ty.signature(), "a{sv}");
+/// assert_eq!(to_text(&ty, &value)?, "{'version': <'1'>}");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn from_text(text: &str) -> TextResult<(Type, Value)> {
     let mut parser = Parser::new(text);
     let node = parser.value()?;
@@ -128,8 +170,10 @@ enum Tok {
     Close(char),
     Comma,
     Colon,
-    /// `@` and the characters that follow it, which are validated as a type
-    /// once the token is scanned.
+    /// `@` and the characters that follow it.
+    ///
+    /// The parser checks these characters as a type after the lexer scans the
+    /// token.
     TypeDecl(String),
     Word(String),
     Number(String),
@@ -220,8 +264,9 @@ impl<'a> Lexer<'a> {
                     }
                     Tok::Word(self.slice(start, self.pos))
                 }
-                // Every other character is a one-character token, which no keyword
-                // is, so the parser reports it as a place a value was expected.
+                // Every other character is a one-character token. No keyword has
+                // one character, so the parser reports the token as a place where
+                // it expected a value.
                 _ => {
                     self.pos += 1;
                     Tok::Word(self.slice(start, self.pos))
@@ -233,10 +278,13 @@ impl<'a> Lexer<'a> {
         })
     }
 
-    /// Scan the body of a `@` declaration. It runs to the first character that
-    /// could close something around it -- whitespace, `,`, `:`, `>`, `]`, and
-    /// an unmatched `)` or `}` -- so `@i5` and `@**` are scanned whole and
-    /// reported as one bad declaration, while `@i)` ends at the bracket.
+    /// Scans the body of a `@` declaration.
+    ///
+    /// The scan stops at the first character that can close something around
+    /// the declaration. These characters are white space, `,`, `:`, `>`, `]`,
+    /// and an unmatched `)` or `}`. The scan reads all of `@i5` and `@**`,
+    /// and the parser reports each as one bad declaration. The scan of `@i)`
+    /// stops at the bracket.
     fn declaration(&mut self) {
         let mut depth = 0usize;
         while let Some(&c) = self.text.get(self.pos) {
@@ -251,8 +299,9 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Scan a quoted literal from `start`, whose opening quote is `quote`. A
-    /// bytestring keeps its bytes; a string is decoded as UTF-8.
+    /// Scans a quoted literal from `start`, with `quote` as its opening quote.
+    ///
+    /// A bytestring keeps its bytes. The scan decodes a string as UTF-8.
     fn string(&mut self, start: usize, quote: u8, bytestring: bool) -> TextResult<Token> {
         self.pos += 1; // the opening quote
         let mut raw = Vec::new();
@@ -269,9 +318,10 @@ impl<'a> Lexer<'a> {
                 break;
             }
             if c != b'\\' {
-                // A string value carries no NUL, so a raw one in the text is
-                // refused where it stands. A bytestring keeps it and ends
-                // there, the way an octal escape naming it does.
+                // A string value carries no NUL, so the scan refuses a raw NUL
+                // in a string at its position. A bytestring keeps the NUL, and
+                // its value ends there. An octal escape that names NUL has the
+                // same result.
                 if c == 0 && !bytestring {
                     return Err(TextError::new(
                         Span::new(self.pos - 1, self.pos),
@@ -298,7 +348,8 @@ impl<'a> Lexer<'a> {
                 b't' => raw.push(b'\t'),
                 b'v' => raw.push(0x0b),
                 b'0'..=b'7' if bytestring => {
-                    // Up to three octal digits, the escape a bytestring prints.
+                    // A bytestring reads a maximum of three octal digits. The
+                    // printer writes this escape for a bytestring.
                     let mut value = u32::from(escaped - b'0');
                     for _ in 0..2 {
                         match self.text.get(self.pos) {
@@ -313,9 +364,9 @@ impl<'a> Lexer<'a> {
                 }
                 b'u' if !bytestring => self.unicode_escape(4, &mut raw)?,
                 b'U' if !bytestring => self.unicode_escape(8, &mut raw)?,
-                // A backslash before a line feed is a line continuation: both
-                // characters leave the value. A string and a bytestring share
-                // the rule.
+                // A backslash before a line feed is a line continuation. Both
+                // characters leave the value. A string and a bytestring use the
+                // same rule.
                 b'\n' => {}
                 // Every other escape drops the backslash and keeps the byte.
                 other => raw.push(other),
@@ -324,8 +375,8 @@ impl<'a> Lexer<'a> {
         let span = Span::new(start, self.pos);
         if bytestring {
             // A bytestring literal names a NUL-terminated byte array, so the
-            // value ends at the first NUL its escapes produce and carries one
-            // terminator of its own.
+            // value ends at the first NUL that its escapes produce. Then the
+            // value gets one terminator of its own.
             if let Some(nul) = raw.iter().position(|&b| b == 0) {
                 raw.truncate(nul);
             }
@@ -344,9 +395,11 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Read a `\u` or `\U` escape of `digits` hexadecimal digits and append the
-    /// character it names, UTF-8 encoded. The refusal names the digits that are
-    /// there, which is a zero-width position where there are none.
+    /// Reads a `\u` or `\U` escape of `digits` hexadecimal digits.
+    ///
+    /// It appends the named character to `raw` in UTF-8. A refusal names the
+    /// digits that are present. If no digits are present, the refusal names a
+    /// zero-width position.
     fn unicode_escape(&mut self, digits: usize, raw: &mut Vec<u8>) -> TextResult<()> {
         let start = self.pos;
         let mut count = 0;
@@ -369,11 +422,10 @@ impl<'a> Lexer<'a> {
         }
         let text = std::str::from_utf8(&self.text[start..start + digits]).map_err(|_| bad())?;
         let code = u32::from_str_radix(text, 16).map_err(|_| bad())?;
-        // U+0000 is refused here, in the words and at the offset the tool uses,
-        // because a string value carries no NUL. A surrogate and a code point
-        // past U+10FFFF are refused here as well; the tool builds a string that
-        // is not UTF-8 and aborts (`docs/format-reference.md`, "Reading the
-        // text form back").
+        // A string value carries no NUL, so this check refuses U+0000. It uses
+        // the words and the offset of the `ostree` command. This check also
+        // refuses a surrogate and a code point past U+10FFFF. For these, the
+        // `ostree` command builds a string that is not UTF-8 and aborts.
         let ch = char::from_u32(code)
             .filter(|&c| c != '\0')
             .ok_or_else(bad)?;
@@ -399,8 +451,10 @@ struct Node {
 #[derive(Debug, Clone)]
 enum Ast {
     Bool(bool),
-    /// A numeric literal, kept as its text. What it means depends on the type
-    /// it lands in, so `@d 017` is 17.0 where `017` alone is 15.
+    /// A numeric literal, kept as its text.
+    ///
+    /// Its value depends on the type that it gets. For example, `@d 017` is
+    /// 17.0, and `017` alone is 15.
     Number(String),
     Str(String),
     ByteString(Vec<u8>),
@@ -417,15 +471,18 @@ enum Ast {
     Variant(Box<Node>),
 }
 
-/// Whether a token can be a keyword at all: two or more characters, the first
-/// two of them letters. A shorter token, and one whose second character is a
-/// digit, is a place a value was expected rather than an unknown keyword.
+/// Returns `true` if a token has the shape of a keyword.
+///
+/// A keyword has two or more characters, and its first two characters are
+/// letters. If a token has this shape and is not a known keyword, the parser
+/// reports `unknown keyword`. The parser reports a shorter token, or a token
+/// with a digit as its second character, with `expected value`.
 fn is_keyword_shaped(word: &str) -> bool {
     let bytes = word.as_bytes();
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1].is_ascii_alphabetic()
 }
 
-/// The type keywords a value may carry in place of a `@` declaration.
+/// The type keywords that a value can carry in place of a `@` declaration.
 fn keyword_type(word: &str) -> Option<Type> {
     Some(match word {
         "boolean" => Type::Bool,
@@ -447,13 +504,16 @@ fn keyword_type(word: &str) -> Option<Type> {
 
 struct Parser<'a> {
     lexer: Lexer<'a>,
-    /// The next token, or the fault the lexer met reading it, which surfaces
-    /// where that token is consumed.
+    /// The next token, or the error from the lexer for that token.
+    ///
+    /// When the parser consumes the token, the error surfaces.
     ahead: TextResult<Token>,
-    /// Where the token just consumed ended, which closes a container's span.
+    /// The end offset of the token that the parser consumed last.
+    ///
+    /// It closes the span of a container.
     last_end: usize,
-    /// How many levels of container, `just`, variant or declaration the value
-    /// being parsed sits inside.
+    /// The number of levels of container, `just`, variant, or declaration
+    /// around the value that the parser reads.
     depth: usize,
 }
 
@@ -473,8 +533,9 @@ impl<'a> Parser<'a> {
         self.ahead.as_ref().ok().map(|token| &token.tok)
     }
 
-    /// Where the next token starts, which is what an `expected ...` refusal
-    /// reports.
+    /// The offset at which the next token starts.
+    ///
+    /// An `expected ...` refusal reports this offset.
     fn ahead_start(&self) -> usize {
         self.ahead
             .as_ref()
@@ -499,7 +560,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Read one value that sits inside the value being read.
+    /// Reads one value nested inside the current value, one level deeper.
     fn nested(&mut self) -> TextResult<Node> {
         self.depth += 1;
         let node = self.value();
@@ -530,9 +591,10 @@ impl<'a> Parser<'a> {
                 span: token.span,
             }),
             Tok::TypeDecl(signature) => {
-                // A declaration is read in three steps: the signature must
-                // spell one complete type, that type must fit in the nesting
-                // left at this level, and only then must it be definite.
+                // The parser reads a declaration in three steps. First, the
+                // signature must spell one complete type. Next, that type must
+                // fit in the nesting that is left at this level. Last, the type
+                // must be definite.
                 let parsed = Type::parse(&signature).ok();
                 let levels = match &parsed {
                     Some(ty) => type_depth(ty),
@@ -543,9 +605,9 @@ impl<'a> Parser<'a> {
                         }
                     },
                 };
-                // The levels the declared type carries count from the level
-                // the declaration sits at, so the same type is refused nearer
-                // the top the deeper it is placed.
+                // The levels of the declared type count from the level of the
+                // declaration. The deeper the declaration is, the fewer
+                // levels its type can have.
                 if self.depth + levels > MAX_NESTING {
                     return Err(TextError::new(
                         token.span,
@@ -565,8 +627,9 @@ impl<'a> Parser<'a> {
                     span: Span::new(start, end),
                 })
             }
-            // A keyword is two or more characters and starts with two letters;
-            // anything else is a place a value was expected.
+            // A keyword has two or more characters and starts with two
+            // letters. The parser reports any other word as a place where it
+            // expected a value.
             Tok::Word(word) if is_keyword_shaped(&word) => self.word(&word, token.span),
             Tok::Open('[') => self.array(start),
             Tok::Open('{') => self.dict(start),
@@ -593,8 +656,8 @@ impl<'a> Parser<'a> {
                 ast: Ast::Bool(false),
                 span,
             }),
-            // The two numeric literals that are spelled as words. `infinity`
-            // reaches a value only behind a sign, as `-infinity`.
+            // The two numeric literals that are words. `infinity` is a value
+            // only after a sign, for example `-infinity`.
             "nan" | "inf" => Ok(Node {
                 ast: Ast::Number(word.to_owned()),
                 span,
@@ -667,8 +730,8 @@ impl<'a> Parser<'a> {
             });
         }
         let first_key = self.nested()?;
-        // `{key, value}` is one dict entry; `{key: value, ...}` is an array of
-        // them.
+        // `{key, value}` is one dict entry. `{key: value, ...}` is an array of
+        // dict entries.
         if matches!(self.peek(), Some(Tok::Comma)) {
             self.bump()?;
             let value = self.nested()?;
@@ -727,8 +790,8 @@ impl<'a> Parser<'a> {
                 span: Span::new(start, self.last_end),
             });
         }
-        // A one-member tuple is written `(x,)`; the comma after the first
-        // element is required and `(x)` is refused.
+        // The text form of a one-member tuple is `(x,)`. The comma after the
+        // first element is necessary, and the parser refuses `(x)`.
         items.push(self.nested()?);
         if !matches!(self.peek(), Some(Tok::Comma)) {
             return Err(TextError::new(
@@ -779,29 +842,36 @@ impl<'a> Parser<'a> {
 
 // --- type declarations -------------------------------------------------------
 
-/// What a `@` declaration the [`Type`] parser refused turns out to be.
+/// The class of a `@` declaration that the [`Type`] parser refused.
 enum Declaration {
-    /// One complete type that names `r`, `*` or `?`, and the levels it
-    /// carries as [`type_depth`] counts them.
+    /// One complete type that names `r`, `*`, or `?`.
+    ///
+    /// The field holds the levels of the type, as [`type_depth`] counts them.
     Indefinite(usize),
     /// Not one complete type.
     Invalid,
 }
 
-/// The nesting a declaration is scanned to, past which it is reported as
-/// invalid. It is the depth the [`Type`] parser accepts, so a declaration the
-/// scanner reads to the end is one the parser refused for another reason.
+/// The maximum nesting of a declaration scan.
+///
+/// If a declaration is deeper, the scan reports it as invalid. This value is
+/// the depth that the [`Type`] parser accepts. If the scanner reads a
+/// declaration to the end, the parser refused that declaration for a
+/// different reason.
 const MAX_DECLARATION_DEPTH: usize = crate::de::MAX_VALUE_DEPTH;
 
-/// How many levels a declared type carries, which is how many levels of
-/// nesting a value under it takes up. A leaf is one level and each container
-/// adds one over its deepest member, so `y` is one, `aay` is three and
-/// `(y(y))` is three. The empty tuple has no member and so is zero levels,
-/// which makes `a{s()}` two levels where `a{sy}` is three. A dict entry
-/// measures its value, whose key is a leaf of one level in every case.
+/// The number of levels that a declared type carries.
 ///
-/// [`Type::parse`] bounds the type at [`MAX_DECLARATION_DEPTH`] levels of
-/// container, so the recursion here is bounded by the same.
+/// A value under the type takes up the same number of levels of nesting. A
+/// leaf is one level. Each container adds one level over its deepest member.
+/// For example, `y` is one level, `aay` is three, and `(y(y))` is three.
+///
+/// The empty tuple has no member, so it is zero levels. `a{s()}` is two
+/// levels, and `a{sy}` is three. A dict entry measures its value, because its
+/// key is always a leaf of one level.
+///
+/// [`Type::parse`] limits the type to [`MAX_DECLARATION_DEPTH`] levels of
+/// container. That limit also bounds the recursion of this function.
 fn type_depth(ty: &Type) -> usize {
     match ty {
         Type::Maybe(elem) | Type::Array(elem) => 1 + type_depth(elem),
@@ -815,8 +885,9 @@ fn type_depth(ty: &Type) -> usize {
     }
 }
 
-/// Tell a declaration that names one indefinite type from one that is not a
-/// type at all. Only a declaration [`Type::parse`] refused reaches this.
+/// Sorts a refused declaration into an indefinite type or an invalid text.
+///
+/// Only a declaration that [`Type::parse`] refused gets to this function.
 fn classify_declaration(signature: &str) -> Declaration {
     let bytes = signature.as_bytes();
     let mut pos = 0;
@@ -827,10 +898,12 @@ fn classify_declaration(signature: &str) -> Declaration {
     }
 }
 
-/// Scan one type, the indefinite characters included, and give the levels it
-/// carries. `None` where no complete type is there. The levels are counted as
-/// [`type_depth`] counts them, so a declaration too deep to be a type is
-/// reported the same whether it is definite or not.
+/// Scans one type and gives the levels that it carries.
+///
+/// The scan accepts the indefinite characters. If no complete type is
+/// present, it returns `None`. It counts the levels as [`type_depth`] counts
+/// them. The parser then reports a declaration that is too deep in the same
+/// way, definite or indefinite.
 fn scan_declared_type(
     sig: &[u8],
     pos: &mut usize,
@@ -874,16 +947,17 @@ fn scan_declared_type(
 
 // --- numeric literals --------------------------------------------------------
 
-/// The type a numeric literal names when nothing beside it does.
+/// The type that a numeric literal names without context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NumberKind {
     Integer,
     Double,
 }
 
-/// Split a numeric literal's leading `-` from its body. The tool reads the sign
-/// itself and hands the rest to the integer reader, so a second sign inside the
-/// body is the body's own.
+/// Splits the leading `-` of a numeric literal from its body.
+///
+/// The `ostree` command reads the sign itself and gives the rest to the
+/// integer reader. A second sign inside the body belongs to the body.
 fn split_sign(text: &str) -> (bool, &str) {
     match text.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -891,17 +965,21 @@ fn split_sign(text: &str) -> (bool, &str) {
     }
 }
 
-/// Whether the body of a numeric literal spells an infinity or a not-a-number.
-/// The spelling is lower case; `-INF` is read as an integer and refused.
+/// Returns `true` if the body of a numeric literal spells an infinity or a NaN.
+///
+/// The spelling is lower case. The reader reads `-INF` as an integer and
+/// refuses it.
 fn is_special_double(body: &str) -> bool {
     matches!(body, "inf" | "infinity" | "nan")
         || matches!(body.strip_prefix('+'), Some("inf" | "infinity" | "nan"))
 }
 
-/// Which reader a literal goes to when no type states one: a body carrying a
-/// fraction, a decimal exponent or a special spelling is a double, and every
-/// other body is an integer. A hexadecimal body needs a `.`, so `0x1e5` is 485
-/// and `0x1p3` is refused where `0x1.8p1` is 3.0.
+/// Returns the reader that takes a literal with no stated type.
+///
+/// A body with a fraction, a decimal exponent, or a special spelling is a
+/// double. Every other body is an integer. A hexadecimal body must have a `.`
+/// to be a double. `0x1e5` is 485, `0x1.8p1` is 3.0, and the reader refuses
+/// `0x1p3`.
 fn number_kind(text: &str) -> NumberKind {
     let (_, body) = split_sign(text);
     if is_special_double(body) {
@@ -921,17 +999,21 @@ fn number_kind(text: &str) -> NumberKind {
     }
 }
 
-/// What the integer reader made of a literal body: the value, how far it read,
-/// and whether the magnitude passed 64 bits.
+/// The result of the integer reader for a literal body.
+///
+/// It holds the value, the end of the read, and a flag that is `true` if the
+/// magnitude passed 64 bits.
 struct IntegerScan {
     value: u64,
     end: usize,
     overflow: bool,
 }
 
-/// Read an unsigned integer the way the tool does: an optional sign, then a
-/// `0x` hexadecimal, a `0b` binary, a leading-`0` octal or a decimal run. A
-/// body with no digits is read as zero and reports that it read nothing.
+/// Reads an unsigned integer in the same way as the `ostree` command.
+///
+/// The body is an optional sign, then a run of digits. The run is `0x`
+/// hexadecimal, `0b` binary, leading-`0` octal, or decimal. If the body has
+/// no digits, the result is zero and reports that the reader read nothing.
 fn scan_integer(body: &str) -> IntegerScan {
     let bytes = body.as_bytes();
     let mut pos = 0;
@@ -989,7 +1071,7 @@ fn scan_integer(body: &str) -> IntegerScan {
     }
 }
 
-/// Read a numeric literal as an integer: its sign and its magnitude.
+/// Reads a numeric literal as an integer and gives its sign and magnitude.
 fn integer_literal(text: &str, span: Span) -> TextResult<(bool, u64)> {
     let (negative, body) = split_sign(text);
     let offset = text.len() - body.len();
@@ -1009,16 +1091,20 @@ fn integer_literal(text: &str, span: Span) -> TextResult<(bool, u64)> {
 
 /// A double read from a literal.
 struct DoubleScan {
-    /// The value the literal carries, rounded to the nearest double.
+    /// The value of the literal, rounded to the nearest double.
     value: f64,
-    /// How far the reader got. A body it cannot start reads nothing.
+    /// The end of the read.
+    ///
+    /// If the reader cannot start on a body, it reads nothing.
     end: usize,
-    /// Whether the double holds the literal exactly. A decimal body reports
-    /// `false`, since that reader states the value alone.
+    /// `true` if the double holds the literal exactly.
+    ///
+    /// A decimal body reports `false`, because the decimal reader gives only
+    /// the value.
     exact: bool,
 }
 
-/// Read a numeric literal as a double.
+/// Reads a numeric literal as a double.
 fn scan_double(text: &str) -> DoubleScan {
     let bytes = text.as_bytes();
     let mut pos = 0;
@@ -1110,7 +1196,7 @@ fn scan_double(text: &str) -> DoubleScan {
     }
 }
 
-/// The scan a body the double reader cannot start gives.
+/// The scan result for a body that the double reader cannot start on.
 fn nothing_read() -> DoubleScan {
     DoubleScan {
         value: 0.0,
@@ -1119,14 +1205,17 @@ fn nothing_read() -> DoubleScan {
     }
 }
 
-/// The largest mantissa the accumulator takes one more hexadecimal digit into.
-/// A digit past it lands in the sticky bit, which keeps the rounding correct
-/// with 124 bits of mantissa in hand.
+/// The largest mantissa into which the accumulator takes one more hex digit.
+///
+/// A digit past this cap goes into the sticky bit. With 124 bits of mantissa
+/// in the accumulator, the sticky bit keeps the rounding correct.
 const HEX_MANTISSA_CAP: u128 = (u128::MAX - 15) / 16;
 
-/// Read the body of a `0x` double: hexadecimal digits, an optional fraction,
-/// and an optional binary exponent. The mantissa the accumulator holds and the
-/// sticky bit together state the value, which `round_binary` rounds.
+/// Reads the body of a `0x` double.
+///
+/// The body is hexadecimal digits, an optional fraction, and an optional
+/// binary exponent. The mantissa in the accumulator and the sticky bit
+/// together state the value. `round_binary` rounds that value.
 fn scan_hex_double(bytes: &[u8], start: usize) -> Option<DoubleScan> {
     let mut end = start;
     let mut mantissa: u128 = 0;
@@ -1194,25 +1283,28 @@ fn scan_hex_double(bytes: &[u8], start: usize) -> Option<DoubleScan> {
     Some(DoubleScan { value, end, exact })
 }
 
-/// Round `mantissa * 2^shift` to the nearest double, ties to even. `sticky`
-/// states that a digit below the mantissa held a bit, which carries the value
-/// past a tie. The second member of the result states whether the double holds
-/// the value exactly. A magnitude over the double range gives an infinity.
+/// Rounds `mantissa * 2^shift` to the nearest double, ties to even.
+///
+/// `sticky` states that a digit past the end of the mantissa held a bit. That
+/// bit moves the value past a tie. The second member of the result is `true`
+/// if the double holds the value exactly. A magnitude over the double range gives an
+/// infinity.
 fn round_binary(mantissa: u128, sticky: bool, shift: i32) -> (f64, bool) {
     if mantissa == 0 {
         return (0.0, true);
     }
     let width = i64::from(128 - mantissa.leading_zeros());
-    // The weight of the top bit of the mantissa, and the weight of the lowest
-    // bit a double holds at that magnitude. A subnormal stops at 2^-1074.
+    // `top` is the weight of the top bit of the mantissa. `lowest` is the
+    // weight of the lowest bit that a double holds at that magnitude. A
+    // subnormal stops at 2^-1074.
     let top = i64::from(shift) + width - 1;
     let lowest = (top - 52).max(-1074);
     let drop = lowest - i64::from(shift);
     let (mut significand, inexact) = if drop <= 0 {
-        // The mantissa fits with bits to spare, so every bit of it is held.
+        // The mantissa fits with bits to spare, so the double holds every bit.
         (mantissa << (-drop) as u32, sticky)
     } else if drop > 128 {
-        // Every bit sits below half of the lowest bit a double holds.
+        // Every bit is less than half of the lowest bit that a double holds.
         (0u128, true)
     } else {
         let dropped = drop as u32;
@@ -1230,12 +1322,12 @@ fn round_binary(mantissa: u128, sticky: bool, shift: i32) -> (f64, bool) {
     }
     let mut lowest = lowest;
     if significand == 1u128 << 53 {
-        // The rounding carried into a new bit.
+        // The rounding carries into a new bit.
         significand >>= 1;
         lowest += 1;
     }
     let bits = if significand < 1u128 << 52 {
-        // A subnormal, whose encoding is the count of 2^-1074 in it.
+        // A subnormal. Its encoding is the count of 2^-1074 units in it.
         significand as u64
     } else {
         let biased = lowest + 1075;
@@ -1247,11 +1339,13 @@ fn round_binary(mantissa: u128, sticky: bool, shift: i32) -> (f64, bool) {
     (f64::from_bits(bits), !inexact)
 }
 
-/// Read a numeric literal as a double, refusing a magnitude the double range
-/// cannot hold. A hexadecimal literal that states a subnormal exactly is kept.
-/// Every other value that rounds to a subnormal is refused, and a value that
-/// underflows all the way to zero is kept. A body whose binary exponent leaves
-/// the range of the shift is clamped.
+/// Reads a numeric literal as a double.
+///
+/// The reader refuses a magnitude that the double range cannot hold. It keeps
+/// a hexadecimal literal that states a subnormal exactly. It refuses every
+/// other value that rounds to a subnormal. It keeps a value that underflows
+/// all the way to zero. If the binary exponent of a body leaves the range of
+/// the shift, the reader clamps the shift to its range.
 fn double_literal(text: &str, span: Span) -> TextResult<f64> {
     let scan = scan_double(text);
     if scan.end != text.len() {
@@ -1272,16 +1366,20 @@ fn double_literal(text: &str, span: Span) -> TextResult<f64> {
 
 // --- type inference ----------------------------------------------------------
 
-/// A type under construction. A literal that states nothing yet is `Any`, an
-/// integer literal is `Int` until a sibling or a declaration makes it concrete,
-/// and a literal carrying a fraction is `Decimal`.
+/// A type under construction.
+///
+/// A literal that states no type yet is `Any`. An integer literal is `Int`
+/// until a sibling or a declaration makes it concrete. A literal with a
+/// fraction is `Decimal`.
 #[derive(Debug, Clone)]
 enum Guess {
     Any(Span),
     Int,
     Decimal,
-    /// A quoted literal, which is a string until an object path or a signature
-    /// beside it says otherwise.
+    /// A quoted literal.
+    ///
+    /// It is a string until an object path or a signature beside it gives a
+    /// different type.
     StringLit,
     Basic(Type),
     Variant,
@@ -1292,7 +1390,7 @@ enum Guess {
 }
 
 impl Guess {
-    /// The guess a stated type pins down exactly.
+    /// The guess that a stated type sets exactly.
     fn of(ty: &Type) -> Guess {
         match ty {
             Type::Variant => Guess::Variant,
@@ -1307,7 +1405,9 @@ impl Guess {
     }
 }
 
-/// Whether a type holds a number, which is what an integer literal may become.
+/// Returns `true` if a type holds a number.
+///
+/// An integer literal can become only a type of this group.
 fn is_numeric(ty: &Type) -> bool {
     matches!(
         ty,
@@ -1323,8 +1423,10 @@ fn is_numeric(ty: &Type) -> bool {
     )
 }
 
-/// The one type two guesses agree on, or `None` where they agree on none. A
-/// maybe absorbs the value beside it, so `'a'` and `@ms 'b'` agree on `ms`.
+/// Returns the one type on which two guesses agree.
+///
+/// If the guesses agree on no type, it returns `None`. A maybe absorbs the
+/// value beside it, so `'a'` and `@ms 'b'` agree on `ms`.
 fn unify(left: &Guess, right: &Guess) -> Option<Guess> {
     match (left, right) {
         (Guess::Any(_), other) | (other, Guess::Any(_)) => Some(other.clone()),
@@ -1364,8 +1466,10 @@ fn unify(left: &Guess, right: &Guess) -> Option<Guess> {
     }
 }
 
-/// The type a guess names: an integer literal with no other context is `i` and
-/// a fractional one is `d`, and a literal that states nothing is refused.
+/// Returns the type that a guess names.
+///
+/// An integer literal with no other context is `i`, and a fractional literal
+/// is `d`. The function refuses a literal that states no type.
 fn resolve(guess: &Guess) -> TextResult<Type> {
     Ok(match guess {
         Guess::Any(span) => return Err(TextError::new(*span, CANNOT_INFER)),
@@ -1385,9 +1489,11 @@ fn resolve(guess: &Guess) -> TextResult<Type> {
     })
 }
 
-/// The type one whole value states. A literal inside it that states nothing is
-/// reported against the whole value, which is the span the tool names; a
-/// variant's child is a whole value of its own, so `[<[]>]` names the `[]`.
+/// Returns the type that one whole value states.
+///
+/// If a literal inside the value states no type, the error names the whole
+/// value. The `ostree` command names the same span. The child of a variant is a whole
+/// value of its own, so the error for `[<[]>]` names the `[]`.
 fn value_type(node: &Node) -> TextResult<Type> {
     let guess = infer(node)?;
     resolve(&guess).map_err(|error| {
@@ -1406,8 +1512,10 @@ fn cannot_parse(span: Span, ty: &Type) -> TextError {
     )
 }
 
-/// The refusal a container raises where two of its members state types that do
-/// not meet: the member that settled the type, the member that broke it.
+/// The refusal of a container whose members state types that do not unify.
+///
+/// It names two members: the member that settled the type, and the member
+/// that broke it.
 fn no_common_type(first: Span, other: Span) -> TextError {
     TextError {
         spans: vec![first, other],
@@ -1424,9 +1532,9 @@ fn infer(node: &Node) -> TextResult<Guess> {
         },
         Ast::Str(_) => Guess::StringLit,
         Ast::ByteString(_) => Guess::Array(Box::new(Guess::Basic(Type::Byte))),
-        // A declaration states the type outright. Whether the value beside it
-        // fits is settled member by member while the value is built, which is
-        // where the tool names the member that does not.
+        // A declaration states the type directly. Construction checks the
+        // value against it, member by member. If a member does not fit,
+        // construction names the same member as the `ostree` command.
         Ast::Typed(ty, _) => Guess::of(ty),
         Ast::Maybe(None) => Guess::Maybe(Box::new(Guess::Any(node.span))),
         Ast::Maybe(Some(child)) => Guess::Maybe(Box::new(infer(child)?)),
@@ -1450,10 +1558,10 @@ fn infer(node: &Node) -> TextResult<Guess> {
                 ))));
             };
             let mut key = infer(first_key)?;
-            // The first entry alone settles the value type; every later value is
-            // read against it while the value is built, so a later value states
-            // nothing here. A key that does not meet the settled key type is
-            // reported the way an array reports it.
+            // Only the first entry settles the value type. Construction reads
+            // every later value against that type, so a later value states
+            // nothing here. If a key does not unify with the settled key type,
+            // the error has the same form as for an array.
             let value = infer(first_value)?;
             for (k, _) in rest {
                 let found = infer(k)?;
@@ -1476,9 +1584,11 @@ fn infer(node: &Node) -> TextResult<Guess> {
     })
 }
 
-/// Whether a guess names a basic type, which is what a dict entry's key must
-/// be. A key that states nothing is not basic either, so `{nothing: 1}` is
-/// reported as the key shape rather than as a type it could not infer.
+/// Returns `true` if a guess names a basic type.
+///
+/// The key of a dict entry must have a basic type. A key that states no type
+/// is not basic, so the error for `{nothing: 1}` names the shape of the key,
+/// with `dictionary keys must have basic types`.
 fn guess_is_basic(guess: &Guess) -> bool {
     match guess {
         Guess::Int | Guess::Decimal | Guess::StringLit => true,
@@ -1487,8 +1597,10 @@ fn guess_is_basic(guess: &Guess) -> bool {
     }
 }
 
-/// Refuse a dictionary whose key is a container, the shape a dict entry cannot
-/// hold. The whole dictionary is named, which is where the tool reports it.
+/// Refuses a dictionary whose key is a container.
+///
+/// A dict entry cannot hold a container key. The error names the whole
+/// dictionary, which is the span that the `ostree` command reports.
 fn check_basic_key(key: &Guess, span: Span) -> TextResult<()> {
     if guess_is_basic(key) {
         return Ok(());
@@ -1501,8 +1613,10 @@ fn check_basic_key(key: &Guess, span: Span) -> TextResult<()> {
 
 // --- value construction ------------------------------------------------------
 
-/// Whether a string names a valid object path: `/`, or `/` and one or more
-/// elements of letters, digits and underscores separated by single slashes.
+/// Returns `true` if a string is a valid object path.
+///
+/// A valid path is `/`, or `/` and one or more elements with single slashes
+/// between them. An element holds letters, digits, and underscores.
 fn is_object_path(text: &str) -> bool {
     if text == "/" {
         return true;
@@ -1519,8 +1633,10 @@ fn is_object_path(text: &str) -> bool {
         })
 }
 
-/// Whether a string names a valid signature: zero or more complete types, the
-/// maybe and the indefinite characters excluded.
+/// Returns `true` if a string is a valid signature.
+///
+/// A valid signature is zero or more complete types. It excludes the maybe and
+/// the indefinite characters.
 fn is_signature(text: &str) -> bool {
     let bytes = text.as_bytes();
     let mut pos = 0;
@@ -1589,8 +1705,8 @@ fn scan_signature_type(sig: &[u8], pos: &mut usize, depth: usize) -> bool {
 }
 
 fn build(node: &Node, ty: &Type) -> TextResult<Value> {
-    // A value beside a maybe takes the maybe's shape, so `['a', @ms 'b']` holds
-    // two `ms` values.
+    // A value beside a maybe takes the shape of the maybe, so
+    // `['a', @ms 'b']` holds two `ms` values.
     if let Type::Maybe(elem) = ty
         && !matches!(node.ast, Ast::Maybe(_) | Ast::Typed(..))
     {
@@ -1671,9 +1787,11 @@ fn build(node: &Node, ty: &Type) -> TextResult<Value> {
     }
 }
 
-/// Turn a numeric literal into a value of `ty`. A double target reads the text
-/// as a double and an integer target reads it as an integer, so the same text
-/// can be 17.0 under `d` and 15 under `i`.
+/// Makes a value of `ty` from a numeric literal.
+///
+/// A double target reads the text as a double. An integer target reads the
+/// text as an integer. The same text `017` is 17.0 under `d` and 15 under
+/// `i`.
 fn number_value(text: &str, ty: &Type, span: Span) -> TextResult<Value> {
     if matches!(ty, Type::Double) {
         return Ok(Value::double(double_literal(text, span)?));
@@ -1710,8 +1828,10 @@ mod tests {
     use super::*;
     use crate::{to_bytes, to_text};
 
-    /// Parse `text` and render it back, which is the pairing the tool states:
-    /// the value goes in through `commit --add-metadata` and comes out through
+    /// Parses `text` and writes it back as text.
+    ///
+    /// The `ostree` command has the same pair of steps. The value goes in
+    /// through `commit --add-metadata` and comes out through
     /// `show -B --print-metadata-key`.
     fn round(text: &str) -> String {
         let (ty, value) = from_text(text).unwrap_or_else(|e| panic!("{text}: {e}"));
@@ -1727,7 +1847,7 @@ mod tests {
             .to_string()
     }
 
-    /// Parse `text` as a double and give the value it carries.
+    /// Parses `text` as a double and gives its value.
     fn double(text: &str) -> f64 {
         let (ty, value) = from_text(text).unwrap_or_else(|e| panic!("{text}: {e}"));
         assert_eq!(ty.signature(), "d", "type of {text}");
@@ -1737,8 +1857,9 @@ mod tests {
         }
     }
 
-    /// Each pair is one `--add-metadata` value and the text
-    /// `show -B --print-metadata-key` printed for it, `ostree` 2026.1.
+    /// Each pair is one `--add-metadata` value and the text that
+    /// `show -B --print-metadata-key` printed for it. The `ostree` command
+    /// is version 2026.1.
     #[test]
     fn reads_the_forms_the_tool_accepts() {
         let cases: &[(&str, &str)] = &[
@@ -1824,12 +1945,12 @@ mod tests {
             ("'a\\0b'", "'a0b'"),
             ("'a\\tb'", "'a\\tb'"),
             ("'\\u00e9'", "'é'"),
-            // A bytestring has no `\\u` escape, so the backslash drops and the
-            // digits stay.
+            // A bytestring has no `\\u` escape, so the reader drops the
+            // backslash and keeps the digits.
             ("b'\\u0000'", "b'u0000'"),
             ("b'a\\u0000b'", "b'au0000b'"),
-            // A bytestring ends at the raw NUL it carries, the way it ends at
-            // the NUL an octal escape names.
+            // A bytestring ends at a raw NUL, the same as at a NUL that an
+            // octal escape names.
             ("b'a\0b'", "b'a'"),
         ];
         for (input, expected) in cases {
@@ -1837,12 +1958,14 @@ mod tests {
         }
     }
 
-    /// The literals whose text alone does not say which reader takes them, and
-    /// the value each carries. `ostree` 2026.1 stores exactly these.
+    /// Literals whose text alone does not tell which reader takes them.
+    ///
+    /// Each literal has its value beside it. `ostree` 2026.1 stores exactly
+    /// these values.
     #[test]
     fn reads_the_numeric_literals_the_tool_accepts() {
         let cases: &[(&str, &str)] = &[
-            // A binary literal, both spellings of its prefix.
+            // A binary literal, with both spellings of its prefix.
             ("0b101", "5"),
             ("0B101", "5"),
             ("0b0", "0"),
@@ -1864,7 +1987,8 @@ mod tests {
             ("@d 08", "8.0"),
             ("@d 1E3", "1000.0"),
             ("double 1E3", "1000.0"),
-            // The sign the tool reads itself, and the body it hands on.
+            // The sign that the `ostree` command reads itself, and the body
+            // that it gives to the integer reader.
             ("-", "0"),
             ("@i -", "0"),
             ("@y -", "byte 0x00"),
@@ -1884,12 +2008,14 @@ mod tests {
             ("just nan", "@md nan"),
             ("[1, nan]", "[1.0, nan]"),
             ("[nan, 1]", "[nan, 1.0]"),
-            // An underflow all the way to zero is kept; a subnormal is not.
+            // The reader keeps an underflow all the way to zero. It refuses a
+            // subnormal.
             ("1e-400", "0.0"),
             ("-1e-400", "-0.0"),
             ("0.0e-400", "0.0"),
             ("2.2250738585072014e-308", "2.2250738585072014e-308"),
-            // The mantissa forms a decimal literal may leave out.
+            // A decimal literal can omit the integer part or the fraction part
+            // of the mantissa.
             ("1.", "1.0"),
             (".5", "0.5"),
             ("5.", "5.0"),
@@ -1901,9 +2027,9 @@ mod tests {
         }
     }
 
-    /// A binary exponent whose magnitude leaves the range of the shift is
-    /// clamped, so the reader stays inside the shift range. `ostree` 2026.1
-    /// stores 0.0 for each of these bodies.
+    /// The reader clamps a binary exponent that leaves the range of the shift.
+    ///
+    /// `ostree` 2026.1 stores 0.0 for each of these bodies.
     #[test]
     fn a_binary_exponent_out_of_range_is_clamped() {
         assert_eq!(round("0x0.0p-2147483645"), "0.0");
@@ -1912,9 +2038,10 @@ mod tests {
         assert_eq!(round("0x0.0p2147483647"), "0.0");
     }
 
-    /// A hexadecimal body states a value in binary, and the reader rounds it to
-    /// the nearest double, ties to even. `ostree` 2026.1 stores each value
-    /// beside its literal.
+    /// The reader rounds a hexadecimal body to the nearest double, ties to even.
+    ///
+    /// A hexadecimal body states a value in binary. `ostree` 2026.1 stores the
+    /// value beside each literal.
     #[test]
     fn reads_the_hexadecimal_doubles_the_tool_stores() {
         let cases: &[(&str, f64)] = &[
@@ -1922,8 +2049,9 @@ mod tests {
             ("@d 0x1p1023", 8.98846567431158e307),
             ("@d 0x1.fffffffffffff7ffffffffp1023", f64::MAX),
             ("@d 0x1.00000000000008p0", 1.0),
-            // A mantissa past the digits the accumulator holds keeps the
-            // digits it has, and the digits below them round the result.
+            // If a mantissa has more digits than the accumulator holds, the
+            // accumulator keeps its digits. The digits after them round the
+            // result.
             (
                 "@d 0xffffffffffffffffffffffffffffffffffffffffp0",
                 1.461501637330903e48,
@@ -1935,7 +2063,7 @@ mod tests {
                 "@d 0x123456789abcdef123456789abcdef123456789abcdefp-100",
                 8.596805828370696e22,
             ),
-            // A subnormal the literal states exactly.
+            // A subnormal that the literal states exactly.
             ("@d 0x1p-1023", f64::from_bits(0x0008_0000_0000_0000)),
             ("@d 0x1p-1074", f64::from_bits(1)),
             ("@d 0x2p-1074", f64::from_bits(2)),
@@ -1946,8 +2074,8 @@ mod tests {
             // A value under the smallest normal that rounds up to it.
             ("@d 0x1.fffffffffffffffp-1023", f64::MIN_POSITIVE),
             ("@d 0x1.fffffffffffff8p-1023", f64::MIN_POSITIVE),
-            // An underflow all the way to zero is kept, the tie to even with
-            // it, and a zero mantissa is zero under any exponent.
+            // The reader keeps an underflow all the way to zero, and a tie to
+            // even that gives zero. A zero mantissa is zero under any exponent.
             ("@d 0x1p-1075", 0.0),
             ("@d 0x0.8p-1074", 0.0),
             ("@d 0x8000000000000000000000000000000000000000p-1234", 0.0),
@@ -1966,14 +2094,17 @@ mod tests {
         }
     }
 
-    /// A hexadecimal body that rounds to a subnormal it does not state exactly
-    /// is refused, and so is one over the double range. Each text is the one
-    /// `ostree` 2026.1 reports, with the offsets relative to the value.
+    /// The reader refuses a hex body that rounds to an inexact subnormal.
+    ///
+    /// An inexact subnormal is a subnormal that the body does not state
+    /// exactly. The reader also refuses a body over the double range. Each
+    /// text is the text that `ostree` 2026.1 reports. The offsets are relative
+    /// to the value.
     #[test]
     fn refuses_the_hexadecimal_doubles_the_tool_refuses() {
         let cases: &[(&str, &str)] = &[
-            // A subnormal the rounding reaches, which the literal does not
-            // state exactly.
+            // The rounding gives a subnormal that the literal does not state
+            // exactly.
             ("@d 0x1.8p-1074", "3-14:number too big for any type"),
             ("@d 0x1.8p-1075", "3-14:number too big for any type"),
             (
@@ -2011,9 +2142,11 @@ mod tests {
         }
     }
 
-    /// Each pair is one refused `--add-metadata` value and the text after
-    /// `Parsing <KEY=VALUE>: ` the tool reported, `ostree` 2026.1. The offsets
-    /// are relative to the value.
+    /// Each pair is one refused `--add-metadata` value and the report of the
+    /// `ostree` command.
+    ///
+    /// The report is the text after `Parsing <KEY=VALUE>: `. The version of
+    /// the `ostree` command is 2026.1. The offsets are relative to the value.
     #[test]
     fn refuses_what_the_tool_refuses_in_its_own_words() {
         let cases: &[(&str, &str)] = &[
@@ -2086,13 +2219,15 @@ mod tests {
             ("(1 2)", "3:expected ',' after first tuple element"),
             ("(1,2,)", "5:expected value"),
             ("(1,2 3)", "5:expected ',' or ')' to follow tuple element"),
-            // The exponent marker is lower case; `E` leaves an integer body.
+            // The exponent marker is lower case. With `E`, the body is an
+            // integer.
             ("1E3", "1-2:invalid character in number"),
             ("1E+3", "1-2:invalid character in number"),
             ("1E", "1-2:invalid character in number"),
             ("1d", "1-2:invalid character in number"),
             ("0x1p3", "3-4:invalid character in number"),
-            // A subnormal is out of the range the tool accepts.
+            // A subnormal is out of the range that the `ostree` command
+            // accepts.
             ("5e-324", "0-6:number too big for any type"),
             ("1e-310", "0-6:number too big for any type"),
             ("1e-308", "0-6:number too big for any type"),
@@ -2100,7 +2235,7 @@ mod tests {
             ("-1e400", "0-6:number too big for any type"),
             ("1.7976931348623157e309", "0-22:number too big for any type"),
             ("@d 5e-324", "3-9:number too big for any type"),
-            // The character the number reader stopped at.
+            // The character at which the number reader stopped.
             ("1.5.5", "3-4:invalid character in number"),
             ("1..5", "2-3:invalid character in number"),
             ("1e", "1-2:invalid character in number"),
@@ -2129,7 +2264,8 @@ mod tests {
             ("int32 1e3", "7-8:invalid character in number"),
             ("@d 0b101", "4-5:invalid character in number"),
             ("@d -", "3-4:invalid character in number"),
-            // A magnitude no 64-bit type holds against one no target holds.
+            // A magnitude that no 64-bit type holds, compared with a magnitude
+            // that no target holds.
             (
                 "int64 -9223372036854775809",
                 "6-26:number out of range for type 'x'",
@@ -2139,7 +2275,7 @@ mod tests {
                 "0-21:number out of range for type 'i'",
             ),
             ("18446744073709551616", "0-20:integer too big for any type"),
-            // An object path and a signature are checked.
+            // The reader checks an object path and a signature.
             ("objectpath 'notapath'", "11-21:not a valid object path"),
             ("objectpath ''", "11-13:not a valid object path"),
             ("objectpath '/a/'", "11-16:not a valid object path"),
@@ -2152,8 +2288,9 @@ mod tests {
             ("signature 'r'", "10-13:not a valid signature"),
             ("signature '{vs}'", "10-16:not a valid signature"),
             ("@g 'zz'", "3-7:not a valid signature"),
-            // A declaration is scanned to the first character that could close
-            // something around it, and an indefinite one is named as such.
+            // The scan of a declaration stops at the first character that can
+            // close something around it. The error for an indefinite
+            // declaration names it as indefinite.
             ("@z 5", "0-2:invalid type declaration"),
             ("@r 5", "0-2:type declarations must be definite"),
             ("@* 5", "0-2:type declarations must be definite"),
@@ -2183,8 +2320,8 @@ mod tests {
             ("@ai 5", "4-5:can not parse as value of type 'ai'"),
             ("@i []", "3-5:can not parse as value of type 'i'"),
             ("@as [nothing]", "5-12:can not parse as value of type 's'"),
-            // The type a value states nothing about is named against the whole
-            // value, and a variant's child is a whole value of its own.
+            // If a value states no type, the error names the whole value. The
+            // child of a variant is a whole value of its own.
             ("[[]]", "0-4:unable to infer type"),
             ("just []", "0-7:unable to infer type"),
             ("just nothing", "0-12:unable to infer type"),
@@ -2199,11 +2336,12 @@ mod tests {
             ("nothing nothing", "0-7:unable to infer type"),
             ("[<[]>]", "2-4:unable to infer type"),
             ("<just nothing>", "1-13:unable to infer type"),
-            // A key that is not basic is named by its shape.
+            // The error for a key that is not basic names its shape.
             ("{nothing: 1}", "0-12:dictionary keys must have basic types"),
             ("{{}: 'a'}", "0-9:dictionary keys must have basic types"),
             ("{<1>: 'a'}", "0-10:dictionary keys must have basic types"),
-            // Keys that do not meet are reported the way an array reports them.
+            // The error for keys that do not unify has the same form as for an
+            // array.
             ("{'a': 1, 2: 'b'}", "1-4,9-10:unable to find a common type"),
             ("{1: 'a', 'b': 2}", "1-2,9-12:unable to find a common type"),
             (
@@ -2214,7 +2352,7 @@ mod tests {
                 "{'a': 1, 'b': 2, 'c': 'x'}",
                 "22-25:can not parse as value of type 'i'",
             ),
-            // The closing brackets each carry their own wording.
+            // Each closing bracket has its own wording.
             ("<1 2>", "3:expected '>' to follow variant value"),
             ("{'a', 5, 6}", "7:expected '}' at end of dictionary entry"),
             (
@@ -2222,15 +2360,16 @@ mod tests {
                 "8:expected ',' or '}' to follow dictionary entry",
             ),
             ("[1 2]", "3:expected ',' or ']' to follow array element"),
-            // A unicode escape names the digits that are there.
+            // The error for a unicode escape names the digits that are present.
             ("'\\uZZZZ'", "3:invalid 4-character unicode escape"),
             ("'\\u'", "3:invalid 4-character unicode escape"),
             ("'\\u12'", "3-5:invalid 4-character unicode escape"),
             ("'\\u00'", "3-5:invalid 4-character unicode escape"),
             ("'\\U110000'", "3-9:invalid 8-character unicode escape"),
             ("'\\U0001'", "3-7:invalid 8-character unicode escape"),
-            // An escape naming U+0000 is refused with the escape it names, at
-            // the offset of the digits, wherever the literal stands.
+            // The reader refuses an escape that names U+0000, at any position
+            // in the literal. The error names the escape at the offset of its
+            // digits.
             ("'\\u0000'", "3-7:invalid 4-character unicode escape"),
             ("'\\U00000000'", "3-11:invalid 8-character unicode escape"),
             ("'a\\u0000b'", "4-8:invalid 4-character unicode escape"),
@@ -2263,10 +2402,9 @@ mod tests {
             ("'\\ud800'", "3-7:invalid 4-character unicode escape"),
             ("'\\U0000d800'", "3-11:invalid 8-character unicode escape"),
             ("'\\U00110000'", "3-11:invalid 8-character unicode escape"),
-            // A raw NUL byte in a string literal is refused where it stands.
-            // The tool takes its value through `argv`, which carries no NUL, so
-            // this refusal belongs to the port alone
-            // (`docs/format-reference.md`, "Reading the text form back").
+            // The reader refuses a raw NUL byte in a string literal at its
+            // position. The `ostree` command takes its value through `argv`,
+            // which carries no NUL, so only ostrya has this refusal.
             ("'a\0b'", "2-3:NUL byte in string constant"),
             ("'\0'", "1-2:NUL byte in string constant"),
             ("@o '/a\0b'", "6-7:NUL byte in string constant"),
@@ -2277,14 +2415,16 @@ mod tests {
         }
     }
 
-    /// The first entry of an undeclared dictionary settles the value type, and
-    /// every later value is read against it. Each pair is one `--add-metadata`
-    /// value and the text `show -B --print-metadata-key` printed for it,
-    /// `ostree` 2026.1.
+    /// The first entry of an undeclared dictionary settles the value type.
+    ///
+    /// The reader reads every later value against that type. Each pair is one
+    /// `--add-metadata` value and the text that `show -B --print-metadata-key`
+    /// printed for it. The version of the `ostree` command is 2026.1.
     #[test]
     fn a_dictionary_reads_its_values_against_the_first_entry() {
         let cases: &[(&str, &str)] = &[
-            // The order of the entries picks the type; the later value follows.
+            // The order of the entries selects the type. The later value takes
+            // that type.
             ("{'a': 1, 'b': uint32 2}", "{'a': 1, 'b': 2}"),
             ("{'a': uint32 2, 'b': 1}", "{'a': uint32 2, 'b': 1}"),
             ("{'a': 1.5, 'b': 1}", "{'a': 1.5, 'b': 1.0}"),
@@ -2298,7 +2438,7 @@ mod tests {
                 "{'a': @ms nothing, 'b': 'x'}",
             ),
             ("{'a': just 1, 'b': nothing}", "{'a': @mi 1, 'b': nothing}"),
-            // A settled container takes an empty one beside it.
+            // A settled container type takes an empty container beside it.
             ("{'a': [1], 'b': []}", "{'a': [1], 'b': []}"),
             ("{'a': {'d': 2}, 'c': {}}", "{'a': {'d': 2}, 'c': {}}"),
             ("{'a': <1>, 'b': <'x'>}", "{'a': <1>, 'b': <'x'>}"),
@@ -2311,7 +2451,8 @@ mod tests {
                 "{'a': uint32 1, 'b': 2, 'c': 3}",
                 "{'a': uint32 1, 'b': 2, 'c': 3}",
             ),
-            // The keys meet one common type the way an array's elements do.
+            // The keys unify to one common type, the same as the elements of
+            // an array.
             ("{1: 'a', 2.5: 'b'}", "{1.0: 'a', 2.5: 'b'}"),
             ("{2.5: 'a', 1: 'b'}", "{2.5: 'a', 1.0: 'b'}"),
         ];
@@ -2320,10 +2461,12 @@ mod tests {
         }
     }
 
-    /// A type already in force takes the value beside a declaration and drops
-    /// the declaration, so `@o` under `s` stores a string and its object-path
-    /// check never runs. Each pair is one `--add-metadata` value and the text
-    /// `show -B --print-metadata-key` printed for it, `ostree` 2026.1.
+    /// A type that is already in force drops a declaration beside a value.
+    ///
+    /// The type takes the value, so `@o` under `s` stores a string, and the
+    /// object-path check does not run. Each pair is one `--add-metadata` value
+    /// and the text that `show -B --print-metadata-key` printed for it. The
+    /// version of the `ostree` command is 2026.1.
     #[test]
     fn a_declaration_under_a_driven_type_gives_up_its_type() {
         let cases: &[(&str, &str)] = &[
@@ -2348,7 +2491,7 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(round(input), *expected, "reading {input}");
         }
-        // The value beside the declaration still has to fit the driven type.
+        // The value beside the declaration must still fit the driven type.
         let refusals: &[(&str, &str)] = &[
             ("@as [@i 5]", "8-9:can not parse as value of type 's'"),
             ("@ai [@d 1.5]", "9-10:invalid character in number"),
@@ -2379,11 +2522,13 @@ mod tests {
         }
     }
 
-    /// A later dictionary value that does not fit the settled type is named
-    /// against that type, and a first value that states no type at all is named
-    /// against the whole value. Each pair is one refused `--add-metadata` value
-    /// and the text after `Parsing <KEY=VALUE>: ` the tool reported, `ostree`
-    /// 2026.1.
+    /// The error for a later dictionary value that does not fit names the
+    /// settled type.
+    ///
+    /// If the first value states no type, the error names the whole value.
+    /// Each pair is one refused `--add-metadata` value and the report of the
+    /// `ostree` command. The report is the text after `Parsing <KEY=VALUE>: `.
+    /// The version of the `ostree` command is 2026.1.
     #[test]
     fn refuses_a_dictionary_value_against_the_settled_type() {
         let cases: &[(&str, &str)] = &[
@@ -2449,8 +2594,9 @@ mod tests {
                 "{'a': 1, 'b': 99999999999999999999}",
                 "14-34:integer too big for any type",
             ),
-            // A later value states nothing of its own, so a shape that would
-            // settle a type of its own is named against the settled type.
+            // Type inference skips a later value, so the error names a later
+            // shape against the settled type, also a shape that states its
+            // own type.
             (
                 "{'a': 1, 'b': ['x', 5]}",
                 "14-22:can not parse as value of type 'i'",
@@ -2489,8 +2635,8 @@ mod tests {
             ),
             // A variant inside a later value is still a whole value of its own.
             ("{'a': <1>, 'b': <[]>}", "17-19:unable to infer type"),
-            // A first value that states no type is named against the whole
-            // value, and no later entry fills it in.
+            // If the first value states no type, the error names the whole
+            // value. No later entry supplies the type.
             ("{'a': nothing, 'b': 'y'}", "0-24:unable to infer type"),
             (
                 "{'a': nothing, 'b': 2, 'c': 3}",
@@ -2506,8 +2652,8 @@ mod tests {
             ("({'a': [], 'b': 5},)", "0-20:unable to infer type"),
             ("just {'a': [], 'b': 5}", "0-22:unable to infer type"),
             ("<{'a': [], 'b': 5}>", "1-18:unable to infer type"),
-            // A key that does not meet the settled key type stands ahead of the
-            // value type, which is never resolved.
+            // The error for a key that does not unify with the settled key
+            // type comes first. The value type is never resolved.
             (
                 "{[1]: [], 'b': 5}",
                 "1-4,10-13:unable to find a common type",
@@ -2525,8 +2671,10 @@ mod tests {
         }
     }
 
-    /// A bytestring literal ends at the first NUL its escapes produce, so
-    /// `b'\0'` and `b'\400'` are the one-byte array the tool stores.
+    /// A bytestring literal ends at the first NUL that its escapes produce.
+    ///
+    /// `b'\0'` and `b'\400'` are the one-byte array that the `ostree` command
+    /// stores.
     #[test]
     fn a_bytestring_ends_at_its_first_nul() {
         let cases: &[(&str, &[u8])] = &[
@@ -2551,16 +2699,17 @@ mod tests {
         }
     }
 
-    /// A backslash before a line feed is a line continuation, in a string and
-    /// in a bytestring alike, so both characters leave the value. Measured
-    /// against `ostree` 2026.1, which stores `'ab'` for `'a\<LF>b'`.
+    /// A backslash before a line feed is a line continuation.
+    ///
+    /// The rule applies to a string and to a bytestring. Both characters leave
+    /// the value. `ostree` 2026.1 stores `'ab'` for `'a\<LF>b'`.
     #[test]
     fn a_backslash_before_a_line_feed_continues_the_line() {
         assert_eq!(round("'a\\\nb'"), "'ab'");
         assert_eq!(round("'\\\n'"), "''");
         assert_eq!(round("'a\\\n'"), "'a'");
         assert_eq!(round("'a\\\n\\\nb'"), "'ab'");
-        // The line feed after a `\\` is the literal's own, so it stays.
+        // The line feed after a `\\` belongs to the literal, so it stays.
         assert_eq!(round("'a\\\\\nb'"), "'a\\\\\\nb'");
         // A raw line feed with no backslash before it stays as well.
         assert_eq!(round("'a\\\n\nb'"), "'a\\nb'");
@@ -2569,12 +2718,16 @@ mod tests {
         assert_eq!(value, Value::Bytes(b"ab\0".to_vec()));
     }
 
-    /// The nesting the tool accepts, the level past it, and the wording the
-    /// refusal carries. A value sits inside at most 127 levels.
+    /// The nesting that the `ostree` command accepts, the next level, and the
+    /// refusal.
+    ///
+    /// The test also checks the wording of the refusal. A value sits inside a
+    /// maximum of 127 levels.
     #[test]
     fn refuses_the_level_past_the_nesting_cap() {
-        // A tuple of one member needs its comma, so the tuple form closes each
-        // level with `,)` where the other two close with the bracket alone.
+        // A tuple of one member needs its comma, so the tuple form closes
+        // each level with `,)`. The other two forms close with the bracket
+        // alone.
         for (open, close) in [("[", "]"), ("(", ",)"), ("<", ">")] {
             for depth in [125usize, 126, 127] {
                 let text = format!("{}1{}", open.repeat(depth), close.repeat(depth));
@@ -2592,7 +2745,7 @@ mod tests {
                 );
             }
         }
-        // A `just`, a declaration and a type keyword each add a level too.
+        // A `just`, a declaration, and a type keyword each add a level too.
         assert!(from_text(&format!("{}5", "just ".repeat(127))).is_ok());
         assert!(from_text(&format!("{}5", "@i ".repeat(127))).is_ok());
         assert!(from_text(&format!("{}5", "uint32 ".repeat(127))).is_ok());
@@ -2608,10 +2761,11 @@ mod tests {
         }
     }
 
-    /// A signature value is checked as a type string on its own and takes 129
-    /// levels, the leaf counted. The levels it carries are inside the string,
-    /// so the level it stands at does not narrow it. Measured against `ostree`
-    /// 2026.1.
+    /// A signature value takes 129 levels, with the leaf counted.
+    ///
+    /// The reader checks a signature value as a type string on its own. Its
+    /// levels are inside the string, so its level in the value does not
+    /// narrow it. Measured against `ostree` 2026.1.
     #[test]
     fn a_signature_value_takes_129_levels() {
         let arrays = |count: usize| "a".repeat(count);
@@ -2631,7 +2785,8 @@ mod tests {
             refuse(&format!("@g '{}y'", arrays(129))),
             "3-135:not a valid signature"
         );
-        // The deepest signature stands at the deepest level a value reaches.
+        // The deepest signature stands at the deepest level that a value
+        // reaches.
         let deep = format!(
             "{}signature '{}y'{}",
             "[".repeat(100),
@@ -2641,13 +2796,15 @@ mod tests {
         assert!(from_text(&deep).is_ok());
     }
 
-    /// A declaration takes the levels its type carries, counted from the level
-    /// the declaration stands at, and 128 levels in all. A leaf is one level
-    /// and a container adds one over its deepest member, the empty tuple
-    /// carries none, and a dict entry is measured by its value. A type string
-    /// past 129 levels is invalid, which is reported ahead of the depth, and
-    /// the depth is reported ahead of the definiteness. Measured against
-    /// `ostree` 2026.1.
+    /// A declaration takes the levels of its type, up to 128 levels in all.
+    ///
+    /// The count starts at the level where the declaration stands. A leaf is
+    /// one level, and a container adds one over its deepest member. The empty
+    /// tuple carries no level. A dict entry measures its value.
+    ///
+    /// A type string past 129 levels is invalid. The invalid refusal comes
+    /// before the depth refusal. The depth refusal comes before the
+    /// definiteness refusal. Measured against `ostree` 2026.1.
     #[test]
     fn a_declaration_takes_128_levels_from_where_it_stands() {
         let arrays = |count: usize| "a".repeat(count);
@@ -2686,8 +2843,7 @@ mod tests {
                 format!("@{}((y)y) []", arrays(126)),
                 format!("0-133:{deep}"),
             ),
-            // The definiteness is reported only inside the cap. `@a{66}r` is
-            // the second symptom the 64-level limit gave.
+            // The reader reports the definiteness only inside the cap.
             (format!("@{}r 5", arrays(66)), format!("0-68:{indefinite}")),
             (
                 format!("@{}r 5", arrays(127)),
@@ -2714,8 +2870,9 @@ mod tests {
         }
     }
 
-    /// The whole value is parsed, typed and built before the text is checked
-    /// for trailing input, so a fault inside the value is the one reported.
+    /// The reader parses, types, and builds the value before the trailing check.
+    ///
+    /// If the value has a fault, the error names that fault.
     #[test]
     fn a_fault_in_the_value_stands_ahead_of_trailing_input() {
         let cases: &[(&str, &str)] = &[
@@ -2734,9 +2891,11 @@ mod tests {
         }
     }
 
-    /// The depth-limited parser bounds the node tree, so a text far past the
-    /// cap is refused rather than overflowing the stack -- in the parser, in
-    /// type inference, in construction, and in the tree's own drop.
+    /// The depth limit of the parser bounds the node tree.
+    ///
+    /// The reader refuses a text far past the cap, and the stack does not
+    /// overflow. This applies to the parser, type inference, construction, and
+    /// the drop of the tree.
     #[test]
     fn deep_nesting_does_not_overflow_the_stack() {
         for text in [
@@ -2753,8 +2912,10 @@ mod tests {
         }
     }
 
-    /// Every text the printer writes reads back, so a value can go out through
-    /// `to_text` and come back in through [`from_text`].
+    /// Every text that the printer writes reads back.
+    ///
+    /// A value can go out through `to_text` and come back in through
+    /// `from_text`.
     #[test]
     fn the_printers_output_reads_back() {
         let cases = [
@@ -2782,8 +2943,9 @@ mod tests {
             "{'a', 5}",
             "int64 -5",
             "handle 5",
-            // Every escape the string printer writes, the quote it selects for
-            // a string holding one, and a character it writes through.
+            // Every escape that the string printer writes, its quote for a
+            // string that holds a quote, and one character that it writes
+            // unchanged.
             "'a\\ab'",
             "'a\\bb'",
             "'a\\fb'",
@@ -2798,8 +2960,8 @@ mod tests {
             "'a\"b'",
             "\"a'\\\"b\"",
             "'héllo'",
-            // Every escape the bytestring printer writes, and the quote it
-            // selects for content holding a single one.
+            // Every escape that the bytestring printer writes, and the quote
+            // that it selects for content with a single quote in it.
             "b'a\\tb'",
             "b'a\\nb'",
             "b'a\\rb'",
@@ -2812,9 +2974,9 @@ mod tests {
             "b\"a'\\\"b\"",
             "b'\\377'",
             "b'h\\303\\251'",
-            // A nested maybe: the `just ` prefixes the printer writes are the
-            // only record of how many levels are set, so the text reads back as
-            // the same value only when they survive.
+            // A nested maybe. The `just ` prefixes that the printer writes are
+            // the only record of the number of set levels. If these prefixes do
+            // not survive, the text reads back as a different value.
             "@mmi 5",
             "@mmi just nothing",
             "@mmi nothing",
@@ -2843,8 +3005,8 @@ mod tests {
             assert_eq!(again_ty, ty, "type of {text}");
             assert_eq!(again_value, value, "value of {text}");
         }
-        // The one text the printer writes that the reader refuses: a subnormal,
-        // which the tool refuses on the way in as well.
+        // The reader refuses one text that the printer writes, a subnormal.
+        // The `ostree` command also refuses a subnormal on the way in.
         let printed = to_text(&Type::Double, &Value::double(f64::from_bits(1))).unwrap();
         assert_eq!(printed, "4.9406564584124654e-324");
         assert_eq!(
@@ -2854,12 +3016,12 @@ mod tests {
         );
     }
 
-    /// Every maybe chain the printer writes reads back as the same value.
+    /// Every maybe chain that the printer writes reads back as the same value.
     ///
-    /// A chain whose every level is set prints the value alone, and the type
-    /// states the level count. A chain that ends at `nothing` states its own set
-    /// levels, one `just ` for each. Both readings have to survive the trip, or
-    /// the printed text names a different value.
+    /// If every level of a chain is set, the printer writes the value alone.
+    /// Then the type states the level count. A chain that ends at `nothing`
+    /// states its set levels, with one `just ` for each. Both readings must
+    /// survive the trip. If not, the printed text names a different value.
     #[test]
     fn every_maybe_chain_the_printer_writes_reads_back() {
         let leaves: &[(&str, Value)] = &[
@@ -2904,8 +3066,9 @@ mod tests {
         }
     }
 
-    /// The bytes a value serializes to are the bytes the tool stores, host byte
-    /// order and all.
+    /// A value serializes to the bytes that the `ostree` command stores.
+    ///
+    /// The bytes of a `u` and a `d` are little-endian.
     #[test]
     fn serializes_in_host_byte_order() {
         let (ty, value) = from_text("uint32 42").unwrap();

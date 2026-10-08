@@ -1,17 +1,19 @@
 use crate::Type;
 
-/// A dynamically-typed GVariant value.
+/// A dynamically typed GVariant value.
 ///
-/// The representation is canonical with respect to a [`Type`]:
+/// The representation is canonical for a [`Type`]:
 ///
-/// - byte arrays (`ay`) are `Bytes`, never `Array` of `Byte`;
-/// - dict entries are two-element `Tuple`s;
-/// - a `Variant` carries the child's type, since the serialized form embeds
-///   the child's signature.
-/// - a double is held as its IEEE-754 bit pattern, so a value compares by the
-///   bytes it serializes to.
-/// - an object path (`o`) and a signature (`g`) are `Str`, and a handle (`h`)
-///   is `I32`; the [`Type`] states which of the pair a value carries.
+/// - A byte array (`ay`) is [`Value::Bytes`]. The canonical form holds no
+///   [`Value::Array`] of [`Value::Byte`].
+/// - A dict entry is a two-element [`Value::Tuple`].
+/// - A [`Value::Variant`] carries the type of its child, because the
+///   serialized form embeds the signature of the child.
+/// - A double is its IEEE-754 bit pattern, so a value compares by the bytes
+///   that it serializes to.
+/// - An object path (`o`) and a signature (`g`) are [`Value::Str`]. A handle
+///   (`h`) is [`Value::I32`]. The [`Type`] states which of these types a
+///   value carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     /// `b`.
@@ -22,7 +24,7 @@ pub enum Value {
     I16(i16),
     /// `q`.
     U16(u16),
-    /// `i`, and the folded `h`.
+    /// `i` or `h`.
     I32(i32),
     /// `u`.
     U32(u32),
@@ -30,30 +32,29 @@ pub enum Value {
     I64(i64),
     /// `t`.
     U64(u64),
-    /// The IEEE-754 bit pattern of a `d` value. Build one with
-    /// [`Value::double`].
+    /// The IEEE-754 bit pattern of a `d` value, as [`Value::double`] creates it.
     Double(u64),
-    /// `s`, and the folded `o` and `g`.
+    /// `s`, `o`, or `g`.
     Str(String),
-    /// `ay`, held as its bytes rather than as an array of [`Value::Byte`].
+    /// `ay`, held as its bytes.
     Bytes(Vec<u8>),
     /// `m<T>`: the value it holds, or `None` for `nothing`.
     Maybe(Option<Box<Value>>),
     /// `a<T>`: the elements, in order.
     Array(Vec<Value>),
-    /// `(...)`, and the folded dict entry, which is a two-element tuple.
+    /// `(...)` or a dict entry.
     Tuple(Vec<Value>),
-    /// `v`: the child's type and the child.
+    /// `v`: the type of the child and the child.
     Variant(Box<(Type, Value)>),
 }
 
 impl Value {
-    /// Wrap `value` of type `ty` as a variant.
+    /// Creates a variant that holds `value` of type `ty`.
     pub fn variant(ty: Type, value: Value) -> Value {
         Value::Variant(Box::new((ty, value)))
     }
 
-    /// A `d` value from a double.
+    /// Creates a `d` value from an `f64`.
     pub fn double(value: f64) -> Value {
         Value::Double(value.to_bits())
     }
@@ -78,7 +79,7 @@ impl Value {
         }
     }
 
-    /// The `b` this value holds, or `None` for any other type.
+    /// Returns the `b` that this value holds, or `None` for any other type.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Value::Bool(b) => Some(*b),
@@ -86,7 +87,7 @@ impl Value {
         }
     }
 
-    /// The `y` this value holds, or `None` for any other type.
+    /// Returns the `y` that this value holds, or `None` for any other type.
     pub fn as_byte(&self) -> Option<u8> {
         match self {
             Value::Byte(b) => Some(*b),
@@ -94,7 +95,7 @@ impl Value {
         }
     }
 
-    /// The `u` this value holds, or `None` for any other type.
+    /// Returns the `u` that this value holds, or `None` for any other type.
     pub fn as_u32(&self) -> Option<u32> {
         match self {
             Value::U32(x) => Some(*x),
@@ -102,7 +103,7 @@ impl Value {
         }
     }
 
-    /// The `t` this value holds, or `None` for any other type.
+    /// Returns the `t` that this value holds, or `None` for any other type.
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Value::U64(x) => Some(*x),
@@ -110,7 +111,7 @@ impl Value {
         }
     }
 
-    /// The string this value holds, or `None` for any other type.
+    /// Returns the string that this value holds, or `None` for any other type.
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::Str(s) => Some(s),
@@ -118,7 +119,7 @@ impl Value {
         }
     }
 
-    /// The byte array this value holds, or `None` for any other type.
+    /// Returns the byte array that this value holds, or `None` for any other type.
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Value::Bytes(b) => Some(b),
@@ -126,7 +127,10 @@ impl Value {
         }
     }
 
-    /// The array elements this value holds, or `None` for any other type.
+    /// Returns the elements of this array value, or `None` for any other type.
+    ///
+    /// A byte array (`ay`) is a [`Value::Bytes`], so this method returns `None`
+    /// for it. [`as_bytes`](Value::as_bytes) returns its bytes.
     pub fn as_array(&self) -> Option<&[Value]> {
         match self {
             Value::Array(items) => Some(items),
@@ -134,14 +138,15 @@ impl Value {
         }
     }
 
-    /// The strings an array holds, or `None` for any other type. One element
-    /// that is not a string yields `None` for the whole array. The empty
-    /// array yields the empty list.
+    /// Returns the strings of this array value, or `None` for any other type.
+    ///
+    /// If one element is not a string, the result is `None` for the whole
+    /// array. The empty array yields the empty list.
     pub fn as_strv(&self) -> Option<Vec<&str>> {
         self.as_array()?.iter().map(Value::as_str).collect()
     }
 
-    /// The tuple members this value holds, or `None` for any other type.
+    /// Returns the members of this tuple value, or `None` for any other type.
     pub fn as_tuple(&self) -> Option<&[Value]> {
         match self {
             Value::Tuple(items) => Some(items),
@@ -149,7 +154,7 @@ impl Value {
         }
     }
 
-    /// The child type and child value a variant holds, or `None` for any other type.
+    /// Returns the type and the child of this variant, or `None` for any other type.
     pub fn as_variant(&self) -> Option<(&Type, &Value)> {
         match self {
             Value::Variant(inner) => Some((&inner.0, &inner.1)),
@@ -157,14 +162,20 @@ impl Value {
         }
     }
 
-    /// The same value with every multi-byte scalar byte-swapped, recursively,
-    /// through arrays, tuples, dict entries, and the child of a variant.
+    /// Returns a copy of the value with each multi-byte scalar byte-swapped.
     ///
-    /// This is GVariant's own byte-order conversion. The on-disk format places
-    /// its numeric fields in the variant already big-endian while the framing
-    /// stays little-endian, so a value parsed from those bytes holds each
-    /// numeric field byte-reversed, and one swap of the whole tree recovers the
-    /// numbers the fields state. Booleans, bytes, and strings are unchanged.
+    /// The swap recurses through arrays, maybes, tuples, dict entries, and the
+    /// child of a variant. Booleans, bytes, strings, and byte arrays stay
+    /// unchanged.
+    ///
+    /// The method is the byte-order conversion of GVariant itself. The ostree
+    /// on-disk format stores some numeric fields big-endian inside the
+    /// little-endian framing, so [`from_bytes`] returns each of them
+    /// byte-reversed. One swap of the whole tree recovers the numbers that
+    /// the fields state. [`to_bytes`] lists these fields.
+    ///
+    /// [`from_bytes`]: crate::from_bytes
+    /// [`to_bytes`]: crate::to_bytes
     pub fn byteswapped(&self) -> Value {
         match self {
             Value::I16(x) => Value::I16(x.swap_bytes()),
@@ -185,10 +196,17 @@ impl Value {
         }
     }
 
-    /// Look up a key in a dictionary value (`a{s?}`): an array of two-element
-    /// tuples whose first member is the key string. Returns the value member of
-    /// the first entry whose key matches. Entries that are not `{s?}`-shaped are
-    /// skipped; a non-array `self` yields `None`.
+    /// Looks up a key in a dictionary value (`a{s?}`).
+    ///
+    /// A dictionary value is an array of two-element tuples. The first member
+    /// of each tuple is the key string. The method returns the value member
+    /// of the first entry whose key matches. If a [`DictBuilder`] inserted one
+    /// key twice, the method returns the value of the first entry.
+    ///
+    /// The method skips each entry that does not have the `{s?}` shape. If
+    /// `self` is not an array, or if no key matches, the result is `None`.
+    ///
+    /// [`DictBuilder`]: crate::DictBuilder
     pub fn dict_get(&self, key: &str) -> Option<&Value> {
         for entry in self.as_array()? {
             let Some(fields) = entry.as_tuple() else {
@@ -258,7 +276,8 @@ mod tests {
     use crate::{DictBuilder, from_bytes, to_bytes};
 
     /// A key written as an `as` reads back as the same strings in the same
-    /// order, through the dict the builder produces.
+    /// order. The test reads the key through the dict that the builder
+    /// produces.
     #[test]
     fn reads_back_an_inserted_strv() {
         let mut builder = DictBuilder::new();
@@ -276,8 +295,8 @@ mod tests {
         assert_eq!(value.as_strv(), Some(vec!["one", "two", "three"]));
     }
 
-    /// A serialized `a{sv}` carrying an `as` key hands the strings back after a
-    /// parse of its bytes.
+    /// A serialized `a{sv}` with an `as` key returns the strings after a parse
+    /// of its bytes.
     #[test]
     fn reads_back_a_parsed_strv() {
         let mut builder = DictBuilder::new();
@@ -298,8 +317,8 @@ mod tests {
         assert_eq!(value.as_strv(), Some(vec!["alpha", ""]));
     }
 
-    /// The empty array yields the empty list, which is what a key written as an
-    /// empty `as` holds.
+    /// The empty array yields the empty list. A key written as an empty `as`
+    /// holds this list.
     #[test]
     fn reads_an_empty_array_as_an_empty_list() {
         assert_eq!(Value::Array(Vec::new()).as_strv(), Some(Vec::new()));
@@ -311,8 +330,8 @@ mod tests {
         assert_eq!(value.as_strv(), Some(Vec::new()));
     }
 
-    /// An `o` and a `g` are held as strings, so an `ao` and an `ag` hand their
-    /// strings back the way an `as` does.
+    /// A value holds an `o` and a `g` as strings, so an `ao` and an `ag`
+    /// return their strings the same as an `as` does.
     #[test]
     fn reads_a_folded_object_path_and_signature_array() {
         let paths = Value::Array(vec![
@@ -332,9 +351,9 @@ mod tests {
         assert_eq!(parsed.as_strv(), Some(vec!["a{sv}"]));
     }
 
-    /// An array holding an element that is not a string yields `None` for the
-    /// whole array. A byte array, a nested array, and a dict entry are such
-    /// elements.
+    /// If an array holds an element that is not a string, the result is
+    /// `None` for the whole array. A byte array, a nested array, and a dict
+    /// entry are such elements.
     #[test]
     fn refuses_an_array_with_a_non_string_element() {
         let mixed = Value::Array(vec![Value::Str("one".to_owned()), Value::U32(2)]);

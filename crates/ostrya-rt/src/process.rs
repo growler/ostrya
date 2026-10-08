@@ -1,17 +1,12 @@
-//! Run a helper process with piped standard streams.
+//! Helper processes with piped standard streams.
 //!
-//! [`Command`] spawns a program through the compiled backend's async process
-//! API (`smol::process` under smol, `tokio::process` under tokio). It runs the
-//! program in two forms:
+//! [`Command`] starts a program through the async process API of the
+//! backend: `smol::process` with the `smol` feature, and `tokio::process`
+//! with the `tokio` feature.
 //!
-//! - [`Command::output`] is a short-lived run. It feeds the program a byte
-//!   payload on stdin and collects the exit status and both output streams.
-//!   The GPG signing engine drives the `gpg` binary through it. The payloads
-//!   involved are bounded metadata, so whole-buffer input and output fit the
-//!   crate's streaming rules.
-//! - [`Command::spawn`] starts a long-lived [`Child`]. Its standard input and
-//!   standard output are async streams, and its standard error is the
-//!   standard error of this process.
+//! The GPG signing engine runs the `gpg` binary through [`Command::output`].
+//! Its payloads are bounded metadata, so the whole-buffer input and output
+//! obey the streaming rules of the crate.
 
 use std::ffi::OsString;
 use std::io;
@@ -24,19 +19,23 @@ use smol::process as backend;
 #[cfg(feature = "tokio")]
 use tokio::process as backend;
 
-/// A command to run with piped stdin, stdout, and stderr.
+/// A program and its arguments to run as a child process.
 ///
-/// The builder mirrors the small subset of `std::process::Command` the
-/// library needs: a program, its arguments, one-shot execution over a stdin
-/// payload ([`output`](Command::output)), and a long-lived child with streamed
-/// standard input and output ([`spawn`](Command::spawn)).
+/// The command runs in one of two forms: a one-shot run with
+/// [`output`](Command::output), or a long-lived [`Child`] with
+/// [`spawn`](Command::spawn).
 pub struct Command {
     program: OsString,
     args: Vec<OsString>,
 }
 
+/// The builder and the one-shot run.
 impl Command {
-    /// A command running `program`, resolved through `PATH` when relative.
+    /// Creates a command that runs `program` with no arguments.
+    ///
+    /// [`output`](Command::output) and [`spawn`](Command::spawn) give
+    /// `program` unchanged to the process API of the backend, which finds the
+    /// program file.
     pub fn new(program: impl Into<OsString>) -> Command {
         Command {
             program: program.into(),
@@ -44,21 +43,33 @@ impl Command {
         }
     }
 
-    /// Append one argument.
+    /// Adds one argument.
     pub fn arg(&mut self, arg: impl Into<OsString>) -> &mut Command {
         self.args.push(arg.into());
         self
     }
 
-    /// Run the command, write `input` to its stdin, and collect the exit
-    /// status and both output streams.
+    /// Runs the command with `input` on standard input and collects its output.
     ///
-    /// stdin is closed once `input` is written. A stdin write failure (the
-    /// child exiting without reading it all, for example) is not an error of
-    /// the run; the exit status and stderr carry the child's side of the
-    /// story. The input is written while both output streams drain, so a
-    /// child that interleaves reading and writing cannot deadlock on a full
-    /// pipe.
+    /// The returned [`Output`] holds the exit status, the standard output, and
+    /// the standard error of the child. The run holds `input` and both outputs
+    /// in memory, so it fits small payloads. For a stream of any size,
+    /// [`spawn`](Command::spawn) gives async pipes.
+    ///
+    /// The run writes `input` while it reads both outputs, so a child that
+    /// reads and writes in turn cannot block on a full pipe. After the run
+    /// writes `input`, it closes standard input.
+    ///
+    /// A failure to write standard input is not an error of the run. For
+    /// example, the child can exit before it reads all of `input`. The exit
+    /// status and the standard error then tell what the child did.
+    ///
+    /// # Errors
+    ///
+    /// - An I/O error if the program does not start, for example if the
+    ///   program does not exist.
+    /// - An I/O error from the wait for the child, or from a read of standard
+    ///   output or standard error.
     #[cfg(feature = "tokio")]
     pub async fn output(&self, input: &[u8]) -> io::Result<Output> {
         use std::process::Stdio;
@@ -81,15 +92,27 @@ impl Command {
         output
     }
 
-    /// Run the command, write `input` to its stdin, and collect the exit
-    /// status and both output streams.
+    /// Runs the command with `input` on standard input and collects its output.
     ///
-    /// stdin is closed once `input` is written. A stdin write failure (the
-    /// child exiting without reading it all, for example) is not an error of
-    /// the run; the exit status and stderr carry the child's side of the
-    /// story. The input is written while both output streams drain, so a
-    /// child that interleaves reading and writing cannot deadlock on a full
-    /// pipe.
+    /// The returned [`Output`] holds the exit status, the standard output, and
+    /// the standard error of the child. The run holds `input` and both outputs
+    /// in memory, so it fits small payloads. For a stream of any size,
+    /// [`spawn`](Command::spawn) gives async pipes.
+    ///
+    /// The run writes `input` while it reads both outputs, so a child that
+    /// reads and writes in turn cannot block on a full pipe. After the run
+    /// writes `input`, it closes standard input.
+    ///
+    /// A failure to write standard input is not an error of the run. For
+    /// example, the child can exit before it reads all of `input`. The exit
+    /// status and the standard error then tell what the child did.
+    ///
+    /// # Errors
+    ///
+    /// - An I/O error if the program does not start, for example if the
+    ///   program does not exist.
+    /// - An I/O error from the wait for the child, or from a read of standard
+    ///   output or standard error.
     #[cfg(all(feature = "smol", not(feature = "tokio")))]
     pub async fn output(&self, input: &[u8]) -> io::Result<Output> {
         use smol::io::{AsyncReadExt, AsyncWriteExt};
@@ -127,14 +150,21 @@ impl Command {
     }
 }
 
+/// The start of a long-lived child process.
 impl Command {
-    /// Start the command with its standard input and standard output piped
-    /// and the standard error of this process.
+    /// Starts the command as a long-lived child process.
     ///
-    /// The returned [`Child`] holds both pipes; take them with
-    /// [`Child::take_stdin`] and [`Child::take_stdout`]. Under the tokio
-    /// backend this must be called from within a runtime context, as
-    /// `tokio::process::Command::spawn` requires.
+    /// The child gets piped standard input and standard output. It writes to
+    /// the standard error of this process. The returned [`Child`] holds both
+    /// pipes, and [`Child::take_stdin`] and [`Child::take_stdout`] return them.
+    ///
+    /// With the `tokio` feature, the call must run inside a tokio runtime
+    /// context.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the program does not start, for example if the program
+    /// does not exist.
     pub fn spawn(&self) -> io::Result<Child> {
         use std::process::Stdio;
 
@@ -165,21 +195,30 @@ pub struct Child {
 }
 
 impl Child {
-    /// Take the standard input of the child. The second call gives `None`.
+    /// Takes the standard input of the child.
+    ///
+    /// A second call returns `None`.
     pub fn take_stdin(&mut self) -> Option<ChildStdin> {
         self.stdin.take()
     }
 
-    /// Take the standard output of the child. The second call gives `None`.
+    /// Takes the standard output of the child.
+    ///
+    /// A second call returns `None`.
     pub fn take_stdout(&mut self) -> Option<ChildStdout> {
         self.stdout.take()
     }
 
-    /// Wait for the child to exit and return its exit status.
+    /// Waits for the child to exit and returns its exit status.
     ///
-    /// The wait first drops a standard input the caller did not take, so a
-    /// child that reads its standard input to the end sees end of file. A
-    /// [`ChildStdin`] the caller took stays open: close or drop it first.
+    /// If the caller did not take the standard input, the wait drops it first.
+    /// A child that reads its standard input to the end then gets end of file.
+    /// A [`ChildStdin`] that the caller took stays open until the caller
+    /// closes or drops it.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error from the wait for the child.
     pub async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
         self.stdin = None;
         #[cfg(feature = "tokio")]
@@ -199,7 +238,7 @@ impl Child {
 /// file. After `close`, a write fails with [`io::ErrorKind::BrokenPipe`],
 /// and a flush or a second close succeeds and does nothing.
 pub struct ChildStdin {
-    /// `None` after `close`: the pipe is dropped to close the descriptor,
+    /// `None` after `close`. `close` drops the pipe to close the descriptor,
     /// because the close of neither backend closes it.
     inner: Option<backend::ChildStdin>,
 }
@@ -282,7 +321,7 @@ impl futures_io::AsyncRead for ChildStdout {
     }
 }
 
-/// The child types move freely across tasks and threads.
+// The child types move freely across tasks and threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Child>();

@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
-//! Read the real objects the `ostree` tool wrote into
-//! tests/fixtures/generated/, recompute their checksums, and require
-//! byte-identical reserialization. The content-object
-//! checksums are additionally recomputed from first principles -- the known
-//! deterministic tree the fixture generator commits -- and must equal the
-//! object names the tool chose.
+//! Golden objects.
+//!
+//! The tests read the objects that the `ostree` command wrote into
+//! `tests/fixtures/generated/`. They compute each checksum again and require
+//! a byte-identical serialization. They also compute the content-object
+//! checksums from the known deterministic tree that the fixture generator
+//! commits. These checksums must equal the object names that the `ostree`
+//! command chose.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -18,7 +20,7 @@ use ostrya_core::{
 #[path = "../../../tests/support.rs"]
 mod support;
 
-/// A `key=value` line from the generator's MANIFEST.
+/// Returns the value of a `key=value` line in the `MANIFEST` of the generator.
 fn manifest_value(key: &str) -> String {
     let text = fs::read_to_string(support::fixture_root().join("MANIFEST")).unwrap();
     text.lines()
@@ -27,8 +29,10 @@ fn manifest_value(key: &str) -> String {
         .to_owned()
 }
 
-/// All loose objects with the given extension in one fixture repo, as
-/// (checksum-from-filename, object bytes).
+/// Returns the loose objects with the given extension in one fixture
+/// repository.
+///
+/// Each item holds the checksum from the file name and the object bytes.
 fn repo_objects(mode: &str, extension: &str) -> Vec<(Checksum, Vec<u8>)> {
     support::objects_with_extension(extension, Some(mode))
         .into_iter()
@@ -36,16 +40,18 @@ fn repo_objects(mode: &str, extension: &str) -> Vec<(Checksum, Vec<u8>)> {
         .collect()
 }
 
-/// The same objects across both fixture repos.
+/// Returns the objects of `repo_objects` from both fixture repositories.
 fn objects(extension: &str) -> Vec<(Checksum, Vec<u8>)> {
     let mut found = repo_objects("archive", extension);
     found.extend(repo_objects("bare-user", extension));
     found
 }
 
-/// The deterministic tree the fixture generator commits (see generate.sh):
-/// regular files are 0644 owned 0:0 with no xattrs, the symlink points at
-/// hello.txt.
+/// Returns the header of a regular file in the fixture tree.
+///
+/// The fixture generator (`generate.sh`) commits a deterministic tree. In
+/// this tree, each regular file has mode 0644, owner 0:0, and no xattrs. The
+/// symlink points at `hello.txt`.
 fn regular_header() -> FileHeader {
     FileHeader {
         uid: 0,
@@ -66,8 +72,9 @@ fn symlink_header() -> FileHeader {
     }
 }
 
-/// (payload, expected header) for every content object, keyed by the
-/// checksum recomputed from first principles.
+/// Returns the payload and the expected header of each content object.
+///
+/// The key is the checksum that the test computes from the known tree.
 fn expected_content() -> BTreeMap<Checksum, (&'static [u8], FileHeader)> {
     let regular = |payload: &'static [u8]| {
         let mut hasher = ContentHasher::new(&regular_header()).unwrap();
@@ -144,7 +151,8 @@ fn dirtree_objects_walk_validate_and_hash_to_their_names() {
 
         let file_names: Vec<&str> = files.iter().map(|(name, _)| *name).collect();
         if dirs.len() == 1 {
-            // The root tree: three file entries plus the subdir, name-sorted.
+            // The root tree has three file entries and the subdirectory,
+            // sorted by name.
             assert_eq!(file_names, ["empty.txt", "hello.txt", "link"]);
             assert_eq!(dirs[0].0, "subdir");
             let by_name: BTreeMap<&str, Checksum> = files.into_iter().collect();
@@ -218,8 +226,8 @@ fn bare_user_payloads_are_the_raw_content() {
     let expected = expected_content();
     for (name, bytes) in repo_objects("bare-user", "file") {
         let (payload, header) = &expected[&name];
-        // Symlink objects are materialized specially in bare-user mode; only
-        // regular-file objects store the raw payload.
+        // In bare-user mode, a symlink object stores its target in the file
+        // content. Only a regular-file object stores the raw payload.
         if !header.is_symlink() {
             assert_eq!(&bytes, payload, "raw payload for {name}");
         }

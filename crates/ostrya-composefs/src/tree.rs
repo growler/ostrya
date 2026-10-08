@@ -63,7 +63,17 @@ pub struct Directory {
     pub meta: Metadata,
     /// The children, keyed by name and sorted by name.
     ///
-    /// A name is raw bytes. It holds no `/` and is never `.` or `..`.
+    /// A name is raw bytes and one path component:
+    ///
+    /// - It is not empty.
+    /// - It is not `.` or `..`.
+    /// - It holds no `/`.
+    /// - It is at most 255 bytes, the limit that an observation of the
+    ///   `ostree` command shows.
+    ///
+    /// If a name breaks one of these rules, [`build_image`](crate::build_image)
+    /// and [`write_image_to`](crate::write_image_to) return
+    /// [`Error::Unsupported`](crate::Error::Unsupported).
     pub children: BTreeMap<Vec<u8>, Node>,
 }
 

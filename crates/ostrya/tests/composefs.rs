@@ -1026,6 +1026,83 @@ fn holds_a_symlink_target_to_its_inode_block() {
     });
 }
 
+/// Commit a tree holding one regular file whose name is `len` bytes, in a
+/// repository of its own under `dir`, and walk it into the image.
+async fn export_child_name(dir: &Path, len: usize) -> Result<(), Error> {
+    let repo = Repo::create(dir, CreateOptions::new(RepoMode::BareUser))
+        .await
+        .unwrap();
+    let txn = repo.transaction().await.unwrap();
+    let meta = FileMeta {
+        uid: 0,
+        gid: 0,
+        mode: 0o100644,
+        xattrs: Xattrs::empty(),
+    };
+    let file = txn
+        .write_regfile_inline(None, &meta, b"named\n")
+        .await
+        .unwrap();
+    let mut mtree = MutableTree::new();
+    mtree.replace_file(&"n".repeat(len), file).unwrap();
+    let dirmeta_bytes = DirMeta {
+        uid: 0,
+        gid: 0,
+        mode: 0o040755,
+        xattrs: Xattrs::empty(),
+    }
+    .serialize()
+    .unwrap();
+    let dirmeta = txn
+        .write_metadata(ObjectType::DirMeta, None, &dirmeta_bytes)
+        .await
+        .unwrap();
+    mtree.set_metadata_checksum(dirmeta);
+    let root = txn.write_mtree(&mut mtree).await.unwrap();
+    let commit = txn
+        .write_commit(
+            CommitOptions {
+                subject: Some("child name".to_owned()),
+                timestamp: Some(0),
+                ..CommitOptions::default()
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    // `Image` holds no `Debug`, so the value is dropped rather than matched on.
+    repo.export_composefs(&commit, &ComposefsOptions::default())
+        .await
+        .map(|_| ())
+}
+
+/// The image holds a child name of at most 255 bytes. The tool refuses a
+/// 256-byte name with `File name too long`, which `format-reference.md`,
+/// "composefs", records.
+#[test]
+fn holds_a_child_name_to_255_bytes() {
+    let scratch = TmpDir::new("composefs-child-name");
+    block_on(async {
+        export_child_name(&scratch.path().join("at"), 255)
+            .await
+            .expect("the export builds the image at 255 bytes");
+
+        let err = export_child_name(&scratch.path().join("over"), 256)
+            .await
+            .expect_err("the export refuses a 256-byte name");
+        let text = err.to_string();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "the export refused with {err:?}"
+        );
+        assert!(
+            text.contains("256 bytes"),
+            "the refusal names the length: {text}"
+        );
+    });
+}
+
 /// A stored name goes into a one-byte length field, so a name above 255 bytes
 /// has no place in the image whatever the budget says. At 255 bytes the walk
 /// accepts the attribute, and at 256 it refuses and names it.

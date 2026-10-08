@@ -3602,6 +3602,116 @@ fn composefs_switches_match_the_tool(base: &Path, mode: RepoMode) {
     );
 }
 
+/// A composefs image holds a child name of at most 255 bytes. A filesystem
+/// holds no longer name, so each side commits a tar archive whose member name
+/// comes from a pax `path` record. Both commit the 255-byte and the 256-byte
+/// name to the same checksum. At 255 bytes both composefs switches write the
+/// same image bytes, and `commit --generate-composefs-metadata` writes the same
+/// commit. At 256 bytes both refuse each form at exit 1 and write no image, no
+/// commit, and no ref. The two refusals are worded differently, so the test
+/// compares the exit status and standard output only.
+#[test]
+fn checkout_composefs_child_name_bound_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-composefs-name");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::BareUser);
+    for len in [255, 256] {
+        let archive = base.join(format!("name{len}.tar"));
+        pack_long_name(&archive, len);
+        let source = format!("--tree=tar={}", archive.display());
+        let branch = format!("name{len}");
+        assert_agrees(
+            &port_repo,
+            &tool_repo,
+            &["commit", "-b", &branch, FIXED_TIMESTAMP, &source],
+        );
+
+        // The tool writes the image through a temporary file in the working
+        // directory, so both sides run from the directory of the destinations.
+        for flag in ["--composefs", "--composefs-noverity"] {
+            let label = format!("checkout {flag} over a {len}-byte name");
+            let port_image = base.join(format!("port{len}{flag}.cfs"));
+            let tool_image = base.join(format!("tool{len}{flag}.cfs"));
+            let line = |repo: &Path, dest: &Path| {
+                vec![
+                    "checkout".to_owned(),
+                    format!("--repo={}", repo.display()),
+                    flag.to_owned(),
+                    branch.clone(),
+                    dest.display().to_string(),
+                ]
+            };
+            let port_args = line(&port_repo, &port_image);
+            let tool_args = line(&tool_repo, &tool_image);
+            let port = ostrya_in(
+                Some(base),
+                &port_args.iter().map(String::as_str).collect::<Vec<_>>(),
+                None,
+                &[],
+            );
+            let tool = ostree_in(
+                base,
+                &tool_args.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            if len == 255 {
+                assert_runs_agree(&port, &tool, &label);
+                assert_eq!(
+                    std::fs::read(&port_image).unwrap(),
+                    std::fs::read(&tool_image).unwrap(),
+                    "`{label}` and the tool wrote different image bytes",
+                );
+            } else {
+                assert_eq!(port.status.code(), Some(1), "`{label}` exit status");
+                assert_eq!(tool.status.code(), Some(1), "the tool's `{label}`");
+                assert!(port.stdout.is_empty() && tool.stdout.is_empty());
+                assert!(!port_image.exists(), "`{label}` left an image");
+                assert!(!tool_image.exists(), "the tool's `{label}` left an image");
+            }
+        }
+
+        let generated = format!("generated{len}");
+        let args = [
+            "commit",
+            "-b",
+            &generated,
+            "--generate-composefs-metadata",
+            FIXED_TIMESTAMP,
+            &source,
+        ];
+        if len == 255 {
+            assert_agrees(&port_repo, &tool_repo, &args);
+        } else {
+            let commits = |repo: &Path| {
+                loose_objects(repo)
+                    .into_iter()
+                    .filter(|(_, ext)| ext == "commit")
+                    .count()
+            };
+            let before = [commits(&port_repo), commits(&tool_repo)];
+            let (port, tool) = run_both(&port_repo, &tool_repo, &args);
+            assert_eq!(port.status.code(), Some(1), "the port's commit exit");
+            assert_eq!(tool.status.code(), Some(1), "the tool's commit exit");
+            assert!(port.stdout.is_empty() && tool.stdout.is_empty());
+            for (repo, before) in [&port_repo, &tool_repo].into_iter().zip(before) {
+                assert_eq!(
+                    commits(repo),
+                    before,
+                    "{} holds a commit object for the refused commit",
+                    repo.display()
+                );
+                assert!(
+                    !repo.join("refs/heads").join(&generated).exists(),
+                    "{} holds a ref for the refused commit",
+                    repo.display()
+                );
+            }
+        }
+    }
+}
+
 /// A composefs export that fails part way writes no destination and leaves a
 /// destination that already exists as it was, byte for byte and at the mode it
 /// carried. The failure comes from a content object removed from the
@@ -18047,6 +18157,40 @@ fn pack_invalid_pathname(archive: &Path) {
         body.len(),
         false,
     ));
+    out.extend_from_slice(body);
+    out.resize(out.len().next_multiple_of(512), 0);
+    // Two zero blocks end the stream, and the whole is padded to a tar record.
+    out.resize(out.len() + 1024, 0);
+    out.resize(out.len().next_multiple_of(10240), 0);
+    std::fs::write(archive, &out).unwrap();
+}
+
+/// Pack an archive holding a `./` root member and one regular file whose name
+/// is `len` bytes. The name goes in a pax `path` record, because the name
+/// field of a header holds 100 bytes.
+fn pack_long_name(archive: &Path, len: usize) {
+    let path = format!("./{}", "n".repeat(len));
+    // A record states its own length in decimal, the digits included.
+    let rest = format!(" path={path}\n");
+    let mut size = rest.len() + 1;
+    while format!("{size}{rest}").len() != size {
+        size += 1;
+    }
+    let record = format!("{size}{rest}");
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&tar_header(b"./", 0o755, b'5', "", 0, false));
+    out.extend_from_slice(&tar_header(
+        b"./PaxHeaders/long",
+        0o644,
+        b'x',
+        "",
+        record.len(),
+        false,
+    ));
+    out.extend_from_slice(record.as_bytes());
+    out.resize(out.len().next_multiple_of(512), 0);
+    let body = b"named\n";
+    out.extend_from_slice(&tar_header(b"./long", 0o644, b'0', "", body.len(), false));
     out.extend_from_slice(body);
     out.resize(out.len().next_multiple_of(512), 0);
     // Two zero blocks end the stream, and the whole is padded to a tar record.

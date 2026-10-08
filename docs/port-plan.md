@@ -7557,9 +7557,10 @@ Deliverables, one line each:
   the 32755 bytes the tool allows an inode's attributes, and holds the one EROFS
   length field that budget leaves unbound: 255 bytes of name. The writer refuses
   a symlink target its inode's block does not hold, the bound the tool aborts
-  on. Those are the two tree facts the export has no room for. The writer holds
-  an inode to the 128 shared-xattr references the tool gives it and keeps the
-  rest inline, which `tree-rich.cfs` pins.
+  on, and a child name above 255 bytes, the bound the tool refuses with `File
+  name too long`. Those are the three tree facts the export has no room for.
+  The writer holds an inode to the 128 shared-xattr references the tool gives
+  it and keeps the rest inline, which `tree-rich.cfs` pins.
 - `D7b` -- `checkout --composefs-noverity` and the destination-fd rewiring,
   with their cells (DONE): the two switches are independent and the no-verity
   one decides whatever their order, and all four forms write the tool's image

@@ -81,6 +81,12 @@
 //! the same trees, which `docs/format-reference.md`, "composefs", records.
 //! `PATH_MAX` keeps a target that long out of a tree a checkout produces; a tar
 //! import reaches it.
+//!
+//! A child name above 255 bytes has no place there either. The writer refuses
+//! it, and every path here reports that refusal as [`Error::Unsupported`]. The
+//! tool refuses the same trees with `File name too long`, which
+//! `docs/format-reference.md`, "composefs", records. A filesystem holds no name
+//! that long; a tar import reaches it.
 
 use std::future::Future;
 use std::io::BufWriter;

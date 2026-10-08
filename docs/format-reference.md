@@ -3486,6 +3486,22 @@ separators. Each dirent header is 12 bytes:
 
 The first dirent's name offset divided by 12 gives the entry count.
 
+A child name is at most 255 bytes. Measured against libostree 2026.1 over trees
+committed from a tar archive whose member name comes from a pax `path` record:
+at 255 bytes `checkout --composefs`, `checkout --composefs-noverity`, and
+`commit --generate-composefs-metadata` write the image or the commit, and at 256
+bytes each exits 1 on `File name too long` and writes no image, no commit, and
+no ref. The bound holds for a regular file, a directory, a symlink, and an entry
+in a subdirectory. `composefs-info ls` refuses an image holding a name of 256
+bytes or more with `File name too long`. `fsck`, `ls`, and a plain `commit`
+take such a tree. The port refuses the same trees with `Error::Unsupported`,
+and at 255 bytes its image is byte-identical to the tool's. A Linux filesystem
+stores no name above 255 bytes, so a checkout produces no tree that reaches the
+bound; a tar import does.
+
+`composefs-info ls` and `composefs-info dump` refuse an image holding an empty
+child name: each exits 1 on `Failed to load '<image>': Invalid argument`.
+
 ### Inode extended attributes and the name filter
 
 An inode's xattr area, present only when the inode has at least one xattr,

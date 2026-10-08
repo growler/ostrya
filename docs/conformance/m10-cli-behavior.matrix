@@ -2609,6 +2609,37 @@ spec: format-reference.md#composefs
 note: both implementations export from a `bare-user-only` repository. The
  cited test states the bytes equal to the tool's for all four switch forms.
 
+family: M10
+subcommand: checkout
+cell: checkout/composefs-name-255
+modes: bare-user
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_composefs_child_name_bound_matches_the_tool
+spec: format-reference.md#composefs
+note: a child name of 255 bytes is the longest a composefs image holds, and
+ both switches write the tool's image bytes for a tree that holds one. The
+ cited test commits the tree from a tar archive whose member name comes from a
+ pax `path` record, the source `checkout/composefs-name-256` needs, because a
+ filesystem holds no 256-byte name. No setup builds such an archive.
+
+family: M10
+subcommand: checkout
+cell: checkout/composefs-name-256
+modes: bare-user
+setup: repo
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_composefs_child_name_bound_matches_the_tool
+spec: format-reference.md#composefs
+note: a child name of 256 bytes has no place in a composefs image. Both
+ switches exit 1 and write no image, and `commit --generate-composefs-metadata`
+ exits 1 and writes no commit and no ref. The tool reports `File name too long`
+ and the port names the length and the bound, so the cited test compares the
+ exit status and standard output alone (cli-surface.md, "P2"). The tree comes
+ from the tar archive `checkout/composefs-name-255` describes.
+
 # ---------------------------------------------------------------------------
 # checkout -- the union family and --allow-noent. The refusals run; the cells
 # that state a destination tree cite the test that walks both implementations'

@@ -4975,7 +4975,9 @@ impl Repo {
     /// composefs digest no `ostree` reproduces. The one EROFS field the budget
     /// leaves unbound is refused there as well: a name above 255 bytes. A
     /// symlink target that fills its inode's block reaches the same refusal
-    /// from the writer, which is where the block is measured.
+    /// from the writer, which is where the block is measured, and so does a
+    /// child name above 255 bytes, which the tool refuses with `File name too
+    /// long`.
     pub async fn export_composefs_to(&self, commit: &Checksum,
         opts: &ComposefsOptions, out: BorrowedFd<'_>) -> Result<[u8; 32]>;
     /// Compute and store `ostree.composefs.digest.v0` in the commit's metadata.
@@ -5012,12 +5014,21 @@ run one emission pass:
 /// that flushes on drop, such as a `std::io::BufWriter`, still does.
 ///
 /// A symlink states its target inline in its inode, so a target the inode's
-/// block does not hold is `Error::Unsupported`; `Symlink` states the bound. An
-/// xattr value above 65535 bytes, an xattr name suffix above 255 bytes, or an
-/// xattr area above 262148 bytes is a broken precondition of the `Directory`
-/// the caller built, and panics; `Metadata` states all three. The split is that
-/// a caller reads the xattr bounds off the values it holds, and the symlink
-/// bound off the inode the writer lays out.
+/// block does not hold is `Error::Unsupported`; `Symlink` states the bound. A
+/// child name above 255 bytes is `Error::Unsupported` too, the bound at which
+/// the tool refuses the tree, and so is a child name that is empty, is `.` or
+/// `..`, or holds `/`; `Directory::children` states the rules. An xattr value
+/// above 65535 bytes, an xattr name suffix above 255 bytes, or an xattr area
+/// above 262148 bytes is a broken precondition of the `Directory` the caller
+/// built, and panics; `Metadata` states all three. The split is that each
+/// xattr bound is the range of an EROFS length or count field, which a caller
+/// reads off the values it holds. The symlink bound comes from the inode the
+/// writer lays out. No dirent field states the length of a name, so the
+/// child-name bound is the bound of the tool, and the writer refuses it as it
+/// refuses a symlink target. The name rules take the same refusal: the writer
+/// adds the `.` and `..` entries of each directory itself, `composefs-info`
+/// loads no image that holds an empty name, and no path lookup reaches a name
+/// that holds `/`.
 pub fn write_image_to(root: &Directory, out: &mut impl std::io::Write)
     -> Result<[u8; 32], Error>;
 

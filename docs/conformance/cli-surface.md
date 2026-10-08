@@ -1335,6 +1335,17 @@ and the two orders of the pair each write the tool's image bytes over a
 `bare-user` repository
 (`ostrya_cli::cli::checkout_composefs_switches_match_the_tool`).
 
+A composefs image holds a child name of at most 255 bytes. A tar archive
+commits a longer name, which a filesystem cannot hold. At 255 bytes both
+composefs switches write the tool's image bytes, and `commit
+--generate-composefs-metadata` writes the tool's commit. At 256 bytes each of
+the three forms exits 1 in both and writes no image, no commit, and no ref
+(`ostrya_cli::cli::checkout_composefs_child_name_bound_matches_the_tool`). The
+words part, which the standing wording rule covers: the tool reports `error:
+Checking out composefs: Processing <checksum>: File name too long`, and the port
+reports `error: unsupported: a child name of 256 bytes is longer than the 255
+bytes that a composefs image holds`.
+
 The three union modes and `--allow-noent` agree with the tool over a
 destination the test pre-populates, in `archive`, `bare-user`, and `bare`
 (`ostrya_cli::cli::checkout_union_modes_match_the_tool`). Two union options on

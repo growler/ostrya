@@ -55,9 +55,9 @@ impl std::io::Write for CountingSink {
 
 /// The largest single write of the emitting pass.
 ///
-/// If each child name is at most 65535 bytes, no write is larger than the
-/// largest xattr value. The EROFS value-length field holds that length in two
-/// bytes.
+/// No write is larger than the largest xattr value that the EROFS
+/// value-length field allows. The field holds the length in two bytes, so
+/// that value is 65535 bytes.
 const MAX_WRITE: usize = u16::MAX as usize;
 
 fn fixture_dir() -> PathBuf {
@@ -227,9 +227,8 @@ fn check_fixture(stem: &str, digest_key: &str) {
         "{stem}: streamed length differs from the buffered image"
     );
     // The test checks the largest write against two limits. MAX_WRITE is the
-    // limit for a tree with short child names. Each fixture image is smaller
-    // than MAX_WRITE, so on these fixtures the image length is the limit that
-    // applies.
+    // limit for each tree. Each fixture image is smaller than MAX_WRITE, so on
+    // these fixtures the image length is the limit that applies.
     assert!(
         sink.largest <= MAX_WRITE,
         "{stem}: one write of {} bytes exceeds the largest field",

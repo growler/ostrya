@@ -104,6 +104,9 @@ pub struct Image {
 ///
 /// # Errors
 ///
+/// - [`Error::Unsupported`] if a child name is empty, is `.` or `..`, holds
+///   `/`, or is longer than 255 bytes. [`Directory::children`] gives the
+///   rules.
 /// - [`Error::Unsupported`] if a symlink target is too long for its inode
 ///   block. [`Symlink::target`] gives the limit.
 ///

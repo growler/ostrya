@@ -16,7 +16,9 @@
 //! and counts it. The sink needs no seek, and the writer gets the digest
 //! without a copy of the image.
 //!
-//! The sizing pass refuses a symlink target that does not fit its inode block.
+//! The sizing pass refuses a child name that is empty, is `.` or `..`, holds
+//! `/`, or has more than 255 bytes. It also refuses a symlink target that does
+//! not fit its inode block.
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
@@ -631,7 +633,7 @@ fn add_metadata_xattrs(set: &mut XattrSet, xattrs: &[(Vec<u8>, Vec<u8>)]) {
     }
 }
 
-fn collect(root: &Directory) -> Vec<Inode> {
+fn collect(root: &Directory) -> Result<Vec<Inode>, Error> {
     let mut c = Collector {
         inodes: Vec::new(),
         root,
@@ -643,6 +645,12 @@ fn collect(root: &Directory) -> Vec<Inode> {
     let mut dir_entries: Vec<(usize, Vec<DirEnt>)> = Vec::new();
 
     while let Some((dir, me, parent, is_root)) = queue.pop_front() {
+        // The writer makes `.`, `..`, and the whiteout stubs, so only the
+        // names of the tree need the check.
+        for name in dir.children.keys() {
+            check_name(name)?;
+        }
+
         let mut entries = vec![
             DirEnt {
                 name: b".".to_vec(),
@@ -682,7 +690,7 @@ fn collect(root: &Directory) -> Vec<Inode> {
         c.inodes[me].kind = Kind::Dir(DirData::from_entries(entries));
     }
 
-    c.inodes
+    Ok(c.inodes)
 }
 
 // --- Shared-xattr promotion ------------------------------------------------
@@ -764,6 +772,40 @@ fn share_xattrs(inodes: &mut [Inode]) -> Vec<LocalXattr> {
     }
 
     table
+}
+
+/// The maximum length in bytes of a child name.
+///
+/// The composefs image format, as the `ostree` command writes and reads it,
+/// holds a child name of at most 255 bytes.
+const MAX_NAME: usize = 255;
+
+/// Refuses a child name that the image cannot hold.
+///
+/// The check refuses a name of more than 255 bytes, an empty name, the names
+/// `.` and `..`, and a name that holds `/`. The length check comes first, so
+/// the other messages show at most 255 bytes of name.
+fn check_name(name: &[u8]) -> Result<(), Error> {
+    if name.len() > MAX_NAME {
+        return Err(Error::Unsupported(format!(
+            "a child name of {} bytes is longer than the {MAX_NAME} bytes \
+             that a composefs image holds",
+            name.len(),
+        )));
+    }
+    match name {
+        b"" => Err(Error::Unsupported("a child name is empty".to_owned())),
+        b"." | b".." => Err(Error::Unsupported(format!(
+            "a child name is `{}`, the name of an entry that the writer adds \
+             to each directory",
+            name.escape_ascii(),
+        ))),
+        _ if name.contains(&b'/') => Err(Error::Unsupported(format!(
+            "a child name `{}` holds `/`, so it is not one path component",
+            name.escape_ascii(),
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Refuses a symlink whose inode header, xattrs, and target fill a block.
@@ -1055,7 +1097,7 @@ pub(crate) struct Plan {
 
 /// Builds the inode list of the tree at `root` and runs the sizing pass.
 pub(crate) fn plan(root: &Directory) -> Result<Plan, Error> {
-    let mut inodes = collect(root);
+    let mut inodes = collect(root)?;
 
     // The root is opaque, as in the images of the composefs image writer.
     inodes[0].xattrs.add(XATTR_OPAQUE_ROOT, b"y");
@@ -1164,8 +1206,8 @@ pub(crate) fn emit(plan: &Plan, out: &mut impl Write) -> io::Result<[u8; 32]> {
 /// [`std::io::BufWriter`]. The writer only appends, so the sink needs no seek.
 /// The image never exists as a whole in memory.
 ///
-/// If each child name is at most 65535 bytes, one write holds at most 65535
-/// bytes. This limit is the range of the EROFS length field of an xattr value.
+/// One write holds at most 65535 bytes. This limit is the range of the EROFS
+/// length field of an xattr value.
 /// The superblock is one write of 128 bytes. The writer writes padding in
 /// pieces of at most 4096 bytes.
 ///
@@ -1176,6 +1218,9 @@ pub(crate) fn emit(plan: &Plan, out: &mut impl Write) -> io::Result<[u8; 32]> {
 ///
 /// # Errors
 ///
+/// - [`Error::Unsupported`] if a child name is empty, is `.` or `..`, holds
+///   `/`, or is longer than 255 bytes. [`Directory::children`] gives the
+///   rules.
 /// - [`Error::Unsupported`] if a symlink target is too long for its inode
 ///   block. [`Symlink::target`] gives the limit.
 /// - [`Error::Io`] with the first error of `out`, if a write or the flush
@@ -1313,6 +1358,115 @@ mod tests {
         plan(&tree_with_symlink(BLOCK - 32 - 20, xattrs))
             .map(|_| ())
             .expect_err("4044 bytes do not fit");
+    }
+
+    /// Returns `small_tree` plus one empty regular file named `name`.
+    fn tree_with_name(name: &[u8]) -> Directory {
+        let mut root = small_tree();
+        root.insert(
+            name,
+            Node::Regular(Regular {
+                meta: Metadata {
+                    mode: 0o100644,
+                    ..Default::default()
+                },
+                content: Content::Empty,
+            }),
+        );
+        root
+    }
+
+    /// A name that does not fit one directory block is refused.
+    #[test]
+    fn a_name_longer_than_a_directory_block_is_refused() {
+        let err = plan(&tree_with_name(&[b'n'; BLOCK - 11]))
+            .map(|_| ())
+            .expect_err("a 4085-byte name is refused");
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "the writer refused with {err:?}"
+        );
+    }
+
+    /// A child name fits at 255 bytes and does not fit at 256 bytes.
+    #[test]
+    fn a_name_of_256_bytes_is_refused() {
+        let root = tree_with_name(&[b'n'; MAX_NAME]);
+        plan(&root).expect("255 bytes fit");
+        crate::build_image(&root).expect("a 255-byte name has an image");
+
+        let err = plan(&tree_with_name(&[b'n'; MAX_NAME + 1]))
+            .map(|_| ())
+            .expect_err("256 bytes do not fit");
+        let text = err.to_string();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "the writer refused with {err:?}"
+        );
+        assert!(
+            text.contains("256 bytes") && text.contains("255 bytes"),
+            "the refusal names the length and the bound: {text}"
+        );
+    }
+
+    /// Plans `root` and returns the message of its `Unsupported` refusal.
+    fn refusal(root: &Directory) -> String {
+        match plan(root).map(|_| ()) {
+            Err(Error::Unsupported(msg)) => msg,
+            other => panic!("the writer did not refuse with Unsupported: {other:?}"),
+        }
+    }
+
+    /// An empty child name is refused.
+    #[test]
+    fn an_empty_name_is_refused() {
+        let msg = refusal(&tree_with_name(b""));
+        assert!(msg.contains("empty"), "the refusal names the form: {msg}");
+    }
+
+    /// A child named `.` is refused.
+    #[test]
+    fn a_name_of_one_dot_is_refused() {
+        let msg = refusal(&tree_with_name(b"."));
+        assert!(msg.contains("`.`"), "the refusal names the form: {msg}");
+    }
+
+    /// A child named `..` is refused.
+    #[test]
+    fn a_name_of_two_dots_is_refused() {
+        let msg = refusal(&tree_with_name(b".."));
+        assert!(msg.contains("`..`"), "the refusal names the form: {msg}");
+    }
+
+    /// A child name that holds `/` is refused.
+    #[test]
+    fn a_name_with_a_slash_is_refused() {
+        let msg = refusal(&tree_with_name(b"a/b"));
+        assert!(msg.contains("`a/b`"), "the refusal names the name: {msg}");
+    }
+
+    /// The check runs in each directory, so a bad name below the root is
+    /// refused.
+    #[test]
+    fn a_bad_name_in_a_subdirectory_is_refused() {
+        let mut sub = Directory::new(Metadata {
+            mode: 0o040755,
+            ..Default::default()
+        });
+        sub.insert("..", Node::Directory(Directory::new(sub.meta.clone())));
+        let mut root = small_tree();
+        root.insert("sub", Node::Directory(sub));
+        let msg = refusal(&root);
+        assert!(msg.contains("`..`"), "the refusal names the form: {msg}");
+    }
+
+    /// The names `...`, `.a`, `a.`, and `a\b` are each one path component, so
+    /// the writer keeps them.
+    #[test]
+    fn a_name_with_dots_is_kept() {
+        for name in [&b"..."[..], b".a", b"a.", b"a\\b"] {
+            plan(&tree_with_name(name)).expect("the name is one path component");
+        }
     }
 
     /// If an inode has more repeated xattrs than the cap, it references the

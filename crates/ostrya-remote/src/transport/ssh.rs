@@ -1,6 +1,7 @@
 //! The ssh transport: the address parser, the options of the ssh client, the
 //! command line, and the child process of the ssh client.
 
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fmt;
 use std::time::Duration;
@@ -28,19 +29,21 @@ fn invalid(msg: impl Into<String>) -> Error {
 /// - `ssh://[USER@]HOST[:PORT]/~/RELATIVE/PATH`. The client removes the `/~/`
 ///   prefix and sends `RELATIVE/PATH`. The remote side resolves it in the
 ///   home directory of the ssh session.
-/// - `[USER@]HOST:PATH`, the scp form. If `PATH` starts with `/`, it is
-///   absolute. Otherwise it is relative to the remote home directory. The
-///   client removes a leading `~/`.
+/// - `[USER@]HOST:PATH`, the scp form. A `PATH` that starts with `~/` or
+///   `/~/` is relative to the remote home directory, and the client removes
+///   that prefix. Each other `PATH` that starts with `/`, apart from `/~`
+///   and `/~USER`, is absolute, for example `/./~x/r` and `/srv/~/r`. Any
+///   other `PATH` is relative to the remote home directory.
 ///
 /// After a `/~/` or a `~/` prefix, the client also removes each leading `/` of
 /// the path. The path then stays relative to the home directory.
 ///
-/// In the scp form, the first `:` outside brackets ends the host, as git reads
-/// the form. For example, `u:p@host:path` gives the host `u` and the path
-/// `p@host:path`, so the scp form cannot give a user that holds `:`. An IPv6
-/// host needs brackets: `fe80::1:repo` gives the host `fe80`, and
-/// `[fe80::1]:repo` gives the host `fe80::1`. ssh gets a bracketed host
-/// without the brackets.
+/// In the scp form, the first `:` outside brackets ends the host, and a leading
+/// `/~` of the path is the home prefix, as git reads the form. For example,
+/// `u:p@host:path` gives the host `u` and the path `p@host:path`, so the scp
+/// form cannot give a user that holds `:`. An IPv6 host needs brackets:
+/// `fe80::1:repo` gives the host `fe80`, and `[fe80::1]:repo` gives the host
+/// `fe80::1`. ssh gets a bracketed host without the brackets.
 ///
 /// A user holds ASCII letters, digits, `.`, `-`, and `_` alone. A host holds
 /// the same characters, or it is a bracketed IPv6 address. A bracketed address
@@ -57,7 +60,7 @@ fn invalid(msg: impl Into<String>) -> Error {
 /// - a port that is not a number from 1 to 65535
 /// - more than one `@`
 /// - a `USER:PASSWORD@` user in the `ssh://` form
-/// - a path of the form `~` or `~USER`
+/// - a path of the form `~` or `~USER`, and in the scp form `/~` or `/~USER`
 /// - a stray or an unclosed bracket in the host
 /// - in the scp form, a `/` before the `:` that ends the host
 /// - an address with no `ssh://` prefix and no `:` outside brackets
@@ -93,9 +96,10 @@ impl SshAddress {
     /// # Errors
     ///
     /// - [`Error::InvalidInput`] if `address` is not one of the forms, or if
-    ///   the parse refuses a part of it. The message holds the address and the
-    ///   reason. The refusal of an `http://` or an `https://` address does not
-    ///   show the address, because the address can hold userinfo.
+    ///   the parse refuses a part of it. The message holds the reason and the
+    ///   address without the text up to its last `@`, so it shows no user and
+    ///   no password. The refusal of an `http://` or an `https://` address does
+    ///   not show the address, because the address can hold userinfo.
     ///
     /// # Examples
     ///
@@ -115,9 +119,11 @@ impl SshAddress {
     ///
     /// If `windows` is `true`, the call refuses a scp-form address that names
     /// a local path: a one-letter host, or a `\` before the first `:`. A
-    /// refusal is [`Error::InvalidInput`] with the address and the reason.
+    /// refusal is [`Error::InvalidInput`] with the reason and the address
+    /// without the text up to its last `@`.
     pub(super) fn parse_with(address: &str, windows: bool) -> Result<SshAddress> {
-        let bad = |why: &str| invalid(format!("address '{address}': {why}"));
+        // The userinfo can hold a password, so no message shows it.
+        let bad = |why: &str| invalid(format!("address '{}': {why}", without_userinfo(address)));
         if let Some(rest) = address.strip_prefix("ssh://") {
             let (authority, path) = match rest.find('/') {
                 Some(i) => rest.split_at(i),
@@ -157,7 +163,9 @@ impl SshAddress {
         {
             return Err(bad("a one-letter host is a local path on Windows"));
         }
-        let path = match path.strip_prefix('~') {
+        // A leading `/~` is the home prefix too, as git reads the scp form.
+        let home = path.strip_prefix('~').or_else(|| path.strip_prefix("/~"));
+        let path = match home {
             Some(home) => home_relative(home).map_err(&bad)?,
             None => path,
         };
@@ -231,15 +239,27 @@ impl SshAddress {
 
 /// Writes the address in the `ssh://` form.
 ///
-/// A path that is relative to the home directory gets the `/~/` prefix, and an
-/// IPv6 host gets brackets.
+/// A path that is relative to the home directory gets the `/~/` prefix. A host
+/// that holds `:` or `%` gets brackets. The parse of the output gives an equal
+/// address.
+///
+/// # Examples
+///
+/// ```
+/// use ostrya_remote::transport::SshAddress;
+/// # fn main() -> ostrya_remote::Result<()> {
+/// let address = SshAddress::parse("host:/~/repos/os")?;
+/// assert_eq!(address.to_string(), "ssh://host/~/repos/os");
+/// assert_eq!(SshAddress::parse(&address.to_string())?, address);
+/// # Ok(()) }
+/// ```
 impl fmt::Display for SshAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ssh://")?;
         if let Some(user) = &self.user {
             write!(f, "{user}@")?;
         }
-        if self.host.contains(':') {
+        if self.host.contains([':', '%']) {
             write!(f, "[{}]", self.host)?;
         } else {
             f.write_str(&self.host)?;
@@ -330,6 +350,30 @@ fn split_user(s: &str) -> std::result::Result<(Option<&str>, &str), &'static str
         Some((_, rest)) if rest.contains('@') => Err("the address holds more than one '@'"),
         Some((user, rest)) => Ok((Some(user), rest)),
     }
+}
+
+/// Returns `address` without its userinfo, for a message.
+///
+/// A password can hold any character, `/` and `:` among them, so the end of
+/// the userinfo is not known before the parse. The function leaves out all
+/// text up to the last `@`. It keeps a `SCHEME://` prefix before that `@`
+/// when `SCHEME` is a valid URI scheme: an ASCII letter, then ASCII letters,
+/// digits, `+`, `-`, and `.`. Other text before `://` can be a part of the
+/// userinfo, so the function does not keep it.
+fn without_userinfo(address: &str) -> Cow<'_, str> {
+    let Some(at) = address.rfind('@') else {
+        return Cow::Borrowed(address);
+    };
+    let is_scheme = |s: &str| {
+        let mut chars = s.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    };
+    let scheme = match address[..at].find("://") {
+        Some(end) if is_scheme(&address[..end]) => &address[..end + 3],
+        _ => "",
+    };
+    Cow::Owned(format!("{scheme}{}", &address[at + 1..]))
 }
 
 /// A host of an address, without the brackets of an IPv6 address.

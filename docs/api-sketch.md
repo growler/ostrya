@@ -3595,7 +3595,8 @@ address gives `Endpoint::Http` with `FetcherOptions::new` of the address.
 Each other address gives `Endpoint::Ssh` with the default `SshOptions`.
 `SshAddress::parse` reads the ssh forms alone, and it refuses an `http://`
 or `https://` address with a message that does not show the address. The
-`Display` of an `SshAddress` writes the `ssh://` form. `SshOptions` holds
+`Display` of an `SshAddress` writes the `ssh://` form, and the parse of that
+form gives an equal address. `SshOptions` holds
 `command`, `config_command`, and `remote_command`. The ssh command is
 `SshOptions::command`, then the `OSTRYA_SSH_COMMAND` environment variable,
 then `SshOptions::config_command`, then `ssh`. `config_command` holds the
@@ -3617,10 +3618,12 @@ and the remote side runs `ostrya receive`.
 
 - The addresses are `ssh://[USER@]HOST[:PORT]/PATH`,
   `ssh://[USER@]HOST[:PORT]/~/PATH`, and the scp form `[USER@]HOST:PATH`. A
-  `/~/` or a scp-form `~/` prefix is removed, and so is each `/` that
-  follows it, so the path is relative to the remote home directory. The
-  path is quoted with POSIX single quotes.
-- In the scp form the first `:` ends the host, as git reads the form:
+  `/~/` prefix, or a scp-form `~/` or `/~/` prefix, is removed, and so is
+  each `/` that follows it, so the path is relative to the remote home
+  directory. Each other path that starts with `/`, apart from `/~` and
+  `/~USER`, is absolute. The path is quoted with POSIX single quotes.
+- In the scp form the first `:` ends the host, and a leading `/~` of the
+  path is the home prefix, as git reads the form:
   `u:p@host:path` gives the host `u`, so the scp form cannot give a user
   with `:`. An IPv6 host needs brackets: `fe80::1:repo` gives the host
   `fe80`, and `[fe80::1]:repo` gives `fe80::1`.
@@ -3630,9 +3633,11 @@ and the remote side runs `ostrya receive`.
   other character, which includes control characters, whitespace, and shell
   metacharacters.
 - The parser also refuses a user or a host that starts with `-`, an empty
-  part, a bad port, more than one `@`, a `~USER` path, and a scheme other
-  than `ssh`, `http`, and `https`. In the `ssh://` form it refuses a
-  `USER:PASSWORD@` user.
+  part, a bad port, more than one `@`, a `~USER` path (`/~USER` in the scp
+  form too), and a scheme other than `ssh`, `http`, and `https`. In the
+  `ssh://` form it refuses a `USER:PASSWORD@` user.
+- A refusal of an ssh address shows the address without the text up to its
+  last `@`, so it shows no user and no password.
 - On Windows it refuses a scp-form address that names a local path: a host
   of one ASCII letter, and a `\` before the first `:`.
 - `SSH_COMMAND` is `ConnectOptions::ssh_command`, then the
@@ -3745,7 +3750,7 @@ impl PushRemote {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SshAddress { user, host, port, path }   // Display: the ssh:// form
+pub struct SshAddress { user, host, port, path }   // Display: the ssh:// form; parses back
 
 impl SshAddress {
     pub fn parse(address: &str) -> Result<SshAddress>;   // the ssh forms alone

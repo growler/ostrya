@@ -40,7 +40,8 @@ const PENDING_READ_LIMIT: Duration = Duration::from_secs(5);
 /// # ssh addresses
 ///
 /// An address that does not start with `http://` or `https://` is an ssh
-/// address. Its forms and rules are the forms and rules of [`SshAddress`].
+/// address. Its forms and rules are the forms and rules of [`SshAddress`]. A
+/// refusal does not show the userinfo.
 ///
 /// # HTTP addresses
 ///
@@ -128,8 +129,7 @@ impl Endpoint {
     /// - [`Error::InvalidInput`] if `address` is not one of the
     ///   [ssh forms](SshAddress#forms) or the
     ///   [HTTP forms](PushRemote#http-addresses), or if the parse refuses a
-    ///   part of it. The refusal of an address that starts with `http://` or
-    ///   `https://` does not show the userinfo.
+    ///   part of it. No refusal shows the userinfo of the address.
     ///
     /// # Examples
     ///

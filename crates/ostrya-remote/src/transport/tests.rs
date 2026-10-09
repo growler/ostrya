@@ -86,6 +86,7 @@ fn each_address_form_gives_its_command_line() {
 fn the_home_prefix_is_removed() {
     assert_eq!(ssh("ssh://h/~/a/b"), ssh("h:a/b"));
     assert_eq!(ssh("h:~/a"), ssh("h:a"));
+    assert_eq!(ssh("h:/~/a/b"), ssh("ssh://h/~/a/b"));
     assert_eq!(ssh("ssh://h/a/b").to_string(), "ssh://h/a/b");
     assert_eq!(ssh("h:a/b").to_string(), "ssh://h/~/a/b");
     assert_eq!(ssh("ssh://u@[::1]:7/x").to_string(), "ssh://u@[::1]:7/x");
@@ -227,8 +228,8 @@ fn malformed_addresses_are_refused() {
     }
 }
 
-/// A refusal names the address that it refuses. The push and the pull get
-/// the same refusal.
+/// A refusal names the address that it refuses, without its userinfo. The
+/// push and the pull get the same refusal.
 #[test]
 fn a_refusal_names_the_address() {
     assert_eq!(
@@ -241,6 +242,100 @@ fn a_refusal_names_the_address() {
         "address 'dir/host:r': not an address"
     );
     assert!(refused("http://", false).starts_with("address: "));
+    assert_eq!(
+        refused("ssh://u:pw@h/r", false),
+        "address 'ssh://h/r': the user holds ':'"
+    );
+    assert_eq!(
+        refused("HTTPS://user:pw@h/r", false),
+        "address 'HTTPS://h/r': the scheme is not supported"
+    );
+    assert_eq!(
+        refused("a@b@host:r", false),
+        "address 'host:r': the address holds more than one '@'"
+    );
+    assert_eq!(
+        refused("alice:s3cret://x@host:repo", false),
+        "address 'host:repo': the scheme is not supported"
+    );
+}
+
+/// The scp form reads a leading `/~` of its path as the home prefix, as git
+/// reads the form. Each other path that starts with `/` stays absolute.
+#[test]
+fn the_scp_form_reads_a_leading_slash_tilde_as_the_home_prefix() {
+    for windows in [false, true] {
+        let ssh = |address: &str| match parse_remote(address, windows) {
+            Ok(PushRemote {
+                inner: RemoteAddr::Ssh(addr),
+            }) => addr,
+            other => panic!("{address} windows={windows}: {other:?}"),
+        };
+        let reason = |address: &str| {
+            let msg = refused(address, windows);
+            match msg.split_once("': ") {
+                Some((_, reason)) => reason.to_owned(),
+                None => panic!("{address}: {msg}"),
+            }
+        };
+        assert_eq!(ssh("host:/~/r"), ssh("ssh://host/~/r"));
+        assert_eq!(ssh("host:/~/r"), ssh("host:r"));
+        assert_eq!(ssh("host:/~//r"), ssh("host:r"));
+        assert_eq!(ssh("u@[::1]:/~/r"), ssh("ssh://u@[::1]/~/r"));
+        assert_eq!(ssh("ab:/~/r").to_string(), "ssh://ab/~/r");
+        assert_eq!(ssh("[C]:/~/r").to_string(), "ssh://C/~/r");
+        for (scp, url) in [
+            ("host:/~x/r", "ssh://host/~x/r"),
+            ("host:/~", "ssh://host/~"),
+            ("u@host:/~x", "ssh://u@host/~x"),
+        ] {
+            assert_eq!(reason(scp), reason(url), "{scp} windows={windows}");
+        }
+        let msg = refused("host:/~/", windows);
+        assert!(msg.contains("path is empty"), "{msg}");
+        for (address, shown) in [
+            ("host:/./~x/r", "ssh://host/./~x/r"),
+            ("host:/srv/~/r", "ssh://host/srv/~/r"),
+        ] {
+            assert_eq!(ssh(address).to_string(), shown, "windows={windows}");
+        }
+        // A scp path that starts with `//` puts `://` in the address, so the
+        // parse reads a scheme.
+        assert_eq!(reason("host://~/r"), "the scheme is not supported");
+    }
+    for address in ["C:/~/r", "C:/~x/r"] {
+        let msg = refused(address, true);
+        assert!(msg.contains("local path"), "{address}: {msg}");
+    }
+    assert_eq!(ssh("C:/~/r"), ssh("ssh://C/~/r"));
+    let msg = refused("C:/~x/r", false);
+    assert!(msg.contains("~USER"), "{msg}");
+}
+
+/// No refusal shows the user or the password of an address. The message
+/// shows the address without the text up to its last `@`.
+#[test]
+fn no_refusal_shows_the_userinfo_of_an_address() {
+    let both = SECRET.iter().flat_map(|a| [(*a, false), (*a, true)]);
+    let windows_only = SECRET_ON_WINDOWS.iter().map(|a| (*a, true));
+    for (address, windows) in both.chain(windows_only) {
+        let results = [
+            ("PushRemote", parse_remote(address, windows).map(drop)),
+            ("Endpoint", parse_endpoint(address, windows).map(drop)),
+            (
+                "SshAddress",
+                SshAddress::parse_with(address, windows).map(drop),
+            ),
+        ];
+        for (name, result) in results {
+            match result {
+                Err(Error::InvalidInput(msg)) => {
+                    assert!(!msg.contains("QXZ"), "{name} {address:?}: {msg}");
+                }
+                other => panic!("{name} {address:?} windows={windows}: {other:?}"),
+            }
+        }
+    }
 }
 
 #[test]
@@ -297,151 +392,239 @@ enum Want {
     Refused,
 }
 
+use Want::{Http, Refused, Ssh};
+
+/// The addresses of the address tests, with the `windows` value of the parse
+/// and the result.
+const ROWS: &[(&str, bool, Want)] = &[
+    // The forms and their command lines.
+    ("ssh://host/srv/repo", false, Ssh),
+    ("ssh://me@host:2222/srv/repo", false, Ssh),
+    ("ssh://host/~/repos/a", false, Ssh),
+    ("ssh://me@[::1]:22/r", false, Ssh),
+    ("ssh://[::1]/r", false, Ssh),
+    ("host:repo", false, Ssh),
+    ("me@host:/srv/repo", false, Ssh),
+    ("host:~/repo", false, Ssh),
+    ("[::1]:repo", false, Ssh),
+    ("me@[fe80::1]:a:b", false, Ssh),
+    ("C:repo", false, Ssh),
+    ("host:%41", false, Ssh),
+    // The home prefix.
+    ("ssh://h/~/a/b", false, Ssh),
+    ("h:a/b", false, Ssh),
+    ("h:~/a", false, Ssh),
+    ("h:a", false, Ssh),
+    ("ssh://h/a/b", false, Ssh),
+    ("ssh://u@[::1]:7/x", false, Ssh),
+    ("host:~//etc/repo", false, Ssh),
+    ("host:etc/repo", false, Ssh),
+    ("ssh://host/~//etc/repo", false, Ssh),
+    ("ssh://host/~///etc/repo", false, Ssh),
+    ("host:~//", false, Refused),
+    ("ssh://host/~//", false, Refused),
+    ("host:~///", false, Refused),
+    // The first `:` of the scp form.
+    ("u:p@host:path", false, Ssh),
+    ("fe80::1:repo", false, Ssh),
+    ("[fe80::1]:repo", false, Ssh),
+    ("ssh://u:p@host/r", false, Refused),
+    // The characters of a host and of a user.
+    ("ssh://ho st/p", false, Refused),
+    ("ssh://h?x/p", false, Refused),
+    ("ssh://h;x/p", false, Refused),
+    ("ssh://$(x)/p", false, Refused),
+    ("ssh://h\nx/p", false, Refused),
+    ("ssh://h\tx/p", false, Refused),
+    ("ssh://h`x`/p", false, Refused),
+    ("ssh://h|x/p", false, Refused),
+    ("ssh://h&x/p", false, Refused),
+    ("ssh://h'x/p", false, Refused),
+    ("ssh://h\\x/p", false, Refused),
+    ("ssh://u x@h/p", false, Refused),
+    ("ssh://u;x@h/p", false, Refused),
+    ("ssh://$(u)@h/p", false, Refused),
+    ("ssh://u\n@h/p", false, Refused),
+    ("ssh://[::1;x]/p", false, Refused),
+    ("ssh://[::1 ]/p", false, Refused),
+    ("ssh://[fe80::1%e$x]/p", false, Refused),
+    ("ssh://[g::1]/p", false, Refused),
+    ("ho st:p", false, Refused),
+    ("h?x:p", false, Refused),
+    ("h;x:p", false, Refused),
+    ("$(x):p", false, Refused),
+    ("h\nx:p", false, Refused),
+    ("h\tx:p", false, Refused),
+    ("u x@h:p", false, Refused),
+    ("u;x@h:p", false, Refused),
+    ("$(u)@h:p", false, Refused),
+    ("u\t@h:p", false, Refused),
+    ("[::1;x]:p", false, Refused),
+    ("ssh://my-host.example_1/p", false, Ssh),
+    ("ssh://u.s-e_r@h/p", false, Ssh),
+    ("ssh://[fe80::1%eth0]/p", false, Ssh),
+    ("ssh://[::ffff:192.0.2.1]:22/p", false, Ssh),
+    ("my-host.example_1:p", false, Ssh),
+    ("u.s-e_r@h:p", false, Ssh),
+    ("[fe80::1%eth0]:p", false, Ssh),
+    // A backslash before the first `:`.
+    ("..\\dir:x", true, Refused),
+    ("..\\dir:x", false, Refused),
+    ("\\\\?\\C:\\repo", true, Refused),
+    ("\\\\?\\C:\\repo", false, Refused),
+    ("dir\\sub:x", true, Refused),
+    ("dir\\sub:x", false, Refused),
+    // Malformed addresses.
+    ("ssh://-oProxyCommand=x/r", false, Refused),
+    ("ssh://-u@host/r", false, Refused),
+    ("-oProxyCommand=x:r", false, Refused),
+    ("-u@host:r", false, Refused),
+    ("ssh://host", false, Refused),
+    ("ssh:///r", false, Refused),
+    ("ssh://@host/r", false, Refused),
+    ("ssh://host:/r", false, Refused),
+    ("ssh://host:0/r", false, Refused),
+    ("ssh://host:65536/r", false, Refused),
+    ("ssh://host:22x/r", false, Refused),
+    ("ssh://u:pw@host/r", false, Refused),
+    ("ssh://a@b@host/r", false, Refused),
+    ("ssh://host/~", false, Refused),
+    ("ssh://host/~/", false, Refused),
+    ("ssh://host/~user/r", false, Refused),
+    ("ssh://[::1/r", false, Refused),
+    ("ssh://[::1]x/r", false, Refused),
+    ("host:", false, Refused),
+    ("host:~", false, Refused),
+    ("host:~user/r", false, Refused),
+    ("a@b@host:r", false, Refused),
+    ("@host:r", false, Refused),
+    (":r", false, Refused),
+    ("[::1:r", false, Refused),
+    ("ho]st:r", false, Refused),
+    ("file:///srv/repo", false, Refused),
+    ("ftp://host/r", false, Refused),
+    ("/srv/repo", false, Refused),
+    ("repo", false, Refused),
+    ("dir/host:r", false, Refused),
+    ("http://", false, Refused),
+    // A one-letter host on Windows.
+    ("C:\\repo", true, Refused),
+    ("C:\\repo", false, Ssh),
+    ("C:repo", true, Refused),
+    ("c:/repo", true, Refused),
+    ("c:/repo", false, Ssh),
+    ("u@C:repo", true, Refused),
+    ("u@C:repo", false, Ssh),
+    ("ssh://C/repo", true, Ssh),
+    ("ab:repo", true, Ssh),
+    ("[C]:repo", true, Ssh),
+    // A leading `/~` of the scp path, and a zone in a bracketed host.
+    ("host:/~/r", false, Ssh),
+    ("host:/~/r", true, Ssh),
+    ("host:/~//r", false, Ssh),
+    ("host:/~//r", true, Ssh),
+    ("u@[::1]:/~/r", false, Ssh),
+    ("u@[::1]:/~/r", true, Ssh),
+    ("host:/./~x/r", false, Ssh),
+    ("host:/./~x/r", true, Ssh),
+    ("host:/srv/~/r", false, Ssh),
+    ("host:/srv/~/r", true, Ssh),
+    ("ab:/~/r", false, Ssh),
+    ("ab:/~/r", true, Ssh),
+    ("[C]:/~/r", false, Ssh),
+    ("[C]:/~/r", true, Ssh),
+    ("ssh://host/~/r", false, Ssh),
+    ("host:r", false, Ssh),
+    ("ssh://u@[::1]/~/r", false, Ssh),
+    ("h:/~/a/b", false, Ssh),
+    ("C:/~/r", false, Ssh),
+    ("ssh://C/~/r", false, Ssh),
+    ("[fe80%eth0]:r", false, Ssh),
+    ("ssh://[fe80%eth0]/r", false, Ssh),
+    ("ssh://h/srv/my repo's", false, Ssh),
+    ("ssh://user-QXZ@h/srv/repo", false, Ssh),
+    ("ssh://me@host:2222/srv/it's repo", false, Ssh),
+    ("host:/~x/r", false, Refused),
+    ("host:/~x/r", true, Refused),
+    ("host:/~", false, Refused),
+    ("host:/~", true, Refused),
+    ("host://~/r", false, Refused),
+    ("host://~/r", true, Refused),
+    ("host:/~/", false, Refused),
+    ("host:/~/", true, Refused),
+    ("C:/~x/r", false, Refused),
+    ("C:/~x/r", true, Refused),
+    ("C:/~/r", true, Refused),
+    ("u@C:/~/r", true, Refused),
+    // HTTP addresses.
+    ("http://h/repo", false, Http),
+    ("https://h:8443/repo", false, Http),
+    ("http://127.0.0.1:8080/", false, Http),
+    ("https://[::1]/", false, Http),
+    ("https://h", false, Http),
+    ("http://h:080/", false, Http),
+    ("https://:443/r", false, Refused),
+    ("https://user:pw-QXZ@h/r", false, Refused),
+    ("https://h/r?x=1", false, Refused),
+    ("https://h/r#frag", false, Refused),
+    ("https://h:65536/r", false, Refused),
+    ("http://h:port/r", false, Refused),
+    ("https://user:443/pw-QXZ@h/repo", false, Refused),
+    ("https://user:1234?pw-QXZ@h/", false, Refused),
+    ("http://h:+80/", false, Refused),
+];
+
+/// Addresses with userinfo that each parse refuses, with `windows` set to
+/// `false` and to `true`. `QXZ` marks the user and the password.
+const SECRET: &[&str] = &[
+    "HTTPS://user-QXZ:pw-QXZ@h/r",
+    "HTTP://user-QXZ@h/r",
+    "SSH://user-QXZ:pw-QXZ@h/r",
+    "Ssh://user-QXZ@h/r",
+    "ftp://user-QXZ:pw-QXZ@h/r",
+    "file://user-QXZ@h/r",
+    "https://user-QXZ:pw-QXZ@h/r",
+    "http://user-QXZ@h/r",
+    "ssh://user-QXZ:pw-QXZ@h/r",
+    "ssh://user-QXZ@h",
+    "ssh://user-QXZ@h:0/r",
+    "ssh://user-QXZ:p/w-QXZ@h/r",
+    "ssh://user-QXZ:p?w-QXZ@h/r",
+    "ssh://user-QXZ:pw@QXZ@h/r",
+    "ssh://-user-QXZ@h/r",
+    "ssh://user QXZ@h/r",
+    "ssh://user-QXZ@h/~x/r",
+    "ssh://user-QXZ@h/~/",
+    "ssh://user-QXZ@[::1/r",
+    "user-QXZ@h:",
+    "user-QXZ@h:~x/r",
+    "user-QXZ@h:/~x/r",
+    "user-QXZ@h:/~",
+    "user-QXZ@@h:r",
+    "a@user-QXZ@h:r",
+    "user-QXZ@-h:r",
+    "user-QXZ@h;x:r",
+    "user QXZ@h:r",
+    "user;QXZ:pw-QXZ@h:r",
+    "user-QXZ@[::1:r",
+    "user-QXZ@host",
+    "dir/user-QXZ@h:r",
+    "user-QXZ:pw-QXZ://x@h:r",
+    "user-QXZ:pw-QXZ://x@h/r",
+];
+
+/// Addresses with userinfo that each parse refuses on Windows alone.
+const SECRET_ON_WINDOWS: &[&str] = &["user-QXZ@C:repo", "user-QXZ@dir\\x:r"];
+
 /// `Endpoint::parse` and `PushRemote::parse` accept and refuse the same
 /// addresses, and each address gives the same transport.
 #[test]
 fn an_endpoint_parses_each_address_as_a_push_remote_does() {
-    use Want::{Http, Refused, Ssh};
-    let rows: &[(&str, bool, Want)] = &[
-        // The forms and their command lines.
-        ("ssh://host/srv/repo", false, Ssh),
-        ("ssh://me@host:2222/srv/repo", false, Ssh),
-        ("ssh://host/~/repos/a", false, Ssh),
-        ("ssh://me@[::1]:22/r", false, Ssh),
-        ("ssh://[::1]/r", false, Ssh),
-        ("host:repo", false, Ssh),
-        ("me@host:/srv/repo", false, Ssh),
-        ("host:~/repo", false, Ssh),
-        ("[::1]:repo", false, Ssh),
-        ("me@[fe80::1]:a:b", false, Ssh),
-        ("C:repo", false, Ssh),
-        ("host:%41", false, Ssh),
-        // The home prefix.
-        ("ssh://h/~/a/b", false, Ssh),
-        ("h:a/b", false, Ssh),
-        ("h:~/a", false, Ssh),
-        ("h:a", false, Ssh),
-        ("ssh://h/a/b", false, Ssh),
-        ("ssh://u@[::1]:7/x", false, Ssh),
-        ("host:~//etc/repo", false, Ssh),
-        ("host:etc/repo", false, Ssh),
-        ("ssh://host/~//etc/repo", false, Ssh),
-        ("ssh://host/~///etc/repo", false, Ssh),
-        ("host:~//", false, Refused),
-        ("ssh://host/~//", false, Refused),
-        ("host:~///", false, Refused),
-        // The first `:` of the scp form.
-        ("u:p@host:path", false, Ssh),
-        ("fe80::1:repo", false, Ssh),
-        ("[fe80::1]:repo", false, Ssh),
-        ("ssh://u:p@host/r", false, Refused),
-        // The characters of a host and of a user.
-        ("ssh://ho st/p", false, Refused),
-        ("ssh://h?x/p", false, Refused),
-        ("ssh://h;x/p", false, Refused),
-        ("ssh://$(x)/p", false, Refused),
-        ("ssh://h\nx/p", false, Refused),
-        ("ssh://h\tx/p", false, Refused),
-        ("ssh://h`x`/p", false, Refused),
-        ("ssh://h|x/p", false, Refused),
-        ("ssh://h&x/p", false, Refused),
-        ("ssh://h'x/p", false, Refused),
-        ("ssh://h\\x/p", false, Refused),
-        ("ssh://u x@h/p", false, Refused),
-        ("ssh://u;x@h/p", false, Refused),
-        ("ssh://$(u)@h/p", false, Refused),
-        ("ssh://u\n@h/p", false, Refused),
-        ("ssh://[::1;x]/p", false, Refused),
-        ("ssh://[::1 ]/p", false, Refused),
-        ("ssh://[fe80::1%e$x]/p", false, Refused),
-        ("ssh://[g::1]/p", false, Refused),
-        ("ho st:p", false, Refused),
-        ("h?x:p", false, Refused),
-        ("h;x:p", false, Refused),
-        ("$(x):p", false, Refused),
-        ("h\nx:p", false, Refused),
-        ("h\tx:p", false, Refused),
-        ("u x@h:p", false, Refused),
-        ("u;x@h:p", false, Refused),
-        ("$(u)@h:p", false, Refused),
-        ("u\t@h:p", false, Refused),
-        ("[::1;x]:p", false, Refused),
-        ("ssh://my-host.example_1/p", false, Ssh),
-        ("ssh://u.s-e_r@h/p", false, Ssh),
-        ("ssh://[fe80::1%eth0]/p", false, Ssh),
-        ("ssh://[::ffff:192.0.2.1]:22/p", false, Ssh),
-        ("my-host.example_1:p", false, Ssh),
-        ("u.s-e_r@h:p", false, Ssh),
-        ("[fe80::1%eth0]:p", false, Ssh),
-        // A backslash before the first `:`.
-        ("..\\dir:x", true, Refused),
-        ("..\\dir:x", false, Refused),
-        ("\\\\?\\C:\\repo", true, Refused),
-        ("\\\\?\\C:\\repo", false, Refused),
-        ("dir\\sub:x", true, Refused),
-        ("dir\\sub:x", false, Refused),
-        // Malformed addresses.
-        ("ssh://-oProxyCommand=x/r", false, Refused),
-        ("ssh://-u@host/r", false, Refused),
-        ("-oProxyCommand=x:r", false, Refused),
-        ("-u@host:r", false, Refused),
-        ("ssh://host", false, Refused),
-        ("ssh:///r", false, Refused),
-        ("ssh://@host/r", false, Refused),
-        ("ssh://host:/r", false, Refused),
-        ("ssh://host:0/r", false, Refused),
-        ("ssh://host:65536/r", false, Refused),
-        ("ssh://host:22x/r", false, Refused),
-        ("ssh://u:pw@host/r", false, Refused),
-        ("ssh://a@b@host/r", false, Refused),
-        ("ssh://host/~", false, Refused),
-        ("ssh://host/~/", false, Refused),
-        ("ssh://host/~user/r", false, Refused),
-        ("ssh://[::1/r", false, Refused),
-        ("ssh://[::1]x/r", false, Refused),
-        ("host:", false, Refused),
-        ("host:~", false, Refused),
-        ("host:~user/r", false, Refused),
-        ("a@b@host:r", false, Refused),
-        ("@host:r", false, Refused),
-        (":r", false, Refused),
-        ("[::1:r", false, Refused),
-        ("ho]st:r", false, Refused),
-        ("file:///srv/repo", false, Refused),
-        ("ftp://host/r", false, Refused),
-        ("/srv/repo", false, Refused),
-        ("repo", false, Refused),
-        ("dir/host:r", false, Refused),
-        ("http://", false, Refused),
-        // A one-letter host on Windows.
-        ("C:\\repo", true, Refused),
-        ("C:\\repo", false, Ssh),
-        ("C:repo", true, Refused),
-        ("c:/repo", true, Refused),
-        ("c:/repo", false, Ssh),
-        ("u@C:repo", true, Refused),
-        ("u@C:repo", false, Ssh),
-        ("ssh://C/repo", true, Ssh),
-        ("ab:repo", true, Ssh),
-        ("[C]:repo", true, Ssh),
-        // HTTP addresses.
-        ("http://h/repo", false, Http),
-        ("https://h:8443/repo", false, Http),
-        ("http://127.0.0.1:8080/", false, Http),
-        ("https://[::1]/", false, Http),
-        ("https://h", false, Http),
-        ("http://h:080/", false, Http),
-        ("https://:443/r", false, Refused),
-        ("https://user:pw-QXZ@h/r", false, Refused),
-        ("https://h/r?x=1", false, Refused),
-        ("https://h/r#frag", false, Refused),
-        ("https://h:65536/r", false, Refused),
-        ("http://h:port/r", false, Refused),
-        ("https://user:443/pw-QXZ@h/repo", false, Refused),
-        ("https://user:1234?pw-QXZ@h/", false, Refused),
-        ("http://h:+80/", false, Refused),
-    ];
-    for &(address, windows, want) in rows {
+    let secret = SECRET
+        .iter()
+        .flat_map(|a| [(*a, false, Refused), (*a, true, Refused)]);
+    let secret_on_windows = SECRET_ON_WINDOWS.iter().map(|a| (*a, true, Refused));
+    for (address, windows, want) in ROWS.iter().copied().chain(secret).chain(secret_on_windows) {
         let remote = parse_remote(address, windows);
         let endpoint = parse_endpoint(address, windows);
         let case = format!("{address:?} windows={windows}");
@@ -487,6 +670,29 @@ fn an_endpoint_parses_each_address_as_a_push_remote_does() {
                 assert_eq!(msg, from_remote, "{case}");
             }
         }
+    }
+}
+
+/// The parse of the `Display` output of an ssh address gives an equal
+/// address.
+#[test]
+fn the_parse_of_the_display_gives_an_equal_address() {
+    for &(address, windows, want) in ROWS {
+        if want != Ssh {
+            continue;
+        }
+        let case = format!("{address:?} windows={windows}");
+        let parsed = SshAddress::parse_with(address, windows).unwrap();
+        let shown = parsed.to_string();
+        assert_eq!(
+            SshAddress::parse_with(&shown, windows).unwrap(),
+            parsed,
+            "{case}: {shown}"
+        );
+        let RemoteAddr::Ssh(remote) = parse_remote(&shown, windows).unwrap().inner else {
+            panic!("{case}: {shown} is not ssh");
+        };
+        assert_eq!(remote, parsed, "{case}: {shown}");
     }
 }
 

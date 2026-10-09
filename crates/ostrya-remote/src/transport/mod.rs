@@ -26,7 +26,7 @@ use crate::session::http::Endpoint as HttpEndpoint;
 use crate::session::{PullSession, PullSessionOptions, PushSession, SessionOptions};
 
 pub(crate) use ssh::Transport;
-pub use ssh::{SshAddress, SshOptions};
+pub use ssh::{SshAddress, SshOptions, without_userinfo};
 
 /// The longest wait for a pending message after a failed write, and for the
 /// exit of the ssh client. It applies to a session that
@@ -71,6 +71,33 @@ impl PushRemote {
     ///   part of it.
     pub fn parse(address: &str) -> Result<PushRemote> {
         parse_remote(address, cfg!(windows))
+    }
+
+    /// Returns the address with no user, for a message.
+    ///
+    /// The `Display` of the result writes an ssh address in the `ssh://`
+    /// form with no `USER@`. An HTTP address holds no user, so the result is
+    /// equal to `self`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ostrya_remote::transport::PushRemote;
+    /// # fn main() -> ostrya_remote::Result<()> {
+    /// let remote = PushRemote::parse("builder@repo.example.com:srv/a@b")?;
+    /// assert_eq!(
+    ///     remote.without_user().to_string(),
+    ///     "ssh://repo.example.com/~/srv/a@b"
+    /// );
+    /// # Ok(()) }
+    /// ```
+    #[doc(hidden)]
+    pub fn without_user(&self) -> PushRemote {
+        let inner = match &self.inner {
+            RemoteAddr::Ssh(addr) => RemoteAddr::Ssh(addr.without_user()),
+            RemoteAddr::Http(url) => RemoteAddr::Http(url.clone()),
+        };
+        PushRemote { inner }
     }
 }
 
@@ -579,6 +606,8 @@ async fn prepare_with(
 }
 
 /// Refuses a field of `connect` that applies to an HTTP address alone.
+///
+/// The message shows `addr` in the `ssh://` form with no user.
 fn refuse_http_fields(addr: &SshAddress, connect: &ConnectOptions) -> Result<()> {
     // Each name is the remote key and the CLI option of the field. The
     // options of the HTTP client have neither, so the field names them.
@@ -599,7 +628,8 @@ fn refuse_http_fields(addr: &SshAddress, connect: &ConnectOptions) -> Result<()>
     ];
     match set.iter().find(|(_, set)| *set) {
         Some((name, _)) => Err(Error::InvalidInput(format!(
-            "{name} applies to an HTTP address, and '{addr}' is an ssh address"
+            "{name} applies to an HTTP address, and '{}' is an ssh address",
+            addr.without_user()
         ))),
         None => Ok(()),
     }

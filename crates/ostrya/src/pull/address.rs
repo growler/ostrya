@@ -20,11 +20,10 @@ pub(super) enum PullAddress {
     Ssh(SshAddress),
 }
 
-/// An ssh address in its parsed form and in its written form.
+/// An ssh address in its parsed form.
 #[derive(Debug)]
 pub(super) struct SshAddress {
     pub(super) remote: PushRemote,
-    pub(super) written: String,
 }
 
 /// Returns the address of a pull of `remote`, with `section` as its config
@@ -36,7 +35,9 @@ pub(super) struct SshAddress {
 ///   of the caller or of `pull-url` is malformed.
 /// - [`Error::Pull`] if there is no section and the caller gives no `url`.
 /// - [`Error::Pull`] if the section has neither `pull-url` nor `url`.
-/// - [`Error::Pull`] if the key `url` holds an ssh address.
+/// - [`Error::Pull`] if the key `url` holds an ssh address. The message shows
+///   the value without the text up to its last `@`, so it shows no user and
+///   no password.
 /// - [`Error::Core`] if `pull-url` or `url` holds a malformed escape
 ///   sequence.
 pub(super) fn resolve_pull_address(
@@ -54,8 +55,9 @@ pub(super) fn resolve_pull_address(
     }
     match section.url()? {
         Some(url) if is_ssh(&url) && is_ssh_address(&url) => Err(Error::Pull(format!(
-            "remote '{remote}': url '{url}' is an ssh address; the port reads an ssh \
-             address from pull-url alone"
+            "remote '{remote}': url '{}' is an ssh address; the port reads an ssh \
+             address from pull-url alone",
+            remote::without_userinfo(&url)
         ))),
         Some(url) => Ok(PullAddress::Http(url)),
         None => Err(Error::Pull(format!(
@@ -101,7 +103,8 @@ pub(super) fn fill_pull_connect(
 /// # Errors
 ///
 /// - [`Error::InvalidInput`] if `opts` sets a field of an HTTP pull alone.
-///   The message names the option of the first field that is set.
+///   The message names the option of the first field that is set. It shows
+///   the address in the `ssh://` form with no user.
 pub(super) fn refuse_http_fields(opts: &PullOptions, address: &SshAddress) -> Result<()> {
     // Each name is the option of `ostrya pull` that sets the field.
     let set = [
@@ -119,7 +122,7 @@ pub(super) fn refuse_http_fields(opts: &PullOptions, address: &SshAddress) -> Re
     match set.iter().find(|(_, set)| *set) {
         Some((name, _)) => Err(Error::InvalidInput(format!(
             "{name} applies to a pull over HTTP, and '{}' is an ssh address",
-            address.written
+            address.remote.without_user()
         ))),
         None => Ok(()),
     }
@@ -153,10 +156,7 @@ fn parse_address(value: &str) -> Result<PullAddress> {
         remote::Error::InvalidInput(msg) => Error::InvalidInput(msg),
         other => Error::Remote(other),
     })?;
-    Ok(PullAddress::Ssh(SshAddress {
-        remote,
-        written: value.to_owned(),
-    }))
+    Ok(PullAddress::Ssh(SshAddress { remote }))
 }
 
 #[cfg(test)]
@@ -222,15 +222,13 @@ mod tests {
             http(resolve("both", Some("https://other.ex.com/"))),
             "https://other.ex.com/"
         );
-        let addr = ssh(resolve("both", None));
-        assert_eq!(addr.written, "ssh://puller@ex.com/srv/repo");
         assert_eq!(
-            addr.remote,
+            ssh(resolve("both", None)).remote,
             PushRemote::parse("ssh://puller@ex.com/srv/repo").unwrap()
         );
         assert_eq!(
-            ssh(resolve("http-pull-url", Some("u@h:x"))).written,
-            "u@h:x"
+            ssh(resolve("http-pull-url", Some("u@h:x"))).remote,
+            PushRemote::parse("u@h:x").unwrap()
         );
         // If `pull-url` is set, the pull does not read a dead ssh `url`.
         assert_eq!(
@@ -238,7 +236,10 @@ mod tests {
             "http://pull.ex.com/repo"
         );
         assert_eq!(http(resolve("url", None)), "https://ex.com/repo");
-        assert_eq!(ssh(resolve("scp", None)).written, "h:srv/repo");
+        assert_eq!(
+            ssh(resolve("scp", None)).remote,
+            PushRemote::parse("h:srv/repo").unwrap()
+        );
     }
 
     /// A value with `://` and a scheme other than `ssh` goes to the fetcher
@@ -277,10 +278,7 @@ mod tests {
     /// the scp form. A `url` that is not an ssh address goes to the fetcher.
     #[test]
     fn an_ssh_address_in_url_is_refused() {
-        for (name, value) in [
-            ("ssh-url", "ssh://h/srv/repo"),
-            ("scp-url", "u@h:/srv/repo"),
-        ] {
+        for (name, value) in [("ssh-url", "ssh://h/srv/repo"), ("scp-url", "h:/srv/repo")] {
             match resolve(name, None) {
                 Err(Error::Pull(msg)) => assert_eq!(
                     msg,
@@ -293,6 +291,38 @@ mod tests {
             }
         }
         assert_eq!(http(resolve("path-url", None)), "/srv/repo");
+    }
+
+    /// The refusal of an ssh address in `url` shows no user name and no
+    /// password. It shows the address with all text up to its last `@`
+    /// removed.
+    #[test]
+    fn the_refusal_of_an_ssh_url_shows_no_userinfo() {
+        let config = RepoConfig::parse(
+            "[core]\nrepo_version=1\nmode=archive-z2\n\n\
+             [remote \"ssh-userinfo\"]\nurl=ssh://user-QXZ:pw-QXZ@ex.com/srv/repo\n\n\
+             [remote \"scp-user\"]\nurl=user-QXZ@ex.com:/srv/repo\n",
+        )
+        .unwrap();
+        for (name, shown) in [
+            ("ssh-userinfo", "ssh://ex.com/srv/repo"),
+            ("scp-user", "ex.com:/srv/repo"),
+        ] {
+            let section = config.remote(name);
+            match resolve_pull_address(section.as_ref(), name, None) {
+                Err(Error::Pull(msg)) => {
+                    assert!(!msg.contains("QXZ"), "{name}: {msg}");
+                    assert_eq!(
+                        msg,
+                        format!(
+                            "remote '{name}': url '{shown}' is an ssh address; the port reads \
+                             an ssh address from pull-url alone"
+                        )
+                    );
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
     }
 
     /// The pull refuses a remote with no section and no address of the
@@ -308,8 +338,8 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(
-            ssh(resolve("absent", Some("ssh://h/x"))).written,
-            "ssh://h/x"
+            ssh(resolve("absent", Some("ssh://h/x"))).remote,
+            PushRemote::parse("ssh://h/x").unwrap()
         );
     }
 
@@ -358,7 +388,7 @@ mod tests {
         let refused = |opts: PullOptions, name: &str| match refuse_http_fields(&opts, &addr) {
             Err(Error::InvalidInput(msg)) => assert_eq!(
                 msg,
-                format!("{name} applies to a pull over HTTP, and 'u@h:x' is an ssh address")
+                format!("{name} applies to a pull over HTTP, and 'ssh://h/~/x' is an ssh address")
             ),
             other => panic!("{name}: {other:?}"),
         };
@@ -400,5 +430,36 @@ mod tests {
         )
         .unwrap();
         refuse_http_fields(&PullOptions::default(), &addr).unwrap();
+    }
+
+    /// The refusal of a field of an HTTP pull alone shows no user name of
+    /// the ssh address. It shows the address in the `ssh://` form with no
+    /// user, so an `@` in the path stays.
+    #[test]
+    fn the_refusal_of_an_http_field_shows_no_user_name() {
+        let opts = PullOptions {
+            http_headers: vec![("A".to_owned(), "B".to_owned())],
+            ..PullOptions::default()
+        };
+        for (written, shown) in [
+            ("ssh://user-QXZ@ex.com/srv/repo", "ssh://ex.com/srv/repo"),
+            ("user-QXZ@ex.com:srv/repo", "ssh://ex.com/~/srv/repo"),
+            ("ssh://user-QXZ@ex.com/srv/a@b", "ssh://ex.com/srv/a@b"),
+        ] {
+            let addr = ssh(resolve("none", Some(written)));
+            match refuse_http_fields(&opts, &addr) {
+                Err(Error::InvalidInput(msg)) => {
+                    assert!(!msg.contains("QXZ"), "{written}: {msg}");
+                    assert_eq!(
+                        msg,
+                        format!(
+                            "http-header applies to a pull over HTTP, and '{shown}' is an ssh \
+                             address"
+                        )
+                    );
+                }
+                other => panic!("{written}: {other:?}"),
+            }
+        }
     }
 }

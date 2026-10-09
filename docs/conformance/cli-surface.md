@@ -2586,15 +2586,17 @@ such a remote with `error: No "url" option in remote "NAME"`. Over ssh:
   `--low-speed-limit-bytes`, and `--low-speed-time-seconds` are refused at
   exit 1 before the ssh client starts. The message names the option without
   `--`: `error: invalid input: http-header applies to a pull over HTTP, and
-  'ADDRESS' is an ssh address`. `--disable-retry-on-network-errors` is
+  'ADDRESS' is an ssh address`. `ADDRESS` is the address in the `ssh://`
+  form with no user. `--disable-retry-on-network-errors` is
   accepted, because a pull over ssh never sends a request again.
 - The pull reads no `tls-*` key, no `contenturl` key, no `metalink` key,
   and no `proxy` key of the remote. A pull over HTTP reads neither
   `ssh-command` nor `send-command`.
 - An ssh address in the `url` key is refused at exit 1, and no ssh client
-  starts: `error: pull: remote 'NAME': url 'VALUE' is an ssh address; the
-  port reads an ssh address from pull-url alone`. The tool refuses the same
-  `url` with `error: Invalid URI scheme in VALUE`.
+  starts: `error: pull: remote 'NAME': url 'SHOWN' is an ssh address; the
+  port reads an ssh address from pull-url alone`. `SHOWN` is the value
+  without the text up to its last `@`. The tool refuses the same `url`
+  with `error: Invalid URI scheme in VALUE`, where `VALUE` is the value.
 - A malformed ssh address in `--url` or in `pull-url` is refused at exit 1
   with the text of the address parser, for example `error: invalid input:
   address 'ssh://HOST': an ssh:// address needs a path`.

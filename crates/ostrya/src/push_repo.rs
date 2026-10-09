@@ -84,7 +84,8 @@ pub fn is_push_address(remote: &str) -> bool {
 ///   section.
 /// - [`Error::Remote`] with `InvalidInput` if the section has no push address:
 ///   no `push-url`, and no `url` or a `url` that is not `http://` or
-///   `https://`.
+///   `https://`. The message shows such a `url` without the text up to its
+///   last `@`, so it shows no user and no password.
 /// - [`Error::Remote`] with `InvalidInput` if the address is `https://` and the
 ///   section sets `tls-permissive=true`.
 /// - [`Error::Remote`] with the error of [`PushRemote::parse`] if the address
@@ -108,7 +109,8 @@ pub fn resolve_push_remote(
             Some(url) if is_http_address(&url) => url,
             Some(url) => {
                 return Err(invalid(format!(
-                    "remote '{remote}' has no push-url, and its url '{url}' is no push address"
+                    "remote '{remote}' has no push-url, and its url '{}' is no push address",
+                    crate::remote::without_userinfo(&url)
                 )));
             }
             None => {
@@ -334,6 +336,37 @@ mod tests {
             resolve_push_remote(Some(&cfg), "none", ConnectOptions::default()),
             "no push-url and no url",
         );
+    }
+
+    /// The refusal of a `url` that is no push address shows no user name and
+    /// no password. It shows the address with all text up to its last `@`
+    /// removed.
+    #[test]
+    fn the_refusal_of_a_url_that_is_no_push_address_shows_no_userinfo() {
+        let cfg = RepoConfig::parse(
+            "[core]\nrepo_version=1\nmode=archive-z2\n\n\
+             [remote \"upper\"]\nurl=HTTPS://user-QXZ:pw-QXZ@ex.com/repo\n\n\
+             [remote \"ftp\"]\nurl=ftp://user-QXZ:pw-QXZ@ex.com/repo\n",
+        )
+        .unwrap();
+        for (name, shown) in [
+            ("upper", "HTTPS://ex.com/repo"),
+            ("ftp", "ftp://ex.com/repo"),
+        ] {
+            match resolve_push_remote(Some(&cfg), name, ConnectOptions::default()) {
+                Err(Error::Remote(crate::remote::Error::InvalidInput(msg))) => {
+                    assert!(!msg.contains("QXZ"), "{name}: {msg}");
+                    assert_eq!(
+                        msg,
+                        format!(
+                            "remote '{name}' has no push-url, and its url '{shown}' is no push \
+                             address"
+                        )
+                    );
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
     }
 
     #[test]

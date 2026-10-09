@@ -3584,7 +3584,9 @@ does not read it. With an ssh address, a field of `http` that differs from
 `FetcherOptions::default()` is refused. A refusal names a field by its
 remote key, which is also the CLI option without `--`, for example
 `push-user needs push-token-file` and `ssh-command applies to an ssh
-address`. A refusal of a field of `http` names `ConnectOptions::http`.
+address`. A refusal of a field of `http` names `ConnectOptions::http`. A
+refusal of an HTTP field with an ssh address shows the address in the
+`ssh://` form with no user.
 
 `Endpoint` holds a remote address with the options of its transport.
 `Endpoint::Ssh` holds an `SshAddress` and the `SshOptions` of the ssh
@@ -3637,7 +3639,11 @@ and the remote side runs `ostrya receive`.
   form too), and a scheme other than `ssh`, `http`, and `https`. In the
   `ssh://` form it refuses a `USER:PASSWORD@` user.
 - A refusal of an ssh address shows the address without the text up to its
-  last `@`, so it shows no user and no password.
+  last `@`, so it shows no user and no password. `without_userinfo` gives
+  that text, and keeps a `SCHEME://` prefix before the last `@` when
+  `SCHEME` is a valid URI scheme. It applies to text that no parse has
+  read. `PushRemote::without_user` gives a parsed address with no user, so
+  an `@` in its path stays.
 - On Windows it refuses a scp-form address that names a local path: a host
   of one ASCII letter, and a `\` before the first `:`.
 - `SSH_COMMAND` is `ConnectOptions::ssh_command`, then the
@@ -3747,7 +3753,10 @@ pub struct PushRemote { inner: RemoteAddr }
 
 impl PushRemote {
     pub fn parse(address: &str) -> Result<PushRemote>;
+    pub fn without_user(&self) -> PushRemote;   // for a message
 }
+
+pub fn without_userinfo(address: &str) -> Cow<'_, str>;   // all text up to the last @ out
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshAddress { user, host, port, path }   // Display: the ssh:// form; parses back
@@ -3863,7 +3872,9 @@ the connect options of a push:
 - No key gives `allow_cleartext_credentials`. Only the caller sets it.
 - A name with no section, and a section with no push address, are
   `Error::Remote` with `remote::Error::InvalidInput`. A `config` of `None` holds
-  no section. So a caller that has no repository must give an address.
+  no section. So a caller that has no repository must give an address. The
+  refusal of a `url` that is no push address shows the `url` without the
+  text up to its last `@`.
 
 ```rust
 impl Remote<'_> {
@@ -4779,11 +4790,14 @@ The pull over ssh to an address:
   `ssh://`, or that holds no `://`, is an ssh address of `PushRemote::parse`,
   and a malformed one is `Error::InvalidInput` with the text of the parser.
   Any other value goes to the fetcher as written. An ssh address in the
-  `url` key is `Error::Pull`, and so is a section with neither key.
+  `url` key is `Error::Pull`, and so is a section with neither key. The
+  refusal of the `url` key shows its value without the text up to its last
+  `@`.
 - With an ssh address, `http_headers`, `n_network_retries` above 0,
   `low_speed_limit_bytes`, and `low_speed_time` are `Error::InvalidInput`
   before the ssh client starts. The message names the option of `ostrya
-  pull` without `--`. `n_network_retries` of `Some(0)` is accepted.
+  pull` without `--`, and shows the address in the `ssh://` form with no
+  user. `n_network_retries` of `Some(0)` is accepted.
 - The remote keys `ssh-command` and `send-command` fill
   `connect.remote_ssh_command` and `connect.send_command` where they are
   `None`, also when the address comes from `url`. The pull reads no

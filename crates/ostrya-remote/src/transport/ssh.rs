@@ -235,6 +235,14 @@ impl SshAddress {
         argv.push(format!("{command} --repo={}", quote_posix(&self.path)));
         argv
     }
+
+    /// Returns the address with no user, for a message.
+    pub(super) fn without_user(&self) -> SshAddress {
+        SshAddress {
+            user: None,
+            ..self.clone()
+        }
+    }
 }
 
 /// Writes the address in the `ssh://` form.
@@ -354,13 +362,27 @@ fn split_user(s: &str) -> std::result::Result<(Option<&str>, &str), &'static str
 
 /// Returns `address` without its userinfo, for a message.
 ///
-/// A password can hold any character, `/` and `:` among them, so the end of
-/// the userinfo is not known before the parse. The function leaves out all
-/// text up to the last `@`. It keeps a `SCHEME://` prefix before that `@`
-/// when `SCHEME` is a valid URI scheme: an ASCII letter, then ASCII letters,
-/// digits, `+`, `-`, and `.`. Other text before `://` can be a part of the
-/// userinfo, so the function does not keep it.
-fn without_userinfo(address: &str) -> Cow<'_, str> {
+/// `address` is any text that a caller has not parsed. A password can hold
+/// any character, `/` and `:` among them, so the end of the userinfo is not
+/// known before the parse. The function leaves out all text up to the last
+/// `@`. It keeps a `SCHEME://` prefix before that `@` when `SCHEME` is a valid
+/// URI scheme: an ASCII letter, then ASCII letters, digits, `+`, `-`, and `.`.
+/// Other text before `://` can be a part of the userinfo, so the function does
+/// not keep it. A path that holds `@` also loses the text before its last
+/// `@`. An `address` with no `@` is returned with no change.
+///
+/// # Examples
+///
+/// ```
+/// use ostrya_remote::transport::without_userinfo;
+/// assert_eq!(
+///     without_userinfo("https://user:pw@repo.example.com/os"),
+///     "https://repo.example.com/os"
+/// );
+/// assert_eq!(without_userinfo("builder@host:repos/os"), "host:repos/os");
+/// assert_eq!(without_userinfo("ssh://host/srv/os"), "ssh://host/srv/os");
+/// ```
+pub fn without_userinfo(address: &str) -> Cow<'_, str> {
     let Some(at) = address.rfind('@') else {
         return Cow::Borrowed(address);
     };

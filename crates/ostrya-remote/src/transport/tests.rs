@@ -792,6 +792,37 @@ fn an_http_option_is_refused_with_an_ssh_address() {
     assert!(matches!(r, Ok(Prepared::Ssh(_))));
 }
 
+/// The refusal of an HTTP option with an ssh address shows no user name. It
+/// shows the address in the `ssh://` form with no user, so an `@` in the
+/// path stays.
+#[test]
+fn the_refusal_of_an_http_option_shows_no_user_name() {
+    let connect = ConnectOptions {
+        push_user: Some("u".into()),
+        ..Default::default()
+    };
+    for (address, shown) in [
+        ("ssh://user-QXZ@ex.com/srv/repo", "ssh://ex.com/srv/repo"),
+        ("user-QXZ@ex.com:srv/repo", "ssh://ex.com/~/srv/repo"),
+        ("user-QXZ@ex.com:srv/a@b", "ssh://ex.com/~/srv/a@b"),
+    ] {
+        let remote = PushRemote::parse(address).unwrap();
+        match ostrya_rt::block_on(prepare_with(&remote, &connect, None)) {
+            Err(Error::InvalidInput(msg)) => {
+                assert!(!msg.contains("QXZ"), "{address}: {msg}");
+                assert_eq!(
+                    msg,
+                    format!(
+                        "push-user applies to an HTTP address, and '{shown}' is an ssh address"
+                    )
+                );
+            }
+            Err(other) => panic!("{address}: {other:?}"),
+            Ok(_) => panic!("{address}: accepted"),
+        }
+    }
+}
+
 /// The `Debug` output of a prepared session names the transport and the
 /// HTTP address, and holds no credential and no part of the ssh command
 /// line.

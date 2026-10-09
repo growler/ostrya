@@ -64,7 +64,7 @@ pub use session::{
 #[doc(hidden)]
 pub use transport::{
     ConnectOptions, Endpoint, PreparedSession, PullConnectOptions, PushRemote, SshAddress,
-    SshOptions,
+    SshOptions, without_userinfo,
 };
 
 // The public types of the protocol move freely across tasks and threads.

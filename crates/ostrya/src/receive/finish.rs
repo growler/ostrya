@@ -25,9 +25,9 @@ use super::{ReceivePolicy, ReceiveRule, ReceiveVerify, ServerSigner, TrustedKeys
 use crate::MAX_METADATA_SIZE;
 use crate::error::{Error, Result};
 use crate::object::read_meta_object;
-use crate::push::proto::{CommitRequest, MAX_FRAME, Message};
-use crate::push::{self, Expected, RefOutcome, RefUpdate};
 use crate::refs::{RefFileState, refspec_to_relpath};
+use crate::remote::proto::{CommitRequest, MAX_FRAME, Message};
+use crate::remote::{self, Expected, RefOutcome, RefUpdate};
 use crate::repo::Repo;
 use crate::sign::append_signature;
 use crate::summary::{
@@ -49,11 +49,11 @@ type Checked<T> = std::result::Result<T, Failure>;
 type Bytes = Arc<Vec<u8>>;
 
 fn protocol(message: String) -> Failure {
-    Failure::Wire(push::Error::Protocol(message))
+    Failure::Wire(remote::Error::Protocol(message))
 }
 
 fn ref_denied(message: String) -> Failure {
-    Failure::Wire(push::Error::RefDenied(message))
+    Failure::Wire(remote::Error::RefDenied(message))
 }
 
 /// A commit that a ref update names as its new value.
@@ -367,7 +367,7 @@ pub(super) async fn finish(
         && let Err(mut message) = hooks.after_update(&report, carried).await
     {
         hooks::cut(&mut message);
-        return Err(Failure::Wire(push::Error::Internal(message)));
+        return Err(Failure::Wire(remote::Error::Internal(message)));
     }
     Ok(report)
 }
@@ -381,7 +381,7 @@ pub(super) async fn finish(
 fn check_names(named: &[String], updates: &[RefUpdate]) -> Checked<()> {
     for update in updates {
         crate::validate_refspec(&update.name).map_err(|e| match e {
-            Error::InvalidRefspec(_) => Failure::Wire(push::Error::InvalidRef(format!(
+            Error::InvalidRefspec(_) => Failure::Wire(remote::Error::InvalidRef(format!(
                 "invalid ref name '{}'",
                 update.name
             ))),
@@ -390,7 +390,7 @@ fn check_names(named: &[String], updates: &[RefUpdate]) -> Checked<()> {
         // A revision reads 64 lowercase hex characters as a checksum, so a
         // push writes no commit to such a ref. A delete of it passes.
         if update.new.is_some() && ostrya_core::is_checksum_shaped(&update.name) {
-            return Err(Failure::Wire(push::Error::InvalidRef(format!(
+            return Err(Failure::Wire(remote::Error::InvalidRef(format!(
                 "invalid ref name '{}'",
                 update.name
             ))));
@@ -443,7 +443,7 @@ fn check_reply_fits(updates: &[RefUpdate]) -> Checked<()> {
     let body = longest.encode_body().map_err(Failure::Wire)?;
     let len = body.len() as u64 + 1;
     if len > u64::from(MAX_FRAME) {
-        return Err(Failure::Wire(push::Error::LimitExceeded(format!(
+        return Err(Failure::Wire(remote::Error::LimitExceeded(format!(
             "the reply to the {} ref updates of Commit can need a frame of {len} bytes, over the \
              limit {MAX_FRAME}",
             updates.len()
@@ -685,7 +685,7 @@ fn missing_objects(missing: Missing, what: &str) -> Failure {
     if missing.listed.len() < missing.total {
         message.push_str(&format!(", the first {} listed", missing.listed.len()));
     }
-    Failure::Wire(push::Error::MissingObjects {
+    Failure::Wire(remote::Error::MissingObjects {
         message,
         missing: missing.listed,
     })
@@ -706,7 +706,7 @@ fn check_bindings(repo: &Repo, updates: &[RefUpdate], targets: &[Target]) -> Che
                 let name = updates[i].name.as_str();
                 let bare = name.split_once(':').map_or(name, |(_, bare)| bare);
                 if !bindings.contains(&bare) {
-                    return Err(Failure::Wire(push::Error::BindingMismatch(format!(
+                    return Err(Failure::Wire(remote::Error::BindingMismatch(format!(
                         "commit {} is bound to the refs {bindings:?}, which do not hold '{bare}'",
                         target.checksum
                     ))));
@@ -716,7 +716,7 @@ fn check_bindings(repo: &Repo, updates: &[RefUpdate], targets: &[Target]) -> Che
         if let (Some(id), Some(bound)) = (collection, target.commit.collection_binding())
             && id != bound
         {
-            return Err(Failure::Wire(push::Error::BindingMismatch(format!(
+            return Err(Failure::Wire(remote::Error::BindingMismatch(format!(
                 "commit {} is bound to the collection '{bound}', not '{id}'",
                 target.checksum
             ))));
@@ -863,7 +863,7 @@ async fn check_signatures(
                 .await
                 .map_err(|e| match e {
                     Error::Signature(message) => {
-                        Failure::Wire(push::Error::SignatureRequired(message))
+                        Failure::Wire(remote::Error::SignatureRequired(message))
                     }
                     other => Failure::Internal(other),
                 })?;
@@ -960,7 +960,7 @@ async fn check_ref(
             Some(commit) => format!("at {commit}"),
             None => "absent".into(),
         };
-        return Err(Failure::Wire(push::Error::RefMismatch {
+        return Err(Failure::Wire(remote::Error::RefMismatch {
             message: format!("ref '{name}' is {state}"),
             name: name.clone(),
             current,
@@ -968,7 +968,7 @@ async fn check_ref(
     }
     match (current, update.new) {
         (None, None) => Ok(false),
-        (Some(_), None) if !rule.allow_delete => Err(Failure::Wire(push::Error::DeleteDenied(
+        (Some(_), None) if !rule.allow_delete => Err(Failure::Wire(remote::Error::DeleteDenied(
             format!("the policy does not allow a delete of ref '{name}'"),
         ))),
         (Some(_), None) | (None, Some(_)) => Ok(true),
@@ -981,7 +981,7 @@ async fn check_ref(
                 None => walks.chain(txn, new, current).await?,
             };
             if !walks.reaches(txn, chain, current).await? {
-                return Err(Failure::Wire(push::Error::NonFastForward(format!(
+                return Err(Failure::Wire(remote::Error::NonFastForward(format!(
                     "commit {new} does not descend from {current}, the commit of ref '{name}'"
                 ))));
             }
@@ -1201,7 +1201,7 @@ async fn oversize(edit: &Edit<'_>, written: Option<Value>) -> Checked<Option<u64
 /// Returns the `limit-exceeded` failure of a merged dict of `size` bytes for
 /// `commit`.
 fn oversize_failure(commit: &Checksum, size: u64) -> Failure {
-    Failure::Wire(push::Error::LimitExceeded(format!(
+    Failure::Wire(remote::Error::LimitExceeded(format!(
         "the merged detached metadata of commit {commit} is {size} bytes, larger than \
          {MAX_METADATA_SIZE} bytes"
     )))
@@ -1693,7 +1693,7 @@ mod tests {
         let request_len = request.encode_body().unwrap().len() + 1;
         assert!(request_len <= MAX_FRAME as usize, "{request_len}");
         match check_reply_fits(&updates) {
-            Err(Failure::Wire(push::Error::LimitExceeded(m))) => {
+            Err(Failure::Wire(remote::Error::LimitExceeded(m))) => {
                 assert!(m.contains("15000 ref updates"), "{m}")
             }
             Err(Failure::Wire(e)) => panic!("expected limit-exceeded, got {e}"),

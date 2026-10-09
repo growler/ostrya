@@ -9,7 +9,7 @@
 //! - the shape of the writes and the flushes on the output
 //!
 //! A test client drives the session over two in-process pipes with the frame
-//! codec of `ostrya::push::proto`. Other tests give the session one input
+//! codec of `ostrya::remote::proto`. Other tests give the session one input
 //! buffer and record its output. A second `ArchiveView` of the same
 //! repository is the oracle of each reply: the session serves what the view
 //! serves over HTTP.
@@ -34,8 +34,8 @@ use common::pipe::{PipeReader, PipeWriter, pipe};
 use futures_io::AsyncWrite;
 use futures_lite::future;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt, Cursor};
-use ostrya::push::ErrorCode;
-use ostrya::push::proto::{
+use ostrya::remote::ErrorCode;
+use ostrya::remote::proto::{
     ErrorMessage, FrameReader, FrameWriter, GetReply, Hello, MIN_FRAME_LIMIT, Message, ObjectRead,
     PullHello, PullHelloReply,
 };
@@ -255,7 +255,7 @@ where
 /// The wire code that a failed session returned to its caller.
 fn returned_code(result: &ostrya::Result<()>) -> Option<ErrorCode> {
     match result {
-        Err(Error::Push(e)) => e.code(),
+        Err(Error::Remote(e)) => e.code(),
         other => panic!("expected a push error, got {other:?}"),
     }
 }
@@ -718,7 +718,7 @@ fn assert_internal_before_the_reply(repo: &Repo, path: &str) -> Error {
     });
     assert_eq!(error.code, ErrorCode::Internal);
     let err = result.unwrap_err();
-    assert!(!matches!(err, Error::Push(_)), "{err:?}");
+    assert!(!matches!(err, Error::Remote(_)), "{err:?}");
     err
 }
 

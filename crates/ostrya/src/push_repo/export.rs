@@ -11,9 +11,9 @@ use super::source::RepoSource;
 use crate::error::Result;
 use crate::lock::LockKind;
 use crate::pull::DetachedMetadataFilter;
-use crate::push::{Compression, Expected, PushStats, RefUpdate, SessionOptions};
 use crate::read::CommitState;
 use crate::refs::validate_refspec;
+use crate::remote::{Compression, Expected, PushStats, RefUpdate, SessionOptions};
 use crate::repo::Repo;
 
 /// The options of [`Repo::export_stream`].
@@ -73,7 +73,7 @@ impl Repo {
     /// # Output
     ///
     /// The call writes `output` as
-    /// [`export_stream`](crate::push::session::export_stream) of the session
+    /// [`export_stream`](crate::remote::session::export_stream) of the session
     /// states. It does not close `output`. The caller closes `output` to end
     /// the stream.
     ///
@@ -83,17 +83,17 @@ impl Repo {
     /// exists. A missing file object or a failed read of the repository ends
     /// the stream inside the object that the call was to send. The call
     /// writes the abandon marker and `Abort`, and returns the error. The
-    /// receiver then returns [`Aborted`](crate::push::Error::Aborted).
+    /// receiver then returns [`Aborted`](crate::remote::Error::Aborted).
     ///
     /// # Errors
     ///
     /// Before the call writes the first byte to `output`, it returns:
     ///
-    /// - [`Error::Push`](crate::Error::Push) with
-    ///   [`InvalidInput`](crate::push::Error::InvalidInput) if `updates` is
+    /// - [`Error::Remote`](crate::Error::Remote) with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if `updates` is
     ///   empty, or names a ref two times.
-    /// - [`Error::Push`](crate::Error::Push) with
-    ///   [`InvalidInput`](crate::push::Error::InvalidInput) if an update
+    /// - [`Error::Remote`](crate::Error::Remote) with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if an update
     ///   expects [`Expected::Commit`], or has no new commit.
     /// - [`Error::InvalidRefspec`](crate::Error::InvalidRefspec) if
     ///   [`validate_refspec`] refuses a ref name.
@@ -112,19 +112,19 @@ impl Repo {
     ///   that the tree of a new commit reaches.
     /// - [`Error::Core`](crate::Error::Core) if a commit object or a dirtree
     ///   object does not parse.
-    /// - [`Error::Push`](crate::Error::Push) with
-    ///   [`InvalidInput`](crate::push::Error::InvalidInput) if the repository
+    /// - [`Error::Remote`](crate::Error::Remote) with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the repository
     ///   marks a new commit partial.
-    /// - [`Error::Push`](crate::Error::Push) with
-    ///   [`BindingMismatch`](crate::push::Error::BindingMismatch) if the
+    /// - [`Error::Remote`](crate::Error::Remote) with
+    ///   [`BindingMismatch`](crate::remote::Error::BindingMismatch) if the
     ///   `ostree.ref-binding` list of a commit does not hold the name of its
     ///   ref. The check leaves out the `REMOTE:` part of a remote ref. A
     ///   commit with no binding, or with an empty list, passes.
-    /// - [`Error::Push`](crate::Error::Push) with
-    ///   [`InvalidInput`](crate::push::Error::InvalidInput) if
+    /// - [`Error::Remote`](crate::Error::Remote) with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if
     ///   `opts.compression` has a level outside 1 through 9.
-    /// - [`Error::Push`](crate::Error::Push) with
-    ///   [`InvalidInput`](crate::push::Error::InvalidInput) if the `Hello`
+    /// - [`Error::Remote`](crate::Error::Remote) with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the `Hello`
     ///   frame or the `Commit` frame is more than 1 MiB.
     /// - [`Error::Io`](crate::Error::Io) if the open or the lock of the lock
     ///   file fails.
@@ -136,17 +136,17 @@ impl Repo {
     ///
     /// After the first byte, the call returns:
     ///
-    /// - [`Error::Push`](crate::Error::Push) with
-    ///   [`Source`](crate::push::Error::Source) if the read of an object or
+    /// - [`Error::Remote`](crate::Error::Remote) with
+    ///   [`Source`](crate::remote::Error::Source) if the read of an object or
     ///   of detached metadata fails, also for a missing file object. It holds
     ///   the error of the repository.
-    /// - [`Error::Push`](crate::Error::Push) with
-    ///   [`InvalidInput`](crate::push::Error::InvalidInput) if the data of an
+    /// - [`Error::Remote`](crate::Error::Remote) with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the data of an
     ///   object cannot go in the stream, as
-    ///   [`export_stream`](crate::push::session::export_stream) of the session
+    ///   [`export_stream`](crate::remote::session::export_stream) of the session
     ///   states.
-    /// - [`Error::Push`](crate::Error::Push) with
-    ///   [`Io`](crate::push::Error::Io) if a write to `output` or a flush of
+    /// - [`Error::Remote`](crate::Error::Remote) with
+    ///   [`Io`](crate::remote::Error::Io) if a write to `output` or a flush of
     ///   `output` fails.
     pub async fn export_stream<W>(&self, output: W, opts: ExportStreamOptions) -> Result<PushStats>
     where
@@ -222,7 +222,7 @@ impl Repo {
         drop(loaded);
 
         let source = RepoSource::new(self.clone(), opts.detached_metadata_filter);
-        Ok(crate::push::session::export_stream(
+        Ok(crate::remote::session::export_stream(
             output,
             &source,
             &names,

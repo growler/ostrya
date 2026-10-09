@@ -598,7 +598,7 @@ mod tests {
         use crate::tree::EntryAction;
 
         let root =
-            std::env::temp_dir().join(format!("ostrya-push-scan-phases-{}", std::process::id()));
+            std::env::temp_dir().join(format!("ostrya-remote-scan-phases-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("dir")).unwrap();
         std::fs::write(root.join("dir/file"), b"file").unwrap();

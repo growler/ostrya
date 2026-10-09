@@ -385,10 +385,10 @@ impl PushSession {
     /// The example deletes a ref on the server if the ref exists.
     ///
     /// ```no_run
-    /// use ostrya_push::proto::{Expected, RefUpdate};
-    /// use ostrya_push::session::{PushSession, SessionOptions};
-    /// use ostrya_push::transport::{ConnectOptions, PushRemote};
-    /// # async fn run() -> ostrya_push::Result<()> {
+    /// use ostrya_remote::proto::{Expected, RefUpdate};
+    /// use ostrya_remote::session::{PushSession, SessionOptions};
+    /// use ostrya_remote::transport::{ConnectOptions, PushRemote};
+    /// # async fn run() -> ostrya_remote::Result<()> {
     /// let remote = PushRemote::parse("https://repo.example.com/")?;
     /// let refs = vec!["exampleos/testing".to_owned()];
     /// let connect = ConnectOptions { push_token_file: Some("token".into()), ..Default::default() };
@@ -676,8 +676,8 @@ impl PullSession {
     ///
     /// ```no_run
     /// use futures_lite::AsyncReadExt;
-    /// use ostrya_push::session::{PullSession, PullSessionOptions};
-    /// use ostrya_push::transport::{PullConnectOptions, PushRemote};
+    /// use ostrya_remote::session::{PullSession, PullSessionOptions};
+    /// use ostrya_remote::transport::{PullConnectOptions, PushRemote};
     /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
     /// let remote = PushRemote::parse("builder@repo.example.com:/srv/repo")?;
     /// let opts = PullSessionOptions::default();

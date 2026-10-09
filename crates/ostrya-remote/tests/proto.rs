@@ -4,12 +4,12 @@
 use futures_lite::future::block_on;
 use ostrya_core::{Checksum, ObjectName, ObjectType};
 use ostrya_gvariant::{DictBuilder, Type, Value};
-use ostrya_push::proto::{
+use ostrya_remote::proto::{
     CommitRequest, ErrorMessage, FrameReader, FrameWriter, GetReply, HaveReply, Hello, HelloReply,
     Kind, MAX_FRAME, MAX_FRAME_LIMIT, MAX_HAVE, MIN_FRAME_LIMIT, Message, ObjectHeader, ObjectRead,
     ObjectsReply, PULL_PROTOCOL_VERSION, PullHello, PullHelloReply, RefState,
 };
-use ostrya_push::{Encoding, Error, ErrorCode, Expected, RefOutcome, RefUpdate};
+use ostrya_remote::{Encoding, Error, ErrorCode, Expected, RefOutcome, RefUpdate};
 
 const MIB: usize = 1 << 20;
 

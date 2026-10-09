@@ -2,17 +2,17 @@
 //! share.
 //!
 //! The driver is a client of `Repo::receive` over two in-process pipes. It
-//! uses the frame codec of `ostrya::push::proto`.
+//! uses the frame codec of `ostrya::remote::proto`.
 
 use std::future::Future;
 use std::path::Path;
 
 use futures_lite::io::AsyncReadExt;
-use ostrya::push::proto::{
+use ostrya::remote::proto::{
     CommitRequest, ErrorMessage, FrameReader, FrameWriter, Hello, HelloReply, Message,
     ObjectHeader, ObjectsReply,
 };
-use ostrya::push::{self, Encoding, ErrorCode, RefOutcome, RefUpdate};
+use ostrya::remote::{self, Encoding, ErrorCode, RefOutcome, RefUpdate};
 use ostrya::{
     Checksum, CreateOptions, Error, ObjectName, ObjectType, ReceivePolicy, Repo, RepoMode, Xattrs,
 };
@@ -42,12 +42,12 @@ pub struct Client {
 impl Client {
     /// Sends one message and returns a write error to the caller, because the
     /// server can already be gone.
-    pub async fn send(&mut self, msg: &Message) -> push::Result<()> {
+    pub async fn send(&mut self, msg: &Message) -> remote::Result<()> {
         self.writer.write_message(msg).await?;
         self.writer.flush().await
     }
 
-    pub async fn hello(&mut self, refs: &[&str]) -> push::Result<()> {
+    pub async fn hello(&mut self, refs: &[&str]) -> remote::Result<()> {
         self.send(&Message::Hello(Hello {
             version: 1,
             agent: None,
@@ -80,7 +80,7 @@ impl Client {
         checksum: Checksum,
         encoding: Encoding,
         bytes: &[u8],
-    ) -> push::Result<()> {
+    ) -> remote::Result<()> {
         self.writer
             .write_message(&Message::ObjectHeader(ObjectHeader {
                 name: ObjectName::new(checksum, ty),
@@ -103,7 +103,7 @@ impl Client {
     }
 
     /// Sends a `Commit` message with `updates` and `force`.
-    pub async fn commit(&mut self, updates: Vec<RefUpdate>, force: bool) -> push::Result<()> {
+    pub async fn commit(&mut self, updates: Vec<RefUpdate>, force: bool) -> remote::Result<()> {
         self.send(&Message::Commit(CommitRequest { updates, force }))
             .await
     }
@@ -168,7 +168,7 @@ pub fn connect() -> (Client, PipeReader, PipeWriter) {
 
 /// Writes one object to `w`: its header, its bytes in pieces of 40 KiB, and
 /// the end chunk.
-pub async fn write_object<W>(w: &mut FrameWriter<W>, o: &Obj) -> push::Result<()>
+pub async fn write_object<W>(w: &mut FrameWriter<W>, o: &Obj) -> remote::Result<()>
 where
     W: futures_io::AsyncWrite + Unpin,
 {
@@ -199,7 +199,7 @@ pub fn body(objects: &[Obj]) -> Vec<u8> {
 /// Returns the wire code that a failed session returned to its caller.
 pub fn returned_code(result: &ostrya::Result<ostrya::ReceiveReport>) -> Option<ErrorCode> {
     match result {
-        Err(Error::Push(e)) => e.code(),
+        Err(Error::Remote(e)) => e.code(),
         other => panic!("expected a push error, got {other:?}"),
     }
 }

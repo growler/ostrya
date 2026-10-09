@@ -12,11 +12,11 @@ use super::{invalid, resolve_push_remote};
 use crate::error::{Error, Result};
 use crate::lock::{LockGuard, LockKind};
 use crate::pull::DetachedMetadataFilter;
-use crate::push::{
+use crate::read::CommitState;
+use crate::remote::{
     Compression, ConnectOptions, Expected, PushOutcome, PushProgress, PushSession, RefUpdate,
     SessionOptions,
 };
-use crate::read::CommitState;
 use crate::repo::Repo;
 
 /// The options of [`Repo::push`] and [`Repo::push_over_stream`].
@@ -134,7 +134,7 @@ impl Repo {
     /// [`push_over_stream`](Repo::push_over_stream). If the push refuses the
     /// remote or its options, it takes no lock and reads no refspec. After
     /// these steps, the push runs the checks and the walk. It opens the
-    /// session with [`PreparedSession::open`](crate::push::PreparedSession::open)
+    /// session with [`PreparedSession::open`](crate::remote::PreparedSession::open)
     /// and does the rest of the work of `push_over_stream`.
     ///
     /// # Tokio runtime
@@ -148,22 +148,22 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+    /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
     ///   if `remote` names no configured remote, or if the remote has no push
     ///   address.
-    /// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+    /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
     ///   if an `https://` remote sets `tls-permissive=true`.
-    /// - [`Error::Push`] with the error of
-    ///   [`PushRemote::parse`](crate::push::PushRemote::parse) if the address
+    /// - [`Error::Remote`] with the error of
+    ///   [`PushRemote::parse`](crate::remote::PushRemote::parse) if the address
     ///   does not parse.
     /// - [`Error::Core`] if a key of the remote section holds a malformed
     ///   escape sequence, or if `tls-permissive` is not a boolean.
-    /// - [`Error::Push`] with the error of [`PushSession::prepare`] if a
+    /// - [`Error::Remote`] with the error of [`PushSession::prepare`] if a
     ///   connect option does not apply, or if a token file or a TLS file
     ///   cannot be read. If the HTTP client cannot be built, the push also
     ///   gives this error.
-    /// - [`Error::Push`] with the error of
-    ///   [`PreparedSession::open`](crate::push::PreparedSession::open) if the
+    /// - [`Error::Remote`] with the error of
+    ///   [`PreparedSession::open`](crate::remote::PreparedSession::open) if the
     ///   session does not open.
     /// - Each error of [`push_over_stream`](Repo::push_over_stream).
     pub async fn push(&self, remote: &str, mut opts: RepoPushOptions) -> Result<PushOutcome> {
@@ -245,15 +245,15 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+    /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
     ///   if `depth` is less than `-1`.
-    /// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+    /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
     ///   if `refspecs` is empty, or if a refspec is empty, is `:`, or names an
     ///   empty `DST`.
-    /// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+    /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
     ///   if a `SRC` with a `^` suffix or a checksum `SRC` has no `DST`, or if
     ///   two refspecs name the same `DST`.
-    /// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+    /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
     ///   if the local repository marks a source commit partial.
     /// - [`Error::InvalidRefspec`] with the `DST` if
     ///   [`validate_refspec`](crate::validate_refspec) refuses a `DST`, or if
@@ -263,12 +263,12 @@ impl Repo {
     /// - [`Error::RefNotFound`], [`Error::AmbiguousRefspec`],
     ///   [`Error::NoParentCommit`], or another error of
     ///   [`resolve_rev`](Repo::resolve_rev) if a `SRC` does not resolve.
-    /// - [`Error::Push`] with
-    ///   [`BindingMismatch`](crate::push::Error::BindingMismatch) if the
+    /// - [`Error::Remote`] with
+    ///   [`BindingMismatch`](crate::remote::Error::BindingMismatch) if the
     ///   `ostree.ref-binding` of a source commit is a list that does not hold
     ///   its `DST`. A commit with no binding, or with an empty list, passes.
-    /// - [`Error::Push`] with
-    ///   [`BindingMismatch`](crate::push::Error::BindingMismatch) if the
+    /// - [`Error::Remote`] with
+    ///   [`BindingMismatch`](crate::remote::Error::BindingMismatch) if the
     ///   `ostree.collection-binding` of a source commit differs from the
     ///   collection id of the server.
     /// - [`Error::ObjectNotFound`] if the local repository lacks a source
@@ -282,12 +282,12 @@ impl Repo {
     ///   dirtree object does not parse.
     /// - [`Error::Io`] if a read from the file system fails, or if a metadata
     ///   object is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
-    /// - [`Error::Push`] with the error of the server if the server refuses
+    /// - [`Error::Remote`] with the error of the server if the server refuses
     ///   the session, an object, or a ref update.
-    /// - [`Error::Push`] with the error of the session if the stream or the
+    /// - [`Error::Remote`] with the error of the session if the stream or the
     ///   protocol fails. If the reply to `Commit` is lost, the error is
-    ///   [`CommitOutcomeUnknown`](crate::push::Error::CommitOutcomeUnknown).
-    /// - [`Error::Push`] with [`Source`](crate::push::Error::Source) if a
+    ///   [`CommitOutcomeUnknown`](crate::remote::Error::CommitOutcomeUnknown).
+    /// - [`Error::Remote`] with [`Source`](crate::remote::Error::Source) if a
     ///   read of the local repository fails while the session sends objects.
     pub async fn push_over_stream<R, W>(
         &self,
@@ -444,9 +444,9 @@ pub(super) fn check_ref_binding(checksum: &Checksum, commit: &Commit, dst: &str)
     if bindings.is_empty() || bindings.contains(&bare) {
         return Ok(());
     }
-    Err(Error::Push(crate::push::Error::BindingMismatch(format!(
-        "commit {checksum} is bound to the refs {bindings:?}, which do not hold '{bare}'"
-    ))))
+    Err(Error::Remote(crate::remote::Error::BindingMismatch(
+        format!("commit {checksum} is bound to the refs {bindings:?}, which do not hold '{bare}'"),
+    )))
 }
 
 impl Plan {
@@ -479,9 +479,11 @@ impl Plan {
                 if let Some(bound) = bound
                     && bound != id
                 {
-                    return Err(Error::Push(crate::push::Error::BindingMismatch(format!(
-                        "commit {checksum} is bound to the collection '{bound}', not '{id}'"
-                    ))));
+                    return Err(Error::Remote(crate::remote::Error::BindingMismatch(
+                        format!(
+                            "commit {checksum} is bound to the collection '{bound}', not '{id}'"
+                        ),
+                    )));
                 }
             }
         }

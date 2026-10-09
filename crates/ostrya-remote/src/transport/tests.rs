@@ -361,7 +361,7 @@ fn an_http_option_is_refused_with_an_ssh_address() {
 /// line.
 #[test]
 fn a_prepared_session_shows_no_credential() {
-    let dir = std::env::temp_dir().join(format!("ostrya-push-prepared-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("ostrya-remote-prepared-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let token = dir.join("token");
     std::fs::write(&token, b"tok-QXZ\n").unwrap();
@@ -559,7 +559,7 @@ mod standin {
         fn new() -> Dir {
             static N: AtomicU32 = AtomicU32::new(0);
             let path = std::env::temp_dir().join(format!(
-                "ostrya-push-transport-{}-{}",
+                "ostrya-remote-transport-{}-{}",
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
             ));

@@ -26,12 +26,12 @@ use futures_lite::io::{AsyncReadExt, Cursor};
 use ostrya_core::filehdr::{frame, split_framed};
 use ostrya_core::{Checksum, FileHeader, ObjectName, ObjectType};
 use ostrya_gvariant::{DictBuilder, Value};
-use ostrya_push::proto::{
+use ostrya_remote::proto::{
     FrameReader, FrameWriter, HelloReply, MIN_FRAME_LIMIT, Message, ObjectRead, ObjectsReply,
     RefState,
 };
-use ostrya_push::tree::{EntryAction, EntryFilter, EntryKind, EntryMeta, ScanOptions, TreeModel};
-use ostrya_push::{
+use ostrya_remote::tree::{EntryAction, EntryFilter, EntryKind, EntryMeta, ScanOptions, TreeModel};
+use ostrya_remote::{
     Compression, Encoding, Error, ObjectData, ObjectSource, PushSession, SessionOptions,
 };
 
@@ -44,8 +44,10 @@ impl Scratch {
     fn new(tag: &str) -> Scratch {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("ostrya-push-tree-{}-{tag}-{n}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "ostrya-remote-tree-{}-{tag}-{n}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         Scratch { path }
@@ -88,7 +90,7 @@ fn mkfifo(path: &Path) -> bool {
     }
 }
 
-fn scan(root: &Path, options: ScanOptions) -> ostrya_push::Result<TreeModel> {
+fn scan(root: &Path, options: ScanOptions) -> ostrya_remote::Result<TreeModel> {
     ostrya_rt::block_on(TreeModel::scan(root, options))
 }
 
@@ -100,7 +102,7 @@ fn with_filter(filter: EntryFilter) -> ScanOptions {
 }
 
 /// Returns the path and the kind of an `Error::Walk`.
-fn walk_error(result: ostrya_push::Result<TreeModel>) -> (PathBuf, io::ErrorKind) {
+fn walk_error(result: ostrya_remote::Result<TreeModel>) -> (PathBuf, io::ErrorKind) {
     match result {
         Err(Error::Walk { path, source }) => (path, source.kind()),
         Err(other) => panic!("expected Error::Walk, got {other:?}"),
@@ -663,11 +665,11 @@ fn run<T>(future: impl std::future::Future<Output = T>) -> T {
     ostrya_rt::block_on(future)
 }
 
-fn open(model: &TreeModel, name: &ObjectName) -> ostrya_push::Result<ObjectData> {
+fn open(model: &TreeModel, name: &ObjectName) -> ostrya_remote::Result<ObjectData> {
     run(model.open(name, Encoding::Raw))
 }
 
-async fn read_all(mut reader: Box<dyn ostrya_push::ObjectReader>) -> Vec<u8> {
+async fn read_all(mut reader: Box<dyn ostrya_remote::ObjectReader>) -> Vec<u8> {
     let mut out = Vec::new();
     reader.read_to_end(&mut out).await.unwrap();
     out
@@ -696,7 +698,7 @@ fn raw_bytes(data: ObjectData) -> Vec<u8> {
     }
 }
 
-fn assert_invalid_input<T: std::fmt::Debug>(result: ostrya_push::Result<T>) {
+fn assert_invalid_input<T: std::fmt::Debug>(result: ostrya_remote::Result<T>) {
     match result {
         Err(Error::InvalidInput(_)) => {}
         other => panic!("expected InvalidInput, got {other:?}"),
@@ -890,7 +892,7 @@ fn a_symlink_opens_nothing_and_has_the_mode_0o120777() {
 }
 
 /// Returns the path and the kind of the `Error::Walk` of a failed open.
-fn open_walk_error(result: ostrya_push::Result<ObjectData>) -> (PathBuf, io::ErrorKind) {
+fn open_walk_error(result: ostrya_remote::Result<ObjectData>) -> (PathBuf, io::ErrorKind) {
     match result {
         Err(Error::Walk { path, source }) => (path, source.kind()),
         other => panic!("expected Error::Walk, got {other:?}"),

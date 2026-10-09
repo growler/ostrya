@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use ostrya::Repo;
-use ostrya::push::ErrorCode;
-use ostrya::push::proto::{FrameReader, FrameWriter, GetReply, Message, ObjectRead, PullHello};
+use ostrya::remote::ErrorCode;
+use ostrya::remote::proto::{FrameReader, FrameWriter, GetReply, Message, ObjectRead, PullHello};
 use ostrya_rt::block_on;
 
 /// A scratch directory, made writable again and removed when dropped.
@@ -339,7 +339,7 @@ fn anon_resident(pid: u32) -> u64 {
 
 /// One read of `body` into `buf`. The bound names the reader trait through
 /// the object reader of the push, so the test needs no I/O crate of its own.
-fn poll_body<R: ostrya::push::ObjectReader>(
+fn poll_body<R: ostrya::remote::ObjectReader>(
     body: &mut R,
     cx: &mut std::task::Context<'_>,
     buf: &mut [u8],
@@ -358,7 +358,7 @@ fn poll_body<R: ostrya::push::ObjectReader>(
 fn send_streams_a_large_object_in_bounded_memory() {
     use std::os::fd::{AsFd, OwnedFd};
 
-    use ostrya::push::{PullSession, PullSessionOptions};
+    use ostrya::remote::{PullSession, PullSessionOptions};
     use ostrya::{CommitOptions, CreateOptions, MutableTree, ObjectType, RepoMode, loose_path};
 
     const SIZE: u64 = 256 << 20;

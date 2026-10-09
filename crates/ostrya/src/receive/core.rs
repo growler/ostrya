@@ -20,11 +20,11 @@ use super::merge::check_incoming;
 use super::session::{Failure, ReceiveReport, aborted, codec, next, out_of_order};
 use crate::error::{Error, Result};
 use crate::object::{MAX_METADATA_SIZE, object_exists};
-use crate::push::proto::{
+use crate::remote::proto::{
     CommitRequest, FrameReader, HaveReply, Hello, HelloReply, MAX_FRAME, MAX_HAVE, Message,
     ObjectHeader, ObjectsReply, PROTOCOL_VERSION, RefState,
 };
-use crate::push::{self, Encoding};
+use crate::remote::{self, Encoding};
 use crate::repo::Repo;
 use crate::transaction::Transaction;
 
@@ -86,7 +86,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         hello: Hello,
     ) -> std::result::Result<(Self, HelloReply), Failure> {
         if hello.one_way {
-            return Err(Failure::Wire(push::Error::Protocol(
+            return Err(Failure::Wire(remote::Error::Protocol(
                 "a Hello with one-way true opens a one-way stream, which this session does not \
                  read"
                     .into(),
@@ -124,7 +124,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         hello: Hello,
     ) -> std::result::Result<Self, Failure> {
         if !hello.one_way {
-            return Err(Failure::Wire(push::Error::Protocol(
+            return Err(Failure::Wire(remote::Error::Protocol(
                 "a one-way stream starts with a Hello with one-way true".into(),
             )));
         }
@@ -157,7 +157,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         if mode == RepoMode::Bare {
             let (uid, _) = txn.fresh_owner().await.map_err(Failure::Internal)?;
             if uid != 0 {
-                return Err(Failure::Wire(push::Error::ModeRefused(
+                return Err(Failure::Wire(remote::Error::ModeRefused(
                     "a bare repository stores the owner of each file, which needs the server \
                      to run as root"
                         .into(),
@@ -185,7 +185,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         names: Vec<ObjectName>,
     ) -> std::result::Result<HaveReply, Failure> {
         if names.len() > MAX_HAVE as usize {
-            return Err(Failure::Wire(push::Error::LimitExceeded(format!(
+            return Err(Failure::Wire(remote::Error::LimitExceeded(format!(
                 "a Have of {} entries is over max-have {MAX_HAVE}",
                 names.len()
             ))));
@@ -321,7 +321,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         }
         match result {
             Ok(stored) if body.is_finished() => Ok(stored.then_some(count)),
-            Ok(_) => Err(Failure::Wire(push::Error::Protocol(format!(
+            Ok(_) => Err(Failure::Wire(remote::Error::Protocol(format!(
                 "bytes follow {ty:?} object {checksum}"
             )))),
             Err(failure) => Err(failure),
@@ -350,7 +350,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         {
             let mut meta = self.lock_meta();
             if meta.dicts.contains_key(checksum) || !meta.pending.insert(*checksum) {
-                return Err(Failure::Wire(push::Error::Protocol(format!(
+                return Err(Failure::Wire(remote::Error::Protocol(format!(
                     "a second detached metadata object for commit {checksum}"
                 ))));
             }
@@ -367,7 +367,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         })
         .await;
         checked.map_err(|e| {
-            Failure::Wire(push::Error::Protocol(format!(
+            Failure::Wire(remote::Error::Protocol(format!(
                 "the detached metadata of commit {checksum}: {e}"
             )))
         })?;
@@ -431,24 +431,24 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
 /// No check does I/O.
 pub(super) fn check_hello(repo: &Repo, hello: &Hello) -> std::result::Result<(), Failure> {
     if hello.version != PROTOCOL_VERSION {
-        return Err(Failure::Wire(push::Error::VersionUnsupported(format!(
+        return Err(Failure::Wire(remote::Error::VersionUnsupported(format!(
             "the server speaks protocol version {PROTOCOL_VERSION}, not {}",
             hello.version
         ))));
     }
     if repo.mode() == RepoMode::BareSplitXattrs {
-        return Err(Failure::Wire(push::Error::ModeRefused(
+        return Err(Failure::Wire(remote::Error::ModeRefused(
             "the repository mode bare-split-xattrs is read-only".into(),
         )));
     }
     if !hello.one_way && !repo.config().locking().map_err(Failure::Internal)? {
-        return Err(Failure::Wire(push::Error::LockingDisabled(
+        return Err(Failure::Wire(remote::Error::LockingDisabled(
             "the repository sets [core] locking=false".into(),
         )));
     }
     for name in &hello.refs {
         crate::validate_refspec(name).map_err(|e| match e {
-            Error::InvalidRefspec(_) => Failure::Wire(push::Error::InvalidRef(format!(
+            Error::InvalidRefspec(_) => Failure::Wire(remote::Error::InvalidRef(format!(
                 "invalid ref name '{name}'"
             ))),
             other => Failure::Internal(other),
@@ -488,11 +488,11 @@ fn check_hello_reply_fits(repo: &Repo, names: &[String]) -> std::result::Result<
     // not change the size of the reply.
     let empty = Message::HelloReply(hello_reply(repo, 1, Vec::new()))
         .encode_body()
-        .map_err(|e| Failure::Wire(push::Error::Internal(e.to_string())))?;
+        .map_err(|e| Failure::Wire(remote::Error::Internal(e.to_string())))?;
     let fits = reply_frame_len(empty.len(), names.iter().map(String::len))
         .is_some_and(|len| len <= u64::from(MAX_FRAME));
     if !fits {
-        return Err(Failure::Wire(push::Error::LimitExceeded(format!(
+        return Err(Failure::Wire(remote::Error::LimitExceeded(format!(
             "the reply to the {} refs of Hello can need a frame over the limit {MAX_FRAME}",
             names.len()
         ))));

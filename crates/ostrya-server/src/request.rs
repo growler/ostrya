@@ -10,8 +10,8 @@ use futures_io::AsyncRead;
 use futures_lite::future;
 use futures_lite::io::AsyncReadExt;
 use hyper::body::{Body, Buf, Bytes};
-use ostrya::push;
-use ostrya::push::proto::{Kind, MAX_FRAME, Message};
+use ostrya::remote;
+use ostrya::remote::proto::{Kind, MAX_FRAME, Message};
 use ostrya_rt as rt;
 
 use crate::session::BodyTrack;
@@ -145,8 +145,8 @@ where
     }
 }
 
-fn protocol(message: impl Into<String>) -> push::Error {
-    push::Error::Protocol(message.into())
+fn protocol(message: impl Into<String>) -> remote::Error {
+    remote::Error::Protocol(message.into())
 }
 
 /// Reads the one message of `body`: one frame of at most [`MAX_FRAME`]
@@ -159,10 +159,10 @@ fn protocol(message: impl Into<String>) -> push::Error {
 /// - a frame of length 0,
 /// - a byte after the frame.
 ///
-/// A frame over [`MAX_FRAME`] is `push::Error::LimitExceeded`. The buffer of
+/// A frame over [`MAX_FRAME`] is `remote::Error::LimitExceeded`. The buffer of
 /// the frame grows with the bytes that arrive, so a stated length allocates
 /// no memory before its bytes arrive.
-pub(crate) async fn read_message<B>(body: &mut RequestBody<B>) -> Result<Message, push::Error>
+pub(crate) async fn read_message<B>(body: &mut RequestBody<B>) -> Result<Message, remote::Error>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -185,7 +185,7 @@ where
         return Err(protocol("frame of length 0"));
     }
     if len > MAX_FRAME {
-        return Err(push::Error::LimitExceeded(format!(
+        return Err(remote::Error::LimitExceeded(format!(
             "frame of {len} bytes is over the limit {MAX_FRAME}"
         )));
     }
@@ -257,7 +257,7 @@ mod tests {
 
     use hyper::HeaderMap;
     use hyper::body::Frame;
-    use ostrya::push::proto::FrameWriter;
+    use ostrya::remote::proto::FrameWriter;
     use ostrya_rt::block_on;
 
     use super::*;
@@ -411,7 +411,7 @@ mod tests {
         writer.into_inner()
     }
 
-    fn read(steps: Vec<Option<Vec<u8>>>) -> Result<Message, push::Error> {
+    fn read(steps: Vec<Option<Vec<u8>>>) -> Result<Message, remote::Error> {
         block_on(read_message(&mut Script::new(steps)))
     }
 
@@ -428,7 +428,7 @@ mod tests {
         assert!(matches!(read(pieces).unwrap(), Message::Have(_)));
 
         let protocol = |steps: Vec<Option<Vec<u8>>>, text: &str| match read(steps) {
-            Err(push::Error::Protocol(m)) => assert!(m.contains(text), "{m}"),
+            Err(remote::Error::Protocol(m)) => assert!(m.contains(text), "{m}"),
             other => panic!("{text}: {other:?}"),
         };
         protocol(Vec::new(), "holds no message");
@@ -445,7 +445,7 @@ mod tests {
         let over = (MAX_FRAME + 1).to_be_bytes().to_vec();
         assert!(matches!(
             read(vec![Some(over)]),
-            Err(push::Error::LimitExceeded(_))
+            Err(remote::Error::LimitExceeded(_))
         ));
         let stated = MAX_FRAME.to_be_bytes().to_vec();
         protocol(

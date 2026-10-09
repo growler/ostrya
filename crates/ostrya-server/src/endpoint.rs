@@ -378,8 +378,8 @@ impl<A: ReceiveAuth> ReceiveEndpoint<A> {
 mod tests {
     use hyper::{Method, StatusCode};
     use ostrya::ReceivePolicy;
-    use ostrya::push::ErrorCode;
-    use ostrya::push::proto::{Hello, Kind, Message};
+    use ostrya::remote::ErrorCode;
+    use ostrya::remote::proto::{Hello, Kind, Message};
     use ostrya_rt::block_on;
 
     use super::*;

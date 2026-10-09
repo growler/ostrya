@@ -291,7 +291,7 @@ mod tests {
         fn new() -> Dir {
             static N: AtomicU32 = AtomicU32::new(0);
             let path = std::env::temp_dir().join(format!(
-                "ostrya-push-http-{}-{}",
+                "ostrya-remote-http-{}-{}",
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
             ));

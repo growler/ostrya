@@ -32,8 +32,8 @@
 //! # Examples
 //!
 //! ```no_run
-//! use ostrya_push::{TreePushOptions, push_tree, transport::{ConnectOptions, PushRemote}};
-//! # async fn run() -> ostrya_push::Result<()> {
+//! use ostrya_remote::{TreePushOptions, push_tree, transport::{ConnectOptions, PushRemote}};
+//! # async fn run() -> ostrya_remote::Result<()> {
 //! let remote = PushRemote::parse("ssh://builder@repo.example.com/srv/repo")?;
 //! let opts = TreePushOptions { refs: vec!["exampleos/stable".into()], ..Default::default() };
 //! let outcome = push_tree(&remote, "rootfs".as_ref(), ConnectOptions::default(), opts).await?;

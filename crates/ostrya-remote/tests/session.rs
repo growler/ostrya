@@ -14,11 +14,11 @@ use futures_lite::io::{AsyncWriteExt, Cursor};
 use ostrya_core::filehdr::frame;
 use ostrya_core::{Checksum, DeflateSink, FileHeader, ObjectName, ObjectType, Xattrs};
 use ostrya_gvariant::{DictBuilder, Type, Value};
-use ostrya_push::proto::{
+use ostrya_remote::proto::{
     ErrorMessage, FrameReader, FrameWriter, HaveReply, HelloReply, MIN_FRAME_LIMIT, Message,
     ObjectHeader, ObjectRead, ObjectsReply,
 };
-use ostrya_push::{
+use ostrya_remote::{
     BoxFuture, Compression, Encoding, Error, ErrorCode, Expected, ObjectData, ObjectSource,
     PushPhase, PushProgress, PushProgressSnapshot, PushSession, RefOutcome, RefState, RefUpdate,
     SessionOptions,
@@ -188,7 +188,7 @@ fn open_with(
     input: Vec<u8>,
     refs: &[&str],
     opts: SessionOptions,
-) -> (ostrya_push::Result<PushSession>, Capture) {
+) -> (ostrya_remote::Result<PushSession>, Capture) {
     let out = Capture::default();
     let session = block_on(PushSession::over_stream(
         Cursor::new(input),
@@ -334,7 +334,7 @@ impl ObjectSource for Source {
     fn objects<'a>(
         &'a self,
         _commit: &'a Checksum,
-    ) -> BoxFuture<'a, ostrya_push::Result<Vec<ObjectName>>> {
+    ) -> BoxFuture<'a, ostrya_remote::Result<Vec<ObjectName>>> {
         Box::pin(async move { Ok(self.items.keys().copied().collect()) })
     }
 
@@ -342,7 +342,7 @@ impl ObjectSource for Source {
         &'a self,
         name: &'a ObjectName,
         encoding: Encoding,
-    ) -> BoxFuture<'a, ostrya_push::Result<ObjectData>> {
+    ) -> BoxFuture<'a, ostrya_remote::Result<ObjectData>> {
         self.opened.lock().unwrap().push((*name, encoding));
         let item = self.items[name].clone();
         Box::pin(async move {
@@ -380,7 +380,7 @@ impl ObjectSource for Source {
     fn detached_metadata<'a>(
         &'a self,
         commit: &'a Checksum,
-    ) -> BoxFuture<'a, ostrya_push::Result<Option<Value>>> {
+    ) -> BoxFuture<'a, ostrya_remote::Result<Option<Value>>> {
         self.asked.lock().unwrap().push(*commit);
         Box::pin(async move { Ok(self.meta.get(commit).cloned()) })
     }
@@ -389,7 +389,7 @@ impl ObjectSource for Source {
         &'a self,
         names: &'a [ObjectName],
         encoding: Encoding,
-    ) -> BoxFuture<'a, ostrya_push::Result<Option<u64>>> {
+    ) -> BoxFuture<'a, ostrya_remote::Result<Option<u64>>> {
         self.sized.lock().unwrap().push(encoding);
         let total = names
             .iter()
@@ -414,7 +414,7 @@ fn a_sv_bytes(dict: &Value) -> Vec<u8> {
     ostrya_gvariant::to_bytes(&Type::parse("a{sv}").unwrap(), dict).unwrap()
 }
 
-fn assert_invalid<T: std::fmt::Debug>(r: ostrya_push::Result<T>, text: &str) {
+fn assert_invalid<T: std::fmt::Debug>(r: ostrya_remote::Result<T>, text: &str) {
     match r {
         Err(Error::InvalidInput(m)) => assert!(m.contains(text), "{m}"),
         other => panic!("expected InvalidInput with {text:?}, got {other:?}"),
@@ -1158,7 +1158,7 @@ fn an_error_after_commit_is_that_error() {
 
 /// Assert that `r` is an unknown outcome for `refs`, with `text` in its
 /// message.
-fn assert_unknown<T: std::fmt::Debug>(r: ostrya_push::Result<T>, refs: &[&str], text: &str) {
+fn assert_unknown<T: std::fmt::Debug>(r: ostrya_remote::Result<T>, refs: &[&str], text: &str) {
     match r {
         Err(Error::CommitOutcomeUnknown { refs: got, message }) => {
             assert_eq!(got, strings(refs));

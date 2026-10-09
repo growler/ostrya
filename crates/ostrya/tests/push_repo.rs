@@ -18,7 +18,7 @@ use common::receive::{PIPE_CAP, PipeReader, PipeWriter, is_root, new_repo, pipe}
 use common::{Counting, TmpDir, mark_partial};
 use futures_io::AsyncWrite;
 use futures_lite::future::zip;
-use ostrya::push::{self, Compression, PushOutcome, PushProgress};
+use ostrya::remote::{self, Compression, PushOutcome, PushProgress};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, DetachedMetadataFilter,
     DictBuilder, Error, MutableTree, ObjectType, PruneOptions, ReceivePolicy, ReceiveReport,
@@ -258,7 +258,7 @@ impl Hook {
                     let len = u32::from_be_bytes(self.partial[..4].try_into().unwrap());
                     self.forward.extend(self.partial.drain(..4));
                     self.parse = match len {
-                        0 | push::proto::ABANDON => Parse::Frames,
+                        0 | remote::proto::ABANDON => Parse::Frames,
                         len => Parse::Chunks(len as usize),
                     };
                 }
@@ -327,14 +327,14 @@ fn frame_kinds() -> (
 
 fn assert_aborted(report: &ostrya::Result<ReceiveReport>) {
     match report {
-        Err(Error::Push(push::Error::Aborted)) => {}
+        Err(Error::Remote(remote::Error::Aborted)) => {}
         other => panic!("expected Aborted on the server, got {other:?}"),
     }
 }
 
 fn assert_invalid_input(error: &Error, needle: &str) {
     match error {
-        Error::Push(push::Error::InvalidInput(msg)) => {
+        Error::Remote(remote::Error::InvalidInput(msg)) => {
             assert!(msg.contains(needle), "{msg:?} lacks {needle:?}")
         }
         other => panic!("expected InvalidInput, got {other:?}"),
@@ -406,7 +406,7 @@ fn a_push_onto_a_moved_ref_fails_with_ref_mismatch() {
     });
     assert!(report.is_err());
     match outcome {
-        Err(Error::Push(push::Error::RefMismatch { name, current, .. })) => {
+        Err(Error::Remote(remote::Error::RefMismatch { name, current, .. })) => {
             assert_eq!(name, "main");
             assert_eq!(current, Some(side));
         }
@@ -491,7 +491,7 @@ fn a_ref_binding_that_does_not_hold_the_destination_is_refused_before_any_byte()
     commit(&repo, "a", None, "bound", Some(metadata.build()));
     let (error, written) = refused(&repo, opts(&["a:b"]));
     match &error {
-        Error::Push(push::Error::BindingMismatch(msg)) => {
+        Error::Remote(remote::Error::BindingMismatch(msg)) => {
             assert!(msg.contains("[\"a\"]") && msg.contains("'b'"), "{msg}");
         }
         other => panic!("expected BindingMismatch, got {other:?}"),
@@ -534,7 +534,7 @@ fn a_collection_binding_mismatch_is_refused_before_any_upload() {
     );
     assert_aborted(&report);
     match outcome {
-        Err(Error::Push(push::Error::BindingMismatch(msg))) => {
+        Err(Error::Remote(remote::Error::BindingMismatch(msg))) => {
             assert!(msg.contains("org.example.Other"), "{msg}");
         }
         other => panic!("expected BindingMismatch, got {other:?}"),
@@ -626,7 +626,7 @@ fn deleting_a_present_ref_is_delete_denied_by_default() {
     );
     assert!(report.is_err());
     match outcome {
-        Err(Error::Push(push::Error::DeleteDenied(_))) => {}
+        Err(Error::Remote(remote::Error::DeleteDenied(_))) => {}
         other => panic!("expected DeleteDenied, got {other:?}"),
     }
     // A push of deletes alone offers no object.
@@ -868,7 +868,7 @@ fn a_partial_commit_before_the_server_tip_leaves_the_source_commit_alone() {
     );
     assert!(report.is_err());
     match outcome {
-        Err(Error::Push(push::Error::NonFastForward(_))) => {}
+        Err(Error::Remote(remote::Error::NonFastForward(_))) => {}
         other => panic!("expected NonFastForward, got {other:?}"),
     }
     // The offer holds the source commit and its tree alone.
@@ -898,7 +898,7 @@ fn with_a_depth_a_partial_history_commit_ends_the_chain_before_it() {
     );
     assert!(report.is_err());
     match outcome {
-        Err(Error::Push(push::Error::NonFastForward(_))) => {}
+        Err(Error::Remote(remote::Error::NonFastForward(_))) => {}
         other => panic!("expected NonFastForward, got {other:?}"),
     }
     assert_eq!(tip(&pair.server, "main"), Some(c1));

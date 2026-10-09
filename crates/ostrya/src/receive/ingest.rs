@@ -25,7 +25,7 @@ use crate::pull::check_canonical;
 use crate::pull::http::{
     BoundedInput, check_stream_end, compressed_bound, payload_refusal, store_filez_payload,
 };
-use crate::push;
+use crate::remote;
 use crate::transaction::Transaction;
 use crate::write::{COPY_CHUNK, FileMeta, check_archive_payload};
 
@@ -117,15 +117,15 @@ fn refuse_privileged_xattrs(
 }
 
 fn mode_refused(message: String) -> Failure {
-    Failure::Wire(push::Error::ModeRefused(message))
+    Failure::Wire(remote::Error::ModeRefused(message))
 }
 
 fn protocol(message: String) -> Failure {
-    Failure::Wire(push::Error::Protocol(message))
+    Failure::Wire(remote::Error::Protocol(message))
 }
 
 pub(super) fn limit_exceeded(message: String) -> Failure {
-    Failure::Wire(push::Error::LimitExceeded(message))
+    Failure::Wire(remote::Error::LimitExceeded(message))
 }
 
 /// Returns the failure code for an error of a write path that the ingest reuses.
@@ -146,7 +146,7 @@ pub(super) fn limit_exceeded(message: String) -> Failure {
 fn classify(error: Error) -> Failure {
     match error {
         Error::ChecksumMismatch { .. } => {
-            Failure::Wire(push::Error::ChecksumMismatch(error.to_string()))
+            Failure::Wire(remote::Error::ChecksumMismatch(error.to_string()))
         }
         Error::InvalidFormat(message) => protocol(message),
         Error::Io(e) if e.raw_os_error().is_none() => protocol(e.to_string()),
@@ -269,7 +269,7 @@ where
     })
     .await;
     if actual != *checksum {
-        return Err(Failure::Wire(push::Error::ChecksumMismatch(format!(
+        return Err(Failure::Wire(remote::Error::ChecksumMismatch(format!(
             "{what} {checksum}: the bytes hash to {actual}"
         ))));
     }
@@ -359,7 +359,7 @@ fn check_digest(checksum: &Checksum, actual: Checksum) -> Result<(), Failure> {
     if actual == *checksum {
         return Ok(());
     }
-    Err(Failure::Wire(push::Error::ChecksumMismatch(format!(
+    Err(Failure::Wire(remote::Error::ChecksumMismatch(format!(
         "content object {checksum}: the bytes hash to {actual}"
     ))))
 }
@@ -478,7 +478,7 @@ mod tests {
     }
 
     fn refused(r: Result<(), Failure>) -> bool {
-        matches!(r, Err(Failure::Wire(push::Error::ModeRefused(_))))
+        matches!(r, Err(Failure::Wire(remote::Error::ModeRefused(_))))
     }
 
     fn with_xattr(mut meta: FileMeta, name: &[u8]) -> FileMeta {
@@ -533,7 +533,7 @@ mod tests {
         );
         assert!(matches!(
             strict.check_dirmeta(&csum(), b"junk"),
-            Err(Failure::Wire(push::Error::Protocol(_)))
+            Err(Failure::Wire(remote::Error::Protocol(_)))
         ));
     }
 
@@ -588,7 +588,7 @@ mod tests {
         ));
         assert!(matches!(
             got,
-            Err(Failure::Wire(push::Error::LimitExceeded(_)))
+            Err(Failure::Wire(remote::Error::LimitExceeded(_)))
         ));
         // The read stops at the first byte past the cap.
         assert_eq!(body.count, MAX_METADATA_SIZE + 1);
@@ -653,7 +653,7 @@ mod tests {
         ));
         assert!(matches!(
             got,
-            Err(Failure::Wire(push::Error::LimitExceeded(m))) if m == "the session cap"
+            Err(Failure::Wire(remote::Error::LimitExceeded(m))) if m == "the session cap"
         ));
         // The function reserves each read that returns bytes before the next
         // read starts.

@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use common::receive::{Obj, assert_staging_removed, body, fixture_objects, is_root, new_repo};
 use common::{COMMIT, TmpDir, foreign_holder, lock_holder_main};
-use ostrya::push::proto::{CommitRequest, Hello};
-use ostrya::push::{self, Encoding, Expected, RefUpdate};
+use ostrya::remote::proto::{CommitRequest, Hello};
+use ostrya::remote::{self, Encoding, Expected, RefUpdate};
 use ostrya::{
     Checksum, DetachedMetadataFilter, Error, HookFuture, HookRefusal, HostEntry, LockKind,
     MAX_METADATA_SIZE, ObjectType, ReceiveHooks, ReceivePolicy, ReceiveReport, ReceiveRule,
@@ -329,7 +329,7 @@ fn keys(dict: &Value) -> Vec<String> {
 /// commit fails as `protocol`, with the message "the session was aborted".
 fn assert_aborted(service: &ReceiveService, case: &str) {
     match block_on(service.have(Vec::new())) {
-        Err(Error::Push(push::Error::Protocol(message))) => {
+        Err(Error::Remote(remote::Error::Protocol(message))) => {
             assert!(
                 message.contains("the session was aborted"),
                 "{case}: {message}"
@@ -815,8 +815,8 @@ fn a_hook_refusal_keeps_its_code() {
             vec![main_update()],
         );
         let got = match (denied, result) {
-            (true, Err(Error::Push(push::Error::RefDenied(m)))) => m,
-            (false, Err(Error::Push(push::Error::Internal(m)))) => m,
+            (true, Err(Error::Remote(remote::Error::RefDenied(m)))) => m,
+            (false, Err(Error::Remote(remote::Error::Internal(m)))) => m,
             (_, other) => panic!("denied {denied}: {other:?}"),
         };
         if message.len() > 4096 {
@@ -865,7 +865,7 @@ fn a_merged_dict_over_the_limit_is_refused_before_the_lock() {
     assert!(
         matches!(
             &result,
-            Err(Error::Push(push::Error::LimitExceeded(m))) if m.contains("merged detached metadata")
+            Err(Error::Remote(remote::Error::LimitExceeded(m))) if m.contains("merged detached metadata")
         ),
         "{result:?}"
     );
@@ -904,7 +904,10 @@ fn the_carried_value_drops_once_on_a_ref_mismatch() {
         vec![update],
     );
     assert!(
-        matches!(&result, Err(Error::Push(push::Error::RefMismatch { .. }))),
+        matches!(
+            &result,
+            Err(Error::Remote(remote::Error::RefMismatch { .. }))
+        ),
         "{result:?}"
     );
     assert_eq!(hook.calls(), 1);
@@ -966,7 +969,10 @@ fn the_carried_value_drops_after_the_update_lock_is_released() {
         match expected {
             Expected::Absent => assert!(result.is_ok(), "{result:?}"),
             _ => assert!(
-                matches!(&result, Err(Error::Push(push::Error::RefMismatch { .. }))),
+                matches!(
+                    &result,
+                    Err(Error::Remote(remote::Error::RefMismatch { .. }))
+                ),
                 "{result:?}"
             ),
         }
@@ -989,7 +995,7 @@ fn missing_objects_do_not_call_the_hook() {
     assert!(
         matches!(
             &result,
-            Err(Error::Push(push::Error::MissingObjects { .. }))
+            Err(Error::Remote(remote::Error::MissingObjects { .. }))
         ),
         "{result:?}"
     );
@@ -1091,7 +1097,7 @@ fn an_after_update_error_is_internal_with_the_refs_written() {
             vec![main_update()],
         );
         let got = match result {
-            Err(Error::Push(push::Error::Internal(m))) => m,
+            Err(Error::Remote(remote::Error::Internal(m))) => m,
             other => panic!("expected internal, got {other:?}"),
         };
         if message.len() > 4096 {
@@ -1143,7 +1149,10 @@ fn after_update_does_not_run_when_the_commit_fails_after_before_update() {
         drop(holder);
         if mismatch {
             assert!(
-                matches!(&result, Err(Error::Push(push::Error::RefMismatch { .. }))),
+                matches!(
+                    &result,
+                    Err(Error::Remote(remote::Error::RefMismatch { .. }))
+                ),
                 "{result:?}"
             );
         } else {

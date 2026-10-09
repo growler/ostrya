@@ -17,7 +17,7 @@ use futures_io::AsyncRead;
 
 use crate::error::{Error, Result};
 use crate::fetch::{Fetcher, Priority};
-use crate::push::{self, PullBody, PullSession};
+use crate::remote::{self, PullBody, PullSession};
 use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE};
 
 use super::http::{
@@ -151,7 +151,7 @@ impl RemoteSource {
     ///
     /// The ssh source closes the input of the server and waits for the ssh
     /// client. If the pull succeeded and the session end fails, the function
-    /// returns that error as [`Error::Push`].
+    /// returns that error as [`Error::Remote`].
     ///
     /// A failure of the pull can come from the session. If the session end
     /// then fails too, the function returns the error of the session end.
@@ -163,8 +163,8 @@ impl RemoteSource {
             RemoteSource::Ssh(ssh) => {
                 let ended = ssh.session.finish().await;
                 match (result, ended) {
-                    (Ok(value), ended) => ended.map(|()| value).map_err(Error::Push),
-                    (Err(Error::Push(_)), Err(ended)) => Err(Error::Push(ended)),
+                    (Ok(value), ended) => ended.map(|()| value).map_err(Error::Remote),
+                    (Err(Error::Remote(_)), Err(ended)) => Err(Error::Remote(ended)),
                     (Err(e), _) => Err(e),
                 }
             }
@@ -244,15 +244,15 @@ impl AsyncRead for Counted<'_> {
 }
 
 /// Returns the session error that a failed body read carries, as
-/// [`Error::Push`].
+/// [`Error::Remote`].
 ///
 /// If a body fails, it gives an `io::Error` that carries the error of the
 /// session. A reader above the body passes that `io::Error` up as its own
 /// failure. This function returns any other error unchanged.
 pub(crate) fn session_error(error: Error) -> Error {
     match error {
-        Error::Io(io) => match io.downcast::<push::Error>() {
-            Ok(e) => Error::Push(e),
+        Error::Io(io) => match io.downcast::<remote::Error>() {
+            Ok(e) => Error::Remote(e),
             Err(io) => Error::Io(io),
         },
         other => other,
@@ -264,7 +264,7 @@ mod tests {
     use futures_lite::io::Cursor;
 
     use super::*;
-    use crate::push::proto::{
+    use crate::remote::proto::{
         FrameWriter, GetReply, Message, PULL_PROTOCOL_VERSION, PullHelloReply,
     };
 

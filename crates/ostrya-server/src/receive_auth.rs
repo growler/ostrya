@@ -6,7 +6,7 @@ use std::sync::Arc;
 use hyper::StatusCode;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::http::request::Parts;
-use ostrya::push::proto::Hello;
+use ostrya::remote::proto::Hello;
 use ostrya::{ReceiveHooks, ReceivePolicy};
 
 /// The authentication of the requests of the receive endpoint.
@@ -44,7 +44,7 @@ use ostrya::{ReceiveHooks, ReceivePolicy};
 /// use std::sync::Arc;
 ///
 /// use hyper::http::request::Parts;
-/// use ostrya::push::proto::Hello;
+/// use ostrya::remote::proto::Hello;
 /// use ostrya::{ReceivePolicy, Repo};
 /// use ostrya_server::{
 ///     EndpointOptions, ReceiveAuth, ReceiveEndpoint, Refusal, RequestKind, SessionSetup,

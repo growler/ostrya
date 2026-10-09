@@ -37,8 +37,8 @@ use crate::fetch::{
 };
 use crate::inflate::BufSource;
 use crate::object::{MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
-use crate::push::{PullSession, PullSessionOptions};
 use crate::read::CommitState;
+use crate::remote::{PullSession, PullSessionOptions};
 use crate::repo::Repo;
 use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE, Summary, put_root_file_blocking};
 use crate::transaction::Transaction;
@@ -413,7 +413,7 @@ impl Repo {
     /// - [`Error::Fetch`], [`Error::HttpStatus`], [`Error::FetchTooLarge`],
     ///   [`Error::ContentEncoded`], or [`Error::RedirectLimit`] if an HTTP
     ///   request fails after its retries.
-    /// - [`Error::Push`] if the session of a pull over ssh fails.
+    /// - [`Error::Remote`] if the session of a pull over ssh fails.
     /// - [`Error::LockTimeout`] if the wait for the repository lock or the
     ///   update lock passes `[core] lock-timeout-secs`.
     /// - [`Error::Io`] for an I/O error of the file system.
@@ -434,7 +434,7 @@ impl Repo {
     /// # Ok(()) }
     /// ```
     ///
-    /// [`PushRemote::parse`]: crate::push::PushRemote::parse
+    /// [`PushRemote::parse`]: crate::remote::PushRemote::parse
     pub async fn pull(&self, remote: &str, opts: PullOptions) -> Result<PullStats> {
         let started = Instant::now();
         // A subpath the walk cannot read is refused before anything else, so it
@@ -527,7 +527,7 @@ impl Repo {
     /// - [`Error::Unsupported`] if
     ///   [`collection_id`](PullOptions::collection_id) is set, before the
     ///   session opens.
-    /// - [`Error::Push`] if the session fails. A failure ends the session and
+    /// - [`Error::Remote`] if the session fails. A failure ends the session and
     ///   the pull.
     /// - The other errors of [`pull`](Repo::pull) that apply to a pull over
     ///   ssh.
@@ -819,7 +819,7 @@ impl Repo {
     /// - [`Error::Fetch`], [`Error::HttpStatus`] other than 404,
     ///   [`Error::ContentEncoded`], or [`Error::RedirectLimit`] if an HTTP
     ///   request fails after its retries.
-    /// - [`Error::Push`] if the ssh session fails.
+    /// - [`Error::Remote`] if the ssh session fails.
     pub async fn remote_fetch_summary(
         &self,
         remote: &str,

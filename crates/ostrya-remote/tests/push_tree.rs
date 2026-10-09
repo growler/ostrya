@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use futures_io::AsyncWrite;
-use ostrya_push::{
+use ostrya_remote::{
     Compression, ConnectOptions, Error, PushRemote, TreePushOptions, push_tree,
     push_tree_over_stream,
 };
@@ -31,7 +31,7 @@ impl Scratch {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "ostrya-push-tree-push-{}-{tag}-{n}",
+            "ostrya-remote-tree-push-{}-{tag}-{n}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&path);

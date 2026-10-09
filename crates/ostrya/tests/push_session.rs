@@ -17,7 +17,7 @@ use common::{COMMIT, TmpDir, fixture_repo};
 use futures_io::AsyncWrite;
 use futures_lite::future::zip;
 use futures_lite::io::Cursor;
-use ostrya::push::{
+use ostrya::remote::{
     BoxFuture, Compression, Encoding, Error, Expected, ObjectData, ObjectSource, PushOutcome,
     PushSession, RefUpdate, SessionOptions,
 };
@@ -98,7 +98,7 @@ impl ObjectSource for FixtureSource {
     fn objects<'a>(
         &'a self,
         commit: &'a Checksum,
-    ) -> BoxFuture<'a, ostrya::push::Result<Vec<ObjectName>>> {
+    ) -> BoxFuture<'a, ostrya::remote::Result<Vec<ObjectName>>> {
         Box::pin(async move {
             let names = self
                 .repo
@@ -115,14 +115,14 @@ impl ObjectSource for FixtureSource {
         &'a self,
         name: &'a ObjectName,
         encoding: Encoding,
-    ) -> BoxFuture<'a, ostrya::push::Result<ObjectData>> {
+    ) -> BoxFuture<'a, ostrya::remote::Result<ObjectData>> {
         Box::pin(async move { self.load(name, encoding).await.map_err(source_error) })
     }
 
     fn detached_metadata<'a>(
         &'a self,
         _commit: &'a Checksum,
-    ) -> BoxFuture<'a, ostrya::push::Result<Option<Value>>> {
+    ) -> BoxFuture<'a, ostrya::remote::Result<Option<Value>>> {
         Box::pin(async move {
             let mut dict = DictBuilder::new();
             dict.insert_str("xa.pushed-by", "push_session");
@@ -222,7 +222,7 @@ impl AsyncWrite for DropCommitReply {
 
 /// The result of the client in one session: the names that `missing`
 /// returned, and the result of the commit.
-type Client = ostrya::push::Result<(Vec<ObjectName>, PushOutcome)>;
+type Client = ostrya::remote::Result<(Vec<ObjectName>, PushOutcome)>;
 
 /// Pushes the fixture commit from `source` into `repo` one time.
 ///

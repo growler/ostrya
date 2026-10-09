@@ -11,7 +11,7 @@ use std::pin::Pin;
 use ostrya_core::{Checksum, Value};
 
 use super::session::{Failure, ReceiveReport};
-use crate::push::{self, RefUpdate};
+use crate::remote::{self, RefUpdate};
 
 /// The future that a hook returns.
 ///
@@ -330,8 +330,8 @@ impl HookRefusal {
     /// Returns the failure of the session for the refusal.
     pub(super) fn into_failure(self) -> Failure {
         Failure::Wire(match self.kind {
-            Kind::Denied => push::Error::RefDenied(self.message),
-            Kind::Internal => push::Error::Internal(self.message),
+            Kind::Denied => remote::Error::RefDenied(self.message),
+            Kind::Internal => remote::Error::Internal(self.message),
         })
     }
 }

@@ -10,8 +10,8 @@ use ostrya_core::ObjectName;
 use super::ReceivePolicy;
 use super::core::SessionCore;
 use crate::error::{Error, Result};
-use crate::push::proto::{CommitRequest, FrameReader, FrameWriter, Hello, Message, ObjectHeader};
-use crate::push::{self, RefOutcome};
+use crate::remote::proto::{CommitRequest, FrameReader, FrameWriter, Hello, Message, ObjectHeader};
+use crate::remote::{self, RefOutcome};
 use crate::repo::Repo;
 use crate::transaction::TransactionStats;
 
@@ -64,8 +64,8 @@ pub enum ReceiveStep {
 /// How a session failed.
 pub(super) enum Failure {
     /// A failure with a wire code. The session sends it to the peer, and the
-    /// caller gets it as [`Error::Push`].
-    Wire(push::Error),
+    /// caller gets it as [`Error::Remote`].
+    Wire(remote::Error),
     /// A failure on the server side. The session sends it to the peer as
     /// `internal`, and the caller gets it as it is.
     Internal(Error),
@@ -76,19 +76,19 @@ pub(super) enum Failure {
 
 /// Returns the failure of a codec error of the reader. An error of the
 /// stream is silent, and every other error carries its wire code.
-pub(super) fn codec(error: push::Error) -> Failure {
+pub(super) fn codec(error: remote::Error) -> Failure {
     match error {
-        push::Error::Io(e) => Failure::Silent(Error::Io(e)),
+        remote::Error::Io(e) => Failure::Silent(Error::Io(e)),
         other => Failure::Wire(other),
     }
 }
 
 pub(super) fn aborted() -> Failure {
-    Failure::Silent(Error::Push(push::Error::Aborted))
+    Failure::Silent(Error::Remote(remote::Error::Aborted))
 }
 
 pub(super) fn out_of_order(msg: &Message) -> Failure {
-    Failure::Wire(push::Error::Protocol(format!(
+    Failure::Wire(remote::Error::Protocol(format!(
         "{:?} is out of order",
         msg.kind()
     )))
@@ -258,37 +258,37 @@ impl Repo {
     ///
     /// Each error ends the session. The session sends a wire code to the
     /// client as an `Error` message, and the call returns it inside
-    /// [`Error::Push`]. The session sends each other error as `internal`,
+    /// [`Error::Remote`]. The session sends each other error as `internal`,
     /// except the errors of the stream, which send nothing.
     ///
-    /// - [`push::Error::Protocol`] if a message comes out of order.
+    /// - [`remote::Error::Protocol`] if a message comes out of order.
     /// - At `Hello`, the errors of
     ///   [`ReceiveService::hello`](super::ReceiveService::hello), other than
     ///   `Error::InvalidInput`. These include [`Error::LockTimeout`] for the
     ///   repository lock.
-    /// - [`push::Error::LimitExceeded`] if a `Have` holds more than
-    ///   [`MAX_HAVE`](crate::push::proto::MAX_HAVE) entries.
-    /// - [`push::Error::ChecksumMismatch`] if the bytes of an object do not
+    /// - [`remote::Error::LimitExceeded`] if a `Have` holds more than
+    ///   [`MAX_HAVE`](crate::remote::proto::MAX_HAVE) entries.
+    /// - [`remote::Error::ChecksumMismatch`] if the bytes of an object do not
     ///   hash to its checksum.
-    /// - [`push::Error::ModeRefused`] if an object breaks the content rules of
+    /// - [`remote::Error::ModeRefused`] if an object breaks the content rules of
     ///   the repository mode or of `policy`.
-    /// - [`push::Error::LimitExceeded`] if a metadata object is larger than
+    /// - [`remote::Error::LimitExceeded`] if a metadata object is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if the header of
     ///   a content object is larger than its limit.
-    /// - [`push::Error::LimitExceeded`] if a read passes one of the
+    /// - [`remote::Error::LimitExceeded`] if a read passes one of the
     ///   [metadata budgets](super::ReceiveService#metadata-budgets).
-    /// - [`push::Error::Protocol`] if the payload of an object is malformed,
+    /// - [`remote::Error::Protocol`] if the payload of an object is malformed,
     ///   or if bytes follow the end of an object.
-    /// - [`push::Error::Protocol`] if two detached metadata objects name the
+    /// - [`remote::Error::Protocol`] if two detached metadata objects name the
     ///   same commit, or if an incoming detached metadata dict is malformed.
     /// - The wire code of the frame decoder, if it refuses a frame.
-    /// - [`push::Error::Internal`] if the encoder refuses a reply.
+    /// - [`remote::Error::Internal`] if the encoder refuses a reply.
     /// - At `Commit`, the errors of
     ///   [`ReceiveService::commit`](super::ReceiveService::commit), other than
     ///   the errors of steps in flight and of hooks. These include
     ///   [`Error::LockTimeout`] for the update lock and the errors of a stored
     ///   detached metadata dict.
-    /// - [`push::Error::Aborted`] if the client sends `Abort` or abandons an
+    /// - [`remote::Error::Aborted`] if the client sends `Abort` or abandons an
     ///   object. The session sends nothing.
     /// - [`Error::Io`] of kind `UnexpectedEof` if `input` ends at a frame
     ///   boundary before `Commit`. The session sends nothing.
@@ -321,10 +321,10 @@ impl Repo {
         let error = match failure {
             Failure::Wire(e) => {
                 session.send_error(e.to_message()).await;
-                Error::Push(e)
+                Error::Remote(e)
             }
             Failure::Internal(e) => {
-                let msg = push::Error::Internal(e.to_string()).to_message();
+                let msg = remote::Error::Internal(e.to_string()).to_message();
                 session.send_error(msg).await;
                 e
             }
@@ -377,16 +377,16 @@ where
             Err(e) => Err(e),
         };
         sent.map_err(|e| match e {
-            push::Error::Io(e) => Failure::Silent(Error::Io(e)),
+            remote::Error::Io(e) => Failure::Silent(Error::Io(e)),
             // A reply the codec refuses is a fault of the server, whatever
             // code the codec gives it.
-            other => Failure::Wire(push::Error::Internal(other.to_string())),
+            other => Failure::Wire(remote::Error::Internal(other.to_string())),
         })
     }
 
     /// Sends an `Error` message. The session ignores a failure to send it,
     /// because the peer can be gone.
-    async fn send_error(&mut self, msg: push::proto::ErrorMessage) {
+    async fn send_error(&mut self, msg: remote::proto::ErrorMessage) {
         if self
             .writer
             .write_message(&Message::Error(msg))

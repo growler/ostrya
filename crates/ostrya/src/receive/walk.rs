@@ -11,7 +11,7 @@ use ostrya_core::{Checksum, DirTree, ObjectName, ObjectType, loose_path};
 use super::session::Failure;
 use crate::error::{Error, Result};
 use crate::object::{MAX_METADATA_SIZE, object_exists, read_meta_object};
-use crate::push::{self, proto::MAX_HAVE};
+use crate::remote::{self, proto::MAX_HAVE};
 use crate::transaction::Transaction;
 use crate::write::flat_name;
 
@@ -174,7 +174,7 @@ impl Walk<'_> {
             let dirtree = parsed.map_err(|e| {
                 let message = format!("dirtree {checksum} does not parse: {e}");
                 if staged {
-                    Failure::Wire(push::Error::Protocol(message))
+                    Failure::Wire(remote::Error::Protocol(message))
                 } else {
                     Failure::Internal(Error::InvalidFormat(message))
                 }

@@ -2174,10 +2174,10 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
 /// The encoding of the content objects that `--compress` selects: `deflate`
 /// at the given level, or `raw` when the option is absent.
 #[cfg(feature = "push")]
-fn push_compression(level: Option<u8>) -> ostrya::push::Compression {
+fn push_compression(level: Option<u8>) -> ostrya::remote::Compression {
     match level {
-        Some(level) => ostrya::push::Compression::Deflate { level },
-        None => ostrya::push::Compression::None,
+        Some(level) => ostrya::remote::Compression::Deflate { level },
+        None => ostrya::remote::Compression::None,
     }
 }
 
@@ -2185,14 +2185,14 @@ fn push_compression(level: Option<u8>) -> ostrya::push::Compression {
 /// options, each in the field of its name, so the push refuses an option of
 /// the other transport. The ssh command is split at ASCII whitespace.
 #[cfg(feature = "push")]
-fn push_connect_options(args: PushConnectArgs) -> ostrya::push::ConnectOptions {
+fn push_connect_options(args: PushConnectArgs) -> ostrya::remote::ConnectOptions {
     let ssh_command = args.ssh_command.map(|command| {
         command
             .split_ascii_whitespace()
             .map(str::to_owned)
             .collect()
     });
-    ostrya::push::ConnectOptions {
+    ostrya::remote::ConnectOptions {
         ssh_command,
         receive_command: args.receive_command,
         push_token_file: args.push_token_file,
@@ -2263,10 +2263,10 @@ async fn push_tree(
     }
     // The server resolves no revision, so the parent is a full checksum.
     let parent = match args.parent.as_deref() {
-        None => ostrya::push::ParentPolicy::CurrentTip,
-        Some(NO_PARENT) => ostrya::push::ParentPolicy::None,
+        None => ostrya::remote::ParentPolicy::CurrentTip,
+        Some(NO_PARENT) => ostrya::remote::ParentPolicy::None,
         Some(text) => match Checksum::from_hex_lower(text) {
-            Ok(checksum) => ostrya::push::ParentPolicy::Commit(checksum),
+            Ok(checksum) => ostrya::remote::ParentPolicy::Commit(checksum),
             Err(_) => exit_error(&format!(
                 "Invalid --parent '{text}': give a commit checksum of 64 lowercase hex \
                  characters, or none"
@@ -2295,7 +2295,7 @@ async fn push_tree(
         let (repo, _) = resolve_repo(repo, verbose, name).await;
         ostrya::resolve_push_remote(Some(repo.config()), remote, connect)?
     };
-    let transport = ostrya::push::PushSession::prepare(&address, connect).await?;
+    let transport = ostrya::remote::PushSession::prepare(&address, connect).await?;
     let signers = refuse!(
         collect_signers(
             &args.sign,
@@ -2312,7 +2312,7 @@ async fn push_tree(
         None => args.body,
     };
     let (progress, bar) = PushBar::start();
-    let opts = ostrya::push::TreePushOptions {
+    let opts = ostrya::remote::TreePushOptions {
         refs: args.branch,
         parent,
         subject: args.subject,
@@ -2328,7 +2328,7 @@ async fn push_tree(
         force: args.force,
         progress,
     };
-    let pushed = ostrya::push::push_tree_prepared(transport, dir, opts).await;
+    let pushed = ostrya::remote::push_tree_prepared(transport, dir, opts).await;
     // The bar is cleared before any line of the result or of the error.
     bar.finish();
     let outcome = pushed?;
@@ -2357,8 +2357,8 @@ async fn push_tree(
 /// than a symlink to its file type and `perm & 0755`, and then each declared
 /// id.
 #[cfg(feature = "push")]
-fn tree_push_filter(owner: Owner, canonical: bool) -> Option<ostrya::push::tree::EntryFilter> {
-    use ostrya::push::tree::{EntryAction, EntryKind};
+fn tree_push_filter(owner: Owner, canonical: bool) -> Option<ostrya::remote::tree::EntryFilter> {
+    use ostrya::remote::tree::{EntryAction, EntryKind};
     if !canonical && owner == Owner::default() {
         return None;
     }
@@ -2385,7 +2385,7 @@ fn tree_push_filter(owner: Owner, canonical: bool) -> Option<ostrya::push::tree:
 /// or `(new)` or `(absent)`, and the commit after it or `(deleted)` or
 /// `(unchanged)`.
 #[cfg(feature = "push")]
-fn ref_line(outcome: &ostrya::push::RefOutcome) -> String {
+fn ref_line(outcome: &ostrya::remote::RefOutcome) -> String {
     let name = &outcome.name;
     match (outcome.old, outcome.new) {
         (None, Some(new)) => format!("{name} (new) {new}"),
@@ -2398,7 +2398,7 @@ fn ref_line(outcome: &ostrya::push::RefOutcome) -> String {
 
 /// The statistics line `push --verbose` writes to standard error.
 #[cfg(feature = "push")]
-fn push_statistics_line(stats: &ostrya::push::PushStats) -> String {
+fn push_statistics_line(stats: &ostrya::remote::PushStats) -> String {
     format!(
         "{} objects offered, {} needed, {} sent; {} bytes sent in {:.3} seconds",
         stats.objects_total,
@@ -2411,7 +2411,7 @@ fn push_statistics_line(stats: &ostrya::push::PushStats) -> String {
 
 /// The progress bar of `push` and `push-tree` on standard error.
 ///
-/// The hook of a [`PushProgress`](ostrya::push::PushProgress) drives the bar.
+/// The hook of a [`PushProgress`](ostrya::remote::PushProgress) drives the bar.
 /// `indicatif` draws it at most 20 times a second. When standard error is not
 /// a terminal, or `TERM` is unset or `dumb`, the bar is hidden, and the push
 /// gets no progress handle: the session then asks its source for no byte
@@ -2465,7 +2465,7 @@ const BYTES_TEMPLATE: &str = "{spinner} {objects} {bytes} {binary_bytes_per_sec}
 impl PushBar {
     /// A new bar, and the progress handle whose hook drives it. A hidden bar
     /// gives no handle.
-    fn start() -> (Option<ostrya::push::PushProgress>, Arc<PushBar>) {
+    fn start() -> (Option<ostrya::remote::PushProgress>, Arc<PushBar>) {
         let bar = Arc::new(PushBar {
             bar: indicatif::ProgressBar::with_draw_target(
                 None,
@@ -2478,7 +2478,7 @@ impl PushBar {
             return (None, bar);
         }
         let hooked = Arc::clone(&bar);
-        let progress = ostrya::push::PushProgress::with_hook(Arc::new(move |snapshot| {
+        let progress = ostrya::remote::PushProgress::with_hook(Arc::new(move |snapshot| {
             hooked.update(snapshot)
         }));
         (Some(progress), bar)
@@ -2486,8 +2486,8 @@ impl PushBar {
 
     /// Show `snapshot`. The style changes only when the stage changes, and
     /// a snapshot of an earlier stage changes nothing.
-    fn update(&self, snapshot: &ostrya::push::PushProgressSnapshot) {
-        use ostrya::push::PushPhase;
+    fn update(&self, snapshot: &ostrya::remote::PushProgressSnapshot) {
+        use ostrya::remote::PushPhase;
         let stage = match snapshot.phase {
             PushPhase::Negotiating => STAGE_NEGOTIATING,
             PushPhase::Uploading => STAGE_UPLOADING,
@@ -10880,7 +10880,7 @@ mod tests {
         let c1 = Checksum::from_bytes([0x11; 32]);
         let c2 = Checksum::from_bytes([0x22; 32]);
         let line = |old, new| {
-            ref_line(&ostrya::push::RefOutcome {
+            ref_line(&ostrya::remote::RefOutcome {
                 name: "main".into(),
                 old,
                 new,
@@ -10904,7 +10904,7 @@ mod tests {
     #[cfg(feature = "push")]
     #[test]
     fn the_push_statistics_line_gives_each_counter() {
-        let stats = ostrya::push::PushStats {
+        let stats = ostrya::remote::PushStats {
             objects_total: 12,
             objects_needed: 5,
             objects_sent: 4,
@@ -10971,7 +10971,7 @@ mod tests {
     #[cfg(feature = "push")]
     #[test]
     fn the_push_bar_templates_parse_and_the_bar_clears_at_committing() {
-        use ostrya::push::PushPhase;
+        use ostrya::remote::PushPhase;
         for template in [NEGOTIATING_TEMPLATE, BAR_TEMPLATE, BYTES_TEMPLATE] {
             assert!(
                 indicatif::ProgressStyle::with_template(template).is_ok(),
@@ -10987,7 +10987,7 @@ mod tests {
             objects: Arc::default(),
         };
         let bar = hidden();
-        let mut snapshot = ostrya::push::PushProgressSnapshot::default();
+        let mut snapshot = ostrya::remote::PushProgressSnapshot::default();
         snapshot.bytes_total = 10;
         snapshot.objects_needed = 2;
         snapshot.objects_sent = 1;
@@ -11027,7 +11027,7 @@ mod tests {
     #[cfg(feature = "push")]
     #[test]
     fn the_tree_push_filter_applies_the_canonical_rule_then_the_owner() {
-        use ostrya::push::tree::{EntryAction, EntryFilter, EntryMeta, ScanOptions, TreeModel};
+        use ostrya::remote::tree::{EntryAction, EntryFilter, EntryMeta, ScanOptions, TreeModel};
 
         assert!(tree_push_filter(Owner::default(), false).is_none());
         let root = std::env::temp_dir().join(format!(

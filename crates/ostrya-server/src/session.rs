@@ -570,8 +570,8 @@ impl Drop for BodyTrack {
 pub(crate) mod tests {
     use std::path::PathBuf;
 
-    use ostrya::push::proto::{CommitRequest, Hello};
-    use ostrya::push::{Expected, RefUpdate};
+    use ostrya::remote::proto::{CommitRequest, Hello};
+    use ostrya::remote::{Expected, RefUpdate};
     use ostrya::{CreateOptions, ReceivePolicy, Repo, RepoMode};
     use ostrya_rt::block_on;
 

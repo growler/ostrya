@@ -21,8 +21,8 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use ostrya::fetch::Proxy;
-use ostrya::push::tree::{ScanOptions, TreeModel};
-use ostrya::push::{
+use ostrya::remote::tree::{ScanOptions, TreeModel};
+use ostrya::remote::{
     BoxFuture, Compression, ConnectOptions, Encoding, Error, ObjectData, ObjectSource, PushOutcome,
     PushRemote, PushSession, SessionOptions, TreePushOptions, push_tree,
 };
@@ -257,7 +257,7 @@ async fn push(
     root: &Path,
     connect: ConnectOptions,
     refs: &[&str],
-) -> ostrya::push::Result<PushOutcome> {
+) -> ostrya::remote::Result<PushOutcome> {
     push_tree(
         &remote(url),
         root,
@@ -531,7 +531,7 @@ impl ObjectSource for Altered<'_> {
     fn objects<'a>(
         &'a self,
         commit: &'a Checksum,
-    ) -> BoxFuture<'a, ostrya::push::Result<Vec<ObjectName>>> {
+    ) -> BoxFuture<'a, ostrya::remote::Result<Vec<ObjectName>>> {
         self.model.objects(commit)
     }
 
@@ -539,7 +539,7 @@ impl ObjectSource for Altered<'_> {
         &'a self,
         name: &'a ObjectName,
         encoding: Encoding,
-    ) -> BoxFuture<'a, ostrya::push::Result<ObjectData>> {
+    ) -> BoxFuture<'a, ostrya::remote::Result<ObjectData>> {
         if *name != self.target {
             return self.model.open(name, encoding);
         }
@@ -556,7 +556,7 @@ impl ObjectSource for Altered<'_> {
     fn detached_metadata<'a>(
         &'a self,
         commit: &'a Checksum,
-    ) -> BoxFuture<'a, ostrya::push::Result<Option<Value>>> {
+    ) -> BoxFuture<'a, ostrya::remote::Result<Option<Value>>> {
         self.model.detached_metadata(commit)
     }
 }

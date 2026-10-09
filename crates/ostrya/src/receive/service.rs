@@ -16,8 +16,8 @@ use super::core::SessionCore;
 use super::session::{Failure, ReceiveReport, STREAM_BUFFER, aborted, next, out_of_order};
 use super::{ReceiveHooks, ReceivePolicy};
 use crate::error::{Error, Result};
-use crate::push;
-use crate::push::proto::{
+use crate::remote;
+use crate::remote::proto::{
     CommitRequest, FrameReader, HaveReply, Hello, HelloReply, MAX_FRAME, Message, ObjectsReply,
 };
 use crate::repo::Repo;
@@ -83,13 +83,13 @@ type Core = SessionCore<Arc<ReceivePolicy>>;
 ///
 /// # Failures
 ///
-/// - A failure with a wire code returns as [`Error::Push`].
+/// - A failure with a wire code returns as [`Error::Remote`].
 /// - A failure on the server side returns as the error it is. The host sends
 ///   it as `internal`.
 /// - If the input of `objects` fails with an I/O error that is not an end of
 ///   file, the step returns [`Error::Io`].
 /// - A step of a session that an earlier failure or [`abort`](Self::abort)
-///   ended returns [`push::Error::Protocol`] with the message
+///   ended returns [`remote::Error::Protocol`] with the message
 ///   `the session was aborted: CAUSE`.
 /// - A step can complete after a failure of another step or
 ///   [`abort`](Self::abort) ended the session. Then the step drops its result
@@ -123,7 +123,7 @@ enum Kind {
 }
 
 fn protocol(message: impl Into<String>) -> Error {
-    Error::Push(push::Error::Protocol(message.into()))
+    Error::Remote(remote::Error::Protocol(message.into()))
 }
 
 /// Returns the error that a step returns for `failure`.
@@ -132,9 +132,9 @@ fn protocol(message: impl Into<String>) -> Error {
 /// get no reply on a stream. Here they are `protocol`, which the host sends.
 fn into_error(failure: Failure) -> Error {
     match failure {
-        Failure::Wire(e) => Error::Push(e),
+        Failure::Wire(e) => Error::Remote(e),
         Failure::Internal(e) => e,
-        Failure::Silent(Error::Push(push::Error::Aborted)) => {
+        Failure::Silent(Error::Remote(remote::Error::Aborted)) => {
             protocol("the client aborted the session")
         }
         Failure::Silent(Error::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -158,16 +158,16 @@ impl ReceiveService {
     ///
     /// # Errors
     ///
-    /// A wire code returns inside [`Error::Push`].
+    /// A wire code returns inside [`Error::Remote`].
     ///
     /// - [`Error::InvalidInput`] if `parallel_uploads` is 0.
-    /// - [`push::Error::Protocol`] if `Hello` has `one-way` true.
+    /// - [`remote::Error::Protocol`] if `Hello` has `one-way` true.
     /// - The errors of [`check_hello`](Self::check_hello).
     /// - The errors of [`Repo::transaction`](crate::Repo::transaction) if the
     ///   session transaction cannot open. These include
     ///   [`Error::LockTimeout`] if the wait for the repository lock passes
     ///   `[core] lock-timeout-secs`.
-    /// - [`push::Error::ModeRefused`] if the repository mode is `bare` and the
+    /// - [`remote::Error::ModeRefused`] if the repository mode is `bare` and the
     ///   process does not run as root.
     /// - [`Error::Core`] or [`Error::InvalidFormat`] if `[core] fsync`,
     ///   `[core] per-object-fsync`, `[ex-integrity] fsverity`, or, in an
@@ -251,18 +251,18 @@ impl ReceiveService {
     ///
     /// # Errors
     ///
-    /// A wire code returns inside [`Error::Push`].
+    /// A wire code returns inside [`Error::Remote`].
     ///
-    /// - [`push::Error::VersionUnsupported`] if `hello` names a protocol
+    /// - [`remote::Error::VersionUnsupported`] if `hello` names a protocol
     ///   version that the server does not speak.
-    /// - [`push::Error::ModeRefused`] if the repository mode is
+    /// - [`remote::Error::ModeRefused`] if the repository mode is
     ///   `bare-split-xattrs`.
-    /// - [`push::Error::LockingDisabled`] if `hello` has `one-way` false and
+    /// - [`remote::Error::LockingDisabled`] if `hello` has `one-way` false and
     ///   the repository sets `[core] locking=false`.
-    /// - [`push::Error::InvalidRef`] if a ref name of `hello` is not valid.
-    /// - [`push::Error::LimitExceeded`] if `hello` has `one-way` false and
+    /// - [`remote::Error::InvalidRef`] if a ref name of `hello` is not valid.
+    /// - [`remote::Error::LimitExceeded`] if `hello` has `one-way` false and
     ///   its `HelloReply` can need a frame over [`MAX_FRAME`].
-    /// - [`push::Error::Internal`] if the encoder refuses the `HelloReply`
+    /// - [`remote::Error::Internal`] if the encoder refuses the `HelloReply`
     ///   with no ref.
     /// - [`Error::Core`] if `[core] locking` is not a boolean.
     pub fn check_hello(repo: &Repo, hello: &Hello) -> Result<()> {
@@ -276,13 +276,13 @@ impl ReceiveService {
     ///
     /// # Errors
     ///
-    /// A wire code returns inside [`Error::Push`]. Each error ends the
+    /// A wire code returns inside [`Error::Remote`]. Each error ends the
     /// session.
     ///
-    /// - [`push::Error::LimitExceeded`] if another `have` of the session is in
+    /// - [`remote::Error::LimitExceeded`] if another `have` of the session is in
     ///   flight, or if `names` holds more than
-    ///   [`MAX_HAVE`](crate::push::proto::MAX_HAVE) entries.
-    /// - [`push::Error::Protocol`] if the session ended or a
+    ///   [`MAX_HAVE`](crate::remote::proto::MAX_HAVE) entries.
+    /// - [`remote::Error::Protocol`] if the session ended or a
     ///   [`commit`](Self::commit) runs.
     /// - An I/O error from the file system, if the check of an object in the
     ///   object store fails.
@@ -302,30 +302,30 @@ impl ReceiveService {
     ///
     /// # Errors
     ///
-    /// A wire code returns inside [`Error::Push`]. Each error ends the
+    /// A wire code returns inside [`Error::Remote`]. Each error ends the
     /// session.
     ///
-    /// - [`push::Error::LimitExceeded`] if `parallel_uploads` calls are in
+    /// - [`remote::Error::LimitExceeded`] if `parallel_uploads` calls are in
     ///   flight already, or if a read passes one of the
     ///   [metadata budgets](ReceiveService#metadata-budgets).
-    /// - [`push::Error::LimitExceeded`] if one metadata object is larger than
+    /// - [`remote::Error::LimitExceeded`] if one metadata object is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if the header
     ///   of a content object is larger than its limit.
-    /// - [`push::Error::Protocol`] if a byte follows `ObjectsEnd`, or if
+    /// - [`remote::Error::Protocol`] if a byte follows `ObjectsEnd`, or if
     ///   `input` ends before `ObjectsEnd`.
-    /// - [`push::Error::Protocol`] if the client sends an `Abort` frame, or a
+    /// - [`remote::Error::Protocol`] if the client sends an `Abort` frame, or a
     ///   message out of order, or bytes after the end of an object.
-    /// - [`push::Error::Protocol`] if two detached metadata objects of the
+    /// - [`remote::Error::Protocol`] if two detached metadata objects of the
     ///   session name the same commit, or if a detached metadata dict is
     ///   malformed.
-    /// - [`push::Error::Protocol`] if the payload of an object is malformed,
+    /// - [`remote::Error::Protocol`] if the payload of an object is malformed,
     ///   for example a corrupt DEFLATE stream or a size that does not match
     ///   its header.
-    /// - [`push::Error::Protocol`] if the session ended or a
+    /// - [`remote::Error::Protocol`] if the session ended or a
     ///   [`commit`](Self::commit) runs.
-    /// - [`push::Error::ChecksumMismatch`] if the bytes of an object do not
+    /// - [`remote::Error::ChecksumMismatch`] if the bytes of an object do not
     ///   hash to its checksum.
-    /// - [`push::Error::ModeRefused`] if an object breaks the content rules of
+    /// - [`remote::Error::ModeRefused`] if an object breaks the content rules of
     ///   the repository mode or of the policy.
     /// - The wire code of the frame decoder, if it refuses a frame.
     /// - [`Error::Io`] if `input` fails with an I/O error that is not an end
@@ -393,46 +393,46 @@ impl ReceiveService {
     ///
     /// # Errors
     ///
-    /// A wire code returns inside [`Error::Push`]. Each error ends the
+    /// A wire code returns inside [`Error::Remote`]. Each error ends the
     /// session.
     ///
-    /// - [`push::Error::Protocol`] if another step of the session is in
+    /// - [`remote::Error::Protocol`] if another step of the session is in
     ///   flight, if the session ended, or if another `commit` runs.
-    /// - [`push::Error::Protocol`] if the request holds no update, or names a
+    /// - [`remote::Error::Protocol`] if the request holds no update, or names a
     ///   ref that `Hello` does not name, or names one ref twice.
-    /// - [`push::Error::Protocol`] if a detached metadata dict belongs to a
+    /// - [`remote::Error::Protocol`] if a detached metadata dict belongs to a
     ///   commit that is not a commit of the session.
-    /// - [`push::Error::Protocol`] if a staged commit or a staged dirtree does
+    /// - [`remote::Error::Protocol`] if a staged commit or a staged dirtree does
     ///   not parse.
-    /// - [`push::Error::InvalidRef`] if a ref name is not valid, or if an
+    /// - [`remote::Error::InvalidRef`] if a ref name is not valid, or if an
     ///   update writes a commit to a ref name of 64 lowercase hex characters.
-    /// - [`push::Error::LimitExceeded`] if the `CommitReply` can need a frame
+    /// - [`remote::Error::LimitExceeded`] if the `CommitReply` can need a frame
     ///   over [`MAX_FRAME`], or if a merged detached metadata dict is larger
     ///   than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
-    /// - [`push::Error::RefDenied`] if a rule refuses an update, or if an
+    /// - [`remote::Error::RefDenied`] if a rule refuses an update, or if an
     ///   update names the collection anchor ref of a repository with a
     ///   collection id.
-    /// - [`push::Error::RefDenied`] if a ref path fails a check under the
+    /// - [`remote::Error::RefDenied`] if a ref path fails a check under the
     ///   update lock: a ref is an alias, a ref write cannot replace a path, or
     ///   one update names a directory of another.
-    /// - [`push::Error::RefDenied`] or [`push::Error::Internal`] if
+    /// - [`remote::Error::RefDenied`] or [`remote::Error::Internal`] if
     ///   `before_update` refuses with
     ///   [`HookRefusal::denied`](super::HookRefusal::denied) or
     ///   [`HookRefusal::internal`](super::HookRefusal::internal).
-    /// - [`push::Error::MissingObjects`] if a new commit, or an object of the
+    /// - [`remote::Error::MissingObjects`] if a new commit, or an object of the
     ///   tree of a commit of the session, is neither staged nor present.
-    /// - [`push::Error::BindingMismatch`] if the ref binding or the collection
+    /// - [`remote::Error::BindingMismatch`] if the ref binding or the collection
     ///   binding of a new commit does not name its ref or the repository.
-    /// - [`push::Error::SignatureRequired`] if a new commit fails the
+    /// - [`remote::Error::SignatureRequired`] if a new commit fails the
     ///   signature verification of a rule.
-    /// - [`push::Error::RefMismatch`] if a ref is not in the state that its
+    /// - [`remote::Error::RefMismatch`] if a ref is not in the state that its
     ///   update expects.
-    /// - [`push::Error::DeleteDenied`] if an update deletes a ref and the
+    /// - [`remote::Error::DeleteDenied`] if an update deletes a ref and the
     ///   policy does not allow it.
-    /// - [`push::Error::NonFastForward`] if the new commit does not descend
+    /// - [`remote::Error::NonFastForward`] if the new commit does not descend
     ///   from the commit of the ref. If the client sends `force` and the rule
     ///   allows an update that is not a fast-forward, this check does not run.
-    /// - [`push::Error::Internal`] if `after_update` returns an error.
+    /// - [`remote::Error::Internal`] if `after_update` returns an error.
     /// - [`Error::InvalidInput`] if the plan of `before_update` breaks a rule
     ///   that [`ReceiveHooks`] states. The host sends it as `internal`.
     /// - [`Error::InvalidFormat`] if a commit or a dirtree that the repository
@@ -457,7 +457,7 @@ impl ReceiveService {
                     ..
                 } => {}
                 State::Open { .. } => {
-                    let e = push::Error::Protocol(
+                    let e = remote::Error::Protocol(
                         "Commit while another request of the session is in flight".into(),
                     );
                     return Err(self.refuse(state, e));
@@ -514,14 +514,14 @@ impl ReceiveService {
         };
         match kind {
             Kind::Objects if *uploads == self.parallel_uploads => {
-                let e = push::Error::LimitExceeded(format!(
+                let e = remote::Error::LimitExceeded(format!(
                     "an objects request past parallel-uploads {}",
                     self.parallel_uploads
                 ));
                 return Err(self.refuse(state, e));
             }
             Kind::Have if *haves == 1 => {
-                let e = push::Error::LimitExceeded(
+                let e = remote::Error::LimitExceeded(
                     "a Have request while another Have of the session is in flight".into(),
                 );
                 return Err(self.refuse(state, e));
@@ -556,11 +556,11 @@ impl ReceiveService {
 
     /// Refuses a step with `error` and ends the open session with it, in the
     /// same hold of the lock that `state` holds.
-    fn refuse(&self, mut state: MutexGuard<'_, State>, error: push::Error) -> Error {
+    fn refuse(&self, mut state: MutexGuard<'_, State>, error: remote::Error) -> Error {
         let core = close_locked(&mut state, &error.to_string());
         drop(state);
         self.closed(core);
-        Error::Push(error)
+        Error::Remote(error)
     }
 
     /// Completes the end of a session after the release of the lock.
@@ -657,7 +657,7 @@ async fn read_objects<R: AsyncRead + Unpin>(
         .await
         .map_err(|e| Failure::Silent(Error::Io(e)))?;
     if n != 0 {
-        return Err(Failure::Wire(push::Error::Protocol(
+        return Err(Failure::Wire(remote::Error::Protocol(
             "bytes follow ObjectsEnd".into(),
         )));
     }

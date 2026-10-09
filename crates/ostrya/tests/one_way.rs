@@ -2,7 +2,7 @@
 //! and the refusal of a one-way `Hello` by the two-way receiver.
 //!
 //! The tests write each stream by hand with the frame codec of
-//! `ostrya::push::proto`. A stream carries the objects of the golden fixture
+//! `ostrya::remote::proto`. A stream carries the objects of the golden fixture
 //! commit, which binds the ref `test/main`. A stream that commits runs through
 //! an in-process pipe. The receiver reads a stream that fails from a byte
 //! buffer, so a test can cut the stream or change a byte.
@@ -24,8 +24,8 @@ use common::receive::{
 use common::{COMMIT, TmpDir, file_inventory, foreign_holder, lock_holder_main, tool_fsck};
 use futures_io::AsyncWrite;
 use futures_lite::io::AsyncWriteExt;
-use ostrya::push::proto::{CommitRequest, FrameWriter, Hello, Message, ObjectHeader};
-use ostrya::push::{self, Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
+use ostrya::remote::proto::{CommitRequest, FrameWriter, Hello, Message, ObjectHeader};
+use ostrya::remote::{self, Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
 use ostrya::{
     Checksum, DictBuilder, Error, FsckOptions, MAX_METADATA_SIZE, ObjectName, ObjectType,
     ReceivePolicy, ReceiveReport, ReceiveRule, ReceiveService, RefPattern, Repo, RepoMode,
@@ -242,7 +242,7 @@ fn receive(repo: &Repo, policy: &ReceivePolicy, bytes: &[u8]) -> ostrya::Result<
 
 fn assert_protocol(result: ostrya::Result<ReceiveReport>) {
     assert!(
-        matches!(result, Err(Error::Push(push::Error::Protocol(_)))),
+        matches!(result, Err(Error::Remote(remote::Error::Protocol(_)))),
         "{result:?}"
     );
 }
@@ -479,7 +479,7 @@ fn messages_out_of_place_are_protocol() {
     for (case, bytes) in cases {
         let result = receive(&repo, &policy, &bytes);
         assert!(
-            matches!(result, Err(Error::Push(push::Error::Protocol(_)))),
+            matches!(result, Err(Error::Remote(remote::Error::Protocol(_)))),
             "{case}: {result:?}"
         );
         assert_nothing_published(&repo, &before);
@@ -533,7 +533,7 @@ fn an_abandoned_object_is_aborted() {
     let (abandoned, marks) = s.finish();
     let result = receive(&repo, &policy, &abandoned);
     assert!(
-        matches!(result, Err(Error::Push(push::Error::Aborted))),
+        matches!(result, Err(Error::Remote(remote::Error::Aborted))),
         "{result:?}"
     );
     assert_nothing_published(&repo, &before);
@@ -599,7 +599,10 @@ fn a_corrupted_object_is_checksum_mismatch() {
         s.objects(&objects).commit(updates());
         let result = receive(&repo, &policy, &s.bytes());
         assert!(
-            matches!(result, Err(Error::Push(push::Error::ChecksumMismatch(_)))),
+            matches!(
+                result,
+                Err(Error::Remote(remote::Error::ChecksumMismatch(_)))
+            ),
             "{ty:?}: {result:?}"
         );
         assert_nothing_published(&repo, &before);
@@ -647,7 +650,7 @@ fn merged_detached_metadata_over_the_limit_is_limit_exceeded() {
     assert!(
         matches!(
             &result,
-            Err(Error::Push(push::Error::LimitExceeded(m))) if m.contains("merged detached metadata")
+            Err(Error::Remote(remote::Error::LimitExceeded(m))) if m.contains("merged detached metadata")
         ),
         "{result:?}"
     );
@@ -697,7 +700,7 @@ fn the_two_way_receiver_refuses_a_one_way_hello() {
 
     let opened = block_on(ReceiveService::hello(repo.clone(), policy, 1, one_way));
     assert!(
-        matches!(opened, Err(Error::Push(push::Error::Protocol(_)))),
+        matches!(opened, Err(Error::Remote(remote::Error::Protocol(_)))),
         "{:?}",
         opened.map(|(_, reply)| reply)
     );
@@ -723,7 +726,7 @@ fn a_write_to_a_checksum_shaped_name_is_invalid_ref_at_commit() {
         .objects(&fixture_objects(Encoding::Raw))
         .commit(vec![update(&hex, Expected::Absent, Some(fixture_commit()))]);
     match receive(&repo, &policy(), &stream.bytes()) {
-        Err(Error::Push(push::Error::InvalidRef(m))) => {
+        Err(Error::Remote(remote::Error::InvalidRef(m))) => {
             assert_eq!(m, format!("invalid ref name '{hex}'"));
         }
         other => panic!("{other:?}"),
@@ -747,8 +750,8 @@ mod export {
     use common::receive::is_root;
     use common::{Untouchable, is_sealed, mark_partial, regular_objects};
     use futures_lite::future::zip;
-    use ostrya::push::proto::ABANDON;
-    use ostrya::push::{Compression, PushStats};
+    use ostrya::remote::proto::ABANDON;
+    use ostrya::remote::{Compression, PushStats};
     use ostrya::{CommitOptions, DirMeta, ExportStreamOptions, FileMeta, MutableTree, Value};
     use ostrya_core::Xattrs;
 
@@ -1149,7 +1152,10 @@ mod export {
         bytes[chunk.start + chunk.len() / 2] ^= 0x01;
         let result = receive(&repo, &export_policy(), &bytes);
         assert!(
-            matches!(result, Err(Error::Push(push::Error::ChecksumMismatch(_)))),
+            matches!(
+                result,
+                Err(Error::Remote(remote::Error::ChecksumMismatch(_)))
+            ),
             "{result:?}"
         );
         assert_nothing_published(&repo, &before);
@@ -1254,7 +1260,7 @@ mod export {
         for (case, opts) in invalid {
             let (error, calls) = refused(repo, opts);
             assert!(
-                matches!(error, Error::Push(push::Error::InvalidInput(_))),
+                matches!(error, Error::Remote(remote::Error::InvalidInput(_))),
                 "{case}: {error:?}"
             );
             assert_eq!(calls, 0, "{case}");
@@ -1296,7 +1302,7 @@ mod export {
             let (error, calls) =
                 refused(repo, with(vec![update(name, Expected::Any, Some(bound))]));
             assert!(
-                matches!(error, Error::Push(push::Error::BindingMismatch(_))),
+                matches!(error, Error::Remote(remote::Error::BindingMismatch(_))),
                 "{name}: {error:?}"
             );
             assert_eq!(calls, 0, "{name}");
@@ -1310,7 +1316,7 @@ mod export {
         mark_partial(repo, &commit);
         let (error, calls) = refused(repo, options(commit, Compression::None));
         assert!(
-            matches!(error, Error::Push(push::Error::InvalidInput(_))),
+            matches!(error, Error::Remote(remote::Error::InvalidInput(_))),
             "{error:?}"
         );
         assert_eq!(calls, 0);
@@ -1339,14 +1345,14 @@ mod export {
                     .export_stream(&mut bytes, options(source.commit, compression)),
             );
             assert!(
-                matches!(result, Err(Error::Push(push::Error::Source(_)))),
+                matches!(result, Err(Error::Remote(remote::Error::Source(_)))),
                 "{compression:?}: {result:?}"
             );
             let tail = [&ABANDON.to_be_bytes()[..], &[0, 0, 0, 2, 11, 0]].concat();
             assert!(bytes.ends_with(&tail), "{compression:?}");
             let result = receive(&repo, &export_policy(), &bytes);
             assert!(
-                matches!(result, Err(Error::Push(push::Error::Aborted))),
+                matches!(result, Err(Error::Remote(remote::Error::Aborted))),
                 "{compression:?}: {result:?}"
             );
             assert_nothing_published(&repo, &before);

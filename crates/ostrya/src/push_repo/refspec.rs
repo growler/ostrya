@@ -32,8 +32,8 @@ struct Refspec<'a> {
 
 /// Splits `spec` at its last `:`.
 ///
-/// These forms give [`Error::Push`] with
-/// [`InvalidInput`](crate::push::Error::InvalidInput):
+/// These forms give [`Error::Remote`] with
+/// [`InvalidInput`](crate::remote::Error::InvalidInput):
 ///
 /// - An empty refspec.
 /// - The refspec `:` and each other refspec with an empty `DST`.
@@ -93,7 +93,7 @@ impl Repo {
     /// # Errors
     ///
     /// - The error of [`split`] if it refuses a refspec.
-    /// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+    /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
     ///   for an empty list, a checksum `SRC` with no `DST`, and a `DST` that
     ///   two refspecs name.
     /// - [`Error::RefNotFound`] with the `SRC` if `SRC` resolves to no commit.
@@ -174,7 +174,7 @@ mod tests {
 
     fn assert_invalid<T: std::fmt::Debug>(result: Result<T>, needle: &str) {
         match result {
-            Err(Error::Push(crate::push::Error::InvalidInput(msg))) => {
+            Err(Error::Remote(crate::remote::Error::InvalidInput(msg))) => {
                 assert!(msg.contains(needle), "{msg:?} lacks {needle:?}")
             }
             other => panic!("expected InvalidInput, got {other:?}"),

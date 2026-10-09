@@ -463,19 +463,22 @@ pub enum Error {
         /// The text that names the defect of the value.
         reason: String,
     },
-    /// A failure of a session of the wire protocol of [`push`](crate::push).
+    /// A failure of a session of the wire protocol of
+    /// [`ostrya-remote`](crate::remote).
+    ///
+    /// The push, the receive side, and the pull over ssh use this protocol.
     ///
     /// The causes are:
     ///
     /// - an error that the server side sent to the peer with its wire code
-    /// - an `Abort` from the client ([`Aborted`](crate::push::Error::Aborted))
+    /// - an `Abort` from the client ([`Aborted`](crate::remote::Error::Aborted))
     /// - an error of the session stream
     /// - on the client side, a push request that the client refuses
-    ///   ([`InvalidInput`](crate::push::Error::InvalidInput))
+    ///   ([`InvalidInput`](crate::remote::Error::InvalidInput))
     ///
     /// The variant is in every build.
     #[error(transparent)]
-    Push(#[from] crate::push::Error),
+    Remote(#[from] crate::remote::Error),
     /// A static delta from `from` to `to` that the repository does not hold.
     ///
     /// No file resolves at its `deltas/<fanout>/<rest>` path. The message

@@ -1,5 +1,5 @@
 [package]
-name = "ostrya-push"
+name = "ostrya-remote"
 description = "The push and pull protocol of ostrya: the wire codec, the push client session, and the ssh and HTTP transports"
 version.workspace = true
 edition.workspace = true

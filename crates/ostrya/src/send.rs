@@ -8,8 +8,8 @@ use futures_lite::io::{AsyncReadExt, BufReader, BufWriter};
 
 use crate::archive::{ArchiveAnswer, ArchiveView};
 use crate::error::{Error, Result};
-use crate::push;
-use crate::push::proto::{
+use crate::remote;
+use crate::remote::proto::{
     FrameReader, FrameWriter, GetReply, Message, PULL_PROTOCOL_VERSION, PullHello, PullHelloReply,
 };
 use crate::repo::Repo;
@@ -27,8 +27,8 @@ const CHUNK: usize = STREAM_BUFFER - 4;
 /// The kind of failure that ends a session.
 enum Failure {
     /// A failure with a wire code. The session sends it to the peer. The
-    /// caller gets it as [`Error::Push`].
-    Wire(push::Error),
+    /// caller gets it as [`Error::Remote`].
+    Wire(remote::Error),
     /// A failure on the server side. The session sends it to the peer as
     /// `internal`. The caller gets the error unchanged.
     Internal(Error),
@@ -44,12 +44,12 @@ enum Failure {
 ///
 /// An end of file inside a frame is `protocol`. Another error of the input
 /// stream is a failure of the server. Every other error keeps its wire code.
-fn input(error: push::Error) -> Failure {
+fn input(error: remote::Error) -> Failure {
     match error {
-        push::Error::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof => Failure::Wire(
-            push::Error::Protocol("the input ended inside a frame".to_owned()),
+        remote::Error::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof => Failure::Wire(
+            remote::Error::Protocol("the input ended inside a frame".to_owned()),
         ),
-        push::Error::Io(e) => Failure::Internal(Error::Io(e)),
+        remote::Error::Io(e) => Failure::Internal(Error::Io(e)),
         other => Failure::Wire(other),
     }
 }
@@ -59,15 +59,15 @@ fn input(error: push::Error) -> Failure {
 /// An error of the output stream is silent. If the codec refuses a message,
 /// the failure is `internal`, whatever code the codec gives. The refusal is a
 /// fault of the server.
-fn output(error: push::Error) -> Failure {
+fn output(error: remote::Error) -> Failure {
     match error {
-        push::Error::Io(e) => Failure::Silent(Error::Io(e)),
-        other => Failure::Wire(push::Error::Internal(other.to_string())),
+        remote::Error::Io(e) => Failure::Silent(Error::Io(e)),
+        other => Failure::Wire(remote::Error::Internal(other.to_string())),
     }
 }
 
 fn out_of_order(msg: &Message) -> Failure {
-    Failure::Wire(push::Error::Protocol(format!(
+    Failure::Wire(remote::Error::Protocol(format!(
         "{:?} is out of order",
         msg.kind()
     )))
@@ -115,7 +115,7 @@ impl Repo {
     ///
     /// # Framing and memory
     ///
-    /// The frame limit is [`MIN_FRAME_LIMIT`](crate::push::proto::MIN_FRAME_LIMIT)
+    /// The frame limit is [`MIN_FRAME_LIMIT`](crate::remote::proto::MIN_FRAME_LIMIT)
     /// in the two directions. Each direction goes through a buffer of 64 KiB.
     /// Each chunk of a body, except the last chunk, holds 64 KiB less 4 bytes.
     ///
@@ -150,15 +150,15 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::Push`] with the code `version-unsupported` if the
+    /// - [`Error::Remote`] with the code `version-unsupported` if the
     ///   `PullHello` states version 0.
-    /// - [`Error::Push`] with the code `protocol` if a message is out of
+    /// - [`Error::Remote`] with the code `protocol` if a message is out of
     ///   order or is a kind of the push.
-    /// - [`Error::Push`] with the code `protocol` if a frame is malformed, or
+    /// - [`Error::Remote`] with the code `protocol` if a frame is malformed, or
     ///   if `input` ends inside a frame.
-    /// - [`Error::Push`] with the code `limit-exceeded` if a frame is larger
+    /// - [`Error::Remote`] with the code `limit-exceeded` if a frame is larger
     ///   than the limit.
-    /// - [`Error::Push`] with the code `internal` if the codec refuses a
+    /// - [`Error::Remote`] with the code `internal` if the codec refuses a
     ///   message that the session writes.
     /// - Each error of [`ArchiveView::get`] if the view fails before the
     ///   reply.
@@ -187,11 +187,11 @@ impl Repo {
         Err(match failure {
             Failure::Wire(e) => {
                 session.send_error(&e).await;
-                Error::Push(e)
+                Error::Remote(e)
             }
             Failure::Internal(e) => {
                 session
-                    .send_error(&push::Error::Internal(e.to_string()))
+                    .send_error(&remote::Error::Internal(e.to_string()))
                     .await;
                 e
             }
@@ -251,7 +251,7 @@ where
     ///
     /// The method ignores a failure to send the message, because the peer can
     /// be gone.
-    async fn send_error(&mut self, error: &push::Error) {
+    async fn send_error(&mut self, error: &remote::Error) {
         let msg = Message::Error(error.to_message());
         if self.writer.write_message(&msg).await.is_ok() {
             let _ = self.writer.flush().await;
@@ -264,7 +264,7 @@ where
     /// The server speaks each version from 1 up.
     async fn hello(&mut self, hello: PullHello) -> std::result::Result<(), Failure> {
         if hello.version == 0 {
-            return Err(Failure::Wire(push::Error::VersionUnsupported(format!(
+            return Err(Failure::Wire(remote::Error::VersionUnsupported(format!(
                 "pull protocol version 0: the server speaks versions 1 to {PULL_PROTOCOL_VERSION}"
             ))));
         }
@@ -388,7 +388,7 @@ async fn abandon<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     error: Error,
 ) -> std::result::Result<(), Failure> {
-    let msg = push::Error::Internal(error.to_string()).to_message();
+    let msg = remote::Error::Internal(error.to_string()).to_message();
     writer.abandon_body(&msg).await.map_err(output)?;
     Err(Failure::Abandoned(error))
 }
@@ -410,8 +410,8 @@ mod tests {
     use futures_lite::future::block_on;
 
     use super::*;
-    use crate::push::ErrorCode;
-    use crate::push::proto::ObjectRead;
+    use crate::remote::ErrorCode;
+    use crate::remote::proto::ObjectRead;
 
     /// A reader that gives `ok` bytes of `0x5a` and then fails.
     ///
@@ -472,7 +472,7 @@ mod tests {
         loop {
             let len = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
             lengths.push(len);
-            if len == 0 || len == crate::push::proto::ABANDON {
+            if len == 0 || len == crate::remote::proto::ABANDON {
                 return lengths;
             }
             at += 4 + len as usize;
@@ -497,7 +497,7 @@ mod tests {
         assert_eq!(e.to_string(), "the disk failed");
         assert_eq!(
             chunk_lengths(&bytes),
-            [CHUNK as u32, crate::push::proto::ABANDON]
+            [CHUNK as u32, crate::remote::proto::ABANDON]
         );
 
         let mut reader = FrameReader::new(&bytes[..]);
@@ -579,21 +579,21 @@ mod tests {
         };
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert_eq!(source.read, 11);
-        assert_eq!(chunk_lengths(&bytes), [crate::push::proto::ABANDON]);
+        assert_eq!(chunk_lengths(&bytes), [crate::remote::proto::ABANDON]);
 
         let (result, bytes) = serve(Some(20), &[1u8; 10][..]);
         let Err(Failure::Abandoned(Error::Io(e))) = result else {
             panic!("a short body was not abandoned");
         };
         assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
-        assert_eq!(chunk_lengths(&bytes), [crate::push::proto::ABANDON]);
+        assert_eq!(chunk_lengths(&bytes), [crate::remote::proto::ABANDON]);
 
         // The next read finds a body that falls short at a chunk boundary.
         let (result, bytes) = serve(Some(CHUNK as u64 + 1), &vec![1u8; CHUNK][..]);
         assert!(matches!(result, Err(Failure::Abandoned(_))));
         assert_eq!(
             chunk_lengths(&bytes),
-            [CHUNK as u32, crate::push::proto::ABANDON]
+            [CHUNK as u32, crate::remote::proto::ABANDON]
         );
     }
 

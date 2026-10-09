@@ -815,13 +815,13 @@ pub struct PullOptions {
     /// over ssh.
     ///
     /// The fields resolve as the fields of
-    /// [`ConnectOptions`](crate::push::ConnectOptions) do for a push. The
+    /// [`ConnectOptions`](crate::remote::ConnectOptions) do for a push. The
     /// remote keys `ssh-command` and `send-command` fill `remote_ssh_command`
     /// and `send_command` if they are `None`. An HTTP pull refuses
     /// `ssh_command` and `send_command` with [`Error::InvalidInput`], and does
     /// not read `remote_ssh_command`. [`Repo::pull_over_stream`] runs no ssh
     /// client, and refuses the same two fields.
-    pub connect: crate::push::PullConnectOptions,
+    pub connect: crate::remote::PullConnectOptions,
 }
 
 /// Applies the durability options of a pull to its transaction.

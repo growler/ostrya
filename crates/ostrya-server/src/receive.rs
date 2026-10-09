@@ -14,8 +14,8 @@ use hyper::header::{
     ALLOW, CONNECTION, CONTENT_LENGTH, HeaderName, HeaderValue, TRANSFER_ENCODING,
 };
 use hyper::{Method, Request, Response, StatusCode, Version};
-use ostrya::push::proto::{ErrorMessage, MAX_FRAME, Message};
-use ostrya::push::{self, ErrorCode};
+use ostrya::remote::proto::{ErrorMessage, MAX_FRAME, Message};
+use ostrya::remote::{self, ErrorCode};
 use ostrya::{ReceiveReport, ReceiveService, ReceiveStep, ReceiveWarning, Repo};
 use ostrya_rt as rt;
 
@@ -421,7 +421,7 @@ async fn cancellable<T>(cancel: &Cancel, step: impl Future<Output = T>) -> Optio
 }
 
 fn protocol(message: impl Into<String>) -> ostrya::Error {
-    ostrya::Error::Push(push::Error::Protocol(message.into()))
+    ostrya::Error::Remote(remote::Error::Protocol(message.into()))
 }
 
 /// The error of a request that finds its session committing.
@@ -455,7 +455,7 @@ fn error_message(code: ErrorCode, message: String) -> ErrorMessage {
 /// states its own status, 401 or 403.
 pub(crate) fn status(e: &ostrya::Error) -> (StatusCode, ErrorMessage) {
     let message = match e {
-        ostrya::Error::Push(e) => e.to_message(),
+        ostrya::Error::Remote(e) => e.to_message(),
         other => error_message(ErrorCode::Internal, other.to_string()),
     };
     let status = match message.code {
@@ -531,13 +531,13 @@ fn frame(status: StatusCode, message: &ErrorMessage) -> Response<ServeBody> {
 /// The frame of `msg`: a 4-byte big-endian length, the kind byte, and the
 /// body. The length counts the kind byte and the body. If the length is more
 /// than [`MAX_FRAME`], the error is `limit-exceeded`.
-fn encode(msg: &Message) -> Result<Bytes, push::Error> {
+fn encode(msg: &Message) -> Result<Bytes, remote::Error> {
     let body = msg.encode_body()?;
     let len = u32::try_from(body.len() + 1)
         .ok()
         .filter(|len| *len <= MAX_FRAME)
         .ok_or_else(|| {
-            push::Error::LimitExceeded(format!(
+            remote::Error::LimitExceeded(format!(
                 "a reply frame of {} bytes is over the limit {MAX_FRAME}",
                 body.len() + 1
             ))
@@ -650,8 +650,8 @@ mod tests {
     use crate::body::tests::frames;
     use crate::request::MAX_DRAIN;
     use crate::session::tests::TmpRepo;
-    use ostrya::push::proto::{CommitRequest, Hello, Kind};
-    use ostrya::push::{Expected, RefOutcome, RefUpdate};
+    use ostrya::remote::proto::{CommitRequest, Hello, Kind};
+    use ostrya::remote::{Expected, RefOutcome, RefUpdate};
     use ostrya::{Checksum, ObjectName, ObjectType, ReceivePolicy, ReceiveRule, TransactionStats};
     use ostrya_rt::block_on;
 
@@ -659,7 +659,7 @@ mod tests {
     fn errors_map_to_their_status() {
         let cases: Vec<(ostrya::Error, u16, ErrorCode)> = vec![
             (
-                push::Error::RefMismatch {
+                remote::Error::RefMismatch {
                     message: "m".into(),
                     name: "main".into(),
                     current: None,
@@ -669,32 +669,32 @@ mod tests {
                 ErrorCode::RefMismatch,
             ),
             (
-                push::Error::NonFastForward("m".into()).into(),
+                remote::Error::NonFastForward("m".into()).into(),
                 409,
                 ErrorCode::NonFastForward,
             ),
             (
-                push::Error::Internal("m".into()).into(),
+                remote::Error::Internal("m".into()).into(),
                 500,
                 ErrorCode::Internal,
             ),
             (
-                push::Error::Protocol("m".into()).into(),
+                remote::Error::Protocol("m".into()).into(),
                 422,
                 ErrorCode::Protocol,
             ),
             (
-                push::Error::ModeRefused("m".into()).into(),
+                remote::Error::ModeRefused("m".into()).into(),
                 422,
                 ErrorCode::ModeRefused,
             ),
             (
-                push::Error::LimitExceeded("m".into()).into(),
+                remote::Error::LimitExceeded("m".into()).into(),
                 422,
                 ErrorCode::LimitExceeded,
             ),
             (
-                push::Error::MissingObjects {
+                remote::Error::MissingObjects {
                     message: "m".into(),
                     missing: Vec::new(),
                 }
@@ -703,11 +703,11 @@ mod tests {
                 ErrorCode::MissingObjects,
             ),
             (
-                push::Error::Unauthorized("m".into()).into(),
+                remote::Error::Unauthorized("m".into()).into(),
                 403,
                 ErrorCode::Unauthorized,
             ),
-            (push::Error::Aborted.into(), 500, ErrorCode::Internal),
+            (remote::Error::Aborted.into(), 500, ErrorCode::Internal),
             (
                 ostrya::Error::Io(std::io::ErrorKind::Other.into()),
                 500,
@@ -727,7 +727,7 @@ mod tests {
         let (_, message) = status(&ostrya::Error::InvalidFormat("bad".into()));
         assert!(message.message.contains("bad"), "{}", message.message);
         let (_, message) = status(
-            &push::Error::RefMismatch {
+            &remote::Error::RefMismatch {
                 message: "m".into(),
                 name: "main".into(),
                 current: None,

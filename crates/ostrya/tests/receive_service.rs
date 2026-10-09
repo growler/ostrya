@@ -29,8 +29,8 @@ use common::receive::{
 use common::{COMMIT, TmpDir, foreign_holder, lock_holder_main};
 use futures_io::AsyncRead;
 use futures_lite::future::{poll_once, zip};
-use ostrya::push::proto::{CommitRequest, FrameWriter, Hello, Message, ObjectHeader};
-use ostrya::push::{self, Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
+use ostrya::remote::proto::{CommitRequest, FrameWriter, Hello, Message, ObjectHeader};
+use ostrya::remote::{self, Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
 use ostrya::{
     Checksum, Error, ObjectName, ObjectType, ReceivePolicy, ReceiveService, Repo, RepoMode,
 };
@@ -94,7 +94,7 @@ fn corrupt_object() -> Obj {
 /// The wire code of a step that failed.
 fn code<T: std::fmt::Debug>(result: &ostrya::Result<T>) -> Option<ErrorCode> {
     match result {
-        Err(Error::Push(e)) => e.code(),
+        Err(Error::Remote(e)) => e.code(),
         other => panic!("expected a push error, got {other:?}"),
     }
 }
@@ -103,7 +103,7 @@ fn code<T: std::fmt::Debug>(result: &ostrya::Result<T>) -> Option<ErrorCode> {
 /// with a message that holds `reason`.
 fn assert_ended<T: std::fmt::Debug>(result: ostrya::Result<T>, reason: &str) {
     match result {
-        Err(Error::Push(push::Error::Protocol(message))) => {
+        Err(Error::Remote(remote::Error::Protocol(message))) => {
             assert!(message.contains(reason), "{message}")
         }
         other => panic!("expected protocol with {reason:?}, got {other:?}"),
@@ -255,7 +255,7 @@ fn hello_refusals_keep_their_codes() {
     let repo = new_repo(&tmp, RepoMode::Archive, "[archive]\nzlib-level=abc\n");
     let result = block_on(ReceiveService::hello(repo.clone(), policy, 1, hello(&[]))).map(|_| ());
     assert!(
-        matches!(result, Err(ref e) if !matches!(e, Error::Push(_))),
+        matches!(result, Err(ref e) if !matches!(e, Error::Remote(_))),
         "{result:?}"
     );
     assert!(staging_entries(repo.path()).is_empty());
@@ -531,7 +531,7 @@ fn the_body_of_objects_holds_one_object_stream() {
         let service = open(&repo, 1, &[]);
         let result = block_on(service.objects(&bytes[..]));
         match &result {
-            Err(Error::Push(push::Error::Protocol(m))) => {
+            Err(Error::Remote(remote::Error::Protocol(m))) => {
                 assert!(m.contains(message), "{what}: {m}")
             }
             other => panic!("{what}: expected protocol, got {other:?}"),
@@ -601,7 +601,7 @@ fn a_commit_while_objects_is_in_flight_is_protocol() {
         service.commit(fixture_update()).await
     }));
     match &commit {
-        Err(Error::Push(push::Error::Protocol(m))) => assert!(m.contains("in flight"), "{m}"),
+        Err(Error::Remote(remote::Error::Protocol(m))) => assert!(m.contains("in flight"), "{m}"),
         other => panic!("expected protocol, got {other:?}"),
     }
     assert_ended(objects, "the session was aborted: protocol:");
@@ -827,7 +827,7 @@ fn metadata_objects_read_at_the_same_time_past_the_budget_are_limit_exceeded() {
         for _ in 0..chunks {
             wa.write_object_data(&zeros).await.unwrap();
         }
-        let sent: push::Result<()> = async {
+        let sent: remote::Result<()> = async {
             wb.write_message(&dirtree(b"second")).await?;
             for _ in 0..chunks {
                 wb.write_object_data(&zeros).await?;
@@ -844,7 +844,7 @@ fn metadata_objects_read_at_the_same_time_past_the_budget_are_limit_exceeded() {
         _ => (b, a),
     };
     match &refused {
-        Err(Error::Push(push::Error::LimitExceeded(m))) => {
+        Err(Error::Remote(remote::Error::LimitExceeded(m))) => {
             assert!(m.contains("at the same time"), "{m}")
         }
         other => panic!("expected limit-exceeded, got {other:?}"),

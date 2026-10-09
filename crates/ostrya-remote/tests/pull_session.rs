@@ -14,11 +14,11 @@ use std::time::Duration;
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::future;
 use futures_lite::io::AsyncReadExt;
-use ostrya_push::proto::{
+use ostrya_remote::proto::{
     ErrorMessage, FrameReader, FrameWriter, GetReply, Message, PULL_PROTOCOL_VERSION,
     PullHelloReply,
 };
-use ostrya_push::{Error, ErrorCode, PullBody, PullSession, PullSessionOptions};
+use ostrya_remote::{Error, ErrorCode, PullBody, PullSession, PullSessionOptions};
 
 /// The capacity of each pipe. It is smaller than a large body, so the server
 /// waits for the client to read.

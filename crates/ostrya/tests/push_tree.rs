@@ -1,6 +1,6 @@
-//! Tests of the tree push of `ostrya::push`. The file has three parts:
+//! Tests of the tree push of `ostrya::remote`. The file has three parts:
 //!
-//! - The tree walk of `ostrya::push::tree` against the ingest of
+//! - The tree walk of `ostrya::remote::tree` against the ingest of
 //!   `write_dfd_to_mtree`. The two give the same root checksums over the same
 //!   tree. The tests skip extended attributes, run with and without canonical
 //!   permissions, and skip a directory.
@@ -28,8 +28,8 @@ use common::receive::{PipeReader, connect, new_repo};
 use common::{ROOT_DIRMETA, ROOT_DIRTREE, TmpDir};
 use futures_io::AsyncRead;
 use futures_lite::future::zip;
-use ostrya::push::tree::{EntryAction, EntryFilter, EntryKind, ScanOptions, TreeModel};
-use ostrya::push::{
+use ostrya::remote::tree::{EntryAction, EntryFilter, EntryKind, ScanOptions, TreeModel};
+use ostrya::remote::{
     Compression, Error, Expected, ObjectSource, ParentPolicy, PushOutcome, PushPhase, PushProgress,
     PushSession, RefUpdate, SessionOptions, TreePushOptions, push_tree_over_stream,
 };
@@ -278,7 +278,7 @@ fn push(
     compression: Compression,
 ) -> (
     ostrya::Result<ReceiveReport>,
-    ostrya::push::Result<PushOutcome>,
+    ostrya::remote::Result<PushOutcome>,
 ) {
     let (client, server_in, server_out) = connect();
     let output = client.writer.into_inner();
@@ -386,7 +386,7 @@ fn a_file_changed_at_the_same_length_fails_with_checksum_mismatch() {
             assert!(
                 matches!(
                     server,
-                    ostrya::Error::Push(ostrya::push::Error::ChecksumMismatch(_))
+                    ostrya::Error::Remote(ostrya::remote::Error::ChecksumMismatch(_))
                 ),
                 "{mode:?}, {compression:?}: server {server:?}"
             );
@@ -411,7 +411,7 @@ fn a_file_that_grew_fails_with_protocol_in_deflate_and_checksum_mismatch_in_raw(
         assert!(
             matches!(
                 server,
-                ostrya::Error::Push(ostrya::push::Error::Protocol(_))
+                ostrya::Error::Remote(ostrya::remote::Error::Protocol(_))
             ),
             "{mode:?}, deflate: server {server:?}"
         );
@@ -420,7 +420,7 @@ fn a_file_that_grew_fails_with_protocol_in_deflate_and_checksum_mismatch_in_raw(
         assert!(
             matches!(
                 server,
-                ostrya::Error::Push(ostrya::push::Error::ChecksumMismatch(_))
+                ostrya::Error::Remote(ostrya::remote::Error::ChecksumMismatch(_))
             ),
             "{mode:?}, raw: server {server:?}"
         );
@@ -500,7 +500,7 @@ fn tree_push(
     hook: Option<Hook>,
 ) -> (
     ostrya::Result<ReceiveReport>,
-    ostrya::push::Result<PushOutcome>,
+    ostrya::remote::Result<PushOutcome>,
 ) {
     let (client, server_in, server_out) = connect();
     let output = client.writer.into_inner();
@@ -773,9 +773,9 @@ fn a_file_changed_at_the_same_length_after_the_scan_fails_the_tree_push() {
             assert!(
                 matches!(
                     report,
-                    Err(ostrya::Error::Push(ostrya::push::Error::ChecksumMismatch(
-                        _
-                    )))
+                    Err(ostrya::Error::Remote(
+                        ostrya::remote::Error::ChecksumMismatch(_)
+                    ))
                 ),
                 "{what}: server {report:?}"
             );
@@ -836,7 +836,7 @@ fn target_refs_in_mixed_states_are_refused_before_any_upload() {
         assert!(
             matches!(
                 report,
-                Err(ostrya::Error::Push(ostrya::push::Error::Aborted))
+                Err(ostrya::Error::Remote(ostrya::remote::Error::Aborted))
             ),
             "{what}: server {report:?}"
         );

@@ -1688,7 +1688,7 @@ dependencies = [
  "ostrya-composefs",
  "ostrya-core",
  "ostrya-fetch",
- "ostrya-push",
+ "ostrya-remote",
  "ostrya-rt",
  "ostrya-sign",
  "ostrya-sys",
@@ -1765,7 +1765,7 @@ name = "ostrya-gvariant"
 version = "0.2.8"
 
 [[package]]
-name = "ostrya-push"
+name = "ostrya-remote"
 version = "0.2.8"
 dependencies = [
  "futures-io",

@@ -21,10 +21,10 @@ use ostrya::fetch::{
     BasicAuth, BearerToken, ClientIdentity, Fetcher, FetcherOptions, Protocol, Proxy, TlsOptions,
     TrustRoots, UploadBody, UploadMethod, UploadRequest,
 };
-use ostrya::push::proto::{
+use ostrya::remote::proto::{
     CommitRequest, ErrorMessage, FrameWriter, Hello, Kind, Message, ObjectHeader,
 };
-use ostrya::push::{Encoding, ErrorCode, Expected, RefUpdate};
+use ostrya::remote::{Encoding, ErrorCode, Expected, RefUpdate};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree,
     ObjectName, ObjectType, PruneOptions, ReceivePolicy, ReceiveReport, Repo, RepoMode, loose_path,
@@ -1190,7 +1190,7 @@ fn detached_metadata_past_the_session_cap_is_limit_exceeded() {
             .objects_streamed(&id, |w| async move {
                 let mut writer = FrameWriter::new(w);
                 let zeros = vec![0u8; 64 * 1024];
-                let _: ostrya::push::Result<()> = async {
+                let _: ostrya::remote::Result<()> = async {
                     writer.write_message(&header(b"second")).await?;
                     for _ in 0..2 * len / zeros.len() {
                         writer.write_object_data(&zeros).await?;

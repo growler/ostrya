@@ -23,11 +23,11 @@ use std::time::Instant;
 
 use futures_lite::io::{Cursor, sink};
 use ostrya_core::ObjectType;
-use ostrya_push::proto::{
+use ostrya_remote::proto::{
     FrameWriter, HelloReply, MIN_FRAME_LIMIT, Message, ObjectsReply, RefState,
 };
-use ostrya_push::tree::{ScanOptions, TreeModel};
-use ostrya_push::{Compression, Encoding, PushSession, SessionOptions};
+use ostrya_remote::tree::{ScanOptions, TreeModel};
+use ostrya_remote::{Compression, Encoding, PushSession, SessionOptions};
 
 /// The largest write of file data: 1 MiB.
 const WRITE_CHUNK: usize = 1024 * 1024;

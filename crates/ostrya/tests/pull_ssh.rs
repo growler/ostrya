@@ -374,8 +374,8 @@ fn an_error_of_the_server_fails_the_pull_and_ends_the_session() {
         let dest = dest_at(&dir.path().join("dest"), RepoMode::Archive, None).await;
         let (pulled, served) = pull_ssh(&dest, &remote, main_ref(0)).await;
         match pulled {
-            Err(Error::Push(e)) => {
-                assert_eq!(e.code(), Some(ostrya::push::ErrorCode::Internal), "{e:?}")
+            Err(Error::Remote(e)) => {
+                assert_eq!(e.code(), Some(ostrya::remote::ErrorCode::Internal), "{e:?}")
             }
             other => panic!("{other:?}"),
         }
@@ -460,7 +460,7 @@ fn a_stated_length_above_the_cap_ends_the_session() {
         let dest = dest_at(&dir.path().join("dest"), RepoMode::Archive, None).await;
         let (pulled, served) = pull_ssh(&dest, &remote, main_ref(0)).await;
         match pulled {
-            Err(Error::Push(ostrya::push::Error::LimitExceeded(msg))) => {
+            Err(Error::Remote(ostrya::remote::Error::LimitExceeded(msg))) => {
                 assert!(msg.contains("refs/heads/test/main"), "{msg}")
             }
             other => panic!("{other:?}"),
@@ -484,11 +484,11 @@ fn the_fields_of_the_other_transport_are_refused() {
         let dir = TmpDir::new("pull-ssh-refusals");
         let (remote, _commit) = build_remote(dir.path()).await;
         let dest = dest_at(&dir.path().join("dest"), RepoMode::Archive, None).await;
-        let ssh_command = || ostrya::push::PullConnectOptions {
+        let ssh_command = || ostrya::remote::PullConnectOptions {
             ssh_command: Some(vec!["ssh".to_owned()]),
             ..Default::default()
         };
-        let send_command = || ostrya::push::PullConnectOptions {
+        let send_command = || ostrya::remote::PullConnectOptions {
             send_command: Some("ostrya send".to_owned()),
             ..Default::default()
         };
@@ -537,7 +537,7 @@ fn the_fields_of_the_other_transport_are_refused() {
             "origin",
             PullOptions {
                 url: Some(server.url()),
-                connect: ostrya::push::PullConnectOptions {
+                connect: ostrya::remote::PullConnectOptions {
                     remote_ssh_command: Some("ssh -q".to_owned()),
                     ..Default::default()
                 },
@@ -551,8 +551,8 @@ fn the_fields_of_the_other_transport_are_refused() {
 
 /// A stand-in ssh command. It writes the arguments that the pull adds, one to
 /// a line, to `record`, and exits 0. It serves no session.
-fn recording_ssh(record: &Path) -> ostrya::push::PullConnectOptions {
-    ostrya::push::PullConnectOptions {
+fn recording_ssh(record: &Path) -> ostrya::remote::PullConnectOptions {
+    ostrya::remote::PullConnectOptions {
         ssh_command: Some(vec![
             "sh".to_owned(),
             "-c".to_owned(),
@@ -590,7 +590,7 @@ fn the_commands_of_the_caller_win_over_the_remote_keys() {
             .pull(
                 "origin",
                 PullOptions {
-                    connect: ostrya::push::PullConnectOptions {
+                    connect: ostrya::remote::PullConnectOptions {
                         send_command: Some("my-send".to_owned()),
                         ..recording_ssh(&both)
                     },
@@ -688,7 +688,7 @@ fn the_options_of_http_alone_are_refused_before_the_ssh_client_starts() {
         let address = "ssh://localhost/srv/repo";
         let with = |opts: PullOptions| PullOptions {
             url: Some(address.to_owned()),
-            connect: ostrya::push::PullConnectOptions {
+            connect: ostrya::remote::PullConnectOptions {
                 ssh_command: Some(vec!["/nonexistent/ssh".to_owned()]),
                 ..Default::default()
             },
@@ -745,7 +745,7 @@ fn the_options_of_http_alone_are_refused_before_the_ssh_client_starts() {
             .await
             .unwrap_err();
         match err {
-            Error::Push(ostrya::push::Error::Transport(msg)) => {
+            Error::Remote(ostrya::remote::Error::Transport(msg)) => {
                 assert!(msg.contains("/nonexistent/ssh"), "{msg}")
             }
             other => panic!("{other:?}"),

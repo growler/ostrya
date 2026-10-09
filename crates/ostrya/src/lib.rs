@@ -24,8 +24,8 @@
 //! - Read: [`read`], [`file`](mod@file), [`tree`], [`refs`], and [`traverse`].
 //! - Write: [`transaction`], [`mtree`], [`staging_tree`], [`commit`], [`modifier`], [`bootable`].
 //! - Checkout and export: [`checkout`], [`composefs`], [`tar`], and [`archive`].
-//! - Pull: [`pull`], [`summary`], and [`fetch`], the HTTP client of `ostrya-fetch`.
-//! - Push and receive: [`push`], the wire protocol of `ostrya-push`, and `receive`.
+//! - Pull: [`pull`], [`summary`], [`fetch`], the HTTP client of `ostrya-fetch`, and [`remote`] for the pull over ssh.
+//! - Push and receive: [`remote`], the wire protocol of `ostrya-remote`, and `receive`.
 //! - Signing: [`sign`], `gpg`, and `spki`.
 //! - Maintenance: [`prune`], [`fsck`], [`diff`], [`update`], and [`config`].
 //! - Static deltas: [`DeltaSuperblock`], [`DeltaOptions`], and [`Repo::generate_static_delta`].
@@ -63,7 +63,7 @@ mod deltagen;
 pub mod diff;
 pub mod error;
 pub use ostrya_fetch as fetch;
-pub use ostrya_push as push;
+pub use ostrya_remote as remote;
 pub mod file;
 pub mod fsck;
 #[cfg(feature = "verify-gpg")]

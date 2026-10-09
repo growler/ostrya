@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::file::FileKind;
 use crate::object;
 use crate::pull::DetachedMetadataFilter;
-use crate::push::{BoxFuture, Encoding, ObjectData, ObjectSource};
+use crate::remote::{BoxFuture, Encoding, ObjectData, ObjectSource};
 use crate::repo::Repo;
 
 /// The [`ObjectSource`] over a local repository.
@@ -133,15 +133,15 @@ impl RepoSource {
     }
 }
 
-fn source_error(e: Error) -> crate::push::Error {
-    crate::push::Error::Source(Box::new(e))
+fn source_error(e: Error) -> crate::remote::Error {
+    crate::remote::Error::Source(Box::new(e))
 }
 
 impl ObjectSource for RepoSource {
     fn objects<'a>(
         &'a self,
         commit: &'a Checksum,
-    ) -> BoxFuture<'a, crate::push::Result<Vec<ObjectName>>> {
+    ) -> BoxFuture<'a, crate::remote::Result<Vec<ObjectName>>> {
         Box::pin(async move {
             let names = self
                 .repo
@@ -156,14 +156,14 @@ impl ObjectSource for RepoSource {
         &'a self,
         name: &'a ObjectName,
         encoding: Encoding,
-    ) -> BoxFuture<'a, crate::push::Result<ObjectData>> {
+    ) -> BoxFuture<'a, crate::remote::Result<ObjectData>> {
         Box::pin(async move { self.load(name, encoding).await.map_err(source_error) })
     }
 
     fn detached_metadata<'a>(
         &'a self,
         commit: &'a Checksum,
-    ) -> BoxFuture<'a, crate::push::Result<Option<Value>>> {
+    ) -> BoxFuture<'a, crate::remote::Result<Option<Value>>> {
         Box::pin(async move { self.detached(commit).await.map_err(source_error) })
     }
 
@@ -171,7 +171,7 @@ impl ObjectSource for RepoSource {
         &'a self,
         names: &'a [ObjectName],
         encoding: Encoding,
-    ) -> BoxFuture<'a, crate::push::Result<Option<u64>>> {
+    ) -> BoxFuture<'a, crate::remote::Result<Option<u64>>> {
         Box::pin(async move {
             self.content_total(names, encoding)
                 .await
@@ -229,7 +229,7 @@ mod tests {
         std::fs::read(scratch.path().join("repo/objects").join(path)).unwrap()
     }
 
-    async fn read_all(mut reader: Box<dyn crate::push::ObjectReader>) -> Vec<u8> {
+    async fn read_all(mut reader: Box<dyn crate::remote::ObjectReader>) -> Vec<u8> {
         let mut out = Vec::new();
         reader.read_to_end(&mut out).await.unwrap();
         out
@@ -412,7 +412,7 @@ mod tests {
                 ty,
             };
             let err = src.open(&name, encoding).await.unwrap_err();
-            let crate::push::Error::Source(inner) = err else {
+            let crate::remote::Error::Source(inner) = err else {
                 panic!("{label} {ty:?} {encoding:?}: {err:?}");
             };
             assert!(
@@ -427,7 +427,7 @@ mod tests {
         // A commit that is absent has no objects to list.
         assert!(matches!(
             src.objects(&absent).await,
-            Err(crate::push::Error::Source(_))
+            Err(crate::remote::Error::Source(_))
         ));
     }
 

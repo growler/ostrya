@@ -156,8 +156,7 @@ pub enum Error {
     Staging(String),
     MergeConflict(String),
     StaticDeltaNotFound { from: Option<Checksum>, to: Checksum },
-    #[cfg(feature = "receive")]
-    Push(ostrya_push::Error),          // a push session: wire code, abort, stream
+    Remote(ostrya_remote::Error),      // a wire protocol session: wire code, abort, stream
     // ... one variant per class of refusal the library reports
 }
 
@@ -2302,7 +2301,7 @@ white-space refusal applies to the proxy variables of the environment.
 
 The driver of `pull` reads the remote through a source, one of two: the HTTP
 source, over the fetcher, and the ssh source, over a `PullSession` of
-`ostrya-push`. `pull_over_stream` runs the same pull through the ssh source
+`ostrya-remote`. `pull_over_stream` runs the same pull through the ssh source
 over a pair of streams (see "Pull over ssh: the client side"). The two
 sources serve the same paths under the same size caps, and the plan, the
 checks, the statistics, and the transaction are the same for both. An HTTP
@@ -2669,9 +2668,9 @@ impl ServerSigner {
 ```
 
 `Repo::receive` runs one push session over a pair of streams, with the
-policy the caller lends it. `ostrya::push` re-exports `ostrya-push`, the wire
+policy the caller lends it. `ostrya::remote` re-exports `ostrya-remote`, the wire
 protocol crate, in every build, so a caller names its error codes and
-messages through `ostrya`. `Error::Push` carries them in every build too.
+messages through `ostrya`. `Error::Remote` carries them in every build too.
 
 - `Hello` opens the session transaction, which holds the repository lock
   shared under `[core] lock-timeout-secs`. A repository with `[core]
@@ -2760,17 +2759,17 @@ messages through `ostrya`. `Error::Push` carries them in every build too.
   `ReceiveWarning` to the report, and the client is not told. A summary
   failure is such a step, and so is a `CommitReply` that cannot be sent, so
   the call returns `Ok` also when the client did not get the reply.
-- A failure with a wire code goes to the peer and returns as `Error::Push`. A
+- A failure with a wire code goes to the peer and returns as `Error::Remote`. A
   server-side failure goes to the peer as `internal` and returns as the error
   it is. An `Abort`, an abandoned object, and an error or end of file of the
-  input send nothing: the first two return `push::Error::Aborted`, and an end
+  input send nothing: the first two return `remote::Error::Aborted`, and an end
   of file at a frame boundary returns an `Error::Io` of kind
   `UnexpectedEof`.
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiveReport {
-    pub refs: Vec<push::RefOutcome>,
+    pub refs: Vec<remote::RefOutcome>,
     pub stats: TransactionStats,
     pub warnings: Vec<ReceiveWarning>,     // steps after the commit that failed
 }
@@ -2807,7 +2806,7 @@ impl Repo {
 
 `Repo::receive_stream` reads one one-way stream: one `Hello` with `one-way`
 true, zero or more object streams, each closed by `ObjectsEnd`, one
-`Commit`, and the end of the input. `ostrya_push::proto::Hello` carries the
+`Commit`, and the end of the input. `ostrya_remote::proto::Hello` carries the
 key as the field `one_way`. The encoder writes the key when it is true
 alone, and an absent key reads as false. The call sends no message and
 returns the result.
@@ -2824,7 +2823,7 @@ returns the result.
   which ignores `[core] locking`.
 - `Have`, a second `Hello`, and an `Abort` frame between two objects are
   `protocol`. An object that the sender abandons with the abandon marker and
-  `Abort` returns `push::Error::Aborted`.
+  `Abort` returns `remote::Error::Aborted`.
 - An update of `Commit` whose expected state is `Commit`, and an update with
   no new commit, are `protocol`. The call then reads to the end of the
   input, and a byte after `Commit` is `protocol`, also a byte that does not
@@ -2912,7 +2911,7 @@ knows no HTTP, no session id, no owner, no timeout, and no status.
   dropped before it completes drops the transaction inline, on the thread
   that drops the future. A host drops it only when it drops the commit
   task, for example at the shutdown of the runtime.
-- A failure with a wire code returns as `Error::Push`, and a failure on the
+- A failure with a wire code returns as `Error::Remote`, and a failure on the
   server side returns as the error it is. A `commit` that fails ends the
   session. After a commit every step is `protocol` with the message `the
   session committed`. A step on a session that an error or `abort` ended is
@@ -3075,8 +3074,8 @@ impl HookRefusal {
 
 ## Push client session
 
-`ostrya-push` holds the client side of a push, re-exported as
-`ostrya::push`. A `PushSession` runs one session over a pair of byte
+`ostrya-remote` holds the client side of a push, re-exported as
+`ostrya::remote`. A `PushSession` runs one session over a pair of byte
 streams. `over_stream` needs no runtime. `connect` opens a session over
 ssh or HTTP, on the runtime backend that the `smol` or the `tokio` feature
 selects.
@@ -3259,7 +3258,7 @@ pub struct PushOutcome {
 
 ## Push tree model
 
-`ostrya_push::tree` walks a local directory with `std::fs` into a
+`ostrya_remote::tree` walks a local directory with `std::fs` into a
 `TreeModel`: the metadata of each entry and the checksum of each object of
 the tree. The model stores each entry once, as its name, its metadata, and
 the index of its parent directory, and it holds no file content.
@@ -3380,13 +3379,13 @@ pub enum Error {
 
 ## Tree push
 
-`ostrya_push::push_tree` pushes a local directory as one commit and sets
+`ostrya_remote::push_tree` pushes a local directory as one commit and sets
 the target refs of the server to it in one transaction.
 `push_tree_prepared` runs the same push over a `PreparedSession`, the
 transport that `PushSession::prepare` made ready, so a caller can run the
 transport checks before its own work. `push_tree_over_stream` runs the same
 push over a pair of byte streams. `ostrya` re-exports the three as
-`ostrya::push`.
+`ostrya::remote`.
 
 - Before the scan, the push refuses with `Error::InvalidInput`: empty
   `refs`, a ref named twice, a ref that holds `:`, a ref that holds `^`, a
@@ -3795,13 +3794,13 @@ the connect options of a push:
     the fields of the same names. The ssh keys are not read, so a
     `receive-command` key in such a section causes no refusal. The `proxy`
     key is not read.
-  - For an `https://` address, `tls-permissive=true` is `Error::Push` with
-    `push::Error::InvalidInput`, before any request. A push verifies the
+  - For an `https://` address, `tls-permissive=true` is `Error::Remote` with
+    `remote::Error::InvalidInput`, before any request. A push verifies the
     certificate chain of the server. An `http://` address uses no TLS, and
     the key is not read.
 - No key gives `allow_cleartext_credentials`. Only the caller sets it.
 - A name with no section, and a section with no push address, are
-  `Error::Push` with `push::Error::InvalidInput`. A `config` of `None` holds
+  `Error::Remote` with `remote::Error::InvalidInput`. A `config` of `None` holds
   no section. So a caller that has no repository must give an address.
 
 ```rust
@@ -3870,21 +3869,21 @@ it waits for the push, and it fails with `Error::LockTimeout` after
 
 Before it writes a byte, the push refuses:
 
-- a `depth` below `-1`, as `Error::Push` with `InvalidInput`;
+- a `depth` below `-1`, as `Error::Remote` with `InvalidInput`;
 - an empty list of refspecs, an empty refspec, `:`, an empty `DST`, and a
-  `DST` that two refspecs name, as `Error::Push` with `InvalidInput`;
+  `DST` that two refspecs name, as `Error::Remote` with `InvalidInput`;
 - a checksum `SRC` and a `SRC` with a `^` suffix, each with no `DST`, as
-  `Error::Push` with `InvalidInput`;
+  `Error::Remote` with `InvalidInput`;
 - a `DST` that `validate_refspec` refuses, a `DST` that holds a `^`, and a
   `DST` of 64 lowercase hex characters that takes a commit, as
   `Error::InvalidRefspec` with the `DST`. A revision reads a `DST` of 64
   lowercase hex characters as a commit checksum. A delete (`:DST`) of a
   `DST` of 64 lowercase hex characters passes;
 - a `SRC` that does not resolve, with the error of `Repo::resolve_rev`;
-- a source commit that the local repository marks partial, as `Error::Push`
+- a source commit that the local repository marks partial, as `Error::Remote`
   with `InvalidInput`;
 - a source commit whose `ostree.ref-binding` is a list that does not hold its
-  `DST`, as `Error::Push` with `BindingMismatch`. The message names the
+  `DST`, as `Error::Remote` with `BindingMismatch`. The message names the
   binding. A commit with no binding, or with an empty list, passes, as on the
   server.
 
@@ -3907,7 +3906,7 @@ refspecs. After `HelloReply`:
 1. The push checks the `ostree.collection-binding` of each source commit.
    When the server has a collection id and a binding differs from it, the
    push sends no object. It ends the session with `Abort` and fails with
-   `Error::Push` with `BindingMismatch`.
+   `Error::Remote` with `BindingMismatch`.
 2. With `depth` `None`, the push cuts each chain at the server tip of its
    `DST`, the tip excluded. A chain that does not hold the tip keeps the
    source commit alone. This occurs when the server does not hold the
@@ -3940,7 +3939,7 @@ refspecs. After `HelloReply`:
 A push whose refspecs are all deletes runs no `Have` round and sends no
 object. A failure of the push after the session opened and before `Commit`
 ends the session and returns that failure. The push writes `Abort` when the
-stream is still usable. A refusal of the server is `Error::Push` with the error of the server. `opts.progress` goes to
+stream is still usable. A refusal of the server is `Error::Remote` with the error of the server. `opts.progress` goes to
 the session, so its counters show the push while it runs.
 
 The push reads objects through a source over the repository. Its
@@ -4065,23 +4064,23 @@ at the crate root.
 - Before it writes a byte, the export refuses empty `updates`, a ref named
   twice, an update whose expected state is `Commit`, an update with no new
   commit, and a commit that the local repository marks partial, as
-  `Error::Push` with `InvalidInput`. It refuses a ref name that
+  `Error::Remote` with `InvalidInput`. It refuses a ref name that
   `validate_refspec` refuses, and a ref name of 64 lowercase hex characters
   that an update writes, as `Error::InvalidRefspec`. A delete of such a
   name is refused as an update with no new commit. A remote ref
   `REMOTE:NAME` with a `NAME` of
   64 hex characters passes. It refuses a commit
   whose `ostree.ref-binding` is a list that does not hold the name of its
-  ref as `Error::Push` with `BindingMismatch`. For a remote ref
+  ref as `Error::Remote` with `BindingMismatch`. For a remote ref
   `REMOTE:NAME` the check compares `NAME` alone. A dirtree or a dirmeta that
   the local repository lacks is `Error::ObjectNotFound`. A level outside 1
-  to 9, and a `Hello` or a `Commit` frame over 1 MiB, are `Error::Push` with
+  to 9, and a `Hello` or a `Commit` frame over 1 MiB, are `Error::Remote` with
   `InvalidInput`.
 - The export does not check before the stream that each file object
   exists. A missing file object, and another failure of the source, end the
   stream inside the object that the export was to send, with the abandon
-  marker and `Abort`. The export returns `Error::Push` with `Source`, and
-  the receiver returns `push::Error::Aborted`.
+  marker and `Abort`. The export returns `Error::Remote` with `Source`, and
+  the receiver returns `remote::Error::Aborted`.
 - An `archive` repository sends a file object in `deflate` as the bytes of
   its stored `.filez` file.
 - The export writes `output` in blocks of 64 KiB, so the caller need not
@@ -4506,7 +4505,7 @@ of `ostrya-fetch` drive the hyper connections of the server over
 `ArchiveView` of the repository. It takes no feature of `ostrya`. `ostrya
 send` calls it with standard input and standard output, and an ssh pull
 runs that command on the remote side. The wire protocol is in the module
-docs of `ostrya::push::proto`.
+docs of `ostrya::remote::proto`.
 
 ```rust
 impl Repo {
@@ -4570,7 +4569,7 @@ Rules:
 Failures:
 
 - A failure with a wire code goes to the client as `Error` and returns as
-  `Error::Push` with that code: `version-unsupported` for `PullHello` with
+  `Error::Remote` with that code: `version-unsupported` for `PullHello` with
   version 0; `protocol` for a `Get` before `PullHello`, a second
   `PullHello`, a kind of the push, `PullHelloReply`, `GetReply`, or `Error`
   from the client, a malformed frame, and an end of input inside a frame;
@@ -4590,12 +4589,12 @@ Failures:
 
 ## Pull over ssh: the client side
 
-`PullSession` of `ostrya-push` is the client half of the pull over ssh, and
+`PullSession` of `ostrya-remote` is the client half of the pull over ssh, and
 `Repo::pull_over_stream` wraps it as the ssh source of the pull driver. Both
 take no feature.
 
 ```rust
-// ostrya-push
+// ostrya-remote
 #[derive(Debug, Clone, Default)]
 pub struct PullConnectOptions {
     pub ssh_command: Option<Vec<String>>,       // default ["ssh"]
@@ -4705,9 +4704,9 @@ The pull through the ssh source:
 - After the plan ends, and before the transaction commits, the source ends
   the session with `finish`. The pull also ends the session on each error.
   The error of a failed pull is the error of the step that failed first. When
-  that error came from the session, `Error::Push`, it takes the error that
+  that error came from the session, `Error::Remote`, it takes the error that
   `finish` gives, so an I/O error under a failed ssh client becomes
-  `Error::Transport`. An error of the session is `Error::Push`.
+  `Error::Transport`. An error of the session is `Error::Remote`.
 - `url`, `connect.ssh_command`, and `connect.send_command` are
   `Error::InvalidInput` for `pull_over_stream`.
 

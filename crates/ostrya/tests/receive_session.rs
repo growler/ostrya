@@ -7,7 +7,7 @@
 //! - the repository lock that the session holds
 //!
 //! A test client drives the session over two in-process pipes with the frame
-//! codec of `ostrya::push::proto`. No case sends `Commit`, so each session
+//! codec of `ostrya::remote::proto`. No case sends `Commit`, so each session
 //! ends in an error and no case publishes an object. The tests of `Commit`
 //! are in `receive_commit.rs`.
 
@@ -25,11 +25,11 @@ use common::receive::{
     returned_code, session, sha, staging_entries,
 };
 use common::{TmpDir, file_inventory, foreign_holder, lock_holder_main};
-use ostrya::push::proto::{
+use ostrya::remote::proto::{
     ErrorMessage, FrameWriter, Hello, MAX_FRAME, MAX_HAVE, Message, ObjectHeader, ObjectsReply,
     PULL_PROTOCOL_VERSION, PullHello,
 };
-use ostrya::push::{self, Encoding, ErrorCode};
+use ostrya::remote::{self, Encoding, ErrorCode};
 use ostrya::{Checksum, DirMeta, Error, ObjectName, ObjectType, ReceivePolicy, RepoMode, Xattrs};
 use ostrya_core::filehdr::frame;
 use ostrya_rt::block_on;
@@ -106,7 +106,7 @@ fn hello_reply_states_the_repository_and_its_refs() {
         ]
     );
     assert!(
-        matches!(result, Err(Error::Push(push::Error::Aborted))),
+        matches!(result, Err(Error::Remote(remote::Error::Aborted))),
         "{result:?}"
     );
 }
@@ -191,7 +191,7 @@ fn a_malformed_write_setting_is_internal_at_hello() {
         });
         assert_eq!(error.code, ErrorCode::Internal, "{extra}: {error:?}");
         assert!(
-            !matches!(result, Err(Error::Push(_))),
+            !matches!(result, Err(Error::Remote(_))),
             "{extra}: the caller gets the server error, {result:?}"
         );
         assert!(staging_entries(repo.path()).is_empty());
@@ -364,7 +364,7 @@ fn a_pull_kind_is_protocol() {
         let (result, error) = session(&repo, &policy(), script);
         assert_eq!(error.code, ErrorCode::Protocol, "{what}");
         assert!(
-            matches!(&result, Err(Error::Push(push::Error::Protocol(_)))),
+            matches!(&result, Err(Error::Remote(remote::Error::Protocol(_)))),
             "{what}: {result:?}"
         );
         assert_nothing_published(&repo, &before);
@@ -550,7 +550,7 @@ fn each_encoding_stages_and_a_held_object_is_dropped() {
         );
         assert!(!have.is_missing(0) && !have.is_missing(1) && have.is_missing(2));
         have.check_len(3).unwrap();
-        assert!(matches!(result, Err(Error::Push(push::Error::Aborted))));
+        assert!(matches!(result, Err(Error::Remote(remote::Error::Aborted))));
         assert_nothing_published(&repo, &before);
     }
 }
@@ -851,7 +851,7 @@ fn an_abandoned_object_aborts_and_publishes_nothing() {
         "the server sends nothing after an abandoned object"
     );
     assert!(
-        matches!(result, Err(Error::Push(push::Error::Aborted))),
+        matches!(result, Err(Error::Remote(remote::Error::Aborted))),
         "{result:?}"
     );
     assert_nothing_published(&repo, &before);
@@ -976,7 +976,7 @@ fn detached_metadata_past_the_session_cap_is_limit_exceeded() {
         let reply = c.objects_end().await;
         // The second dict needs no valid form: the cap refuses it before its
         // end.
-        let sent: push::Result<()> = async {
+        let sent: remote::Result<()> = async {
             c.writer
                 .write_message(&Message::ObjectHeader(ObjectHeader {
                     name: ObjectName::new(sha(b"second"), ObjectType::CommitMeta),
@@ -1067,7 +1067,7 @@ fn hello_with_minus_one_waits_for_the_lock_with_no_limit() {
         "the Hello returned after {waited:?}"
     );
     assert!(
-        matches!(result, Err(Error::Push(push::Error::Aborted))),
+        matches!(result, Err(Error::Remote(remote::Error::Aborted))),
         "{result:?}"
     );
 }

@@ -8,8 +8,8 @@ use super::core::SessionCore;
 use super::session::{Failure, ReceiveReport, STREAM_BUFFER, next, out_of_order};
 use super::{ReceivePolicy, ReceiveRule};
 use crate::error::{Error, Result};
-use crate::push::proto::{CommitRequest, FrameReader, Message};
-use crate::push::{self, Expected};
+use crate::remote::proto::{CommitRequest, FrameReader, Message};
+use crate::remote::{self, Expected};
 use crate::repo::Repo;
 
 /// Methods that receive a one-way stream.
@@ -28,7 +28,7 @@ impl Repo {
     /// # Hello
     ///
     /// The frame limit and the chunk limit are 1 MiB
-    /// ([`MAX_FRAME`](crate::push::proto::MAX_FRAME)). A `bare-split-xattrs`
+    /// ([`MAX_FRAME`](crate::remote::proto::MAX_FRAME)). A `bare-split-xattrs`
     /// repository is `mode-refused`. A `bare` repository is `mode-refused`
     /// unless the process runs as root. The call accepts a repository with
     /// `[core] locking=false`.
@@ -70,18 +70,18 @@ impl Repo {
     /// A failure before the transaction commit aborts the transaction, and the
     /// repository does not change. A failure of the transaction commit can
     /// leave the detached metadata and some refs written. The call returns a
-    /// wire code inside [`Error::Push`]. It returns each other error as it is.
+    /// wire code inside [`Error::Remote`]. It returns each other error as it is.
     ///
-    /// - [`push::Error::Protocol`] if the first message is not `Hello`, or if
+    /// - [`remote::Error::Protocol`] if the first message is not `Hello`, or if
     ///   `Hello` does not have `one-way` true.
-    /// - [`push::Error::Protocol`] if a message comes out of order. `Have` and
+    /// - [`remote::Error::Protocol`] if a message comes out of order. `Have` and
     ///   an `Abort` frame between two objects are out of order.
-    /// - [`push::Error::VersionUnsupported`] if `Hello` states another
+    /// - [`remote::Error::VersionUnsupported`] if `Hello` states another
     ///   protocol version.
-    /// - [`push::Error::ModeRefused`] if the repository mode is
+    /// - [`remote::Error::ModeRefused`] if the repository mode is
     ///   `bare-split-xattrs`, or if it is `bare` and the process does not run
     ///   as root.
-    /// - [`push::Error::InvalidRef`] if `Hello` names a ref that is not valid.
+    /// - [`remote::Error::InvalidRef`] if `Hello` names a ref that is not valid.
     /// - The errors of [`Repo::transaction`] if the session transaction cannot
     ///   open. These include [`Error::LockTimeout`] for the repository lock.
     /// - [`Error::Core`] or [`Error::InvalidFormat`] if `[core] fsync`,
@@ -90,13 +90,13 @@ impl Repo {
     /// - The errors of an object stream that [`Repo::receive`] lists:
     ///   `checksum-mismatch`, `mode-refused`, `limit-exceeded`, `protocol`,
     ///   and the wire code of the frame decoder.
-    /// - [`push::Error::Protocol`] if an update of `Commit` expects a commit
+    /// - [`remote::Error::Protocol`] if an update of `Commit` expects a commit
     ///   or has no new commit, or if a byte follows `Commit`.
     /// - At `Commit`, the errors of
     ///   [`ReceiveService::commit`](super::ReceiveService::commit), other than
     ///   the errors of steps in flight and of hooks. These include
     ///   [`Error::LockTimeout`] for the update lock.
-    /// - [`push::Error::Aborted`] inside [`Error::Push`] if the sender
+    /// - [`remote::Error::Aborted`] inside [`Error::Remote`] if the sender
     ///   abandons an object: the abandon marker and then `Abort` inside the
     ///   object.
     /// - [`Error::Io`] of kind `UnexpectedEof` if `input` ends before
@@ -115,7 +115,7 @@ impl Repo {
         run(self, &policy, reader)
             .await
             .map_err(|failure| match failure {
-                Failure::Wire(e) => Error::Push(e),
+                Failure::Wire(e) => Error::Remote(e),
                 Failure::Internal(e) | Failure::Silent(e) => e,
             })
     }
@@ -176,7 +176,7 @@ where
     match rest.fill_buf().await {
         Ok([]) => {}
         Ok(_) => {
-            return Err(Failure::Wire(push::Error::Protocol(
+            return Err(Failure::Wire(remote::Error::Protocol(
                 "bytes follow Commit in a one-way stream".into(),
             )));
         }
@@ -194,13 +194,13 @@ where
 fn check_updates(request: &CommitRequest) -> std::result::Result<(), Failure> {
     for update in &request.updates {
         if let Expected::Commit(_) = update.expected {
-            return Err(Failure::Wire(push::Error::Protocol(format!(
+            return Err(Failure::Wire(remote::Error::Protocol(format!(
                 "the update of '{}' expects a commit, which a one-way stream cannot state",
                 update.name
             ))));
         }
         if update.new.is_none() {
-            return Err(Failure::Wire(push::Error::Protocol(format!(
+            return Err(Failure::Wire(remote::Error::Protocol(format!(
                 "the update of '{}' deletes the ref, which a one-way stream cannot do",
                 update.name
             ))));

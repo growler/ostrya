@@ -2,7 +2,7 @@
 //! lock, the ref writes, the transaction commit, and `CommitReply`.
 //!
 //! A test client drives the session over two in-process pipes with the frame
-//! codec of `ostrya::push::proto`. It sends the objects of the golden fixture
+//! codec of `ostrya::remote::proto`. It sends the objects of the golden fixture
 //! commit, which binds the ref `test/main`, or of commits that the tests build
 //! over the fixture tree.
 
@@ -21,8 +21,8 @@ use common::{
     foreign_holder, guard_holder, guard_holder_main, is_sealed, lock_holder_main, regular_objects,
     tool_fsck,
 };
-use ostrya::push::proto::ErrorMessage;
-use ostrya::push::{Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
+use ostrya::remote::proto::ErrorMessage;
+use ostrya::remote::{Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
 use ostrya::sign::append_signature;
 use ostrya::{
     Checksum, Commit, DictBuilder, Ed25519Signer, Ed25519Verifier, Error, FsckOptions, ObjectName,
@@ -1954,7 +1954,7 @@ fn a_corrupt_stored_commitmeta_is_internal() {
     );
     assert_eq!(reply.unwrap_err().code, ErrorCode::Internal);
     assert!(
-        result.is_err() && !matches!(result, Err(Error::Push(_))),
+        result.is_err() && !matches!(result, Err(Error::Remote(_))),
         "{result:?}"
     );
     assert_unchanged(&repo, &before);

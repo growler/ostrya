@@ -26,7 +26,7 @@ use std::path::PathBuf;
 
 use crate::config::RepoConfig;
 use crate::error::{Error, Result};
-use crate::push::{ConnectOptions, PushRemote};
+use crate::remote::{ConnectOptions, PushRemote};
 
 /// Returns `true` if `remote` is a push address: a value with a `:` or a `/`.
 ///
@@ -79,15 +79,15 @@ pub fn is_push_address(remote: &str) -> bool {
 ///
 /// # Errors
 ///
-/// - [`Error::Push`] with [`InvalidInput`](crate::push::Error::InvalidInput)
+/// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
 ///   if `config` holds no section for the name. A `config` of `None` holds no
 ///   section.
-/// - [`Error::Push`] with `InvalidInput` if the section has no push address:
+/// - [`Error::Remote`] with `InvalidInput` if the section has no push address:
 ///   no `push-url`, and no `url` or a `url` that is not `http://` or
 ///   `https://`.
-/// - [`Error::Push`] with `InvalidInput` if the address is `https://` and the
+/// - [`Error::Remote`] with `InvalidInput` if the address is `https://` and the
 ///   section sets `tls-permissive=true`.
-/// - [`Error::Push`] with the error of [`PushRemote::parse`] if the address
+/// - [`Error::Remote`] with the error of [`PushRemote::parse`] if the address
 ///   does not parse.
 /// - [`Error::Core`] if a key that the function reads holds a malformed
 ///   escape sequence, or if `tls-permissive` is not a boolean.
@@ -161,7 +161,7 @@ fn is_http_address(address: &str) -> bool {
 
 /// Returns the error of a push request that the client refuses.
 pub(crate) fn invalid(msg: impl Into<String>) -> Error {
-    Error::Push(crate::push::Error::InvalidInput(msg.into()))
+    Error::Remote(crate::remote::Error::InvalidInput(msg.into()))
 }
 
 #[cfg(test)]
@@ -226,7 +226,7 @@ mod tests {
 
     fn assert_invalid(result: Result<(PushRemote, ConnectOptions)>, needle: &str) {
         match result {
-            Err(Error::Push(crate::push::Error::InvalidInput(msg))) => {
+            Err(Error::Remote(crate::remote::Error::InvalidInput(msg))) => {
                 assert!(msg.contains(needle), "{msg:?} lacks {needle:?}")
             }
             other => panic!("expected InvalidInput, got {other:?}"),
@@ -273,7 +273,7 @@ mod tests {
         // when it holds a `/` alone.
         for address in ["ftp://host/r", "srv/repo"] {
             let expected = match PushRemote::parse(address) {
-                Err(crate::push::Error::InvalidInput(msg)) => msg,
+                Err(crate::remote::Error::InvalidInput(msg)) => msg,
                 other => panic!("{address}: {other:?}"),
             };
             assert_invalid(

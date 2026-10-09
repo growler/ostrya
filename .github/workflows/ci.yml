@@ -214,9 +214,9 @@ jobs:
       - name: The portable crates check on the non-Linux targets
         run: |
           for target in x86_64-pc-windows-gnu x86_64-apple-darwin aarch64-apple-darwin; do
-            cargo check --target "$target" -p ostrya-gvariant -p ostrya-core -p ostrya-rt -p ostrya-push
+            cargo check --target "$target" -p ostrya-gvariant -p ostrya-core -p ostrya-rt -p ostrya-remote
             cargo check --target "$target" -p ostrya-rt --no-default-features --features tokio
-            cargo check --target "$target" -p ostrya-push --no-default-features --features tokio
+            cargo check --target "$target" -p ostrya-remote --no-default-features --features tokio
             cargo check --target "$target" -p ostrya-sign --features sign-spki,sign-gpg
             cargo check --target "$target" -p ostrya-sign --no-default-features --features tokio,sign-spki,sign-gpg
           done
@@ -244,7 +244,7 @@ jobs:
       # `default-features = false`, and each dependent forwards `smol` and
       # `tokio` itself. So a tokio build of `ostrya` holds no `smol`, with and
       # without the `receive` and the `push` features, and so does a tokio
-      # build of `ostrya-server`. `ostrya-push` is a regular dependency of
+      # build of `ostrya-server`. `ostrya-remote` is a regular dependency of
       # `ostrya`, so each of these builds holds it. This fails when one path
       # turns the smol backend on.
       # `cargo tree -i` exits non-zero both when the package is absent and on

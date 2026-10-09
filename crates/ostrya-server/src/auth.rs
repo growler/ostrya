@@ -12,7 +12,7 @@ use std::sync::Arc;
 use hyper::header::{AUTHORIZATION, HeaderValue, WWW_AUTHENTICATE};
 use hyper::http::request::Parts;
 use hyper::{HeaderMap, StatusCode};
-use ostrya::push::proto::Hello;
+use ostrya::remote::proto::Hello;
 use ostrya::{Checksum, ReceivePolicy};
 
 use crate::error::Error;

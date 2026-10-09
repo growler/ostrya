@@ -7,7 +7,7 @@
 
 use crate::config::Remote;
 use crate::error::{Error, Result};
-use crate::push::{self, PullConnectOptions, PushRemote};
+use crate::remote::{self, PullConnectOptions, PushRemote};
 
 use super::PullOptions;
 
@@ -150,8 +150,8 @@ fn parse_address(value: &str) -> Result<PullAddress> {
         return Ok(PullAddress::Http(value.to_owned()));
     }
     let remote = PushRemote::parse(value).map_err(|e| match e {
-        push::Error::InvalidInput(msg) => Error::InvalidInput(msg),
-        other => Error::Push(other),
+        remote::Error::InvalidInput(msg) => Error::InvalidInput(msg),
+        other => Error::Remote(other),
     })?;
     Ok(PullAddress::Ssh(SshAddress {
         remote,

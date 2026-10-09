@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use ostrya::push::{
+use ostrya::remote::{
     BoxFuture, Compression, ConnectOptions, Encoding, Error, Expected, ObjectData, ObjectSource,
     PushOutcome, PushRemote, PushSession, RefUpdate, SessionOptions,
 };
@@ -129,7 +129,7 @@ impl ObjectSource for FixtureSource {
     fn objects<'a>(
         &'a self,
         commit: &'a Checksum,
-    ) -> BoxFuture<'a, ostrya::push::Result<Vec<ObjectName>>> {
+    ) -> BoxFuture<'a, ostrya::remote::Result<Vec<ObjectName>>> {
         Box::pin(async move {
             let names = self
                 .repo
@@ -146,14 +146,14 @@ impl ObjectSource for FixtureSource {
         &'a self,
         name: &'a ObjectName,
         encoding: Encoding,
-    ) -> BoxFuture<'a, ostrya::push::Result<ObjectData>> {
+    ) -> BoxFuture<'a, ostrya::remote::Result<ObjectData>> {
         Box::pin(async move { self.load(name, encoding).await.map_err(source_error) })
     }
 
     fn detached_metadata<'a>(
         &'a self,
         _commit: &'a Checksum,
-    ) -> BoxFuture<'a, ostrya::push::Result<Option<Value>>> {
+    ) -> BoxFuture<'a, ostrya::remote::Result<Option<Value>>> {
         Box::pin(async { Ok(None) })
     }
 }
@@ -166,7 +166,7 @@ impl ObjectSource for BadSource {
     fn objects<'a>(
         &'a self,
         _commit: &'a Checksum,
-    ) -> BoxFuture<'a, ostrya::push::Result<Vec<ObjectName>>> {
+    ) -> BoxFuture<'a, ostrya::remote::Result<Vec<ObjectName>>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 
@@ -174,7 +174,7 @@ impl ObjectSource for BadSource {
         &'a self,
         name: &'a ObjectName,
         _encoding: Encoding,
-    ) -> BoxFuture<'a, ostrya::push::Result<ObjectData>> {
+    ) -> BoxFuture<'a, ostrya::remote::Result<ObjectData>> {
         Box::pin(async move {
             let path = match name.ty {
                 ObjectType::DirMeta => fixture().join("objects").join(loose_path(
@@ -194,7 +194,7 @@ impl ObjectSource for BadSource {
     fn detached_metadata<'a>(
         &'a self,
         _commit: &'a Checksum,
-    ) -> BoxFuture<'a, ostrya::push::Result<Option<Value>>> {
+    ) -> BoxFuture<'a, ostrya::remote::Result<Option<Value>>> {
         Box::pin(async { Ok(None) })
     }
 }
@@ -250,7 +250,7 @@ fn push(
     status: &Path,
     policy: Option<&Path>,
     compression: Compression,
-) -> ostrya::push::Result<PushOutcome> {
+) -> ostrya::remote::Result<PushOutcome> {
     let source = FixtureSource::new();
     block_on(async {
         let session = PushSession::connect(
@@ -522,7 +522,7 @@ mod repo_push {
 
         let delete = format!(":{BRANCH}");
         match block_on(local.push("origin", push_opts(&status, &[&delete]))) {
-            Err(ostrya::Error::Push(Error::DeleteDenied(_))) => {}
+            Err(ostrya::Error::Remote(Error::DeleteDenied(_))) => {}
             other => panic!("expected DeleteDenied, got {other:?}"),
         }
         assert_eq!(tip(&dest), Some(commit()));

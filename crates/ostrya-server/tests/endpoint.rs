@@ -36,8 +36,8 @@ use hyper::http::request::Parts;
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use ostrya::push::proto::Hello;
-use ostrya::push::{
+use ostrya::remote::proto::Hello;
+use ostrya::remote::{
     self, ConnectOptions, ParentPolicy, PushRemote, RefUpdate, TreePushOptions, push_tree,
 };
 use ostrya::{
@@ -357,7 +357,7 @@ fn a_push_through_a_mounted_endpoint_commits_over_http2() {
 
                 let refused = push_tree(&remote, &small, connect(&wrong), push_options()).await;
                 assert!(
-                    matches!(refused, Err(ostrya::push::Error::Unauthorized(_))),
+                    matches!(refused, Err(ostrya::remote::Error::Unauthorized(_))),
                     "{refused:?}"
                 );
 
@@ -376,7 +376,7 @@ fn a_push_through_a_mounted_endpoint_commits_over_http2() {
                 assert!(ended, "the sweep ends after shutdown");
                 let stopped = push_tree(&remote, &small, connect(&token), push_options()).await;
                 assert!(
-                    matches!(stopped, Err(ostrya::push::Error::LimitExceeded(_))),
+                    matches!(stopped, Err(ostrya::remote::Error::LimitExceeded(_))),
                     "{stopped:?}"
                 );
             },
@@ -683,7 +683,7 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
                 state.fail_after.store(true, Ordering::SeqCst);
                 let failed = push_tree(&remote, &small, connect(&bob), push_options("rel/c")).await;
                 match &failed {
-                    Err(push::Error::Internal(message)) => {
+                    Err(remote::Error::Internal(message)) => {
                         assert!(message.contains(AFTER_FAILED), "{message}");
                     }
                     other => panic!("{other:?}"),
@@ -704,7 +704,7 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
                 let moved =
                     push_tree(&remote, &small, connect(&alice), push_options("rel/d")).await;
                 match &moved {
-                    Err(push::Error::RefMismatch { name, current, .. }) => {
+                    Err(remote::Error::RefMismatch { name, current, .. }) => {
                         assert_eq!(name, "rel/d");
                         assert_eq!(*current, Some(commit));
                     }

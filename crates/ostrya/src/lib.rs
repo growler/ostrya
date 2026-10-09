@@ -172,7 +172,7 @@ pub use pull::{
     PullProgressSnapshot, PullStats, PullVerify, TimestampCheck,
 };
 #[cfg(feature = "push")]
-pub use push_repo::{ExportStreamOptions, RepoPushOptions, is_push_address, resolve_push_remote};
+pub use push_repo::{ExportStreamOptions, RepoPushOptions, is_push_address};
 #[doc(hidden)]
 pub use read::{CommitSizes, CommitState, MetadataReader};
 #[cfg(feature = "receive")]

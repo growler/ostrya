@@ -17,7 +17,7 @@ use std::task::{Context, Poll};
 
 use futures_io::AsyncWrite;
 use ostrya_remote::{
-    Compression, ConnectOptions, Error, PushRemote, TreePushOptions, push_tree,
+    Compression, Endpoint, Error, SshAddress, SshOptions, TreePushOptions, push_tree,
     push_tree_over_stream,
 };
 
@@ -59,18 +59,21 @@ fn tree(base: &Path) -> PathBuf {
     root
 }
 
-/// The connect options of a stand-in ssh client that creates `marker` and
-/// exits.
-fn stand_in(marker: &Path) -> ConnectOptions {
+/// The endpoint of the ssh address `address` with a stand-in ssh client that
+/// creates `marker` and exits.
+fn stand_in(address: &str, marker: &Path) -> Endpoint {
     let script = format!("touch '{}'", marker.to_str().unwrap());
-    ConnectOptions {
-        ssh_command: Some(
-            ["sh", "-c", &script, "stand-in"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-        ),
-        ..Default::default()
+    Endpoint::Ssh {
+        address: SshAddress::parse(address).unwrap(),
+        options: SshOptions {
+            command: Some(
+                ["sh", "-c", &script, "stand-in"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            ..Default::default()
+        },
     }
 }
 
@@ -118,8 +121,7 @@ fn refused_with_no_start(
 ) -> Error {
     let scratch = Scratch::new(tag);
     let marker = scratch.path.join("started");
-    let remote = PushRemote::parse(address).unwrap();
-    let result = ostrya_rt::block_on(push_tree(&remote, root, stand_in(&marker), opts()));
+    let result = ostrya_rt::block_on(push_tree(stand_in(address, &marker), root, opts()));
     assert!(!marker.exists(), "{tag}: the ssh client started");
 
     let written = Arc::new(AtomicU64::new(0));
@@ -170,11 +172,9 @@ fn a_tree_that_scans_starts_the_ssh_client() {
     let scratch = Scratch::new("control");
     let root = tree(&scratch.path);
     let marker = scratch.path.join("started");
-    let remote = PushRemote::parse(ADDRESS).unwrap();
     let result = ostrya_rt::block_on(push_tree(
-        &remote,
+        stand_in(ADDRESS, &marker),
         &root,
-        stand_in(&marker),
         options(&["main"]),
     ));
     assert!(marker.exists(), "the ssh client did not start");
@@ -314,25 +314,27 @@ fn options_refused_before_the_scan_start_no_ssh_client() {
         invalid_input(tag, e, part);
     }
 
-    // Before it sends a request, the push refuses an ssh option with an HTTP
-    // address. It also refuses a token to an `http://` address without the
-    // cleartext switch.
-    let marker = scratch.path.join("started");
-    let remote = PushRemote::parse("http://host/repo").unwrap();
-    let result = ostrya_rt::block_on(push_tree(
-        &remote,
-        &root,
-        stand_in(&marker),
-        options(&["main"]),
-    ));
-    assert!(!marker.exists(), "http: the ssh client started");
-    invalid_input("http", result.unwrap_err(), "is an HTTP address");
-    let token = scratch.path.join("token");
-    fs::write(&token, b"token\n").unwrap();
-    let connect = ConnectOptions {
-        push_token_file: Some(token),
-        ..Default::default()
-    };
-    let result = ostrya_rt::block_on(push_tree(&remote, &root, connect, options(&["main"])));
-    invalid_input("cleartext", result.unwrap_err(), "cleartext");
+    // Before it sends a request, the push refuses HTTP options with no mirror
+    // or with two mirrors. The fetcher refuses a token to an `http://`
+    // address without the cleartext permission.
+    for mirrors in [
+        Vec::new(),
+        vec!["http://a/".to_owned(), "http://b/".to_owned()],
+    ] {
+        let endpoint = Endpoint::Http(ostrya_fetch::FetcherOptions {
+            mirrors,
+            ..Default::default()
+        });
+        let result = ostrya_rt::block_on(push_tree(endpoint, &root, options(&["main"])));
+        invalid_input("mirrors", result.unwrap_err(), "exactly one mirror");
+    }
+    let mut http = ostrya_fetch::FetcherOptions::new("http://host/repo");
+    http.bearer_token = Some(ostrya_fetch::BearerToken {
+        token: "token".into(),
+    });
+    let result = ostrya_rt::block_on(push_tree(Endpoint::Http(http), &root, options(&["main"])));
+    match result {
+        Err(Error::Fetch(e)) => assert!(e.to_string().contains("cleartext"), "{e}"),
+        other => panic!("cleartext: {other:?}"),
+    }
 }

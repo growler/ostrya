@@ -3415,11 +3415,11 @@ push over a pair of byte streams. `ostrya` re-exports the three as
   parent of `ParentPolicy::CurrentTip`. A revision reads `^` as the parent
   of a commit, and 64 lowercase hex characters as a commit checksum, so a
   ref of either form cannot be read back by its name. The
-  timestamp is read here. `push_tree` then makes the transport ready with
-  `PushSession::prepare`. For an ssh address it builds the command line.
-  For an `http://` or an `https://` address it reads the token file and the
-  TLS files and builds the HTTP client. It refuses each option that
-  `PushSession::connect` refuses before it starts the transport.
+  timestamp is read here. `push_tree` then makes the transport of its
+  `Endpoint` ready with `PushSession::prepare`. For an ssh endpoint it
+  builds the command line. For an HTTP endpoint it builds the HTTP client.
+  It refuses each value that `PushSession::connect` refuses before it
+  starts the transport.
   `push_tree_prepared` takes a transport that is ready, and makes these
   checks of `opts` after it.
 - The scan is `TreeModel::scan` with `entry_filter` and `hash_jobs`. It runs
@@ -3481,8 +3481,8 @@ pub struct TreePushOptions {
     pub progress: Option<PushProgress>,
 }
 
-pub async fn push_tree(remote: &PushRemote, root: &Path, connect: ConnectOptions,
-                       opts: TreePushOptions) -> Result<PushOutcome>;
+pub async fn push_tree(endpoint: Endpoint, root: &Path, opts: TreePushOptions)
+    -> Result<PushOutcome>;
 pub async fn push_tree_prepared(session: PreparedSession, root: &Path,
                                 opts: TreePushOptions) -> Result<PushOutcome>;
 pub async fn push_tree_over_stream<R, W>(input: R, output: W, root: &Path,
@@ -3521,16 +3521,18 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
   branch must be specified with --branch`, checked in that order after
   `--owner-uid` and `--owner-gid` and before a repository opens. Each exits
   1 before an ssh client starts.
-- `REMOTE` goes to `resolve_push_remote`. When `is_push_address` holds for
-  it, the command opens no repository and gives a `config` of `None`.
+- `REMOTE` goes to `ostrya::endpoint::resolve_push`. When
+  `is_push_address` holds for it, the command opens no repository and gives
+  a `config` of `None`.
   Otherwise the command opens the repository of `--repo`, the current
   directory, or `OSTREE_REPO`, and gives its config.
 - The checks run in this order: `--owner-uid` and `--owner-gid`, the
   operands, `--canonical-permissions`, the `-b` names that the command
   refuses itself, `--parent`, the metadata options, and `--timestamp`. The
-  command then resolves `REMOTE` and calls `PushSession::prepare`, which
-  refuses an option of the other transport and a bad HTTP option, and
-  reads the token file and the TLS files. It then builds the signers and
+  command then resolves `REMOTE` with `resolve_push`, which refuses an
+  option of the other transport and a bad HTTP option, and reads the token
+  file and the TLS files. It then calls `PushSession::prepare`, which builds
+  the HTTP client or the ssh command line. It then builds the signers and
   reads `--body-file`, and calls `push_tree_prepared`, which checks the
   other options before the scan. So a refusal of the remote or of its
   options starts no gpg and reads no body file.
@@ -3560,9 +3562,9 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
   a selector that names no secret key are refused before an ssh client
   starts and before the first HTTP request. The command reads
   `--body-file` after it builds the list.
-- `--force`, `--compress`, `--ssh-command`, `--receive-command`, and the
-  HTTP options set `force`, `compression`, and `connect` as they do for
-  `ostrya push`. `hash_jobs` is `None`. `progress` draws the progress bar
+- `--force` and `--compress` set `force` and `compression` as they do for
+  `ostrya push`. `--ssh-command`, `--receive-command`, and the HTTP options
+  set the fields of `EndpointOverrides` as they do for `ostrya push`. `hash_jobs` is `None`. `progress` draws the progress bar
   of `ostrya push`, with its rules, or is `None` when the bar is hidden. The
   bar shows nothing during the scan, and nothing
   before `Negotiating`, so a signer that asks for a passphrase keeps the
@@ -3575,18 +3577,13 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
 
 ## Push transports
 
-`PushRemote::parse` reads a push address, and `PushSession::connect` opens
-a session to it over ssh or over HTTP. An ssh address takes the ssh fields
-of `ConnectOptions`, and an `http://` or `https://` address takes the other
-fields. A field of the other transport is `Error::InvalidInput`.
-`remote_ssh_command` holds a key of a remote section, and an HTTP address
-does not read it. With an ssh address, a field of `http` that differs from
-`FetcherOptions::default()` is refused. A refusal names a field by its
-remote key, which is also the CLI option without `--`, for example
-`push-user needs push-token-file` and `ssh-command applies to an ssh
-address`. A refusal of a field of `http` names `ConnectOptions::http`. A
-refusal of an HTTP field with an ssh address shows the address in the
-`ssh://` form with no user.
+`PushSession::connect` opens a push session to an `Endpoint` over ssh or
+over HTTP. The transport takes the credential and the TLS material from
+memory, and reads no file that the endpoint names. An `https://` endpoint
+with `TrustRoots::System` reads the trust store of the host.
+`ostrya::endpoint::resolve_push` gives the endpoint of a remote section or
+of an address, and reads the files that the remote keys name ("Endpoint
+resolution"). `PushRemote::parse` reads the address of a pull over ssh.
 
 `Endpoint` holds a remote address with the options of its transport.
 `Endpoint::Ssh` holds an `SshAddress` and the `SshOptions` of the ssh
@@ -3606,17 +3603,18 @@ remote key `ssh-command`. `remote_command` defaults to `ostrya receive` for
 a push and `ostrya send` for a pull.
 
 `PushSession::connect` is `PushSession::prepare` and then
-`PreparedSession::open`. `prepare` checks the options and makes the
-transport ready: for ssh it builds the command line, and for HTTP it reads
-the token file and the TLS files and builds the HTTP client. It starts no
-ssh client and sends no request. `open` starts the ssh client or sends the
+`PreparedSession::open`. `prepare` checks the endpoint and makes the
+transport ready: for ssh it builds the command line, and for HTTP it builds
+the HTTP client. It reads no file that the endpoint names, starts no ssh
+client, and sends no request. `open` starts the ssh client or sends the
 first request, and opens the session. `PreparedSession` is `Send + Sync`,
 and its `Debug` output shows the transport and the HTTP address alone.
 
 The ssh transport runs the ssh client as a child process with the command
 line
 `SSH_COMMAND... [-p PORT] [USER@]HOST 'RECEIVE_COMMAND --repo=QUOTED_PATH'`,
-and the remote side runs `ostrya receive`.
+and the remote side runs `ostrya receive`. `RECEIVE_COMMAND` is
+`SshOptions::remote_command`, or `ostrya receive`.
 
 - The addresses are `ssh://[USER@]HOST[:PORT]/PATH`,
   `ssh://[USER@]HOST[:PORT]/~/PATH`, and the scp form `[USER@]HOST:PATH`. A
@@ -3646,11 +3644,10 @@ and the remote side runs `ostrya receive`.
   an `@` in its path stays.
 - On Windows it refuses a scp-form address that names a local path: a host
   of one ASCII letter, and a `\` before the first `:`.
-- `SSH_COMMAND` is `ConnectOptions::ssh_command`, then the
-  `OSTRYA_SSH_COMMAND` environment variable, then
-  `ConnectOptions::remote_ssh_command`, then `ssh`. The two strings are
-  split at ASCII whitespace. An empty command and a value that is not UTF-8
-  are `Error::InvalidInput`.
+- `SSH_COMMAND` is `SshOptions::command`, then the `OSTRYA_SSH_COMMAND`
+  environment variable, then `SshOptions::config_command`, then `ssh`. The
+  two strings are split at ASCII whitespace. An empty command, an empty
+  remote command, and a value that is not UTF-8 are `Error::InvalidInput`.
 - On a session that `connect` opened, the read of a pending message after a
   failed write waits at most 5 seconds. `commit` and `abort` close the
   standard input of the ssh client and wait at most 5 seconds for it to
@@ -3676,8 +3673,10 @@ and the remote side runs `ostrya receive`.
 The HTTP transport sends each step of a session as one request to the
 receive endpoint of the server ("Archive view and HTTP server").
 
-- The addresses are `http://HOST[:PORT][/PATH]` and
-  `https://HOST[:PORT][/PATH]`. `PushRemote::parse` checks them with
+- The `FetcherOptions` of `Endpoint::Http` must name exactly one mirror,
+  the push address. Another count is `Error::InvalidInput`. The addresses
+  are `http://HOST[:PORT][/PATH]` and `https://HOST[:PORT][/PATH]`.
+  `Endpoint::parse` and `prepare` check the mirror with
   `ostrya_fetch::check_base_url`, which refuses an `@` anywhere, a query, a
   fragment, an empty host, and a port that is not ASCII digits from 0 to
   65535. A refusal does not show the text before the last `@`.
@@ -3690,32 +3689,20 @@ receive endpoint of the server ("Archive view and HTTP server").
 - `Hello`, `Have`, and `Commit` go as whole request bodies. Each object
   stream is the streamed body of one `objects` request. Each response body
   is one frame, read at the limit `MAX_FRAME`.
-- `push_token_file` names a file whose first line is the token. The client
-  reads at most 1 MiB of the file on the blocking pool and takes the bytes
-  up to the first LF. A relative path is relative to the current directory
-  of the process, and `~` is not expanded, for each file of this list. A
-  file that cannot be read fails with `Error::Io`, whose message names the
-  key and the path, for example `push-token-file 't': ...`. It refuses a CR, an empty token, a token that is not
-  UTF-8, and a token that is not token68. No message holds the token. The
-  client checks no permission of the file. With `push_user`, the token is
-  the password of a Basic credential with that name. Without it, the token
-  is a bearer token. `push_user` without `push_token_file`, an empty
-  `push_user`, and a `push_user` that holds `:` are `Error::InvalidInput`.
-- A credential to an `http://` address is `Error::InvalidInput` before any
-  request, unless `allow_cleartext_credentials` is set. Set it for a server
-  on a loopback address or behind a proxy that terminates TLS.
-- `tls_ca_path` names the CA certificates that verify the server, in place
-  of the trust store of the host. `tls_client_cert_path` and
-  `tls_client_key_path` name a client certificate and its key, and the two
-  come together. A key that needs a passphrase is refused. The client reads
-  each file once, at most 1 MiB, before the session opens.
-- `http` holds the other options of the HTTP client, for example a proxy and
-  the timeouts. Mirrors, `basic_auth`, `bearer_token`,
-  `allow_cleartext_credentials`, a trust setting that verifies no
-  certificate chain, trust roots other than the system store beside
-  `tls_ca_path`, and a client identity beside the client files are
-  `Error::InvalidInput`. The client sets `max_outstanding` to 32 and
-  `max_redirects` to 0.
+- The fetcher carries the credential, the trust setting, the client
+  identity, the proxy, the headers, and the timeouts of the
+  `FetcherOptions` to each request. `basic_auth` and `bearer_token` give
+  the `Authorization` header. `Fetcher::new` refuses a bearer token or a
+  Basic credential beside an `Authorization` entry of `headers`, and refuses
+  a credential to an `http://` address unless `allow_cleartext_credentials`
+  is set. These refusals are `Error::Fetch`, from `prepare`. A client key
+  can be an encrypted PKCS#8 key, with its passphrase in `key_passphrase`.
+- The transport accepts each trust setting of the caller,
+  `DangerousAcceptAnyChain` and `DangerousAcceptAny` among them. The trust
+  policy belongs to the caller. `resolve_push` holds the policy of the
+  remote keys.
+- The client sets `max_outstanding` to 32 and `max_redirects` to 0,
+  whatever values the options hold.
 - `send` runs `min(parallel-uploads, 31)` object streams at most, and no
   more streams than the objects it sends. A `parallel-uploads` of 0 counts
   as 1. All the `send` calls of one session share that limit. A call with
@@ -3727,7 +3714,7 @@ receive endpoint of the server ("Archive view and HTTP server").
   while one runs is `Error::InvalidInput`.
 - The response to `Hello` may take 360 seconds after the request body was
   sent, and the response to `Commit` 1 hour. The response to each other
-  request takes the progress timeout of `http`.
+  request takes the progress timeout of the `FetcherOptions`.
 - The client sends a request again only when the attempt failed before it
   sent a byte. A `Commit` that was not sent is a definite error. After
   `Commit` was sent, an interrupted request, a failed read of the response,
@@ -3782,26 +3769,10 @@ impl Endpoint {
     pub fn parse(address: &str) -> Result<Endpoint>;
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ConnectOptions {
-    pub ssh_command: Option<Vec<String>>,     // wins over OSTRYA_SSH_COMMAND
-    pub receive_command: Option<String>,      // default "ostrya receive"
-    pub remote_ssh_command: Option<String>,   // the remote key, lowest
-    pub push_token_file: Option<PathBuf>,     // first line: the token
-    pub push_user: Option<String>,            // Basic name; else bearer
-    pub tls_ca_path: Option<PathBuf>,         // replaces the host store
-    pub tls_client_cert_path: Option<PathBuf>,
-    pub tls_client_key_path: Option<PathBuf>,
-    pub allow_cleartext_credentials: bool,    // a token to http://
-    pub http: ostrya_fetch::FetcherOptions,   // the other client options
-}
-
 impl PushSession {
-    pub async fn connect(remote: &PushRemote, connect: ConnectOptions,
-                         refs: &[String], opts: SessionOptions)
+    pub async fn connect(endpoint: Endpoint, refs: &[String], opts: SessionOptions)
         -> Result<PushSession>;
-    pub async fn prepare(remote: &PushRemote, connect: ConnectOptions)
-        -> Result<PreparedSession>;
+    pub async fn prepare(endpoint: Endpoint) -> Result<PreparedSession>;
 }
 
 pub struct PreparedSession { inner: Prepared }   // Send + Sync
@@ -3840,31 +3811,34 @@ restrict,command="ostrya receive --repo=/srv/repo --policy=/etc/ostrya/receive.c
 A remote section of the repository config can hold the push keys
 `push-url`, `ssh-command`, `receive-command`, `push-token-file`, and
 `push-user`. `Remote` reads each one as written, in every build. A push to
-an HTTP address also reads the TLS keys of the pull: `tls-ca-path`,
-`tls-client-cert-path`, `tls-client-key-path`, and `tls-permissive`.
+an HTTP address also reads the TLS keys and the `proxy` key of the pull:
+`tls-ca-path`, `tls-client-cert-path`, `tls-client-key-path`,
+`tls-permissive`, and `proxy`.
 
-`resolve_push_remote`, under the `push` feature, gives the push address and
-the connect options of a push:
+`ostrya::endpoint::resolve_push`, under the `push` feature, gives the
+endpoint of a push. "Endpoint resolution" gives all of its rules. These are
+the rules of the remote keys:
 
 - A value that holds a `:` or a `/` is an address, which
-  `PushRemote::parse` reads. No configuration is read for it.
+  `Endpoint::parse` reads. No configuration is read for it.
   `is_push_address` gives this rule, so a caller can open no repository
   for an address.
 - Any other value is the name of a remote section. The address is its
   `push-url`. When `push-url` is absent, a `url` that starts with `http://`
   or `https://` is the address. A `url` of another form, for example
   `file://`, `metalink=`, or `mirrorlist=`, is no push address.
-- The keys of the section fill the fields of `ConnectOptions` that apply to
-  the transport of the address, each only when the caller left that field
-  `None`. A field that the caller set wins, and each key resolves on its
-  own.
-  - For an ssh address, `ssh-command` fills `remote_ssh_command`, and
-    `receive-command` fills `receive_command`. The HTTP keys are not read.
+- The keys of the section fill the fields of `EndpointOverrides` that
+  apply to the transport of the address, each only when the caller left
+  that field `None`. A field that the caller set wins, and each key
+  resolves on its own.
+  - For an ssh address, `ssh-command` gives `SshOptions::config_command`,
+    and `receive-command` fills `remote_command`. The HTTP keys are not
+    read.
   - For an `http://` or `https://` address, `push-token-file`, `push-user`,
     `tls-ca-path`, `tls-client-cert-path`, and `tls-client-key-path` fill
-    the fields of the same names. The ssh keys are not read, so a
-    `receive-command` key in such a section causes no refusal. The `proxy`
-    key is not read.
+    the fields of the same names. The `proxy` key gives the proxy. The ssh
+    keys are not read, so a `receive-command` key in such a section causes
+    no refusal.
   - For an `https://` address, `tls-permissive=true` is `Error::Remote` with
     `remote::Error::InvalidInput`, before any request. A push verifies the
     certificate chain of the server. An `http://` address uses no TLS, and
@@ -3886,10 +3860,6 @@ impl Remote<'_> {
 }
 
 pub fn is_push_address(remote: &str) -> bool;
-
-pub fn resolve_push_remote(config: Option<&RepoConfig>, remote: &str,
-                           connect: ConnectOptions)
-    -> Result<(PushRemote, ConnectOptions)>;
 ```
 
 ## Endpoint resolution
@@ -3897,8 +3867,9 @@ pub fn resolve_push_remote(config: Option<&RepoConfig>, remote: &str,
 The module `ostrya::endpoint` reads the keys of a remote section and the
 files that the keys name. It gives a `remote::Endpoint` that holds all
 values in memory. `resolve_pull` is in every build. The `push` feature
-gates `resolve_push`. `Repo::pull` and `Repo::push` do not call the
-resolvers yet.
+gates `resolve_push`. `ostrya push` and `ostrya push-tree` call
+`resolve_push`, and give the endpoint to `Repo::push` or to
+`PushSession::prepare`. `Repo::pull` does not call `resolve_pull` yet.
 
 ```rust
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -3988,8 +3959,7 @@ Rules of both resolvers:
 `resolve_push`:
 
 - It refuses `url` before it reads the address.
-- The address rules are the rules of `resolve_push_remote` in "Push
-  remotes".
+- The address rules are the rules of "Push remotes".
 - For an `https://` address of a section, `tls-permissive=true` is refused.
   An `http://` address does not read the key.
 - For an HTTP address, it refuses `ssh_command` (`ssh-command`) and
@@ -4003,7 +3973,10 @@ Rules of both resolvers:
   key `proxy` and before the first file read. `Fetcher::new` also refuses
   such a token.
 - The token and a `push_user` give `basic_auth`. The token alone gives
-  `bearer_token`.
+  `bearer_token`. The resolver does not refuse an `Authorization` entry of
+  `http_headers` beside the token. `PushSession::prepare` refuses the pair
+  when `Fetcher::new` builds the HTTP client.
+- The key `proxy` gives the proxy of the push.
 - `max_retries` of `None` keeps the default of `FetcherOptions`. With no
   low-speed field, the push has no low-speed rule. With one field, the
   other field takes its pull default.
@@ -4022,17 +3995,16 @@ Rules of both resolvers:
 ## Push from a repository
 
 `Repo::push`, under the `push` feature, pushes the commits that a set of
-refspecs name to a remote. The server updates its refs in one transaction.
-`remote` is a remote name or an address, and
-`resolve_push_remote` reads it with the config of the repository and
-`RepoPushOptions::connect`. The push then makes the transport ready with
-`PushSession::prepare`, before the checks and the commit walk below, so a
-refusal of the remote or of its options takes no lock and reads no
-refspec. After the walk it opens the session with `PreparedSession::open`.
-`Repo::push_over_stream` runs the same push over a
-pair of byte streams, the mirror of `PushSession::over_stream`, and does not
-read `connect`. Under the tokio backend, `Repo::push` needs a runtime with
-the IO driver and the time driver, as `PushSession::connect` does.
+refspecs name to an `Endpoint`. The server updates its refs in one
+transaction. The caller gives the endpoint: `resolve_push` gives it for a
+remote name or an address, with the config of the repository. The push
+makes the transport ready with `PushSession::prepare`, before the checks
+and the commit walk below, so a refusal of the endpoint takes no lock and
+reads no refspec. After the walk it opens the session with
+`PreparedSession::open`. `Repo::push_over_stream` runs the same push over a
+pair of byte streams, the mirror of `PushSession::over_stream`. Under the
+tokio backend, `Repo::push` needs a runtime with the IO driver and the time
+driver, as `PushSession::connect` does.
 
 ```rust
 #[derive(Debug, Clone, Default)]
@@ -4041,13 +4013,12 @@ pub struct RepoPushOptions {
     pub depth: Option<i32>,        // None: the chain to the server tip
     pub compression: Compression,
     pub force: bool,
-    pub connect: ConnectOptions,
     pub detached_metadata_filter: DetachedMetadataFilter,
     pub progress: Option<PushProgress>,
 }
 
 impl Repo {
-    pub async fn push(&self, remote: &str, opts: RepoPushOptions)
+    pub async fn push(&self, endpoint: Endpoint, opts: RepoPushOptions)
         -> Result<PushOutcome>;
 
     pub async fn push_over_stream<R, W>(&self, input: R, output: W,
@@ -4167,8 +4138,9 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
             [--tls-ca-path=FILE] [--allow-cleartext-credentials]
 ```
 
-- `REMOTE` is the `remote` argument, and each `SRC[:DST]` is one of
-  `refspecs`. It is a remote name, an ssh address, or an `http://` or
+- `REMOTE` goes to `resolve_push` with the config of the repository, and
+  the endpoint goes to `Repo::push`. Each `SRC[:DST]` is one of
+  `refspecs`. `REMOTE` is a remote name, an ssh address, or an `http://` or
   `https://` address.
 - `--depth=N` sets `depth` to `Some(N)`. Without it, `depth` is `None`.
   When the server does not hold the ref, or the local chain does not hold
@@ -4178,15 +4150,17 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
 - `--compress` sets `compression` to `Compression::Deflate { level: 6 }`,
   and `--compress=LEVEL` to the level, 1 to 9. The value needs the `=`
   form. Without the option, `compression` is `Compression::None`.
-- `--ssh-command=CMD` sets `connect.ssh_command` to `CMD` split at ASCII
-  whitespace, and `--receive-command=CMD` sets `connect.receive_command`.
+- `--ssh-command=CMD` sets `EndpointOverrides::ssh_command` to `CMD`
+  split at ASCII whitespace, and `--receive-command=CMD` sets
+  `remote_command`.
 - `--push-token-file`, `--push-user`, `--tls-client-cert-path`,
   `--tls-client-key-path`, and `--tls-ca-path` set the fields of
-  `connect` with the same names, and `--allow-cleartext-credentials` sets
-  `connect.allow_cleartext_credentials`. So each option wins over the key
-  of the remote with its name, and `PushSession::prepare` refuses an option
-  of the other transport, before the push reads `--depth` and the
-  refspecs.
+  `EndpointOverrides` with the same names, and
+  `--allow-cleartext-credentials` sets `allow_cleartext_credentials`. So
+  each option wins over the key of the remote with its name, and
+  `resolve_push` refuses an option of the other transport, before the push
+  reads `--depth` and the refspecs. No option of `ostrya push` sets a
+  header.
 - `detached_metadata_filter` comes from `[ex-ostrya]
   detached-metadata-exclude` of the local repository. `progress` is a
   `PushProgress` whose hook draws the progress bar of the command, or

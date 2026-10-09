@@ -2016,8 +2016,8 @@ pull, so an ssh address stands in `push-url` or `pull-url` alone.
 The keys of a section apply to the transport of the push address. For an ssh
 address the push reads `ssh-command` and `receive-command`, and ignores the
 other keys of this list and the TLS keys. For an `http://` or `https://`
-address the push reads `push-token-file`, `push-user`, and these TLS keys of
-the pull, and ignores `ssh-command` and `receive-command`:
+address the push reads `push-token-file`, `push-user`, and these TLS and
+proxy keys of the pull, and ignores `ssh-command` and `receive-command`:
 
 - `tls-ca-path` -- a PEM file of the CA certificates that verify the server,
   in place of the trust store of the host.
@@ -2028,20 +2028,27 @@ the pull, and ignores `ssh-command` and `receive-command`:
   `tls-permissive=true` before any request. A push verifies the certificate
   chain of the server. An `http://` address uses no TLS, and the push does
   not read the key.
+- `proxy` -- the `http://` proxy URL of the push, by the rules of the pull.
+  An empty or absent key gives the proxy environment variables. A value with
+  white space at its start or end fails the push before any request.
 
-The push reads each file once, before the session opens, and reads at most
-1 MiB of it. A relative path in `push-token-file`, `tls-ca-path`,
+The push reads each file once, before the session opens. It reads at most
+1 MiB and one byte of a TLS file, and refuses a TLS file of more than
+1 MiB. A relative path in `push-token-file`, `tls-ca-path`,
 `tls-client-cert-path`, or `tls-client-key-path` is relative to the current
 directory of the process, as a pull reads the TLS keys. The push does not
-expand `~`. A file that the push cannot read fails the push with a message
-that names the key and the path, and holds no byte of the file. Each key
+expand `~`. A file that the push cannot read fails the push with an I/O
+error whose message names the key and the path, and holds no byte of the
+file. Each key
 resolves on its own, and an option of the push wins over its key. No key lets a push send a token over `http://`. Only the push
 options do that.
 
 The token file holds the token on its first line:
 
-- The push reads at most 1 MiB of the file, and takes the bytes up to the
-  first LF (0x0a). With no LF, the token is the whole file.
+- The push reads the file up to the first LF (0x0a), and takes the bytes
+  before it. With no LF, the token is the whole file. A first line of more
+  than 1 MiB is refused, and the push reads at most 1 MiB and one byte of
+  it.
 - The push refuses the token when it holds a CR (0x0d), when it is empty,
   when it is not UTF-8, and when it is not token68: one or more ASCII
   letters, digits, `-`, `.`, `_`, `~`, `+`, or `/`, then zero or more `=`.

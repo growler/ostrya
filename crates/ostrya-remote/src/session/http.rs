@@ -15,9 +15,7 @@ use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::io::AsyncReadExt;
 use ostrya_core::ObjectName;
 use ostrya_fetch::gate::Gate;
-use ostrya_fetch::{
-    BasicAuth, BearerToken, Fetcher, Priority, UploadBody, UploadMethod, UploadRequest, Uploaded,
-};
+use ostrya_fetch::{Fetcher, Priority, UploadBody, UploadMethod, UploadRequest, Uploaded};
 
 use super::progress::Counters;
 use super::writer::{Counting, Item, ObjectWriter, Pass, Stop, Upload};
@@ -55,23 +53,13 @@ pub(crate) const MAX_PARALLEL: u32 = 31;
 /// after it aborted the session for another cause.
 const SESSION_ABORTED: &str = "the session was aborted";
 
-/// The credential that each request of a session carries.
-pub(crate) enum Credential {
-    /// `Authorization: Bearer`.
-    Bearer(BearerToken),
-    /// `Authorization: Basic`.
-    Basic(BasicAuth),
-}
-
 /// The receive endpoint of a server, as a session reaches it.
 pub(crate) struct Endpoint {
-    /// The fetcher, with the push address as its one mirror.
+    /// The fetcher, with the push address as its one mirror. It carries the
+    /// credential of each request.
     pub(crate) fetcher: Fetcher,
     /// The push address, which the messages name.
     pub(crate) url: String,
-    pub(crate) credential: Option<Credential>,
-    /// If `true`, the requests send the credential to an `http://` address.
-    pub(crate) allow_cleartext: bool,
 }
 
 /// The result of one upload request.
@@ -94,12 +82,6 @@ impl Endpoint {
         let mut request = UploadRequest::path(path, body);
         request.method = method;
         request.response_timeout = timeout;
-        request.allow_cleartext_credentials = self.allow_cleartext;
-        match &self.credential {
-            Some(Credential::Bearer(token)) => request.bearer_token = Some(token),
-            Some(Credential::Basic(basic)) => request.basic_auth = Some(basic),
-            None => {}
-        }
         Box::pin(self.fetcher.upload(request))
     }
 
@@ -955,8 +937,7 @@ mod tests {
     fn the_session_futures_are_small() {
         use crate::proto::{Encoding, HelloReply};
         use crate::{
-            ConnectOptions, PushRemote, PushSession, SessionOptions, TreePushOptions, push_tree,
-            push_tree_prepared,
+            Endpoint, PushSession, SessionOptions, TreePushOptions, push_tree, push_tree_prepared,
         };
 
         let reply = encode(&Message::HelloReply(HelloReply {
@@ -984,27 +965,23 @@ mod tests {
         let session = open();
         let missing = std::mem::size_of_val(&session.missing(&[]));
         let commit = std::mem::size_of_val(&open().commit(&[], false));
-        let remote = PushRemote::parse("https://h/repo").unwrap();
+        let endpoint = Endpoint::parse("https://h/repo").unwrap();
         let refs = ["main".to_owned()];
         let connect = std::mem::size_of_val(&PushSession::connect(
-            &remote,
-            ConnectOptions::default(),
+            endpoint.clone(),
             &refs,
             SessionOptions::default(),
         ));
         let root = std::path::Path::new("/nonexistent");
         let tree = std::mem::size_of_val(&push_tree(
-            &remote,
+            endpoint.clone(),
             root,
-            ConnectOptions::default(),
             TreePushOptions::default(),
         ));
-        let prepare =
-            std::mem::size_of_val(&PushSession::prepare(&remote, ConnectOptions::default()));
+        let prepare = std::mem::size_of_val(&PushSession::prepare(endpoint));
         // An ssh address needs no runtime to prepare.
-        let ssh = PushRemote::parse("ssh://h/repo").unwrap();
-        let prepared =
-            || ostrya_rt::block_on(PushSession::prepare(&ssh, ConnectOptions::default())).unwrap();
+        let ssh = Endpoint::parse("ssh://h/repo").unwrap();
+        let prepared = || ostrya_rt::block_on(PushSession::prepare(ssh.clone())).unwrap();
         let open = std::mem::size_of_val(&prepared().open(&refs, SessionOptions::default()));
         let tree_prepared = std::mem::size_of_val(&push_tree_prepared(
             prepared(),

@@ -4974,16 +4974,13 @@ fn parse_proxy(url: &str) -> Result<ProxyEndpoint> {
         return Err(refused("a proxy url carries no fragment"));
     }
     let uri = Uri::try_from(url).map_err(|e| refused(&format!("invalid url: {e}")))?;
-    if let Some(query) = uri.query() {
-        return Err(refused(&format!(
-            "a proxy url carries no query string, and this one carries ?{query}"
-        )));
+    // A `/` or a `?` in the userinfo moves a part of the password into the
+    // path or the query. So these refusals do not show the path or the query.
+    if uri.query().is_some() {
+        return Err(refused("a proxy url carries no query string"));
     }
     if !matches!(uri.path(), "" | "/") {
-        return Err(refused(&format!(
-            "a proxy url carries no path, and this one carries {}",
-            uri.path()
-        )));
+        return Err(refused("a proxy url carries no path"));
     }
     // `Uri::host` holds an IPv6 literal in brackets. The brackets belong to
     // the authority. A connect resolves the bracketed form to nothing.
@@ -7025,6 +7022,14 @@ mod tests {
                 message.contains("proxy.example:3128"),
                 "{password}: {message}"
             );
+        }
+
+        // A `/` or a `?` in the userinfo moves the text after it into the path
+        // or the query. The refusal of that path or query shows no part of it.
+        for userinfo in ["u/pw-QXZ", "tok?pw-QXZ", "u:x/pw-QXZ", "u:x?pw-QXZ"] {
+            let url = format!("http://{userinfo}@proxy.invalid:3128");
+            let message = parse_proxy(&url).unwrap_err().to_string();
+            assert!(!message.contains("pw-QXZ"), "{userinfo}: {message}");
         }
 
         // The refusal the constructor writes is the one a caller logs.

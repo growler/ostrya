@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use ostrya::remote::{
-    BoxFuture, Compression, ConnectOptions, Encoding, Error, Expected, ObjectData, ObjectSource,
-    PushOutcome, PushRemote, PushSession, RefUpdate, SessionOptions,
+    BoxFuture, Compression, Encoding, Endpoint, Error, Expected, ObjectData, ObjectSource,
+    PushOutcome, PushSession, RefUpdate, SessionOptions, SshAddress, SshOptions,
 };
 use ostrya::{
     Checksum, CreateOptions, FileKind, ObjectName, ObjectType, Repo, RepoMode, Value, loose_path,
@@ -209,31 +209,41 @@ fn receiver(base: &TmpDir, mode: RepoMode) -> PathBuf {
 /// The options that run `ostrya -v receive` through the stand-in, with the
 /// exit status of the command written to `status` and its standard error to
 /// the file beside it that [`stderr_of`] names.
-fn options(status: &Path, policy: Option<&Path>) -> ConnectOptions {
+fn options(status: &Path, policy: Option<&Path>) -> SshOptions {
     let mut receive = format!("{} -v receive", quote(env!("CARGO_BIN_EXE_ostrya")));
     if let Some(policy) = policy {
         receive.push_str(&format!(" --policy={}", quote(policy.to_str().unwrap())));
     }
-    ConnectOptions {
-        ssh_command: Some(vec![
-            "sh".into(),
-            "-c".into(),
-            STANDIN.into(),
-            "ssh".into(),
-            status.to_str().unwrap().into(),
-            stderr_of(status).to_str().unwrap().into(),
-        ]),
-        receive_command: Some(receive),
+    SshOptions {
+        command: Some(standin(status)),
+        remote_command: Some(receive),
         ..Default::default()
     }
+}
+
+/// The command line of the stand-in, which writes the exit status of the
+/// command to `status`.
+fn standin(status: &Path) -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-c".into(),
+        STANDIN.into(),
+        "ssh".into(),
+        status.to_str().unwrap().into(),
+        stderr_of(status).to_str().unwrap().into(),
+    ]
 }
 
 fn stderr_of(status: &Path) -> PathBuf {
     status.with_extension("stderr")
 }
 
-fn remote(dest: &Path) -> PushRemote {
-    PushRemote::parse(&format!("ssh://localhost{}", dest.display())).unwrap()
+/// The endpoint of `dest` with the options of [`options`].
+fn endpoint(dest: &Path, status: &Path, policy: Option<&Path>) -> Endpoint {
+    Endpoint::Ssh {
+        address: SshAddress::parse(&format!("ssh://localhost{}", dest.display())).unwrap(),
+        options: options(status, policy),
+    }
 }
 
 fn update() -> RefUpdate {
@@ -254,8 +264,7 @@ fn push(
     let source = FixtureSource::new();
     block_on(async {
         let session = PushSession::connect(
-            &remote(dest),
-            options(status, policy),
+            endpoint(dest, status, policy),
             &[BRANCH.to_owned()],
             SessionOptions::default(),
         )
@@ -381,8 +390,7 @@ fn a_server_error_while_the_client_still_sends_reaches_the_client() {
     let start = Instant::now();
     let r = block_on(async {
         let session = PushSession::connect(
-            &remote(&dest),
-            options(&status, None),
+            endpoint(&dest, &status, None),
             &[BRANCH.to_owned()],
             SessionOptions::default(),
         )
@@ -439,6 +447,7 @@ fn receive_refuses_a_policy_file_it_cannot_read() {
 #[cfg(feature = "push")]
 mod repo_push {
     use super::*;
+    use ostrya::endpoint::{EndpointOverrides, resolve_push};
     use ostrya::{PullOptions, RepoPushOptions};
 
     /// A local repository that holds the fixture commit on its branch, with
@@ -472,16 +481,21 @@ mod repo_push {
         block_on(Repo::open(&path)).unwrap()
     }
 
-    /// The options of a push of `refspecs`, with the stand-in as the ssh
-    /// command and the receive command left to the remote section.
-    fn push_opts(status: &Path, refspecs: &[&str]) -> RepoPushOptions {
+    /// The endpoint of the remote `origin` of `local`, with the stand-in as
+    /// the ssh command and the receive command left to the remote section.
+    fn origin(local: &Repo, status: &Path) -> Endpoint {
+        let overrides = EndpointOverrides {
+            ssh_command: Some(standin(status)),
+            ..EndpointOverrides::default()
+        };
+        block_on(resolve_push(Some(local.config()), "origin", overrides)).unwrap()
+    }
+
+    /// The options of a push of `refspecs`.
+    fn push_opts(refspecs: &[&str]) -> RepoPushOptions {
         RepoPushOptions {
             refspecs: refspecs.iter().map(|s| (*s).to_owned()).collect(),
             compression: Compression::Deflate { level: 6 },
-            connect: ConnectOptions {
-                receive_command: None,
-                ..options(status, None)
-            },
             ..RepoPushOptions::default()
         }
     }
@@ -493,7 +507,7 @@ mod repo_push {
         let local = client(&base, &dest);
         let status = base.0.join("status");
 
-        let outcome = block_on(local.push("origin", push_opts(&status, &[BRANCH]))).unwrap();
+        let outcome = block_on(local.push(origin(&local, &status), push_opts(&[BRANCH]))).unwrap();
         assert_eq!(outcome.refs.len(), 1);
         assert_eq!(outcome.refs[0].old, None);
         assert_eq!(outcome.refs[0].new, Some(commit()));
@@ -502,7 +516,7 @@ mod repo_push {
         assert_eq!(exit_status(&status), "0");
 
         // A repeat push finds every object on the server and sends none.
-        let outcome = block_on(local.push("origin", push_opts(&status, &[BRANCH]))).unwrap();
+        let outcome = block_on(local.push(origin(&local, &status), push_opts(&[BRANCH]))).unwrap();
         assert_eq!(outcome.refs[0].old, Some(commit()));
         assert_eq!(outcome.refs[0].new, Some(commit()));
         assert_eq!(outcome.stats.objects_needed, 0);
@@ -518,10 +532,10 @@ mod repo_push {
         let dest = receiver(&base, RepoMode::Archive);
         let local = client(&base, &dest);
         let status = base.0.join("status");
-        block_on(local.push("origin", push_opts(&status, &[BRANCH]))).unwrap();
+        block_on(local.push(origin(&local, &status), push_opts(&[BRANCH]))).unwrap();
 
         let delete = format!(":{BRANCH}");
-        match block_on(local.push("origin", push_opts(&status, &[&delete]))) {
+        match block_on(local.push(origin(&local, &status), push_opts(&[&delete]))) {
             Err(ostrya::Error::Remote(Error::DeleteDenied(_))) => {}
             other => panic!("expected DeleteDenied, got {other:?}"),
         }

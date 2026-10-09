@@ -345,8 +345,6 @@ impl SshOptions {
     /// The order is [`command`](SshOptions::command), then `env`, then
     /// [`config_command`](SshOptions::config_command), then `ssh`. An empty
     /// command and an `env` that is not UTF-8 are [`Error::InvalidInput`].
-    // No session calls this function. The tests call it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn program(&self, env: Option<&OsStr>) -> Result<Vec<String>> {
         ssh_program(self.command.as_deref(), env, self.config_command.as_deref())
     }

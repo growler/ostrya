@@ -815,7 +815,7 @@ pub struct PullOptions {
     /// over ssh.
     ///
     /// The fields resolve as the fields of
-    /// [`ConnectOptions`](crate::remote::ConnectOptions) do for a push. The
+    /// [`SshOptions`](crate::remote::SshOptions) do for a push. The
     /// remote keys `ssh-command` and `send-command` fill `remote_ssh_command`
     /// and `send_command` if they are `None`. An HTTP pull refuses
     /// `ssh_command` and `send_command` with [`Error::InvalidInput`], and does

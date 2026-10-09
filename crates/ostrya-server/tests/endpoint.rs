@@ -37,14 +37,14 @@ use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use ostrya::remote::proto::Hello;
-use ostrya::remote::{
-    self, ConnectOptions, ParentPolicy, PushRemote, RefUpdate, TreePushOptions, push_tree,
-};
+use ostrya::remote::{self, Endpoint, ParentPolicy, RefUpdate, TreePushOptions, push_tree};
 use ostrya::{
     Checksum, CreateOptions, HookFuture, HookRefusal, HostEntry, ReceiveHooks, ReceivePolicy,
     ReceiveReport, Repo, RepoMode, Type, UpdatePlan, Value,
 };
-use ostrya_fetch::{FetcherOptions, FuturesIo, Proxy, RtExecutor, RtTimer};
+use ostrya_fetch::{
+    BearerToken, FetcherOptions, FuturesIo, Proxy, RtExecutor, RtTimer, TrustRoots,
+};
 use ostrya_rt::{self as rt, Timer, block_on};
 use ostrya_server::{
     EndpointOptions, ReceiveAuth, ReceiveBody, ReceiveEndpoint, Refusal, RequestKind, SessionSetup,
@@ -59,6 +59,18 @@ const MOUNT: &str = "/api/v1/push";
 
 /// The bearer token that the host takes.
 const TOKEN: &str = "host-token";
+
+/// The endpoint of `url` with the bearer token `token`, the fixture CA as the
+/// trust anchor, and no proxy. Each value is in memory.
+fn connect(url: &str, token: &str) -> Endpoint {
+    let mut http = FetcherOptions::new(url);
+    http.tls.roots = TrustRoots::Pem(CA_PEM.to_vec());
+    http.bearer_token = Some(BearerToken {
+        token: token.to_owned(),
+    });
+    http.proxy = Proxy::None;
+    Endpoint::Http(http)
+}
 
 struct TmpDir(PathBuf);
 
@@ -273,12 +285,6 @@ fn a_push_through_a_mounted_endpoint_commits_over_http2() {
         CreateOptions::new(RepoMode::Archive),
     ))
     .unwrap();
-    let ca = tmp.path().join("ca.pem");
-    std::fs::write(&ca, CA_PEM).unwrap();
-    let token = tmp.path().join("token");
-    std::fs::write(&token, format!("{TOKEN}\n")).unwrap();
-    let wrong = tmp.path().join("wrong-token");
-    std::fs::write(&wrong, b"other-token\n").unwrap();
 
     let reports = Arc::new(AtomicUsize::new(0));
     let counter = reports.clone();
@@ -295,15 +301,6 @@ fn a_push_through_a_mounted_endpoint_commits_over_http2() {
     let endpoint = Arc::new(ReceiveEndpoint::new(receiver.clone(), auth, options).unwrap());
     let seen = Arc::new(Seen::default());
 
-    let connect = |token: &Path| ConnectOptions {
-        tls_ca_path: Some(ca.clone()),
-        push_token_file: Some(token.to_owned()),
-        http: FetcherOptions {
-            proxy: Proxy::None,
-            ..FetcherOptions::default()
-        },
-        ..ConnectOptions::default()
-    };
     let push_options = || TreePushOptions {
         refs: vec!["main".into()],
         timestamp: Some(1_700_000_000),
@@ -322,7 +319,7 @@ fn a_push_through_a_mounted_endpoint_commits_over_http2() {
             let endpoint = endpoint.clone();
             async move { endpoint.sweep().await }
         });
-        let remote = PushRemote::parse(&format!("https://127.0.0.1:{port}{MOUNT}")).unwrap();
+        let url = format!("https://127.0.0.1:{port}{MOUNT}");
         let serving = host(listener, config, endpoint.clone(), seen.clone());
         future::or(
             async {
@@ -330,7 +327,7 @@ fn a_push_through_a_mounted_endpoint_commits_over_http2() {
                 unreachable!("the host serves until the test ends");
             },
             async {
-                let outcome = push_tree(&remote, &root, connect(&token), push_options())
+                let outcome = push_tree(connect(&url, TOKEN), &root, push_options())
                     .await
                     .unwrap();
                 let commit = outcome.commit.expect("a tree push builds a commit");
@@ -355,7 +352,7 @@ fn a_push_through_a_mounted_endpoint_commits_over_http2() {
                 assert_eq!(seen.h2_connections.load(Ordering::SeqCst), connections);
                 assert_eq!(*opened.lock().unwrap(), vec![vec!["main".to_owned()]]);
 
-                let refused = push_tree(&remote, &small, connect(&wrong), push_options()).await;
+                let refused = push_tree(connect(&url, "other-token"), &small, push_options()).await;
                 assert!(
                     matches!(refused, Err(ostrya::remote::Error::Unauthorized(_))),
                     "{refused:?}"
@@ -374,7 +371,7 @@ fn a_push_through_a_mounted_endpoint_commits_over_http2() {
                 )
                 .await;
                 assert!(ended, "the sweep ends after shutdown");
-                let stopped = push_tree(&remote, &small, connect(&token), push_options()).await;
+                let stopped = push_tree(connect(&url, TOKEN), &small, push_options()).await;
                 assert!(
                     matches!(stopped, Err(ostrya::remote::Error::LimitExceeded(_))),
                     "{stopped:?}"
@@ -589,12 +586,6 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
         CreateOptions::new(RepoMode::Archive),
     ))
     .unwrap();
-    let ca = tmp.path().join("ca.pem");
-    std::fs::write(&ca, CA_PEM).unwrap();
-    let alice = tmp.path().join("alice-token");
-    std::fs::write(&alice, b"alice-token\n").unwrap();
-    let bob = tmp.path().join("bob-token");
-    std::fs::write(&bob, b"bob-token\n").unwrap();
 
     let reports = Arc::new(AtomicUsize::new(0));
     let counter = reports.clone();
@@ -614,15 +605,6 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
     let endpoint = Arc::new(ReceiveEndpoint::new(receiver.clone(), auth, options).unwrap());
     let seen = Arc::new(Seen::default());
 
-    let connect = |token: &Path| ConnectOptions {
-        tls_ca_path: Some(ca.clone()),
-        push_token_file: Some(token.to_owned()),
-        http: FetcherOptions {
-            proxy: Proxy::None,
-            ..FetcherOptions::default()
-        },
-        ..ConnectOptions::default()
-    };
     let push_options = |name: &str| TreePushOptions {
         refs: vec![name.into()],
         parent: ParentPolicy::None,
@@ -641,7 +623,7 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
             .await
             .unwrap();
         let port = listener.local_addr().unwrap().port();
-        let remote = PushRemote::parse(&format!("https://127.0.0.1:{port}{MOUNT}")).unwrap();
+        let url = format!("https://127.0.0.1:{port}{MOUNT}");
         let serving = host(listener, config, endpoint.clone(), seen.clone());
         future::or(
             async {
@@ -652,9 +634,10 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
                 let resolve = |name: &'static str| receiver.resolve_rev(name, false);
 
                 // The first push writes the entry of its uploader.
-                let outcome = push_tree(&remote, &small, connect(&alice), push_options("rel/a"))
-                    .await
-                    .unwrap();
+                let outcome =
+                    push_tree(connect(&url, "alice-token"), &small, push_options("rel/a"))
+                        .await
+                        .unwrap();
                 let commit = outcome.commit.expect("a tree push builds a commit");
                 assert_eq!(resolve("rel/a").await.unwrap(), Some(commit));
                 assert_eq!(uploader(&receiver, &commit).await.as_deref(), Some("alice"));
@@ -668,7 +651,7 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
                 eventually("the first report", || reports.load(Ordering::SeqCst) == 1).await;
 
                 // The second push of the commit keeps the first entry.
-                let outcome = push_tree(&remote, &small, connect(&bob), push_options("rel/b"))
+                let outcome = push_tree(connect(&url, "bob-token"), &small, push_options("rel/b"))
                     .await
                     .unwrap();
                 assert_eq!(outcome.commit, Some(commit));
@@ -681,7 +664,8 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
 
                 // An error of `after_update` comes after the write of the ref.
                 state.fail_after.store(true, Ordering::SeqCst);
-                let failed = push_tree(&remote, &small, connect(&bob), push_options("rel/c")).await;
+                let failed =
+                    push_tree(connect(&url, "bob-token"), &small, push_options("rel/c")).await;
                 match &failed {
                     Err(remote::Error::Internal(message)) => {
                         assert!(message.contains(AFTER_FAILED), "{message}");
@@ -702,7 +686,7 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
                 state.fail_after.store(false, Ordering::SeqCst);
                 *state.move_ref.lock().unwrap() = Some(("rel/d".into(), commit));
                 let moved =
-                    push_tree(&remote, &small, connect(&alice), push_options("rel/d")).await;
+                    push_tree(connect(&url, "alice-token"), &small, push_options("rel/d")).await;
                 match &moved {
                     Err(remote::Error::RefMismatch { name, current, .. }) => {
                         assert_eq!(name, "rel/d");

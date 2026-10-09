@@ -1,5 +1,7 @@
 //! The HTTP transport of a push against `ostrya_server` in this process:
-//! each authentication method over HTTPS, a credential over plain HTTP, the
+//! each authentication method over HTTPS with an endpoint built in memory, a
+//! trust setting that verifies no certificate chain, a credential over plain
+//! HTTP, the
 //! tree push and its repeat, the push of a repository, the object streams
 //! of a session through a proxy that counts them, a commit whose response is
 //! lost or refused, a source that fails, and an object whose bytes do not
@@ -20,11 +22,12 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use ostrya::fetch::Proxy;
+use ostrya::endpoint::EndpointOverrides;
+use ostrya::fetch::{BasicAuth, BearerToken, ClientIdentity, FetcherOptions, Proxy, TrustRoots};
 use ostrya::remote::tree::{ScanOptions, TreeModel};
 use ostrya::remote::{
-    BoxFuture, Compression, ConnectOptions, Encoding, Error, ObjectData, ObjectSource, PushOutcome,
-    PushRemote, PushSession, SessionOptions, TreePushOptions, push_tree,
+    BoxFuture, Compression, Encoding, Endpoint, Error, ObjectData, ObjectSource, PushOutcome,
+    PushSession, SessionOptions, TreePushOptions, push_tree,
 };
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree,
@@ -232,16 +235,24 @@ where
     });
 }
 
-/// Connect options that reach the server directly, whatever proxy the
-/// environment names.
-fn direct() -> ConnectOptions {
-    let mut connect = ConnectOptions::default();
-    connect.http.proxy = Proxy::None;
-    connect
+/// The options of an HTTP client that reaches `url` directly, whatever proxy
+/// the environment names.
+fn direct(url: &str) -> FetcherOptions {
+    let mut http = FetcherOptions::new(url);
+    http.proxy = Proxy::None;
+    http
 }
 
-fn remote(url: &str) -> PushRemote {
-    PushRemote::parse(url).unwrap()
+/// The endpoint of `url` with the options of [`direct`].
+fn endpoint(url: &str) -> Endpoint {
+    Endpoint::Http(direct(url))
+}
+
+/// The options of [`direct`] that trust the fixture CA alone.
+fn fixture_ca(url: &str) -> FetcherOptions {
+    let mut http = direct(url);
+    http.tls.roots = TrustRoots::Pem(read_fixture("ca.pem"));
+    http
 }
 
 fn tree_options(refs: &[&str], timestamp: u64) -> TreePushOptions {
@@ -253,18 +264,11 @@ fn tree_options(refs: &[&str], timestamp: u64) -> TreePushOptions {
 }
 
 async fn push(
-    url: &str,
+    endpoint: Endpoint,
     root: &Path,
-    connect: ConnectOptions,
     refs: &[&str],
 ) -> ostrya::remote::Result<PushOutcome> {
-    push_tree(
-        &remote(url),
-        root,
-        connect,
-        tree_options(refs, 1_700_000_000),
-    )
-    .await
+    push_tree(endpoint, root, tree_options(refs, 1_700_000_000)).await
 }
 
 /// The commit of `outcome`, which set the ref `name` of `server`.
@@ -572,15 +576,14 @@ async fn scan(root: &Path) -> TreeModel {
 
 /// Over HTTPS, a push with a bearer token, with Basic, and with a client
 /// certificate sets its ref, and a push with no credential is
-/// `unauthorized`. A server that allows anonymous push takes a push with no
-/// credential.
+/// `unauthorized`. Each credential and each key is in memory. One client key
+/// is an encrypted PKCS#8 key, with its passphrase in memory. A server that
+/// allows anonymous push takes a push with no credential.
 #[test]
 fn each_method_pushes_over_https_and_no_credential_is_refused() {
     let tmp = TmpDir::new("methods");
     let root = tree(tmp.path(), "tree", 4, 1000);
     let server = repo(tmp.path(), "server");
-    let alice = tmp.file("alice", format!("{ALICE}\n").as_bytes());
-    let bob = tmp.file("bob", format!("{BOB}\n").as_bytes());
     let mut opts = serve_options();
     opts.allow_anonymous_push = false;
     opts.credentials = Some(credentials());
@@ -589,33 +592,37 @@ fn each_method_pushes_over_https_and_no_credential_is_refused() {
     with_server(server.clone(), opts, |addr| async move {
         let (server, root) = (first_server, first_root);
         let url = format!("https://127.0.0.1:{}/", addr.port());
-        let tls = || ConnectOptions {
-            tls_ca_path: Some(fixture("ca.pem")),
-            ..direct()
-        };
-        let by_bearer = ConnectOptions {
-            push_token_file: Some(alice),
-            ..tls()
-        };
-        let by_basic = ConnectOptions {
-            push_token_file: Some(bob),
-            push_user: Some("bob".into()),
-            ..tls()
-        };
-        let by_cert = ConnectOptions {
-            tls_client_cert_path: Some(fixture("client.pem")),
-            tls_client_key_path: Some(fixture("client.key.pem")),
-            ..tls()
-        };
-        for (name, connect) in [
+        let mut by_bearer = fixture_ca(&url);
+        by_bearer.bearer_token = Some(BearerToken {
+            token: ALICE.into(),
+        });
+        let mut by_basic = fixture_ca(&url);
+        by_basic.basic_auth = Some(BasicAuth {
+            user: "bob".into(),
+            password: BOB.into(),
+        });
+        let mut by_cert = fixture_ca(&url);
+        by_cert.tls.client_identity = Some(ClientIdentity {
+            cert_chain_pem: read_fixture("client.pem"),
+            key_pem: read_fixture("client.key.pem"),
+            key_passphrase: None,
+        });
+        let mut by_encrypted_key = fixture_ca(&url);
+        by_encrypted_key.tls.client_identity = Some(ClientIdentity {
+            cert_chain_pem: read_fixture("client.pem"),
+            key_pem: read_fixture("client.key.enc.pem"),
+            key_passphrase: Some("ostrya test passphrase".into()),
+        });
+        for (name, http) in [
             ("bearer", by_bearer),
             ("basic", by_basic),
             ("cert", by_cert),
+            ("encrypted-key", by_encrypted_key),
         ] {
-            let outcome = push(&url, &root, connect, &[name]).await.unwrap();
+            let outcome = push(Endpoint::Http(http), &root, &[name]).await.unwrap();
             assert_pushed(&server, name, &outcome).await;
         }
-        match push(&url, &root, tls(), &["nobody"]).await {
+        match push(Endpoint::Http(fixture_ca(&url)), &root, &["nobody"]).await {
             Err(Error::Unauthorized(_)) => {}
             other => panic!("expected unauthorized, got {other:?}"),
         }
@@ -626,18 +633,51 @@ fn each_method_pushes_over_https_and_no_credential_is_refused() {
     opts.tls = Some(server_tls());
     with_server(server.clone(), opts, |addr| async move {
         let url = format!("https://127.0.0.1:{}/", addr.port());
-        let connect = ConnectOptions {
-            tls_ca_path: Some(fixture("ca.pem")),
-            ..direct()
-        };
-        let outcome = push(&url, &root, connect, &["anonymous"]).await.unwrap();
+        let outcome = push(Endpoint::Http(fixture_ca(&url)), &root, &["anonymous"])
+            .await
+            .unwrap();
         assert_pushed(&server, "anonymous", &outcome).await;
     });
 }
 
+/// The transport accepts a trust setting that verifies no certificate chain.
+/// A server whose certificate chains to an authority that the client does not
+/// trust takes the push with `DangerousAcceptAnyChain`. The fixture CA alone
+/// refuses the same server.
+#[test]
+fn a_trust_setting_of_the_caller_that_accepts_any_chain_pushes() {
+    let tmp = TmpDir::new("any-chain");
+    let root = tree(tmp.path(), "tree", 2, 100);
+    let server = repo(tmp.path(), "server");
+    let mut opts = serve_options();
+    opts.tls = Some(ServerTls {
+        cert_chain_pem: read_fixture("server-untrusted.pem"),
+        key_pem: read_fixture("server-untrusted.key.pem"),
+        key_passphrase: None,
+        client_ca_pem: None,
+    });
+    with_server(server.clone(), opts, |addr| async move {
+        let url = format!("https://127.0.0.1:{}/", addr.port());
+        let mut trusted = fixture_ca(&url);
+        trusted.max_retries = 0;
+        match push(Endpoint::Http(trusted), &root, &["trusted"]).await {
+            Err(Error::Fetch(e)) if e.to_string().contains("UnknownIssuer") => {}
+            other => panic!("expected a failure of the chain, got {other:?}"),
+        }
+        assert_eq!(tip(&server, "trusted").await, None);
+        let mut http = direct(&url);
+        http.tls.roots = TrustRoots::DangerousAcceptAnyChain;
+        let outcome = push(Endpoint::Http(http), &root, &["any-chain"])
+            .await
+            .unwrap();
+        assert_pushed(&server, "any-chain", &outcome).await;
+    });
+}
+
 /// A token to an `http://` address is refused before any request when the
-/// cleartext switch is not set. With it, the push succeeds against a server
-/// that takes cleartext credentials.
+/// cleartext permission is not set: the resolver refuses a token file, and
+/// the HTTP client refuses a token in memory. With the permission, the push
+/// succeeds against a server that takes cleartext credentials.
 #[test]
 fn a_cleartext_credential_needs_the_switch() {
     let tmp = TmpDir::new("cleartext");
@@ -650,21 +690,37 @@ fn a_cleartext_credential_needs_the_switch() {
     opts.allow_cleartext_credentials = true;
     with_server(server.clone(), opts, |addr| async move {
         let proxy = CountingProxy::start(addr, CommitResponse::Forward);
-        let connect = ConnectOptions {
+        let overrides = EndpointOverrides {
             push_token_file: Some(alice.clone()),
-            ..direct()
+            ..Default::default()
         };
-        match push(&proxy.url, &root, connect, &["main"]).await {
-            Err(Error::InvalidInput(m)) => assert!(m.contains("cleartext"), "{m}"),
+        match ostrya::endpoint::resolve_push(None, &proxy.url, overrides).await {
+            Err(ostrya::Error::Remote(Error::InvalidInput(m))) => {
+                assert!(m.contains("cleartext"), "{m}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let mut http = direct(&proxy.url);
+        http.bearer_token = Some(BearerToken {
+            token: ALICE.into(),
+        });
+        match push(Endpoint::Http(http), &root, &["main"]).await {
+            Err(Error::Fetch(e)) => assert!(e.to_string().contains("cleartext"), "{e}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert_eq!(proxy.seen.connections.load(Ordering::SeqCst), 0);
-        let connect = ConnectOptions {
+        let overrides = EndpointOverrides {
             push_token_file: Some(alice),
             allow_cleartext_credentials: true,
-            ..direct()
+            ..Default::default()
         };
-        let outcome = push(&proxy.url, &root, connect, &["main"]).await.unwrap();
+        let mut endpoint = ostrya::endpoint::resolve_push(None, &proxy.url, overrides)
+            .await
+            .unwrap();
+        if let Endpoint::Http(http) = &mut endpoint {
+            http.proxy = Proxy::None;
+        }
+        let outcome = push(endpoint, &root, &["main"]).await.unwrap();
         assert_pushed(&server, "main", &outcome).await;
     });
 }
@@ -678,7 +734,7 @@ fn a_tree_push_and_its_repeat_over_http() {
     let server = repo(tmp.path(), "server");
     with_server(server.clone(), serve_options(), |addr| async move {
         let url = format!("http://{addr}/");
-        let first = push(&url, &root, direct(), &["main"]).await.unwrap();
+        let first = push(endpoint(&url), &root, &["main"]).await.unwrap();
         assert_pushed(&server, "main", &first).await;
         // The server holds nothing, so each object of the tree and the
         // commit go.
@@ -691,9 +747,7 @@ fn a_tree_push_and_its_repeat_over_http() {
         assert!(first.stats.bytes_sent > 30_000, "{:?}", first.stats);
 
         let opts = tree_options(&["main"], 1_700_000_001);
-        let second = push_tree(&remote(&url), &root, direct(), opts)
-            .await
-            .unwrap();
+        let second = push_tree(endpoint(&url), &root, opts).await.unwrap();
         assert_pushed(&server, "main", &second).await;
         assert_eq!(second.refs[0].old, first.commit);
         assert_eq!(second.stats.objects_sent, 1, "{:?}", second.stats);
@@ -729,10 +783,12 @@ fn a_repository_push_over_http() {
     with_server(server.clone(), serve_options(), |addr| async move {
         let opts = RepoPushOptions {
             refspecs: vec!["main".into()],
-            connect: direct(),
             ..Default::default()
         };
-        let outcome = local.push(&format!("http://{addr}/"), opts).await.unwrap();
+        let outcome = local
+            .push(endpoint(&format!("http://{addr}/")), opts)
+            .await
+            .unwrap();
         assert_eq!(outcome.refs[0].new, Some(commit));
         assert_eq!(tip(&server, "main").await, Some(commit));
     });
@@ -753,7 +809,7 @@ fn the_object_streams_stay_within_parallel_uploads() {
         with_server(server.clone(), opts, |addr| async move {
             let proxy = CountingProxy::start(addr, CommitResponse::Forward);
             let name = format!("p{parallel}");
-            let outcome = push(&proxy.url, &root, direct(), &[&name]).await.unwrap();
+            let outcome = push(endpoint(&proxy.url), &root, &[&name]).await.unwrap();
             assert_pushed(&server, &name, &outcome).await;
             let max = proxy.max_objects();
             assert!(max <= parallel as usize, "{max} streams, limit {parallel}");
@@ -774,8 +830,7 @@ fn the_object_streams_stay_within_parallel_uploads() {
             let names = model.object_names();
             let (a, b) = names.split_at(names.len() / 2);
             let session = PushSession::connect(
-                &remote(&proxy.url),
-                direct(),
+                endpoint(&proxy.url),
                 &["concurrent".to_owned()],
                 SessionOptions::default(),
             )
@@ -806,7 +861,7 @@ fn expected_commit(base: &Path, root: &Path) -> Checksum {
         let commit = &mut commit;
         async move {
             let url = format!("http://{addr}/");
-            *commit = push(&url, root, direct(), &["main"]).await.unwrap().commit;
+            *commit = push(endpoint(&url), root, &["main"]).await.unwrap().commit;
         }
     });
     commit.unwrap()
@@ -823,7 +878,7 @@ fn a_lost_commit_response_leaves_the_outcome_unknown() {
     let server = repo(tmp.path(), "server");
     with_server(server.clone(), serve_options(), |addr| async move {
         let proxy = CountingProxy::start(addr, CommitResponse::Drop);
-        match push(&proxy.url, &root, direct(), &["main"]).await {
+        match push(endpoint(&proxy.url), &root, &["main"]).await {
             Err(Error::CommitOutcomeUnknown { refs, .. }) => assert_eq!(refs, ["main"]),
             other => panic!("expected an unknown outcome, got {other:?}"),
         }
@@ -843,7 +898,7 @@ fn a_refused_commit_response_leaves_the_outcome_unknown() {
     let server = repo(tmp.path(), "server");
     with_server(server.clone(), serve_options(), |addr| async move {
         let proxy = CountingProxy::start(addr, CommitResponse::Gzip);
-        match push(&proxy.url, &root, direct(), &["main"]).await {
+        match push(endpoint(&proxy.url), &root, &["main"]).await {
             Err(Error::CommitOutcomeUnknown { refs, message }) => {
                 assert_eq!(refs, ["main"]);
                 assert!(message.contains("gzip"), "{message}");
@@ -874,8 +929,7 @@ fn a_failed_source_aborts_the_session() {
             change: Change::Fail,
         };
         let session = PushSession::connect(
-            &remote(&format!("http://{addr}/")),
-            direct(),
+            endpoint(&format!("http://{addr}/")),
             &["main".to_owned()],
             SessionOptions::default(),
         )
@@ -924,8 +978,7 @@ fn a_checksum_mismatch_over_http() {
             change: Change::Swap(files[0]),
         };
         let session = PushSession::connect(
-            &remote(&proxy.url),
-            direct(),
+            endpoint(&proxy.url),
             &["main".to_owned()],
             SessionOptions::default(),
         )
@@ -1386,9 +1439,10 @@ mod cli {
         assert_eq!(rev_parse(&server, "main"), stdout(&out).trim());
     }
 
-    /// `tls-permissive=true` on a remote with an HTTP push address is refused
-    /// before any connection. An option of the other transport is refused
-    /// too, for an HTTP address and for an ssh address.
+    /// `tls-permissive=true` on a remote with an `https://` push address is
+    /// refused before any connection, by `ostrya push` and by `ostrya
+    /// push-tree`. An option of the other transport is refused too, for an
+    /// HTTP address and for an ssh address.
     #[test]
     fn tls_permissive_and_an_option_of_the_other_transport_are_refused() {
         let setup = Setup::new("cli-refusals");
@@ -1406,6 +1460,17 @@ mod cli {
         );
         assert_refused(
             &push_from(&client, &["permissive", "main"]),
+            "remote 'permissive' sets tls-permissive=true",
+        );
+        assert_refused(
+            &ostrya(&[
+                &format!("--repo={}", client.display()),
+                "push-tree",
+                "permissive",
+                src.to_str().unwrap(),
+                "-b",
+                "main",
+            ]),
             "remote 'permissive' sets tls-permissive=true",
         );
         assert_refused(
@@ -1459,6 +1524,28 @@ mod cli {
         );
     }
 
+    /// An HTTP push reads the `proxy` key of the remote. A value with white
+    /// space at its start is refused before any connection.
+    #[test]
+    fn a_padded_proxy_key_is_refused() {
+        let setup = Setup::new("cli-proxy");
+        let src = tree(setup.tmp.path(), "tree", 2, 100);
+        let (client, _) = setup.client(&src);
+        let silent = Silent::new();
+        add_config(
+            &client,
+            &format!(
+                "[remote \"padded\"]\nurl={}\nproxy=\\shttp://proxy.invalid:3128\n",
+                silent.url("https")
+            ),
+        );
+        assert_refused(
+            &push_from(&client, &["padded", "main"]),
+            "error: unsupported: remote 'padded': the proxy key has white space",
+        );
+        silent.assert_untouched();
+    }
+
     /// `tls-permissive=true` on a remote whose push address is `http://` is
     /// ignored: the push uses no TLS, and it succeeds.
     #[test]
@@ -1506,7 +1593,7 @@ mod cli {
         let out = push_from(&client, &[&token, &https, "nosuchref"]);
         assert_refused(
             &out,
-            &format!("error: push-token-file '{}': ", absent.display()),
+            &format!("error: i/o error: push-token-file '{}': ", absent.display()),
         );
         // A depth below -1 is a check of the local work too.
         let out = push_from(&client, &["--push-user=bob", "--depth=-2", &https, "main"]);

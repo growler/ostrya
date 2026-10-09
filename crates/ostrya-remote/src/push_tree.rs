@@ -18,7 +18,7 @@ use crate::session::{
     Compression, ObjectSource, PushOutcome, PushProgress, PushSession, SessionOptions,
     deflate_level, invalid,
 };
-use crate::transport::{ConnectOptions, PreparedSession, PushRemote};
+use crate::transport::{Endpoint, PreparedSession};
 use crate::tree::{EntryFilter, ScanOptions, TreeModel};
 
 /// The parent of the commit of a tree push.
@@ -96,7 +96,7 @@ pub struct TreePushOptions {
     pub progress: Option<PushProgress>,
 }
 
-/// Pushes the directory `root` to `remote` as one commit.
+/// Pushes the directory `root` to `endpoint` as one commit.
 ///
 /// The server sets the target refs to the commit in one transaction. The push
 /// runs in this order:
@@ -104,9 +104,8 @@ pub struct TreePushOptions {
 /// 1. It checks `opts` and refuses each value that [`push_tree_over_stream`]
 ///    refuses. Then it makes the transport ready with
 ///    [`PushSession::prepare`]. For ssh, it builds the command line. For
-///    HTTP, it reads the files that `connect` names and builds the HTTP
-///    client. It refuses each value that [`PushSession::connect`] refuses
-///    before it starts the transport.
+///    HTTP, it builds the HTTP client. It refuses each value that
+///    [`PushSession::connect`] refuses before it starts the transport.
 /// 2. It walks and hashes the tree with [`TreeModel::scan`], with
 ///    `entry_filter` and `hash_jobs`.
 /// 3. It starts the ssh client, or sends the first HTTP request. It opens the
@@ -130,23 +129,14 @@ pub struct TreePushOptions {
 /// # Errors
 ///
 /// - Each error of [`push_tree_prepared`](push_tree_prepared#errors).
-/// - [`Error::InvalidInput`] if `connect` holds a value that
-///   [`PushSession::prepare`] refuses.
-/// - [`Error::Io`] if the token file or a TLS file of `connect` cannot be
-///   read.
-/// - [`Error::Fetch`] if the HTTP client cannot be built.
-///
-/// [`Error::InvalidInput`]: crate::Error::InvalidInput
-/// [`Error::Io`]: crate::Error::Io
-/// [`Error::Fetch`]: crate::Error::Fetch
+/// - Each error of [`PushSession::prepare`].
 pub async fn push_tree(
-    remote: &PushRemote,
+    endpoint: Endpoint,
     root: &Path,
-    connect: ConnectOptions,
     opts: TreePushOptions,
 ) -> Result<PushOutcome> {
     let (scan, push) = Prepared::new(opts)?;
-    let transport = PushSession::prepare(remote, connect).await?;
+    let transport = PushSession::prepare(endpoint).await?;
     push.scan_and_run(transport, root, scan).await
 }
 

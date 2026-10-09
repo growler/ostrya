@@ -423,7 +423,10 @@ async fn pull_http(
 ///   gives [`Proxy::Environment`].
 /// - The headers, the cleartext permission, and the retry count are the
 ///   values of the caller. A retry count of `None` keeps the default of
-///   [`FetcherOptions`].
+///   [`FetcherOptions`]. The function does not refuse an `Authorization`
+///   header beside the token.
+///   [`PushSession::prepare`](crate::remote::PushSession::prepare) refuses
+///   the pair when it builds the HTTP client.
 /// - With no low-speed field, the push has no low-speed rule. With one
 ///   field, the other field takes 1000 bytes per second or 30 seconds. A zero
 ///   in either field turns the rule off.
@@ -2174,6 +2177,38 @@ mod tests {
             );
         }
 
+        /// The push gives an `Authorization` header of the caller beside the
+        /// token. The HTTP client of the push session refuses the pair, so
+        /// the session does not send one of the two in place of the other.
+        #[test]
+        fn the_push_session_refuses_an_authorization_header_beside_a_token() {
+            let dir = Dir::new();
+            let token = dir.file("t", b"s3cr3t==\n");
+            for (user, part) in [
+                (None, "a bearer token and an authorization header"),
+                (
+                    Some("alice"),
+                    "basic-auth credentials and an authorization header",
+                ),
+            ] {
+                let o = EndpointOverrides {
+                    push_token_file: Some(token.clone()),
+                    push_user: user.map(str::to_owned),
+                    http_headers: vec![("Authorization".into(), "Bearer other".into())],
+                    ..EndpointOverrides::default()
+                };
+                let endpoint = push(None, "https://h/", o).unwrap();
+                match ostrya_rt::block_on(remote::PushSession::prepare(endpoint)) {
+                    Err(remote::Error::Fetch(e)) => {
+                        let msg = e.to_string();
+                        assert!(msg.contains(part), "{msg}");
+                        assert!(!msg.contains("s3cr3t"), "{msg}");
+                    }
+                    other => panic!("{user:?}: {other:?}"),
+                }
+            }
+        }
+
         /// A lone certificate or a lone key is refused before the push reads
         /// a file.
         #[test]
@@ -2337,6 +2372,23 @@ mod tests {
                     refused(push(None, "user-QXZ@h:x", o)),
                     format!(
                         "{name} applies to an HTTP address, and 'ssh://h/~/x' is an ssh address"
+                    )
+                );
+            }
+            // The message shows the `ssh://` form with no user. An `@` in the
+            // path stays.
+            for (value, shown) in [
+                ("ssh://user-QXZ@ex.com/srv/repo", "ssh://ex.com/srv/repo"),
+                ("user-QXZ@ex.com:srv/a@b", "ssh://ex.com/~/srv/a@b"),
+            ] {
+                let o = EndpointOverrides {
+                    push_user: Some("u".into()),
+                    ..d()
+                };
+                assert_eq!(
+                    refused(push(None, value, o)),
+                    format!(
+                        "push-user applies to an HTTP address, and '{shown}' is an ssh address"
                     )
                 );
             }

@@ -725,102 +725,146 @@ fn an_ssh_address_is_not_an_http_address() {
     assert_eq!(msg, "address 'ftp://host/r': the scheme is not supported");
 }
 
-/// With an ssh address, an HTTP option and a non-default `http` field are
-/// refused before the ssh client starts.
-#[test]
-fn an_http_option_is_refused_with_an_ssh_address() {
-    let remote = PushRemote::parse("ssh://host/srv/repo").unwrap();
-    let mut changed_http = ConnectOptions::default();
-    changed_http.http.http2 = false;
-    let cases: Vec<(ConnectOptions, &str)> = vec![
-        (
-            ConnectOptions {
-                push_token_file: Some("t".into()),
-                ..Default::default()
-            },
-            "push-token-file",
-        ),
-        (
-            ConnectOptions {
-                push_user: Some("u".into()),
-                ..Default::default()
-            },
-            "push-user",
-        ),
-        (
-            ConnectOptions {
-                tls_ca_path: Some("ca".into()),
-                ..Default::default()
-            },
-            "tls-ca-path",
-        ),
-        (
-            ConnectOptions {
-                tls_client_cert_path: Some("c".into()),
-                ..Default::default()
-            },
-            "tls-client-cert-path",
-        ),
-        (
-            ConnectOptions {
-                tls_client_key_path: Some("k".into()),
-                ..Default::default()
-            },
-            "tls-client-key-path",
-        ),
-        (
-            ConnectOptions {
-                allow_cleartext_credentials: true,
-                ..Default::default()
-            },
-            "allow-cleartext-credentials",
-        ),
-        (changed_http, "ConnectOptions::http "),
-    ];
-    for (connect, field) in cases {
-        let r = ostrya_rt::block_on(prepare_with(&remote, &connect, None));
-        match r {
-            Err(Error::InvalidInput(msg)) => {
-                assert!(msg.contains(field), "{msg:?} lacks {field:?}");
-                assert!(msg.contains("is an ssh address"), "{msg}");
-            }
-            Err(other) => panic!("{field}: {other:?}"),
-            Ok(_) => panic!("{field}: accepted"),
-        }
-    }
-    let r = ostrya_rt::block_on(prepare_with(&remote, &ConnectOptions::default(), None));
-    assert!(matches!(r, Ok(Prepared::Ssh(_))));
+/// Returns the transport that `endpoint` prepares, with no value of the
+/// environment variable.
+fn prepared(endpoint: Endpoint) -> Result<Prepared> {
+    ostrya_rt::block_on(prepare_with(endpoint, None))
 }
 
-/// The refusal of an HTTP option with an ssh address shows no user name. It
-/// shows the address in the `ssh://` form with no user, so an `@` in the
-/// path stays.
-#[test]
-fn the_refusal_of_an_http_option_shows_no_user_name() {
-    let connect = ConnectOptions {
-        push_user: Some("u".into()),
+/// Returns an HTTP endpoint with the mirrors `mirrors`.
+fn http_endpoint(mirrors: &[&str]) -> Endpoint {
+    Endpoint::Http(ostrya_fetch::FetcherOptions {
+        mirrors: strings(mirrors),
         ..Default::default()
+    })
+}
+
+/// An ssh endpoint gives the command line of its options, with
+/// `ostrya receive` as the default remote command.
+#[test]
+fn an_ssh_endpoint_gives_the_command_line_of_its_options() {
+    let address = SshAddress::parse("ssh://me@host:2222/srv/repo").unwrap();
+    let argv = |options: SshOptions, env: Option<&OsStr>| {
+        let endpoint = Endpoint::Ssh {
+            address: address.clone(),
+            options,
+        };
+        match ostrya_rt::block_on(prepare_with(endpoint, env)) {
+            Ok(Prepared::Ssh(argv)) => argv,
+            Ok(Prepared::Http(_)) => panic!("an ssh endpoint prepared HTTP"),
+            Err(e) => panic!("{e:?}"),
+        }
     };
-    for (address, shown) in [
-        ("ssh://user-QXZ@ex.com/srv/repo", "ssh://ex.com/srv/repo"),
-        ("user-QXZ@ex.com:srv/repo", "ssh://ex.com/~/srv/repo"),
-        ("user-QXZ@ex.com:srv/a@b", "ssh://ex.com/~/srv/a@b"),
-    ] {
-        let remote = PushRemote::parse(address).unwrap();
-        match ostrya_rt::block_on(prepare_with(&remote, &connect, None)) {
+    assert_eq!(
+        argv(SshOptions::default(), None),
+        strings(&[
+            "ssh",
+            "-p",
+            "2222",
+            "me@host",
+            "ostrya receive --repo='/srv/repo'"
+        ])
+    );
+    let options = SshOptions {
+        command: None,
+        config_command: Some("key-ssh -q".into()),
+        remote_command: Some("/opt/ostrya receive".into()),
+    };
+    assert_eq!(
+        argv(options.clone(), None),
+        strings(&[
+            "key-ssh",
+            "-q",
+            "-p",
+            "2222",
+            "me@host",
+            "/opt/ostrya receive --repo='/srv/repo'"
+        ])
+    );
+    assert_eq!(
+        argv(options.clone(), Some(OsStr::new("env-ssh")))[0],
+        "env-ssh"
+    );
+    let options = SshOptions {
+        command: Some(strings(&["my ssh"])),
+        ..options
+    };
+    assert_eq!(argv(options, Some(OsStr::new("env-ssh")))[0], "my ssh");
+    let empty = Endpoint::Ssh {
+        address,
+        options: SshOptions {
+            remote_command: Some(" ".into()),
+            ..Default::default()
+        },
+    };
+    assert!(matches!(prepared(empty), Err(Error::InvalidInput(_))));
+}
+
+/// The options of an HTTP endpoint must name exactly one mirror, which
+/// [`ostrya_fetch::check_base_url`] accepts. A refusal holds no userinfo.
+#[test]
+fn an_http_endpoint_needs_exactly_one_mirror() {
+    for mirrors in [&[][..], &["https://a/", "https://b/"]] {
+        match prepared(http_endpoint(mirrors)) {
             Err(Error::InvalidInput(msg)) => {
-                assert!(!msg.contains("QXZ"), "{address}: {msg}");
-                assert_eq!(
-                    msg,
-                    format!(
-                        "push-user applies to an HTTP address, and '{shown}' is an ssh address"
-                    )
-                );
+                assert!(msg.contains("exactly one mirror"), "{msg}");
+                assert!(msg.ends_with(&format!("name {}", mirrors.len())), "{msg}");
             }
-            Err(other) => panic!("{address}: {other:?}"),
-            Ok(_) => panic!("{address}: accepted"),
+            Err(other) => panic!("{mirrors:?}: {other:?}"),
+            Ok(_) => panic!("{mirrors:?}: accepted"),
         }
     }
+    for mirror in [
+        "https://user:pw-QXZ@h/r",
+        "https://h/r#x",
+        "https://h/r?q=1",
+    ] {
+        match prepared(http_endpoint(&[mirror])) {
+            Err(Error::InvalidInput(msg)) => {
+                assert!(msg.starts_with("address: "), "{msg}");
+                assert!(!msg.contains("QXZ"), "{msg}");
+            }
+            Err(other) => panic!("{mirror}: {other:?}"),
+            Ok(_) => panic!("{mirror}: accepted"),
+        }
+    }
+}
+
+/// The options of an HTTP endpoint carry the credential, the cleartext
+/// permission, and each trust setting, a setting that verifies no
+/// certificate chain among them.
+#[test]
+fn an_http_endpoint_takes_its_credential_and_its_trust_setting() {
+    use ostrya_fetch::{BasicAuth, BearerToken, TrustRoots};
+
+    let mut bearer = ostrya_fetch::FetcherOptions::new("http://h/");
+    bearer.bearer_token = Some(BearerToken { token: "t".into() });
+    bearer.allow_cleartext_credentials = true;
+    let mut basic = ostrya_fetch::FetcherOptions::new("http://h/");
+    basic.basic_auth = Some(BasicAuth {
+        user: "u".into(),
+        password: "p".into(),
+    });
+    basic.allow_cleartext_credentials = true;
+    let mut any_chain = ostrya_fetch::FetcherOptions::new("https://h/");
+    any_chain.tls.roots = TrustRoots::DangerousAcceptAnyChain;
+    let mut any = ostrya_fetch::FetcherOptions::new("https://h/");
+    any.tls.roots = TrustRoots::DangerousAcceptAny;
+    for http in [bearer, basic, any_chain, any] {
+        let shown = format!("{http:?}");
+        assert!(
+            matches!(prepared(Endpoint::Http(http)), Ok(Prepared::Http(_))),
+            "{shown}"
+        );
+    }
+    // The fetcher refuses a credential to an `http://` address without the
+    // cleartext permission.
+    let mut cleartext = ostrya_fetch::FetcherOptions::new("http://h/");
+    cleartext.bearer_token = Some(BearerToken { token: "t".into() });
+    assert!(matches!(
+        prepared(Endpoint::Http(cleartext)),
+        Err(Error::Fetch(_))
+    ));
 }
 
 /// The `Debug` output of a prepared session names the transport and the
@@ -828,35 +872,27 @@ fn the_refusal_of_an_http_option_shows_no_user_name() {
 /// line.
 #[test]
 fn a_prepared_session_shows_no_credential() {
-    let dir = std::env::temp_dir().join(format!("ostrya-remote-prepared-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let token = dir.join("token");
-    std::fs::write(&token, b"tok-QXZ\n").unwrap();
-    let remote = PushRemote::parse("http://h:8080/").unwrap();
-    let prepared = ostrya_rt::block_on(PushSession::prepare(
-        &remote,
-        ConnectOptions {
-            push_token_file: Some(token),
-            push_user: Some("user-QXZ".into()),
-            allow_cleartext_credentials: true,
-            ..Default::default()
-        },
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
+    let mut http = ostrya_fetch::FetcherOptions::new("http://h:8080/");
+    http.basic_auth = Some(ostrya_fetch::BasicAuth {
+        user: "user-QXZ".into(),
+        password: "tok-QXZ".into(),
+    });
+    http.allow_cleartext_credentials = true;
+    let prepared = ostrya_rt::block_on(PushSession::prepare(Endpoint::Http(http)));
     let shown = format!("{:?}", prepared.unwrap());
     assert_eq!(
         shown,
         r#"PreparedSession { transport: "http", url: "http://h:8080/", .. }"#
     );
 
-    let remote = PushRemote::parse("ssh://user-QXZ@h/srv/repo").unwrap();
-    let prepared = ostrya_rt::block_on(PushSession::prepare(
-        &remote,
-        ConnectOptions {
-            ssh_command: Some(strings(&["ssh", "-i", "key-QXZ"])),
+    let endpoint = Endpoint::Ssh {
+        address: SshAddress::parse("ssh://user-QXZ@h/srv/repo").unwrap(),
+        options: SshOptions {
+            command: Some(strings(&["ssh", "-i", "key-QXZ"])),
             ..Default::default()
         },
-    ));
+    };
+    let prepared = ostrya_rt::block_on(PushSession::prepare(endpoint));
     let shown = format!("{:?}", prepared.unwrap());
     assert_eq!(shown, r#"PreparedSession { transport: "ssh", .. }"#);
 }
@@ -1154,10 +1190,13 @@ mod standin {
         format!("cat {}", quote_posix(path.to_str().unwrap()))
     }
 
-    fn options(script: &str) -> ConnectOptions {
-        ConnectOptions {
-            ssh_command: Some(strings(&["sh", "-c", script, "stand-in"])),
-            ..Default::default()
+    fn endpoint(address: &str, command: Vec<String>) -> Endpoint {
+        Endpoint::Ssh {
+            address: SshAddress::parse(address).unwrap(),
+            options: SshOptions {
+                command: Some(command),
+                ..Default::default()
+            },
         }
     }
 
@@ -1171,10 +1210,11 @@ mod standin {
     /// Opens a session as [`open`] does, with `limit` as the time limit of the
     /// session.
     async fn open_with_limit(script: &str, limit: Duration) -> Result<PushSession> {
-        let remote = PushRemote::parse("ssh://me@host:2222/srv/it's repo").unwrap();
         connect_with(
-            &remote,
-            &options(script),
+            endpoint(
+                "ssh://me@host:2222/srv/it's repo",
+                strings(&["sh", "-c", script, "stand-in"]),
+            ),
             None,
             &refs(),
             SessionOptions {
@@ -1188,14 +1228,8 @@ mod standin {
 
     #[test]
     fn a_program_that_cannot_run_is_a_transport_error() {
-        let remote = PushRemote::parse("host:repo").unwrap();
-        let connect = ConnectOptions {
-            ssh_command: Some(strings(&["ostrya-no-such-ssh"])),
-            ..Default::default()
-        };
         let r = ostrya_rt::block_on(connect_with(
-            &remote,
-            &connect,
+            endpoint("host:repo", strings(&["ostrya-no-such-ssh"])),
             None,
             &refs(),
             SessionOptions::default(),

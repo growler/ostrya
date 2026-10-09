@@ -2140,17 +2140,18 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
         exit_with_error(name, "REFSPEC must be specified");
     }
     let detached_metadata_filter = detached_metadata_filter(&repo)?;
+    let overrides = push_overrides(args.connect);
+    let endpoint = ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?;
     let (progress, bar) = PushBar::start();
     let opts = ostrya::RepoPushOptions {
         refspecs: args.refspecs,
         depth: args.depth,
         compression: push_compression(args.compress),
         force: args.force,
-        connect: push_connect_options(args.connect),
         detached_metadata_filter,
         progress,
     };
-    let pushed = repo.push(remote, opts).await;
+    let pushed = repo.push(endpoint, opts).await;
     // The bar is cleared before any line of the result or of the error.
     bar.finish();
     let outcome = pushed?;
@@ -2181,20 +2182,20 @@ fn push_compression(level: Option<u8>) -> ostrya::remote::Compression {
     }
 }
 
-/// The connect options of `--ssh-command`, `--receive-command`, and the HTTP
-/// options, each in the field of its name, so the push refuses an option of
-/// the other transport. The ssh command is split at ASCII whitespace.
+/// The overrides of `--ssh-command`, `--receive-command`, and the HTTP
+/// options, each in the field of its name, so the resolver refuses an option
+/// of the other transport. The ssh command is split at ASCII whitespace.
 #[cfg(feature = "push")]
-fn push_connect_options(args: PushConnectArgs) -> ostrya::remote::ConnectOptions {
+fn push_overrides(args: PushConnectArgs) -> ostrya::endpoint::EndpointOverrides {
     let ssh_command = args.ssh_command.map(|command| {
         command
             .split_ascii_whitespace()
             .map(str::to_owned)
             .collect()
     });
-    ostrya::remote::ConnectOptions {
+    ostrya::endpoint::EndpointOverrides {
         ssh_command,
-        receive_command: args.receive_command,
+        remote_command: args.receive_command,
         push_token_file: args.push_token_file,
         push_user: args.push_user,
         tls_ca_path: args.tls_ca_path,
@@ -2212,11 +2213,11 @@ fn push_connect_options(args: PushConnectArgs) -> ostrya::remote::ConnectOptions
 /// the order REMOTE, DIR, and `-b`, each with the usage text. The other
 /// options the command reads itself, except the signing keys and the body
 /// file, are then checked before a repository opens. The command then
-/// resolves the remote and makes the transport ready: it refuses an option
-/// of the other transport and the bad HTTP options, and reads the token file
-/// and the TLS files of an HTTP push. The signing keys are checked next, and
-/// the body file is read last. The push refuses the other bad refs before the
-/// scan. All of these come before the ssh client starts or the first HTTP
+/// resolves the remote: it refuses an option of the other transport and the
+/// bad HTTP options, and reads the token file and the TLS files of an HTTP
+/// push. It then makes the transport ready. The signing keys are checked
+/// next, and the body file is read last. The push refuses the other bad refs
+/// before the scan. All of these come before the ssh client starts or the first HTTP
 /// request. A remote name is looked up in the repository that `--repo`, the
 /// current directory, or `OSTREE_REPO` gives. An address opens no
 /// repository, so none of the three is read for it.
@@ -2288,14 +2289,14 @@ async fn push_tree(
     // The transport is made ready before a signer can start gpg and before
     // the body file is read, so a refusal of the remote or of its options
     // costs neither.
-    let connect = push_connect_options(args.connect);
-    let (address, connect) = if ostrya::is_push_address(remote) {
-        ostrya::resolve_push_remote(None, remote, connect)?
+    let overrides = push_overrides(args.connect);
+    let endpoint = if ostrya::is_push_address(remote) {
+        ostrya::endpoint::resolve_push(None, remote, overrides).await?
     } else {
         let (repo, _) = resolve_repo(repo, verbose, name).await;
-        ostrya::resolve_push_remote(Some(repo.config()), remote, connect)?
+        ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?
     };
-    let transport = ostrya::remote::PushSession::prepare(&address, connect).await?;
+    let transport = ostrya::remote::PushSession::prepare(endpoint).await?;
     let signers = refuse!(
         collect_signers(
             &args.sign,

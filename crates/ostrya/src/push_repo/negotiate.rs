@@ -6,15 +6,15 @@ use std::collections::{HashMap, HashSet};
 use futures_io::{AsyncRead, AsyncWrite};
 use ostrya_core::{Checksum, Commit, CommitLink, ObjectName, ObjectType};
 
+use super::invalid;
 use super::refspec::PushTarget;
 use super::source::RepoSource;
-use super::{invalid, resolve_push_remote};
 use crate::error::{Error, Result};
 use crate::lock::{LockGuard, LockKind};
 use crate::pull::DetachedMetadataFilter;
 use crate::read::CommitState;
 use crate::remote::{
-    Compression, ConnectOptions, Expected, PushOutcome, PushProgress, PushSession, RefUpdate,
+    Compression, Endpoint, Expected, PushOutcome, PushProgress, PushSession, RefUpdate,
     SessionOptions,
 };
 use crate::repo::Repo;
@@ -63,11 +63,6 @@ pub struct RepoPushOptions {
     /// If `true`, each ref update expects any state. The push also asks the
     /// server to allow an update that is not a fast-forward.
     pub force: bool,
-    /// The connect options of [`Repo::push`].
-    ///
-    /// A field that is set here wins over the matching key of the remote
-    /// section. [`Repo::push_over_stream`] does not read this field.
-    pub connect: ConnectOptions,
     /// The filter of the detached metadata of each commit that the push sends.
     ///
     /// If the filter is unset, the push sends every key.
@@ -119,21 +114,24 @@ struct Plan {
 
 /// Methods that push commits to a remote.
 impl Repo {
-    /// Pushes the commits of `opts.refspecs` to `remote` and updates the
+    /// Pushes the commits of `opts.refspecs` to `endpoint` and updates the
     /// server refs.
     ///
-    /// The server updates all the refs in one transaction. `remote` is a
-    /// configured remote name or an address. [`resolve_push_remote`] reads it
-    /// with the config of this repository and `opts.connect`.
+    /// The server updates all the refs in one transaction.
+    /// [`resolve_push`](crate::endpoint::resolve_push) gives the endpoint of a
+    /// configured remote or of an address. A caller can also build the
+    /// endpoint itself.
     ///
     /// The push makes the transport ready with [`PushSession::prepare`]. The
-    /// prepare step refuses the connect options that do not apply. For an
-    /// HTTP push, it reads the token file and the TLS files.
+    /// prepare step reads no file that the endpoint names. For an HTTP push,
+    /// it builds the HTTP client. An `https://` endpoint with
+    /// [`TrustRoots::System`](crate::fetch::TrustRoots::System) reads the
+    /// trust store of the host.
     ///
-    /// These steps come before the checks and the commit walk of
-    /// [`push_over_stream`](Repo::push_over_stream). If the push refuses the
-    /// remote or its options, it takes no lock and reads no refspec. After
-    /// these steps, the push runs the checks and the walk. It opens the
+    /// This step comes before the checks and the commit walk of
+    /// [`push_over_stream`](Repo::push_over_stream). If the prepare step
+    /// refuses the endpoint, the push takes no lock and reads no refspec.
+    /// After this step, the push runs the checks and the walk. It opens the
     /// session with [`PreparedSession::open`](crate::remote::PreparedSession::open)
     /// and does the rest of the work of `push_over_stream`.
     ///
@@ -148,28 +146,14 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
-    ///   if `remote` names no configured remote, or if the remote has no push
-    ///   address.
-    /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
-    ///   if an `https://` remote sets `tls-permissive=true`.
-    /// - [`Error::Remote`] with the error of
-    ///   [`PushRemote::parse`](crate::remote::PushRemote::parse) if the address
-    ///   does not parse.
-    /// - [`Error::Core`] if a key of the remote section holds a malformed
-    ///   escape sequence, or if `tls-permissive` is not a boolean.
-    /// - [`Error::Remote`] with the error of [`PushSession::prepare`] if a
-    ///   connect option does not apply, or if a token file or a TLS file
-    ///   cannot be read. If the HTTP client cannot be built, the push also
-    ///   gives this error.
+    /// - [`Error::Remote`] with the error of [`PushSession::prepare`] if the
+    ///   endpoint does not apply, or if the HTTP client cannot be built.
     /// - [`Error::Remote`] with the error of
     ///   [`PreparedSession::open`](crate::remote::PreparedSession::open) if the
     ///   session does not open.
     /// - Each error of [`push_over_stream`](Repo::push_over_stream).
-    pub async fn push(&self, remote: &str, mut opts: RepoPushOptions) -> Result<PushOutcome> {
-        let connect = std::mem::take(&mut opts.connect);
-        let (address, connect) = resolve_push_remote(Some(self.config()), remote, connect)?;
-        let transport = PushSession::prepare(&address, connect).await?;
+    pub async fn push(&self, endpoint: Endpoint, opts: RepoPushOptions) -> Result<PushOutcome> {
+        let transport = PushSession::prepare(endpoint).await?;
         let plan = self.plan_push(&opts).await?;
         let session = transport.open(&plan.refs, session_options(&opts)).await?;
         plan.run(session, &opts).await
@@ -178,8 +162,7 @@ impl Repo {
     /// Pushes the commits of `opts.refspecs` over a pair of byte streams.
     ///
     /// The server updates all the refs in one transaction. `input` comes from
-    /// the server, and `output` goes to it. The call does not read
-    /// `opts.connect`.
+    /// the server, and `output` goes to it.
     ///
     /// The push checks the depth, the refspecs, and the source commits
     /// before it writes a byte. After the depth check, it takes the repository

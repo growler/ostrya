@@ -9,10 +9,11 @@
 //!
 //! # Entry points
 //!
-//! - [`push_tree`](fn@push_tree) pushes a local directory to a [`PushRemote`] as one commit.
+//! - [`push_tree`](fn@push_tree) pushes a local directory to an [`Endpoint`] as one commit.
 //! - [`push_tree_prepared`] and [`push_tree_over_stream`] run that push over other transports.
-//! - [`PushSession::connect`] opens a push session to an address that [`PushRemote::parse`] reads.
-//! - [`PushSession::prepare`] checks a transport, and [`PreparedSession::open`] opens its session.
+//! - [`PushSession::connect`] opens a push session to an [`Endpoint`].
+//! - [`Endpoint::parse`] reads an address into an endpoint with the default options.
+//! - [`PushSession::prepare`] checks an endpoint, and [`PreparedSession::open`] opens its session.
 //! - [`PushSession::over_stream`] opens a push session over a pair of byte streams.
 //! - [`PullSession::connect`] opens a pull session over ssh, and [`PullSession::get`] reads a file.
 //! - [`Error`] is the error of each fallible operation, and [`ErrorCode`] names its wire codes.
@@ -21,7 +22,7 @@
 //!
 //! - [`proto`]: the wire format and its codec.
 //! - [`session`]: the push and pull sessions, their progress, and the one-way stream.
-//! - [`transport`]: the push addresses and the ssh and HTTP transports.
+//! - [`transport`]: the endpoints, the addresses, and the ssh and HTTP transports.
 //! - [`tree`]: the walk and the hash of a local directory.
 //!
 //! # Features
@@ -32,11 +33,11 @@
 //! # Examples
 //!
 //! ```no_run
-//! use ostrya_remote::{TreePushOptions, push_tree, transport::{ConnectOptions, PushRemote}};
+//! use ostrya_remote::{TreePushOptions, push_tree, transport::Endpoint};
 //! # async fn run() -> ostrya_remote::Result<()> {
-//! let remote = PushRemote::parse("ssh://builder@repo.example.com/srv/repo")?;
+//! let endpoint = Endpoint::parse("ssh://builder@repo.example.com/srv/repo")?;
 //! let opts = TreePushOptions { refs: vec!["exampleos/stable".into()], ..Default::default() };
-//! let outcome = push_tree(&remote, "rootfs".as_ref(), ConnectOptions::default(), opts).await?;
+//! let outcome = push_tree(endpoint, "rootfs".as_ref(), opts).await?;
 //! println!("{:?}", outcome.commit);
 //! # Ok(()) }
 //! ```
@@ -63,8 +64,8 @@ pub use session::{
 };
 #[doc(hidden)]
 pub use transport::{
-    ConnectOptions, Endpoint, PreparedSession, PullConnectOptions, PushRemote, SshAddress,
-    SshOptions, without_userinfo,
+    Endpoint, PreparedSession, PullConnectOptions, PushRemote, SshAddress, SshOptions,
+    without_userinfo,
 };
 
 // The public types of the protocol move freely across tasks and threads.
@@ -86,7 +87,6 @@ const _: fn() = || {
     assert_send_sync::<ObjectData>();
     assert_send_sync::<Box<dyn ObjectReader>>();
     assert_send_sync::<PushRemote>();
-    assert_send_sync::<ConnectOptions>();
     assert_send_sync::<PreparedSession>();
     assert_send_sync::<tree::TreeModel>();
     assert_send_sync::<tree::EntryMeta>();
@@ -158,15 +158,14 @@ fn session_futures_are_send(
 /// The future of a connect, and the futures of its two steps, can run on a
 /// multi-threaded executor, over ssh and over HTTP.
 #[allow(dead_code)]
-fn connect_future_is_send(remote: &PushRemote, refs: &[String], prepared: PreparedSession) {
+fn connect_future_is_send(endpoint: &Endpoint, refs: &[String], prepared: PreparedSession) {
     fn assert_send<T: Send>(_: &T) {}
     assert_send(&PushSession::connect(
-        remote,
-        ConnectOptions::default(),
+        endpoint.clone(),
         refs,
         SessionOptions::default(),
     ));
-    assert_send(&PushSession::prepare(remote, ConnectOptions::default()));
+    assert_send(&PushSession::prepare(endpoint.clone()));
     assert_send(&prepared.open(refs, SessionOptions::default()));
 }
 
@@ -174,16 +173,15 @@ fn connect_future_is_send(remote: &PushRemote, refs: &[String], prepared: Prepar
 /// multi-threaded executor.
 #[allow(dead_code)]
 fn push_tree_futures_are_send(
-    remote: &PushRemote,
+    endpoint: &Endpoint,
     root: &std::path::Path,
     prepared: PreparedSession,
 ) {
     fn assert_send<T: Send>(_: &T) {}
     assert_send(&TreePushOptions::default());
     assert_send(&push_tree(
-        remote,
+        endpoint.clone(),
         root,
-        ConnectOptions::default(),
         TreePushOptions::default(),
     ));
     assert_send(&push_tree_prepared(

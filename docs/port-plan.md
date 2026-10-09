@@ -176,9 +176,10 @@ bounded:
   `ObjectBody` reads the bytes of one object or of one pull body as an
   `AsyncRead`. The client session: `PushSession` over a pair of byte
   streams, the `ObjectSource` trait it reads objects through, and
-  `PushProgress`, `PushStats`, and `PushOutcome`. The ssh transport:
-  `PushRemote`, `ConnectOptions`, and `PushSession::connect`, which runs the
-  ssh client as a child process through `ostrya-rt`. No repository
+  `PushProgress`, `PushStats`, and `PushOutcome`. The transports:
+  `Endpoint`, `SshAddress`, `SshOptions`, `PushRemote`, and
+  `PushSession::connect`, which runs the ssh client as a child process
+  through `ostrya-rt`, or sends the steps of a session to an HTTP server. No repository
   knowledge. Depends on `ostrya-gvariant`, `ostrya-core`, `ostrya-rt`,
   `thiserror`, `futures-io`, and `futures-lite`, with the `smol` (default)
   and `tokio` features that select the backend of `ostrya-rt`. Compiles on
@@ -7248,11 +7249,11 @@ them.
 
 The `push` feature of `ostrya` is `push = []`, and it adds no dependency.
 `ostrya-remote` is a regular dependency of `ostrya`, and `ostrya::remote`
-re-exports it in every build. Under the feature, `resolve_push_remote` gives
-the push address and the
-connect options of a configured remote or of an address. `is_push_address`
+re-exports it in every build. Under the feature,
+`ostrya::endpoint::resolve_push` gives the endpoint of a configured remote or
+of an address, with all values in memory. `is_push_address`
 tells an address from a remote name. `Repo::push` pushes the commits of a set
-of refspecs to a remote over ssh or HTTP. `Repo::push_over_stream` runs the same push
+of refspecs to an endpoint over ssh or HTTP. `Repo::push_over_stream` runs the same push
 over a pair of byte streams. Both take the options of `RepoPushOptions`. The
 push holds the lock of the local repository shared for the whole push. It
 reads the commits before the session opens, and it offers the commits first.
@@ -7260,8 +7261,8 @@ It then offers the trees of the new values and of the history commits that the
 server lacks (`docs/api-sketch.md`, "Push from a repository"). The push keys
 of a remote section, `push-url`, `ssh-command`, `receive-command`,
 `push-token-file`, and `push-user`, are read through `Remote` in every build.
-`resolve_push_remote` applies the keys of the transport of the push address
-alone, and refuses `tls-permissive=true` for an `https://` address
+`resolve_push` applies the keys of the transport of the push address alone,
+and refuses `tls-permissive=true` for an `https://` address
 (`format-reference.md`, "Port extension: the push and pull keys of a remote"). `ostrya-cli` has the feature
 `push = ["ostrya/push"]` in its default set, which builds `ostrya push` and
 `ostrya push-tree`, beside `receive = ["ostrya/receive"]`, which builds
@@ -7945,8 +7946,11 @@ The proxy the port implements:
   the key of that remote too. `Proxy::Url` reads no exemptions, so `no_proxy`
   does not exempt an origin from the key. A value that is not
   `http://host[:port]` fails `Fetcher::new` with `Error::Unsupported`, before
-  the first request and before the pull opens a transaction. A push and a
-  pull over ssh do not read the key.
+  the first request and before the pull opens a transaction.
+- `ostrya::endpoint::resolve_push` reads the `proxy` key of the remote of an
+  HTTP push by the same rules. An address names no remote, so its push gets
+  `Proxy::Environment`. A pull over ssh and a push over ssh do not read the
+  key.
 
 The verification bypass:
 

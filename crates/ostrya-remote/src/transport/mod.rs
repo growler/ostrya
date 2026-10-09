@@ -1,13 +1,14 @@
 //! The push addresses, and the ssh and HTTP transports of the sessions.
 //!
-//! [`PushRemote`] is a parsed push address. [`PushSession::connect`] opens a
-//! push session to it with [`ConnectOptions`]. [`PushSession::prepare`] checks
-//! the options and makes the transport ready, and [`PreparedSession::open`]
-//! opens the session later. [`PullSession::connect`] opens a pull session over
-//! ssh with [`PullConnectOptions`].
-//!
 //! [`Endpoint`] holds an address and the options of its transport: an
 //! [`SshAddress`] with [`SshOptions`], or the options of the HTTP client.
+//! [`PushSession::connect`] opens a push session to an endpoint.
+//! [`PushSession::prepare`] checks the endpoint and makes the transport ready,
+//! and [`PreparedSession::open`] opens the session later.
+//!
+//! [`PushRemote`] is a parsed address of a pull over ssh.
+//! [`PullSession::connect`] opens a pull session over ssh to it with
+//! [`PullConnectOptions`].
 //!
 //! Over ssh, the client runs the ssh client as a child process, and the remote
 //! side runs the receive command or the send command. The frames of the
@@ -17,8 +18,8 @@
 mod http;
 mod ssh;
 
+use std::ffi::OsStr;
 use std::fmt;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -33,7 +34,8 @@ pub use ssh::{SshAddress, SshOptions, without_userinfo};
 /// [`PushSession::connect`] or [`PullSession::connect`] opens.
 const PENDING_READ_LIMIT: Duration = Duration::from_secs(5);
 
-/// A push destination, parsed from an ssh address or an HTTP address.
+/// The address of a pull over ssh, parsed from an ssh address or an HTTP
+/// address.
 ///
 /// [`PullSession::connect`] takes the ssh forms alone.
 ///
@@ -197,153 +199,9 @@ fn parse_endpoint(address: &str, windows: bool) -> Result<Endpoint> {
     }
 }
 
-/// The transport options of a push session.
-///
-/// The ssh fields are [`ssh_command`](ConnectOptions::ssh_command),
-/// [`receive_command`](ConnectOptions::receive_command), and
-/// [`remote_ssh_command`](ConnectOptions::remote_ssh_command). They apply to an
-/// ssh address, and the other fields apply to an `http://` or `https://`
-/// address. A field set for the other transport is [`Error::InvalidInput`].
-/// The exception is `remote_ssh_command`: it holds a key of the configuration
-/// of a remote, and an HTTP address does not read it.
-///
-/// A refusal names a field by its key in the configuration of a remote. The
-/// key is also the option of the `ostrya` command without `--`, for example
-/// `push-user needs push-token-file`. A refusal of a field of
-/// [`http`](ConnectOptions::http) names that field.
-///
-/// The struct carries no `#[non_exhaustive]`. A caller builds it with
-/// `..Default::default()`.
-///
-/// # ssh command line
-///
-/// The command line is:
-///
-/// ```text
-/// SSH_COMMAND... [-p PORT] [USER@]HOST 'RECEIVE_COMMAND --repo=QUOTED_PATH'
-/// ```
-///
-/// The last argument is one string, and the remote shell parses it. The client
-/// quotes the path with POSIX single quotes, so the path gets no expansion.
-///
-/// `SSH_COMMAND` comes from the first of these that is set:
-///
-/// 1. [`ssh_command`](ConnectOptions::ssh_command)
-/// 2. the `OSTRYA_SSH_COMMAND` environment variable
-/// 3. [`remote_ssh_command`](ConnectOptions::remote_ssh_command)
-///
-/// If none is set, `SSH_COMMAND` is `ssh`. The client splits the environment
-/// variable and `remote_ssh_command` at ASCII white space, with no quoting
-/// rule. A command with an argument that holds white space must come from
-/// `ssh_command`.
-///
-/// `RECEIVE_COMMAND` is [`receive_command`](ConnectOptions::receive_command),
-/// or `ostrya receive` if that field is not set.
-///
-/// The ssh client writes to the standard error of this process. Host key
-/// prompts, password prompts, and the diagnostics of the server reach the
-/// user through it.
-#[derive(Debug, Clone, Default)]
-pub struct ConnectOptions {
-    /// The ssh command line, as a list of arguments.
-    ///
-    /// It wins over the `OSTRYA_SSH_COMMAND` environment variable and over
-    /// [`remote_ssh_command`](ConnectOptions::remote_ssh_command). An empty
-    /// list is refused, and so is a list whose first argument holds only white
-    /// space.
-    pub ssh_command: Option<Vec<String>>,
-    /// The command that the remote side runs.
-    ///
-    /// The remote shell parses it. The default is `ostrya receive`.
-    pub receive_command: Option<String>,
-    /// The ssh command line from the configuration of a remote.
-    ///
-    /// The client splits it at ASCII white space. It has the lowest
-    /// precedence: the `OSTRYA_SSH_COMMAND` environment variable wins over it.
-    /// An HTTP address does not read it.
-    pub remote_ssh_command: Option<String>,
-    /// A file whose first line is the token of an HTTP push.
-    ///
-    /// The client reads at most 1 MiB of the file. It refuses a first line
-    /// that:
-    ///
-    /// - is empty
-    /// - holds a carriage return
-    /// - is not UTF-8
-    /// - is not token68: one or more ASCII letters, digits, `-`, `.`, `_`,
-    ///   `~`, `+`, or `/`, then any number of `=`
-    /// - is more than 1 MiB long
-    ///
-    /// A refusal holds no part of the token. The client checks no permission
-    /// of the file.
-    ///
-    /// A relative path of a file of the options is relative to the current
-    /// directory of the process, and the client does not expand `~`. If the
-    /// client cannot read a file of the options, [`PushSession::prepare`]
-    /// returns [`Error::Io`], with the key and the path in the message.
-    ///
-    /// If the address is `http://` and
-    /// [`allow_cleartext_credentials`](ConnectOptions::allow_cleartext_credentials)
-    /// is `false`, the client refuses the credential before any request.
-    pub push_token_file: Option<PathBuf>,
-    /// The name of a Basic credential.
-    ///
-    /// The token of [`push_token_file`](ConnectOptions::push_token_file) is its
-    /// password. If the name is not set, the token is a bearer token. The name
-    /// needs `push_token_file`. An empty name and a name that holds `:` are
-    /// refused.
-    pub push_user: Option<String>,
-    /// A PEM file of the CA certificates that verify the server.
-    ///
-    /// The certificates take the place of the trust store of the host. If
-    /// [`http`](ConnectOptions::http) also sets trust roots, this field is
-    /// refused.
-    pub tls_ca_path: Option<PathBuf>,
-    /// A PEM file of the client certificate and the intermediates after it.
-    ///
-    /// It needs [`tls_client_key_path`](ConnectOptions::tls_client_key_path).
-    /// If [`http`](ConnectOptions::http) also sets a client identity, this
-    /// field is refused.
-    pub tls_client_cert_path: Option<PathBuf>,
-    /// A PEM file of the private key of the client certificate.
-    ///
-    /// It needs [`tls_client_cert_path`](ConnectOptions::tls_client_cert_path).
-    /// If the key needs a passphrase, the HTTP client refuses it, and
-    /// [`PushSession::prepare`] returns [`Error::Fetch`].
-    ///
-    /// [`PushSession::prepare`] reads each TLS file of the options once. If a
-    /// TLS file is more than 1 MiB, it returns [`Error::InvalidInput`].
-    pub tls_client_key_path: Option<PathBuf>,
-    /// The permission to send the credential to an `http://` address.
-    ///
-    /// The credential is the token of
-    /// [`push_token_file`](ConnectOptions::push_token_file).
-    ///
-    /// A caller sets it for a server on a loopback address, or for a server
-    /// behind a proxy that terminates TLS.
-    pub allow_cleartext_credentials: bool,
-    /// The other options of the HTTP client.
-    ///
-    /// They include the trust roots, a client identity, a proxy, extra
-    /// headers, and the timeouts. The client sets `max_outstanding` to 32 and
-    /// `max_redirects` to 0, whatever values this field holds. The 32 requests
-    /// are one for each of the at most 31 object streams of
-    /// [`PushSession::send`], and one `Have` or `Commit` request.
-    ///
-    /// The client refuses a trust setting that verifies no certificate chain,
-    /// mirrors, a Basic credential, a bearer token, and
-    /// `allow_cleartext_credentials`. It follows no redirect, and a 3xx answer
-    /// is [`Error::Transport`].
-    ///
-    /// If `headers` holds an `Authorization`, `Proxy-Authorization`, or
-    /// `Cookie` header and the address is `http://`, [`PushSession::prepare`]
-    /// returns [`Error::Fetch`]. No option of the push lifts this refusal.
-    pub http: ostrya_fetch::FetcherOptions,
-}
-
 /// The open of a session over ssh or HTTP.
 impl PushSession {
-    /// Opens a push session to `remote` over ssh or HTTP.
+    /// Opens a push session to `endpoint` over ssh or HTTP.
     ///
     /// The call starts the transport, sends `Hello` with `refs`, and reads
     /// `HelloReply`. It is [`prepare`](PushSession::prepare) and then
@@ -353,17 +211,8 @@ impl PushSession {
     ///
     /// - An `Error` message from the server, as the [`Error`] variant of its
     ///   code.
-    /// - [`Error::InvalidInput`] if a field of `connect` does not apply to the
-    ///   transport of `remote`.
-    /// - [`Error::InvalidInput`] if the ssh command or the receive command is
-    ///   empty or holds only white space, or if the value of
-    ///   `OSTRYA_SSH_COMMAND` is not UTF-8.
-    /// - [`Error::InvalidInput`] if the client refuses an HTTP field of
-    ///   [`ConnectOptions`], for example a token file or a TLS file of more
-    ///   than 1 MiB.
-    /// - [`Error::Io`] if the client cannot read a file that `connect` names.
-    /// - [`Error::Fetch`] if the HTTP client cannot be built, for example for a
-    ///   key that needs a passphrase, or if an HTTP request fails.
+    /// - Each error of [`prepare`](PushSession::prepare).
+    /// - [`Error::Fetch`] if an HTTP request fails.
     /// - [`Error::Transport`] if the ssh client cannot be started. The message
     ///   names the program.
     /// - [`Error::Transport`] if an HTTP answer has a status that the endpoint
@@ -439,23 +288,38 @@ impl PushSession {
     ///
     /// After the client sent the request body, it waits for the response. The
     /// wait is at most 6 minutes for `Hello` and at most 1 hour for `Commit`.
-    /// For each other request, the limit is the progress timeout of
-    /// [`ConnectOptions::http`]. The client sends a request again only if the
-    /// attempt failed before it sent any byte of the request.
+    /// For each other request, the limit is the `progress_timeout` of the
+    /// options of [`Endpoint::Http`]. The client sends a request again only if
+    /// the attempt failed before it sent any byte of the request.
+    ///
+    /// The options of [`Endpoint::Http`] must name exactly one mirror, the
+    /// push address. The client sets `max_outstanding` to 32 and
+    /// `max_redirects` to 0, whatever values the options hold. The 32 requests
+    /// are one for each of the at most 31 object streams of
+    /// [`PushSession::send`], and one `Have` or `Commit` request. The client
+    /// follows no redirect, and a 3xx answer is [`Error::Transport`].
+    ///
+    /// The fetcher carries the credential, the TLS settings, the proxy, and
+    /// the headers of the options to each request. The client accepts each
+    /// trust setting of the options, a setting that verifies no certificate
+    /// chain among them. The trust policy belongs to the caller.
     ///
     /// # Examples
     ///
     /// The example deletes a ref on the server if the ref exists.
     ///
     /// ```no_run
+    /// use ostrya_fetch::BearerToken;
     /// use ostrya_remote::proto::{Expected, RefUpdate};
     /// use ostrya_remote::session::{PushSession, SessionOptions};
-    /// use ostrya_remote::transport::{ConnectOptions, PushRemote};
-    /// # async fn run() -> ostrya_remote::Result<()> {
-    /// let remote = PushRemote::parse("https://repo.example.com/")?;
+    /// use ostrya_remote::transport::Endpoint;
+    /// # async fn run(token: String) -> ostrya_remote::Result<()> {
+    /// let mut endpoint = Endpoint::parse("https://repo.example.com/")?;
+    /// if let Endpoint::Http(http) = &mut endpoint {
+    ///     http.bearer_token = Some(BearerToken { token });
+    /// }
     /// let refs = vec!["exampleos/testing".to_owned()];
-    /// let connect = ConnectOptions { push_token_file: Some("token".into()), ..Default::default() };
-    /// let session = PushSession::connect(&remote, connect, &refs, SessionOptions::default()).await?;
+    /// let session = PushSession::connect(endpoint, &refs, SessionOptions::default()).await?;
     /// let Some(tip) = session.server().tip(&refs[0]) else {
     ///     return session.abort().await;
     /// };
@@ -465,23 +329,25 @@ impl PushSession {
     /// # Ok(()) }
     /// ```
     pub async fn connect(
-        remote: &PushRemote,
-        connect: ConnectOptions,
+        endpoint: Endpoint,
         refs: &[String],
         opts: SessionOptions,
     ) -> Result<PushSession> {
-        PushSession::prepare(remote, connect)
-            .await?
-            .open(refs, opts)
-            .await
+        PushSession::prepare(endpoint).await?.open(refs, opts).await
     }
 
-    /// Checks `connect` for `remote` and makes the transport ready to open.
+    /// Checks `endpoint` and makes the transport ready to open.
     ///
-    /// For an ssh address, the call reads the `OSTRYA_SSH_COMMAND` environment
-    /// variable and builds the command line of the ssh client. For an HTTP
-    /// address, it reads the token file and the TLS files that `connect` names,
-    /// and it builds the HTTP client.
+    /// For an ssh endpoint, the call reads the `OSTRYA_SSH_COMMAND`
+    /// environment variable and builds the command line of the ssh client, by
+    /// the rules of [`SshOptions`]. The remote command is `ostrya receive` if
+    /// [`SshOptions::remote_command`] is not set. For an HTTP endpoint, it
+    /// builds the HTTP client from the options, as
+    /// [`connect`](PushSession::connect) states. The call takes the
+    /// credential and the TLS material from the endpoint, and reads no file
+    /// that the endpoint names. An `https://` endpoint with
+    /// [`TrustRoots::System`](ostrya_fetch::TrustRoots::System) reads the
+    /// trust store of the host.
     ///
     /// The call starts no ssh client and sends no request. It refuses each
     /// value that [`connect`](PushSession::connect) refuses before it starts
@@ -494,20 +360,21 @@ impl PushSession {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidInput`] if a field of `connect` does not apply to the
-    ///   transport of `remote`.
     /// - [`Error::InvalidInput`] if the ssh command or the receive command is
     ///   empty or holds only white space, or if the value of
     ///   `OSTRYA_SSH_COMMAND` is not UTF-8.
-    /// - [`Error::InvalidInput`] if the client refuses an HTTP field of
-    ///   [`ConnectOptions`], for example a token file or a TLS file of more
-    ///   than 1 MiB.
-    /// - [`Error::Io`] if the client cannot read a file that `connect` names.
-    /// - [`Error::Fetch`] if the HTTP client cannot be built, for example for a
-    ///   key that needs a passphrase.
-    pub async fn prepare(remote: &PushRemote, connect: ConnectOptions) -> Result<PreparedSession> {
+    /// - [`Error::InvalidInput`] if the options of an HTTP endpoint do not name
+    ///   exactly one mirror, or if
+    ///   [`check_base_url`](ostrya_fetch::check_base_url) refuses the mirror.
+    ///   The message holds no userinfo.
+    /// - [`Error::Fetch`] if the HTTP client cannot be built. Examples are a
+    ///   credential to an `http://` address without
+    ///   `allow_cleartext_credentials`, a bearer token beside an
+    ///   `Authorization` header, and a client key that needs a passphrase that
+    ///   the options do not hold.
+    pub async fn prepare(endpoint: Endpoint) -> Result<PreparedSession> {
         let env = std::env::var_os("OSTRYA_SSH_COMMAND");
-        let inner = prepare_with(remote, &connect, env.as_deref()).await?;
+        let inner = prepare_with(endpoint, env.as_deref()).await?;
         Ok(PreparedSession { inner })
     }
 }
@@ -578,60 +445,20 @@ pub(crate) enum Prepared {
     Http(HttpEndpoint),
 }
 
-/// Checks `connect` for `remote` and makes the transport ready to open, with
-/// `env` as the value of the `OSTRYA_SSH_COMMAND` environment variable. For
-/// ssh, it builds the command line. For HTTP, it reads the files that
-/// `connect` names and builds the HTTP client. It starts nothing and sends
-/// nothing.
-async fn prepare_with(
-    remote: &PushRemote,
-    connect: &ConnectOptions,
-    env: Option<&std::ffi::OsStr>,
-) -> Result<Prepared> {
-    match &remote.inner {
-        RemoteAddr::Ssh(addr) => {
-            refuse_http_fields(addr, connect)?;
-            let program = ssh::ssh_program(
-                connect.ssh_command.as_deref(),
-                env,
-                connect.remote_ssh_command.as_deref(),
-            )?;
-            let receive = ssh::receive_command(connect.receive_command.as_deref())?;
-            Ok(Prepared::Ssh(addr.command_line(program, receive)))
+/// Checks `endpoint` and makes the transport ready to open, with `env` as the
+/// value of the `OSTRYA_SSH_COMMAND` environment variable. For ssh, it builds
+/// the command line. For HTTP, it builds the HTTP client. It starts nothing and
+/// sends nothing.
+async fn prepare_with(endpoint: Endpoint, env: Option<&OsStr>) -> Result<Prepared> {
+    match endpoint {
+        Endpoint::Ssh { address, options } => {
+            let program = options.program(env)?;
+            let receive = ssh::receive_command(options.remote_command.as_deref())?;
+            Ok(Prepared::Ssh(address.command_line(program, receive)))
         }
-        // The HTTP preparation reads files and builds the fetcher. Its future
-        // is boxed, so that the future of an ssh connect does not hold it.
-        RemoteAddr::Http(url) => Ok(Prepared::Http(Box::pin(http::prepare(url, connect)).await?)),
-    }
-}
-
-/// Refuses a field of `connect` that applies to an HTTP address alone.
-///
-/// The message shows `addr` in the `ssh://` form with no user.
-fn refuse_http_fields(addr: &SshAddress, connect: &ConnectOptions) -> Result<()> {
-    // Each name is the remote key and the CLI option of the field. The
-    // options of the HTTP client have neither, so the field names them.
-    let set = [
-        ("push-token-file", connect.push_token_file.is_some()),
-        ("push-user", connect.push_user.is_some()),
-        ("tls-ca-path", connect.tls_ca_path.is_some()),
-        (
-            "tls-client-cert-path",
-            connect.tls_client_cert_path.is_some(),
-        ),
-        ("tls-client-key-path", connect.tls_client_key_path.is_some()),
-        (
-            "allow-cleartext-credentials",
-            connect.allow_cleartext_credentials,
-        ),
-        ("ConnectOptions::http", !http::is_default(&connect.http)),
-    ];
-    match set.iter().find(|(_, set)| *set) {
-        Some((name, _)) => Err(Error::InvalidInput(format!(
-            "{name} applies to an HTTP address, and '{}' is an ssh address",
-            addr.without_user()
-        ))),
-        None => Ok(()),
+        // The HTTP preparation builds the fetcher. Its future is boxed, so
+        // that the future of an ssh connect does not hold it.
+        Endpoint::Http(http) => Ok(Prepared::Http(Box::pin(http::prepare(http)).await?)),
     }
 }
 
@@ -662,8 +489,8 @@ impl Prepared {
 
 /// The transport options of a pull session.
 ///
-/// The fields resolve as the ssh fields of [`ConnectOptions`] do, by the rules
-/// of its [ssh command line](ConnectOptions#ssh-command-line). The struct
+/// The fields resolve as the fields of [`SshOptions`] do, by the rules of its
+/// [ssh command line](SshOptions#ssh-command-line). The struct
 /// carries no `#[non_exhaustive]`. A caller builds it with
 /// `..Default::default()`.
 #[derive(Debug, Clone, Default)]
@@ -771,7 +598,7 @@ impl PullSession {
 fn pull_command_line(
     remote: &PushRemote,
     connect: &PullConnectOptions,
-    env: Option<&std::ffi::OsStr>,
+    env: Option<&OsStr>,
 ) -> Result<Vec<String>> {
     match &remote.inner {
         RemoteAddr::Ssh(addr) => {
@@ -809,7 +636,7 @@ async fn spawn_and_open_pull(
 async fn connect_pull_with(
     remote: &PushRemote,
     connect: &PullConnectOptions,
-    env: Option<&std::ffi::OsStr>,
+    env: Option<&OsStr>,
     opts: PullSessionOptions,
     limit: Duration,
 ) -> Result<PullSession> {
@@ -821,14 +648,13 @@ async fn connect_pull_with(
 /// the environment variable and the time limit as parameters.
 #[cfg(test)]
 async fn connect_with(
-    remote: &PushRemote,
-    connect: &ConnectOptions,
-    env: Option<&std::ffi::OsStr>,
+    endpoint: Endpoint,
+    env: Option<&OsStr>,
     refs: &[String],
     opts: SessionOptions,
     limit: Duration,
 ) -> Result<PushSession> {
-    prepare_with(remote, connect, env)
+    prepare_with(endpoint, env)
         .await?
         .open_with(refs, opts, limit)
         .await

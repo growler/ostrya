@@ -911,8 +911,11 @@ impl Remote<'_> {
     /// The default is `false`. A pull from a remote that sets the key accepts
     /// the certificate chain as presented and keeps the host name check.
     ///
-    /// A push refuses an `https://` address of a remote that sets the key. A
-    /// push to an `http://` address uses no TLS and ignores the key.
+    /// `ostrya::endpoint::resolve_push` refuses an `https://`
+    /// address of a remote that sets the key. A push to an `http://` address
+    /// uses no TLS and ignores the key. The transport of a push accepts each
+    /// trust setting that its caller gives, so this refusal is the policy of
+    /// the remote key alone.
     ///
     /// # Errors
     ///
@@ -1011,16 +1014,18 @@ impl Remote<'_> {
         self.string("send-command")
     }
 
-    /// Returns the `proxy` key: the `http://` proxy URL of an HTTP pull.
+    /// Returns the `proxy` key: the `http://` proxy URL of an HTTP pull and of
+    /// an HTTP push.
     ///
-    /// An HTTP pull from this remote connects through this proxy. If the value
-    /// is empty, the key counts as absent, and the pull reads the proxy
-    /// environment variables. A pull that uses the key connects through the
-    /// proxy for every origin and ignores `no_proxy`.
+    /// An HTTP pull from this remote and an HTTP push to it connect through
+    /// this proxy. If the value is empty, the key counts as absent, and the
+    /// pull or the push reads the proxy environment variables. A pull or a
+    /// push that uses the key connects through the proxy for every origin and
+    /// ignores `no_proxy`.
     ///
-    /// The call keeps white space at the end of the value. An HTTP pull
-    /// refuses a non-empty value with white space at its start or end. A push
-    /// and a pull over ssh do not read the key.
+    /// The call keeps white space at the end of the value. An HTTP pull and an
+    /// HTTP push refuse a non-empty value with white space at its start or
+    /// end. A push and a pull over ssh do not read the key.
     ///
     /// # Errors
     ///

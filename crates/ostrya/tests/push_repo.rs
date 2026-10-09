@@ -1109,8 +1109,13 @@ const _: fn() = || {
 
 /// The futures of a push can run on a multi-threaded executor.
 #[allow(dead_code)]
-fn push_futures_are_send(repo: &Repo, input: PipeReader, output: PipeWriter) {
+fn push_futures_are_send(
+    repo: &Repo,
+    endpoint: remote::Endpoint,
+    input: PipeReader,
+    output: PipeWriter,
+) {
     fn assert_send<T: Send>(_: &T) {}
-    assert_send(&repo.push("origin", RepoPushOptions::default()));
+    assert_send(&repo.push(endpoint, RepoPushOptions::default()));
     assert_send(&repo.push_over_stream(input, output, RepoPushOptions::default()));
 }

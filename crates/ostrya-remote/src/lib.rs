@@ -62,7 +62,10 @@ pub use session::{
     PushSession, PushStats, ServerInfo, SessionOptions,
 };
 #[doc(hidden)]
-pub use transport::{ConnectOptions, PreparedSession, PullConnectOptions, PushRemote};
+pub use transport::{
+    ConnectOptions, Endpoint, PreparedSession, PullConnectOptions, PushRemote, SshAddress,
+    SshOptions,
+};
 
 // The public types of the protocol move freely across tasks and threads.
 const _: fn() = || {
@@ -95,6 +98,9 @@ const _: fn() = || {
     assert_send_sync::<PullBody>();
     assert_send_sync::<PullSessionOptions>();
     assert_send_sync::<PullConnectOptions>();
+    assert_send_sync::<Endpoint>();
+    assert_send_sync::<SshAddress>();
+    assert_send_sync::<SshOptions>();
 };
 
 /// The futures of a pull session can run on a multi-threaded executor.

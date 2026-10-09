@@ -1,9 +1,9 @@
 use std::ffi::OsStr;
 
-use super::ssh::{SshAddr, quote_posix, receive_command, send_command, ssh_program};
+use super::ssh::{quote_posix, receive_command, send_command, ssh_program};
 use super::*;
 
-fn ssh(address: &str) -> SshAddr {
+fn ssh(address: &str) -> SshAddress {
     match parse_remote(address, false).unwrap().inner {
         RemoteAddr::Ssh(addr) => addr,
         RemoteAddr::Http(url) => panic!("{address} parsed as HTTP: {url}"),
@@ -289,6 +289,236 @@ fn http_addresses_parse_and_their_malformed_forms_are_refused() {
     }
 }
 
+/// The result of the parse of an address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Want {
+    Ssh,
+    Http,
+    Refused,
+}
+
+/// `Endpoint::parse` and `PushRemote::parse` accept and refuse the same
+/// addresses, and each address gives the same transport.
+#[test]
+fn an_endpoint_parses_each_address_as_a_push_remote_does() {
+    use Want::{Http, Refused, Ssh};
+    let rows: &[(&str, bool, Want)] = &[
+        // The forms and their command lines.
+        ("ssh://host/srv/repo", false, Ssh),
+        ("ssh://me@host:2222/srv/repo", false, Ssh),
+        ("ssh://host/~/repos/a", false, Ssh),
+        ("ssh://me@[::1]:22/r", false, Ssh),
+        ("ssh://[::1]/r", false, Ssh),
+        ("host:repo", false, Ssh),
+        ("me@host:/srv/repo", false, Ssh),
+        ("host:~/repo", false, Ssh),
+        ("[::1]:repo", false, Ssh),
+        ("me@[fe80::1]:a:b", false, Ssh),
+        ("C:repo", false, Ssh),
+        ("host:%41", false, Ssh),
+        // The home prefix.
+        ("ssh://h/~/a/b", false, Ssh),
+        ("h:a/b", false, Ssh),
+        ("h:~/a", false, Ssh),
+        ("h:a", false, Ssh),
+        ("ssh://h/a/b", false, Ssh),
+        ("ssh://u@[::1]:7/x", false, Ssh),
+        ("host:~//etc/repo", false, Ssh),
+        ("host:etc/repo", false, Ssh),
+        ("ssh://host/~//etc/repo", false, Ssh),
+        ("ssh://host/~///etc/repo", false, Ssh),
+        ("host:~//", false, Refused),
+        ("ssh://host/~//", false, Refused),
+        ("host:~///", false, Refused),
+        // The first `:` of the scp form.
+        ("u:p@host:path", false, Ssh),
+        ("fe80::1:repo", false, Ssh),
+        ("[fe80::1]:repo", false, Ssh),
+        ("ssh://u:p@host/r", false, Refused),
+        // The characters of a host and of a user.
+        ("ssh://ho st/p", false, Refused),
+        ("ssh://h?x/p", false, Refused),
+        ("ssh://h;x/p", false, Refused),
+        ("ssh://$(x)/p", false, Refused),
+        ("ssh://h\nx/p", false, Refused),
+        ("ssh://h\tx/p", false, Refused),
+        ("ssh://h`x`/p", false, Refused),
+        ("ssh://h|x/p", false, Refused),
+        ("ssh://h&x/p", false, Refused),
+        ("ssh://h'x/p", false, Refused),
+        ("ssh://h\\x/p", false, Refused),
+        ("ssh://u x@h/p", false, Refused),
+        ("ssh://u;x@h/p", false, Refused),
+        ("ssh://$(u)@h/p", false, Refused),
+        ("ssh://u\n@h/p", false, Refused),
+        ("ssh://[::1;x]/p", false, Refused),
+        ("ssh://[::1 ]/p", false, Refused),
+        ("ssh://[fe80::1%e$x]/p", false, Refused),
+        ("ssh://[g::1]/p", false, Refused),
+        ("ho st:p", false, Refused),
+        ("h?x:p", false, Refused),
+        ("h;x:p", false, Refused),
+        ("$(x):p", false, Refused),
+        ("h\nx:p", false, Refused),
+        ("h\tx:p", false, Refused),
+        ("u x@h:p", false, Refused),
+        ("u;x@h:p", false, Refused),
+        ("$(u)@h:p", false, Refused),
+        ("u\t@h:p", false, Refused),
+        ("[::1;x]:p", false, Refused),
+        ("ssh://my-host.example_1/p", false, Ssh),
+        ("ssh://u.s-e_r@h/p", false, Ssh),
+        ("ssh://[fe80::1%eth0]/p", false, Ssh),
+        ("ssh://[::ffff:192.0.2.1]:22/p", false, Ssh),
+        ("my-host.example_1:p", false, Ssh),
+        ("u.s-e_r@h:p", false, Ssh),
+        ("[fe80::1%eth0]:p", false, Ssh),
+        // A backslash before the first `:`.
+        ("..\\dir:x", true, Refused),
+        ("..\\dir:x", false, Refused),
+        ("\\\\?\\C:\\repo", true, Refused),
+        ("\\\\?\\C:\\repo", false, Refused),
+        ("dir\\sub:x", true, Refused),
+        ("dir\\sub:x", false, Refused),
+        // Malformed addresses.
+        ("ssh://-oProxyCommand=x/r", false, Refused),
+        ("ssh://-u@host/r", false, Refused),
+        ("-oProxyCommand=x:r", false, Refused),
+        ("-u@host:r", false, Refused),
+        ("ssh://host", false, Refused),
+        ("ssh:///r", false, Refused),
+        ("ssh://@host/r", false, Refused),
+        ("ssh://host:/r", false, Refused),
+        ("ssh://host:0/r", false, Refused),
+        ("ssh://host:65536/r", false, Refused),
+        ("ssh://host:22x/r", false, Refused),
+        ("ssh://u:pw@host/r", false, Refused),
+        ("ssh://a@b@host/r", false, Refused),
+        ("ssh://host/~", false, Refused),
+        ("ssh://host/~/", false, Refused),
+        ("ssh://host/~user/r", false, Refused),
+        ("ssh://[::1/r", false, Refused),
+        ("ssh://[::1]x/r", false, Refused),
+        ("host:", false, Refused),
+        ("host:~", false, Refused),
+        ("host:~user/r", false, Refused),
+        ("a@b@host:r", false, Refused),
+        ("@host:r", false, Refused),
+        (":r", false, Refused),
+        ("[::1:r", false, Refused),
+        ("ho]st:r", false, Refused),
+        ("file:///srv/repo", false, Refused),
+        ("ftp://host/r", false, Refused),
+        ("/srv/repo", false, Refused),
+        ("repo", false, Refused),
+        ("dir/host:r", false, Refused),
+        ("http://", false, Refused),
+        // A one-letter host on Windows.
+        ("C:\\repo", true, Refused),
+        ("C:\\repo", false, Ssh),
+        ("C:repo", true, Refused),
+        ("c:/repo", true, Refused),
+        ("c:/repo", false, Ssh),
+        ("u@C:repo", true, Refused),
+        ("u@C:repo", false, Ssh),
+        ("ssh://C/repo", true, Ssh),
+        ("ab:repo", true, Ssh),
+        ("[C]:repo", true, Ssh),
+        // HTTP addresses.
+        ("http://h/repo", false, Http),
+        ("https://h:8443/repo", false, Http),
+        ("http://127.0.0.1:8080/", false, Http),
+        ("https://[::1]/", false, Http),
+        ("https://h", false, Http),
+        ("http://h:080/", false, Http),
+        ("https://:443/r", false, Refused),
+        ("https://user:pw-QXZ@h/r", false, Refused),
+        ("https://h/r?x=1", false, Refused),
+        ("https://h/r#frag", false, Refused),
+        ("https://h:65536/r", false, Refused),
+        ("http://h:port/r", false, Refused),
+        ("https://user:443/pw-QXZ@h/repo", false, Refused),
+        ("https://user:1234?pw-QXZ@h/", false, Refused),
+        ("http://h:+80/", false, Refused),
+    ];
+    for &(address, windows, want) in rows {
+        let remote = parse_remote(address, windows);
+        let endpoint = parse_endpoint(address, windows);
+        let case = format!("{address:?} windows={windows}");
+        match want {
+            Ssh => {
+                let RemoteAddr::Ssh(from_remote) = remote.unwrap().inner else {
+                    panic!("{case}: the push remote is not ssh");
+                };
+                let Ok(Endpoint::Ssh { address, options }) = endpoint else {
+                    panic!("{case}: the endpoint is not ssh: {endpoint:?}");
+                };
+                assert_eq!(address, from_remote, "{case}");
+                assert_eq!(options, SshOptions::default(), "{case}");
+            }
+            Http => {
+                let RemoteAddr::Http(url) = remote.unwrap().inner else {
+                    panic!("{case}: the push remote is not HTTP");
+                };
+                assert_eq!(url, address, "{case}");
+                let Ok(Endpoint::Http(http)) = endpoint else {
+                    panic!("{case}: the endpoint is not HTTP: {endpoint:?}");
+                };
+                let new = ostrya_fetch::FetcherOptions::new(address);
+                assert_eq!(http.mirrors, vec![address.to_owned()], "{case}");
+                assert_eq!(http.headers, new.headers, "{case}");
+                assert!(http.basic_auth.is_none(), "{case}");
+                assert!(http.bearer_token.is_none(), "{case}");
+                assert_eq!(
+                    http.allow_cleartext_credentials, new.allow_cleartext_credentials,
+                    "{case}"
+                );
+                assert_eq!(http.max_retries, new.max_retries, "{case}");
+                assert_eq!(http.max_redirects, new.max_redirects, "{case}");
+                assert_eq!(http.max_outstanding, new.max_outstanding, "{case}");
+            }
+            Refused => {
+                let Err(Error::InvalidInput(from_remote)) = remote else {
+                    panic!("{case}: the push remote is not refused: {remote:?}");
+                };
+                let Err(Error::InvalidInput(msg)) = endpoint else {
+                    panic!("{case}: the endpoint is not refused: {endpoint:?}");
+                };
+                assert_eq!(msg, from_remote, "{case}");
+            }
+        }
+    }
+}
+
+/// The parse of an ssh address refuses an HTTP address, and the message does
+/// not show the address.
+#[test]
+fn an_ssh_address_is_not_an_http_address() {
+    for address in [
+        "http://h/repo",
+        "https://h:8443/repo",
+        "https://user:pw-QXZ@h/r",
+        "https://user:443/pw-QXZ@h/repo",
+        "http://",
+    ] {
+        for windows in [false, true] {
+            match SshAddress::parse_with(address, windows) {
+                Err(Error::InvalidInput(msg)) => {
+                    assert_eq!(msg, "address: an HTTP address is not an ssh address");
+                }
+                other => panic!("{address}: expected a refusal, got {other:?}"),
+            }
+        }
+        assert!(SshAddress::parse(address).is_err(), "{address}");
+    }
+    // The other schemes keep their refusal.
+    let msg = match SshAddress::parse_with("ftp://host/r", false) {
+        Err(Error::InvalidInput(msg)) => msg,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    assert_eq!(msg, "address 'ftp://host/r': the scheme is not supported");
+}
+
 /// With an ssh address, an HTTP option and a non-default `http` field are
 /// refused before the ssh client starts.
 #[test]
@@ -423,6 +653,49 @@ fn the_ssh_command_is_explicit_then_env_then_remote_key() {
         strings(&["key-ssh", "-q"])
     );
     assert_eq!(ssh_program(None, None, None).unwrap(), strings(&["ssh"]));
+}
+
+/// The ssh program of the options comes from `command`, then from the
+/// environment variable, then from `config_command`, then it is `ssh`. The
+/// remote command does not change it.
+#[test]
+fn the_ssh_program_of_the_options_is_command_then_env_then_config_command() {
+    let command = strings(&["my ssh", "-F", "cfg"]);
+    let env = OsStr::new("env-ssh  -v\t-4");
+    for remote_command in [None, Some("/opt/ostrya receive".to_owned())] {
+        let all = SshOptions {
+            command: Some(command.clone()),
+            config_command: Some("key-ssh -q".into()),
+            remote_command: remote_command.clone(),
+        };
+        assert_eq!(all.program(Some(env)).unwrap(), command);
+        let no_command = SshOptions {
+            command: None,
+            ..all.clone()
+        };
+        assert_eq!(
+            no_command.program(Some(env)).unwrap(),
+            strings(&["env-ssh", "-v", "-4"])
+        );
+        assert_eq!(
+            no_command.program(None).unwrap(),
+            strings(&["key-ssh", "-q"])
+        );
+        let none = SshOptions {
+            remote_command,
+            ..SshOptions::default()
+        };
+        assert_eq!(none.program(None).unwrap(), strings(&["ssh"]));
+    }
+    let empty = SshOptions {
+        command: Some(Vec::new()),
+        ..SshOptions::default()
+    };
+    assert!(matches!(empty.program(None), Err(Error::InvalidInput(_))));
+    assert!(matches!(
+        SshOptions::default().program(Some(OsStr::new(" \t "))),
+        Err(Error::InvalidInput(_))
+    ));
 }
 
 #[test]

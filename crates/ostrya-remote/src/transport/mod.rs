@@ -6,6 +6,9 @@
 //! opens the session later. [`PullSession::connect`] opens a pull session over
 //! ssh with [`PullConnectOptions`].
 //!
+//! [`Endpoint`] holds an address and the options of its transport: an
+//! [`SshAddress`] with [`SshOptions`], or the options of the HTTP client.
+//!
 //! Over ssh, the client runs the ssh client as a child process, and the remote
 //! side runs the receive command or the send command. The frames of the
 //! session go over the standard input and the standard output of the child.
@@ -19,10 +22,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::session::http::Endpoint;
+use crate::session::http::Endpoint as HttpEndpoint;
 use crate::session::{PullSession, PullSessionOptions, PushSession, SessionOptions};
 
 pub(crate) use ssh::Transport;
+pub use ssh::{SshAddress, SshOptions};
 
 /// The longest wait for a pending message after a failed write, and for the
 /// exit of the ssh client. It applies to a session that
@@ -35,55 +39,8 @@ const PENDING_READ_LIMIT: Duration = Duration::from_secs(5);
 ///
 /// # ssh addresses
 ///
-/// The forms are:
-///
-/// - `ssh://[USER@]HOST[:PORT]/ABSOLUTE/PATH`.
-/// - `ssh://[USER@]HOST[:PORT]/~/RELATIVE/PATH`. The client removes the `/~/`
-///   prefix and sends `RELATIVE/PATH`. The remote side resolves it in the
-///   home directory of the ssh session.
-/// - `[USER@]HOST:PATH`, the scp form. If `PATH` starts with `/`, it is
-///   absolute. Otherwise it is relative to the remote home directory. The
-///   client removes a leading `~/`.
-///
-/// After a `/~/` or a `~/` prefix, the client also removes each leading `/` of
-/// the path. The path then stays relative to the home directory.
-///
-/// In the scp form, the first `:` outside brackets ends the host, as git reads
-/// the form. For example, `u:p@host:path` gives the host `u` and the path
-/// `p@host:path`, so the scp form cannot give a user that holds `:`. An IPv6
-/// host needs brackets: `fe80::1:repo` gives the host `fe80`, and
-/// `[fe80::1]:repo` gives the host `fe80::1`. ssh gets a bracketed host
-/// without the brackets.
-///
-/// A user holds ASCII letters, digits, `.`, `-`, and `_` alone. A host holds
-/// the same characters, or it is a bracketed IPv6 address. A bracketed address
-/// holds hex digits, `:`, and `.`, with an optional `%ZONE` of ASCII letters
-/// and digits. These rules refuse a control character, white space, and a
-/// shell metacharacter in a user or a host.
-///
-/// The parse also refuses:
-///
-/// - a user or a host that starts with `-`, so that no part of an address
-///   reaches ssh as an option
-/// - an empty user, host, or path, and an `ssh://` address with no `/` after
-///   the host
-/// - a port that is not a number from 1 to 65535
-/// - more than one `@`
-/// - a `USER:PASSWORD@` user in the `ssh://` form
-/// - a path of the form `~` or `~USER`
-/// - a stray or an unclosed bracket in the host
-/// - in the scp form, a `/` before the `:` that ends the host
-/// - an address with no `ssh://` prefix and no `:` outside brackets
-/// - a scheme other than `ssh`, `http`, and `https`
-///
-/// The parse decodes no percent escape.
-///
-/// On Windows, the parse refuses a scp-form address that names a local path:
-///
-/// - an address whose host is one ASCII letter (`C:\repo`, `C:repo`)
-/// - an address with a `\` before the first `:` (`..\dir:x`, `\\?\C:\repo`)
-///
-/// The `ssh://` form carries a one-letter host on Windows too.
+/// An address that does not start with `http://` or `https://` is an ssh
+/// address. Its forms and rules are the forms and rules of [`SshAddress`].
 ///
 /// # HTTP addresses
 ///
@@ -98,7 +55,7 @@ pub struct PushRemote {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RemoteAddr {
-    Ssh(ssh::SshAddr),
+    Ssh(SshAddress),
     Http(String),
 }
 
@@ -134,9 +91,83 @@ fn parse_remote(address: &str, windows: bool) -> Result<PushRemote> {
             .map_err(|e| Error::InvalidInput(format!("address: {e}")))?;
         RemoteAddr::Http(address.to_owned())
     } else {
-        RemoteAddr::Ssh(ssh::SshAddr::parse(address, windows)?)
+        RemoteAddr::Ssh(SshAddress::parse_with(address, windows)?)
     };
     Ok(PushRemote { inner })
+}
+
+/// A remote address with the options of its transport.
+///
+/// [`Endpoint::parse`] reads an address and gives the default options. A
+/// caller can also build an endpoint from its parts, with options of its own.
+#[derive(Debug, Clone)]
+pub enum Endpoint {
+    /// An ssh address and the options of the ssh client.
+    Ssh {
+        /// The ssh address.
+        address: SshAddress,
+        /// The options of the ssh client.
+        options: SshOptions,
+    },
+    /// The options of the HTTP client. The `mirrors` field holds the address.
+    Http(ostrya_fetch::FetcherOptions),
+}
+
+impl Endpoint {
+    /// Parses `address` into an endpoint with the default options.
+    ///
+    /// An address that starts with `http://` or `https://` gives
+    /// [`Endpoint::Http`] with
+    /// [`FetcherOptions::new`](ostrya_fetch::FetcherOptions::new) of the
+    /// address. Each other address gives [`Endpoint::Ssh`] with the default
+    /// [`SshOptions`]. The call accepts and refuses the same addresses as
+    /// [`PushRemote::parse`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if `address` is not one of the
+    ///   [ssh forms](SshAddress#forms) or the
+    ///   [HTTP forms](PushRemote#http-addresses), or if the parse refuses a
+    ///   part of it. The refusal of an address that starts with `http://` or
+    ///   `https://` does not show the userinfo.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ostrya_remote::transport::Endpoint;
+    /// # fn main() -> ostrya_remote::Result<()> {
+    /// let endpoint = Endpoint::parse("builder@repo.example.com:/srv/repo")?;
+    /// let Endpoint::Ssh { address, options } = endpoint else {
+    ///     panic!("an scp-form address gives an ssh endpoint");
+    /// };
+    /// assert_eq!(address.to_string(), "ssh://builder@repo.example.com/srv/repo");
+    /// assert_eq!(options.remote_command, None);
+    ///
+    /// let Endpoint::Http(http) = Endpoint::parse("https://repo.example.com/")? else {
+    ///     panic!("an https address gives an HTTP endpoint");
+    /// };
+    /// assert_eq!(http.mirrors, ["https://repo.example.com/"]);
+    /// # Ok(()) }
+    /// ```
+    pub fn parse(address: &str) -> Result<Endpoint> {
+        parse_endpoint(address, cfg!(windows))
+    }
+}
+
+/// Parses `address` as [`Endpoint::parse`] does, with the Windows rules of an
+/// ssh address if `windows` is `true`.
+fn parse_endpoint(address: &str, windows: bool) -> Result<Endpoint> {
+    if address.starts_with("http://") || address.starts_with("https://") {
+        // The message of the fetcher holds no userinfo.
+        ostrya_fetch::check_base_url(address)
+            .map_err(|e| Error::InvalidInput(format!("address: {e}")))?;
+        Ok(Endpoint::Http(ostrya_fetch::FetcherOptions::new(address)))
+    } else {
+        Ok(Endpoint::Ssh {
+            address: SshAddress::parse_with(address, windows)?,
+            options: SshOptions::default(),
+        })
+    }
 }
 
 /// The transport options of a push session.
@@ -517,7 +548,7 @@ pub(crate) enum Prepared {
     /// The command line of the ssh client.
     Ssh(Vec<String>),
     /// The receive endpoint of an HTTP server.
-    Http(Endpoint),
+    Http(HttpEndpoint),
 }
 
 /// Checks `connect` for `remote` and makes the transport ready to open, with
@@ -548,7 +579,7 @@ async fn prepare_with(
 }
 
 /// Refuses a field of `connect` that applies to an HTTP address alone.
-fn refuse_http_fields(addr: &ssh::SshAddr, connect: &ConnectOptions) -> Result<()> {
+fn refuse_http_fields(addr: &SshAddress, connect: &ConnectOptions) -> Result<()> {
     // Each name is the remote key and the CLI option of the field. The
     // options of the HTTP client have neither, so the field names them.
     let set = [

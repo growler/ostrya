@@ -1,5 +1,5 @@
-//! The ssh transport: the address parser, the command line, and the child
-//! process of the ssh client.
+//! The ssh transport: the address parser, the options of the ssh client, the
+//! command line, and the child process of the ssh client.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -19,8 +19,61 @@ fn invalid(msg: impl Into<String>) -> Error {
 }
 
 /// A parsed ssh address.
+///
+/// # Forms
+///
+/// The forms are:
+///
+/// - `ssh://[USER@]HOST[:PORT]/ABSOLUTE/PATH`.
+/// - `ssh://[USER@]HOST[:PORT]/~/RELATIVE/PATH`. The client removes the `/~/`
+///   prefix and sends `RELATIVE/PATH`. The remote side resolves it in the
+///   home directory of the ssh session.
+/// - `[USER@]HOST:PATH`, the scp form. If `PATH` starts with `/`, it is
+///   absolute. Otherwise it is relative to the remote home directory. The
+///   client removes a leading `~/`.
+///
+/// After a `/~/` or a `~/` prefix, the client also removes each leading `/` of
+/// the path. The path then stays relative to the home directory.
+///
+/// In the scp form, the first `:` outside brackets ends the host, as git reads
+/// the form. For example, `u:p@host:path` gives the host `u` and the path
+/// `p@host:path`, so the scp form cannot give a user that holds `:`. An IPv6
+/// host needs brackets: `fe80::1:repo` gives the host `fe80`, and
+/// `[fe80::1]:repo` gives the host `fe80::1`. ssh gets a bracketed host
+/// without the brackets.
+///
+/// A user holds ASCII letters, digits, `.`, `-`, and `_` alone. A host holds
+/// the same characters, or it is a bracketed IPv6 address. A bracketed address
+/// holds hex digits, `:`, and `.`, with an optional `%ZONE` of ASCII letters
+/// and digits. These rules refuse a control character, white space, and a
+/// shell metacharacter in a user or a host.
+///
+/// [`parse`](SshAddress::parse) also refuses:
+///
+/// - a user or a host that starts with `-`, so that no part of an address
+///   reaches ssh as an option
+/// - an empty user, host, or path, and an `ssh://` address with no `/` after
+///   the host
+/// - a port that is not a number from 1 to 65535
+/// - more than one `@`
+/// - a `USER:PASSWORD@` user in the `ssh://` form
+/// - a path of the form `~` or `~USER`
+/// - a stray or an unclosed bracket in the host
+/// - in the scp form, a `/` before the `:` that ends the host
+/// - an address with no `ssh://` prefix and no `:` outside brackets
+/// - a scheme other than `ssh`. An `http://` or an `https://` address gets a
+///   message of its own.
+///
+/// The parse decodes no percent escape.
+///
+/// On Windows, the parse refuses a scp-form address that names a local path:
+///
+/// - an address whose host is one ASCII letter (`C:\repo`, `C:repo`)
+/// - an address with a `\` before the first `:` (`..\dir:x`, `\\?\C:\repo`)
+///
+/// The `ssh://` form carries a one-letter host on Windows too.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SshAddr {
+pub struct SshAddress {
     user: Option<String>,
     /// The host, without the brackets of an IPv6 address.
     host: String,
@@ -30,13 +83,40 @@ pub(super) struct SshAddr {
     path: String,
 }
 
-impl SshAddr {
+impl SshAddress {
+    /// Parses `address` as one of the [forms](SshAddress#forms) of an ssh
+    /// address.
+    ///
+    /// On Windows, the call also refuses a scp-form address that names a local
+    /// path.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if `address` is not one of the forms, or if
+    ///   the parse refuses a part of it. The message holds the address and the
+    ///   reason. The refusal of an `http://` or an `https://` address does not
+    ///   show the address, because the address can hold userinfo.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ostrya_remote::transport::SshAddress;
+    /// # fn main() -> ostrya_remote::Result<()> {
+    /// let address = SshAddress::parse("builder@repo.example.com:repos/os")?;
+    /// assert_eq!(address.to_string(), "ssh://builder@repo.example.com/~/repos/os");
+    /// assert!(SshAddress::parse("https://repo.example.com/").is_err());
+    /// # Ok(()) }
+    /// ```
+    pub fn parse(address: &str) -> Result<SshAddress> {
+        SshAddress::parse_with(address, cfg!(windows))
+    }
+
     /// Parses an `ssh://` address or a scp-form address.
     ///
     /// If `windows` is `true`, the call refuses a scp-form address that names
     /// a local path: a one-letter host, or a `\` before the first `:`. A
     /// refusal is [`Error::InvalidInput`] with the address and the reason.
-    pub(super) fn parse(address: &str, windows: bool) -> Result<SshAddr> {
+    pub(super) fn parse_with(address: &str, windows: bool) -> Result<SshAddress> {
         let bad = |why: &str| invalid(format!("address '{address}': {why}"));
         if let Some(rest) = address.strip_prefix("ssh://") {
             let (authority, path) = match rest.find('/') {
@@ -49,10 +129,14 @@ impl SshAddr {
                 Some(home) => home_relative(home).map_err(&bad)?,
                 None => path,
             };
-            return SshAddr::checked(user, host, port, path).map_err(&bad);
+            return SshAddress::checked(user, host, port, path).map_err(&bad);
+        }
+        if address.starts_with("http://") || address.starts_with("https://") {
+            // The address can hold userinfo, so the message does not show it.
+            return Err(invalid("address: an HTTP address is not an ssh address"));
         }
         if address.contains("://") {
-            return Err(bad("the scheme is not ssh, http, or https"));
+            return Err(bad("the scheme is not supported"));
         }
         let colon = separator(address).ok_or_else(|| bad("not an address"))?;
         let (prefix, path) = (&address[..colon], &address[colon + 1..]);
@@ -77,7 +161,7 @@ impl SshAddr {
             Some(home) => home_relative(home).map_err(&bad)?,
             None => path,
         };
-        SshAddr::checked(user, host, None, path).map_err(&bad)
+        SshAddress::checked(user, host, None, path).map_err(&bad)
     }
 
     fn checked(
@@ -85,7 +169,7 @@ impl SshAddr {
         host: Host<'_>,
         port: Option<u16>,
         path: &str,
-    ) -> std::result::Result<SshAddr, &'static str> {
+    ) -> std::result::Result<SshAddress, &'static str> {
         if let Some(user) = user {
             if user.is_empty() {
                 return Err("the user is empty");
@@ -116,7 +200,7 @@ impl SshAddr {
         if path.is_empty() {
             return Err("the path is empty");
         }
-        Ok(SshAddr {
+        Ok(SshAddress {
             user: user.map(str::to_owned),
             host: host.name.to_owned(),
             port,
@@ -145,7 +229,11 @@ impl SshAddr {
     }
 }
 
-impl fmt::Display for SshAddr {
+/// Writes the address in the `ssh://` form.
+///
+/// A path that is relative to the home directory gets the `/~/` prefix, and an
+/// IPv6 host gets brackets.
+impl fmt::Display for SshAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ssh://")?;
         if let Some(user) = &self.user {
@@ -164,6 +252,74 @@ impl fmt::Display for SshAddr {
         } else {
             write!(f, "/~/{}", self.path)
         }
+    }
+}
+
+/// The options of the ssh client of a session.
+///
+/// The struct carries no `#[non_exhaustive]`. A caller builds it with
+/// `..Default::default()`.
+///
+/// # ssh command line
+///
+/// The command line is:
+///
+/// ```text
+/// SSH_COMMAND... [-p PORT] [USER@]HOST 'REMOTE_COMMAND --repo=QUOTED_PATH'
+/// ```
+///
+/// The last argument is one string, and the remote shell parses it. The client
+/// quotes the path with POSIX single quotes, so the path gets no expansion.
+///
+/// `SSH_COMMAND` comes from the first of these that is set:
+///
+/// 1. [`command`](SshOptions::command)
+/// 2. the `OSTRYA_SSH_COMMAND` environment variable
+/// 3. [`config_command`](SshOptions::config_command)
+///
+/// If none is set, `SSH_COMMAND` is `ssh`. The client splits the environment
+/// variable and `config_command` at ASCII white space, with no quoting rule. A
+/// command with an argument that holds white space must come from `command`.
+///
+/// `REMOTE_COMMAND` is [`remote_command`](SshOptions::remote_command). If that
+/// field is not set, it is `ostrya receive` for a push and `ostrya send` for a
+/// pull.
+///
+/// The ssh client writes to the standard error of this process. Host key
+/// prompts, password prompts, and the diagnostics of the server reach the
+/// user through it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SshOptions {
+    /// The ssh command line, as a list of arguments.
+    ///
+    /// It wins over the `OSTRYA_SSH_COMMAND` environment variable and over
+    /// [`config_command`](SshOptions::config_command). An empty list is
+    /// refused, and so is a list whose first argument holds only white space.
+    pub command: Option<Vec<String>>,
+    /// The ssh command line from the configuration of a remote.
+    ///
+    /// It is the value of the remote key `ssh-command`. The client splits it at
+    /// ASCII white space. It has the lowest precedence: the
+    /// `OSTRYA_SSH_COMMAND` environment variable wins over it.
+    pub config_command: Option<String>,
+    /// The command that the remote side runs.
+    ///
+    /// The remote shell parses it. The default is `ostrya receive` for a push
+    /// and `ostrya send` for a pull.
+    pub remote_command: Option<String>,
+}
+
+impl SshOptions {
+    /// Returns the ssh command line from the first source that is set, with
+    /// `env` as the value of the `OSTRYA_SSH_COMMAND` environment variable.
+    ///
+    /// The order is [`command`](SshOptions::command), then `env`, then
+    /// [`config_command`](SshOptions::config_command), then `ssh`. An empty
+    /// command and an `env` that is not UTF-8 are [`Error::InvalidInput`].
+    // No session calls this function. The tests call it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn program(&self, env: Option<&OsStr>) -> Result<Vec<String>> {
+        ssh_program(self.command.as_deref(), env, self.config_command.as_deref())
     }
 }
 

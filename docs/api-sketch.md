@@ -3586,6 +3586,22 @@ remote key, which is also the CLI option without `--`, for example
 `push-user needs push-token-file` and `ssh-command applies to an ssh
 address`. A refusal of a field of `http` names `ConnectOptions::http`.
 
+`Endpoint` holds a remote address with the options of its transport.
+`Endpoint::Ssh` holds an `SshAddress` and the `SshOptions` of the ssh
+client. `Endpoint::Http` holds the `FetcherOptions` of the HTTP client, and
+its `mirrors` field holds the address. `Endpoint::parse` accepts and refuses
+the same addresses as `PushRemote::parse`. An `http://` or `https://`
+address gives `Endpoint::Http` with `FetcherOptions::new` of the address.
+Each other address gives `Endpoint::Ssh` with the default `SshOptions`.
+`SshAddress::parse` reads the ssh forms alone, and it refuses an `http://`
+or `https://` address with a message that does not show the address. The
+`Display` of an `SshAddress` writes the `ssh://` form. `SshOptions` holds
+`command`, `config_command`, and `remote_command`. The ssh command is
+`SshOptions::command`, then the `OSTRYA_SSH_COMMAND` environment variable,
+then `SshOptions::config_command`, then `ssh`. `config_command` holds the
+remote key `ssh-command`. `remote_command` defaults to `ostrya receive` for
+a push and `ostrya send` for a pull.
+
 `PushSession::connect` is `PushSession::prepare` and then
 `PreparedSession::open`. `prepare` checks the options and makes the
 transport ready: for ssh it builds the command line, and for HTTP it reads
@@ -3726,6 +3742,30 @@ pub struct PushRemote { inner: RemoteAddr }
 
 impl PushRemote {
     pub fn parse(address: &str) -> Result<PushRemote>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshAddress { user, host, port, path }   // Display: the ssh:// form
+
+impl SshAddress {
+    pub fn parse(address: &str) -> Result<SshAddress>;   // the ssh forms alone
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SshOptions {
+    pub command: Option<Vec<String>>,         // wins over OSTRYA_SSH_COMMAND
+    pub config_command: Option<String>,       // the remote key, lowest
+    pub remote_command: Option<String>,       // default "ostrya receive" or "ostrya send"
+}
+
+#[derive(Debug, Clone)]
+pub enum Endpoint {
+    Ssh { address: SshAddress, options: SshOptions },
+    Http(ostrya_fetch::FetcherOptions),       // the mirrors hold the address
+}
+
+impl Endpoint {
+    pub fn parse(address: &str) -> Result<Endpoint>;
 }
 
 #[derive(Debug, Clone, Default)]

@@ -237,7 +237,8 @@ impl SshAddress {
     }
 
     /// Returns the address with no user, for a message.
-    pub(super) fn without_user(&self) -> SshAddress {
+    #[doc(hidden)]
+    pub fn without_user(&self) -> SshAddress {
         SshAddress {
             user: None,
             ..self.clone()

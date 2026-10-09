@@ -3892,6 +3892,133 @@ pub fn resolve_push_remote(config: Option<&RepoConfig>, remote: &str,
     -> Result<(PushRemote, ConnectOptions)>;
 ```
 
+## Endpoint resolution
+
+The module `ostrya::endpoint` reads the keys of a remote section and the
+files that the keys name. It gives a `remote::Endpoint` that holds all
+values in memory. `resolve_pull` is in every build. The `push` feature
+gates `resolve_push`. `Repo::pull` and `Repo::push` do not call the
+resolvers yet.
+
+```rust
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct EndpointOverrides {
+    pub url: Option<String>,                  // pull alone
+    pub push_token_file: Option<PathBuf>,     // push alone
+    pub push_user: Option<String>,            // push alone
+    pub tls_ca_path: Option<PathBuf>,
+    pub tls_client_cert_path: Option<PathBuf>,
+    pub tls_client_key_path: Option<PathBuf>,
+    pub ssh_command: Option<Vec<String>>,
+    pub remote_command: Option<String>,       // receive or send command
+    pub allow_cleartext_credentials: bool,
+    pub http_headers: Vec<(String, String)>,
+    pub max_retries: Option<u32>,
+    pub low_speed_limit_bytes: Option<u32>,
+    pub low_speed_time: Option<Duration>,
+}
+
+pub async fn resolve_pull(config: Option<&RepoConfig>, remote: &str,
+                          overrides: EndpointOverrides) -> Result<Endpoint>;
+#[cfg(feature = "push")]
+pub async fn resolve_push(config: Option<&RepoConfig>, remote_or_address: &str,
+                          overrides: EndpointOverrides) -> Result<Endpoint>;
+pub async fn read_token_file(path: &Path) -> Result<String>;
+pub async fn read_pem_file(key: &str, path: &Path) -> Result<Vec<u8>>;
+```
+
+`EndpointOverrides` holds the values of the caller. A value of the caller
+wins over its remote key, and each field resolves on its own. The `Debug`
+output shows `url` without its userinfo, and shows `<redacted>` in place of
+each header value.
+
+Rules of both resolvers:
+
+- Each refusal that needs no file comes before the first file read.
+- The readers run on the blocking pool. The PEM reader reads at most 1 MiB
+  and one byte of a file. The token reader stops at the first LF, and reads
+  at most 1 MiB and one byte. A file that cannot be read is `Error::Io`, and
+  the message names the key and the path. A PEM file over 1 MiB, or a token
+  file whose first line is over 1 MiB, is `Error::InvalidInput`, and the
+  message names the key and the path.
+- The token file holds the token on its first line. The grammar is the
+  grammar of the token file in `docs/format-reference.md`.
+- The key `proxy` gives `Proxy::Url`. An empty or absent key, or no
+  section, gives `Proxy::Environment`. A value with white space at its start
+  or end is `Error::Unsupported`.
+- A client certificate path with no key path, or a key path with no
+  certificate path, is refused. The client key must need no passphrase.
+- For an ssh address, the resolvers refuse each field of an HTTP address.
+  The order of the check is `push-token-file` and `push-user` (push alone),
+  `tls-ca-path`, `tls-client-cert-path`, `tls-client-key-path`,
+  `allow-cleartext-credentials`, `http-header`, `network-retries` (a value
+  above 0), `low-speed-limit-bytes`, and `low-speed-time-seconds`. The
+  message names the first field that is set, and shows the address in the
+  `ssh://` form with no user. A retry count of 0 is accepted.
+- `ssh_command` gives `SshOptions::command`, and the key `ssh-command`
+  gives `SshOptions::config_command`.
+- No field sets the timeouts, `http2`, or `max_outstanding` of
+  `FetcherOptions`. A caller changes them in the returned `Endpoint::Http`.
+
+`resolve_pull`:
+
+- It refuses `push_token_file` and `push_user` with `Error::InvalidInput`
+  before it reads the address.
+- The address is `url` of the caller, then the key `pull-url`, then the key
+  `url`. A value that starts with `ssh://`, or that holds no `://`, is an
+  ssh address. Each other value goes to the fetcher as written. An ssh
+  address in the key `url` is `Error::Pull`. A name with no section and no
+  `url` of the caller is `Error::Pull`. The keys `contenturl` and
+  `metalink` are not read.
+- For an HTTP address, it refuses `ssh_command` (`ssh-command`) and
+  `remote_command` (`send-command`) with `Error::InvalidInput`.
+- The trust anchors come from `tls_ca_path` of the caller. Else
+  `tls-permissive=true` gives `TrustRoots::DangerousAcceptAnyChain`, and the
+  key `tls-ca-path` is not read. Else the key `tls-ca-path` gives
+  `TrustRoots::Pem`. Else the trust setting is `TrustRoots::System`. The
+  key `tls-permissive` is read for `http://` too.
+- A lone certificate or key is `Error::Pull`.
+- The pull defaults apply: `max_retries` 5, `max_outstanding` 8, and a low
+  speed limit of 1000 bytes per second for 30 seconds. A low-speed field
+  left `None` takes its default. A zero in either field turns the rule off.
+  A `max_retries` of 0 turns the retries off.
+- For an ssh address, `remote_command`, or else the key `send-command`,
+  gives `SshOptions::remote_command`.
+
+`resolve_push`:
+
+- It refuses `url` before it reads the address.
+- The address rules are the rules of `resolve_push_remote` in "Push
+  remotes".
+- For an `https://` address of a section, `tls-permissive=true` is refused.
+  An `http://` address does not read the key.
+- For an HTTP address, it refuses `ssh_command` (`ssh-command`) and
+  `remote_command` (`receive-command`).
+- The keys `push-token-file`, `push-user`, `tls-ca-path`,
+  `tls-client-cert-path`, and `tls-client-key-path` fill each field that the
+  caller leaves `None`. A `push_user` with no token file, or one that is
+  empty or holds `:`, is refused.
+- A token to an `http://` address is refused if the caller does not set
+  `allow_cleartext_credentials`. This check comes before the read of the
+  key `proxy` and before the first file read. `Fetcher::new` also refuses
+  such a token.
+- The token and a `push_user` give `basic_auth`. The token alone gives
+  `bearer_token`.
+- `max_retries` of `None` keeps the default of `FetcherOptions`. With no
+  low-speed field, the push has no low-speed rule. With one field, the
+  other field takes its pull default.
+- For an ssh address, `remote_command`, or else the key `receive-command`,
+  gives `SshOptions::remote_command`.
+- A refusal of `url`, of a remote with no push address, of
+  `tls-permissive`, of an ssh field, of a lone certificate or key, of a
+  `push_user`, of a cleartext token, or of an HTTP field for an ssh address
+  is `Error::Remote` with `remote::Error::InvalidInput`. An address that
+  does not parse is `Error::Remote` with the error of `Endpoint::parse`. A
+  key `proxy` with white space is `Error::Unsupported`. The errors of the
+  readers, `Error::Io` and `Error::InvalidInput`, pass through as they are.
+  A malformed escape sequence in a key that the push reads, or a
+  `tls-permissive` that is not a boolean, is `Error::Core`.
+
 ## Push from a repository
 
 `Repo::push`, under the `push` feature, pushes the commits that a set of

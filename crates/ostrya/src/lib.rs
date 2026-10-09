@@ -26,6 +26,7 @@
 //! - Checkout and export: [`checkout`], [`composefs`], [`tar`], and [`archive`].
 //! - Pull: [`pull`], [`summary`], [`fetch`], the HTTP client of `ostrya-fetch`, and [`remote`] for the pull over ssh.
 //! - Push and receive: [`remote`], the wire protocol of `ostrya-remote`, and `receive`.
+//! - Remote resolution: [`endpoint`], which reads the keys and files of a remote for a pull or a push.
 //! - Signing: [`sign`], `gpg`, and `spki`.
 //! - Maintenance: [`prune`], [`fsck`], [`diff`], [`update`], and [`config`].
 //! - Static deltas: [`DeltaSuperblock`], [`DeltaOptions`], and [`Repo::generate_static_delta`].
@@ -61,6 +62,7 @@ pub mod config;
 mod delta;
 mod deltagen;
 pub mod diff;
+pub mod endpoint;
 pub mod error;
 pub use ostrya_fetch as fetch;
 pub use ostrya_remote as remote;

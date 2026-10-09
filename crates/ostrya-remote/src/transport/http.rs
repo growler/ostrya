@@ -72,7 +72,8 @@ pub(super) async fn prepare(url: &str, connect: &ConnectOptions) -> Result<Endpo
 /// The refused values are:
 ///
 /// - an ssh field
-/// - mirrors or a Basic credential in [`ConnectOptions::http`]
+/// - mirrors, a Basic credential, a bearer token, or the cleartext permission
+///   in [`ConnectOptions::http`]
 /// - a TLS setting that verifies no server certificate
 /// - two fields that set one thing, for example `tls_ca_path` and the trust
 ///   roots of `http`
@@ -102,6 +103,18 @@ fn check(url: &str, connect: &ConnectOptions) -> Result<()> {
         return Err(invalid(
             "ConnectOptions::http sets basic_auth: a push takes its credential from \
              push-token-file and push-user",
+        ));
+    }
+    if http.bearer_token.is_some() {
+        return Err(invalid(
+            "ConnectOptions::http sets bearer_token: a push takes its credential from \
+             push-token-file",
+        ));
+    }
+    if http.allow_cleartext_credentials {
+        return Err(invalid(
+            "ConnectOptions::http sets allow_cleartext_credentials: a push takes the \
+             permission for its push token from ConnectOptions::allow_cleartext_credentials",
         ));
     }
     if matches!(
@@ -162,6 +175,8 @@ pub(super) fn is_default(http: &FetcherOptions) -> bool {
         mirrors,
         headers,
         basic_auth,
+        bearer_token,
+        allow_cleartext_credentials,
         tls,
         proxy,
         http2,
@@ -183,6 +198,8 @@ pub(super) fn is_default(http: &FetcherOptions) -> bool {
     *mirrors == d.mirrors
         && *headers == d.headers
         && *basic_auth == d.basic_auth
+        && *bearer_token == d.bearer_token
+        && *allow_cleartext_credentials == d.allow_cleartext_credentials
         && *tls == d.tls
         && same_proxy
         && *http2 == d.http2
@@ -571,6 +588,12 @@ mod tests {
             password: "p".into(),
         });
         assert!(refused("https://h/", connect).contains("basic_auth"));
+        let mut connect = ConnectOptions::default();
+        connect.http.bearer_token = Some(BearerToken { token: "t".into() });
+        assert!(refused("https://h/", connect).contains("bearer_token"));
+        let mut connect = ConnectOptions::default();
+        connect.http.allow_cleartext_credentials = true;
+        assert!(refused("https://h/", connect).contains("allow_cleartext_credentials"));
     }
 
     /// An ssh option with an HTTP address is refused.
@@ -609,8 +632,10 @@ mod tests {
     #[test]
     fn the_default_http_options_are_default() {
         assert!(is_default(&FetcherOptions::default()));
-        let changes: [fn(&mut FetcherOptions); 6] = [
+        let changes: [fn(&mut FetcherOptions); 8] = [
             |h| h.headers.push(("x".into(), "y".into())),
+            |h| h.bearer_token = Some(BearerToken { token: "t".into() }),
+            |h| h.allow_cleartext_credentials = true,
             |h| h.proxy = Proxy::None,
             |h| h.http2 = false,
             |h| h.max_retries += 1,

@@ -1828,12 +1828,17 @@ is fetched again from its first byte, starting again at the first mirror, and
 each refetch spends one repeat of `max_retries`. A body refused for its content
 is not fetched again. `fetch_timeout` bounds the mirror rounds and the retries
 together, from admission to the response head, which is what caps how
-long one fetch holds an admission permit. A credential is sent to every mirror,
-so `basic_auth` and an `Authorization`, `Proxy-Authorization`, or `Cookie` entry
-in `headers` require every mirror to be `https`; a cleartext mirror alongside one
-fails `Fetcher::new`. A request whose merged headers carry a credential is
-refused before admission when a destination it may reach is cleartext, which
-`allow_cleartext_credentials` admits. A `Host` header, and a header the
+long one fetch holds an admission permit. A credential goes to each mirror.
+The credentials of the fetcher are `basic_auth`, `bearer_token`, and an
+`Authorization`, `Proxy-Authorization`, or `Cookie` entry in `headers`. If the
+fetcher holds a credential and a mirror is cleartext, `Fetcher::new` fails. If
+the merged headers of a request carry a credential and the request can reach a
+cleartext destination, the request fails before admission.
+`FetcherOptions::allow_cleartext_credentials` lifts both refusals. The flag of
+a request lifts the refusal of that request alone. `bearer_token` beside
+`basic_auth`, or beside an `Authorization` entry in `headers`, fails
+`Fetcher::new`, because both set one header. A token that is not token68 also
+fails `Fetcher::new`. A `Host` header, and a header the
 connection layer sets -- `Content-Length`, `Transfer-Encoding`, `Connection`,
 `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Upgrade`, `Expect` -- is
 refused at both layers. A URL whose authority names a port the URL parser
@@ -1865,8 +1870,9 @@ host is canonicalized, and a fragment is dropped. A scheme other than `http` or
 `https`, and a hop from `https` to `http`, are refused with `Error::Fetch`
 naming both URLs; a hop onto a TLS origin is refused the same way on a fetcher
 that holds no trust anchors, and a hop from `http` to `https` is followed. A
-credential -- `basic_auth`, or an `Authorization`, `Proxy-Authorization`, or
-`Cookie` header at either layer -- and a configured client certificate reach
+credential -- `basic_auth`, `bearer_token`, or an `Authorization`,
+`Proxy-Authorization`, or `Cookie` header at either layer -- and a configured
+client certificate reach
 the origin the route named and a hop at that same origin, and no other; a
 credential dropped for a hop stays dropped for the rest of the attempt. Every
 other header reaches every hop. An intermediate body is discarded the way an
@@ -1927,12 +1933,20 @@ pub struct FetcherOptions {
                                           // port is rejected; empty serves
                                           // Target::Url requests alone
     pub headers: Vec<(String, String)>,   // an Authorization, Proxy-Authorization,
-                                          // or Cookie entry needs https mirrors;
+                                          // or Cookie entry needs https mirrors
+                                          // or allow_cleartext_credentials;
                                           // a Host or connection-layer name is
                                           // rejected; a User-Agent or
                                           // Accept-Encoding entry replaces the
                                           // one the fetcher sets
-    pub basic_auth: Option<BasicAuth>,    // needs https mirrors
+    pub basic_auth: Option<BasicAuth>,    // needs https mirrors or
+                                          // allow_cleartext_credentials
+    pub bearer_token: Option<BearerToken>, // the same; refused beside
+                                          // basic_auth or an Authorization
+                                          // entry in headers
+    pub allow_cleartext_credentials: bool, // default false; true admits a
+                                          // credential to a cleartext origin
+                                          // for each request
     pub tls: TlsOptions,                  // trust roots, client identity
     pub proxy: Proxy,                     // default Proxy::Environment
     pub http2: bool,                      // default true
@@ -2018,7 +2032,9 @@ pub struct FetchRequest<'a> {
     pub basic_auth: Option<&'a BasicAuth>, // replaces the fetcher's for this
                                           // one request
     pub allow_cleartext_credentials: bool, // default false: a credential bound
-                                          // for an http origin is refused
+                                          // for an http origin is refused,
+                                          // unless the fetcher sets
+                                          // allow_cleartext_credentials
 }
 
 /// Credentials for HTTP basic authentication. The `Debug` rendering holds the
@@ -2084,7 +2100,7 @@ pub struct UploadWriter { /* ... */ }
 pub enum UploadMethod { Post /* default */, Delete /* no body */ }
 
 /// `Authorization: Bearer TOKEN`, token68 syntax. The `Debug` rendering holds
-/// no token.
+/// no token. `Fetcher::new` checks the syntax of `FetcherOptions::bearer_token`.
 pub struct BearerToken { pub token: String }
 
 pub struct UploadRequest<'a> {
@@ -3667,7 +3683,8 @@ receive endpoint of the server ("Archive view and HTTP server").
   come together. A key that needs a passphrase is refused. The client reads
   each file once, at most 1 MiB, before the session opens.
 - `http` holds the other options of the HTTP client, for example a proxy and
-  the timeouts. Mirrors, `basic_auth`, a trust setting that verifies no
+  the timeouts. Mirrors, `basic_auth`, `bearer_token`,
+  `allow_cleartext_credentials`, a trust setting that verifies no
   certificate chain, trust roots other than the system store beside
   `tls_ca_path`, and a client identity beside the client files are
   `Error::InvalidInput`. The client sets `max_outstanding` to 32 and

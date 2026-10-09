@@ -139,7 +139,7 @@ const AMBIGUOUS_AUTHORIZATION: &str =
 const AMBIGUOUS_BEARER: &str =
     "a bearer token and an authorization header both set Authorization: pass one of them";
 
-/// The message for a request that sets both basic-auth credentials and a bearer
+/// The message for a layer that sets both basic-auth credentials and a bearer
 /// token, for the reason that [`AMBIGUOUS_AUTHORIZATION`] states.
 const BASIC_AND_BEARER: &str =
     "basic-auth credentials and a bearer token both set Authorization: pass one of them";
@@ -263,8 +263,9 @@ impl std::fmt::Debug for BasicAuth {
 /// The fetcher sends the token as written, so the token must have the token68
 /// syntax of HTTP authentication. This is one or more ASCII letters, digits,
 /// `-`, `.`, `_`, `~`, `+`, or `/`, then any number of `=`. If the token has
-/// another form, the request fails before admission with [`Error::Fetch`]. The
-/// message holds no part of the token.
+/// another form, [`Error::Fetch`] occurs. A request fails before admission, and
+/// [`FetcherOptions::bearer_token`] fails [`Fetcher::new`]. The message holds
+/// no part of the token.
 ///
 /// The [`Debug`] output shows a fixed word in place of the token. So the log of
 /// a struct that holds a token does not show it.
@@ -561,12 +562,16 @@ pub struct FetcherOptions {
     ///
     /// [`Fetcher::new`] refuses these entries:
     ///
-    /// - a credential header, if a mirror is cleartext `http`
+    /// - a credential header, if a mirror is cleartext `http` and
+    ///   [`allow_cleartext_credentials`](FetcherOptions::allow_cleartext_credentials)
+    ///   is `false`
     /// - a `Host` header
     /// - a header that the connection layer sets: a framing name or a
     ///   hop-by-hop name
     /// - an `Authorization` header beside
     ///   [`basic_auth`](FetcherOptions::basic_auth)
+    /// - an `Authorization` header beside
+    ///   [`bearer_token`](FetcherOptions::bearer_token)
     /// - an invalid header name or value.
     pub headers: Vec<(String, String)>,
     /// The credentials for `Authorization: Basic`, sent with each request.
@@ -575,11 +580,49 @@ pub struct FetcherOptions {
     /// origin that the route names. [`FetchRequest::basic_auth`] replaces them
     /// for one request. The default is `None`.
     ///
-    /// Each mirror must be `https`. [`Fetcher::new`] refuses a cleartext mirror,
-    /// so the credentials never go in cleartext. An `Authorization` entry in
-    /// [`headers`](FetcherOptions::headers) beside these also fails
-    /// [`Fetcher::new`], because both set the same header.
+    /// Each mirror must be `https`, unless
+    /// [`allow_cleartext_credentials`](FetcherOptions::allow_cleartext_credentials)
+    /// is `true`. [`Fetcher::new`] refuses a cleartext mirror, so the
+    /// credentials go in cleartext only with that permission. An
+    /// `Authorization` entry in [`headers`](FetcherOptions::headers) or a
+    /// [`bearer_token`](FetcherOptions::bearer_token) beside these also fails
+    /// [`Fetcher::new`], because each of them sets the same header.
     pub basic_auth: Option<BasicAuth>,
+    /// The token for `Authorization: Bearer`, sent with each request.
+    ///
+    /// The token goes to each destination, and to a redirect hop at the origin
+    /// that the route names. Each of these replaces it for one request:
+    /// [`FetchRequest::basic_auth`], [`UploadRequest::basic_auth`],
+    /// [`UploadRequest::bearer_token`], or an `Authorization` entry in the
+    /// headers of the request. The default is `None`.
+    ///
+    /// [`Fetcher::new`] refuses a token that does not have the token68 syntax
+    /// that [`BearerToken`] states. It also refuses the token beside
+    /// [`basic_auth`](FetcherOptions::basic_auth), or beside an
+    /// `Authorization` entry in [`headers`](FetcherOptions::headers), because
+    /// each of them sets the same header.
+    ///
+    /// Each mirror must be `https`, unless
+    /// [`allow_cleartext_credentials`](FetcherOptions::allow_cleartext_credentials)
+    /// is `true`.
+    pub bearer_token: Option<BearerToken>,
+    /// The permission for a credential to reach a cleartext origin.
+    ///
+    /// If this is `true`, [`Fetcher::new`] does not refuse a cleartext mirror
+    /// beside a credential: [`basic_auth`](FetcherOptions::basic_auth),
+    /// [`bearer_token`](FetcherOptions::bearer_token), or a credential header
+    /// in [`headers`](FetcherOptions::headers). A fetch or an upload also does
+    /// not refuse a credential for a cleartext destination, whatever the flag
+    /// of the request is. [`FetchRequest::allow_cleartext_credentials`] states
+    /// that rule.
+    ///
+    /// The redirect rules apply with this flag. A hop at another origin gets no
+    /// credential, and a hop from `https` to `http` is refused. The default is
+    /// `false`.
+    ///
+    /// A caller sets it for a server on a loopback address, or for a server
+    /// behind a proxy that terminates TLS.
+    pub allow_cleartext_credentials: bool,
     /// The trust anchors and the client certificate for `https` mirrors.
     ///
     /// The default is [`TlsOptions::default`]: [`TrustRoots::System`] and no
@@ -700,6 +743,8 @@ impl Default for FetcherOptions {
             mirrors: Vec::new(),
             headers: Vec::new(),
             basic_auth: None,
+            bearer_token: None,
+            allow_cleartext_credentials: false,
             tls: TlsOptions::default(),
             proxy: Proxy::default(),
             http2: true,
@@ -802,7 +847,7 @@ pub struct FetchRequest<'a> {
     ///
     /// 1. [`FetchRequest::basic_auth`]
     /// 2. an `Authorization` entry in these headers
-    /// 3. [`FetcherOptions::basic_auth`]
+    /// 3. [`FetcherOptions::basic_auth`] or [`FetcherOptions::bearer_token`]
     /// 4. an `Authorization` entry in [`FetcherOptions::headers`].
     ///
     /// Credentials beside an `Authorization` header in one layer give two
@@ -823,9 +868,12 @@ pub struct FetchRequest<'a> {
     /// The permission for a credential to reach a cleartext origin.
     ///
     /// If this is `false` and the merged headers carry a credential, the fetch
-    /// fails if a destination that it can reach is `http`. The check of
-    /// [`Fetcher::new`] on the mirror list applies whatever this value is. The
-    /// default is `false`.
+    /// fails if a destination that it can reach is `http`. The merged headers
+    /// include the credentials of the fetcher. The check of [`Fetcher::new`] on
+    /// the mirror list applies whatever this value is. The default is `false`.
+    ///
+    /// [`FetcherOptions::allow_cleartext_credentials`] lifts this refusal for
+    /// each request of the fetcher.
     ///
     /// A redirect hop never carries a credential to a cleartext origin of its
     /// own. The fetcher removes the credential for a hop at another origin, and
@@ -838,7 +886,9 @@ pub struct FetchRequest<'a> {
     /// names. So it refuses a credential and a cleartext destination together.
     /// The credentials are [`basic_auth`](FetchRequest::basic_auth), and an
     /// `Authorization`, `Proxy-Authorization`, or `Cookie` entry in the merged
-    /// headers.
+    /// headers. [`FetcherOptions::basic_auth`] and
+    /// [`FetcherOptions::bearer_token`] are `Authorization` entries in the
+    /// merged headers.
     ///
     /// If a fetch carries a credential and a destination that it can reach is
     /// `http`, the fetch fails before admission with [`Error::Fetch`]. The
@@ -1793,6 +1843,9 @@ struct Inner {
     client_identity: bool,
     /// The proxy of each scheme, resolved at construction.
     proxies: Proxies,
+    /// `true` if a credential can reach a cleartext destination. A fetch and
+    /// an upload then skip the cleartext check.
+    allow_cleartext_credentials: bool,
     max_retries: u32,
     max_redirects: u32,
     connect_timeout: Duration,
@@ -1980,12 +2033,21 @@ impl Fetcher {
     ///   nor `https`.
     /// - [`Error::Fetch`] if a header name or value is invalid, or if a header
     ///   is `Host` or a header that the connection layer sets.
-    /// - [`Error::Fetch`] if a mirror is cleartext `http` and the options hold
-    ///   a credential: [`basic_auth`](FetcherOptions::basic_auth), or an
+    /// - [`Error::Fetch`] if a mirror is cleartext `http`, the options hold a
+    ///   credential, and
+    ///   [`allow_cleartext_credentials`](FetcherOptions::allow_cleartext_credentials)
+    ///   is `false`. The credentials are
+    ///   [`basic_auth`](FetcherOptions::basic_auth),
+    ///   [`bearer_token`](FetcherOptions::bearer_token), and an
     ///   `Authorization`, `Proxy-Authorization`, or `Cookie` header.
-    /// - [`Error::Fetch`] if [`basic_auth`](FetcherOptions::basic_auth) is set
-    ///   beside an `Authorization` header, or does not give a valid header
-    ///   value.
+    /// - [`Error::Fetch`] if two of these are set:
+    ///   [`basic_auth`](FetcherOptions::basic_auth),
+    ///   [`bearer_token`](FetcherOptions::bearer_token), and an
+    ///   `Authorization` header.
+    /// - [`Error::Fetch`] if [`basic_auth`](FetcherOptions::basic_auth) does
+    ///   not give a valid header value, or if
+    ///   [`bearer_token`](FetcherOptions::bearer_token) does not have the
+    ///   token68 syntax.
     /// - [`Error::Unsupported`] if a proxy URL is not `http://host[:port]`,
     ///   from the options or from the environment.
     /// - [`Error::Unsupported`] if a proxy variable has
@@ -2032,20 +2094,32 @@ impl Fetcher {
             .collect::<Result<Vec<_>>>()?;
         // The fetcher sends a credential with each request to each mirror. So
         // one cleartext entry in the list puts the credential on the wire in
-        // the clear, and the fetcher refuses such a configuration. A fetch
-        // that withholds the credential gets a 401 that does not state why.
-        let cleartext = options
-            .mirrors
-            .iter()
-            .zip(&mirrors)
-            .find(|(_, mirror)| !mirror.origin.tls)
-            .map(|(url, _)| url.as_str());
-        if options.basic_auth.is_some()
+        // the clear, and the fetcher refuses such a configuration, unless the
+        // caller permits it. A fetch that withholds the credential gets a 401
+        // that does not state why.
+        let cleartext = if options.allow_cleartext_credentials {
+            None
+        } else {
+            options
+                .mirrors
+                .iter()
+                .zip(&mirrors)
+                .find(|(_, mirror)| !mirror.origin.tls)
+                .map(|(url, _)| url.as_str())
+        };
+        let credential = match (&options.basic_auth, &options.bearer_token) {
+            (Some(_), Some(_)) => return Err(Error::Fetch(BASIC_AND_BEARER.into())),
+            (Some(_), None) => Some("basic-auth credentials"),
+            (None, Some(_)) => Some("the bearer token"),
+            (None, None) => None,
+        };
+        if let Some(credential) = credential
             && let Some(url) = cleartext
         {
             return Err(Error::Fetch(format!(
-                "basic-auth credentials would reach the http mirror {url} in the clear: \
-                 use https mirrors or drop the credentials"
+                "{credential} would reach the http mirror {url} in the clear: \
+                 use https mirrors, drop the credentials, or set \
+                 FetcherOptions::allow_cleartext_credentials"
             )));
         }
         let mut headers = vec![
@@ -2077,12 +2151,16 @@ impl Fetcher {
             if name == hyper::header::AUTHORIZATION && options.basic_auth.is_some() {
                 return Err(Error::Fetch(AMBIGUOUS_AUTHORIZATION.into()));
             }
+            if name == hyper::header::AUTHORIZATION && options.bearer_token.is_some() {
+                return Err(Error::Fetch(AMBIGUOUS_BEARER.into()));
+            }
             if is_credential(&name)
                 && let Some(url) = cleartext
             {
                 return Err(Error::Fetch(format!(
                     "the {name} header carries credentials, which the http mirror {url} \
-                     would receive in the clear: use https mirrors or drop the header"
+                     would receive in the clear: use https mirrors, drop the header, or set \
+                     FetcherOptions::allow_cleartext_credentials"
                 )));
             }
             let mut value = HeaderValue::try_from(value.as_str())
@@ -2096,6 +2174,9 @@ impl Fetcher {
         }
         if let Some(auth) = &options.basic_auth {
             headers.push((hyper::header::AUTHORIZATION, basic_auth_value(auth)?));
+        }
+        if let Some(token) = &options.bearer_token {
+            headers.push((hyper::header::AUTHORIZATION, bearer_value(token)?));
         }
         let proxies = resolve_proxy(&options.proxy)?;
         let max_outstanding = options.max_outstanding.max(1);
@@ -2117,6 +2198,7 @@ impl Fetcher {
                 client_identity: options.tls.client_identity.is_some(),
                 proxies,
                 tls,
+                allow_cleartext_credentials: options.allow_cleartext_credentials,
                 max_retries: options.max_retries,
                 max_redirects: options.max_redirects,
                 connect_timeout: options.connect_timeout,
@@ -2268,9 +2350,9 @@ impl Fetcher {
     /// - [`Error::Fetch`] before admission, if an `Authorization` header is
     ///   beside [`basic_auth`](FetchRequest::basic_auth).
     /// - [`Error::Fetch`] before admission, if a credential can reach a
-    ///   cleartext destination and
+    ///   cleartext destination, and neither
     ///   [`allow_cleartext_credentials`](FetchRequest::allow_cleartext_credentials)
-    ///   is `false`.
+    ///   nor [`FetcherOptions::allow_cleartext_credentials`] is `true`.
     /// - [`Error::Fetch`] before admission, if the route names a TLS
     ///   destination and the fetcher holds no trust anchors.
     /// - [`Error::Fetch`] if a transport failure ends the rounds: a failed
@@ -2329,7 +2411,7 @@ impl Fetcher {
             request.basic_auth,
             None,
         )?;
-        if !request.allow_cleartext_credentials {
+        if !request.allow_cleartext_credentials && !self.inner.allow_cleartext_credentials {
             self.check_cleartext(&route, &headers)?;
         }
         self.check_trust_anchors(&route)?;
@@ -2391,7 +2473,7 @@ impl Fetcher {
         Err(Error::Fetch(format!(
             "the request carries credentials, which the cleartext origin {origin} would receive \
              in the clear: fetch over https, drop the credentials, or set \
-             FetchRequest::allow_cleartext_credentials"
+             allow_cleartext_credentials on the request or on the fetcher"
         )))
     }
 
@@ -2853,9 +2935,9 @@ impl Fetcher {
     /// Each final status returns an [`Uploaded`], also 408, 429, and 5xx. The
     /// mirrors, the proxy, TLS, the client certificate, the headers, the
     /// credentials, and the cleartext rule apply to an upload as they apply to
-    /// [`fetch`](Fetcher::fetch). An upload can also carry a [`BearerToken`] as
-    /// its credential. The fetcher sets no `Content-Type` header and no `Expect`
-    /// header.
+    /// [`fetch`](Fetcher::fetch). An upload can also carry a [`BearerToken`] of
+    /// its own as its credential. The fetcher sets no `Content-Type` header and
+    /// no `Expect` header.
     ///
     /// The hand-over gives the request to hyper. A failure before the
     /// hand-over returns the error that a fetch returns. A failure after the
@@ -2992,9 +3074,9 @@ impl Fetcher {
     ///   [`bearer_token`](UploadRequest::bearer_token), and an `Authorization`
     ///   header. A bearer token that is not token68 also fails.
     /// - [`Error::Fetch`] before admission, if a credential can reach a
-    ///   cleartext destination and
+    ///   cleartext destination, and neither
     ///   [`allow_cleartext_credentials`](UploadRequest::allow_cleartext_credentials)
-    ///   is `false`.
+    ///   nor [`FetcherOptions::allow_cleartext_credentials`] is `true`.
     /// - [`Error::Fetch`] before admission, if the route names a TLS
     ///   destination and the fetcher holds no trust anchors.
     /// - [`Error::Fetch`] before admission, if the method is `DELETE` and the
@@ -3042,7 +3124,7 @@ impl Fetcher {
         // The check of the body that a DELETE does not send runs there too.
         let route = self.route(target)?;
         let headers = merge_headers(&self.inner.headers, headers, basic_auth, bearer_token)?;
-        if !allow_cleartext_credentials {
+        if !allow_cleartext_credentials && !self.inner.allow_cleartext_credentials {
             self.check_cleartext(&route, &headers)?;
         }
         self.check_trust_anchors(&route)?;
@@ -7832,6 +7914,160 @@ mod tests {
             token: "s3cret".into(),
         };
         let rendered = format!("{token:?}");
+        assert!(!rendered.contains("s3cret"), "{rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
+    }
+
+    /// The bearer token of the fetcher is one sensitive `Authorization` entry
+    /// in the header list. A request without a credential sends it. Each of
+    /// these replaces it for one request: the `basic_auth` of the request, the
+    /// `bearer_token` of the request, or an `Authorization` header of the
+    /// request.
+    #[test]
+    fn a_fetcher_bearer_token_joins_the_header_list() {
+        let options = FetcherOptions {
+            bearer_token: Some(BearerToken {
+                token: "t0k3n".into(),
+            }),
+            ..tls_options("https://example.com")
+        };
+        let fetcher = rt::block_on(Fetcher::new(options)).unwrap();
+        let authorization = |headers: &[(HeaderName, HeaderValue)]| {
+            headers
+                .iter()
+                .filter(|(name, _)| *name == hyper::header::AUTHORIZATION)
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>()
+        };
+        let held = authorization(&fetcher.inner.headers);
+        assert_eq!(held, ["Bearer t0k3n"]);
+        assert!(held[0].is_sensitive());
+
+        let extra = vec![("x-trace".to_owned(), "abc".to_owned())];
+        let merged = merge_headers(&fetcher.inner.headers, &extra, None, None).unwrap();
+        assert_eq!(authorization(&merged), ["Bearer t0k3n"]);
+
+        // base64("u:p")
+        let auth = BasicAuth {
+            user: "u".into(),
+            password: "p".into(),
+        };
+        let merged = merge_headers(&fetcher.inner.headers, &[], Some(&auth), None).unwrap();
+        assert_eq!(authorization(&merged), ["Basic dTpw"]);
+        let token = BearerToken {
+            token: "other".into(),
+        };
+        let merged = merge_headers(&fetcher.inner.headers, &[], None, Some(&token)).unwrap();
+        assert_eq!(authorization(&merged), ["Bearer other"]);
+        let header = vec![("authorization".to_owned(), "Custom x".to_owned())];
+        let merged = merge_headers(&fetcher.inner.headers, &header, None, None).unwrap();
+        assert_eq!(authorization(&merged), ["Custom x"]);
+    }
+
+    /// The constructor refuses the bearer token of the fetcher beside another
+    /// value for `Authorization`, and a token outside the token68 syntax. A
+    /// refusal names no part of the token.
+    #[test]
+    fn a_fetcher_bearer_token_is_refused_beside_another_credential_or_out_of_syntax() {
+        let token = |token: &str| {
+            Some(BearerToken {
+                token: token.to_owned(),
+            })
+        };
+        let beside_basic = FetcherOptions {
+            bearer_token: token("t0k3n"),
+            basic_auth: Some(BasicAuth {
+                user: "u".into(),
+                password: "p".into(),
+            }),
+            ..tls_options("https://example.com")
+        };
+        let beside_header = FetcherOptions {
+            bearer_token: token("t0k3n"),
+            headers: vec![("authorization".into(), "Basic aaa".into())],
+            ..tls_options("https://example.com")
+        };
+        for options in [beside_basic, beside_header] {
+            let err = rt::block_on(Fetcher::new(options)).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("bearer token"), "{message}");
+            assert!(message.contains("pass one of them"), "{message}");
+        }
+
+        let options = FetcherOptions {
+            bearer_token: token("not a token"),
+            ..tls_options("https://example.com")
+        };
+        let err = rt::block_on(Fetcher::new(options)).unwrap_err();
+        assert!(matches!(err, Error::Fetch(_)), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("token68"), "{message}");
+        assert!(!message.contains("not a token"), "{message}");
+    }
+
+    /// A credential of the fetcher fails the constructor beside a cleartext
+    /// mirror. The cleartext permission of the fetcher admits each kind of
+    /// credential.
+    #[test]
+    fn the_fetcher_cleartext_permission_admits_a_cleartext_mirror() {
+        let cleartext = "http://cleartext.example/repo";
+        let token = || {
+            Some(BearerToken {
+                token: "t0k3n".into(),
+            })
+        };
+        let options = FetcherOptions {
+            bearer_token: token(),
+            ..tls_options(cleartext)
+        };
+        let err = rt::block_on(Fetcher::new(options)).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("bearer token"), "{message}");
+        assert!(message.contains(cleartext), "{message}");
+        assert!(
+            message.contains("FetcherOptions::allow_cleartext_credentials"),
+            "{message}"
+        );
+        assert!(!message.contains("t0k3n"), "{message}");
+
+        let options = FetcherOptions {
+            bearer_token: token(),
+            allow_cleartext_credentials: true,
+            ..tls_options(cleartext)
+        };
+        let fetcher = rt::block_on(Fetcher::new(options)).unwrap();
+        assert!(
+            fetcher.inner.headers.iter().any(
+                |(name, value)| name == hyper::header::AUTHORIZATION && value == "Bearer t0k3n"
+            )
+        );
+
+        let options = FetcherOptions {
+            basic_auth: Some(BasicAuth {
+                user: "u".into(),
+                password: "p".into(),
+            }),
+            allow_cleartext_credentials: true,
+            ..tls_options(cleartext)
+        };
+        rt::block_on(Fetcher::new(options)).unwrap();
+        let options = FetcherOptions {
+            headers: vec![("cookie".into(), "session=1".into())],
+            allow_cleartext_credentials: true,
+            ..tls_options(cleartext)
+        };
+        rt::block_on(Fetcher::new(options)).unwrap();
+    }
+
+    #[test]
+    fn fetcher_options_debug_holds_no_bearer_token() {
+        let options = FetcherOptions {
+            bearer_token: Some(BearerToken {
+                token: "s3cret".into(),
+            }),
+            ..FetcherOptions::default()
+        };
+        let rendered = format!("{options:?}");
         assert!(!rendered.contains("s3cret"), "{rendered}");
         assert!(rendered.contains("redacted"), "{rendered}");
     }

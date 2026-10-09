@@ -273,8 +273,13 @@ pub struct ConnectOptions {
     /// [`PushSession::send`], and one `Have` or `Commit` request.
     ///
     /// The client refuses a trust setting that verifies no certificate chain,
-    /// mirrors, and a Basic credential. It follows no redirect, and a 3xx
-    /// answer is [`Error::Transport`].
+    /// mirrors, a Basic credential, a bearer token, and
+    /// `allow_cleartext_credentials`. It follows no redirect, and a 3xx answer
+    /// is [`Error::Transport`].
+    ///
+    /// If `headers` holds an `Authorization`, `Proxy-Authorization`, or
+    /// `Cookie` header and the address is `http://`, [`PushSession::prepare`]
+    /// returns [`Error::Fetch`]. No option of the push lifts this refusal.
     pub http: ostrya_fetch::FetcherOptions,
 }
 

@@ -2748,9 +2748,10 @@ produces, panics the awaiting side with a message naming the cancellation.
 until the next restart so both backends report it the same way on every poll.
 
 `Fetcher` in `ostrya` is the HTTP client for one remote: `FetcherOptions` holds
-the ordered mirror list, extra headers, basic-auth credentials, the TLS options,
-whether HTTP/2 is offered, the retry count (5), the in-flight limit (8), the
-connect deadline (30s) and the progress deadline (60s). `Fetcher::new` is async:
+the ordered mirror list, extra headers, basic-auth credentials or a bearer
+token, the TLS options, whether HTTP/2 is offered, the retry count (5), the
+in-flight limit (8), the connect deadline (30s) and the progress deadline
+(60s). `Fetcher::new` is async:
 `TrustRoots::System`, the default, reads the host trust store, which goes to the
 blocking pool through `rt::unblock`, keeping that the only door to it. The
 constructor reads the store when a fetch can open a handshake: when a mirror is
@@ -2766,13 +2767,15 @@ holds no anchors, so the one fetch over it that would consult them, a request
 naming an `https` URL, is refused before admission with `Error::Fetch` naming
 the origin. The handshake reports that case as an unknown issuer, a retryable
 failure that spends every round and every backoff before it names anything.
-Credentials are the one thing a cleartext mirror is refused for:
-`basic_auth`, and an `Authorization`,
-`Proxy-Authorization`, or `Cookie` entry in `headers`, are sent with every
-request to every mirror, so one `http` entry in the list fails the constructor
-with `Error::Fetch` naming that mirror. Withholding the credential from that one
-mirror instead would answer 401 and name nothing, and those three are the header
-names whose value is a secret whatever it holds. A `Host` header is refused as
+Credentials are the one thing a cleartext mirror is refused for. The fetcher
+sends `basic_auth`, `bearer_token`, and an `Authorization`,
+`Proxy-Authorization`, or `Cookie` entry in `headers` with each request to each
+mirror. So one `http` entry in the list fails the constructor with
+`Error::Fetch`, and the message names that mirror. A fetcher that withholds the
+credential from that one mirror gets a 401 that names nothing. The value of
+those three header names is a secret, whatever it holds.
+`allow_cleartext_credentials` lifts the refusal, for a server on a loopback
+address or behind a proxy that terminates TLS. A `Host` header is refused as
 well, since it states the authority of the destination the request goes to,
 which the fetcher reads from the URL, and so is a header the connection layer
 sets: `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`,
@@ -7715,15 +7718,19 @@ The request surface:
 - A fetcher whose mirror list is empty serves URL targets alone. It is built
   the way a fetcher with an `https` mirror is built, since any request over it
   may name an `https` URL.
-- A request carries headers of its own, merged over the fetcher's, and
-  credentials of its own, which replace the fetcher's for that request. Within
-  one layer, `basic_auth` beside an `Authorization` header is refused, both of
-  them setting one header.
-- The cleartext-credential rule is checked per request as well as at
-  construction. A fetch whose merged headers carry a credential is refused
-  before admission when a destination it may reach is `http`, and
-  `FetchRequest::allow_cleartext_credentials` admits such a fetch. The
-  construction check over the mirror list holds whatever that flag is set to.
+- A request carries headers of its own, merged over the headers of the
+  fetcher, and credentials of its own. The `basic_auth` or the `bearer_token`
+  of a request, or an `Authorization` header of a request, replaces the
+  `basic_auth` or the `bearer_token` of the fetcher for that request. In one
+  layer, two of `basic_auth`, `bearer_token`, and an `Authorization` header
+  are refused, because each of them sets the same header.
+- The cleartext-credential rule applies per request and at construction. If
+  the merged headers of a fetch carry a credential and the fetch can reach an
+  `http` destination, the fetch fails before admission.
+  `FetchRequest::allow_cleartext_credentials` lifts the refusal for one fetch.
+  `FetcherOptions::allow_cleartext_credentials` lifts it for each request, and
+  also lifts the construction check over the mirror list. The flag of a
+  request does not lift the construction check.
 - The client identity stays per fetcher. A caller that needs a second identity
   builds a second fetcher.
 - `Error::ContentEncoded` and `Error::RedirectLimit` are the two error variants

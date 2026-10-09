@@ -1760,6 +1760,56 @@ fn a_request_basic_auth_overrides_the_fetchers_authorization() {
     });
 }
 
+/// The bearer token of the fetcher reaches the server once with each fetch
+/// and each upload. The `basic_auth` of a fetch replaces it for that fetch.
+#[test]
+fn a_fetcher_bearer_token_reaches_the_server_until_a_request_credential_replaces_it() {
+    block_on(async {
+        let server = TestServer::start(tls_transport("http/1.1"), always(b"bytes")).await;
+        let options = FetcherOptions {
+            bearer_token: Some(BearerToken {
+                token: "abc.DEF-123~+/==".into(),
+            }),
+            ..upload_options(server.url(true))
+        };
+        let fetcher = Fetcher::new(options).await.unwrap();
+
+        let (bytes, _) = fetch_bytes(&fetcher, "one").await;
+        assert_eq!(bytes, b"bytes");
+        let uploaded = fetcher
+            .upload(UploadRequest::path("session", b"hello".to_vec().into()))
+            .await
+            .unwrap();
+        assert_eq!(uploaded.status(), 200);
+        let auth = basic_auth("u", "p");
+        let fetched = fetcher
+            .fetch(FetchRequest {
+                basic_auth: Some(&auth),
+                ..FetchRequest::path("two")
+            })
+            .await
+            .unwrap();
+        assert_eq!(read_body(fetched).await, b"bytes");
+
+        let seen = server.seen();
+        assert_eq!(seen.len(), 3);
+        for seen in &seen {
+            assert_eq!(seen.headers.get_all("authorization").iter().count(), 1);
+        }
+        assert_eq!(
+            seen[0].header("authorization"),
+            Some("Bearer abc.DEF-123~+/==")
+        );
+        assert_eq!(seen[1].method, "POST");
+        assert_eq!(
+            seen[1].header("authorization"),
+            Some("Bearer abc.DEF-123~+/==")
+        );
+        // base64("u:p")
+        assert_eq!(seen[2].header("authorization"), Some("Basic dTpw"));
+    });
+}
+
 /// The fetcher withholds a credential from no destination, so it refuses a
 /// fetch to a cleartext destination and names the destination. A request that
 /// sets `allow_cleartext_credentials` sends the credential over cleartext.
@@ -2067,6 +2117,65 @@ fn credentials_with_a_cleartext_mirror_fail_the_constructor() {
     });
 }
 
+/// A bearer token of the fetcher with a cleartext mirror fails the constructor.
+/// The cleartext permission of the fetcher admits the token, and also admits a
+/// credential of a fetch or an upload that does not set its own permission.
+#[test]
+fn the_fetcher_cleartext_permission_admits_a_bearer_token_over_cleartext() {
+    block_on(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"bytes")).await;
+        let token = || {
+            Some(BearerToken {
+                token: "t0k3n".into(),
+            })
+        };
+
+        let options = FetcherOptions {
+            bearer_token: token(),
+            ..direct_options(server.url(false))
+        };
+        let err = Fetcher::new(options).await.unwrap_err();
+        assert!(err.to_string().contains(&server.url(false)), "{err}");
+        assert_eq!(server.connections(), 0);
+
+        let options = FetcherOptions {
+            bearer_token: token(),
+            allow_cleartext_credentials: true,
+            tls: tls_options(None),
+            ..direct_options(server.url(false))
+        };
+        let fetcher = Fetcher::new(options).await.unwrap();
+        let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
+        assert_eq!(bytes, b"bytes");
+        let auth = basic_auth("u", "p");
+        let fetched = fetcher
+            .fetch(FetchRequest {
+                basic_auth: Some(&auth),
+                ..FetchRequest::path("summary")
+            })
+            .await
+            .unwrap();
+        assert_eq!(read_body(fetched).await, b"bytes");
+        let uploaded = fetcher
+            .upload(UploadRequest {
+                allow_cleartext_credentials: false,
+                ..UploadRequest::path("session", b"hello".to_vec().into())
+            })
+            .await
+            .unwrap();
+        assert_eq!(uploaded.status(), 200);
+
+        let seen = server.seen();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].header("authorization"), Some("Bearer t0k3n"));
+        // base64("u:p")
+        assert_eq!(seen[1].header("authorization"), Some("Basic dTpw"));
+        assert_eq!(seen[2].method, "POST");
+        assert_eq!(seen[2].headers.get_all("authorization").iter().count(), 1);
+        assert_eq!(seen[2].header("authorization"), Some("Bearer t0k3n"));
+    });
+}
+
 #[test]
 fn a_client_certificate_is_presented_when_the_server_demands_one() {
     block_on(async {
@@ -2303,6 +2412,39 @@ fn a_redirect_to_another_origin_leaves_the_credentials_behind() {
         // The headers of the fetcher also reach the hop.
         assert_eq!(second.header("accept-encoding"), Some("identity"));
         assert!(second.header("user-agent").is_some());
+    });
+}
+
+/// The bearer token of the fetcher is a credential header, so a redirect to
+/// another origin leaves it behind.
+#[test]
+fn a_redirect_to_another_origin_leaves_the_fetcher_bearer_token_behind() {
+    block_on(async {
+        let hop = TestServer::start(Transport::Cleartext, always(b"hopped")).await;
+        let named = TestServer::start(
+            Transport::Cleartext,
+            redirect_once(format!("{}/hopped", hop.url(false)), b"unreachable"),
+        )
+        .await;
+        let options = FetcherOptions {
+            bearer_token: Some(BearerToken {
+                token: "t0k3n".into(),
+            }),
+            allow_cleartext_credentials: true,
+            tls: tls_options(None),
+            ..direct_options(named.url(false))
+        };
+        let fetcher = Fetcher::new(options).await.unwrap();
+
+        let (bytes, _) = fetch_bytes(&fetcher, "config").await;
+        assert_eq!(bytes, b"hopped");
+        assert_eq!(
+            named.seen()[0].header("authorization"),
+            Some("Bearer t0k3n")
+        );
+        let second = &hop.seen()[0];
+        assert_eq!(second.path, "/hopped");
+        assert_eq!(second.header("authorization"), None);
     });
 }
 

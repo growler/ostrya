@@ -2133,9 +2133,6 @@ struct Inner {
     gate: Arc<Gate>,
     h2_connection_window: u32,
     pool: Mutex<HashMap<PoolKey, PoolEntry>>,
-    /// The counters that each get the bytes of each response body that this
-    /// fetcher reads, also retried and abandoned bodies.
-    received: Vec<Arc<AtomicU64>>,
 }
 
 /// Returns the HTTP/2 flow-control window of the connection for a fetcher that
@@ -2219,7 +2216,9 @@ type UploadResponse = (Response<Incoming>, Protocol, RequestEnd, Option<H1Sender
 /// A fetcher holds the mirrors, the headers, the credentials, and the TLS
 /// configuration of one remote. It serves a [`Target::Url`] from the origin of
 /// that URL. A clone of a `Fetcher` is another handle on the same connection
-/// pool and the same admission limit.
+/// pool and the same admission limit. The clone has the counters of received
+/// body bytes of the handle. [`counted`](Fetcher::counted) gives a handle with
+/// more counters.
 ///
 /// # Connections
 ///
@@ -2259,6 +2258,9 @@ type UploadResponse = (Response<Incoming>, Protocol, RequestEnd, Option<H1Sender
 #[derive(Clone)]
 pub struct Fetcher {
     inner: Arc<Inner>,
+    /// The counters that get the bytes of each response body of a request of
+    /// this handle.
+    received: Arc<[Arc<AtomicU64>]>,
 }
 
 impl std::fmt::Debug for Fetcher {
@@ -2274,6 +2276,9 @@ impl Fetcher {
     ///
     /// If the mirror list is empty, the fetcher serves [`Target::Url`] requests
     /// alone.
+    ///
+    /// The fetcher has no counters of received body bytes.
+    /// [`counted`](Fetcher::counted) gives a handle that has counters.
     ///
     /// The function is async, because [`TrustRoots::System`], the default,
     /// reads the host trust store on the blocking pool. An encrypted client key
@@ -2337,24 +2342,6 @@ impl Fetcher {
     /// - [`Error::Fetch`] if the system trust store holds no certificate, and
     ///   one or more mirrors are `https` or the mirror list is empty.
     pub async fn new(options: FetcherOptions) -> Result<Fetcher> {
-        Fetcher::with_counters(options, Vec::new()).await
-    }
-
-    /// Creates a fetcher as [`new`](Fetcher::new) does, with counters of the
-    /// received body bytes.
-    ///
-    /// The fetcher adds the bytes of each response body that it reads to each
-    /// counter of `received`. Each data frame costs one relaxed atomic add for
-    /// each counter. A caller can read the count of transferred bytes from
-    /// these counters.
-    ///
-    /// # Errors
-    ///
-    /// The errors of [`new`](Fetcher::new).
-    pub async fn with_counters(
-        options: FetcherOptions,
-        received: Vec<Arc<AtomicU64>>,
-    ) -> Result<Fetcher> {
         // A limit of zero or a time of zero measures nothing. No rate is under
         // a zero limit, and each transfer fails a zero time immediately.
         if let Some(low) = options.low_speed
@@ -2486,9 +2473,35 @@ impl Fetcher {
                 gate: Arc::new(Gate::new(max_outstanding)),
                 h2_connection_window: h2_connection_window(max_outstanding),
                 pool: Mutex::new(HashMap::new()),
-                received,
             }),
+            received: Arc::new([]),
         })
+    }
+
+    /// Returns a handle on this fetcher that adds counters of received body
+    /// bytes.
+    ///
+    /// The new handle shares the configuration, the connection pool, and the
+    /// admission limit of this handle. It has the counters of this handle and
+    /// the counters of `received`. A clone of the new handle has the same
+    /// counters.
+    ///
+    /// Each response body of a request of the new handle adds the bytes that it
+    /// takes from the connection to each of these counters. This includes the
+    /// bytes of a body before it fails, the body of a [`Refetch`], a body that
+    /// the caller drops before its end, and the response body of an upload. A
+    /// request does not count a response that it does not give to the caller:
+    /// a redirect, an unsuccessful status of a fetch, or a refused response.
+    ///
+    /// The counters of this handle do not change. A request of this handle adds
+    /// to the counters of this handle alone. Each data frame costs one relaxed
+    /// atomic add for each counter. A counter that the new handle has two times
+    /// gets the bytes two times.
+    pub fn counted(&self, received: Vec<Arc<AtomicU64>>) -> Fetcher {
+        Fetcher {
+            inner: Arc::clone(&self.inner),
+            received: self.received.iter().cloned().chain(received).collect(),
+        }
     }
 
     /// Sends `request` to each destination in turn and returns the response.
@@ -3054,6 +3067,7 @@ impl Fetcher {
                 content_length,
                 protocol,
                 inner: self.inner.clone(),
+                counters: self.received.clone(),
                 key,
                 reuse,
                 permit: None,
@@ -3631,6 +3645,7 @@ impl Fetcher {
                     content_length,
                     protocol,
                     inner: self.inner.clone(),
+                    counters: self.received.clone(),
                     key,
                     reuse,
                     permit: None,
@@ -4357,6 +4372,9 @@ pub struct Body {
     content_length: Option<u64>,
     protocol: Protocol,
     inner: Arc<Inner>,
+    /// The counters of the fetcher handle that made the request. Each data
+    /// frame adds its bytes to each of them.
+    counters: Arc<[Arc<AtomicU64>]>,
     /// The pool entry of the connection of this body. The connection goes back
     /// to this entry.
     key: PoolKey,
@@ -4602,7 +4620,7 @@ impl AsyncRead for Body {
                     // data.
                     if let Ok(data) = frame.into_data() {
                         me.received += data.len() as u64;
-                        for counter in &me.inner.received {
+                        for counter in me.counters.iter() {
                             counter.fetch_add(data.len() as u64, Ordering::Relaxed);
                         }
                         if let Some(limit) = me.max_size

@@ -2214,8 +2214,9 @@ and `low_speed` does not apply. `ostrya::Error` gains `UploadInterrupted` with
 the same fields.
 
 The pull uses four items of `ostrya-fetch` that are public for it and that
-`ostrya` does not re-export at its crate root: `Fetcher::with_counters`, which
-adds the bytes of each response body to a set of counters;
+`ostrya` does not re-export at its crate root: `Fetcher::counted`, which
+gives a handle on the same connection pool that adds the bytes of each
+response body of its requests to a set of counters;
 `Fetcher::refetching`, which gives a `Refetch` that fetches a body again from
 its first byte when it fails in transit; the `fetch` and `retry` methods of
 `Refetch`; and `fetch::gate::Gate`, the priority admission gate, with its

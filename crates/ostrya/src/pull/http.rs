@@ -837,9 +837,10 @@ impl Repo {
                 "the HTTP endpoint of a pull names no mirror".into(),
             ));
         }
-        Fetcher::with_counters(http, received)
+        Ok(Fetcher::new(http)
             .await
-            .map_err(Error::from)
+            .map_err(Error::from)?
+            .counted(received))
     }
 
     /// Resolves what to pull: the requested refs, the summary refs of the

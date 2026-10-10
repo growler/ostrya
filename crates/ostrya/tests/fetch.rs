@@ -5718,21 +5718,19 @@ fn an_upload_does_not_use_an_idle_connection_the_server_closed() {
 }
 
 /// The response body of an upload holds its admission permit until it ends. Its
-/// bytes reach the counters of the fetcher.
+/// bytes reach the counters of its handle.
 #[test]
 fn an_upload_response_holds_its_permit_and_is_counted() {
     block_on(bounded(async {
         let server = TestServer::start(Transport::Cleartext, always(b"twelve bytes")).await;
         let counter = Arc::new(AtomicU64::new(0));
-        let fetcher = Fetcher::with_counters(
-            FetcherOptions {
-                max_outstanding: 1,
-                ..direct_options(server.url(false))
-            },
-            vec![counter.clone()],
-        )
+        let fetcher = Fetcher::new(FetcherOptions {
+            max_outstanding: 1,
+            ..direct_options(server.url(false))
+        })
         .await
-        .unwrap();
+        .unwrap()
+        .counted(vec![counter.clone()]);
         let uploaded = fetcher
             .upload(UploadRequest::path("objects", b"hello".to_vec().into()))
             .await
@@ -5755,6 +5753,133 @@ fn an_upload_response_holds_its_permit_and_is_counted() {
         assert_eq!(read_uploaded(uploaded).await, b"twelve bytes");
         assert_eq!(counter.load(Ordering::SeqCst), 12);
         fetch_bytes(&fetcher, "config").await;
+    }));
+}
+
+/// The handles that `counted` makes from one fetcher share its connection. A
+/// handle adds the bytes of its bodies to its own counters, and to no counter
+/// of a sibling handle. A clone of a handle has the counters of that handle.
+#[test]
+fn handles_of_one_fetcher_share_a_connection_and_count_their_own_bodies() {
+    block_on(bounded(async {
+        for (transport, tls) in [(Transport::Cleartext, false), (tls_transport("h2"), true)] {
+            let server = TestServer::start(transport, always(b"twelve bytes")).await;
+            let [a, b, c] = [(); 3].map(|()| Arc::new(AtomicU64::new(0)));
+            let plain = Fetcher::new(FetcherOptions {
+                tls: tls_options(None),
+                ..direct_options(server.url(tls))
+            })
+            .await
+            .unwrap();
+            let uncounted = plain.counted(vec![]);
+            let base = plain.counted(vec![a.clone()]);
+            let left = base.counted(vec![b.clone()]);
+            let right = base.counted(vec![c.clone()]);
+            let left_clone = left.clone();
+            let counts = || [&a, &b, &c].map(|counter| counter.load(Ordering::SeqCst));
+            for (handle, expected) in [
+                (&plain, [0, 0, 0]),
+                (&uncounted, [0, 0, 0]),
+                (&base, [12, 0, 0]),
+                (&left, [24, 12, 0]),
+                (&right, [36, 12, 12]),
+                (&left_clone, [48, 24, 12]),
+            ] {
+                let (bytes, _) = fetch_bytes(handle, "config").await;
+                assert_eq!(bytes, b"twelve bytes");
+                assert_eq!(counts(), expected);
+            }
+            assert_eq!(server.connections(), 1);
+        }
+    }));
+}
+
+/// A body that fails in transit adds the bytes that arrived to the counters of
+/// its handle. The body of the refetch adds its bytes to the same counters. A
+/// sibling handle counts none of these bytes.
+#[test]
+fn a_body_refetched_after_a_cut_reaches_the_counters_of_its_handle() {
+    block_on(bounded(async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(spawn(async move {
+            // The first answer declares 16 bytes, sends 8, and closes the
+            // connection. Each later answer sends all 16 bytes.
+            let mut cut = true;
+            while let Ok((mut stream, _peer)) = listener.accept().await {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let answer: &[u8] = if cut {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\n01234567"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\n0123456789abcdef"
+                };
+                cut = false;
+                let _ = stream.write_all(answer).await;
+                let _ = stream.close().await;
+            }
+        }));
+        let [source, own, sibling] = [(); 3].map(|()| Arc::new(AtomicU64::new(0)));
+        let base = Fetcher::new(FetcherOptions {
+            max_retries: 1,
+            ..direct_options(format!("http://127.0.0.1:{}", addr.port()))
+        })
+        .await
+        .unwrap()
+        .counted(vec![source.clone()]);
+        let left = base.counted(vec![own.clone()]);
+        let _right = base.counted(vec![sibling.clone()]);
+
+        let mut refetch = left.refetching(FetchRequest::path("object"));
+        let Fetched::Body(mut body) = refetch.fetch().await.unwrap() else {
+            panic!("unexpected 304");
+        };
+        let mut cut = Vec::new();
+        let err = body.read_to_end(&mut cut).await.unwrap_err();
+        drop(body);
+        assert_eq!(cut, b"01234567");
+        refetch.retry(err).await.unwrap();
+        let whole = read_body(refetch.fetch().await.unwrap()).await;
+        assert_eq!(whole, b"0123456789abcdef");
+        // 8 bytes of the cut body and 16 bytes of the refetched body.
+        assert_eq!(own.load(Ordering::SeqCst), 24);
+        assert_eq!(source.load(Ordering::SeqCst), 24);
+        assert_eq!(sibling.load(Ordering::SeqCst), 0);
+    }));
+}
+
+/// A body that the caller drops before its end adds the bytes that it took
+/// from the connection to the counters of its handle. The drop adds no more
+/// bytes.
+#[test]
+fn an_abandoned_body_reaches_the_counters_of_its_handle() {
+    block_on(bounded(async {
+        let handler: Handler = Arc::new(|_seen, _count| {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(TestBody::chunked(&[b'z'; 64 * 1024], 16))
+                .unwrap()
+        });
+        let server = TestServer::start(Transport::Cleartext, handler).await;
+        let counter = Arc::new(AtomicU64::new(0));
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap()
+            .counted(vec![counter.clone()]);
+
+        let Fetched::Body(mut body) = fetcher.fetch(FetchRequest::path("big")).await.unwrap()
+        else {
+            panic!("unexpected 304");
+        };
+        let mut head = [0u8; 16];
+        body.read_exact(&mut head).await.unwrap();
+        let taken = body.received();
+        drop(body);
+        assert_eq!(counter.load(Ordering::SeqCst), taken);
+        Timer::after(Duration::from_millis(100)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), taken);
     }));
 }
 

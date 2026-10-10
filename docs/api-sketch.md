@@ -3548,9 +3548,10 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
   operands, `--canonical-permissions`, the `-b` names that the command
   refuses itself, `--parent`, the metadata options, and `--timestamp`. The
   command then resolves `REMOTE` with `resolve_push`, which refuses an
-  option of the other transport and a bad HTTP option, and reads the token
-  file and the TLS files. It then calls `PushSession::prepare`, which builds
-  the HTTP client or the ssh command line. It then builds the signers and
+  option of the other transport and a bad HTTP option. It reads the token
+  file, and the TLS files of an `https://` address. It then calls
+  `PushSession::prepare`, which builds the HTTP client or the ssh command
+  line. It then builds the signers and
   reads `--body-file`, and calls `push_tree_prepared`, which checks the
   other options before the scan. So a refusal of the remote or of its
   options starts no gpg and reads no body file.
@@ -3988,7 +3989,8 @@ Rules of both resolvers:
 - It refuses `url` before it reads the address.
 - The address rules are the rules of "Push remotes".
 - For an `https://` address of a section, `tls-permissive=true` is refused.
-  An `http://` address does not read the key.
+  An `http://` address does not read the key. For an `http://` address, the
+  resolver reads no TLS file, because the push uses no TLS.
 - For an HTTP address, it refuses `ssh_command` (`ssh-command`) and
   `remote_command` (`receive-command`).
 - The keys `push-token-file`, `push-user`, `tls-ca-path`,

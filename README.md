@@ -82,15 +82,19 @@ The project is a Cargo workspace of focused crates:
   `rustls`. Portable, with no repository knowledge.
 - `ostrya-remote` -- the wire protocol of the push and of the pull over ssh:
   the messages and their GVariant encoding, the frame codec, the chunked
-  object stream, the bodies of the pull, the push client session, the pull
-  client session, the ssh and HTTP transports, the walk of a local directory into a tree
-  model, and the tree push of that directory as one commit, signed when
-  signers are given. Portable, with no repository knowledge. Depends on
-  `ostrya-sign` and `ostrya-fetch`.
+  object stream, the bodies of the pull, the push client session, and the
+  pull client session. It also holds the endpoint types `Endpoint`,
+  `SshAddress`, and `SshOptions`, and the ssh and HTTP transports. It holds
+  the walk of a local directory into a tree model. It holds the tree push of
+  that directory as one commit, signed when signers are given. The
+  transports read no remote key and no file that a remote key names.
+  Portable, with no repository knowledge. Depends on `ostrya-sign` and
+  `ostrya-fetch`.
 - `ostrya-composefs` -- standalone, synchronous EROFS/composefs image writer
   and fs-verity digest. Takes a tree model and emits image bytes.
 - `ostrya` -- the library: repo, transactions, commit, checkout, refs,
-  reading, and the paths listed under Status. Feature-gated.
+  reading, the resolution of a remote to an endpoint (`ostrya::endpoint`),
+  and the paths listed under Status. Feature-gated.
 - `ostrya-cli` -- the command-line front-end (builds the `ostrya` binary).
 
 Feature flags on `ostrya`:
@@ -105,10 +109,10 @@ Feature flags on `ostrya`:
   builds `ostrya receive` on it.
 - `push` -- the client side of a push from a repository: `Repo::push`,
   `Repo::push_over_stream`, `Repo::export_stream`, which writes one one-way
-  stream for `Repo::receive_stream`, and the push address and the connect
-  options of a configured remote or of an address. The `push` feature of
-  `ostrya-cli`, in its default set, builds `ostrya push` and
-  `ostrya push-tree` on it.
+  stream for `Repo::receive_stream`, and `ostrya::endpoint::resolve_push`,
+  which gives the endpoint of a configured remote or of an address. The
+  `push` feature of `ostrya-cli`, in its default set, builds `ostrya push`
+  and `ostrya push-tree` on it.
 - `lzma-static` -- the static xz build.
 
 `ostrya-remote` is a dependency of `ostrya` in every build, re-exported as
@@ -117,7 +121,8 @@ Feature flags on `ostrya`:
 feature. The `send` feature of `ostrya-cli`, in its default set, builds
 `ostrya send` on `Repo::send`. `Repo::pull` runs over ssh for an ssh
 endpoint in `PullOptions::endpoint` or an ssh address in the remote key
-`pull-url`, with no feature.
+`pull-url`, with no feature. `ostrya::endpoint::resolve_pull` reads the keys
+and the files of a remote for a pull, with no feature.
 
 Later phases add `s3` and `serve`.
 

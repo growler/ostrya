@@ -2569,6 +2569,16 @@ included) at exit 1. The port's fetcher serves `http` and `https` alone, so a
 `file://` remote, which the tool pulls from, reports `error: unsupported: fetch
 url scheme file: only http and https are fetched` at exit 1 and writes nothing.
 
+The keys `tls-ca-path`, `tls-client-cert-path`, and `tls-client-key-path` of
+a remote name TLS files. For each address other than an ssh address, the port
+reads at most 1 MiB and one byte of each such file. Under
+`tls-permissive=true`, the port does not read `tls-ca-path`. The port reads
+the files before the fetcher refuses a `file://` address. A file larger than
+1 MiB is refused at exit 1
+before any request, and the message names the key and the path: `error:
+invalid input: tls-ca-path 'PATH' is over 1 MiB`. A file that cannot be read
+is refused with a message that names the key and the path too.
+
 The port also pulls over ssh, which the tool does not do. The address of a
 pull is `--url`, then the `pull-url` key of the remote, then its `url` key. A
 value that starts with `ssh://`, or that holds no `://`, is an ssh address.
@@ -3314,9 +3324,10 @@ with the ssh command and the remote command of `pull`. The tool reads `url`
 alone.
 
 `remote add-cookie`, `remote delete-cookie`, and `remote list-cookies` stay out.
-`crates/ostrya-fetch/src/lib.rs` refuses any `Cookie` header at construction
-whenever a mirror is cleartext `http`, a deliberate choice, and cookie-jar
-support needs its own design pass against that refusal.
+The fetcher refuses a `Cookie` header at construction when a mirror is
+cleartext `http`, unless the caller sets
+`FetcherOptions::allow_cleartext_credentials`. `pull` has no option that sets
+it. Cookie-jar support needs its own design pass against that refusal.
 
 ## Port extensions with no counterpart in the tool
 
@@ -3384,9 +3395,10 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
   sent.
 - The push then resolves `REMOTE` and makes the transport ready, before it
   reads `--depth` and the refspecs. It refuses an option of the other
-  transport and a bad HTTP option, and it reads the token file and the TLS
-  files of an HTTP push. So `push --push-user=bob https://HOST/ nosuchref`
-  fails with the refusal of `--push-user`, and does not name the refspec.
+  transport and a bad HTTP option. It reads the token file of an HTTP push,
+  and the TLS files of an `https://` push. So
+  `push --push-user=bob https://HOST/ nosuchref` fails with the refusal of
+  `--push-user`, and does not name the refspec.
 - `--depth=N` sends `N` parents of each source commit, and `-1` the whole
   chain. Without it, the push sends the chain back to the commit of the ref
   on the server. When the server does not hold the ref, or the local chain
@@ -3412,9 +3424,10 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
   token. `--tls-ca-path=FILE` names the CA certificates that verify the
   server, in place of the trust store of the host.
   `--tls-client-cert-path=FILE` and `--tls-client-key-path=FILE` name a
-  client certificate and its key, and the two come together. Each of these
-  options wins over the key of the remote with the same name. A relative
-  path is relative to the current directory, and `~` is not expanded.
+  client certificate and its key, and the two come together. The key must
+  need no passphrase. Each of these options wins over the key of the remote
+  with the same name. A relative path is relative to the current directory,
+  and `~` is not expanded.
   `../format-reference.md`, "Port extension: the push and pull keys of a remote",
   states the keys and the grammar of the token file.
 - A token to an `http://` address is refused before any request. With
@@ -3423,12 +3436,22 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
 - An option of the other transport is refused at exit 1 before the ssh
   client starts and before any request: an HTTP option with an ssh address,
   and `--ssh-command` or `--receive-command` with an HTTP address. The
-  message names the option without `--`, which is also the name of the key
-  of the remote, for example `push-user needs push-token-file`. The keys of
-  a remote apply to the transport of its push address alone, and the push
-  ignores the other keys. `tls-permissive=true` on a remote with an
-  `https://` push address is refused at exit 1 before any request. With an
-  `http://` push address the push uses no TLS and ignores the key.
+  message names the option without `--`. Where a remote key backs the
+  option, this is the name of the key. The message shows an ssh address in
+  the `ssh://` form, with no user. Example: `error: invalid input:
+  tls-ca-path applies to an HTTP address, and 'ssh://HOST/PATH' is an ssh
+  address`. The keys of a remote apply to the transport of its push address
+  alone, and the push ignores the other keys. `tls-permissive=true` on a
+  remote with an `https://` push address is refused at exit 1 before any
+  request. With an `http://` push address, the push uses no TLS. It ignores
+  `tls-permissive`, and it reads no file that `tls-ca-path`,
+  `tls-client-cert-path`, `tls-client-key-path`, or their options name.
+- For an `http://` or `https://` push address, the push reads the `proxy`
+  key of the remote. An empty or absent key gives the proxy environment
+  variables, and a push to an address reads them too. A `proxy` value with
+  white space at its start or its end is refused at exit 1 before any
+  request: `error: unsupported: remote 'NAME': the proxy key has white space
+  at the start or the end of its value`.
 - The push drops the detached metadata keys that `[ex-ostrya]
   detached-metadata-exclude` of the local repository names.
 - On success the command writes one line for each ref to standard output,
@@ -3519,8 +3542,8 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
   `--timestamp`, in this order. It refuses a bad value before it opens a
   repository.
 - The command then resolves `REMOTE` and makes the transport ready. It
-  refuses an option of the other transport and a bad HTTP option, and it
-  reads the token file and the TLS files of an HTTP push.
+  refuses an option of the other transport and a bad HTTP option. It reads
+  the token file of an HTTP push, and the TLS files of an `https://` push.
 - The command then reads the signing keys and `--body-file`, in this order.
   For a `--gpg-sign` key, and for a `--sign` or `--sign-from-file` key under
   `--sign-type=gpg`, it looks up the secret key in the GnuPG home

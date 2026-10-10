@@ -2214,13 +2214,14 @@ fn push_overrides(args: PushConnectArgs) -> ostrya::endpoint::EndpointOverrides 
 /// options the command reads itself, except the signing keys and the body
 /// file, are then checked before a repository opens. The command then
 /// resolves the remote: it refuses an option of the other transport and the
-/// bad HTTP options, and reads the token file and the TLS files of an HTTP
-/// push. It then makes the transport ready. The signing keys are checked
-/// next, and the body file is read last. The push refuses the other bad refs
-/// before the scan. All of these come before the ssh client starts or the first HTTP
-/// request. A remote name is looked up in the repository that `--repo`, the
-/// current directory, or `OSTREE_REPO` gives. An address opens no
-/// repository, so none of the three is read for it.
+/// bad HTTP options. It reads the token file of an HTTP push, and the TLS
+/// files of an `https://` push. It then makes the transport ready. The
+/// signing keys are checked next, and the body file is read last. The push
+/// refuses the other bad refs before the scan. All of these come before the
+/// ssh client starts or the first HTTP request. A remote name is looked up in
+/// the repository that `--repo`, the current directory, or `OSTREE_REPO`
+/// gives. An address opens no repository, so none of the three is read for
+/// it.
 ///
 /// Standard output carries the commit checksum alone. Under `--verbose` one
 /// statistics line goes to standard error. A failure writes nothing to

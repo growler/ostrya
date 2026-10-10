@@ -3544,8 +3544,8 @@ and every object those commits reach from an HTTP remote, into one transaction.
 What the transaction publishes, when the refs are written, and what the
 `.commitpartial` markers mean is 16b's contract unchanged; the phase adds where
 the objects come from and how many are fetched at once.
-`Repo::remote_fetch_summary(remote)` reports the remote's `summary` and
-`summary.sig` bytes on their own.
+`Repo::remote_fetch_summary(remote, endpoint)` reports the remote's `summary`
+and `summary.sig` bytes on their own.
 
 What a pull asks for, in the order it first asks: `summary.sig`, `summary`,
 `config`, then the objects. A remote with no summary answers 404 and each
@@ -3684,13 +3684,12 @@ currently names here (`CurrentRef`, where an absent ref passes) or than a given
 commit (`Rev`), naming both revisions and both timestamps. The ref-binding check
 and the timestamp check are made for every requested ref that names a commit, so
 two refs at one commit are both checked while the commit is fetched once.
-`PullOptions` grows
-`url`, `http_headers`, `max_outstanding_fetches`, `n_network_retries`, and
-`timestamp_check`; `config.rs` grows `Remote::branches` and the TLS keys
-`tls-ca-path`, `tls-client-cert-path`, and `tls-client-key-path`, with
-`tls-permissive=true` refused as `Unsupported` -- the fetcher has no way to skip
-verification, and verifying anyway would misreport the configuration. Phase 23
-replaced that refusal: the key maps onto `TrustRoots::DangerousAcceptAnyChain`.
+`PullOptions` grows `max_outstanding_fetches` and `timestamp_check`. The
+address, the extra headers, and the retry count of an HTTP pull are values of
+the endpoint that `ostrya::endpoint::resolve_pull` gives. `config.rs` grows
+`Remote::branches` and the TLS keys `tls-ca-path`, `tls-client-cert-path`, and
+`tls-client-key-path`. `resolve_pull` maps `tls-permissive=true` onto
+`TrustRoots::DangerousAcceptAnyChain` (Phase 23).
 `summary.rs` grows `Summary::parse`/`Summary::lookup`, the read side ref
 resolution needs.
 
@@ -4200,14 +4199,18 @@ remote's configured `branches`, or every ref its summary lists under `--mirror`.
 The command prints the line `pull-local` prints, which reports what the pull
 imported.
 
-The options and the `PullOptions` field each sets:
+Each option other than `--repo` sets a field of `PullOptions` or of
+`EndpointOverrides`. The command gives the `EndpointOverrides` to
+`ostrya::endpoint::resolve_pull`, and sets `PullOptions::endpoint` to the
+endpoint that it returns. A field name with no type is a field of
+`PullOptions`:
 
 - `--repo <PATH>` -- the destination, defaulting to the working directory, as
   every other subcommand takes it.
-- `--url <URL>` -- `url`. A remote the config does not describe is reachable this
-  way. Such a remote supplies no keys and takes the configuration defaults,
-  `gpg-verify` among them, so a pull naming one states its own policy or is
-  refused.
+- `--url <URL>` -- `EndpointOverrides::url`. A remote the config does not
+  describe is reachable this way. Such a remote supplies no keys and takes the
+  configuration defaults, `gpg-verify` among them. So a pull naming one states
+  its own policy or is refused.
 - `--mirror`, `--commit-metadata-only`, `--bareuseronly-files`,
   `--disable-verify-bindings`, `--force-copy` -- the `PullFlags` bits of the same
   names. `UNTRUSTED` has no switch: an HTTP pull hashes every object it stores
@@ -4216,10 +4219,13 @@ The options and the `PullOptions` field each sets:
 - `--depth <N>` -- `depth`, defaulting to 0.
 - `-L`/`--localcache-repo <REPO>`, repeatable -- `localcache_repos`, opened in the
   order given.
-- `--http-header NAME=VALUE`, repeatable -- `http_headers`. The value splits at
-  the first `=`, so a header value carrying one arrives whole.
-- `--max-outstanding-fetcher-requests <N>`, `--network-retries <N>` -- the two
-  fetcher limits, each left at the library's default when absent.
+- `--http-header NAME=VALUE`, repeatable -- `EndpointOverrides::http_headers`.
+  The value splits at the first `=`, so a header value carrying one arrives
+  whole.
+- `--max-outstanding-fetcher-requests <N>` --
+  `PullOptions::max_outstanding_fetches`. `--network-retries <N>` --
+  `EndpointOverrides::max_retries`. Without these options, `resolve_pull` sets
+  8 requests in flight and 5 retries.
 - `-T`/`--timestamp-check` and `--timestamp-check-from-rev <REV>` -- the two
   `TimestampCheck` variants, which conflict with each other since the field holds
   one. A refspec resolves against the destination; a bare checksum is taken as
@@ -6852,22 +6858,24 @@ and all pass; the conformance run reports 1056 cells and 430 passes (the M10
 family 427).
 
 `pull` takes `--disable-retry-on-network-errors`, `--low-speed-limit-bytes=N`,
-and `--low-speed-time-seconds=N`. The switch sets `n_network_retries` to zero,
-whatever `--network-retries` says. The library adds `LowSpeed` and
-`FetcherOptions::low_speed`, the tool's rate rule over one `rt` timer. The
+and `--low-speed-time-seconds=N`. The switch sets
+`EndpointOverrides::max_retries` to zero, whatever `--network-retries` says.
+The library adds `LowSpeed` and `FetcherOptions::low_speed`, the tool's rate
+rule over one `rt` timer. The
 rate is sampled once a second as the bytes of the last five seconds divided by
 five, from a ring of five byte counts, and a transfer fails when the rate stays
 at or below `limit` for `time` without a break. A sample above the limit starts
 the count again. The response head has to arrive within `time`, in whole
 seconds, of the start of an attempt, and the rate of a body is measured from
 its first read. A transfer below the rate is a retryable failure.
-`PullOptions` adds `low_speed_limit_bytes` and `low_speed_time`, below 1000
-bytes per second for 30 seconds by default, a zero in either turning the rule
-off. The pull reads each
-body through a crate-private refetch: a body that fails in transit is fetched
+`EndpointOverrides` holds `low_speed_limit_bytes` and `low_speed_time`.
+`resolve_pull` takes 1000 bytes per second and 30 seconds in place of a field
+left `None`. A zero in either field turns the rule off. The pull reads each
+body through `Fetcher::refetching`: a body that fails in transit is fetched
 again from its first byte, starting again from the first mirror, and each
-refetch spends one repeat of the same `n_network_retries` count. A body that
-outgrows its cap, or that the consumer refuses, is not fetched again.
+refetch spends one repeat of the same retry count,
+`FetcherOptions::max_retries`. A body that outgrows its cap, or that the
+consumer refuses, is not fetched again.
 `Fetcher::fetch` keeps its meaning. A content writer dropped before its object
 is staged removes its temp file, so a refetch on a filesystem without
 `O_TMPFILE` leaves no named temp behind. `rt::Deadline::restart` under tokio
@@ -6895,11 +6903,11 @@ exhausts its retries, the tool keeps what it fetched in a staging directory
 under `tmp/`, with the commit's partial marker in place, and writes no object
 and no ref.
 
-Three decisions stand, each taken without the maintainer and open to reversal.
-The default rule is a `PullOptions` default, and `FetcherOptions` keeps no rule
-by default, so the general client changes nothing. A body that fails in
-transit is fetched again from the shared count, which the default rule needs:
-without it, one slow transfer would end the whole pull. A value on
+Decision 16 places the default rule in `resolve_pull`. `FetcherOptions` keeps
+no rule by default, so the general client changes nothing. Two decisions
+stand, each taken without the maintainer and open to reversal. A body that
+fails in transit is fetched again from the shared count, which the default
+rule needs: without it, one slow transfer would end the whole pull. A value on
 `--disable-retry-on-network-errors` stays refused by `clap`, which the open
 decision on a value given to a switch covers.
 
@@ -7337,10 +7345,10 @@ over a pair of streams, and `PullOptions::endpoint` carries the address and
 the options of each transport (`docs/api-sketch.md`, "Pull over ssh: the
 client side"). `Repo::pull` and `Repo::remote_fetch_summary` run over the
 ssh client for an ssh endpoint of the caller, or for an ssh address in the
-remote key `pull-url`. `resolve_pull` reads the remote keys `ssh-command`
-and `send-command` into the `SshOptions` of the endpoint where the caller
-leaves a field `None`, and reads `Remote::pull_url` and
-`Remote::send_command` in every build
+remote key `pull-url`. `resolve_pull` reads the key `ssh-command` into
+`SshOptions::config_command`. It reads the key `send-command` into
+`SshOptions::remote_command` when `EndpointOverrides::remote_command` is
+`None`. It reads `Remote::pull_url` and `Remote::send_command` in every build
 (`format-reference.md`, "Port extension: the push and pull keys of a
 remote"). `ostrya pull`, `ostrya remote refs`, and `ostrya remote summary`
 work for a remote whose `pull-url` is an ssh address
@@ -8777,3 +8785,50 @@ Resolved:
     objects before `objects/` moves the constraint into the type; it is a
     public API addition and lands with the phase that brings a second
     caller.
+
+16. Remote endpoints (Phase 19): `ostrya::endpoint` reads the remote keys.
+    `ostrya-remote` takes an `Endpoint`: an `SshAddress` with `SshOptions`, or
+    the `FetcherOptions` of the HTTP client. The transports read no remote
+    key and no file that a remote key names. The ssh transport reads the
+    `OSTRYA_SSH_COMMAND` environment variable. Under `TrustRoots::System`,
+    `ostrya-fetch` reads the trust store of the host. The module
+    `ostrya::endpoint` reads the remote keys and the files that the keys
+    name, for the pull and for the push. `resolve_pull` and `resolve_push`
+    give an `Endpoint`, and a value in `EndpointOverrides` wins over its
+    remote key. The `push` feature gates `resolve_push`. A library caller can
+    build an `Endpoint` itself, with a credential, trust anchors, or a client
+    key and its passphrase from any source.
+
+    The trust policy belongs to the caller. The transports and `ostrya-fetch`
+    accept each trust root that the caller gives,
+    `TrustRoots::DangerousAcceptAnyChain` and `TrustRoots::DangerousAcceptAny`
+    included. The resolvers hold the policy of the remote keys.
+    `resolve_pull` maps `tls-permissive=true` to
+    `TrustRoots::DangerousAcceptAnyChain`. `resolve_push` refuses
+    `tls-permissive=true` for an `https://` address.
+
+    The two resolvers read the shared keys by the same rules:
+
+    - The push reads the `proxy` key, as the pull reads it. An empty or
+      absent key gives `Proxy::Environment`. A value with white space at its
+      start or its end is `Error::Unsupported`. A push to an address names no
+      remote, so it gets `Proxy::Environment`.
+    - The pull and the push read the TLS files through one reader,
+      `read_pem_file`. The reader refuses a file larger than 1 MiB. Each
+      error names the key and the path. For an `http://` address, the push
+      uses no TLS and reads no TLS file.
+    - A refusal of a field of the other transport names the field by its
+      remote key, or by the option of the `ostrya` command that sets it.
+    - `resolve_push` refuses a Basic user name that is empty or that holds
+      `:`. A library caller that builds a `BasicAuth` itself gets no refusal.
+
+    `FetcherOptions` holds `bearer_token` and `allow_cleartext_credentials`.
+    `Fetcher::new` refuses a bearer token or a Basic credential beside an
+    `Authorization` entry in `headers`. So the push refuses an
+    `Authorization` header beside a push token, when `PushSession::prepare`
+    builds the HTTP client.
+
+    `resolve_pull` sets 5 retries, 8 requests in flight, and a low-speed rule
+    of 1000 bytes per second for 30 seconds, where the caller gives no value.
+    An endpoint from `FetcherOptions::new` also has 5 retries and 8 requests
+    in flight, but no low-speed rule.

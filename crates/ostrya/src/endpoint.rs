@@ -428,7 +428,8 @@ async fn pull_http(
 ///   [`basic_auth`](FetcherOptions::basic_auth). The token alone gives
 ///   [`bearer_token`](FetcherOptions::bearer_token).
 /// - The trust anchors and the client identity are the PEM files. The client
-///   key must need no passphrase.
+///   key must need no passphrase. For an `http://` address, the function
+///   reads no PEM file, because the push uses no TLS.
 /// - The proxy is the key `proxy`. An empty or absent key, or no section,
 ///   gives [`Proxy::Environment`].
 /// - The headers, the cleartext permission, and the retry count are the
@@ -620,10 +621,12 @@ async fn push_http(
             None => http.bearer_token = Some(BearerToken { token }),
         }
     }
-    if let Some(path) = &o.tls_ca_path {
+    // The HTTP client of a push session follows no redirect, so an `http://`
+    // address uses no TLS, and the push reads no TLS file.
+    if !cleartext && let Some(path) = &o.tls_ca_path {
         http.tls.roots = TrustRoots::Pem(read_pem_file("tls-ca-path", path).await?);
     }
-    if let Some((cert, key)) = client_files {
+    if !cleartext && let Some((cert, key)) = client_files {
         http.tls.client_identity = Some(client_identity(&cert, &key).await?);
     }
     http.headers = o.http_headers;
@@ -2212,7 +2215,7 @@ mod tests {
                     password: "KEY-TOKEN".into()
                 })
             );
-            assert_eq!(http.tls.roots, TrustRoots::Pem(b"KEY-CA".to_vec()));
+            assert_eq!(http.tls, TlsOptions::default());
 
             let o = EndpointOverrides {
                 push_token_file: Some(dir.file("t", b"s3cr3t==\n")),
@@ -2226,6 +2229,30 @@ mod tests {
                     token: "s3cr3t==".into()
                 })
             );
+        }
+
+        /// An `http://` push address uses no TLS, so the push reads no TLS
+        /// file of the caller or of the keys. The files are absent, so a read
+        /// gives an I/O error.
+        #[test]
+        fn a_cleartext_push_reads_no_tls_file() {
+            let dir = Dir::new();
+            let absent = dir.absent("absent");
+            let o = EndpointOverrides {
+                tls_ca_path: Some(absent.clone()),
+                tls_client_cert_path: Some(absent.clone()),
+                tls_client_key_path: Some(absent.clone()),
+                ..EndpointOverrides::default()
+            };
+            let http = http_of(push(None, "http://h/", o));
+            assert_eq!(http.tls, TlsOptions::default());
+            let cfg = config(&format!(
+                "[remote \"keys\"]\nurl=http://ex.com/repo\n\
+                 tls-ca-path={0}\ntls-client-cert-path={0}\ntls-client-key-path={0}\n",
+                absent.display()
+            ));
+            let http = http_of(push(Some(&cfg), "keys", EndpointOverrides::default()));
+            assert_eq!(http.tls, TlsOptions::default());
         }
 
         /// The push gives an `Authorization` header of the caller beside the
@@ -2267,18 +2294,22 @@ mod tests {
             let dir = Dir::new();
             let absent = dir.absent("absent");
             for (cert, key) in [(Some(absent.clone()), None), (None, Some(absent.clone()))] {
-                let o = EndpointOverrides {
-                    push_token_file: Some(absent.clone()),
-                    tls_ca_path: Some(absent.clone()),
-                    tls_client_cert_path: cert,
-                    tls_client_key_path: key,
-                    ..EndpointOverrides::default()
-                };
-                assert_eq!(
-                    refused(push(None, "https://h/", o)),
-                    "a client certificate needs both tls-client-cert-path and \
-                     tls-client-key-path"
-                );
+                // An `http://` address reads no TLS file, and the refusal
+                // stays.
+                for address in ["https://h/", "http://h/"] {
+                    let o = EndpointOverrides {
+                        push_token_file: Some(absent.clone()),
+                        tls_ca_path: Some(absent.clone()),
+                        tls_client_cert_path: cert.clone(),
+                        tls_client_key_path: key.clone(),
+                        ..EndpointOverrides::default()
+                    };
+                    assert_eq!(
+                        refused(push(None, address, o)),
+                        "a client certificate needs both tls-client-cert-path and \
+                         tls-client-key-path"
+                    );
+                }
             }
         }
 

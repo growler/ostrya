@@ -2027,7 +2027,8 @@ proxy keys of the pull, and ignores `ssh-command` and `receive-command`:
 - `tls-permissive` -- for an `https://` address, the push refuses
   `tls-permissive=true` before any request. A push verifies the certificate
   chain of the server. An `http://` address uses no TLS, and the push does
-  not read the key.
+  not read the key. For such an address, the push also reads no file that
+  `tls-ca-path`, `tls-client-cert-path`, or `tls-client-key-path` names.
 - `proxy` -- the `http://` proxy URL of the push, by the rules of the pull.
   An empty or absent key gives the proxy environment variables. A value with
   white space at its start or end fails the push before any request.

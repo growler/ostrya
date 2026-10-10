@@ -911,6 +911,16 @@ fn the_debug_of_an_http_endpoint_shows_no_header_value() {
     );
 }
 
+/// The `Debug` output of an HTTP endpoint shows the host and the path of a
+/// mirror URL, and no userinfo or query.
+#[test]
+fn the_debug_of_an_http_endpoint_shows_no_mirror_secret() {
+    let http = ostrya_fetch::FetcherOptions::new("https://user-QXZ:pw-QXZ@h/repo?t=QXZ");
+    let shown = format!("{:?}", Endpoint::Http(http));
+    assert!(!shown.contains("QXZ"), "{shown}");
+    assert!(shown.contains(r#""https://h/repo?<redacted>""#), "{shown}");
+}
+
 #[test]
 fn a_path_with_quotes_and_spaces_is_quoted_for_the_shell() {
     assert_eq!(quote_posix("/a b/it's"), r"'/a b/it'\''s'");

@@ -518,16 +518,32 @@ impl std::fmt::Debug for Proxy {
         match self {
             Proxy::None => f.write_str("None"),
             Proxy::Environment => f.write_str("Environment"),
-            Proxy::Variables(variables) => {
-                let held = variables
-                    .iter()
-                    .map(|(name, value)| (name, without_userinfo(value)));
-                f.debug_tuple("Variables")
-                    .field(&held.collect::<Vec<_>>())
-                    .finish()
-            }
-            Proxy::Url(url) => f.debug_tuple("Url").field(&without_userinfo(url)).finish(),
+            Proxy::Variables(variables) => f
+                .debug_tuple("Variables")
+                .field(&RedactedVariables { variables })
+                .finish(),
+            Proxy::Url(url) => f.debug_tuple("Url").field(&RedactedUrl::url(url)).finish(),
         }
+    }
+}
+
+/// The proxy variables in a [`Debug`] output: a list of name and value pairs.
+///
+/// Each value shows as [`RedactedUrl`] shows an absolute URL.
+struct RedactedVariables<'a> {
+    variables: &'a [(String, String)],
+}
+
+impl std::fmt::Debug for RedactedVariables<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let RedactedVariables { variables } = self;
+        f.debug_list()
+            .entries(
+                variables
+                    .iter()
+                    .map(|(name, value)| (name, RedactedUrl::url(value))),
+            )
+            .finish()
     }
 }
 
@@ -551,6 +567,95 @@ where
     }
 }
 
+/// A URL or a request path in a [`Debug`] output, with no userinfo, query
+/// value, or fragment value.
+///
+/// The userinfo of an absolute URL is the text after the `://` of the scheme,
+/// up to and including the last `@`. When the text has no valid scheme before
+/// the first `://`, the userinfo is the text from the start up to and including
+/// the last `@`. A password can hold a `/`, `?`, or `#`, so the output removes
+/// the userinfo first and leaves no marker for it. Then a query shows as
+/// `?<redacted>`, and a fragment shows as `#<redacted>`. A path has no
+/// userinfo. Each other part shows as the [`Debug`] output of a `str` shows it.
+struct RedactedUrl<'a> {
+    text: &'a str,
+    /// `true` if `text` is an absolute URL, which can hold userinfo.
+    absolute: bool,
+}
+
+impl<'a> RedactedUrl<'a> {
+    /// Shows an absolute URL.
+    fn url(text: &'a str) -> RedactedUrl<'a> {
+        RedactedUrl {
+            text,
+            absolute: true,
+        }
+    }
+
+    /// Shows a request path.
+    fn path(text: &'a str) -> RedactedUrl<'a> {
+        RedactedUrl {
+            text,
+            absolute: false,
+        }
+    }
+}
+
+impl std::fmt::Debug for RedactedUrl<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write as _;
+
+        let RedactedUrl { text, absolute } = *self;
+        let (scheme, rest) = if absolute {
+            let end = scheme_len(text);
+            let rest = &text[end..];
+            let rest = rest.rfind('@').map_or(rest, |at| &rest[at + 1..]);
+            (&text[..end], rest)
+        } else {
+            ("", text)
+        };
+        let (shown, query, fragment) = match rest.find(['?', '#']) {
+            None => (rest, false, false),
+            Some(at) if rest[at..].starts_with('#') => (&rest[..at], false, true),
+            Some(at) => (&rest[..at], true, rest[at..].contains('#')),
+        };
+        // The `Debug` output of a `str` escapes each `char` as
+        // `char::escape_debug` does, except `'`, which it writes as it is.
+        f.write_char('"')?;
+        for c in scheme.chars().chain(shown.chars()) {
+            if c == '\'' {
+                f.write_char(c)?;
+            } else {
+                for escaped in c.escape_debug() {
+                    f.write_char(escaped)?;
+                }
+            }
+        }
+        if query {
+            f.write_str("?<redacted>")?;
+        }
+        if fragment {
+            f.write_str("#<redacted>")?;
+        }
+        f.write_char('"')
+    }
+}
+
+/// A list of URLs in a [`Debug`] output, each one shown as [`RedactedUrl`]
+/// shows an absolute URL.
+struct RedactedUrls<'a> {
+    urls: &'a [String],
+}
+
+impl std::fmt::Debug for RedactedUrls<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let RedactedUrls { urls } = self;
+        f.debug_list()
+            .entries(urls.iter().map(|url| RedactedUrl::url(url)))
+            .finish()
+    }
+}
+
 /// The options of a [`Fetcher`]: the remote, the credentials, and the limits.
 ///
 /// [`FetcherOptions::default`] sets each field to the default that the field
@@ -559,7 +664,8 @@ where
 /// The [`Debug`] output shows the name of each header, and `<redacted>` in
 /// place of its value. The output also shows no password of `basic_auth`, no
 /// token of `bearer_token`, no client key or passphrase, and no userinfo of a
-/// proxy URL. Each mirror URL shows as written.
+/// proxy URL. Each mirror URL shows with no userinfo. A query shows as
+/// `?<redacted>`, and a fragment shows as `#<redacted>`.
 #[derive(Clone)]
 pub struct FetcherOptions {
     /// The base URLs, tried in order for each request that names a
@@ -807,7 +913,7 @@ impl std::fmt::Debug for FetcherOptions {
             names: || headers.iter().map(|(name, _)| name.as_str()),
         };
         f.debug_struct("FetcherOptions")
-            .field("mirrors", mirrors)
+            .field("mirrors", &RedactedUrls { urls: mirrors })
             .field("headers", &headers)
             .field("basic_auth", basic_auth)
             .field("bearer_token", bearer_token)
@@ -837,7 +943,11 @@ impl FetcherOptions {
 }
 
 /// The target of a request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The [`Debug`] output shows no userinfo of a URL. A query shows as
+/// `?<redacted>`, and a fragment shows as `#<redacted>`, in a URL and in a
+/// path.
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum Target<'a> {
     /// A path under the base URL of each mirror.
     Path(&'a str),
@@ -845,6 +955,18 @@ pub enum Target<'a> {
     ///
     /// The fetcher does not use the mirror list for it.
     Url(&'a str),
+}
+
+impl std::fmt::Debug for Target<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Target::Path(path) => f
+                .debug_tuple("Path")
+                .field(&RedactedUrl::path(path))
+                .finish(),
+            Target::Url(url) => f.debug_tuple("Url").field(&RedactedUrl::url(url)).finish(),
+        }
+    }
 }
 
 impl Target<'_> {
@@ -861,7 +983,8 @@ impl Target<'_> {
 /// The request of one fetch.
 ///
 /// The [`Debug`] output shows the name of each header, and `<redacted>` in
-/// place of its value.
+/// place of its value. The target shows as the [`Debug`] output of [`Target`]
+/// shows it.
 #[derive(Clone)]
 pub struct FetchRequest<'a> {
     /// The target: a path under the base URL of each mirror, or an absolute
@@ -1128,7 +1251,8 @@ impl std::fmt::Debug for UploadBody {
 /// The request of one upload, which sends a body and gets a bounded response.
 ///
 /// The [`Debug`] output shows the name of each header, and `<redacted>` in
-/// place of its value.
+/// place of its value. The target shows as the [`Debug`] output of [`Target`]
+/// shows it.
 pub struct UploadRequest<'a> {
     /// The target, read as [`FetchRequest::target`] is.
     ///
@@ -1259,7 +1383,8 @@ impl<'a> UploadRequest<'a> {
 ///
 /// The [`Debug`] output shows the name of each response header, and
 /// `<redacted>` in place of its value. A header with several values shows its
-/// name once for each value.
+/// name once for each value. The URL shows with no userinfo. A query shows as
+/// `?<redacted>`, and a fragment shows as `#<redacted>`.
 pub struct Uploaded {
     status: StatusCode,
     headers: hyper::HeaderMap,
@@ -1281,7 +1406,7 @@ impl std::fmt::Debug for Uploaded {
         f.debug_struct("Uploaded")
             .field("status", status)
             .field("headers", &headers)
-            .field("url", url)
+            .field("url", &RedactedUrl::url(url))
             .field("body", body)
             .finish()
     }
@@ -5396,16 +5521,31 @@ fn parse_authority(url: &str, credentials: &str) -> Result<(Uri, Origin, String)
 ///
 /// The function reads an `@` at any position after the scheme as the end of a
 /// userinfo. It leaves out all text up to the last `@`, so no password of any
-/// form reaches the message.
+/// form reaches the message. When the text has no valid scheme before the
+/// first `://`, the userinfo starts at the start of the text.
 ///
 /// If a URL has an `@` in its path and no userinfo, the message loses its
 /// host. A redaction that reads no well-formed authority has this cost.
 fn without_userinfo(url: &str) -> Cow<'_, str> {
-    let start = url.find("://").map_or(0, |at| at + 3);
+    let start = scheme_len(url);
     match url[start..].rfind('@') {
         Some(at) => Cow::Owned(format!("{}{}", &url[..start], &url[start + at + 1..])),
         None => Cow::Borrowed(url),
     }
+}
+
+/// Returns the length of the `<scheme>://` prefix of `url`, or 0.
+///
+/// The prefix counts only when the text before the first `://` is a valid
+/// scheme: an ASCII letter, then ASCII letters, digits, `+`, `-`, or `.`.
+fn scheme_len(url: &str) -> usize {
+    let Some(end) = url.find("://") else {
+        return 0;
+    };
+    let mut chars = url[..end].chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    if valid { end + 3 } else { 0 }
 }
 
 /// Returns the `Host` header value of one authority.
@@ -7200,6 +7340,42 @@ mod tests {
         });
     }
 
+    /// The `Debug` of a proxy writes each URL as `RedactedUrl` writes it. The
+    /// form of each variant is the form of `derive(Debug)`.
+    #[test]
+    fn proxy_debug_redacts_each_url() {
+        let url = "http://alice:pw-QXZ@proxy.example:3128/?t=QXZ#QXZ";
+        assert_eq!(
+            format!("{:?}", Proxy::Url(url.to_owned())),
+            r#"Url("http://proxy.example:3128/?<redacted>#<redacted>")"#
+        );
+        let variables = Proxy::Variables(vec![
+            ("https_proxy".to_owned(), url.to_owned()),
+            ("no_proxy".to_owned(), ".internal.example.com".to_owned()),
+        ]);
+        assert_eq!(
+            format!("{variables:?}"),
+            concat!(
+                r#"Variables([("https_proxy", "http://proxy.example:3128/?<redacted>#<redacted>"), "#,
+                r#"("no_proxy", ".internal.example.com")])"#
+            )
+        );
+        assert_eq!(format!("{:?}", Proxy::None), "None");
+        assert_eq!(format!("{:?}", Proxy::Environment), "Environment");
+    }
+
+    /// The text before `://` is a scheme only when it is a valid scheme. Else
+    /// the userinfo starts at the start of the text.
+    #[test]
+    fn without_userinfo_reads_only_a_valid_scheme() {
+        assert_eq!(without_userinfo("u:a://b@h/p"), "h/p");
+        assert_eq!(without_userinfo("svn+ssh://u@h/p"), "svn+ssh://h/p");
+        assert_eq!(without_userinfo("https://h/p"), "https://h/p");
+        assert_eq!(scheme_len("1http://h"), 0);
+        assert_eq!(scheme_len("://h"), 0);
+        assert_eq!(scheme_len("h/p"), 0);
+    }
+
     /// A `CONNECT` names its target by host and port, and always writes the
     /// port. The proxy opens a TCP connection, which reads no scheme.
     #[test]
@@ -8322,39 +8498,47 @@ mod tests {
         );
     }
 
-    /// The `Debug` output of an upload answer shows the name of each response
-    /// header, once for each value, and no header value.
+    /// Starts a raw socket peer that answers each request with fixed headers,
+    /// and gives a fetcher with the peer as its mirror, and the port of the
+    /// peer.
     ///
-    /// The peer is a raw socket that answers each request with fixed headers.
-    #[test]
-    fn uploaded_debug_holds_no_header_value() {
+    /// Each header value holds the marker `QXZ`.
+    async fn fixed_header_peer() -> (Fetcher, u16) {
         use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 
-        rt::block_on(async {
-            let peer = rt::TcpListener::bind("127.0.0.1:0".parse().unwrap())
-                .await
-                .unwrap();
-            let port = peer.local_addr().unwrap().port();
-            drop(rt::spawn(async move {
-                while let Ok((mut stream, _peer)) = peer.accept().await {
-                    let mut request = [0u8; 1024];
-                    let _ = stream.read(&mut request).await;
-                    let answer = "HTTP/1.1 200 OK\r\nSet-Cookie: a=val-QXZ-5\r\n\
-                                  Set-Cookie: b=val-QXZ-6\r\nContent-Type: text/val-QXZ-7\r\n\
-                                  Content-Length: 0\r\n\r\n";
-                    let _ = stream.write_all(answer.as_bytes()).await;
-                    let _ = stream.flush().await;
-                }
-            }));
-
-            // With no redirect and a cleartext mirror, the fetcher reads no
-            // system trust store.
-            let fetcher = Fetcher::new(FetcherOptions {
-                max_redirects: 0,
-                ..direct_options(format!("http://127.0.0.1:{port}"))
-            })
+        let peer = rt::TcpListener::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
+        let port = peer.local_addr().unwrap().port();
+        drop(rt::spawn(async move {
+            while let Ok((mut stream, _peer)) = peer.accept().await {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let answer = "HTTP/1.1 200 OK\r\nSet-Cookie: a=val-QXZ-5\r\n\
+                              Set-Cookie: b=val-QXZ-6\r\nContent-Type: text/val-QXZ-7\r\n\
+                              Content-Length: 0\r\n\r\n";
+                let _ = stream.write_all(answer.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        }));
+
+        // With no redirect and a cleartext mirror, the fetcher reads no system
+        // trust store.
+        let fetcher = Fetcher::new(FetcherOptions {
+            max_redirects: 0,
+            ..direct_options(format!("http://127.0.0.1:{port}"))
+        })
+        .await
+        .unwrap();
+        (fetcher, port)
+    }
+
+    /// The `Debug` output of an upload answer shows the name of each response
+    /// header, once for each value, and no header value.
+    #[test]
+    fn uploaded_debug_holds_no_header_value() {
+        rt::block_on(async {
+            let (fetcher, port) = fixed_header_peer().await;
             let uploaded = within(
                 Duration::from_secs(5),
                 fetcher.upload(UploadRequest::path(
@@ -8377,5 +8561,201 @@ mod tests {
                 )
             );
         });
+    }
+
+    /// The `Debug` output of an upload answer shows the host and the path of
+    /// its URL, and `<redacted>` in place of the query.
+    #[test]
+    fn uploaded_debug_holds_no_url_query() {
+        rt::block_on(async {
+            let (fetcher, port) = fixed_header_peer().await;
+            let url = format!("http://127.0.0.1:{port}/objects?X-Amz-Signature=sig-QXZ");
+            let uploaded = within(
+                Duration::from_secs(5),
+                fetcher.upload(UploadRequest::url(&url, UploadBody::bytes(Vec::new()))),
+            )
+            .await
+            .expect("the upload ends within the limit")
+            .unwrap();
+            assert_eq!(uploaded.url(), url);
+            let rendered = format!("{uploaded:?}");
+            assert!(!rendered.contains("QXZ"), "{rendered}");
+            assert!(
+                rendered.contains(&format!(
+                    "url: \"http://127.0.0.1:{port}/objects?<redacted>\""
+                )),
+                "{rendered}"
+            );
+        });
+    }
+
+    /// For a text with no `@`, `?`, and `#`, the `Debug` output of a URL and
+    /// of a path is the `Debug` output of the `str`.
+    #[test]
+    fn redacted_url_debug_quotes_as_str_debug() {
+        let texts = [
+            "https://example.com/it's",
+            "a\"b\\c",
+            "line\nnext\ttab\u{7f}",
+            "caf\u{e9}",
+            "\u{301}start",
+            "mid\u{301}dle",
+            "zero\u{200b}width",
+            "emoji \u{1f980}",
+            "",
+        ];
+        for text in texts {
+            let expected = format!("{text:?}");
+            assert_eq!(format!("{:?}", RedactedUrl::url(text)), expected);
+            assert_eq!(format!("{:?}", RedactedUrl::path(text)), expected);
+        }
+    }
+
+    /// The `Debug` output of a URL removes the text up to the last `@` after
+    /// the scheme, and shows `<redacted>` in place of a query and a fragment.
+    /// A path keeps each `@`.
+    #[test]
+    fn redacted_url_debug_removes_userinfo_query_and_fragment() {
+        let urls = [
+            ("https://example.com/repo", "https://example.com/repo"),
+            (
+                "https://user:pw@example.com/repo",
+                "https://example.com/repo",
+            ),
+            (
+                "https://u:pa#ss@example.com/repo",
+                "https://example.com/repo",
+            ),
+            (
+                "https://u:pa?ss@example.com/repo",
+                "https://example.com/repo",
+            ),
+            (
+                "https://u:p/ss@example.com/repo",
+                "https://example.com/repo",
+            ),
+            ("https://example.com/a@b/c", "https://b/c"),
+            (
+                "https://example.com/s?a=1",
+                "https://example.com/s?<redacted>",
+            ),
+            (
+                "https://example.com/s#f",
+                "https://example.com/s#<redacted>",
+            ),
+            (
+                "https://u:p@example.com/s?a=1#f",
+                "https://example.com/s?<redacted>#<redacted>",
+            ),
+            ("https://example.com/s?", "https://example.com/s?<redacted>"),
+            ("https://example.com/s#", "https://example.com/s#<redacted>"),
+            (
+                "https://example.com/s?#",
+                "https://example.com/s?<redacted>#<redacted>",
+            ),
+            ("https://example.com/s?a=x@y&b=1", "https://y&b=1"),
+            ("example.com/s?a=1", "example.com/s?<redacted>"),
+            ("u:p@example.com/s", "example.com/s"),
+            ("u:a://b@h/p", "h/p"),
+            ("https://[::1]:8/p?q", "https://[::1]:8/p?<redacted>"),
+            ("https://h/p#a?b", "https://h/p#<redacted>"),
+            ("é@é?é#é", "é?<redacted>#<redacted>"),
+        ];
+        for (url, shown) in urls {
+            assert_eq!(
+                format!("{:?}", RedactedUrl::url(url)),
+                format!("\"{shown}\"")
+            );
+        }
+        let paths = [
+            ("objects/ab", "objects/ab"),
+            ("a@b/c", "a@b/c"),
+            ("summary?sig=1", "summary?<redacted>"),
+            ("summary#f", "summary#<redacted>"),
+            ("summary?sig=1#f", "summary?<redacted>#<redacted>"),
+        ];
+        for (path, shown) in paths {
+            assert_eq!(
+                format!("{:?}", RedactedUrl::path(path)),
+                format!("\"{shown}\"")
+            );
+        }
+    }
+
+    /// The `Debug` output of a target alone shows the layout of a tuple
+    /// variant, with the URL rule.
+    #[test]
+    fn target_debug_redacts_url_and_path() {
+        let url = Target::Url("https://u:pw-QXZ@h/p?t=QXZ#QXZ");
+        let path = Target::Path("summary?sig=QXZ#QXZ");
+        assert_eq!(
+            format!("{url:?}"),
+            r#"Url("https://h/p?<redacted>#<redacted>")"#
+        );
+        assert_eq!(
+            format!("{path:?}"),
+            r#"Path("summary?<redacted>#<redacted>")"#
+        );
+        assert_eq!(
+            format!("{url:#?}"),
+            "Url(\n    \"https://h/p?<redacted>#<redacted>\",\n)"
+        );
+        assert_eq!(
+            format!("{path:#?}"),
+            "Path(\n    \"summary?<redacted>#<redacted>\",\n)"
+        );
+    }
+
+    /// A URL that holds the marker `QXZ` in its userinfo, query, and fragment.
+    const SECRET_URL: &str =
+        "https://user-QXZ:pw-QXZ@example.com/repo?X-Amz-Signature=sig-QXZ#frag-QXZ";
+
+    /// The `Debug` output of the options shows the host and the path of each
+    /// mirror, and no userinfo, query, or fragment.
+    #[test]
+    fn fetcher_options_debug_holds_no_mirror_secret() {
+        let options = FetcherOptions {
+            mirrors: vec![SECRET_URL.into(), "https://mirror.example.com/os".into()],
+            ..FetcherOptions::default()
+        };
+        let rendered = format!("{options:?}");
+        assert!(!rendered.contains("QXZ"), "{rendered}");
+        assert!(
+            rendered.contains(
+                r#"mirrors: ["https://example.com/repo?<redacted>#<redacted>", "https://mirror.example.com/os"]"#
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// The `Debug` output of a fetch request shows the host and the path of
+    /// its target, and no userinfo, query, or fragment.
+    #[test]
+    fn fetch_request_debug_holds_no_target_secret() {
+        let rendered = format!("{:?}", FetchRequest::url(SECRET_URL));
+        assert!(!rendered.contains("QXZ"), "{rendered}");
+        assert!(
+            rendered.contains(r#"target: Url("https://example.com/repo?<redacted>#<redacted>")"#),
+            "{rendered}"
+        );
+        let rendered = format!("{:?}", FetchRequest::path("summary?sig=QXZ#f"));
+        assert!(!rendered.contains("QXZ"), "{rendered}");
+        assert!(
+            rendered.contains(r#"target: Path("summary?<redacted>#<redacted>")"#),
+            "{rendered}"
+        );
+    }
+
+    /// The `Debug` output of an upload request shows the host and the path of
+    /// its target, and no userinfo, query, or fragment.
+    #[test]
+    fn upload_request_debug_holds_no_target_secret() {
+        let request = UploadRequest::url(SECRET_URL, UploadBody::bytes(Vec::new()));
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("QXZ"), "{rendered}");
+        assert!(
+            rendered.contains(r#"target: Url("https://example.com/repo?<redacted>#<redacted>")"#),
+            "{rendered}"
+        );
     }
 }

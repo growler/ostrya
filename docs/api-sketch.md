@@ -1928,7 +1928,8 @@ cleartext however it is reached.
 
 ```rust
 /// The `Debug` rendering shows each header name and `<redacted>` in place of
-/// its value.
+/// its value. Each mirror URL shows with no userinfo. A query shows as
+/// `?<redacted>`, and a fragment shows as `#<redacted>`.
 pub struct FetcherOptions {
     pub mirrors: Vec<String>,             // base URLs, tried in order; a query
                                           // string, userinfo, or an unreadable
@@ -1995,7 +1996,8 @@ pub struct ClientIdentity {
 pub struct TlsOptions { pub roots: TrustRoots, pub client_identity: Option<ClientIdentity> }
 
 /// Which proxy an origin is reached through. The `Debug` rendering leaves the
-/// userinfo of a proxy URL out.
+/// userinfo of a proxy URL out. A query shows as `?<redacted>`, and a fragment
+/// shows as `#<redacted>`.
 pub enum Proxy {
     None,                             // connect directly, whatever the
                                       // environment says
@@ -2015,11 +2017,13 @@ pub enum Protocol { Http11, Http2 }
 pub struct Validators { pub etag: Option<String>, pub last_modified: Option<String> }
 
 /// What a request names. A path is served under every mirror; a URL is served
-/// from its own origin, and the mirror list is not consulted.
+/// from its own origin, and the mirror list is not consulted. The `Debug`
+/// rendering shows no userinfo of a URL. A query shows as `?<redacted>`, and a
+/// fragment shows as `#<redacted>`, in a URL and in a path.
 pub enum Target<'a> { Path(&'a str), Url(&'a str) }
 
 /// The `Debug` rendering shows each header name and `<redacted>` in place of
-/// its value.
+/// its value. The target shows as the `Debug` rendering of `Target` shows it.
 pub struct FetchRequest<'a> {
     pub target: Target<'a>,               // a path is appended to each mirror's
                                           // base path as written and holds no
@@ -2108,7 +2112,7 @@ pub enum UploadMethod { Post /* default */, Delete /* no body */ }
 pub struct BearerToken { pub token: String }
 
 /// The `Debug` rendering shows each header name and `<redacted>` in place of
-/// its value.
+/// its value. The target shows as the `Debug` rendering of `Target` shows it.
 pub struct UploadRequest<'a> {
     pub target: Target<'a>,
     pub method: UploadMethod,
@@ -2132,6 +2136,8 @@ impl<'a> UploadRequest<'a> {
 /// The answer to an upload, for every final status. Send + Sync. The `Debug`
 /// rendering shows each response header name and `<redacted>` in place of its
 /// value. A header with several values shows its name once for each value.
+/// The URL shows with no userinfo. A query shows as `?<redacted>`, and a
+/// fragment shows as `#<redacted>`.
 pub struct Uploaded { /* ... */ }
 impl Uploaded {
     pub fn status(&self) -> u16;
@@ -3767,8 +3773,9 @@ pub struct SshOptions {
     pub remote_command: Option<String>,       // default "ostrya receive" or "ostrya send"
 }
 
-/// The `Debug` rendering of `Endpoint::Http` shows no header value, because
-/// the `Debug` rendering of `FetcherOptions` redacts each value.
+/// The `Debug` rendering of `Endpoint::Http` shows no header value, and no
+/// userinfo, query, or fragment of a mirror URL, because the `Debug` rendering
+/// of `FetcherOptions` redacts each of them.
 #[derive(Debug, Clone)]
 pub enum Endpoint {
     Ssh { address: SshAddress, options: SshOptions },

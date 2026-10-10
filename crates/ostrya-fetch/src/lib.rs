@@ -531,11 +531,36 @@ impl std::fmt::Debug for Proxy {
     }
 }
 
+/// The headers in a [`Debug`] output: a list of name and `<redacted>` pairs.
+///
+/// A header value can be a credential, so no value shows. Each call of `names`
+/// gives the name of each header value, in order.
+struct RedactedHeaders<F> {
+    names: F,
+}
+
+impl<'a, F, I> std::fmt::Debug for RedactedHeaders<F>
+where
+    F: Fn() -> I,
+    I: Iterator<Item = &'a str>,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries((self.names)().map(|name| (name, "<redacted>")))
+            .finish()
+    }
+}
+
 /// The options of a [`Fetcher`]: the remote, the credentials, and the limits.
 ///
 /// [`FetcherOptions::default`] sets each field to the default that the field
 /// states. [`FetcherOptions::new`] also sets one mirror.
-#[derive(Clone, Debug)]
+///
+/// The [`Debug`] output shows the name of each header, and `<redacted>` in
+/// place of its value. The output also shows no password of `basic_auth`, no
+/// token of `bearer_token`, no client key or passphrase, and no userinfo of a
+/// proxy URL. Each mirror URL shows as written.
+#[derive(Clone)]
 pub struct FetcherOptions {
     /// The base URLs, tried in order for each request that names a
     /// [`Target::Path`].
@@ -759,6 +784,48 @@ impl Default for FetcherOptions {
     }
 }
 
+impl std::fmt::Debug for FetcherOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let FetcherOptions {
+            mirrors,
+            headers,
+            basic_auth,
+            bearer_token,
+            allow_cleartext_credentials,
+            tls,
+            proxy,
+            http2,
+            max_retries,
+            max_redirects,
+            max_outstanding,
+            connect_timeout,
+            progress_timeout,
+            low_speed,
+            fetch_timeout,
+        } = self;
+        let headers = RedactedHeaders {
+            names: || headers.iter().map(|(name, _)| name.as_str()),
+        };
+        f.debug_struct("FetcherOptions")
+            .field("mirrors", mirrors)
+            .field("headers", &headers)
+            .field("basic_auth", basic_auth)
+            .field("bearer_token", bearer_token)
+            .field("allow_cleartext_credentials", allow_cleartext_credentials)
+            .field("tls", tls)
+            .field("proxy", proxy)
+            .field("http2", http2)
+            .field("max_retries", max_retries)
+            .field("max_redirects", max_redirects)
+            .field("max_outstanding", max_outstanding)
+            .field("connect_timeout", connect_timeout)
+            .field("progress_timeout", progress_timeout)
+            .field("low_speed", low_speed)
+            .field("fetch_timeout", fetch_timeout)
+            .finish()
+    }
+}
+
 impl FetcherOptions {
     /// Creates options with one base URL and the default of each other field.
     pub fn new(url: impl Into<String>) -> FetcherOptions {
@@ -792,7 +859,10 @@ impl Target<'_> {
 }
 
 /// The request of one fetch.
-#[derive(Clone, Debug)]
+///
+/// The [`Debug`] output shows the name of each header, and `<redacted>` in
+/// place of its value.
+#[derive(Clone)]
 pub struct FetchRequest<'a> {
     /// The target: a path under the base URL of each mirror, or an absolute
     /// URL.
@@ -896,6 +966,32 @@ pub struct FetchRequest<'a> {
     /// credential from that one destination. That choice turns a configuration
     /// mistake into a 401 that names nothing.
     pub allow_cleartext_credentials: bool,
+}
+
+impl std::fmt::Debug for FetchRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let FetchRequest {
+            target,
+            priority,
+            validators,
+            max_size,
+            headers,
+            basic_auth,
+            allow_cleartext_credentials,
+        } = self;
+        let headers = RedactedHeaders {
+            names: || headers.iter().map(|(name, _)| name.as_str()),
+        };
+        f.debug_struct("FetchRequest")
+            .field("target", target)
+            .field("priority", priority)
+            .field("validators", validators)
+            .field("max_size", max_size)
+            .field("headers", &headers)
+            .field("basic_auth", basic_auth)
+            .field("allow_cleartext_credentials", allow_cleartext_credentials)
+            .finish()
+    }
 }
 
 impl<'a> FetchRequest<'a> {
@@ -1030,7 +1126,9 @@ impl std::fmt::Debug for UploadBody {
 }
 
 /// The request of one upload, which sends a body and gets a bounded response.
-#[derive(Debug)]
+///
+/// The [`Debug`] output shows the name of each header, and `<redacted>` in
+/// place of its value.
 pub struct UploadRequest<'a> {
     /// The target, read as [`FetchRequest::target`] is.
     ///
@@ -1085,6 +1183,38 @@ pub struct UploadRequest<'a> {
     pub response_timeout: Option<Duration>,
 }
 
+impl std::fmt::Debug for UploadRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let UploadRequest {
+            target,
+            method,
+            body,
+            priority,
+            max_response,
+            headers,
+            basic_auth,
+            bearer_token,
+            allow_cleartext_credentials,
+            response_timeout,
+        } = self;
+        let headers = RedactedHeaders {
+            names: || headers.iter().map(|(name, _)| name.as_str()),
+        };
+        f.debug_struct("UploadRequest")
+            .field("target", target)
+            .field("method", method)
+            .field("body", body)
+            .field("priority", priority)
+            .field("max_response", max_response)
+            .field("headers", &headers)
+            .field("basic_auth", basic_auth)
+            .field("bearer_token", bearer_token)
+            .field("allow_cleartext_credentials", allow_cleartext_credentials)
+            .field("response_timeout", response_timeout)
+            .finish()
+    }
+}
+
 impl<'a> UploadRequest<'a> {
     /// The default response cap of a request: 2 MiB.
     pub const DEFAULT_MAX_RESPONSE: u64 = 2 * 1024 * 1024;
@@ -1126,12 +1256,35 @@ impl<'a> UploadRequest<'a> {
 ///
 /// Each final status arrives here, also an unsuccessful one. The caller
 /// decides what it means.
-#[derive(Debug)]
+///
+/// The [`Debug`] output shows the name of each response header, and
+/// `<redacted>` in place of its value. A header with several values shows its
+/// name once for each value.
 pub struct Uploaded {
     status: StatusCode,
     headers: hyper::HeaderMap,
     url: String,
     body: Body,
+}
+
+impl std::fmt::Debug for Uploaded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Uploaded {
+            status,
+            headers,
+            url,
+            body,
+        } = self;
+        let headers = RedactedHeaders {
+            names: || headers.iter().map(|(name, _)| name.as_str()),
+        };
+        f.debug_struct("Uploaded")
+            .field("status", status)
+            .field("headers", &headers)
+            .field("url", url)
+            .field("body", body)
+            .finish()
+    }
 }
 
 impl Uploaded {
@@ -8075,5 +8228,154 @@ mod tests {
         let rendered = format!("{options:?}");
         assert!(!rendered.contains("s3cret"), "{rendered}");
         assert!(rendered.contains("redacted"), "{rendered}");
+    }
+
+    /// Headers whose values hold the marker `QXZ`, which no `Debug` output
+    /// shows.
+    fn secret_headers() -> Vec<(String, String)> {
+        vec![
+            ("Authorization".into(), "Basic val-QXZ-1".into()),
+            ("proxy-authorization".into(), "Basic val-QXZ-2".into()),
+            ("cookie".into(), "id=val-QXZ-3".into()),
+            ("X-Trace".into(), "val-QXZ-4".into()),
+        ]
+    }
+
+    /// The `Debug` output of the headers of [`secret_headers`].
+    const SECRET_HEADERS_SHOWN: &str = r#"[("Authorization", "<redacted>"), ("proxy-authorization", "<redacted>"), ("cookie", "<redacted>"), ("X-Trace", "<redacted>")]"#;
+
+    /// Checks that `rendered` shows each header of [`secret_headers`] with
+    /// `<redacted>`, and no header value.
+    fn assert_no_header_value(rendered: &str) {
+        assert!(!rendered.contains("QXZ"), "{rendered}");
+        for (name, _) in secret_headers() {
+            let entry = format!(r#"("{name}", "<redacted>")"#);
+            assert!(rendered.contains(&entry), "{rendered}");
+        }
+    }
+
+    /// The `Debug` output of the options shows each header name and no header
+    /// value. Each other field shows as its own `Debug` shows it, in the order
+    /// of declaration.
+    #[test]
+    fn fetcher_options_debug_holds_no_header_value() {
+        let options = FetcherOptions {
+            headers: secret_headers(),
+            ..FetcherOptions::new("https://example.com/")
+        };
+        let rendered = format!("{options:?}");
+        assert_no_header_value(&rendered);
+        assert_eq!(
+            rendered,
+            format!(
+                "FetcherOptions {{ mirrors: [\"https://example.com/\"], \
+                 headers: {SECRET_HEADERS_SHOWN}, basic_auth: None, bearer_token: None, \
+                 allow_cleartext_credentials: false, \
+                 tls: TlsOptions {{ roots: System, client_identity: None }}, \
+                 proxy: Environment, http2: true, max_retries: 5, max_redirects: 10, \
+                 max_outstanding: 8, connect_timeout: 30s, progress_timeout: 60s, \
+                 low_speed: None, fetch_timeout: Some(300s) }}"
+            )
+        );
+    }
+
+    /// The `Debug` output of a fetch request shows each header name and no
+    /// header value. Each other field shows as its own `Debug` shows it.
+    #[test]
+    fn fetch_request_debug_holds_no_header_value() {
+        let headers = secret_headers();
+        let request = FetchRequest {
+            headers: &headers,
+            ..FetchRequest::path("summary")
+        };
+        let rendered = format!("{request:?}");
+        assert_no_header_value(&rendered);
+        assert_eq!(
+            rendered,
+            format!(
+                "FetchRequest {{ target: Path(\"summary\"), priority: Normal, \
+                 validators: None, max_size: None, headers: {SECRET_HEADERS_SHOWN}, \
+                 basic_auth: None, allow_cleartext_credentials: false }}"
+            )
+        );
+    }
+
+    /// The `Debug` output of an upload request shows each header name and no
+    /// header value. Each other field shows as its own `Debug` shows it.
+    #[test]
+    fn upload_request_debug_holds_no_header_value() {
+        let headers = secret_headers();
+        let request = UploadRequest {
+            headers: &headers,
+            ..UploadRequest::path("objects", UploadBody::bytes(Vec::new()))
+        };
+        let rendered = format!("{request:?}");
+        assert_no_header_value(&rendered);
+        assert_eq!(
+            rendered,
+            format!(
+                "UploadRequest {{ target: Path(\"objects\"), method: Post, body: Bytes(0), \
+                 priority: Normal, max_response: 2097152, headers: {SECRET_HEADERS_SHOWN}, \
+                 basic_auth: None, bearer_token: None, allow_cleartext_credentials: false, \
+                 response_timeout: None }}"
+            )
+        );
+    }
+
+    /// The `Debug` output of an upload answer shows the name of each response
+    /// header, once for each value, and no header value.
+    ///
+    /// The peer is a raw socket that answers each request with fixed headers.
+    #[test]
+    fn uploaded_debug_holds_no_header_value() {
+        use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+
+        rt::block_on(async {
+            let peer = rt::TcpListener::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let port = peer.local_addr().unwrap().port();
+            drop(rt::spawn(async move {
+                while let Ok((mut stream, _peer)) = peer.accept().await {
+                    let mut request = [0u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    let answer = "HTTP/1.1 200 OK\r\nSet-Cookie: a=val-QXZ-5\r\n\
+                                  Set-Cookie: b=val-QXZ-6\r\nContent-Type: text/val-QXZ-7\r\n\
+                                  Content-Length: 0\r\n\r\n";
+                    let _ = stream.write_all(answer.as_bytes()).await;
+                    let _ = stream.flush().await;
+                }
+            }));
+
+            // With no redirect and a cleartext mirror, the fetcher reads no
+            // system trust store.
+            let fetcher = Fetcher::new(FetcherOptions {
+                max_redirects: 0,
+                ..direct_options(format!("http://127.0.0.1:{port}"))
+            })
+            .await
+            .unwrap();
+            let uploaded = within(
+                Duration::from_secs(5),
+                fetcher.upload(UploadRequest::path(
+                    "objects",
+                    UploadBody::bytes(Vec::new()),
+                )),
+            )
+            .await
+            .expect("the upload ends within the limit")
+            .unwrap();
+            let rendered = format!("{uploaded:?}");
+            assert!(!rendered.contains("QXZ"), "{rendered}");
+            let headers = r#"[("set-cookie", "<redacted>"), ("set-cookie", "<redacted>"), ("content-type", "<redacted>"), ("content-length", "<redacted>")]"#;
+            assert_eq!(
+                rendered,
+                format!(
+                    "Uploaded {{ status: 200, headers: {headers}, \
+                     url: \"http://127.0.0.1:{port}/objects\", body: Body {{ \
+                     protocol: Http11, content_length: Some(0), received: 0, .. }} }}"
+                )
+            );
+        });
     }
 }

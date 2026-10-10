@@ -130,6 +130,10 @@ fn parse_remote(address: &str, windows: bool) -> Result<PushRemote> {
 ///
 /// [`Endpoint::parse`] reads an address and gives the default options. A
 /// caller can also build an endpoint from its parts, with options of its own.
+///
+/// The [`Debug`] output of [`Endpoint::Http`] shows no header value, because
+/// the [`Debug`] output of [`FetcherOptions`](ostrya_fetch::FetcherOptions)
+/// shows `<redacted>` in place of each value.
 #[derive(Debug, Clone)]
 pub enum Endpoint {
     /// An ssh address and the options of the ssh client.

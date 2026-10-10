@@ -1927,6 +1927,8 @@ decision is made per hop from that hop's origin, and a cleartext origin is
 cleartext however it is reached.
 
 ```rust
+/// The `Debug` rendering shows each header name and `<redacted>` in place of
+/// its value.
 pub struct FetcherOptions {
     pub mirrors: Vec<String>,             // base URLs, tried in order; a query
                                           // string, userinfo, or an unreadable
@@ -2016,6 +2018,8 @@ pub struct Validators { pub etag: Option<String>, pub last_modified: Option<Stri
 /// from its own origin, and the mirror list is not consulted.
 pub enum Target<'a> { Path(&'a str), Url(&'a str) }
 
+/// The `Debug` rendering shows each header name and `<redacted>` in place of
+/// its value.
 pub struct FetchRequest<'a> {
     pub target: Target<'a>,               // a path is appended to each mirror's
                                           // base path as written and holds no
@@ -2103,6 +2107,8 @@ pub enum UploadMethod { Post /* default */, Delete /* no body */ }
 /// no token. `Fetcher::new` checks the syntax of `FetcherOptions::bearer_token`.
 pub struct BearerToken { pub token: String }
 
+/// The `Debug` rendering shows each header name and `<redacted>` in place of
+/// its value.
 pub struct UploadRequest<'a> {
     pub target: Target<'a>,
     pub method: UploadMethod,
@@ -2123,7 +2129,9 @@ impl<'a> UploadRequest<'a> {
     pub fn url(url: &'a str, body: UploadBody) -> UploadRequest<'a>;
 }
 
-/// The answer to an upload, for every final status. Send + Sync.
+/// The answer to an upload, for every final status. Send + Sync. The `Debug`
+/// rendering shows each response header name and `<redacted>` in place of its
+/// value. A header with several values shows its name once for each value.
 pub struct Uploaded { /* ... */ }
 impl Uploaded {
     pub fn status(&self) -> u16;
@@ -3759,6 +3767,8 @@ pub struct SshOptions {
     pub remote_command: Option<String>,       // default "ostrya receive" or "ostrya send"
 }
 
+/// The `Debug` rendering of `Endpoint::Http` shows no header value, because
+/// the `Debug` rendering of `FetcherOptions` redacts each value.
 #[derive(Debug, Clone)]
 pub enum Endpoint {
     Ssh { address: SshAddress, options: SshOptions },

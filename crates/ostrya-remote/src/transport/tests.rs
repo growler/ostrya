@@ -897,6 +897,20 @@ fn a_prepared_session_shows_no_credential() {
     assert_eq!(shown, r#"PreparedSession { transport: "ssh", .. }"#);
 }
 
+/// The `Debug` output of an HTTP endpoint shows the header name and no
+/// header value.
+#[test]
+fn the_debug_of_an_http_endpoint_shows_no_header_value() {
+    let mut http = ostrya_fetch::FetcherOptions::new("https://h/");
+    http.headers = vec![("Authorization".into(), "Bearer tok-QXZ".into())];
+    let shown = format!("{:?}", Endpoint::Http(http));
+    assert!(!shown.contains("QXZ"), "{shown}");
+    assert!(
+        shown.contains(r#"("Authorization", "<redacted>")"#),
+        "{shown}"
+    );
+}
+
 #[test]
 fn a_path_with_quotes_and_spaces_is_quoted_for_the_shell() {
     assert_eq!(quote_posix("/a b/it's"), r"'/a b/it'\''s'");

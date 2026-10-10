@@ -12,7 +12,7 @@
 //! [`PushProgress`] counts the progress of a session, and [`PushOutcome`]
 //! gives the result of a session that committed.
 //!
-//! A [`PullSession`] reads files of a server repository by their path, and
+//! A [`StreamSession`] reads files of a server repository by their path, and
 //! gives the body of each file as a [`PullBody`].
 //!
 //! [`export_stream`] writes a one-way stream: the messages of a push session in
@@ -38,7 +38,7 @@ use ostrya_gvariant::Value;
 
 pub use one_way::export_stream;
 pub use progress::{PushPhase, PushProgress, PushProgressFn, PushProgressSnapshot, PushStats};
-pub use pull::{PullBody, PullSession, PullSessionOptions};
+pub use pull::{PullBody, StreamSession, StreamSessionOptions};
 
 use self::http::{Endpoint, HttpLink};
 use self::progress::Counters;

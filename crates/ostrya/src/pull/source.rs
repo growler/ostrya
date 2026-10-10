@@ -1,5 +1,6 @@
 //! The two sources of a pull from a remote: an HTTP remote through the
-//! fetcher of the pull, or a pull session over ssh.
+//! fetcher of the pull, or a stream session over ssh or over a pair of
+//! streams.
 //!
 //! Both sources serve the same paths under the same size caps. So the pull
 //! driver asks for a file by its path and reads the same bytes from either.
@@ -17,7 +18,7 @@ use futures_io::AsyncRead;
 
 use crate::error::{Error, Result};
 use crate::fetch::{Fetcher, Priority};
-use crate::remote::{self, PullBody, PullSession};
+use crate::remote::{self, PullBody, StreamSession};
 use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE};
 
 use super::http::{
@@ -28,15 +29,14 @@ use super::http::{
 pub(crate) enum RemoteSource {
     /// An HTTP remote, through the pull's fetcher.
     Http(Fetcher),
-    /// A pull session over ssh. The session holds the ssh client, so the
-    /// variant boxes it.
-    Ssh(Box<SshSource>),
+    /// A stream session, over ssh or over a pair of streams. The session can
+    /// hold the ssh client, so the variant boxes it.
+    Stream(Box<StreamSource>),
 }
 
-/// A pull session over ssh, and the counters that get the byte count of each
-/// body.
-pub(crate) struct SshSource {
-    session: PullSession,
+/// A stream session, and the counters that get the byte count of each body.
+pub(crate) struct StreamSource {
+    session: StreamSession,
     transferred: Vec<Arc<AtomicU64>>,
 }
 
@@ -79,15 +79,15 @@ impl RemoteSource {
     ) -> Result<Option<Vec<u8>>> {
         match self {
             RemoteSource::Http(fetcher) => fetch_optional(fetcher, path, priority, cap).await,
-            RemoteSource::Ssh(ssh) => ssh.read_optional(path, cap).await,
+            RemoteSource::Stream(stream) => stream.read_optional(path, cap).await,
         }
     }
 
-    /// Reads the `summary.sig` and the `summary` of the remote, and over ssh
-    /// also its `config`.
+    /// Reads the `summary.sig` and the `summary` of the remote, and from the
+    /// stream source also its `config`.
     ///
     /// An absent file is `None`. The source asks for the files in the order
-    /// of the `ostree` command. The ssh source keeps the three requests in
+    /// of the `ostree` command. The stream source keeps the three requests in
     /// flight together.
     pub(crate) async fn root_files(&self) -> Result<RootFiles> {
         match self {
@@ -99,13 +99,13 @@ impl RemoteSource {
                     config: None,
                 })
             }
-            RemoteSource::Ssh(ssh) => {
+            RemoteSource::Stream(stream) => {
                 let ((signature, summary), config) = futures_lite::future::zip(
                     futures_lite::future::zip(
-                        ssh.read_optional(SUMMARY_SIG_FILE, MAX_ROOT_FILE),
-                        ssh.read_optional(SUMMARY_FILE, MAX_ROOT_FILE),
+                        stream.read_optional(SUMMARY_SIG_FILE, MAX_ROOT_FILE),
+                        stream.read_optional(SUMMARY_FILE, MAX_ROOT_FILE),
                     ),
-                    ssh.read_optional(CONFIG_FILE, MAX_ROOT_FILE),
+                    stream.read_optional(CONFIG_FILE, MAX_ROOT_FILE),
                 )
                 .await;
                 Ok(RootFiles {
@@ -120,15 +120,15 @@ impl RemoteSource {
     /// Reads the `summary` and the `summary.sig` of the remote.
     ///
     /// An absent file is `None`. The source asks for `summary.sig` first, in
-    /// the order of the `ostree` command. The ssh source keeps the two
+    /// the order of the `ostree` command. The stream source keeps the two
     /// requests in flight together.
     pub(crate) async fn summary_files(&self) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
         match self {
             RemoteSource::Http(fetcher) => fetch_summary(fetcher).await,
-            RemoteSource::Ssh(ssh) => {
+            RemoteSource::Stream(stream) => {
                 let (signature, summary) = futures_lite::future::zip(
-                    ssh.read_optional(SUMMARY_SIG_FILE, MAX_ROOT_FILE),
-                    ssh.read_optional(SUMMARY_FILE, MAX_ROOT_FILE),
+                    stream.read_optional(SUMMARY_SIG_FILE, MAX_ROOT_FILE),
+                    stream.read_optional(SUMMARY_FILE, MAX_ROOT_FILE),
                 )
                 .await;
                 Ok((summary?, signature?))
@@ -138,20 +138,20 @@ impl RemoteSource {
 
     /// Returns the path of the remote ref `name`.
     ///
-    /// An HTTP request takes the path percent-encoded. The ssh source takes
-    /// the name as written, because its `Get` carries no escape.
+    /// An HTTP request takes the path percent-encoded. The stream source
+    /// takes the name as written, because its `Get` carries no escape.
     pub(crate) fn ref_path(&self, name: &str) -> String {
         match self {
             RemoteSource::Http(_) => ref_request_path(name),
-            RemoteSource::Ssh(_) => format!("refs/heads/{name}"),
+            RemoteSource::Stream(_) => format!("refs/heads/{name}"),
         }
     }
 
     /// Ends the source with `result`, the result of the pull so far.
     ///
-    /// The ssh source closes the input of the server and waits for the ssh
-    /// client. If the pull succeeded and the session end fails, the function
-    /// returns that error as [`Error::Remote`].
+    /// The stream source closes the input of the server and, over ssh, waits
+    /// for the ssh client. If the pull succeeded and the session end fails,
+    /// the function returns that error as [`Error::Remote`].
     ///
     /// A failure of the pull can come from the session. If the session end
     /// then fails too, the function returns the error of the session end.
@@ -160,8 +160,8 @@ impl RemoteSource {
     pub(crate) async fn finish<T>(self, result: Result<T>) -> Result<T> {
         match self {
             RemoteSource::Http(_) => result,
-            RemoteSource::Ssh(ssh) => {
-                let ended = ssh.session.finish().await;
+            RemoteSource::Stream(stream) => {
+                let ended = stream.session.finish().await;
                 match (result, ended) {
                     (Ok(value), ended) => ended.map(|()| value).map_err(Error::Remote),
                     (Err(Error::Remote(_)), Err(ended)) => Err(Error::Remote(ended)),
@@ -172,13 +172,13 @@ impl RemoteSource {
     }
 }
 
-impl SshSource {
+impl StreamSource {
     /// Creates a source over `session`.
     ///
     /// The source adds the byte count of each body to each counter in
     /// `transferred`.
-    pub(crate) fn new(session: PullSession, transferred: Vec<Arc<AtomicU64>>) -> SshSource {
-        SshSource {
+    pub(crate) fn new(session: StreamSession, transferred: Vec<Arc<AtomicU64>>) -> StreamSource {
+        StreamSource {
             session,
             transferred,
         }
@@ -212,7 +212,7 @@ impl SshSource {
     }
 }
 
-/// The body of one reply of the ssh source.
+/// The body of one reply of the stream source.
 ///
 /// The body adds the count of each read to the transferred counts of the
 /// pull.
@@ -300,14 +300,14 @@ mod tests {
         let body: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
         let input = served(&body);
         let out = ostrya_rt::block_on(async {
-            let session = PullSession::over_stream(
+            let session = StreamSession::over_stream(
                 Cursor::new(input),
                 futures_lite::io::sink(),
                 Default::default(),
             )
             .await
             .unwrap();
-            let source = SshSource::new(session, Vec::new());
+            let source = StreamSource::new(session, Vec::new());
             source.read_optional("summary", 1 << 20).await.unwrap()
         })
         .unwrap();

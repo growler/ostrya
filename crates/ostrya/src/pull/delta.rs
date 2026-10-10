@@ -747,8 +747,8 @@ pub(crate) async fn apply_job_part(
             fetch_part_blob(fetcher, &path, entry, &staging).await?
         }
         // The size of the part in the superblock caps the body.
-        DeltaSource::Remote(RemoteSource::Ssh(ssh)) => {
-            let body = ssh.get(&path, entry.size).await?.ok_or_else(|| {
+        DeltaSource::Remote(RemoteSource::Stream(stream)) => {
+            let body = stream.get(&path, entry.size).await?.ok_or_else(|| {
                 Error::InvalidFormat(format!(
                     "static delta {}: the remote holds no part {index}",
                     job.name

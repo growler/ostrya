@@ -36,7 +36,7 @@ use crate::fetch::{FetchRequest, Fetched, Fetcher, FetcherOptions, Priority};
 use crate::inflate::BufSource;
 use crate::object::{MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
 use crate::read::CommitState;
-use crate::remote::{Endpoint, PullSession, PullSessionOptions};
+use crate::remote::{Endpoint, StreamSession, StreamSessionOptions};
 use crate::repo::Repo;
 use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE, Summary, put_root_file_blocking};
 use crate::transaction::Transaction;
@@ -45,7 +45,7 @@ use crate::write::FileMeta;
 
 use super::delta::{self, DeltaJob, DeltaSource, PART_CAP};
 use super::drive::Slots;
-use super::source::{RemoteSource, SshSource, session_error};
+use super::source::{RemoteSource, StreamSource, session_error};
 use super::subpath::{Scope, Subpaths};
 use super::verify::{Defaults, Verification};
 use super::{
@@ -133,7 +133,7 @@ impl Repo {
     /// For an ssh endpoint, the pull runs the ssh client after it resolves the
     /// signature policy. The [`SshOptions`](crate::remote::SshOptions) of the
     /// endpoint give the commands of the client, by the rules of
-    /// [`PullSession::connect`]. The session obeys the rules of
+    /// [`StreamSession::connect`]. The session obeys the rules of
     /// [`pull_over_stream`](Repo::pull_over_stream).
     ///
     /// `resolve_pull` reads no remote key that applies to HTTP alone for an
@@ -142,22 +142,23 @@ impl Repo {
     /// `send-command`.
     ///
     /// The pull reads the remote through a source: the HTTP source over the
-    /// fetcher, or the ssh source over a pull session.
-    /// [`pull_over_stream`](Repo::pull_over_stream) opens the ssh source over
-    /// a pair of streams. The two sources serve the same paths under the same
-    /// caps. Each rule of this method applies to both sources, with these
+    /// fetcher, or the stream source over a stream session.
+    /// [`pull_over_stream`](Repo::pull_over_stream) opens the stream source
+    /// over a pair of streams. The two sources serve the same paths under the
+    /// same caps. Each rule of this method applies to both sources, with these
     /// differences:
     ///
-    /// - The ssh source requests a ref by its name as written, with no
+    /// - The stream source requests a ref by its name as written, with no
     ///   percent-encoding.
-    /// - The ssh source never sends a request again. A failure ends its
+    /// - The stream source never sends a request again. A failure ends its
     ///   session and the pull.
-    /// - The ssh source keeps the requests of `summary.sig`, `summary`, and
+    /// - The stream source keeps the requests of `summary.sig`, `summary`, and
     ///   `config` in flight together, in the order of the HTTP source. It does
     ///   the same for a `.commitmeta` and its commit, so a parent commit costs
     ///   one round trip. The HTTP source sends these requests one at a time.
-    /// - The ssh source ends its session before the transaction commits. It
-    ///   closes the input of the server and waits for the ssh client.
+    /// - The stream source ends its session before the transaction commits.
+    ///   It closes the input of the server and, over ssh, waits for the ssh
+    ///   client.
     ///
     /// # Requests
     ///
@@ -456,8 +457,8 @@ impl Repo {
                 // The ssh client starts where the HTTP pull sends its first
                 // request.
                 let session =
-                    PullSession::connect(&address, &options, session_options(&opts)).await?;
-                let source = RemoteSource::Ssh(Box::new(SshSource::new(
+                    StreamSession::connect(&address, &options, session_options(&opts)).await?;
+                let source = RemoteSource::Stream(Box::new(StreamSource::new(
                     session,
                     counters.transferred_sinks(),
                 )));
@@ -537,8 +538,8 @@ impl Repo {
         let counters = PullCounters::new(opts.progress.as_ref());
         let verification =
             Verification::build(self, Some(remote), &opts.verify, Defaults::Config).await?;
-        let session = PullSession::over_stream(input, output, session_options(&opts)).await?;
-        let source = RemoteSource::Ssh(Box::new(SshSource::new(
+        let session = StreamSession::over_stream(input, output, session_options(&opts)).await?;
+        let source = RemoteSource::Stream(Box::new(StreamSource::new(
             session,
             counters.transferred_sinks(),
         )));
@@ -590,10 +591,10 @@ impl Repo {
                 &mut marked,
             )
             .await;
-        // The source ends before the transaction commits. The ssh source
-        // closes the input of the server and waits for the ssh client. As a
-        // result, a failure of the session fails the pull before anything
-        // publishes.
+        // The source ends before the transaction commits. The stream source
+        // closes the input of the server and, over ssh, waits for the ssh
+        // client. As a result, a failure of the session fails the pull before
+        // anything publishes.
         let fetched = source.finish(fetched).await;
         let published = match fetched {
             Ok(fetched) => {
@@ -808,13 +809,13 @@ impl Repo {
                 RemoteSource::Http(self.remote_fetcher(http, Vec::new()).await?)
             }
             Endpoint::Ssh { address, options } => {
-                let session = PullSession::connect(
+                let session = StreamSession::connect(
                     &address,
                     &options,
                     session_options(&PullOptions::default()),
                 )
                 .await?;
-                RemoteSource::Ssh(Box::new(SshSource::new(session, Vec::new())))
+                RemoteSource::Stream(Box::new(StreamSource::new(session, Vec::new())))
             }
         };
         let read = source.summary_files().await;
@@ -1236,9 +1237,10 @@ impl Repo {
     /// holds it, else from the remote. The commit object comes after it.
     /// `None` in either place is a file that the remote does not serve.
     ///
-    /// Over ssh, the two remote requests are in flight together, in the order
-    /// of an HTTP pull, so the pair costs one round trip. Over HTTP, the pull
-    /// requests the commit after the `.commitmeta` arrives.
+    /// From the stream source, the two remote requests are in flight together,
+    /// in the order of an HTTP pull, so the pair costs one round trip. From the
+    /// HTTP source, the pull requests the commit after the `.commitmeta`
+    /// arrives.
     async fn fetch_remote_commit(
         &self,
         ctx: &StepCtx<'_>,
@@ -1251,7 +1253,7 @@ impl Repo {
         };
         match cached_detached_metadata(ctx.sources, commit).await? {
             Some(detached) => Ok((Some(detached), fetch().await?)),
-            None if matches!(ctx.source, RemoteSource::Ssh(_)) => {
+            None if matches!(ctx.source, RemoteSource::Stream(_)) => {
                 let (detached, fetched) =
                     futures_lite::future::zip(self.fetch_remote_detached(ctx, commit), fetch())
                         .await;
@@ -1359,18 +1361,18 @@ impl Repo {
         let path = object_path(&name.checksum, ObjectType::File);
         let fetcher = match ctx.source {
             RemoteSource::Http(fetcher) => fetcher,
-            RemoteSource::Ssh(ssh) => {
+            RemoteSource::Stream(stream) => {
                 // A `.filez` has no whole read. The header read caps its header,
                 // and the size that the header declares caps its payload.
-                let body = ssh
+                let body = stream
                     .get(&path, u64::MAX)
                     .await?
                     .ok_or(Error::ObjectNotFound {
                         checksum: name.checksum,
                         ty: name.ty,
                     })?;
-                // The ssh source takes no write permit. The session streams one
-                // body at a time, and the depth of the pipeline bounds the
+                // The stream source takes no write permit. The session streams
+                // one body at a time, and the depth of the pipeline bounds the
                 // stores that finish after the end of their body. If the step
                 // took a permit here, the permit holds the one reader of the
                 // session while other stores finish.
@@ -1509,9 +1511,9 @@ struct FetchedPull {
     signature: Option<Vec<u8>>,
 }
 
-/// Returns the options of the pull session of `opts`.
-fn session_options(opts: &PullOptions) -> PullSessionOptions {
-    PullSessionOptions {
+/// Returns the options of the stream session of `opts`.
+fn session_options(opts: &PullOptions) -> StreamSessionOptions {
+    StreamSessionOptions {
         agent: None,
         max_outstanding: Some(opts.max_outstanding_fetches.unwrap_or(DEFAULT_OUTSTANDING)),
     }
@@ -2238,7 +2240,7 @@ pub(crate) async fn store_filez_payload<R: AsyncRead + Unpin>(
     // The decoder stops at the DEFLATE end-of-stream marker and asks its
     // input for no more bytes. So the function must read the stream to its
     // end here. That read returns the connection to the pool for the next
-    // object, and moves a pull session to its next reply. It comes before
+    // object, and moves a stream session to its next reply. It comes before
     // the finish of the writer, so the next reply arrives while this object
     // is stored.
     check_stream_end(expected, "deflated payload", payload.into_inner())
@@ -2416,7 +2418,7 @@ pub(crate) async fn check_stream_end<R: AsyncRead + Unpin>(
 }
 
 /// A compile-time check that the future of a pull is `Send`: over HTTP,
-/// through the ssh source, and from a local repository.
+/// through the stream source, and from a local repository.
 const _: fn() = || {
     fn assert_send<T: Send>(_: &T) {}
     let _ = |repo: &Repo| assert_send(&repo.pull("origin", PullOptions::default()));
@@ -3029,7 +3031,7 @@ mod tests {
     }
 
     /// Each destination reads the end of the stream of a content object before
-    /// it stores the object. So a pull session moves to its next reply while
+    /// it stores the object. So a stream session moves to its next reply while
     /// the store finishes. The test covers the regular-file path of an archive
     /// and of a bare-user destination, and the symlink path.
     #[test]

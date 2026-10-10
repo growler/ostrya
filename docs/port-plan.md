@@ -7335,16 +7335,16 @@ session over a pair of streams through one `ArchiveView`, and takes no lock.
 `docs/conformance/cli-surface.md`, "send").
 
 The client side of the pull over ssh is done.
-`ostrya::remote::PullSession` opens a pull session over a pair of streams or
-over the ssh client, keeps up to 8 `Get` frames in flight on the one stream,
-and gives the body of each found reply as a `PullBody`. The pull driver of
-`Repo::pull` reads the remote through a source: the HTTP source over the
-fetcher, with no change in behavior, or the ssh source over a
-`PullSession`. `Repo::pull_over_stream` runs the pull through the ssh source
-over a pair of streams, and `PullOptions::endpoint` carries the address and
-the options of each transport (`docs/api-sketch.md`, "Pull over ssh: the
-client side"). `Repo::pull` and `Repo::remote_fetch_summary` run over the
-ssh client for an ssh endpoint of the caller, or for an ssh address in the
+`ostrya::remote::StreamSession` opens a stream session over a pair of streams
+or over the ssh client, keeps up to 8 `Get` frames in flight on the one
+stream, and gives the body of each found reply as a `PullBody`. The pull
+driver of `Repo::pull` reads the remote through a source: the HTTP source over
+the fetcher, with no change in behavior, or the stream source over a
+`StreamSession`. `Repo::pull_over_stream` runs the pull through the stream
+source over a pair of streams, and `PullOptions::endpoint` carries the
+address and the options of each transport (`docs/api-sketch.md`, "Pull over
+ssh: the client side"). `Repo::pull` and `Repo::remote_fetch_summary` run over
+the ssh client for an ssh endpoint of the caller, or for an ssh address in the
 remote key `pull-url`. `resolve_pull` reads the key `ssh-command` into
 `SshOptions::config_command`. It reads the key `send-command` into
 `SshOptions::remote_command` when `EndpointOverrides::remote_command` is
@@ -7428,7 +7428,7 @@ it exits 0 after a clean end and 1 after an `Error`, and it serves an
 change to the repository.
 
 Result of the client side of the pull: `crates/ostrya-remote/tests/pull_session.rs`
-runs `PullSession` against scripted servers over in-process pipes. Eight
+runs `StreamSession` against scripted servers over in-process pipes. Eight
 concurrent calls keep eight `Get` frames in flight, and each reply goes to the
 call of its place. A later reply arrives while the caller holds a body read
 to its end. A stated length that differs from the body is `protocol`, a body
@@ -7454,7 +7454,7 @@ the client drops, and a stated length above the cap fail the pull and end
 the session. A unit test shows that a content object reads the end of its
 stream before its store finishes. The HTTP pull tests pass with no change.
 An ignored test in `crates/ostrya-cli/tests/send.rs` pulls an object of
-256 MiB from `ostrya send` through `PullSession`, and the `RssAnon` of the
+256 MiB from `ostrya send` through `StreamSession`, and the `RssAnon` of the
 server, read after each 16 MiB of the body and before its standard input
 closes, stays below 16 MiB.
 

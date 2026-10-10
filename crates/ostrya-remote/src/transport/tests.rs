@@ -1664,11 +1664,11 @@ mod standin {
         assert!(elapsed < LIMIT + Duration::from_secs(3), "{elapsed:?}");
     }
 
-    /// The pull sessions over a stand-in ssh client.
+    /// The stream sessions over a stand-in ssh client.
     mod pull {
         use super::super::super::connect_pull_with;
         use super::*;
-        use crate::PullSessionOptions;
+        use crate::StreamSessionOptions;
         use crate::proto::{GetReply, PULL_PROTOCOL_VERSION, PullHello, PullHelloReply};
 
         const PULL_AGENT: &str = "pull-transport-test";
@@ -1691,7 +1691,7 @@ mod standin {
             })])
         }
 
-        async fn open_pull(script: &str, limit: Duration) -> Result<crate::PullSession> {
+        async fn open_pull(script: &str, limit: Duration) -> Result<crate::StreamSession> {
             let address = SshAddress::parse("ssh://me@host:2222/srv/it's repo").unwrap();
             connect_pull_with(
                 &address,
@@ -1700,7 +1700,7 @@ mod standin {
                     ..Default::default()
                 },
                 None,
-                PullSessionOptions {
+                StreamSessionOptions {
                     agent: Some(PULL_AGENT.into()),
                     ..Default::default()
                 },

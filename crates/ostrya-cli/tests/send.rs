@@ -347,7 +347,7 @@ fn poll_body<R: ostrya::remote::ObjectReader>(
     std::pin::Pin::new(body).poll_read(cx, buf)
 }
 
-/// `ostrya send` streams an object of 256 MiB to a pull session over its
+/// `ostrya send` streams an object of 256 MiB to a stream session over its
 /// pipes, and its anonymous resident memory stays below 16 MiB. The memory
 /// is read after each 16 MiB of the body and at its end, before the standard
 /// input of the server closes, and the test keeps the largest value. Ignored
@@ -358,7 +358,7 @@ fn poll_body<R: ostrya::remote::ObjectReader>(
 fn send_streams_a_large_object_in_bounded_memory() {
     use std::os::fd::{AsFd, OwnedFd};
 
-    use ostrya::remote::{PullSession, PullSessionOptions};
+    use ostrya::remote::{StreamSession, StreamSessionOptions};
     use ostrya::{CommitOptions, CreateOptions, MutableTree, ObjectType, RepoMode, loose_path};
 
     const SIZE: u64 = 256 << 20;
@@ -428,7 +428,7 @@ fn send_streams_a_large_object_in_bounded_memory() {
     let input = ostrya_rt::File::from(OwnedFd::from(child.stdout.take().unwrap()));
     let output = ostrya_rt::File::from(OwnedFd::from(child.stdin.take().unwrap()));
     let (received, peak) = block_on(async {
-        let session = PullSession::over_stream(input, output, PullSessionOptions::default())
+        let session = StreamSession::over_stream(input, output, StreamSessionOptions::default())
             .await
             .unwrap();
         let mut body = session.get(&path, u64::MAX).await.unwrap().unwrap();

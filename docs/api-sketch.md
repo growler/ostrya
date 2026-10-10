@@ -2336,15 +2336,15 @@ refusal does not hold the value. Where the key is absent or empty, the same
 white-space refusal applies to the proxy variables of the environment.
 
 The driver of `pull` reads the remote through a source, one of two: the HTTP
-source, over the fetcher, and the ssh source, over a `PullSession` of
-`ostrya-remote`. `pull_over_stream` runs the same pull through the ssh source
-over a pair of streams (see "Pull over ssh: the client side"). The two
+source, over the fetcher, and the stream source, over a `StreamSession` of
+`ostrya-remote`. `pull_over_stream` runs the same pull through the stream
+source over a pair of streams (see "Pull over ssh: the client side"). The two
 sources serve the same paths under the same size caps, and the plan, the
 checks, the statistics, and the transaction are the same for both. An HTTP
-request that fails retryably is sent again inside the HTTP source; the ssh
-source sends no request again. A content object reads the end of its stream
-before its store finishes, so a pull session moves to its next reply while
-the object is stored.
+request that fails retryably is sent again inside the HTTP source; the
+stream source sends no request again. A content object reads the end of its
+stream before its store finishes, so a stream session moves to its next
+reply while the object is stored.
 
 Each requested ref resolves against the remote's summary first and then
 `refs/heads/<ref>`, the name percent-encoded where it becomes that path. An empty
@@ -2588,7 +2588,7 @@ impl Repo {
         -> Result<PullStats>;
     pub async fn pull(&self, remote: &str, opts: PullOptions)
         -> Result<PullStats>;
-    /// The pull through the ssh source, over a pair of streams to `ostrya
+    /// The pull through the stream source, over a pair of streams to `ostrya
     /// send` (see "Pull over ssh: the client side").
     pub async fn pull_over_stream<R, W>(&self, remote: &str, input: R,
                                         output: W, opts: PullOptions)
@@ -4793,31 +4793,31 @@ Failures:
 
 ## Pull over ssh: the client side
 
-`PullSession` of `ostrya-remote` is the client half of the pull over ssh, and
-`Repo::pull_over_stream` wraps it as the ssh source of the pull driver. Both
-take no feature.
+`StreamSession` of `ostrya-remote` is the client half of the pull over ssh,
+and `Repo::pull_over_stream` wraps it as the stream source of the pull
+driver. Both take no feature.
 
 ```rust
 // ostrya-remote
 #[derive(Debug, Clone, Default)]
-pub struct PullSessionOptions {
+pub struct StreamSessionOptions {
     pub agent: Option<String>,                  // default "ostrya/<version>"
     pub max_outstanding: Option<usize>,         // Get frames in flight; 8;
                                                 // 0 is raised to 1
 }
 
-pub struct PullSession { /* private */ }        // Send + Sync
+pub struct StreamSession { /* private */ }      // Send + Sync
 
-impl PullSession {
+impl StreamSession {
     pub async fn over_stream<R, W>(input: R, output: W,
-                                   opts: PullSessionOptions)
-        -> Result<PullSession>
+                                   opts: StreamSessionOptions)
+        -> Result<StreamSession>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static;
     pub async fn connect(address: &SshAddress, options: &SshOptions,
-                         session: PullSessionOptions)
-        -> Result<PullSession>;
+                         session: StreamSessionOptions)
+        -> Result<StreamSession>;
     pub async fn get(&self, path: &str, max_len: u64)
         -> Result<Option<PullBody>>;
     pub async fn finish(self) -> Result<()>;
@@ -4872,14 +4872,14 @@ The session:
   `Error::Transport` with the status. The wait for the ssh client takes at
   most 5 seconds. A session over a pair of streams sets no time limit.
 
-The pull through the ssh source:
+The pull through the stream source:
 
 - `Repo::pull_over_stream` resolves the signature policy, then opens the
   session over the streams, then runs the pull of `Repo::pull` through the
-  ssh source: the summary, the refs, the deltas, the commit walk, `depth`,
-  the subpaths, the transaction, and the statistics. `remote` names the
-  remote whose configuration the pull reads: the policy, the `branches`, and
-  the prefix of the refs.
+  stream source: the summary, the refs, the deltas, the commit walk,
+  `depth`, the subpaths, the transaction, and the statistics. `remote` names
+  the remote whose configuration the pull reads: the policy, the `branches`,
+  and the prefix of the refs.
 - The source asks for each file by the path of the HTTP pull. A ref goes as
   written, with no percent-encoding. A body is held to the cap of its path:
   `MAX_ROOT_FILE` for `summary`, `summary.sig`, and `config`, `MAX_REF_FILE`
@@ -4890,7 +4890,7 @@ The pull through the ssh source:
   three calls in flight together, and the `Get` of a `.commitmeta` and of its
   commit as two, in the order of the HTTP pull. The HTTP pull keeps its
   requests one after another.
-- A content object of the ssh source takes no write permit. The session
+- A content object of the stream source takes no write permit. The session
   streams one body at a time, and the stores that finish after the end of
   their body are bounded by `max_outstanding_fetches`. The HTTP pull keeps
   its three write permits.
@@ -4919,12 +4919,12 @@ The pull over ssh to an address:
   the named remote. By default, the name gives the prefix of the refs.
   `PullOptions::remote` and `PullFlags::MIRROR` change the prefix.
 - For an `Endpoint::Ssh`, `PullOptions::max_outstanding_fetches` sets
-  `PullSessionOptions::max_outstanding`, and `None` is 8. For an
+  `StreamSessionOptions::max_outstanding`, and `None` is 8. For an
   `Endpoint::Http`, a `Some` value replaces `FetcherOptions::max_outstanding`
   of the endpoint, and `None` keeps it. An `Endpoint::Http` with no mirror is
   `Error::InvalidInput` before any request.
 - `Repo::pull` resolves the signature policy, then starts the ssh client with
-  `PullSession::connect`, at the point where the HTTP pull sends its first
+  `StreamSession::connect`, at the point where the HTTP pull sends its first
   request, and then runs the pull of `pull_over_stream`.
 - `Repo::remote_fetch_summary` takes an `Option<Endpoint>`, and resolves
   `None` as `Repo::pull` does. Over ssh it reads `summary.sig` and `summary`

@@ -32,15 +32,15 @@ const DEFAULT_OUTSTANDING: usize = 8;
 type Reader = FrameReader<BufReader<Input>>;
 type ReadFuture = Pin<Box<dyn Future<Output = Result<Option<Message>>> + Send>>;
 
-/// The options of a pull session.
+/// The options of a stream session.
 #[derive(Debug, Clone, Default)]
-pub struct PullSessionOptions {
+pub struct StreamSessionOptions {
     /// The `agent` value that the session sends in [`PullHello`].
     ///
     /// The default is `ostrya/<version>`, with the version of this crate.
     pub agent: Option<String>,
-    /// The most [`get`](PullSession::get) calls that hold a place in the
-    /// [pipeline](PullSession#pipeline) at a time.
+    /// The most [`get`](StreamSession::get) calls that hold a place in the
+    /// [pipeline](StreamSession#pipeline) at a time.
     ///
     /// The default is 8. The session raises a value of 0 to 1.
     pub max_outstanding: Option<usize>,
@@ -48,22 +48,23 @@ pub struct PullSessionOptions {
 
 /// A client session of a pull, which reads the files of a server repository.
 ///
-/// [`connect`](PullSession::connect) opens a session over ssh, and
-/// [`over_stream`](PullSession::over_stream) opens one over a pair of byte
+/// [`connect`](StreamSession::connect) opens a session over ssh, and
+/// [`over_stream`](StreamSession::over_stream) opens one over a pair of byte
 /// streams. The session is `Send + Sync`. Concurrent
-/// [`get`](PullSession::get) calls share the [pipeline](PullSession#pipeline),
-/// and the replies come in the order of the `Get` frames.
+/// [`get`](StreamSession::get) calls share the
+/// [pipeline](StreamSession#pipeline), and the replies come in the order of
+/// the `Get` frames.
 ///
-/// If the session is dropped without [`finish`](PullSession::finish), it
+/// If the session is dropped without [`finish`](StreamSession::finish), it
 /// sends nothing more and closes its output, so the server reads the end of
 /// its input. This is also true while the caller holds a [`PullBody`]. If
-/// [`connect`](PullSession::connect) opened the session, the drop then drops
+/// [`connect`](StreamSession::connect) opened the session, the drop then drops
 /// the ssh client without a wait.
 ///
 /// # Pipeline
 ///
 /// The session opens with [`PullHello`] and asks for files by their path
-/// with [`get`](PullSession::get). All requests share one stream as a
+/// with [`get`](StreamSession::get). All requests share one stream as a
 /// pipeline. A `get` takes its place in the pipeline and writes its `Get`
 /// frame under one lock. Because of this lock, the frames go on the wire in
 /// the order of the places.
@@ -71,7 +72,7 @@ pub struct PullSessionOptions {
 /// A reply carries no request id. The reply of a call is the next reply
 /// after the reply of the call before it.
 ///
-/// At most [`max_outstanding`](PullSessionOptions::max_outstanding) calls
+/// At most [`max_outstanding`](StreamSessionOptions::max_outstanding) calls
 /// hold a place at a time. A call holds its place from the write of its
 /// `Get` frame to the end of its reply.
 ///
@@ -92,18 +93,18 @@ pub struct PullSessionOptions {
 /// - a failed read or write
 /// - a drop of a `get` future after the call took its place
 /// - a drop of a [`PullBody`] before its end
-/// - a [`finish`](PullSession::finish) while the body of a reply is not read
+/// - a [`finish`](StreamSession::finish) while the body of a reply is not read
 ///   to its end
 ///
 /// After a failure, each later call and each later read of a body fails. Its
 /// error has the variant and the message of the first failure.
-pub struct PullSession {
-    inner: PullInner,
+pub struct StreamSession {
+    inner: StreamInner,
 }
 
-struct PullInner {
+struct StreamInner {
     shared: Arc<Shared>,
-    /// The ssh client, for a session that [`PullSession::connect`] opened.
+    /// The ssh client, for a session that [`StreamSession::connect`] opened.
     transport: Option<Transport>,
 }
 
@@ -340,7 +341,7 @@ impl Drop for Placed<'_> {
 }
 
 /// The open of a session over a pair of byte streams, and its calls.
-impl PullSession {
+impl StreamSession {
     /// Opens a session over a pair of byte streams.
     ///
     /// `input` carries the bytes from the server, and `output` the bytes to
@@ -369,12 +370,12 @@ impl PullSession {
     /// If the write of `PullHello` fails with [`Error::Io`], the call then
     /// reads the message that the server can have sent before it closed. If
     /// that message is an `Error` message, the call returns its variant.
-    pub async fn over_stream<R, W>(input: R, output: W, opts: PullSessionOptions) -> Result<Self>
+    pub async fn over_stream<R, W>(input: R, output: W, opts: StreamSessionOptions) -> Result<Self>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        PullSession::open(Box::new(input), Box::new(output), opts, None).await
+        StreamSession::open(Box::new(input), Box::new(output), opts, None).await
     }
 
     /// Opens a session over `input` and `output`. `pending_limit` is the
@@ -382,9 +383,9 @@ impl PullSession {
     pub(crate) async fn open(
         input: Input,
         output: Output,
-        opts: PullSessionOptions,
+        opts: StreamSessionOptions,
         pending_limit: Option<Duration>,
-    ) -> Result<PullSession> {
+    ) -> Result<StreamSession> {
         let mut reader = FrameReader::new(BufReader::with_capacity(STREAM_BUFFER, input));
         let mut writer = FrameWriter::new(output);
         let agent = opts
@@ -425,8 +426,8 @@ impl PullSession {
             )));
         }
         let outstanding = opts.max_outstanding.unwrap_or(DEFAULT_OUTSTANDING).max(1);
-        Ok(PullSession {
-            inner: PullInner {
+        Ok(StreamSession {
+            inner: StreamInner {
                 shared: Arc::new(Shared {
                     places: Arc::new(Gate::new(outstanding)),
                     writing: Arc::new(Gate::new(1)),
@@ -449,7 +450,7 @@ impl PullSession {
     }
 
     /// Attaches the child process whose standard streams the session uses.
-    pub(crate) fn with_transport(mut self, child: Transport) -> PullSession {
+    pub(crate) fn with_transport(mut self, child: Transport) -> StreamSession {
         self.inner.transport = Some(child);
         self
     }
@@ -460,7 +461,7 @@ impl PullSession {
     /// the server does not serve the path. The [`PullBody`] holds the body to
     /// `max_len` bytes and to its stated length.
     ///
-    /// If [`max_outstanding`](PullSessionOptions::max_outstanding) calls hold
+    /// If [`max_outstanding`](StreamSessionOptions::max_outstanding) calls hold
     /// a place, the call waits. It then takes its place, and writes and
     /// flushes its `Get` frame under one lock.
     ///
@@ -471,17 +472,17 @@ impl PullSession {
     ///
     /// If the write of the `Get` frame fails, the call waits for the turn of
     /// its reply. It then reads the message that the server can have sent
-    /// before it closed. If [`connect`](PullSession::connect) opened the
+    /// before it closed. If [`connect`](StreamSession::connect) opened the
     /// session, this read takes the ssh time limits of
     /// [`PushSession::connect`](super::PushSession::connect). If
-    /// [`over_stream`](PullSession::over_stream) opened the session, this
+    /// [`over_stream`](StreamSession::over_stream) opened the session, this
     /// read has no time limit.
     ///
     /// # Errors
     ///
     /// The first two errors leave the session usable, and the call writes
     /// nothing. Each other error is a failure of the session, as
-    /// [Failures](PullSession#failures) states.
+    /// [Failures](StreamSession#failures) states.
     ///
     /// - [`Error::LimitExceeded`] if the `Get` frame of `path` is longer than
     ///   [`MIN_FRAME_LIMIT`].
@@ -609,7 +610,7 @@ impl PullSession {
     /// keep the client open. The session then fails with the error that the
     /// call returns, and a later read of a held body repeats that error.
     ///
-    /// If [`connect`](PullSession::connect) opened the session, the call then
+    /// If [`connect`](StreamSession::connect) opened the session, the call then
     /// waits for the ssh client to exit. The wait takes the ssh time limits
     /// of [`PushSession::connect`](super::PushSession::connect).
     ///
@@ -620,7 +621,7 @@ impl PullSession {
     ///   end, for example a body that the caller still holds.
     /// - [`Error::Transport`] with the exit status, if the ssh client exited
     ///   with a failure status and the error of the session is
-    ///   [`Error::Io`]. Only a session that [`connect`](PullSession::connect)
+    ///   [`Error::Io`]. Only a session that [`connect`](StreamSession::connect)
     ///   opened returns it.
     pub async fn finish(mut self) -> Result<()> {
         let transport = self.inner.transport.take();
@@ -657,7 +658,7 @@ impl PullSession {
     }
 }
 
-impl Drop for PullSession {
+impl Drop for StreamSession {
     fn drop(&mut self) {
         // A body that the caller holds keeps the shared state, so this drop
         // closes the output.
@@ -666,7 +667,7 @@ impl Drop for PullSession {
     }
 }
 
-/// The body of a file that [`PullSession::get`] returns, as an `AsyncRead`.
+/// The body of a file that [`StreamSession::get`] returns, as an `AsyncRead`.
 ///
 /// A read gives the bytes of the body until the chunk that ends it, and then
 /// end of file. When a read meets that chunk, the session moves to the next
@@ -687,7 +688,7 @@ impl Drop for PullSession {
 /// `Other`.
 ///
 /// The session can also fail for another reason, for example a dropped
-/// `get` future or [`PullSession::finish`]. A later read of the body then
+/// `get` future or [`StreamSession::finish`]. A later read of the body then
 /// fails with the first failure and reads no more of the body. A drop of the
 /// body before its end also ends the session.
 pub struct PullBody {

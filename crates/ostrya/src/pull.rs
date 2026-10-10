@@ -112,7 +112,7 @@
 //! So a waiting body holds its own credit, and the metadata stream that a
 //! scan waits for receives over its own window.
 //!
-//! The ssh source takes no write permit. Its session streams one body at a
+//! The stream source takes no write permit. Its session streams one body at a
 //! time, and the depth of the pipeline bounds the stores that finish after
 //! the end of their body.
 //!
@@ -760,8 +760,8 @@ pub struct PullOptions {
     /// the endpoint, and `None` keeps the value of the endpoint.
     /// [`resolve_pull`](crate::endpoint::resolve_pull) sets 8. For an ssh
     /// endpoint and for [`Repo::pull_over_stream`], the value sets
-    /// [`max_outstanding`](crate::remote::PullSessionOptions::max_outstanding)
-    /// of the pull session, and `None` is 8.
+    /// [`max_outstanding`](crate::remote::StreamSessionOptions::max_outstanding)
+    /// of the stream session, and `None` is 8.
     pub max_outstanding_fetches: Option<usize>,
     /// The commit that the timestamp of a fetched tip is compared against.
     pub timestamp_check: TimestampCheck,

@@ -3,9 +3,9 @@
 //! The wire codec and the client sessions of the ostrya push and ssh pull.
 //!
 //! A caller pushes a local directory as one commit with [`push_tree`](fn@push_tree), or the
-//! objects of its own source with a [`PushSession`]. A [`PullSession`] reads the
-//! files of a server repository over ssh. The crate has no repository knowledge,
-//! and it compiles on Linux, macOS, and Windows.
+//! objects of its own source with a [`PushSession`]. A [`StreamSession`] reads the files of a
+//! server repository over ssh or over a pair of byte streams. The crate has no repository
+//! knowledge, and it compiles on Linux, macOS, and Windows.
 //!
 //! # Entry points
 //!
@@ -15,7 +15,8 @@
 //! - [`Endpoint::parse`] reads an address into an endpoint with the default options.
 //! - [`PushSession::prepare`] checks an endpoint, and [`PreparedSession::open`] opens its session.
 //! - [`PushSession::over_stream`] opens a push session over a pair of byte streams.
-//! - [`PullSession::connect`] opens a pull session over ssh, and [`PullSession::get`] reads a file.
+//! - [`StreamSession::connect`] opens a stream session over ssh, and [`StreamSession::get`] reads
+//!   a file.
 //! - [`Error`] is the error of each fallible operation, and [`ErrorCode`] names its wire codes.
 //!
 //! # Modules
@@ -58,9 +59,9 @@ pub use push_tree::{
 };
 #[doc(hidden)]
 pub use session::{
-    BoxFuture, Compression, ObjectData, ObjectReader, ObjectSource, PullBody, PullSession,
-    PullSessionOptions, PushOutcome, PushPhase, PushProgress, PushProgressFn, PushProgressSnapshot,
-    PushSession, PushStats, ServerInfo, SessionOptions,
+    BoxFuture, Compression, ObjectData, ObjectReader, ObjectSource, PullBody, PushOutcome,
+    PushPhase, PushProgress, PushProgressFn, PushProgressSnapshot, PushSession, PushStats,
+    ServerInfo, SessionOptions, StreamSession, StreamSessionOptions,
 };
 #[doc(hidden)]
 pub use transport::{Endpoint, PreparedSession, SshAddress, SshOptions, without_userinfo};
@@ -90,32 +91,32 @@ const _: fn() = || {
     assert_send_sync::<tree::EntryAction>();
     assert_send_sync::<tree::EntryPath>();
     assert_send_sync::<ParentPolicy>();
-    assert_send_sync::<PullSession>();
+    assert_send_sync::<StreamSession>();
     assert_send_sync::<PullBody>();
-    assert_send_sync::<PullSessionOptions>();
+    assert_send_sync::<StreamSessionOptions>();
     assert_send_sync::<Endpoint>();
     assert_send_sync::<SshAddress>();
     assert_send_sync::<SshOptions>();
 };
 
-/// The futures of a pull session can run on a multi-threaded executor.
+/// The futures of a stream session can run on a multi-threaded executor.
 #[allow(dead_code)]
-fn pull_session_futures_are_send(
+fn stream_session_futures_are_send(
     address: &SshAddress,
     options: &SshOptions,
-    session: &PullSession,
-    owned: PullSession,
+    session: &StreamSession,
+    owned: StreamSession,
 ) {
     fn assert_send<T: Send>(_: &T) {}
-    assert_send(&PullSession::connect(
+    assert_send(&StreamSession::connect(
         address,
         options,
-        PullSessionOptions::default(),
+        StreamSessionOptions::default(),
     ));
-    assert_send(&PullSession::over_stream(
+    assert_send(&StreamSession::over_stream(
         futures_lite::io::empty(),
         futures_lite::io::sink(),
-        PullSessionOptions::default(),
+        StreamSessionOptions::default(),
     ));
     assert_send(&session.get("config", 1));
     assert_send(&owned.finish());

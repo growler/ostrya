@@ -6,7 +6,7 @@
 //! [`PushSession::prepare`] checks the endpoint and makes the transport ready,
 //! and [`PreparedSession::open`] opens the session later.
 //!
-//! [`PullSession::connect`] opens a pull session over ssh to an
+//! [`StreamSession::connect`] opens a stream session over ssh to an
 //! [`SshAddress`] with [`SshOptions`].
 //!
 //! Over ssh, the client runs the ssh client as a child process, and the remote
@@ -23,14 +23,14 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::session::http::Endpoint as HttpEndpoint;
-use crate::session::{PullSession, PullSessionOptions, PushSession, SessionOptions};
+use crate::session::{PushSession, SessionOptions, StreamSession, StreamSessionOptions};
 
 pub(crate) use ssh::Transport;
 pub use ssh::{SshAddress, SshOptions, without_userinfo};
 
 /// The longest wait for a pending message after a failed write, and for the
 /// exit of the ssh client. It applies to a session that
-/// [`PushSession::connect`] or [`PullSession::connect`] opens.
+/// [`PushSession::connect`] or [`StreamSession::connect`] opens.
 const PENDING_READ_LIMIT: Duration = Duration::from_secs(5);
 
 /// A remote address with the options of its transport.
@@ -406,8 +406,8 @@ impl Prepared {
 }
 
 /// The open of a session over ssh.
-impl PullSession {
-    /// Opens a pull session to the ssh address `address`.
+impl StreamSession {
+    /// Opens a stream session to the ssh address `address`.
     ///
     /// The call starts the ssh client, sends `PullHello`, and reads
     /// `PullHelloReply`. `address` takes the [forms](SshAddress#forms) of
@@ -422,9 +422,9 @@ impl PullSession {
     /// `SEND_COMMAND` is [`SshOptions::remote_command`], or `ostrya send`.
     ///
     /// The session has the ssh time limits of [`PushSession::connect`].
-    /// [`finish`](PullSession::finish) waits for the ssh client as `commit` and
-    /// `abort` of a push do. The session puts no time limit on a read of a
-    /// reply.
+    /// [`finish`](StreamSession::finish) waits for the ssh client as `commit`
+    /// and `abort` of a push do. The session puts no time limit on a read of
+    /// a reply.
     ///
     /// Under the tokio backend, the call must run within a runtime that has
     /// the IO driver and the time driver enabled, as [`PushSession::connect`]
@@ -457,12 +457,12 @@ impl PullSession {
     ///
     /// ```no_run
     /// use futures_lite::AsyncReadExt;
-    /// use ostrya_remote::session::{PullSession, PullSessionOptions};
+    /// use ostrya_remote::session::{StreamSession, StreamSessionOptions};
     /// use ostrya_remote::transport::{SshAddress, SshOptions};
     /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
     /// let address = SshAddress::parse("builder@repo.example.com:/srv/repo")?;
     /// let options = SshOptions::default();
-    /// let session = PullSession::connect(&address, &options, PullSessionOptions::default()).await?;
+    /// let session = StreamSession::connect(&address, &options, StreamSessionOptions::default()).await?;
     /// if let Some(mut body) = session.get("config", 1 << 20).await? {
     ///     let mut config = Vec::new();
     ///     body.read_to_end(&mut config).await?;
@@ -473,8 +473,8 @@ impl PullSession {
     pub async fn connect(
         address: &SshAddress,
         options: &SshOptions,
-        session: PullSessionOptions,
-    ) -> Result<PullSession> {
+        session: StreamSessionOptions,
+    ) -> Result<StreamSession> {
         let env = std::env::var_os("OSTRYA_SSH_COMMAND");
         let argv = pull_command_line(address, options, env.as_deref())?;
         spawn_and_open_pull(&argv, session, PENDING_READ_LIMIT).await
@@ -493,30 +493,30 @@ fn pull_command_line(
     Ok(address.command_line(program, send))
 }
 
-/// Starts `argv` and opens a pull session over its standard input and
+/// Starts `argv` and opens a stream session over its standard input and
 /// standard output, with `limit` as the time limit of the session.
 async fn spawn_and_open_pull(
     argv: &[String],
-    opts: PullSessionOptions,
+    opts: StreamSessionOptions,
     limit: Duration,
-) -> Result<PullSession> {
+) -> Result<StreamSession> {
     let (input, output, transport) = Transport::spawn(argv, limit)?;
-    match PullSession::open(input, output, opts, Some(limit)).await {
+    match StreamSession::open(input, output, opts, Some(limit)).await {
         Ok(session) => Ok(session.with_transport(transport)),
         Err(e) => transport.finish(Err(e)).await,
     }
 }
 
-/// Opens a pull session as [`PullSession::connect`] does, with the value of
+/// Opens a stream session as [`StreamSession::connect`] does, with the value of
 /// the environment variable and the time limit as parameters.
 #[cfg(test)]
 async fn connect_pull_with(
     address: &SshAddress,
     options: &SshOptions,
     env: Option<&OsStr>,
-    opts: PullSessionOptions,
+    opts: StreamSessionOptions,
     limit: Duration,
-) -> Result<PullSession> {
+) -> Result<StreamSession> {
     let argv = pull_command_line(address, options, env)?;
     spawn_and_open_pull(&argv, opts, limit).await
 }

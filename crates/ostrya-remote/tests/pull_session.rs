@@ -18,7 +18,7 @@ use ostrya_remote::proto::{
     ErrorMessage, FrameReader, FrameWriter, GetReply, Message, PULL_PROTOCOL_VERSION,
     PullHelloReply,
 };
-use ostrya_remote::{Error, ErrorCode, PullBody, PullSession, PullSessionOptions};
+use ostrya_remote::{Error, ErrorCode, PullBody, StreamSession, StreamSessionOptions};
 
 /// The capacity of each pipe. It is smaller than a large body, so the server
 /// waits for the client to read.
@@ -221,8 +221,8 @@ fn ends() -> ((PipeReader, PipeWriter), Server) {
     )
 }
 
-fn options(max_outstanding: Option<usize>) -> PullSessionOptions {
-    PullSessionOptions {
+fn options(max_outstanding: Option<usize>) -> StreamSessionOptions {
+    StreamSessionOptions {
         agent: Some("pull-session-test".to_owned()),
         max_outstanding,
     }
@@ -309,7 +309,7 @@ fn concurrent_calls_share_the_pipeline_in_order() {
     let expected = paths.clone();
     let results = run(
         async {
-            let session = PullSession::over_stream(input, output, options(None))
+            let session = StreamSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
             let calls: Vec<Call<'_, Option<Vec<u8>>>> = paths
@@ -366,7 +366,7 @@ fn a_later_reply_arrives_while_the_caller_holds_a_body_read_to_its_end() {
     let ((input, output), mut server) = ends();
     run(
         async {
-            let session = PullSession::over_stream(input, output, options(None))
+            let session = StreamSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
             let mut first = session.get("a", 100).await.unwrap().unwrap();
@@ -399,7 +399,7 @@ fn a_stated_length_that_differs_from_the_body_is_protocol() {
         let ((input, output), mut server) = ends();
         run(
             async {
-                let session = PullSession::over_stream(input, output, options(None))
+                let session = StreamSession::over_stream(input, output, options(None))
                     .await
                     .unwrap();
                 let body = session.get("x", 100).await.unwrap().unwrap();
@@ -427,7 +427,7 @@ fn a_body_over_the_cap_ends_the_session() {
     let ((input, output), mut server) = ends();
     run(
         async {
-            let session = PullSession::over_stream(input, output, options(None))
+            let session = StreamSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
             let e = session.get("big", 4).await.unwrap_err();
@@ -456,7 +456,7 @@ fn a_body_over_the_cap_ends_the_session() {
     let ((input, output), mut server) = ends();
     run(
         async {
-            let session = PullSession::over_stream(input, output, options(None))
+            let session = StreamSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
             let body = session.get("big", 4).await.unwrap().unwrap();
@@ -495,7 +495,7 @@ fn a_dropped_call_or_body_ends_the_session() {
     let ((input, output), mut server) = ends();
     run(
         async {
-            let session = PullSession::over_stream(input, output, options(None))
+            let session = StreamSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
             {
@@ -523,7 +523,7 @@ fn a_dropped_call_or_body_ends_the_session() {
     let ((input, output), mut server) = ends();
     run(
         async {
-            let session = PullSession::over_stream(input, output, options(None))
+            let session = StreamSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
             let mut body = session.get("held", 100).await.unwrap().unwrap();
@@ -552,7 +552,7 @@ fn later_calls_repeat_the_first_error() {
     let ((input, output), mut server) = ends();
     run(
         async {
-            let session = PullSession::over_stream(input, output, options(None))
+            let session = StreamSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
             let (first, second) = future::zip(session.get("a", 100), session.get("b", 100)).await;
@@ -573,7 +573,7 @@ fn later_calls_repeat_the_first_error() {
     let ((input, output), mut server) = ends();
     run(
         async {
-            let session = PullSession::over_stream(input, output, options(None))
+            let session = StreamSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
             let first = session.get("a", 100).await.unwrap_err();
@@ -606,7 +606,7 @@ fn an_abandoned_body_gives_the_code_of_its_error() {
     let ((input, output), mut server) = ends();
     run(
         async {
-            let session = PullSession::over_stream(input, output, options(None))
+            let session = StreamSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
             let body = session.get("a", 100).await.unwrap().unwrap();
@@ -646,7 +646,7 @@ fn the_hello_reply_gives_the_version_of_the_session() {
     let ((input, output), mut server) = ends();
     run(
         async {
-            let session = PullSession::over_stream(input, output, options(None))
+            let session = StreamSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
             assert!(session.get("config", 100).await.unwrap().is_none());
@@ -664,7 +664,7 @@ fn the_hello_reply_gives_the_version_of_the_session() {
         let ((input, output), mut server) = ends();
         run(
             async {
-                match PullSession::over_stream(input, output, options(None)).await {
+                match StreamSession::over_stream(input, output, options(None)).await {
                     Err(Error::VersionUnsupported(m)) => assert!(m.contains("version"), "{m}"),
                     Err(other) => panic!("{other:?}"),
                     Ok(_) => panic!("version {version} accepted"),
@@ -681,7 +681,7 @@ fn the_hello_reply_gives_the_version_of_the_session() {
     let ((input, output), mut server) = ends();
     run(
         async {
-            match PullSession::over_stream(input, output, options(None)).await {
+            match StreamSession::over_stream(input, output, options(None)).await {
                 Err(Error::VersionUnsupported(m)) => assert_eq!(m, "no such version"),
                 Err(other) => panic!("{other:?}"),
                 Ok(_) => panic!("accepted"),
@@ -703,7 +703,7 @@ fn a_depth_of_zero_keeps_one_get_in_flight() {
     let ((input, output), mut server) = ends();
     run(
         async {
-            let session = PullSession::over_stream(input, output, options(Some(0)))
+            let session = StreamSession::over_stream(input, output, options(Some(0)))
                 .await
                 .unwrap();
             let calls: Vec<Call<'_, Vec<u8>>> = ["a", "b", "c"]
@@ -743,7 +743,7 @@ fn finish_with_an_unread_body_is_an_unclean_end() {
     let ((input, output), mut server) = ends();
     let held = run(
         async {
-            let session = PullSession::over_stream(input, output, options(None))
+            let session = StreamSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
             let mut body = session.get("a", 100).await.unwrap().unwrap();
@@ -781,7 +781,7 @@ fn a_body_read_after_a_failure_repeats_the_failure() {
     let ((input, output), mut server) = ends();
     run(
         async {
-            let session = PullSession::over_stream(input, output, options(None))
+            let session = StreamSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
             let mut body = session.get("a", 100).await.unwrap().unwrap();
@@ -814,7 +814,7 @@ fn a_dropped_session_closes_its_output_while_a_body_is_held() {
     let ((input, output), mut server) = ends();
     let held = run(
         async {
-            let session = PullSession::over_stream(input, output, options(None))
+            let session = StreamSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
             let body = session.get("a", 100).await.unwrap().unwrap();

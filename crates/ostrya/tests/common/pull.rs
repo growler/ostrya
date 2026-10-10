@@ -9,6 +9,9 @@
 //! - the largest number of requests in flight at the same time
 //! - the number of connections that it accepts
 //!
+//! A TLS server can demand a client certificate that the fixture authority
+//! signed, and any server can demand a bearer token.
+//!
 //! The pull tests declare this module with a `path` attribute, so the other
 //! tests do not build the server.
 
@@ -32,6 +35,7 @@ use futures_io::{AsyncRead, AsyncWrite};
 use hyper::body::{Bytes, Frame, SizeHint};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
+use ostrya::fetch::{FetcherOptions, Proxy, TrustRoots};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree, Repo,
     RepoMode, SummaryOptions, Type, Value,
@@ -49,6 +53,9 @@ pub const UNTRUSTED_CERT_PEM: &[u8] =
     include_bytes!("../../../../tests/fixtures/tls/server-untrusted.pem");
 pub const UNTRUSTED_KEY_PEM: &[u8] =
     include_bytes!("../../../../tests/fixtures/tls/server-untrusted.key.pem");
+/// A client certificate that the fixture authority signed, and its key.
+pub const CLIENT_CERT_PEM: &[u8] = include_bytes!("../../../../tests/fixtures/tls/client.pem");
+pub const CLIENT_KEY_PEM: &[u8] = include_bytes!("../../../../tests/fixtures/tls/client.key.pem");
 
 /// A fixed timestamp that makes the commits of a source repository reproducible.
 pub const FIXED_TS: u64 = 1_700_000_000;
@@ -173,6 +180,9 @@ pub struct Policy {
     ///
     /// If the count is 0, the server sends the full body.
     truncate_first: HashMap<String, usize>,
+    /// The bearer token that each request must carry. A request without
+    /// `Authorization: Bearer <token>` gets a 401 answer.
+    bearer: Option<String>,
 }
 
 /// The server leaf certificate that a TLS [`RepoServer`] presents.
@@ -226,6 +236,19 @@ impl RepoServer {
     /// The leaf sets which server certificate checks a TLS client can
     /// complete.
     pub async fn start_with_leaf(root: &Path, tls: bool, leaf: Leaf) -> RepoServer {
+        RepoServer::launch(root, tls, leaf, false).await
+    }
+
+    /// Starts a TLS server that presents [`Leaf::Fixture`] and demands a
+    /// client certificate that the fixture authority signed.
+    pub async fn start_demanding_client_certificate(root: &Path) -> RepoServer {
+        RepoServer::launch(root, true, Leaf::Fixture, true).await
+    }
+
+    /// Starts a server that presents `leaf`. If `client_certificate` is
+    /// `true`, a TLS server demands a client certificate that the fixture
+    /// authority signed.
+    async fn launch(root: &Path, tls: bool, leaf: Leaf, client_certificate: bool) -> RepoServer {
         let root = root.to_path_buf();
         let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
             .await
@@ -238,7 +261,11 @@ impl RepoServer {
         let inflight = Arc::new(AtomicUsize::new(0));
         let connections = Arc::new(AtomicUsize::new(0));
         let acceptor = tls.then(|| {
-            futures_rustls::TlsAcceptor::from(Arc::new(server_config(&["h2", "http/1.1"], leaf)))
+            futures_rustls::TlsAcceptor::from(Arc::new(server_config(
+                &["h2", "http/1.1"],
+                leaf,
+                client_certificate,
+            )))
         });
 
         let task = (
@@ -316,6 +343,12 @@ impl RepoServer {
         self.connections.load(Ordering::SeqCst)
     }
 
+    /// Demands `Authorization: Bearer <token>` on each request. A request
+    /// without it gets a 401 answer.
+    pub fn require_bearer(&self, token: &str) {
+        self.policy.lock().unwrap().bearer = Some(token.to_owned());
+    }
+
     pub fn hide(&self, path: &str) {
         self.policy.lock().unwrap().hidden.insert(path.to_owned());
     }
@@ -390,13 +423,18 @@ where
         let (root, seen, answered, policy, peak, inflight) = state.clone();
         async move {
             let path = request.uri().path().trim_start_matches('/').to_owned();
+            let authorization = request
+                .headers()
+                .get(hyper::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             seen.lock().unwrap().push(path.clone());
             let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
             peak.fetch_max(now, Ordering::SeqCst);
             // A small delay makes the overlap of concurrent requests longer,
             // so the counter sees the peak that the pull reaches.
             ostrya_rt::Timer::after(std::time::Duration::from_millis(5)).await;
-            let response = answer(&root, &path, &policy);
+            let response = answer(&root, &path, authorization.as_deref(), &policy);
             answered
                 .lock()
                 .unwrap()
@@ -416,10 +454,21 @@ where
     }
 }
 
-/// Returns the response for one request path.
-pub fn answer(root: &Path, path: &str, policy: &Mutex<Policy>) -> Response<FileBody> {
+/// Returns the response for one request path, with `authorization` as the
+/// value of the `Authorization` header of the request.
+pub fn answer(
+    root: &Path,
+    path: &str,
+    authorization: Option<&str>,
+    policy: &Mutex<Policy>,
+) -> Response<FileBody> {
     let (hidden, replacement, truncated) = {
         let mut policy = policy.lock().unwrap();
+        if let Some(token) = &policy.bearer
+            && authorization != Some(format!("Bearer {token}").as_str())
+        {
+            return status_only(StatusCode::UNAUTHORIZED);
+        }
         let cut_once = match policy.truncate_first.get_mut(path) {
             Some(left) if *left > 0 => {
                 *left -= 1;
@@ -464,8 +513,13 @@ pub fn answer(root: &Path, path: &str, policy: &Mutex<Policy>) -> Response<FileB
 }
 
 pub fn not_found() -> Response<FileBody> {
+    status_only(StatusCode::NOT_FOUND)
+}
+
+/// Returns a response with `status` and an empty body.
+fn status_only(status: StatusCode) -> Response<FileBody> {
     Response::builder()
-        .status(StatusCode::NOT_FOUND)
+        .status(status)
         .body(FileBody {
             chunks: Vec::new(),
             declared: 0,
@@ -473,8 +527,10 @@ pub fn not_found() -> Response<FileBody> {
         .unwrap()
 }
 
-/// Returns the rustls configuration of the fixture server.
-pub fn server_config(alpn: &[&str], leaf: Leaf) -> rustls::ServerConfig {
+/// Returns the rustls configuration of the fixture server. If
+/// `client_certificate` is `true`, the server demands a client certificate
+/// that the fixture authority signed.
+pub fn server_config(alpn: &[&str], leaf: Leaf, client_certificate: bool) -> rustls::ServerConfig {
     let provider = Arc::new(rustls_graviola::default_provider());
     let (cert_pem, key_pem) = leaf.pem();
     let certs: Vec<_> = rustls_pemfile::certs(&mut io::BufReader::new(cert_pem))
@@ -483,12 +539,23 @@ pub fn server_config(alpn: &[&str], leaf: Leaf) -> rustls::ServerConfig {
     let key = rustls_pemfile::private_key(&mut io::BufReader::new(key_pem))
         .unwrap()
         .unwrap();
-    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+    let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
         .unwrap();
+    let builder = if client_certificate {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut io::BufReader::new(CA_PEM)) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let verifier =
+            rustls::server::WebPkiClientVerifier::builder_with_provider(roots.into(), provider)
+                .build()
+                .unwrap();
+        builder.with_client_cert_verifier(verifier)
+    } else {
+        builder.with_no_client_auth()
+    };
+    let mut config = builder.with_single_cert(certs, key).unwrap();
     config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
     config
 }
@@ -738,6 +805,16 @@ pub async fn reconfigure_dest(dir: &Path, url: &str, extra: &str) -> Repo {
     )
     .unwrap();
     Repo::open(&path).await.unwrap()
+}
+
+/// Returns the options of an HTTP endpoint for `server`, built in memory. The
+/// endpoint trusts the fixture authority and connects with no proxy. The
+/// other fields keep the defaults of [`FetcherOptions::new`].
+pub fn https_endpoint(server: &RepoServer) -> FetcherOptions {
+    let mut http = FetcherOptions::new(server.url());
+    http.tls.roots = TrustRoots::Pem(CA_PEM.to_vec());
+    http.proxy = Proxy::None;
+    http
 }
 
 /// Returns the loose object path of a content object, as an archive remote

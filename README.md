@@ -115,8 +115,9 @@ Feature flags on `ostrya`:
 `ostrya::remote`. `Repo::send`, the serving side of the pull over ssh, and
 `Repo::pull_over_stream`, its client side over a pair of streams, take no
 feature. The `send` feature of `ostrya-cli`, in its default set, builds
-`ostrya send` on `Repo::send`. `Repo::pull` runs over ssh for an ssh address
-in `PullOptions::url` or in the remote key `pull-url`, with no feature.
+`ostrya send` on `Repo::send`. `Repo::pull` runs over ssh for an ssh
+endpoint in `PullOptions::endpoint` or an ssh address in the remote key
+`pull-url`, with no feature.
 
 Later phases add `s3` and `serve`.
 

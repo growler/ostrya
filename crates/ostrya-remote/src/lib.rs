@@ -63,10 +63,7 @@ pub use session::{
     PushSession, PushStats, ServerInfo, SessionOptions,
 };
 #[doc(hidden)]
-pub use transport::{
-    Endpoint, PreparedSession, PullConnectOptions, PushRemote, SshAddress, SshOptions,
-    without_userinfo,
-};
+pub use transport::{Endpoint, PreparedSession, SshAddress, SshOptions, without_userinfo};
 
 // The public types of the protocol move freely across tasks and threads.
 const _: fn() = || {
@@ -86,7 +83,6 @@ const _: fn() = || {
     assert_send_sync::<ServerInfo>();
     assert_send_sync::<ObjectData>();
     assert_send_sync::<Box<dyn ObjectReader>>();
-    assert_send_sync::<PushRemote>();
     assert_send_sync::<PreparedSession>();
     assert_send_sync::<tree::TreeModel>();
     assert_send_sync::<tree::EntryMeta>();
@@ -97,7 +93,6 @@ const _: fn() = || {
     assert_send_sync::<PullSession>();
     assert_send_sync::<PullBody>();
     assert_send_sync::<PullSessionOptions>();
-    assert_send_sync::<PullConnectOptions>();
     assert_send_sync::<Endpoint>();
     assert_send_sync::<SshAddress>();
     assert_send_sync::<SshOptions>();
@@ -105,11 +100,16 @@ const _: fn() = || {
 
 /// The futures of a pull session can run on a multi-threaded executor.
 #[allow(dead_code)]
-fn pull_session_futures_are_send(remote: &PushRemote, session: &PullSession, owned: PullSession) {
+fn pull_session_futures_are_send(
+    address: &SshAddress,
+    options: &SshOptions,
+    session: &PullSession,
+    owned: PullSession,
+) {
     fn assert_send<T: Send>(_: &T) {}
     assert_send(&PullSession::connect(
-        remote,
-        PullConnectOptions::default(),
+        address,
+        options,
         PullSessionOptions::default(),
     ));
     assert_send(&PullSession::over_stream(

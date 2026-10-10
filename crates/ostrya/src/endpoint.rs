@@ -6,6 +6,11 @@
 //! `resolve_push`. [`EndpointOverrides`] holds the values of the caller. A
 //! value of the caller wins over its remote key.
 //!
+//! [`Repo::pull`](crate::Repo::pull) and
+//! [`Repo::remote_fetch_summary`](crate::Repo::remote_fetch_summary) call
+//! [`resolve_pull`] with the default overrides when the caller gives no
+//! endpoint.
+//!
 //! [`read_token_file`] and [`read_pem_file`] read a token file and a PEM file.
 //! [`read_pem_file`] reads at most 1 MiB and one byte. [`read_token_file`]
 //! stops at the first LF, and reads at most 1 MiB and one byte. Each error
@@ -341,6 +346,26 @@ async fn pull_http(
             "{name} applies to a pull over ssh, and this pull runs over HTTP"
         )));
     }
+    // `tls-permissive` keeps the host name check and ignores `tls-ca-path`.
+    // Both facts are observed on the `ostree` command: a CA that signed
+    // nothing in the chain works, and a path that names an absent file works
+    // too. So the function does not read the path, and an absent file is no
+    // failure. `DangerousAcceptAnyChain` keeps the name check and takes the
+    // chain as presented. A CA path of the caller wins over the key.
+    //
+    // `DangerousAcceptAnyChain` also drops the expiry check. That part is a
+    // reading of ostrya, with no observation behind it. A peer verification
+    // that ignores the CA path is libcurl peer verification turned off, and
+    // that setting also drops the validity dates.
+    let ca_path = match (o.tls_ca_path, section) {
+        (Some(path), _) => Some(path),
+        (None, Some(section)) if section.tls_permissive()? => {
+            http.tls.roots = TrustRoots::DangerousAcceptAnyChain;
+            None
+        }
+        (None, Some(section)) => section.tls_ca_path()?.map(PathBuf::from),
+        (None, None) => None,
+    };
     if let Some(section) = section {
         if o.tls_client_cert_path.is_none() {
             o.tls_client_cert_path = section.tls_client_cert_path()?.map(PathBuf::from);
@@ -362,21 +387,6 @@ async fn pull_http(
     let proxy = match section {
         Some(section) => remote_proxy(remote, section)?,
         None => Proxy::Environment,
-    };
-    // `tls-permissive` keeps the host name check and ignores `tls-ca-path`.
-    // Both facts are observed on the `ostree` command: a CA that signed
-    // nothing in the chain works, and a path that names an absent file works
-    // too. So the function does not read the path, and an absent file is no
-    // failure. `DangerousAcceptAnyChain` keeps the name check and takes the
-    // chain as presented. A CA path of the caller wins over the key.
-    let ca_path = match (o.tls_ca_path, section) {
-        (Some(path), _) => Some(path),
-        (None, Some(section)) if section.tls_permissive()? => {
-            http.tls.roots = TrustRoots::DangerousAcceptAnyChain;
-            None
-        }
-        (None, Some(section)) => section.tls_ca_path()?.map(PathBuf::from),
-        (None, None) => None,
     };
     if let Some(path) = ca_path {
         http.tls.roots = TrustRoots::Pem(read_pem_file("tls-ca-path", &path).await?);
@@ -1726,6 +1736,47 @@ mod tests {
             ..EndpointOverrides::default()
         };
         ssh(pull(None, "r", o));
+    }
+
+    /// The refusal of a field of an HTTP address shows no user name of the
+    /// ssh address. It shows the address in the `ssh://` form with no user, so
+    /// an `@` in the path stays.
+    #[test]
+    fn the_refusal_of_an_http_field_shows_no_user_name() {
+        for (written, shown) in [
+            ("ssh://user-QXZ@ex.com/srv/repo", "ssh://ex.com/srv/repo"),
+            ("user-QXZ@ex.com:srv/repo", "ssh://ex.com/~/srv/repo"),
+            ("ssh://user-QXZ@ex.com/srv/a@b", "ssh://ex.com/srv/a@b"),
+        ] {
+            let o = EndpointOverrides {
+                url: Some(written.into()),
+                http_headers: vec![("A".into(), "B".into())],
+                ..EndpointOverrides::default()
+            };
+            let msg = invalid_input(pull(None, "r", o));
+            assert!(!msg.contains("QXZ"), "{written}: {msg}");
+            assert_eq!(
+                msg,
+                format!("http-header applies to a pull over HTTP, and '{shown}' is an ssh address")
+            );
+        }
+    }
+
+    /// A url of the caller replaces the address alone. The pull still reads
+    /// the TLS keys and the `proxy` key of the named section.
+    #[test]
+    fn a_url_override_keeps_the_tls_and_proxy_keys_of_the_section() {
+        let dir = Dir::new();
+        let config = tls_keys(&dir, "https://ex.com/repo");
+        let o = EndpointOverrides {
+            url: Some("https://other.ex.com/".into()),
+            ..EndpointOverrides::default()
+        };
+        let http = http_of(pull(Some(&config), "keys", o));
+        assert_eq!(http.mirrors, ["https://other.ex.com/"]);
+        assert_eq!(http.tls.roots, TrustRoots::Pem(b"KEY-CA".to_vec()));
+        assert_eq!(identity(&http), (b"KEY-CERT".to_vec(), b"KEY-KEY".to_vec()));
+        assert!(matches!(&http.proxy, Proxy::Url(url) if url == "http://proxy.ex.com:3128"));
     }
 
     #[cfg(feature = "push")]

@@ -65,9 +65,11 @@
 //!
 //! A pull from a remote keeps up to
 //! [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches) steps
-//! in flight. Each step fetches one object and stores it. The pull fills a
-//! free step from a plan of three classes, in this order and with the
-//! matching fetch priority:
+//! in flight. If the value is `None`, an HTTP pull keeps up to
+//! [`max_outstanding`](crate::fetch::FetcherOptions::max_outstanding) of its
+//! endpoint, and a pull over ssh keeps up to 8. Each step fetches one object
+//! and stores it. The pull fills a free step from a plan of three classes, in
+//! this order and with the matching fetch priority:
 //!
 //! - the commits: the requested tips, and their parents under
 //!   [`depth`](PullOptions::depth)
@@ -148,7 +150,8 @@
 //!
 //! If a request of an HTTP pull fails with a retryable failure, the pull
 //! sends it again, up to
-//! [`n_network_retries`](PullOptions::n_network_retries) times. A body can
+//! [`max_retries`](crate::fetch::FetcherOptions::max_retries) times of the
+//! endpoint. [`resolve_pull`](crate::endpoint::resolve_pull) sets 5. A body can
 //! fail in transit: a cut connection, a silent peer, or a transfer slower
 //! than the low-speed rule. Then the pull fetches it again from its first
 //! byte. Each refetch spends one repeat of the same count.
@@ -182,7 +185,6 @@ use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::write::FileMeta;
 
-mod address;
 mod delta;
 mod drive;
 #[doc(hidden)]
@@ -575,16 +577,10 @@ impl std::fmt::Debug for DetachedMetadataFilter {
 /// - Only a local pull reads [`collection_id`](PullOptions::collection_id).
 ///   A pull from a remote refuses it.
 /// - A pull from a remote also reads [`subpaths`](PullOptions::subpaths),
-///   [`url`](PullOptions::url),
+///   [`endpoint`](PullOptions::endpoint),
 ///   [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches),
-///   [`timestamp_check`](PullOptions::timestamp_check),
-///   [`progress`](PullOptions::progress), and
-///   [`connect`](PullOptions::connect). A local pull refuses `subpaths`.
-/// - Only an HTTP pull reads [`http_headers`](PullOptions::http_headers),
-///   [`n_network_retries`](PullOptions::n_network_retries),
-///   [`low_speed_limit_bytes`](PullOptions::low_speed_limit_bytes), and
-///   [`low_speed_time`](PullOptions::low_speed_time). A pull over ssh
-///   refuses them, as [`Repo::pull`] states.
+///   [`timestamp_check`](PullOptions::timestamp_check), and
+///   [`progress`](PullOptions::progress). A local pull refuses `subpaths`.
 #[derive(Debug, Clone, Default)]
 pub struct PullOptions {
     /// The ref names to pull.
@@ -728,39 +724,45 @@ pub struct PullOptions {
     /// mode, the pull applies a delta that it finds whole, and the walk after
     /// its last part finds the subpaths present.
     pub subpaths: Vec<String>,
-    /// The address that a pull from a remote reads.
+    /// The endpoint that a pull from a remote reads: the address and the
+    /// options of its transport.
     ///
-    /// The address is the base URL of an HTTP remote, or an ssh address. It
-    /// overrides the remote keys `pull-url` and `url`, and `None` uses the
-    /// config. [`Repo::pull`] states how the pull reads the value.
-    pub url: Option<String>,
-    /// More headers that an HTTP pull sends with each request.
-    pub http_headers: Vec<(String, String)>,
+    /// If the value is `None`, [`Repo::pull`] calls
+    /// [`resolve_pull`](crate::endpoint::resolve_pull) with the config of this
+    /// repository, the name of the remote, and the default
+    /// [`EndpointOverrides`](crate::endpoint::EndpointOverrides). The pull
+    /// defaults then apply: 5 retries, 8 requests in flight, and a low speed
+    /// limit of 1000 bytes per second for 30 seconds.
+    ///
+    /// If the value is set, the pull uses the endpoint as it is, with one
+    /// exception: a [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches)
+    /// value replaces the request limit of an HTTP endpoint. The pull reads
+    /// none of the remote keys `pull-url`, `url`, `tls-ca-path`,
+    /// `tls-client-cert-path`, `tls-client-key-path`, `tls-permissive`,
+    /// `proxy`, `ssh-command`, and `send-command`. It still reads the
+    /// signature keys and the `branches` key of the remote. By default, the
+    /// name of the remote gives the prefix of the written refs.
+    /// [`remote`](PullOptions::remote) and [`MIRROR`](PullFlags::MIRROR)
+    /// change this.
+    ///
+    /// An endpoint from [`FetcherOptions::new`](crate::fetch::FetcherOptions::new)
+    /// has the defaults of [`FetcherOptions`](crate::fetch::FetcherOptions),
+    /// with no low speed rule. To get the pull defaults, call `resolve_pull`
+    /// and change the endpoint that it returns.
+    ///
+    /// An [`Endpoint::Http`](crate::remote::Endpoint::Http) must name at least
+    /// one mirror. [`Repo::pull_over_stream`] refuses a value that is set.
+    pub endpoint: Option<crate::remote::Endpoint>,
     /// The number of fetches that a pull from a remote keeps in flight.
     ///
-    /// `None` is 8.
+    /// For an HTTP endpoint, a value replaces
+    /// [`max_outstanding`](crate::fetch::FetcherOptions::max_outstanding) of
+    /// the endpoint, and `None` keeps the value of the endpoint.
+    /// [`resolve_pull`](crate::endpoint::resolve_pull) sets 8. For an ssh
+    /// endpoint and for [`Repo::pull_over_stream`], the value sets
+    /// [`max_outstanding`](crate::remote::PullSessionOptions::max_outstanding)
+    /// of the pull session, and `None` is 8.
     pub max_outstanding_fetches: Option<usize>,
-    /// The number of repeats of an HTTP pull after a retryable failure.
-    ///
-    /// Each repeat is one more round of the mirrors. `None` is 5. If a body
-    /// fails in transit, the pull fetches it again from the start, and each
-    /// such fetch uses one repeat from the same count.
-    pub n_network_retries: Option<u32>,
-    /// The transfer rate, in bytes per second, below which an HTTP pull stops a
-    /// transfer.
-    ///
-    /// The pull stops the transfer, as a retryable failure, after the rate
-    /// stays below the limit for [`low_speed_time`](PullOptions::low_speed_time).
-    /// [`LowSpeed`] states how the pull measures the rate. `None` is 1000, and
-    /// `0` turns the check off.
-    ///
-    /// [`LowSpeed`]: crate::LowSpeed
-    pub low_speed_limit_bytes: Option<u32>,
-    /// The time that the rate can stay below
-    /// [`low_speed_limit_bytes`](PullOptions::low_speed_limit_bytes).
-    ///
-    /// `None` is 30 seconds, and a zero duration turns the check off.
-    pub low_speed_time: Option<Duration>,
     /// The commit that the timestamp of a fetched tip is compared against.
     pub timestamp_check: TimestampCheck,
     /// The option to fetch each object loose and ignore static deltas.
@@ -811,17 +813,6 @@ pub struct PullOptions {
     /// the counts in the counters of the pull alone. A local pull does not use
     /// the handle.
     pub progress: Option<PullProgress>,
-    /// The ssh command, the send command, and the remote ssh command of a pull
-    /// over ssh.
-    ///
-    /// The fields resolve as the fields of
-    /// [`SshOptions`](crate::remote::SshOptions) do for a push. The
-    /// remote keys `ssh-command` and `send-command` fill `remote_ssh_command`
-    /// and `send_command` if they are `None`. An HTTP pull refuses
-    /// `ssh_command` and `send_command` with [`Error::InvalidInput`], and does
-    /// not read `remote_ssh_command`. [`Repo::pull_over_stream`] runs no ssh
-    /// client, and refuses the same two fields.
-    pub connect: crate::remote::PullConnectOptions,
 }
 
 /// Applies the durability options of a pull to its transaction.

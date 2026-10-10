@@ -37,7 +37,7 @@ impl<'a, T> Slots<'a, T> {
     pub(crate) fn new(limit: usize) -> Slots<'a, T> {
         let limit = limit.max(1);
         Slots {
-            slots: Vec::with_capacity(limit),
+            slots: Vec::new(),
             limit,
         }
     }
@@ -237,6 +237,18 @@ mod tests {
             let mut slots: Slots<'_, usize> = Slots::new(2);
             assert_eq!(poll_once(slots.next_ready()).await, Some(None));
             assert!(slots.has_room());
+        });
+    }
+
+    /// A limit of `usize::MAX` makes a set that admits futures. The limit can
+    /// come from the caller, so the set allocates no slot for it in advance.
+    #[test]
+    fn the_largest_limit_makes_a_set() {
+        block_on(async {
+            let mut slots = Slots::new(usize::MAX);
+            slots.push(async { 1usize });
+            assert!(slots.has_room());
+            assert_eq!(slots.next_ready().await, Some(1));
         });
     }
 }

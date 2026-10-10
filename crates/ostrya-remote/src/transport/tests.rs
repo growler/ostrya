@@ -4,10 +4,7 @@ use super::ssh::{quote_posix, receive_command, send_command, ssh_program};
 use super::*;
 
 fn ssh(address: &str) -> SshAddress {
-    match parse_remote(address, false).unwrap().inner {
-        RemoteAddr::Ssh(addr) => addr,
-        RemoteAddr::Http(url) => panic!("{address} parsed as HTTP: {url}"),
-    }
+    SshAddress::parse_with(address, false).unwrap()
 }
 
 fn argv(address: &str) -> Vec<String> {
@@ -19,7 +16,7 @@ fn strings(items: &[&str]) -> Vec<String> {
 }
 
 fn refused(address: &str, windows: bool) -> String {
-    match parse_remote(address, windows) {
+    match parse_endpoint(address, windows) {
         Err(Error::InvalidInput(msg)) => msg,
         other => panic!("{address}: expected a refusal, got {other:?}"),
     }
@@ -168,7 +165,7 @@ fn a_host_or_a_user_outside_the_allowed_characters_is_refused() {
         "u.s-e_r@h:p",
         "[fe80::1%eth0]:p",
     ] {
-        parse_remote(address, false).unwrap();
+        parse_endpoint(address, false).unwrap();
     }
     assert_eq!(
         argv("ssh://[fe80::1%eth0]/p"),
@@ -265,10 +262,8 @@ fn a_refusal_names_the_address() {
 #[test]
 fn the_scp_form_reads_a_leading_slash_tilde_as_the_home_prefix() {
     for windows in [false, true] {
-        let ssh = |address: &str| match parse_remote(address, windows) {
-            Ok(PushRemote {
-                inner: RemoteAddr::Ssh(addr),
-            }) => addr,
+        let ssh = |address: &str| match SshAddress::parse_with(address, windows) {
+            Ok(addr) => addr,
             other => panic!("{address} windows={windows}: {other:?}"),
         };
         let reason = |address: &str| {
@@ -320,7 +315,6 @@ fn no_refusal_shows_the_userinfo_of_an_address() {
     let windows_only = SECRET_ON_WINDOWS.iter().map(|a| (*a, true));
     for (address, windows) in both.chain(windows_only) {
         let results = [
-            ("PushRemote", parse_remote(address, windows).map(drop)),
             ("Endpoint", parse_endpoint(address, windows).map(drop)),
             (
                 "SshAddress",
@@ -343,11 +337,11 @@ fn a_one_letter_host_is_a_local_path_on_windows() {
     for address in ["C:\\repo", "C:repo", "c:/repo", "u@C:repo"] {
         let msg = refused(address, true);
         assert!(msg.contains("local path"), "{address}: {msg}");
-        parse_remote(address, false).unwrap();
+        parse_endpoint(address, false).unwrap();
     }
-    parse_remote("ssh://C/repo", true).unwrap();
-    parse_remote("ab:repo", true).unwrap();
-    parse_remote("[C]:repo", true).unwrap();
+    parse_endpoint("ssh://C/repo", true).unwrap();
+    parse_endpoint("ab:repo", true).unwrap();
+    parse_endpoint("[C]:repo", true).unwrap();
 }
 
 #[test]
@@ -360,9 +354,10 @@ fn http_addresses_parse_and_their_malformed_forms_are_refused() {
         "https://h",
         "http://h:080/",
     ] {
-        let remote = PushRemote::parse(address).unwrap();
-        assert_eq!(remote.to_string(), address);
-        assert!(matches!(remote.inner, RemoteAddr::Http(_)), "{address}");
+        let Endpoint::Http(http) = Endpoint::parse(address).unwrap() else {
+            panic!("{address} is not an HTTP endpoint");
+        };
+        assert_eq!(http.mirrors, [address], "{address}");
     }
     for (address, part) in [
         ("http://", "invalid url"),
@@ -616,34 +611,33 @@ const SECRET: &[&str] = &[
 /// Addresses with userinfo that each parse refuses on Windows alone.
 const SECRET_ON_WINDOWS: &[&str] = &["user-QXZ@C:repo", "user-QXZ@dir\\x:r"];
 
-/// `Endpoint::parse` and `PushRemote::parse` accept and refuse the same
-/// addresses, and each address gives the same transport.
+/// `Endpoint::parse` gives the transport of the `want` column for each
+/// address. An ssh address and the refusal of an ssh address are those of
+/// `SshAddress::parse`.
 #[test]
-fn an_endpoint_parses_each_address_as_a_push_remote_does() {
+fn an_endpoint_parses_each_address_of_the_table() {
     let secret = SECRET
         .iter()
         .flat_map(|a| [(*a, false, Refused), (*a, true, Refused)]);
     let secret_on_windows = SECRET_ON_WINDOWS.iter().map(|a| (*a, true, Refused));
     for (address, windows, want) in ROWS.iter().copied().chain(secret).chain(secret_on_windows) {
-        let remote = parse_remote(address, windows);
         let endpoint = parse_endpoint(address, windows);
         let case = format!("{address:?} windows={windows}");
+        let is_http = address.starts_with("http://") || address.starts_with("https://");
         match want {
             Ssh => {
-                let RemoteAddr::Ssh(from_remote) = remote.unwrap().inner else {
-                    panic!("{case}: the push remote is not ssh");
-                };
-                let Ok(Endpoint::Ssh { address, options }) = endpoint else {
+                let Ok(Endpoint::Ssh {
+                    address: parsed,
+                    options,
+                }) = endpoint
+                else {
                     panic!("{case}: the endpoint is not ssh: {endpoint:?}");
                 };
-                assert_eq!(address, from_remote, "{case}");
+                let ssh = SshAddress::parse_with(address, windows).unwrap();
+                assert_eq!(parsed, ssh, "{case}");
                 assert_eq!(options, SshOptions::default(), "{case}");
             }
             Http => {
-                let RemoteAddr::Http(url) = remote.unwrap().inner else {
-                    panic!("{case}: the push remote is not HTTP");
-                };
-                assert_eq!(url, address, "{case}");
                 let Ok(Endpoint::Http(http)) = endpoint else {
                     panic!("{case}: the endpoint is not HTTP: {endpoint:?}");
                 };
@@ -661,13 +655,17 @@ fn an_endpoint_parses_each_address_as_a_push_remote_does() {
                 assert_eq!(http.max_outstanding, new.max_outstanding, "{case}");
             }
             Refused => {
-                let Err(Error::InvalidInput(from_remote)) = remote else {
-                    panic!("{case}: the push remote is not refused: {remote:?}");
-                };
                 let Err(Error::InvalidInput(msg)) = endpoint else {
                     panic!("{case}: the endpoint is not refused: {endpoint:?}");
                 };
-                assert_eq!(msg, from_remote, "{case}");
+                if !is_http {
+                    let Err(Error::InvalidInput(from_ssh)) =
+                        SshAddress::parse_with(address, windows)
+                    else {
+                        panic!("{case}: the ssh address is not refused");
+                    };
+                    assert_eq!(msg, from_ssh, "{case}");
+                }
             }
         }
     }
@@ -689,10 +687,6 @@ fn the_parse_of_the_display_gives_an_equal_address() {
             parsed,
             "{case}: {shown}"
         );
-        let RemoteAddr::Ssh(remote) = parse_remote(&shown, windows).unwrap().inner else {
-            panic!("{case}: {shown} is not ssh");
-        };
-        assert_eq!(remote, parsed, "{case}: {shown}");
     }
 }
 
@@ -1019,11 +1013,11 @@ fn an_empty_ssh_command_is_refused() {
 }
 
 /// The command line of a pull runs the send command. The options can name
-/// the send command. A pull refuses an HTTP address.
+/// the send command.
 #[test]
 fn a_pull_runs_the_send_command_over_ssh() {
-    let remote = PushRemote::parse("ssh://me@host:2222/srv/repo").unwrap();
-    let argv = pull_command_line(&remote, &PullConnectOptions::default(), None).unwrap();
+    let address = SshAddress::parse("ssh://me@host:2222/srv/repo").unwrap();
+    let argv = pull_command_line(&address, &SshOptions::default(), None).unwrap();
     assert_eq!(
         argv,
         strings(&[
@@ -1034,12 +1028,12 @@ fn a_pull_runs_the_send_command_over_ssh() {
             "ostrya send --repo='/srv/repo'"
         ])
     );
-    let connect = PullConnectOptions {
-        ssh_command: Some(strings(&["my-ssh", "-F", "cfg"])),
-        send_command: Some("/opt/ostrya send".into()),
-        remote_ssh_command: Some("key-ssh".into()),
+    let options = SshOptions {
+        command: Some(strings(&["my-ssh", "-F", "cfg"])),
+        remote_command: Some("/opt/ostrya send".into()),
+        config_command: Some("key-ssh".into()),
     };
-    let argv = pull_command_line(&remote, &connect, Some(OsStr::new("env-ssh"))).unwrap();
+    let argv = pull_command_line(&address, &options, Some(OsStr::new("env-ssh"))).unwrap();
     assert_eq!(
         argv,
         strings(&[
@@ -1052,19 +1046,19 @@ fn a_pull_runs_the_send_command_over_ssh() {
             "/opt/ostrya send --repo='/srv/repo'"
         ])
     );
-    let connect = PullConnectOptions {
-        remote_ssh_command: Some("key-ssh -q".into()),
+    let options = SshOptions {
+        config_command: Some("key-ssh -q".into()),
         ..Default::default()
     };
     assert_eq!(
-        pull_command_line(&remote, &connect, Some(OsStr::new("env-ssh")))
+        pull_command_line(&address, &options, Some(OsStr::new("env-ssh")))
             .unwrap()
             .first()
             .unwrap(),
         "env-ssh"
     );
     assert_eq!(
-        pull_command_line(&remote, &connect, None).unwrap()[..2],
+        pull_command_line(&address, &options, None).unwrap()[..2],
         strings(&["key-ssh", "-q"])
     );
 
@@ -1073,12 +1067,6 @@ fn a_pull_runs_the_send_command_over_ssh() {
         Err(Error::InvalidInput(_))
     ));
     assert_eq!(send_command(None).unwrap(), "ostrya send");
-
-    let http = PushRemote::parse("https://h/repo").unwrap();
-    match pull_command_line(&http, &PullConnectOptions::default(), None) {
-        Err(Error::InvalidInput(msg)) => assert!(msg.contains("HTTP address"), "{msg}"),
-        other => panic!("{other:?}"),
-    }
 }
 
 #[cfg(unix)]
@@ -1680,8 +1668,8 @@ mod standin {
     mod pull {
         use super::super::super::connect_pull_with;
         use super::*;
+        use crate::PullSessionOptions;
         use crate::proto::{GetReply, PULL_PROTOCOL_VERSION, PullHello, PullHelloReply};
-        use crate::{PullConnectOptions, PullSessionOptions};
 
         const PULL_AGENT: &str = "pull-transport-test";
 
@@ -1704,11 +1692,11 @@ mod standin {
         }
 
         async fn open_pull(script: &str, limit: Duration) -> Result<crate::PullSession> {
-            let remote = PushRemote::parse("ssh://me@host:2222/srv/it's repo").unwrap();
+            let address = SshAddress::parse("ssh://me@host:2222/srv/it's repo").unwrap();
             connect_pull_with(
-                &remote,
-                &PullConnectOptions {
-                    ssh_command: Some(strings(&["sh", "-c", script, "stand-in"])),
+                &address,
+                &SshOptions {
+                    command: Some(strings(&["sh", "-c", script, "stand-in"])),
                     ..Default::default()
                 },
                 None,

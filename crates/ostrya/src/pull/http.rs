@@ -18,7 +18,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::task::{Context, Poll, ready};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use async_compression::futures::bufread::DeflateDecoder;
 use futures_io::{AsyncRead, AsyncWrite};
@@ -29,23 +29,20 @@ use ostrya_core::{
 
 use crate::config::RepoConfig;
 use crate::delta::IO_CHUNK;
+use crate::endpoint::{EndpointOverrides, resolve_pull};
 use crate::error::{Error, Result};
 use crate::fetch::gate::Gate;
-use crate::fetch::{
-    ClientIdentity, FetchRequest, Fetched, Fetcher, FetcherOptions, LowSpeed, Priority, Proxy,
-    TlsOptions, TrustRoots,
-};
+use crate::fetch::{FetchRequest, Fetched, Fetcher, FetcherOptions, Priority};
 use crate::inflate::BufSource;
 use crate::object::{MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
 use crate::read::CommitState;
-use crate::remote::{PullSession, PullSessionOptions};
+use crate::remote::{Endpoint, PullSession, PullSessionOptions};
 use crate::repo::Repo;
 use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE, Summary, put_root_file_blocking};
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::write::FileMeta;
 
-use super::address::{PullAddress, fill_pull_connect, refuse_http_fields, resolve_pull_address};
 use super::delta::{self, DeltaJob, DeltaSource, PART_CAP};
 use super::drive::Slots;
 use super::source::{RemoteSource, SshSource, session_error};
@@ -59,14 +56,6 @@ use super::{
 
 /// The number of fetches in flight if the caller names no limit.
 const DEFAULT_OUTSTANDING: usize = 8;
-/// The number of repeats of a round of mirrors if the caller names no count.
-const DEFAULT_RETRIES: u32 = 5;
-/// The rate in bytes per second below which the fetcher stops a transfer, if
-/// the caller names no rate.
-const DEFAULT_LOW_SPEED_LIMIT: u32 = 1000;
-/// The time that the rate can stay below the limit, if the caller names no
-/// time.
-const DEFAULT_LOW_SPEED_TIME: Duration = Duration::from_secs(30);
 /// The number of fetched content objects that stream into the object store at
 /// once.
 const WRITE_THROTTLE: usize = 3;
@@ -86,9 +75,14 @@ impl Repo {
     /// Pulls refs and their objects from a remote over HTTP or over ssh.
     ///
     /// `remote` names a `[remote "<name>"]` section of the config of this
-    /// repository. The section gives the address, the TLS material, and the
-    /// proxy. The pull fetches the objects into one transaction, publishes
-    /// them, and then writes the refs. It returns the statistics of the pull.
+    /// repository. The section gives the signature policy and the `branches`
+    /// key. By default, the name gives the prefix of the written refs.
+    /// [`remote`](PullOptions::remote) and [`MIRROR`](PullFlags::MIRROR)
+    /// change this. With no
+    /// [`endpoint`](PullOptions::endpoint), the section also gives the
+    /// address, the TLS material, and the proxy. The pull fetches the objects
+    /// into one transaction, publishes them, and then writes the refs. It
+    /// returns the statistics of the pull.
     ///
     /// The module [`pull`](mod@crate::pull) states the rules of the
     /// `.commitpartial` markers. It also states the concurrency, the write
@@ -103,20 +97,16 @@ impl Repo {
     ///
     /// # Address
     ///
-    /// The address is the first of these values that is set:
+    /// The pull reads the remote at [`endpoint`](PullOptions::endpoint). If
+    /// the field is `None`, the pull calls
+    /// [`resolve_pull`] with the default
+    /// overrides, and uses the endpoint that it returns. `resolve_pull` reads
+    /// the address from the remote key `pull-url` or `url`, and states the
+    /// rules of the address.
     ///
-    /// 1. [`url`](PullOptions::url), which lets a caller pull from a remote
-    ///    that the config does not describe
-    /// 2. the remote key `pull-url`
-    /// 3. the remote key `url`
-    ///
-    /// If the value starts with `ssh://` or holds no `://`, it is an ssh
-    /// address of [`PushRemote::parse`]. Any other value is the base URL of an
-    /// HTTP remote. The fetcher gets that value as written, and it refuses a
-    /// scheme other than `http` and `https`.
-    ///
-    /// The remote key `url` cannot hold an ssh address, because the `ostree`
-    /// command also reads that key and does not pull over ssh.
+    /// An [`Endpoint::Http`] gives an HTTP pull through the fetcher, and an
+    /// [`Endpoint::Ssh`] gives a pull over ssh. The fetcher gets each mirror
+    /// as written, and it refuses a scheme other than `http` and `https`.
     ///
     /// # Refs
     ///
@@ -131,20 +121,25 @@ impl Repo {
     ///
     /// # Proxy
     ///
-    /// An HTTP pull connects through the `http://` proxy URL of the remote key
-    /// `proxy`, for every origin, and ignores `no_proxy`. If the key is absent
-    /// or empty, the pull reads the proxy environment variables.
+    /// An HTTP pull connects through the proxy of the endpoint.
+    /// [`resolve_pull`] reads it from the
+    /// remote key `proxy`. With the `http://` proxy URL of that key, the pull
+    /// connects through the proxy for every origin, and ignores `no_proxy`. If
+    /// the key is absent or empty, the pull reads the proxy environment
+    /// variables.
     ///
     /// # Pull over ssh
     ///
-    /// For an ssh address, the pull runs the ssh client after it resolves the
-    /// signature policy. [`connect`](PullOptions::connect) states where the
-    /// commands of the client come from. The session obeys the rules of
+    /// For an ssh endpoint, the pull runs the ssh client after it resolves the
+    /// signature policy. The [`SshOptions`](crate::remote::SshOptions) of the
+    /// endpoint give the commands of the client, by the rules of
+    /// [`PullSession::connect`]. The session obeys the rules of
     /// [`pull_over_stream`](Repo::pull_over_stream).
     ///
-    /// A pull over ssh reads no remote key that applies to HTTP alone:
-    /// `contenturl`, `metalink`, `proxy`, and the `tls-*` keys. An HTTP pull
-    /// reads neither `ssh-command` nor `send-command`.
+    /// `resolve_pull` reads no remote key that applies to HTTP alone for an
+    /// ssh address: `contenturl`, `metalink`, `proxy`, and the `tls-*` keys.
+    /// For an HTTP address, it reads neither `ssh-command` nor
+    /// `send-command`.
     ///
     /// The pull reads the remote through a source: the HTTP source over the
     /// fetcher, or the ssh source over a pull session.
@@ -333,34 +328,25 @@ impl Repo {
     /// These errors stop the pull before its first request:
     ///
     /// - [`Error::InvalidInput`] if [`depth`](PullOptions::depth) is below
-    ///   `-1`, or if an ssh address is malformed.
-    /// - [`Error::InvalidInput`] if a pull over ssh gets a field of HTTP alone:
-    ///   [`http_headers`](PullOptions::http_headers),
-    ///   [`n_network_retries`](PullOptions::n_network_retries) above 0,
-    ///   [`low_speed_limit_bytes`](PullOptions::low_speed_limit_bytes), or
-    ///   [`low_speed_time`](PullOptions::low_speed_time).
-    /// - [`Error::InvalidInput`] if an HTTP pull gets the ssh command or the
-    ///   send command of [`connect`](PullOptions::connect).
+    ///   `-1`.
     /// - [`Error::Unsupported`] if
     ///   [`collection_id`](PullOptions::collection_id) is set. The pull reads
     ///   no collection ref.
-    /// - [`Error::Unsupported`] if the scheme of the URL is neither `http` nor
-    ///   `https`.
-    /// - [`Error::Unsupported`] if the value of the remote key `proxy` has
-    ///   white space at its start or end. Also if the fetcher refuses the
-    ///   proxy URL or a proxy environment variable.
-    /// - [`Error::Fetch`] if the URL is not a valid absolute URL, if a header
-    ///   is invalid, or if the TLS material does not parse.
     /// - [`Error::Pull`] if a subpath does not start with `/`.
-    /// - [`Error::Pull`] if the config has no section for `remote` and the
-    ///   caller gives no `url`.
-    /// - [`Error::Pull`] if the section has neither `pull-url` nor `url`, or if
-    ///   `url` holds an ssh address.
-    /// - [`Error::Pull`] if the remote names `tls-client-cert-path` without
-    ///   `tls-client-key-path`, or the reverse.
-    /// - [`Error::Core`] if a key of the remote section holds a malformed
-    ///   escape sequence.
-    /// - [`Error::Io`] if a PEM file that a `tls-*` key names cannot be read.
+    /// - The errors of [`resolve_pull`] if
+    ///   [`endpoint`](PullOptions::endpoint) is `None`. Among them,
+    ///   [`Error::Io`] names the key and the path of a PEM file that cannot be
+    ///   read, and a PEM file over 1 MiB is [`Error::InvalidInput`].
+    /// - [`Error::InvalidInput`] if an [`Endpoint::Http`] names no mirror.
+    /// - [`Error::Remote`] with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the ssh
+    ///   command or the send command of an [`Endpoint::Ssh`] is empty or holds
+    ///   only white space.
+    /// - [`Error::Unsupported`] if the scheme of a mirror is neither `http`
+    ///   nor `https`, or if the fetcher refuses the proxy URL or a proxy
+    ///   environment variable.
+    /// - [`Error::Fetch`] if a mirror is not a valid absolute URL, if a header
+    ///   is invalid, or if the TLS material does not parse.
     ///
     /// These errors stop the pull before it fetches an object:
     ///
@@ -433,48 +419,44 @@ impl Repo {
     /// println!("{} content objects fetched", stats.content_fetched);
     /// # Ok(()) }
     /// ```
-    ///
-    /// [`PushRemote::parse`]: crate::remote::PushRemote::parse
-    pub async fn pull(&self, remote: &str, opts: PullOptions) -> Result<PullStats> {
+    pub async fn pull(&self, remote: &str, mut opts: PullOptions) -> Result<PullStats> {
         let started = Instant::now();
         // A subpath the walk cannot read is refused before anything else, so it
         // costs no request and opens no transaction.
         let subpaths = Subpaths::parse(&opts.subpaths)?;
         check_depth(opts.depth)?;
         refuse_remote_collection(&opts)?;
-        let section = self.config().remote(remote);
-        // The address is resolved first, so a remote the config does not
+        // The endpoint is resolved first, so a remote the config does not
         // describe reports that before a policy is resolved for it.
-        let address = resolve_pull_address(section.as_ref(), remote, opts.url.as_deref())?;
+        let endpoint = match opts.endpoint.take() {
+            Some(endpoint) => endpoint,
+            None => resolve_pull(Some(self.config()), remote, EndpointOverrides::default()).await?,
+        };
         let counters = PullCounters::new(opts.progress.as_ref());
-        let (source, verification) = match address {
-            PullAddress::Http(url) => {
-                refuse_ssh_fields(&opts)?;
-                // `remote_fetcher` reads the TLS material and the proxy and
-                // sends no request, so a refused policy still stops the pull
-                // before its first fetch.
+        let (source, verification) = match endpoint {
+            Endpoint::Http(mut http) => {
+                // A limit of the caller replaces the limit of the endpoint. The
+                // pull keeps as many steps in flight as the fetcher admits.
+                if let Some(n) = opts.max_outstanding_fetches {
+                    http.max_outstanding = n;
+                }
+                opts.max_outstanding_fetches = Some(http.max_outstanding);
+                // `remote_fetcher` sends no request, so a refused policy still
+                // stops the pull before its first fetch.
                 let fetcher = self
-                    .remote_fetcher(
-                        remote,
-                        section.as_ref(),
-                        url,
-                        &opts,
-                        counters.transferred_sinks(),
-                    )
+                    .remote_fetcher(http, counters.transferred_sinks())
                     .await?;
                 let verification =
                     Verification::build(self, Some(remote), &opts.verify, Defaults::Config).await?;
                 (RemoteSource::Http(fetcher), verification)
             }
-            PullAddress::Ssh(address) => {
-                refuse_http_fields(&opts, &address)?;
-                let connect = fill_pull_connect(section.as_ref(), opts.connect.clone())?;
+            Endpoint::Ssh { address, options } => {
                 let verification =
                     Verification::build(self, Some(remote), &opts.verify, Defaults::Config).await?;
                 // The ssh client starts where the HTTP pull sends its first
                 // request.
                 let session =
-                    PullSession::connect(&address.remote, connect, session_options(&opts)).await?;
+                    PullSession::connect(&address, &options, session_options(&opts)).await?;
                 let source = RemoteSource::Ssh(Box::new(SshSource::new(
                     session,
                     counters.transferred_sinks(),
@@ -505,7 +487,7 @@ impl Repo {
     /// `remote` names the remote whose config the pull reads, as for
     /// [`pull`](Repo::pull): the signature policy, the `branches` key, and the
     /// prefix of the written refs. The remote needs no config section, as for a
-    /// pull with [`url`](PullOptions::url).
+    /// pull with an [`endpoint`](PullOptions::endpoint).
     ///
     /// The pull obeys every rule of [`pull`](Repo::pull): the transaction, the
     /// commit walk, [`depth`](PullOptions::depth), the subpaths, the
@@ -520,9 +502,8 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidInput`] if `opts` sets [`url`](PullOptions::url), or
-    ///   the ssh command or the send command of
-    ///   [`connect`](PullOptions::connect). The caller already connected the
+    /// - [`Error::InvalidInput`] if `opts` sets
+    ///   [`endpoint`](PullOptions::endpoint). The caller already connected the
     ///   streams.
     /// - [`Error::Unsupported`] if
     ///   [`collection_id`](PullOptions::collection_id) is set, before the
@@ -546,15 +527,10 @@ impl Repo {
         let subpaths = Subpaths::parse(&opts.subpaths)?;
         check_depth(opts.depth)?;
         refuse_remote_collection(&opts)?;
-        if opts.url.is_some() {
+        if opts.endpoint.is_some() {
             return Err(Error::InvalidInput(
-                "a pull over a pair of streams takes no url".into(),
-            ));
-        }
-        if opts.connect.ssh_command.is_some() || opts.connect.send_command.is_some() {
-            return Err(Error::InvalidInput(
-                "a pull over a pair of streams runs no ssh client, so it takes no ssh \
-                 command and no send command"
+                "a pull over a pair of streams takes no endpoint, because the caller \
+                 already connected the streams"
                     .into(),
             ));
         }
@@ -787,12 +763,14 @@ impl Repo {
     /// file that the remote does not serve is `None`. Each file has a cap of
     /// 64 MiB.
     ///
-    /// The call reaches the remote as [`pull`](Repo::pull) does, with no
-    /// override. It reads the address from `pull-url` or `url`, and over HTTP
-    /// it uses the TLS material and the proxy of the remote. Over ssh, the
-    /// remote keys `ssh-command` and `send-command` give the commands. The
-    /// `OSTRYA_SSH_COMMAND` environment variable has precedence over
-    /// `ssh-command`.
+    /// The call reaches the remote at `endpoint`, as [`pull`](Repo::pull)
+    /// does. If `endpoint` is `None`, the call resolves the endpoint of
+    /// `remote` with [`resolve_pull`] and the
+    /// default overrides. It then reads the address from `pull-url` or `url`,
+    /// and over HTTP it uses the TLS material and the proxy of the remote.
+    /// Over ssh, the remote keys `ssh-command` and `send-command` give the
+    /// commands. The `OSTRYA_SSH_COMMAND` environment variable has precedence
+    /// over `ssh-command`.
     ///
     /// Over HTTP, the call requests `summary.sig` and then `summary`. Over
     /// ssh, the two requests are in flight together, and the session ends
@@ -800,20 +778,16 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::Pull`] if the config has no section for `remote`, or if the
-    ///   section has neither `pull-url` nor `url`.
-    /// - [`Error::Pull`] if `url` holds an ssh address.
-    /// - [`Error::Pull`] if the remote names only one of
-    ///   `tls-client-cert-path` and `tls-client-key-path`.
-    /// - [`Error::InvalidInput`] if the ssh address is malformed.
-    /// - [`Error::Unsupported`] if the scheme of the URL is neither `http` nor
-    ///   `https`.
-    /// - [`Error::Unsupported`] if the value of the remote key `proxy` has
-    ///   white space at its start or end. Also if the fetcher refuses the
-    ///   proxy URL or a proxy environment variable.
-    /// - [`Error::Core`] if a key of the remote section holds a malformed
-    ///   escape sequence.
-    /// - [`Error::Io`] if a PEM file that a `tls-*` key names cannot be read.
+    /// - The errors of [`resolve_pull`] if
+    ///   `endpoint` is `None`.
+    /// - [`Error::InvalidInput`] if an [`Endpoint::Http`] names no mirror.
+    /// - [`Error::Remote`] with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the ssh
+    ///   command or the send command of an [`Endpoint::Ssh`] is empty or holds
+    ///   only white space.
+    /// - [`Error::Unsupported`] if the scheme of a mirror is neither `http`
+    ///   nor `https`, or if the fetcher refuses the proxy URL or a proxy
+    ///   environment variable.
     /// - [`Error::FetchTooLarge`] if an HTTP response declares a file larger
     ///   than 64 MiB.
     /// - [`Error::Fetch`], [`Error::HttpStatus`] other than 404,
@@ -823,24 +797,20 @@ impl Repo {
     pub async fn remote_fetch_summary(
         &self,
         remote: &str,
+        endpoint: Option<Endpoint>,
     ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-        let section = self.config().remote(remote);
-        let source = match resolve_pull_address(section.as_ref(), remote, None)? {
-            PullAddress::Http(url) => RemoteSource::Http(
-                self.remote_fetcher(
-                    remote,
-                    section.as_ref(),
-                    url,
-                    &PullOptions::default(),
-                    Vec::new(),
-                )
-                .await?,
-            ),
-            PullAddress::Ssh(address) => {
-                let connect = fill_pull_connect(section.as_ref(), Default::default())?;
+        let endpoint = match endpoint {
+            Some(endpoint) => endpoint,
+            None => resolve_pull(Some(self.config()), remote, EndpointOverrides::default()).await?,
+        };
+        let source = match endpoint {
+            Endpoint::Http(http) => {
+                RemoteSource::Http(self.remote_fetcher(http, Vec::new()).await?)
+            }
+            Endpoint::Ssh { address, options } => {
                 let session = PullSession::connect(
-                    &address.remote,
-                    connect,
+                    &address,
+                    &options,
                     session_options(&PullOptions::default()),
                 )
                 .await?;
@@ -851,43 +821,25 @@ impl Repo {
         source.finish(read).await
     }
 
-    /// Builds the fetcher of `url` for one remote from its config section and
-    /// `opts`. The fetcher adds the bytes of each body that it reads to each
+    /// Builds the fetcher of a pull from `http`, the options of an HTTP
+    /// endpoint. The fetcher adds the bytes of each body that it reads to each
     /// counter of `received`.
     ///
-    /// The section gives the TLS material and the proxy. A `proxy` value with
-    /// white space at its start or end is [`Error::Unsupported`]. With no
-    /// section, the fetcher trusts the host trust store and reads the proxy
-    /// environment variables.
+    /// The call refuses options that name no mirror with
+    /// [`Error::InvalidInput`], before any request.
     async fn remote_fetcher(
         &self,
-        remote: &str,
-        section: Option<&crate::config::Remote<'_>>,
-        url: String,
-        opts: &PullOptions,
+        http: FetcherOptions,
         received: Vec<Arc<AtomicU64>>,
     ) -> Result<Fetcher> {
-        let (tls, proxy) = match section {
-            Some(section) => (
-                remote_tls(remote, section).await?,
-                remote_proxy(remote, section)?,
-            ),
-            None => (TlsOptions::default(), Proxy::Environment),
-        };
-        Fetcher::with_counters(
-            FetcherOptions {
-                headers: opts.http_headers.clone(),
-                tls,
-                proxy,
-                max_retries: opts.n_network_retries.unwrap_or(DEFAULT_RETRIES),
-                max_outstanding: opts.max_outstanding_fetches.unwrap_or(DEFAULT_OUTSTANDING),
-                low_speed: low_speed(opts),
-                ..FetcherOptions::new(url)
-            },
-            received,
-        )
-        .await
-        .map_err(Error::from)
+        if http.mirrors.is_empty() {
+            return Err(Error::InvalidInput(
+                "the HTTP endpoint of a pull names no mirror".into(),
+            ));
+        }
+        Fetcher::with_counters(http, received)
+            .await
+            .map_err(Error::from)
     }
 
     /// Resolves what to pull: the requested refs, the summary refs of the
@@ -1556,23 +1508,6 @@ struct FetchedPull {
     signature: Option<Vec<u8>>,
 }
 
-/// Refuses a field of [`connect`](PullOptions::connect) that applies to a pull
-/// over ssh alone. The pull does not read the remote ssh command, as an HTTP
-/// push does not read it.
-fn refuse_ssh_fields(opts: &PullOptions) -> Result<()> {
-    // Each name is the remote key of the field.
-    let set = [
-        ("ssh-command", opts.connect.ssh_command.is_some()),
-        ("send-command", opts.connect.send_command.is_some()),
-    ];
-    match set.iter().find(|(_, set)| *set) {
-        Some((name, _)) => Err(Error::InvalidInput(format!(
-            "{name} applies to a pull over ssh, and this pull runs over HTTP"
-        ))),
-        None => Ok(()),
-    }
-}
-
 /// Returns the options of the pull session of `opts`.
 fn session_options(opts: &PullOptions) -> PullSessionOptions {
     PullSessionOptions {
@@ -2118,16 +2053,6 @@ pub(super) fn ref_request_path(name: &str) -> String {
     out
 }
 
-/// Returns the low-speed rule of the fetcher of a pull. A field left `None`
-/// takes its default, and a zero in either field turns the rule off.
-fn low_speed(opts: &PullOptions) -> Option<LowSpeed> {
-    let limit = opts
-        .low_speed_limit_bytes
-        .unwrap_or(DEFAULT_LOW_SPEED_LIMIT);
-    let time = opts.low_speed_time.unwrap_or(DEFAULT_LOW_SPEED_TIME);
-    (limit != 0 && !time.is_zero()).then_some(LowSpeed { limit, time })
-}
-
 /// Fetches a path whole, or returns `None` if the remote answers 404.
 pub(crate) async fn fetch_optional(
     fetcher: &Fetcher,
@@ -2489,79 +2414,6 @@ pub(crate) async fn check_stream_end<R: AsyncRead + Unpin>(
     Ok(())
 }
 
-/// Reads the proxy that the `proxy` key of a remote names. An empty or absent
-/// key leaves the proxy to the environment variables.
-///
-/// The function refuses a value with white space at its start or end, as the
-/// `ostree` command refuses it. The fetcher trims a proxy URL, so without this
-/// check it connects through such a value. The message leaves out the value,
-/// because the userinfo of the value can hold a password.
-fn remote_proxy(remote: &str, section: &crate::config::Remote<'_>) -> Result<Proxy> {
-    Ok(match section.proxy()? {
-        Some(url) if url.trim() != url => {
-            return Err(Error::Unsupported(format!(
-                "remote '{remote}': the proxy key has white space at the start or \
-                 the end of its value"
-            )));
-        }
-        Some(url) if !url.is_empty() => Proxy::Url(url),
-        _ => Proxy::Environment,
-    })
-}
-
-/// Reads the trust anchors and the client identity that the TLS keys of a
-/// remote name.
-async fn remote_tls(remote: &str, section: &crate::config::Remote<'_>) -> Result<TlsOptions> {
-    // `tls-permissive` keeps the host name check and ignores `tls-ca-path`.
-    // Both facts are observed on the `ostree` command: a CA that signed
-    // nothing in the chain works, and a path that names an absent file works
-    // too. So the function does not read the path, and an absent file is no
-    // failure. `DangerousAcceptAnyChain` keeps the name check and takes the
-    // chain as presented, so it is the setting that this mapping needs.
-    //
-    // `DangerousAcceptAnyChain` also drops the expiry check. That part is a
-    // reading of ostrya, with no observation behind it. A peer verification
-    // that ignores the CA path is libcurl peer verification turned off, and
-    // that setting also drops the validity dates.
-    let roots = if section.tls_permissive()? {
-        TrustRoots::DangerousAcceptAnyChain
-    } else {
-        match section.tls_ca_path()? {
-            Some(path) => TrustRoots::Pem(read_pem(&path).await?),
-            None => TrustRoots::System,
-        }
-    };
-    let client_identity = match (
-        section.tls_client_cert_path()?,
-        section.tls_client_key_path()?,
-    ) {
-        (Some(cert), Some(key)) => Some(ClientIdentity {
-            cert_chain_pem: read_pem(&cert).await?,
-            key_pem: read_pem(&key).await?,
-            // A remote has no config key for a passphrase, so a remote client
-            // key must need no passphrase.
-            key_passphrase: None,
-        }),
-        (None, None) => None,
-        _ => {
-            return Err(Error::Pull(format!(
-                "remote '{remote}': a client certificate needs both \
-                 tls-client-cert-path and tls-client-key-path"
-            )));
-        }
-    };
-    Ok(TlsOptions {
-        roots,
-        client_identity,
-    })
-}
-
-/// Reads a PEM file that the config names.
-async fn read_pem(path: &str) -> Result<Vec<u8>> {
-    let path = path.to_owned();
-    ostrya_rt::unblock(move || std::fs::read(&path).map_err(Error::from)).await
-}
-
 /// A compile-time check that the future of a pull is `Send`: over HTTP,
 /// through the ssh source, and from a local repository.
 const _: fn() = || {
@@ -2587,33 +2439,6 @@ mod tests {
     use ostrya_rt::block_on;
     use std::pin::Pin;
     use std::task::{Context, Poll};
-
-    /// By default, a pull holds each transfer to 1000 bytes per second over 30
-    /// seconds. A field left unset keeps its default, and a zero in either
-    /// field turns the rule off.
-    #[test]
-    fn the_low_speed_rule_defaults_and_turns_off_at_zero() {
-        let rule = |limit: Option<u32>, secs: Option<u64>| {
-            low_speed(&PullOptions {
-                low_speed_limit_bytes: limit,
-                low_speed_time: secs.map(Duration::from_secs),
-                ..PullOptions::default()
-            })
-        };
-        let low = |limit, secs| {
-            Some(LowSpeed {
-                limit,
-                time: Duration::from_secs(secs),
-            })
-        };
-        assert_eq!(rule(None, None), low(1000, 30));
-        assert_eq!(rule(Some(0), None), None);
-        assert_eq!(rule(None, Some(0)), None);
-        assert_eq!(rule(Some(0), Some(5)), None);
-        assert_eq!(rule(Some(50), None), low(50, 30));
-        assert_eq!(rule(None, Some(2)), low(1000, 2));
-        assert_eq!(rule(Some(50), Some(2)), low(50, 2));
-    }
 
     /// Returns the archive stored form of a content object: the framed header,
     /// then the payload that the caller supplies.
@@ -3283,23 +3108,6 @@ mod tests {
             }
         });
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A remote with `tls-permissive` maps to the bypass that keeps the host
-    /// name check. The function never opens the `tls-ca-path` of the remote.
-    /// The path here names no file, so a read of it fails the call.
-    #[test]
-    fn tls_permissive_leaves_the_ca_path_unread() {
-        let cfg = RepoConfig::parse(
-            "[core]\nrepo_version=1\nmode=archive-z2\n\
-             [remote \"origin\"]\nurl=https://example.invalid/repo\n\
-             tls-permissive=true\ntls-ca-path=/nonexistent/ca.pem\n",
-        )
-        .unwrap();
-        let section = cfg.remote("origin").unwrap();
-        let tls = block_on(remote_tls("origin", &section)).unwrap();
-        assert_eq!(tls.roots, TrustRoots::DangerousAcceptAnyChain);
-        assert!(tls.client_identity.is_none());
     }
 
     /// Pops the next item, which must be the dirtree `byte`.

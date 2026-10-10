@@ -2303,9 +2303,13 @@ and the next pull walks the tree of the commit and imports what it lacks. At a
 missing dirtree, `fsck` stops with `FsckFailure::MissingDirTree` and marks
 nothing, so no pull repairs that commit.
 
-`pull` fetches the same thing from an HTTP remote named in the repository's
-config, or over ssh from a remote with an ssh address, into one transaction, with up to `max_outstanding_fetches` objects in
-flight. The plan is drained commits first, then the dirtree and dirmeta objects
+`pull` fetches the same thing from an HTTP remote, or over ssh from a remote
+with an ssh address, into one transaction. The endpoint is
+`PullOptions::endpoint`, or the endpoint that `resolve_pull` reads from the
+repository's config. The pull keeps up to `max_outstanding_fetches` objects in
+flight. If the value is `None`, an HTTP pull keeps up to
+`FetcherOptions::max_outstanding` of its endpoint, and a pull over ssh keeps
+up to 8. The plan is drained commits first, then the dirtree and dirmeta objects
 the scan is blocked on, then the content, and each class carries the matching
 fetch priority. A commit object is fetched before the objects it references and
 staged where it arrives, checked there against the name it was requested by; a
@@ -2318,12 +2322,13 @@ stored under the name it was requested by and the write path compares what it
 hashed against that name, so an HTTP pull verifies whatever the flags say.
 `localcache_repos` are consulted before the network, per object.
 
-The fetcher of an HTTP pull takes its proxy from the remote key `proxy`, which
-`Remote::proxy` reads. A non-empty value gives `Proxy::Url`, which reaches
-every origin through that proxy and reads no `no_proxy` exemption. An absent
-key and an empty value give `Proxy::Environment`. The same rule applies to the
-static deltas of the pull, to `remote_fetch_summary`, and to a pull whose
-`url` overrides the address of a configured remote. A value that is not
+The fetcher of an HTTP pull takes its proxy from the endpoint. `resolve_pull`
+reads it from the remote key `proxy`, which `Remote::proxy` reads. A non-empty
+value gives `Proxy::Url`, which reaches every origin through that proxy and
+reads no `no_proxy` exemption. An absent key and an empty value give
+`Proxy::Environment`. The same rule applies to the static deltas of the pull,
+to `remote_fetch_summary`, and to a `url` of the caller that overrides the
+address of a configured remote in `resolve_pull`. A value that is not
 `http://host[:port]`, and a value with white space at its start or end, is
 `Error::Unsupported` before the first request. The message of the second
 refusal does not hold the value. Where the key is absent or empty, the same
@@ -2468,30 +2473,27 @@ pub struct PullOptions {
     pub disable_fsync: bool,              // every sync off; never turns one on
     pub per_object_fsync: bool,           // sync each content object as staged
     // The rest are the remote pull's; each defaults to what a local pull
-    // does. http_headers, n_network_retries above 0, and the two low-speed
-    // fields apply to HTTP alone: an ssh address refuses them.
+    // does.
     pub subpaths: Vec<String>,            // absolute paths; empty is the whole
                                           // tree; a local pull refuses them;
                                           // leaves each commit partial
-    pub url: Option<String>,              // an HTTP base URL or an ssh address;
-                                          // overrides pull-url and url
-    pub http_headers: Vec<(String, String)>,
-    pub max_outstanding_fetches: Option<usize>,  // None is 8
-    pub n_network_retries: Option<u32>,          // None is 5; a body refetch
-                                                 // spends one as well
-    pub low_speed_limit_bytes: Option<u32>,      // None is 1000; 0 is off
-    pub low_speed_time: Option<Duration>,        // None is 30s below the
-                                                 // limit; zero is off
+    pub endpoint: Option<Endpoint>,       // None: Repo::pull calls
+                                          // resolve_pull with the default
+                                          // overrides; Some: the pull reads no
+                                          // address, tls-*, proxy, ssh-command,
+                                          // or send-command key; an Http
+                                          // endpoint names at least one mirror;
+                                          // pull_over_stream refuses Some
+    pub max_outstanding_fetches: Option<usize>,  // HTTP: Some replaces the
+                                                 // max_outstanding of the
+                                                 // endpoint, None keeps it;
+                                                 // ssh: None is 8
     pub timestamp_check: TimestampCheck,
     pub disable_static_deltas: bool,      // fetch every object loose
     pub require_static_deltas: bool,      // refuse where no delta can be taken
     pub verify: PullVerify,               // the signature checks to make
     pub detached_metadata_filter: DetachedMetadataFilter,  // what to store
     pub progress: Option<PullProgress>,   // live counters for the caller
-    pub connect: PullConnectOptions,      // ssh command, send command, and
-                                          // remote ssh command; the remote
-                                          // keys fill the fields left None;
-                                          // HTTP refuses the first two
 }
 
 #[derive(Clone, Default)]
@@ -2594,8 +2596,10 @@ impl Repo {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static;
     /// The remote's `summary` and `summary.sig` bytes, an absent one as None,
-    /// over HTTP or over ssh by the address rule of `pull`, with no `url`.
-    pub async fn remote_fetch_summary(&self, remote: &str)
+    /// over HTTP or over ssh at `endpoint`. None resolves the endpoint of
+    /// `remote` as `pull` does.
+    pub async fn remote_fetch_summary(&self, remote: &str,
+                                      endpoint: Option<Endpoint>)
         -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)>;
 }
 
@@ -3597,13 +3601,16 @@ memory, and reads no file that the endpoint names. An `https://` endpoint
 with `TrustRoots::System` reads the trust store of the host.
 `ostrya::endpoint::resolve_push` gives the endpoint of a remote section or
 of an address, and reads the files that the remote keys name ("Endpoint
-resolution"). `PushRemote::parse` reads the address of a pull over ssh.
+resolution").
 
 `Endpoint` holds a remote address with the options of its transport.
 `Endpoint::Ssh` holds an `SshAddress` and the `SshOptions` of the ssh
 client. `Endpoint::Http` holds the `FetcherOptions` of the HTTP client, and
-its `mirrors` field holds the address. `Endpoint::parse` accepts and refuses
-the same addresses as `PushRemote::parse`. An `http://` or `https://`
+its `mirrors` field holds the address. `Endpoint::parse` reads the ssh forms
+of `SshAddress::parse` and the HTTP forms `http://HOST[:PORT][/PATH]` and
+`https://HOST[:PORT][/PATH]`. In an HTTP address it refuses an `@` at any
+position, a query, a fragment, an empty host, and a port that is not a
+number from 0 to 65535. An `http://` or `https://`
 address gives `Endpoint::Http` with `FetcherOptions::new` of the address.
 Each other address gives `Endpoint::Ssh` with the default `SshOptions`.
 `SshAddress::parse` reads the ssh forms alone, and it refuses an `http://`
@@ -3654,7 +3661,7 @@ and the remote side runs `ostrya receive`. `RECEIVE_COMMAND` is
   last `@`, so it shows no user and no password. `without_userinfo` gives
   that text, and keeps a `SCHEME://` prefix before the last `@` when
   `SCHEME` is a valid URI scheme. It applies to text that no parse has
-  read. `PushRemote::without_user` gives a parsed address with no user, so
+  read. `SshAddress::without_user` gives a parsed address with no user, so
   an `@` in its path stays.
 - On Windows it refuses a scp-form address that names a local path: a host
   of one ASCII letter, and a `\` before the first `:`.
@@ -3750,13 +3757,6 @@ receive endpoint of the server ("Archive view and HTTP server").
   handed to the connection, with no header and no TLS byte.
 
 ```rust
-pub struct PushRemote { inner: RemoteAddr }
-
-impl PushRemote {
-    pub fn parse(address: &str) -> Result<PushRemote>;
-    pub fn without_user(&self) -> PushRemote;   // for a message
-}
-
 pub fn without_userinfo(address: &str) -> Cow<'_, str>;   // all text up to the last @ out
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3764,6 +3764,7 @@ pub struct SshAddress { user, host, port, path }   // Display: the ssh:// form; 
 
 impl SshAddress {
     pub fn parse(address: &str) -> Result<SshAddress>;   // the ssh forms alone
+    pub fn without_user(&self) -> SshAddress;            // for a message
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3886,7 +3887,10 @@ files that the keys name. It gives a `remote::Endpoint` that holds all
 values in memory. `resolve_pull` is in every build. The `push` feature
 gates `resolve_push`. `ostrya push` and `ostrya push-tree` call
 `resolve_push`, and give the endpoint to `Repo::push` or to
-`PushSession::prepare`. `Repo::pull` does not call `resolve_pull` yet.
+`PushSession::prepare`. `ostrya pull` calls `resolve_pull`, and gives the
+endpoint to `Repo::pull` in `PullOptions::endpoint`. `Repo::pull` and
+`Repo::remote_fetch_summary` call `resolve_pull` with the default overrides
+when the caller gives no endpoint.
 
 ```rust
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -3958,6 +3962,8 @@ Rules of both resolvers:
   address in the key `url` is `Error::Pull`. A name with no section and no
   `url` of the caller is `Error::Pull`. The keys `contenturl` and
   `metalink` are not read.
+- A `url` of the caller replaces the address alone. The TLS keys and the
+  key `proxy` of the named section still apply.
 - For an HTTP address, it refuses `ssh_command` (`ssh-command`) and
   `remote_command` (`send-command`) with `Error::InvalidInput`.
 - The trust anchors come from `tls_ca_path` of the caller. Else
@@ -3966,6 +3972,10 @@ Rules of both resolvers:
   `TrustRoots::Pem`. Else the trust setting is `TrustRoots::System`. The
   key `tls-permissive` is read for `http://` too.
 - A lone certificate or key is `Error::Pull`.
+- For an HTTP address, the order is: the key `tls-permissive` (when the
+  caller gives no `tls_ca_path`) and the key `tls-ca-path`, then the client
+  keys and the refusal of a lone certificate or key, then the refusal of a
+  bad `proxy`, then the reads of the files.
 - The pull defaults apply: `max_retries` 5, `max_outstanding` 8, and a low
   speed limit of 1000 bytes per second for 30 seconds. A low-speed field
   left `None` takes its default. A zero in either field turns the rule off.
@@ -4787,13 +4797,6 @@ take no feature.
 ```rust
 // ostrya-remote
 #[derive(Debug, Clone, Default)]
-pub struct PullConnectOptions {
-    pub ssh_command: Option<Vec<String>>,       // default ["ssh"]
-    pub send_command: Option<String>,           // default "ostrya send"
-    pub remote_ssh_command: Option<String>,     // remote key, below the env
-}
-
-#[derive(Debug, Clone, Default)]
 pub struct PullSessionOptions {
     pub agent: Option<String>,                  // default "ostrya/<version>"
     pub max_outstanding: Option<usize>,         // Get frames in flight; 8;
@@ -4809,8 +4812,8 @@ impl PullSession {
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static;
-    pub async fn connect(remote: &PushRemote, connect: PullConnectOptions,
-                         opts: PullSessionOptions)
+    pub async fn connect(address: &SshAddress, options: &SshOptions,
+                         session: PullSessionOptions)
         -> Result<PullSession>;
     pub async fn get(&self, path: &str, max_len: u64)
         -> Result<Option<PullBody>>;
@@ -4828,11 +4831,11 @@ The session:
 - `over_stream` and `connect` send `PullHello` with `PULL_PROTOCOL_VERSION`
   and read `PullHelloReply`. A reply with a version that the client does not
   speak is `Error::VersionUnsupported`, and the session closes its output
-  and sends no `Get`. `connect` refuses an HTTP address with
-  `Error::InvalidInput`, and runs `SSH_COMMAND... [-p PORT] [USER@]HOST
+  and sends no `Get`. `connect` runs `SSH_COMMAND... [-p PORT] [USER@]HOST
   'SEND_COMMAND --repo=QUOTED_PATH'`. The ssh command resolves from
-  `ssh_command`, then `OSTRYA_SSH_COMMAND`, then `remote_ssh_command`, then
-  `ssh`, as for the push.
+  `SshOptions::command`, then `OSTRYA_SSH_COMMAND`, then
+  `SshOptions::config_command`, then `ssh`, as for the push.
+  `SEND_COMMAND` is `SshOptions::remote_command`, or `ostrya send`.
 - A `get` waits while `max_outstanding` calls hold a place in the pipeline.
   It then takes its place, and writes and flushes its `Get` frame under one
   lock, so the frames go on the wire in the order of the places. The places
@@ -4898,39 +4901,31 @@ The pull through the ssh source:
   that error came from the session, `Error::Remote`, it takes the error that
   `finish` gives, so an I/O error under a failed ssh client becomes
   `Error::Transport`. An error of the session is `Error::Remote`.
-- `url`, `connect.ssh_command`, and `connect.send_command` are
-  `Error::InvalidInput` for `pull_over_stream`.
+- `pull_over_stream` refuses `PullOptions::endpoint` of each transport with
+  `Error::InvalidInput`, because the caller already connected the streams.
 
 The pull over ssh to an address:
 
-- `Repo::pull` takes its address from `url`, then from the remote key
-  `pull-url`, then from the remote key `url`. A value that starts with
-  `ssh://`, or that holds no `://`, is an ssh address of `PushRemote::parse`,
-  and a malformed one is `Error::InvalidInput` with the text of the parser.
-  Any other value goes to the fetcher as written. An ssh address in the
-  `url` key is `Error::Pull`, and so is a section with neither key. The
-  refusal of the `url` key shows its value without the text up to its last
-  `@`.
-- With an ssh address, `http_headers`, `n_network_retries` above 0,
-  `low_speed_limit_bytes`, and `low_speed_time` are `Error::InvalidInput`
-  before the ssh client starts. The message names the option of `ostrya
-  pull` without `--`, and shows the address in the `ssh://` form with no
-  user. `n_network_retries` of `Some(0)` is accepted.
-- The remote keys `ssh-command` and `send-command` fill
-  `connect.remote_ssh_command` and `connect.send_command` where they are
-  `None`, also when the address comes from `url`. The pull reads no
-  `contenturl`, `metalink`, `proxy`, or `tls-*` key.
+- `Repo::pull` takes the endpoint of `PullOptions::endpoint`. If the field
+  is `None`, it calls `resolve_pull` with the default overrides. The
+  address, the `SshOptions`, and the refusals of the HTTP fields for an ssh
+  address are the rules of `resolve_pull` ("Endpoint resolution"), or the
+  values of the caller. An endpoint of the caller is used as it is, except
+  for the request limit of the next item: the pull reads no `pull-url`, `url`, `tls-*`, `proxy`, `ssh-command`, or
+  `send-command` key. It still reads the signature keys and `branches` of
+  the named remote. By default, the name gives the prefix of the refs.
+  `PullOptions::remote` and `PullFlags::MIRROR` change the prefix.
+- For an `Endpoint::Ssh`, `PullOptions::max_outstanding_fetches` sets
+  `PullSessionOptions::max_outstanding`, and `None` is 8. For an
+  `Endpoint::Http`, a `Some` value replaces `FetcherOptions::max_outstanding`
+  of the endpoint, and `None` keeps it. An `Endpoint::Http` with no mirror is
+  `Error::InvalidInput` before any request.
 - `Repo::pull` resolves the signature policy, then starts the ssh client with
   `PullSession::connect`, at the point where the HTTP pull sends its first
   request, and then runs the pull of `pull_over_stream`.
-- `Repo::remote_fetch_summary` takes the address of the remote by the same
-  rule, with no `url`. Over ssh it reads `summary.sig` and `summary` as two
-  calls in flight together, and ends the session before it returns. The
-  library caller sets the ssh command through `ssh-command` or
-  `OSTRYA_SSH_COMMAND` alone.
-- With an HTTP address, `Repo::pull` refuses `connect.ssh_command` and
-  `connect.send_command` with `Error::InvalidInput`, and reads neither
-  `connect.remote_ssh_command`, `ssh-command`, nor `send-command`.
+- `Repo::remote_fetch_summary` takes an `Option<Endpoint>`, and resolves
+  `None` as `Repo::pull` does. Over ssh it reads `summary.sig` and `summary`
+  as two calls in flight together, and ends the session before it returns.
 
 ## Static deltas
 

@@ -177,7 +177,7 @@ bounded:
   `AsyncRead`. The client session: `PushSession` over a pair of byte
   streams, the `ObjectSource` trait it reads objects through, and
   `PushProgress`, `PushStats`, and `PushOutcome`. The transports:
-  `Endpoint`, `SshAddress`, `SshOptions`, `PushRemote`, and
+  `Endpoint`, `SshAddress`, `SshOptions`, and
   `PushSession::connect`, which runs the ssh client as a child process
   through `ostrya-rt`, or sends the steps of a session to an HTTP server. No repository
   knowledge. Depends on `ostrya-gvariant`, `ostrya-core`, `ostrya-rt`,
@@ -4108,7 +4108,8 @@ and a from-to delta alike, with verification configured or off, while
 `static-delta apply-offline` applies the same delta.
 
 Two more port rules with no tool behavior behind them. A remote the configuration
-does not describe, which only the port can pull from (`PullOptions::url`), takes
+does not describe, which only the port can pull from (`PullOptions::endpoint`, or
+a `url` override of `resolve_pull`), takes
 the configuration defaults, `gpg-verify` among them, so such a pull states its own
 policy or is refused. A build without the `verify-gpg` feature refuses a pull
 whose policy asks for the GPG axis, naming the feature, rather than passing a
@@ -7332,13 +7333,14 @@ and gives the body of each found reply as a `PullBody`. The pull driver of
 `Repo::pull` reads the remote through a source: the HTTP source over the
 fetcher, with no change in behavior, or the ssh source over a
 `PullSession`. `Repo::pull_over_stream` runs the pull through the ssh source
-over a pair of streams, and `PullOptions::connect` carries the ssh command,
-the send command, and the remote ssh command (`docs/api-sketch.md`, "Pull
-over ssh: the client side"). `Repo::pull` and `Repo::remote_fetch_summary`
-run over the ssh client for an ssh address in `PullOptions::url` or in the
-remote key `pull-url`. The remote keys `ssh-command` and `send-command` fill
-the fields of `PullOptions::connect` that the caller leaves `None`, and the
-pull reads `Remote::pull_url` and `Remote::send_command` in every build
+over a pair of streams, and `PullOptions::endpoint` carries the address and
+the options of each transport (`docs/api-sketch.md`, "Pull over ssh: the
+client side"). `Repo::pull` and `Repo::remote_fetch_summary` run over the
+ssh client for an ssh endpoint of the caller, or for an ssh address in the
+remote key `pull-url`. `resolve_pull` reads the remote keys `ssh-command`
+and `send-command` into the `SshOptions` of the endpoint where the caller
+leaves a field `None`, and reads `Remote::pull_url` and
+`Remote::send_command` in every build
 (`format-reference.md`, "Port extension: the push and pull keys of a
 remote"). `ostrya pull`, `ostrya remote refs`, and `ostrya remote summary`
 work for a remote whose `pull-url` is an ssh address
@@ -7934,19 +7936,20 @@ The proxy the port implements:
 - The decision is made per hop from that hop's origin, so a redirect onto
   another origin is served the way a route naming that origin would be, and a
   proxied hop may redirect onto an exempt origin reached directly.
-- `remote_fetcher` reads the remote `proxy` config key. A non-empty value
-  gives `Proxy::Url` with that value. An absent key and an empty value give
-  `Proxy::Environment`. The keyfile drops the spaces and tabs at the start of
-  a value, so a value of spaces alone is empty. A non-empty value with white
-  space at its start or end is `Error::Unsupported` before the first request,
-  and the message does not hold the value. The fetcher of an HTTP pull,
-  of its static deltas, and of `Repo::remote_fetch_summary`, which the CLI
-  `remote summary` and `remote refs` call, comes from `remote_fetcher`. A pull
-  whose `PullOptions::url` overrides the address of a configured remote reads
-  the key of that remote too. `Proxy::Url` reads no exemptions, so `no_proxy`
-  does not exempt an origin from the key. A value that is not
-  `http://host[:port]` fails `Fetcher::new` with `Error::Unsupported`, before
-  the first request and before the pull opens a transaction.
+- `ostrya::endpoint::resolve_pull` reads the remote `proxy` config key. A
+  non-empty value gives `Proxy::Url` with that value. An absent key and an
+  empty value give `Proxy::Environment`. The keyfile drops the spaces and tabs
+  at the start of a value, so a value of spaces alone is empty. A non-empty
+  value with white space at its start or end is `Error::Unsupported` before
+  the first request, and the message does not hold the value. The fetcher of
+  an HTTP pull, of its static deltas, and of `Repo::remote_fetch_summary`,
+  which the CLI `remote summary` and `remote refs` call, takes the proxy of
+  the endpoint that `resolve_pull` gives. A `url` override of `resolve_pull`
+  reads the key of the named remote too. An endpoint of the caller takes no
+  remote key. `Proxy::Url` reads no exemptions, so `no_proxy` does not exempt
+  an origin from the key. A value that is not `http://host[:port]` fails
+  `Fetcher::new` with `Error::Unsupported`, before the first request and
+  before the pull opens a transaction.
 - `ostrya::endpoint::resolve_push` reads the `proxy` key of the remote of an
   HTTP push by the same rules. An address names no remote, so its push gets
   `Proxy::Environment`. A pull over ssh and a push over ssh do not read the
@@ -7981,11 +7984,11 @@ The verification bypass:
   credential guards, which read the scheme alone, so a credential does reach
   such an origin. The tool sends one there as well, and the operator who asks
   for the bypass carries the risk.
-- `remote_fetcher` applies the named remote's TLS options to a
-  `PullOptions::url` override, so a `tls-permissive` remote's bypass follows
-  that URL to an unrelated host. The tool applies a remote's options under
-  `--url` the same way. The refusal the key drew before this phase left this
-  consequence unreachable.
+- `resolve_pull` applies the named remote's TLS options to a `url`
+  override, so a `tls-permissive` remote's bypass follows that URL to an
+  unrelated host. The tool applies a remote's options under `--url` the same
+  way. The refusal the key drew before this phase left this consequence
+  unreachable. An endpoint of the caller takes no TLS key.
 
 Opening the connection:
 

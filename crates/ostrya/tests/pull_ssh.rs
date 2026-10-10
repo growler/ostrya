@@ -17,6 +17,8 @@ use std::time::Duration;
 use common::TmpDir;
 use common::pipe::pipe;
 use futures_lite::future;
+use ostrya::endpoint::{EndpointOverrides, resolve_pull};
+use ostrya::remote::{Endpoint, SshAddress, SshOptions};
 use ostrya::{
     Checksum, CommitModifierFlags, CreateOptions, DeltaOptions, Error, FsckOptions, ObjectType,
     PullFlags, PullOptions, PullStats, Repo, RepoMode, SummaryOptions, loose_path,
@@ -475,8 +477,8 @@ fn a_stated_length_above_the_cap_ends_the_session() {
     });
 }
 
-/// A pull over a pair of streams refuses a `url` and the ssh fields of the
-/// connect options. An HTTP pull refuses the ssh command and the send
+/// A pull over a pair of streams refuses an endpoint of each transport. The
+/// resolution of an HTTP address refuses the ssh command and the send
 /// command. Each refusal occurs before the pull writes a byte.
 #[test]
 fn the_fields_of_the_other_transport_are_refused() {
@@ -484,83 +486,83 @@ fn the_fields_of_the_other_transport_are_refused() {
         let dir = TmpDir::new("pull-ssh-refusals");
         let (remote, _commit) = build_remote(dir.path()).await;
         let dest = dest_at(&dir.path().join("dest"), RepoMode::Archive, None).await;
-        let ssh_command = || ostrya::remote::PullConnectOptions {
-            ssh_command: Some(vec!["ssh".to_owned()]),
-            ..Default::default()
+        let ssh = Endpoint::Ssh {
+            address: SshAddress::parse("ssh://localhost/srv/repo").unwrap(),
+            options: SshOptions::default(),
         };
-        let send_command = || ostrya::remote::PullConnectOptions {
-            send_command: Some("ostrya send".to_owned()),
-            ..Default::default()
-        };
-        for opts in [
-            PullOptions {
-                url: Some("http://127.0.0.1:1/".to_owned()),
+        for endpoint in [Endpoint::parse("http://127.0.0.1:1/").unwrap(), ssh] {
+            let opts = PullOptions {
+                endpoint: Some(endpoint),
                 ..main_ref(0)
-            },
-            PullOptions {
-                connect: ssh_command(),
-                ..main_ref(0)
-            },
-            PullOptions {
-                connect: send_command(),
-                ..main_ref(0)
-            },
-        ] {
+            };
             let (pulled, served) = pull_ssh(&dest, &remote, opts).await;
             assert!(matches!(pulled, Err(Error::InvalidInput(_))), "{pulled:?}");
             // The server read the end of its input before any `PullHello`.
             served.unwrap();
         }
-        for (connect, key) in [
-            (ssh_command(), "ssh-command"),
-            (send_command(), "send-command"),
+        for (o, key) in [
+            (
+                EndpointOverrides {
+                    ssh_command: Some(vec!["ssh".to_owned()]),
+                    ..EndpointOverrides::default()
+                },
+                "ssh-command",
+            ),
+            (
+                EndpointOverrides {
+                    remote_command: Some("ostrya send".to_owned()),
+                    ..EndpointOverrides::default()
+                },
+                "send-command",
+            ),
         ] {
-            let err = dest
-                .pull(
-                    "origin",
-                    PullOptions {
-                        url: Some("http://127.0.0.1:1/".to_owned()),
-                        connect,
-                        ..main_ref(0)
-                    },
-                )
-                .await
-                .unwrap_err();
-            match err {
-                Error::InvalidInput(msg) => assert!(msg.contains(key), "{msg}"),
+            let o = EndpointOverrides {
+                url: Some("http://127.0.0.1:1/".to_owned()),
+                ..o
+            };
+            match resolve_pull(Some(dest.config()), "origin", o).await {
+                Err(Error::InvalidInput(msg)) => assert!(msg.contains(key), "{msg}"),
                 other => panic!("{other:?}"),
             }
         }
-        // An HTTP pull does not read the remote ssh command.
-        let server = RepoServer::start(&dir.path().join("remote"), false).await;
-        dest.pull(
-            "origin",
-            PullOptions {
-                url: Some(server.url()),
-                connect: ostrya::remote::PullConnectOptions {
-                    remote_ssh_command: Some("ssh -q".to_owned()),
-                    ..Default::default()
-                },
-                ..main_ref(0)
-            },
-        )
-        .await
-        .unwrap();
     });
 }
 
 /// A stand-in ssh command. It writes the arguments that the pull adds, one to
 /// a line, to `record`, and exits 0. It serves no session.
-fn recording_ssh(record: &Path) -> ostrya::remote::PullConnectOptions {
-    ostrya::remote::PullConnectOptions {
-        ssh_command: Some(vec![
-            "sh".to_owned(),
-            "-c".to_owned(),
-            r#"record=$1; shift; printf '%s\n' "$@" > "$record""#.to_owned(),
-            "ssh".to_owned(),
-            record.to_str().unwrap().to_owned(),
-        ]),
-        ..Default::default()
+fn recording_ssh(record: &Path) -> Vec<String> {
+    vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        r#"record=$1; shift; printf '%s\n' "$@" > "$record""#.to_owned(),
+        "ssh".to_owned(),
+        record.to_str().unwrap().to_owned(),
+    ]
+}
+
+/// Resolves the remote `origin` of `dest` with the overrides `o`, and pulls
+/// with the endpoint that the resolution gives.
+async fn pull_resolved(
+    dest: &Repo,
+    o: EndpointOverrides,
+    opts: PullOptions,
+) -> Result<PullStats, Error> {
+    let endpoint = resolve_pull(Some(dest.config()), "origin", o).await?;
+    dest.pull(
+        "origin",
+        PullOptions {
+            endpoint: Some(endpoint),
+            ..opts
+        },
+    )
+    .await
+}
+
+/// The overrides that set the ssh command alone.
+fn ssh_command(command: Vec<String>) -> EndpointOverrides {
+    EndpointOverrides {
+        ssh_command: Some(command),
+        ..EndpointOverrides::default()
     }
 }
 
@@ -586,18 +588,15 @@ fn the_commands_of_the_caller_win_over_the_remote_keys() {
         )
         .await;
         let both = dir.path().join("both");
-        let pulled = dest
-            .pull(
-                "origin",
-                PullOptions {
-                    connect: ostrya::remote::PullConnectOptions {
-                        send_command: Some("my-send".to_owned()),
-                        ..recording_ssh(&both)
-                    },
-                    ..main_ref(0)
-                },
-            )
-            .await;
+        let pulled = pull_resolved(
+            &dest,
+            EndpointOverrides {
+                remote_command: Some("my-send".to_owned()),
+                ..ssh_command(recording_ssh(&both))
+            },
+            main_ref(0),
+        )
+        .await;
         // The stand-in serves no session.
         assert!(pulled.is_err());
         assert_eq!(
@@ -606,15 +605,7 @@ fn the_commands_of_the_caller_win_over_the_remote_keys() {
         );
 
         let key = dir.path().join("key");
-        let pulled = dest
-            .pull(
-                "origin",
-                PullOptions {
-                    connect: recording_ssh(&key),
-                    ..main_ref(0)
-                },
-            )
-            .await;
+        let pulled = pull_resolved(&dest, ssh_command(recording_ssh(&key)), main_ref(0)).await;
         assert!(pulled.is_err());
         assert_eq!(
             recorded(&key).unwrap(),
@@ -622,16 +613,15 @@ fn the_commands_of_the_caller_win_over_the_remote_keys() {
         );
 
         let url = dir.path().join("url");
-        let pulled = dest
-            .pull(
-                "origin",
-                PullOptions {
-                    url: Some("u@h:other".to_owned()),
-                    connect: recording_ssh(&url),
-                    ..main_ref(0)
-                },
-            )
-            .await;
+        let pulled = pull_resolved(
+            &dest,
+            EndpointOverrides {
+                url: Some("u@h:other".to_owned()),
+                ..ssh_command(recording_ssh(&url))
+            },
+            main_ref(0),
+        )
+        .await;
         assert!(pulled.is_err());
         assert_eq!(
             recorded(&url).unwrap(),
@@ -640,8 +630,80 @@ fn the_commands_of_the_caller_win_over_the_remote_keys() {
     });
 }
 
-/// A pull refuses an ssh address in the `url` key, in the `ssh://` form and
-/// in the scp form. The ssh client does not start.
+/// A pull with no endpoint resolves the remote keys. It runs the
+/// `ssh-command` of the remote with the address of `pull-url` and the
+/// `send-command` of the remote.
+#[test]
+fn a_pull_with_no_endpoint_runs_the_ssh_keys_of_the_remote() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-no-endpoint");
+        // A key value splits at white space and cannot hold the script of
+        // `recording_ssh`. The script goes in a file that `sh` reads.
+        let standin = dir.path().join("standin.sh");
+        std::fs::write(
+            &standin,
+            "record=$1; shift; printf '%s\\n' \"$@\" > \"$record\"\n",
+        )
+        .unwrap();
+        let record = dir.path().join("record");
+        let dest = dest_with_keys(
+            &dir.path().join("dest"),
+            RepoMode::Archive,
+            &format!(
+                "pull-url=ssh://localhost/srv/repo\nssh-command=sh {} {}\n\
+                 send-command=my-send\n",
+                standin.display(),
+                record.display()
+            ),
+        )
+        .await;
+        let pulled = dest.pull("origin", main_ref(0)).await;
+        // The stand-in serves no session.
+        assert!(pulled.is_err());
+        assert_eq!(
+            recorded(&record).unwrap(),
+            ["localhost", "my-send --repo='/srv/repo'"]
+        );
+    });
+}
+
+/// `remote_fetch_summary` with an ssh endpoint of the caller runs the
+/// address and the commands of the endpoint. It reads no `pull-url`, no
+/// `ssh-command`, and no `send-command` key of the remote.
+#[test]
+fn remote_fetch_summary_takes_an_ssh_endpoint_of_the_caller() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-fetch-summary-endpoint");
+        let dest = dest_with_keys(
+            &dir.path().join("dest"),
+            RepoMode::Archive,
+            "pull-url=ssh://other/srv/other\nssh-command=/nonexistent/ssh\n\
+             send-command=/nonexistent/send\n",
+        )
+        .await;
+        for (tag, remote_command, sent) in [
+            ("given", Some("my-send"), "my-send --repo='/srv/repo'"),
+            ("default", None, "ostrya send --repo='/srv/repo'"),
+        ] {
+            let record = dir.path().join(tag);
+            let endpoint = Endpoint::Ssh {
+                address: SshAddress::parse("ssh://localhost/srv/repo").unwrap(),
+                options: SshOptions {
+                    command: Some(recording_ssh(&record)),
+                    remote_command: remote_command.map(str::to_owned),
+                    ..SshOptions::default()
+                },
+            };
+            let fetched = dest.remote_fetch_summary("origin", Some(endpoint)).await;
+            // The stand-in serves no session.
+            assert!(fetched.is_err(), "{tag}");
+            assert_eq!(recorded(&record).unwrap(), ["localhost", sent], "{tag}");
+        }
+    });
+}
+
+/// The resolution of a pull refuses an ssh address in the `url` key, in the
+/// `ssh://` form and in the scp form. The ssh client does not start.
 #[test]
 fn an_ssh_address_in_url_is_refused() {
     block_on(async {
@@ -652,14 +714,7 @@ fn an_ssh_address_in_url_is_refused() {
         ] {
             let dest = dest_at(&dir.path().join(tag), RepoMode::Archive, Some(url)).await;
             let record = dir.path().join(format!("{tag}-record"));
-            let err = dest
-                .pull(
-                    "origin",
-                    PullOptions {
-                        connect: recording_ssh(&record),
-                        ..main_ref(0)
-                    },
-                )
+            let err = pull_resolved(&dest, ssh_command(recording_ssh(&record)), main_ref(0))
                 .await
                 .unwrap_err();
             match err {
@@ -677,54 +732,53 @@ fn an_ssh_address_in_url_is_refused() {
     });
 }
 
-/// If the address is an ssh address, a pull refuses each option of HTTP
-/// alone before the ssh client starts. The pull accepts a retry count of 0,
-/// and the ssh client starts.
+/// If the address is an ssh address, the resolution of the pull refuses each
+/// option of HTTP alone, so the ssh client does not start. The resolution
+/// accepts a retry count of 0, and the ssh client starts.
 #[test]
 fn the_options_of_http_alone_are_refused_before_the_ssh_client_starts() {
     block_on(async {
         let dir = TmpDir::new("pull-ssh-http-options");
         let dest = dest_at(&dir.path().join("dest"), RepoMode::Archive, None).await;
         let address = "ssh://localhost/srv/repo";
-        let with = |opts: PullOptions| PullOptions {
+        let with = |o: EndpointOverrides| EndpointOverrides {
             url: Some(address.to_owned()),
-            connect: ostrya::remote::PullConnectOptions {
+            ..EndpointOverrides {
                 ssh_command: Some(vec!["/nonexistent/ssh".to_owned()]),
-                ..Default::default()
-            },
-            ..opts
+                ..o
+            }
         };
-        for (name, opts) in [
+        for (name, o) in [
             (
                 "http-header",
-                PullOptions {
+                EndpointOverrides {
                     http_headers: vec![("A".to_owned(), "B".to_owned())],
-                    ..main_ref(0)
+                    ..EndpointOverrides::default()
                 },
             ),
             (
                 "network-retries",
-                PullOptions {
-                    n_network_retries: Some(1),
-                    ..main_ref(0)
+                EndpointOverrides {
+                    max_retries: Some(1),
+                    ..EndpointOverrides::default()
                 },
             ),
             (
                 "low-speed-limit-bytes",
-                PullOptions {
+                EndpointOverrides {
                     low_speed_limit_bytes: Some(5),
-                    ..main_ref(0)
+                    ..EndpointOverrides::default()
                 },
             ),
             (
                 "low-speed-time-seconds",
-                PullOptions {
+                EndpointOverrides {
                     low_speed_time: Some(Duration::ZERO),
-                    ..main_ref(0)
+                    ..EndpointOverrides::default()
                 },
             ),
         ] {
-            match dest.pull("origin", with(opts)).await {
+            match pull_resolved(&dest, with(o), main_ref(0)).await {
                 Err(Error::InvalidInput(msg)) => assert_eq!(
                     msg,
                     format!(
@@ -734,14 +788,11 @@ fn the_options_of_http_alone_are_refused_before_the_ssh_client_starts() {
                 other => panic!("{name}: {other:?}"),
             }
         }
-        let err = dest
-            .pull(
-                "origin",
-                with(PullOptions {
-                    n_network_retries: Some(0),
-                    ..main_ref(0)
-                }),
-            )
+        let retries = EndpointOverrides {
+            max_retries: Some(0),
+            ..EndpointOverrides::default()
+        };
+        let err = pull_resolved(&dest, with(retries), main_ref(0))
             .await
             .unwrap_err();
         match err {
@@ -768,15 +819,7 @@ fn a_pull_over_ssh_reads_no_tls_key() {
         )
         .await;
         let record = dir.path().join("record");
-        let pulled = dest
-            .pull(
-                "origin",
-                PullOptions {
-                    connect: recording_ssh(&record),
-                    ..main_ref(0)
-                },
-            )
-            .await;
+        let pulled = pull_resolved(&dest, ssh_command(recording_ssh(&record)), main_ref(0)).await;
         assert!(pulled.is_err());
         assert_eq!(
             recorded(&record).unwrap(),
@@ -784,16 +827,16 @@ fn a_pull_over_ssh_reads_no_tls_key() {
         );
 
         // The same keys stop an HTTP pull before its first request.
-        let err = dest
-            .pull(
-                "origin",
-                PullOptions {
-                    url: Some("http://127.0.0.1:1/".to_owned()),
-                    ..main_ref(0)
-                },
-            )
-            .await
-            .unwrap_err();
+        let err = pull_resolved(
+            &dest,
+            EndpointOverrides {
+                url: Some("http://127.0.0.1:1/".to_owned()),
+                ..EndpointOverrides::default()
+            },
+            main_ref(0),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("tls-permissive"), "{err}");
     });
 }
@@ -818,14 +861,7 @@ fn a_refused_policy_stops_the_pull_before_the_ssh_client_starts() {
         .await;
 
         let policy = dir.path().join("policy");
-        let err = dest
-            .pull(
-                "origin",
-                PullOptions {
-                    connect: recording_ssh(&policy),
-                    ..main_ref(0)
-                },
-            )
+        let err = pull_resolved(&dest, ssh_command(recording_ssh(&policy)), main_ref(0))
             .await
             .unwrap_err();
         match err {
@@ -835,17 +871,16 @@ fn a_refused_policy_stops_the_pull_before_the_ssh_client_starts() {
         assert_eq!(recorded(&policy), None);
 
         let header = dir.path().join("header");
-        let err = dest
-            .pull(
-                "origin",
-                PullOptions {
-                    http_headers: vec![("A".to_owned(), "B".to_owned())],
-                    connect: recording_ssh(&header),
-                    ..main_ref(0)
-                },
-            )
-            .await
-            .unwrap_err();
+        let err = pull_resolved(
+            &dest,
+            EndpointOverrides {
+                http_headers: vec![("A".to_owned(), "B".to_owned())],
+                ..ssh_command(recording_ssh(&header))
+            },
+            main_ref(0),
+        )
+        .await
+        .unwrap_err();
         match err {
             Error::InvalidInput(msg) => assert_eq!(
                 msg,
@@ -928,8 +963,13 @@ fn the_ssh_pull_refuses_a_collection_id() {
             .pull(
                 "origin",
                 PullOptions {
-                    url: Some("ssh://localhost/srv/repo".to_owned()),
-                    connect: recording_ssh(&record),
+                    endpoint: Some(Endpoint::Ssh {
+                        address: SshAddress::parse("ssh://localhost/srv/repo").unwrap(),
+                        options: SshOptions {
+                            command: Some(recording_ssh(&record)),
+                            ..SshOptions::default()
+                        },
+                    }),
                     ..collection()
                 },
             )

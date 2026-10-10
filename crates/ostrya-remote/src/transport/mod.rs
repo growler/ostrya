@@ -6,9 +6,8 @@
 //! [`PushSession::prepare`] checks the endpoint and makes the transport ready,
 //! and [`PreparedSession::open`] opens the session later.
 //!
-//! [`PushRemote`] is a parsed address of a pull over ssh.
-//! [`PullSession::connect`] opens a pull session over ssh to it with
-//! [`PullConnectOptions`].
+//! [`PullSession::connect`] opens a pull session over ssh to an
+//! [`SshAddress`] with [`SshOptions`].
 //!
 //! Over ssh, the client runs the ssh client as a child process, and the remote
 //! side runs the receive command or the send command. The frames of the
@@ -34,98 +33,6 @@ pub use ssh::{SshAddress, SshOptions, without_userinfo};
 /// [`PushSession::connect`] or [`PullSession::connect`] opens.
 const PENDING_READ_LIMIT: Duration = Duration::from_secs(5);
 
-/// The address of a pull over ssh, parsed from an ssh address or an HTTP
-/// address.
-///
-/// [`PullSession::connect`] takes the ssh forms alone.
-///
-/// # ssh addresses
-///
-/// An address that does not start with `http://` or `https://` is an ssh
-/// address. Its forms and rules are the forms and rules of [`SshAddress`]. A
-/// refusal does not show the userinfo.
-///
-/// # HTTP addresses
-///
-/// The forms are `http://HOST[:PORT][/PATH]` and `https://HOST[:PORT][/PATH]`.
-/// [`parse`](PushRemote::parse) refuses an `@` at any position, so it refuses
-/// userinfo. It also refuses a query, a fragment, an empty host, and a port
-/// that is not a number from 0 to 65535. A refusal does not show the userinfo.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PushRemote {
-    inner: RemoteAddr,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RemoteAddr {
-    Ssh(SshAddress),
-    Http(String),
-}
-
-impl PushRemote {
-    /// Parses `address` as one of the forms of [`PushRemote`].
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::InvalidInput`] if `address` is not one of the
-    ///   [ssh forms](PushRemote#ssh-addresses) or the
-    ///   [HTTP forms](PushRemote#http-addresses), or if the parse refuses a
-    ///   part of it.
-    pub fn parse(address: &str) -> Result<PushRemote> {
-        parse_remote(address, cfg!(windows))
-    }
-
-    /// Returns the address with no user, for a message.
-    ///
-    /// The `Display` of the result writes an ssh address in the `ssh://`
-    /// form with no `USER@`. An HTTP address holds no user, so the result is
-    /// equal to `self`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use ostrya_remote::transport::PushRemote;
-    /// # fn main() -> ostrya_remote::Result<()> {
-    /// let remote = PushRemote::parse("builder@repo.example.com:srv/a@b")?;
-    /// assert_eq!(
-    ///     remote.without_user().to_string(),
-    ///     "ssh://repo.example.com/~/srv/a@b"
-    /// );
-    /// # Ok(()) }
-    /// ```
-    #[doc(hidden)]
-    pub fn without_user(&self) -> PushRemote {
-        let inner = match &self.inner {
-            RemoteAddr::Ssh(addr) => RemoteAddr::Ssh(addr.without_user()),
-            RemoteAddr::Http(url) => RemoteAddr::Http(url.clone()),
-        };
-        PushRemote { inner }
-    }
-}
-
-impl fmt::Display for PushRemote {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.inner {
-            RemoteAddr::Ssh(addr) => addr.fmt(f),
-            RemoteAddr::Http(url) => f.write_str(url),
-        }
-    }
-}
-
-/// Parses `address`, with the Windows rule for a one-letter host if `windows`
-/// is `true`.
-fn parse_remote(address: &str, windows: bool) -> Result<PushRemote> {
-    let inner = if address.starts_with("http://") || address.starts_with("https://") {
-        // The message of the fetcher holds no userinfo.
-        ostrya_fetch::check_base_url(address)
-            .map_err(|e| Error::InvalidInput(format!("address: {e}")))?;
-        RemoteAddr::Http(address.to_owned())
-    } else {
-        RemoteAddr::Ssh(SshAddress::parse_with(address, windows)?)
-    };
-    Ok(PushRemote { inner })
-}
-
 /// A remote address with the options of its transport.
 ///
 /// [`Endpoint::parse`] reads an address and gives the default options. A
@@ -135,6 +42,13 @@ fn parse_remote(address: &str, windows: bool) -> Result<PushRemote> {
 /// userinfo, query, or fragment of a mirror URL. The [`Debug`] output of
 /// [`FetcherOptions`](ostrya_fetch::FetcherOptions) removes the userinfo and
 /// shows `<redacted>` in place of each of the other values.
+///
+/// # HTTP addresses
+///
+/// The forms are `http://HOST[:PORT][/PATH]` and `https://HOST[:PORT][/PATH]`.
+/// [`parse`](Endpoint::parse) refuses an `@` at any position, so it refuses
+/// userinfo. It also refuses a query, a fragment, an empty host, and a port
+/// that is not a number from 0 to 65535. A refusal does not show the userinfo.
 #[derive(Debug, Clone)]
 pub enum Endpoint {
     /// An ssh address and the options of the ssh client.
@@ -155,14 +69,13 @@ impl Endpoint {
     /// [`Endpoint::Http`] with
     /// [`FetcherOptions::new`](ostrya_fetch::FetcherOptions::new) of the
     /// address. Each other address gives [`Endpoint::Ssh`] with the default
-    /// [`SshOptions`]. The call accepts and refuses the same addresses as
-    /// [`PushRemote::parse`].
+    /// [`SshOptions`].
     ///
     /// # Errors
     ///
     /// - [`Error::InvalidInput`] if `address` is not one of the
     ///   [ssh forms](SshAddress#forms) or the
-    ///   [HTTP forms](PushRemote#http-addresses), or if the parse refuses a
+    ///   [HTTP forms](Endpoint#http-addresses), or if the parse refuses a
     ///   part of it. No refusal shows the userinfo of the address.
     ///
     /// # Examples
@@ -492,49 +405,21 @@ impl Prepared {
     }
 }
 
-/// The transport options of a pull session.
-///
-/// The fields resolve as the fields of [`SshOptions`] do, by the rules of its
-/// [ssh command line](SshOptions#ssh-command-line). The struct
-/// carries no `#[non_exhaustive]`. A caller builds it with
-/// `..Default::default()`.
-#[derive(Debug, Clone, Default)]
-pub struct PullConnectOptions {
-    /// The ssh command line, as a list of arguments.
-    ///
-    /// It wins over the `OSTRYA_SSH_COMMAND` environment variable and over
-    /// [`remote_ssh_command`](PullConnectOptions::remote_ssh_command). An
-    /// empty list is refused, and so is a list whose first argument holds only
-    /// white space.
-    pub ssh_command: Option<Vec<String>>,
-    /// The command that the remote side runs.
-    ///
-    /// The remote shell parses it. The default is `ostrya send`.
-    pub send_command: Option<String>,
-    /// The ssh command line from the configuration of a remote.
-    ///
-    /// The client splits it at ASCII white space. It has the lowest
-    /// precedence: the `OSTRYA_SSH_COMMAND` environment variable wins over it.
-    pub remote_ssh_command: Option<String>,
-}
-
 /// The open of a session over ssh.
 impl PullSession {
-    /// Opens a pull session to the ssh address `remote`.
+    /// Opens a pull session to the ssh address `address`.
     ///
     /// The call starts the ssh client, sends `PullHello`, and reads
-    /// `PullHelloReply`. `remote` takes the [ssh forms](PushRemote#ssh-addresses)
-    /// of [`PushRemote`]. The command line is:
+    /// `PullHelloReply`. `address` takes the [forms](SshAddress#forms) of
+    /// [`SshAddress`]. The command line is:
     ///
     /// ```text
     /// SSH_COMMAND... [-p PORT] [USER@]HOST 'SEND_COMMAND --repo=QUOTED_PATH'
     /// ```
     ///
-    /// `SSH_COMMAND` comes from [`PullConnectOptions::ssh_command`], the
-    /// `OSTRYA_SSH_COMMAND` environment variable, and
-    /// [`PullConnectOptions::remote_ssh_command`], in that order, as for a
-    /// push. `SEND_COMMAND` is [`PullConnectOptions::send_command`], or
-    /// `ostrya send`.
+    /// `SSH_COMMAND` comes from `options` by the rules of the
+    /// [ssh command line](SshOptions#ssh-command-line), as for a push.
+    /// `SEND_COMMAND` is [`SshOptions::remote_command`], or `ostrya send`.
     ///
     /// The session has the ssh time limits of [`PushSession::connect`].
     /// [`finish`](PullSession::finish) waits for the ssh client as `commit` and
@@ -549,8 +434,6 @@ impl PullSession {
     ///
     /// - An `Error` message from the server, as the [`Error`] variant of its
     ///   code.
-    /// - [`Error::InvalidInput`] if `remote` is an HTTP address, because a pull
-    ///   session runs over ssh.
     /// - [`Error::InvalidInput`] if the ssh command or the send command is
     ///   empty or holds only white space, or if the value of
     ///   `OSTRYA_SSH_COMMAND` is not UTF-8.
@@ -575,11 +458,11 @@ impl PullSession {
     /// ```no_run
     /// use futures_lite::AsyncReadExt;
     /// use ostrya_remote::session::{PullSession, PullSessionOptions};
-    /// use ostrya_remote::transport::{PullConnectOptions, PushRemote};
+    /// use ostrya_remote::transport::{SshAddress, SshOptions};
     /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    /// let remote = PushRemote::parse("builder@repo.example.com:/srv/repo")?;
-    /// let opts = PullSessionOptions::default();
-    /// let session = PullSession::connect(&remote, PullConnectOptions::default(), opts).await?;
+    /// let address = SshAddress::parse("builder@repo.example.com:/srv/repo")?;
+    /// let options = SshOptions::default();
+    /// let session = PullSession::connect(&address, &options, PullSessionOptions::default()).await?;
     /// if let Some(mut body) = session.get("config", 1 << 20).await? {
     ///     let mut config = Vec::new();
     ///     body.read_to_end(&mut config).await?;
@@ -588,37 +471,26 @@ impl PullSession {
     /// # Ok(()) }
     /// ```
     pub async fn connect(
-        remote: &PushRemote,
-        connect: PullConnectOptions,
-        opts: PullSessionOptions,
+        address: &SshAddress,
+        options: &SshOptions,
+        session: PullSessionOptions,
     ) -> Result<PullSession> {
         let env = std::env::var_os("OSTRYA_SSH_COMMAND");
-        let argv = pull_command_line(remote, &connect, env.as_deref())?;
-        spawn_and_open_pull(&argv, opts, PENDING_READ_LIMIT).await
+        let argv = pull_command_line(address, options, env.as_deref())?;
+        spawn_and_open_pull(&argv, session, PENDING_READ_LIMIT).await
     }
 }
 
-/// Builds the command line of the ssh client of a pull from `remote`, with
+/// Builds the command line of the ssh client of a pull to `address`, with
 /// `env` as the value of the `OSTRYA_SSH_COMMAND` environment variable.
 fn pull_command_line(
-    remote: &PushRemote,
-    connect: &PullConnectOptions,
+    address: &SshAddress,
+    options: &SshOptions,
     env: Option<&OsStr>,
 ) -> Result<Vec<String>> {
-    match &remote.inner {
-        RemoteAddr::Ssh(addr) => {
-            let program = ssh::ssh_program(
-                connect.ssh_command.as_deref(),
-                env,
-                connect.remote_ssh_command.as_deref(),
-            )?;
-            let send = ssh::send_command(connect.send_command.as_deref())?;
-            Ok(addr.command_line(program, send))
-        }
-        RemoteAddr::Http(url) => Err(Error::InvalidInput(format!(
-            "'{url}' is an HTTP address, and a pull session runs over ssh"
-        ))),
-    }
+    let program = options.program(env)?;
+    let send = ssh::send_command(options.remote_command.as_deref())?;
+    Ok(address.command_line(program, send))
 }
 
 /// Starts `argv` and opens a pull session over its standard input and
@@ -639,13 +511,13 @@ async fn spawn_and_open_pull(
 /// the environment variable and the time limit as parameters.
 #[cfg(test)]
 async fn connect_pull_with(
-    remote: &PushRemote,
-    connect: &PullConnectOptions,
+    address: &SshAddress,
+    options: &SshOptions,
     env: Option<&OsStr>,
     opts: PullSessionOptions,
     limit: Duration,
 ) -> Result<PullSession> {
-    let argv = pull_command_line(remote, connect, env)?;
+    let argv = pull_command_line(address, options, env)?;
     spawn_and_open_pull(&argv, opts, limit).await
 }
 

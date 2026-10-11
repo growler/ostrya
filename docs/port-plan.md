@@ -3544,7 +3544,7 @@ and every object those commits reach from an HTTP remote, into one transaction.
 What the transaction publishes, when the refs are written, and what the
 `.commitpartial` markers mean is 16b's contract unchanged; the phase adds where
 the objects come from and how many are fetched at once.
-`Repo::remote_fetch_summary(remote, endpoint)` reports the remote's `summary`
+`Repo::remote_fetch_summary(remote)` reports the remote's `summary`
 and `summary.sig` bytes on their own.
 
 What a pull asks for, in the order it first asks: `summary.sig`, `summary`,
@@ -3677,7 +3677,7 @@ the `.commitpartial` markers, as without the option. Delta discovery and
 resolves each name as a ref name, through the summary or the ref file, and
 `PullStats` does not report the pulled commits. A checksum given as a name
 fails with `RefNotFound`, unless the remote holds a ref of that name.
-The HTTP pull, the ssh pull, and `pull_over_stream` refuse
+The HTTP pull and the ssh pull refuse
 `PullOptions::collection_id` with `Unsupported` after the depth check, before
 the first request, before the ssh client starts, and before the remote's
 configuration is read.
@@ -3686,9 +3686,10 @@ opened, under a `PullTrust` that the caller gives, and reads no remote section
 of the configuration. `Repo::pull` reads the trust, opens the session, and
 then runs the same engine. Before the first request and before the
 transaction opens, `pull_with_session` refuses an empty `refs`, a `verify`
-other than the default, and a set `max_outstanding_fetches` with
-`InvalidInput`, and a set `collection_id` with `Unsupported`. It then calls
-`PullSession::finish` and returns the refusal. It ignores `endpoint`.
+other than the default, a set `max_outstanding_fetches`, and
+`PullOptions::overrides` other than the default with `InvalidInput`, and a
+set `collection_id` with `Unsupported`. It then calls `PullSession::finish`
+and returns the refusal.
 `opts.remote` gives the prefix of its refs: `None` writes local refs, and
 `MIRROR` writes local refs and copies no summary.
 `TimestampCheck` refuses a fetched tip strictly older than the commit the ref
@@ -4119,12 +4120,12 @@ and a from-to delta alike, with verification configured or off, while
 `static-delta apply-offline` applies the same delta.
 
 Two more port rules with no tool behavior behind them. A remote the configuration
-does not describe, which only the port can pull from (`PullOptions::endpoint`, or
-a `url` override of `resolve_pull`), takes
-the configuration defaults, `gpg-verify` among them, so such a pull states its own
-policy or is refused. A build without the `verify-gpg` feature refuses a pull
-whose policy asks for the GPG axis, naming the feature, rather than passing a
-commit it did not check.
+does not describe, which only the port can pull from (a `url` in
+`PullOptions::overrides`), takes the configuration defaults, `gpg-verify` among
+them, and `PullTrust::from_remote` gives the same defaults for such a name, so
+such a pull states its own policy or is refused. A build without the
+`verify-gpg` feature refuses a pull whose policy asks for the GPG axis, naming
+the feature, rather than passing a commit it did not check.
 
 Config reading grows `SignVerify` and the `Remote` accessors `sign_verify`,
 `sign_verify_summary`, `verification_key`, and `verification_file`;
@@ -4212,9 +4213,10 @@ The command prints the line `pull-local` prints, which reports what the pull
 imported.
 
 Each option other than `--repo` sets a field of `PullOptions` or of
-`EndpointOverrides`. The command gives the `EndpointOverrides` to
-`ostrya::endpoint::resolve_pull`, and sets `PullOptions::endpoint` to the
-endpoint that it returns. A field name with no type is a field of
+`EndpointOverrides`. The command gives `--url`, `--http-header`, the retry
+options, and the low-speed options to `Repo::pull` in
+`PullOptions::overrides`, and `Repo::pull` gives them to
+`ostrya::endpoint::resolve_pull`. A field name with no type is a field of
 `PullOptions`:
 
 - `--repo <PATH>` -- the destination, defaulting to the working directory, as
@@ -7352,18 +7354,21 @@ or over the ssh client, keeps up to 8 `Get` frames in flight on the one
 stream, and gives the body of each found reply as a `PullBody`. The pull
 driver of `Repo::pull` reads the remote through a source: the HTTP source over
 the fetcher, with no change in behavior, or the stream source over a
-`StreamSession`. `Repo::pull_over_stream` runs the pull through the stream
-source over a pair of streams, and `PullOptions::endpoint` carries the
-address and the options of each transport (`docs/api-sketch.md`, "Pull over
-ssh: the client side"). `Repo::pull` and `Repo::remote_fetch_summary` run over
-the ssh client for an ssh endpoint of the caller, or for an ssh address in the
-remote key `pull-url`. `resolve_pull` reads the key `ssh-command` into
-`SshOptions::config_command`. It reads the key `send-command` into
-`SshOptions::remote_command` when `EndpointOverrides::remote_command` is
-`None`. It reads `Remote::pull_url` and `Remote::send_command` in every build
-(`format-reference.md`, "Port extension: the push and pull keys of a
-remote"). `ostrya pull`, `ostrya remote refs`, and `ostrya remote summary`
-work for a remote whose `pull-url` is an ssh address
+`StreamSession`. `PullSession::over_stream` opens a stream session over a
+pair of streams, and `Repo::pull_with_session` runs the pull through it
+(`docs/api-sketch.md`, "Pull over ssh: the client side").
+`PullOptions::overrides` carries the values of the caller for the endpoint
+resolution of `Repo::pull`. `Repo::pull` runs over the ssh client for an ssh
+address in the `url` field of `PullOptions::overrides` or in the remote key
+`pull-url`. `Repo::remote_fetch_summary` runs over the ssh client for an ssh
+address in `pull-url`. `resolve_pull` reads an ssh address from `pull-url`
+alone, and refuses an ssh address in the key `url`. `resolve_pull` reads the
+key `ssh-command` into `SshOptions::config_command`. It reads the key
+`send-command` into `SshOptions::remote_command` when
+`EndpointOverrides::remote_command` is `None`. It reads `Remote::pull_url` and
+`Remote::send_command` in every build (`format-reference.md`, "Port extension:
+the push and pull keys of a remote"). `ostrya pull`, `ostrya remote refs`, and
+`ostrya remote summary` work for a remote whose `pull-url` is an ssh address
 (`docs/conformance/cli-surface.md`, "pull"). A pull between two port
 repositories over ssh to localhost gives a repository that passes `ostree
 fsck`, and `ostree rev-parse` resolves the pulled ref to the source commit
@@ -7455,19 +7460,19 @@ the session over a stand-in ssh client: a failure status after a clean end
 is no failure, an unclean end closes both pipes before the wait, also with a
 body held across `finish`, and an I/O
 error under a failure status is `Error::Transport`.
-`crates/ostrya/tests/pull_ssh.rs` runs `Repo::pull_over_stream` against
-`Repo::send` over pipes of 64 KiB. For the whole tree into an `archive` and a
-`bare-user` destination, with `depth`, commit-only, a subpath, a static delta,
-and an object of 4 MiB with 16 small objects behind it, the refs, the
-objects, the markers, and the fetch statistics, `bytes_transferred`
-included, equal those of the HTTP pull of the same remote. A missing object
-fails the pull, and no ref is written. An `Error` of the server, a body that
-the client drops, and a stated length above the cap fail the pull and end
-the session. A unit test shows that a content object reads the end of its
-stream before its store finishes. The HTTP pull tests pass with no change.
-An ignored test in `crates/ostrya-cli/tests/send.rs` pulls an object of
-256 MiB from `ostrya send` through `StreamSession`, and the `RssAnon` of the
-server, read after each 16 MiB of the body and before its standard input
+`crates/ostrya/tests/pull_ssh.rs` runs `PullSession::over_stream` with
+`Repo::pull_with_session` against `Repo::send` over pipes of 64 KiB. For the
+whole tree into an `archive` and a `bare-user` destination, with `depth`,
+commit-only, a subpath, a static delta, and an object of 4 MiB with 16 small
+objects behind it, the refs, the objects, the markers, and the fetch
+statistics, `bytes_transferred` included, equal those of the HTTP pull of the
+same remote. A missing object fails the pull, and no ref is written. An `Error`
+of the server, a body that the client drops, and a stated length above the cap
+fail the pull and end the session. A unit test shows that a content object
+reads the end of its stream before its store finishes. The HTTP pull tests pass
+with no change. An ignored test in `crates/ostrya-cli/tests/send.rs` pulls an
+object of 256 MiB from `ostrya send` through `StreamSession`, and the `RssAnon`
+of the server, read after each 16 MiB of the body and before its standard input
 closes, stays below 16 MiB.
 
 Result of the receiving half of the one-way stream:
@@ -7965,9 +7970,10 @@ The proxy the port implements:
   an HTTP pull, of its static deltas, and of `Repo::remote_fetch_summary`,
   which the CLI `remote summary` and `remote refs` call, takes the proxy of
   the endpoint that `resolve_pull` gives. A `url` override of `resolve_pull`
-  reads the key of the named remote too. An endpoint of the caller takes no
-  remote key. `Proxy::Url` reads no exemptions, so `no_proxy` does not exempt
-  an origin from the key. A value that is not `http://host[:port]` fails
+  reads the key of the named remote too. A pull through
+  `Repo::pull_with_session` reads no remote key, so the session of the caller
+  gives the proxy. `Proxy::Url` reads no exemptions, so `no_proxy` does not
+  exempt an origin from the key. A value that is not `http://host[:port]` fails
   `Fetcher::new` with `Error::Unsupported`, before the first request and
   before the pull opens a transaction.
 - `ostrya::endpoint::resolve_push` reads the `proxy` key of the remote of an
@@ -8008,7 +8014,8 @@ The verification bypass:
   override, so a `tls-permissive` remote's bypass follows that URL to an
   unrelated host. The tool applies a remote's options under `--url` the same
   way. The refusal the key drew before this phase left this consequence
-  unreachable. An endpoint of the caller takes no TLS key.
+  unreachable. A pull through `Repo::pull_with_session` reads no TLS key, so
+  the session of the caller gives the TLS options.
 
 Opening the connection:
 

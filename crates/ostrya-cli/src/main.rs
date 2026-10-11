@@ -2854,23 +2854,8 @@ async fn pull(
     let line = progress
         .clone()
         .map(|progress| ProgressLine::start(progress, redraw));
-    let pulled = async {
-        // A bad subpath and a bad depth are refused before the remote is
-        // resolved, in the words and the order of `Repo::pull`.
-        if let Some(value) = args.subpath.iter().find(|value| !value.starts_with('/')) {
-            return Err(Error::Pull(format!(
-                "subpath '{value}' is not an absolute path"
-            )));
-        }
-        if args.depth < -1 {
-            return Err(Error::InvalidInput(format!(
-                "depth {} is below -1",
-                args.depth
-            )));
-        }
-        let endpoint =
-            ostrya::endpoint::resolve_pull(Some(repo.config()), remote, overrides).await?;
-        repo.pull(
+    let pulled = repo
+        .pull(
             remote,
             PullOptions {
                 refs: args.refs,
@@ -2880,7 +2865,7 @@ async fn pull(
                 disable_fsync: args.disable_fsync,
                 per_object_fsync: args.per_object_fsync,
                 subpaths: args.subpath,
-                endpoint: Some(endpoint),
+                overrides,
                 max_outstanding_fetches: args.max_outstanding_fetcher_requests,
                 timestamp_check,
                 disable_static_deltas: args.disable_static_deltas,
@@ -2896,9 +2881,7 @@ async fn pull(
                 ..PullOptions::default()
             },
         )
-        .await
-    }
-    .await;
+        .await;
     let prefix = line.map_or("", ProgressLine::finish);
     let stats = match pulled {
         Ok(stats) => stats,
@@ -8134,7 +8117,7 @@ fn remote_show_url(repo: &Repo, nested: &str, args: &RemoteNameArgs) -> Result<(
 /// none. `absent` is the wording for the subcommand asking.
 async fn fetch_remote_summary(repo: &Repo, name: &str, absent: &str) -> Result<Summary> {
     require_remote(repo, name);
-    let (bytes, _signature) = repo.remote_fetch_summary(name, None).await?;
+    let (bytes, _signature) = repo.remote_fetch_summary(name).await?;
     let Some(bytes) = bytes else {
         exit_error(absent);
     };
@@ -8165,7 +8148,7 @@ async fn remote_refs(repo: &Repo, nested: &str, args: &RemoteRefsArgs) -> Result
 async fn remote_summary(repo: &Repo, nested: &str, args: &RemoteSummaryArgs) -> Result<()> {
     let name = remote_operand(nested, args.name.as_deref());
     require_remote(repo, name);
-    let (bytes, _) = repo.remote_fetch_summary(name, None).await?;
+    let (bytes, _) = repo.remote_fetch_summary(name).await?;
     let Some(bytes) = bytes else {
         exit_error("Remote server has no summary file");
     };

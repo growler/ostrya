@@ -117,10 +117,10 @@ Feature flags on `ostrya`:
 
 `ostrya-remote` is a dependency of `ostrya` in every build, re-exported as
 `ostrya::remote`. `Repo::send`, the serving side of the pull over ssh, and
-`Repo::pull_over_stream`, its client side over a pair of streams, take no
-feature. The `send` feature of `ostrya-cli`, in its default set, builds
-`ostrya send` on `Repo::send`. `Repo::pull` runs over ssh for an ssh
-endpoint in `PullOptions::endpoint` or an ssh address in the remote key
+`PullSession::over_stream` with `Repo::pull_with_session`, its client side
+over a pair of streams, take no feature. The `send` feature of `ostrya-cli`,
+in its default set, builds `ostrya send` on `Repo::send`. `Repo::pull` runs
+over ssh for an ssh address in `PullOptions::overrides` or in the remote key
 `pull-url`, with no feature. `ostrya::endpoint::resolve_pull` reads the keys
 and the files of a remote for a pull, with no feature.
 

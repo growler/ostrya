@@ -2306,12 +2306,13 @@ missing dirtree, `fsck` stops with `FsckFailure::MissingDirTree` and marks
 nothing, so no pull repairs that commit.
 
 `pull` fetches the same thing from an HTTP remote, or over ssh from a remote
-with an ssh address, into one transaction. The endpoint is
-`PullOptions::endpoint`, or the endpoint that `resolve_pull` reads from the
-repository's config. The pull keeps as many objects in flight as its session
-admits, `PullSession::max_outstanding`. `pull` gives the session the limit
-`max_outstanding_fetches`. If the value is `None`, an HTTP pull keeps up to
-`FetcherOptions::max_outstanding` of its endpoint, and a pull over ssh keeps
+with an ssh address, into one transaction. The endpoint is the endpoint that
+`resolve_pull` reads from the repository's config, with
+`PullOptions::overrides` as the values of the caller. The pull keeps as many
+objects in flight as its session admits, `PullSession::max_outstanding`. `pull`
+gives the session the limit `max_outstanding_fetches`. If the value is `None`,
+an HTTP pull keeps up to `FetcherOptions::max_outstanding` of its endpoint, and
+a pull over ssh keeps
 up to 8. The plan is drained commits first, then the dirtree and dirmeta objects
 the scan is blocked on, then the content, and each class carries the matching
 fetch priority. A commit object is fetched before the objects it references and
@@ -2339,8 +2340,9 @@ white-space refusal applies to the proxy variables of the environment.
 
 The driver of `pull` reads the remote through a source, one of two: the HTTP
 source, over the fetcher, and the stream source, over a `StreamSession` of
-`ostrya-remote`. `pull_over_stream` runs the same pull through the stream
-source over a pair of streams (see "Pull over ssh: the client side"). The two
+`ostrya-remote`. `PullSession::over_stream` opens a stream session over a
+pair of streams, and `pull_with_session` runs the same pull through it (see
+"Pull over ssh: the client side"). The two
 sources serve the same paths under the same size caps, and the plan, the
 checks, the statistics, and the transaction are the same for both. An HTTP
 request that fails retryably is sent again inside the HTTP source; the
@@ -2354,15 +2356,16 @@ the configuration, and it reads the `[core]` keys that each transaction
 reads. `pull` reads the trust with `PullTrust::from_remote` before it opens
 the session, so a refused policy starts no fetcher and no ssh client. Then
 `pull` runs the engine of `pull_with_session`, with the `branches` key and
-the summary copy of a named remote. `pull_with_session` ignores `endpoint`,
-because the session selects the server. Before its first request, before the
-transaction opens, and before it counts into `progress`, it refuses these
-values:
+the summary copy of a named remote. Before its first request, before the
+transaction opens, and before it counts into `progress`, `pull_with_session`
+refuses these values:
 
 - an empty `refs`, also under `MIRROR`, with `InvalidInput`;
 - a `verify` other than the default, with `InvalidInput`;
 - a set `max_outstanding_fetches`, with `InvalidInput`. The limit of the
   session applies;
+- `overrides` other than the default, with `InvalidInput`. The session
+  selects the server;
 - a set `collection_id`, with `Unsupported`, as `pull` does.
 
 On a refusal, the pull calls `PullSession::finish`, ignores its result, and
@@ -2391,9 +2394,9 @@ summary. It stores the objects and the `.commitmeta` files, and removes the
 `TimestampCheck::CurrentRef` still read the ref the pull would write. The pull
 resolves each name as a ref name, through the summary or the ref file. A
 checksum given as a name fails with `RefNotFound`, unless the remote holds a
-ref of that name. `pull` and `pull_over_stream` refuse `collection_id` with
-`Unsupported` before the first request, so no ssh client starts and the remote
-needs no section in the configuration. `pull_with_session` refuses
+ref of that name. `pull` refuses `collection_id` with `Unsupported` before
+the first request, so no ssh client starts and the remote needs no section in
+the configuration. `pull_with_session` refuses
 `collection_id` with `Unsupported` before its first request on the session of
 the caller.
 
@@ -2503,8 +2506,8 @@ pub struct PullOptions {
                                           // the caller writes the refs
     pub collection_id: Option<String>,    // local pull: refs/mirrors/<id>/<ref>;
                                           // needs no_ref_writes and named refs;
-                                          // pull / pull_over_stream /
-                                          // pull_with_session: Unsupported
+                                          // pull / pull_with_session:
+                                          // Unsupported
     pub flags: PullFlags,
     pub depth: i32,                       // 0 = the commit alone, -1 = all;
                                           // below -1: InvalidInput, nothing written
@@ -2516,14 +2519,11 @@ pub struct PullOptions {
     pub subpaths: Vec<String>,            // absolute paths; empty is the whole
                                           // tree; a local pull refuses them;
                                           // leaves each commit partial
-    pub endpoint: Option<Endpoint>,       // None: Repo::pull calls
-                                          // resolve_pull with the default
-                                          // overrides; Some: the pull reads no
-                                          // address, tls-*, proxy, ssh-command,
-                                          // or send-command key; an Http
-                                          // endpoint names at least one mirror;
-                                          // pull_over_stream refuses Some;
-                                          // pull_with_session ignores it
+    pub overrides: EndpointOverrides,     // Repo::pull gives them to
+                                          // resolve_pull; the default
+                                          // overrides nothing;
+                                          // pull_with_session refuses a
+                                          // value other than the default
     pub max_outstanding_fetches: Option<usize>,  // HTTP: Some replaces the
                                                  // max_outstanding of the
                                                  // endpoint, None keeps it;
@@ -2633,25 +2633,16 @@ impl Repo {
         -> Result<PullStats>;
     /// The pull through a session of the caller, under its trust. It reads
     /// no remote section. Before the first request it refuses an empty
-    /// `refs`, a `verify` other than the default, and a set
-    /// `max_outstanding_fetches` with InvalidInput, and a set
-    /// `collection_id` with Unsupported. It ignores `endpoint`.
+    /// `refs`, a `verify` other than the default, a set
+    /// `max_outstanding_fetches`, and `overrides` other than the default
+    /// with InvalidInput, and a set `collection_id` with Unsupported.
     pub async fn pull_with_session(&self, session: PullSession,
                                    trust: PullTrust, opts: PullOptions)
         -> Result<PullStats>;
-    /// The pull through the stream source, over a pair of streams to `ostrya
-    /// send` (see "Pull over ssh: the client side").
-    pub async fn pull_over_stream<R, W>(&self, remote: &str, input: R,
-                                        output: W, opts: PullOptions)
-        -> Result<PullStats>
-    where
-        R: AsyncRead + Unpin + Send + 'static,
-        W: AsyncWrite + Unpin + Send + 'static;
     /// The remote's `summary` and `summary.sig` bytes, an absent one as None,
-    /// over HTTP or over ssh at `endpoint`. None resolves the endpoint of
-    /// `remote` as `pull` does.
-    pub async fn remote_fetch_summary(&self, remote: &str,
-                                      endpoint: Option<Endpoint>)
+    /// over HTTP or over ssh. It resolves the endpoint of `remote` as `pull`
+    /// does, with the default overrides.
+    pub async fn remote_fetch_summary(&self, remote: &str)
         -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)>;
 }
 
@@ -3991,10 +3982,10 @@ files that the keys name. It gives a `remote::Endpoint` that holds all
 values in memory. `resolve_pull` is in every build. The `push` feature
 gates `resolve_push`. `ostrya push` and `ostrya push-tree` call
 `resolve_push`, and give the endpoint to `Repo::push` or to
-`PushSession::prepare`. `ostrya pull` calls `resolve_pull`, and gives the
-endpoint to `Repo::pull` in `PullOptions::endpoint`. `Repo::pull` and
-`Repo::remote_fetch_summary` call `resolve_pull` with the default overrides
-when the caller gives no endpoint.
+`PushSession::prepare`. `ostrya pull` gives the values of its options to
+`Repo::pull` in `PullOptions::overrides`. `Repo::pull` calls `resolve_pull`
+with them. `Repo::remote_fetch_summary` calls `resolve_pull` with the default
+overrides.
 
 ```rust
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -4895,9 +4886,10 @@ Failures:
 
 ## Pull over ssh: the client side
 
-`StreamSession` of `ostrya-remote` is the client half of the pull over ssh,
-and `Repo::pull_over_stream` wraps it as the stream source of the pull
-driver. Both take no feature.
+`StreamSession` of `ostrya-remote` is the client half of the pull over ssh.
+`PullSession::Stream` wraps it, and `Repo::pull_with_session` reads it as the
+stream source of the pull driver. `StreamSession`, `PullSession`, and
+`Repo::pull_with_session` take no feature.
 
 ```rust
 // ostrya-remote
@@ -5023,12 +5015,13 @@ The session:
 
 The pull through the stream source:
 
-- `Repo::pull_over_stream` resolves the signature policy, then opens the
-  session over the streams, then runs the pull of `Repo::pull` through the
-  stream source: the summary, the refs, the deltas, the commit walk,
-  `depth`, the subpaths, the transaction, and the statistics. `remote` names
-  the remote whose configuration the pull reads: the policy, the `branches`,
-  and the prefix of the refs.
+- The caller opens the session over the streams with
+  `PullSession::over_stream`, and gives it to `Repo::pull_with_session` with
+  a `PullTrust`. The pull runs the engine of `Repo::pull` through the stream
+  source: the summary, the refs, the deltas, the commit walk, `depth`, the
+  subpaths, the transaction, and the statistics. It reads no remote section
+  of the configuration. `PullTrust::from_remote` gives the trust of a
+  configured remote, and `PullOptions::remote` gives the prefix of the refs.
 - The source asks for each file by the path of the HTTP pull. A ref goes as
   written, with no percent-encoding. A body is held to the cap of its path:
   `MAX_ROOT_FILE` for `summary`, `summary.sig`, and `config`, `MAX_REF_FILE`
@@ -5053,31 +5046,26 @@ The pull through the stream source:
   that error came from the session, `Error::Remote`, it takes the error that
   `finish` gives, so an I/O error under a failed ssh client becomes
   `Error::Transport`. An error of the session is `Error::Remote`.
-- `pull_over_stream` refuses `PullOptions::endpoint` of each transport with
-  `Error::InvalidInput`, because the caller already connected the streams.
 
 The pull over ssh to an address:
 
-- `Repo::pull` takes the endpoint of `PullOptions::endpoint`. If the field
-  is `None`, it calls `resolve_pull` with the default overrides. The
+- `Repo::pull` calls `resolve_pull` with `PullOptions::overrides`. The
   address, the `SshOptions`, and the refusals of the HTTP fields for an ssh
-  address are the rules of `resolve_pull` ("Endpoint resolution"), or the
-  values of the caller. An endpoint of the caller is used as it is, except
-  for the request limit of the next item: the pull reads no `pull-url`, `url`, `tls-*`, `proxy`, `ssh-command`, or
-  `send-command` key. It still reads the signature keys and `branches` of
-  the named remote. By default, the name gives the prefix of the refs.
-  `PullOptions::remote` and `PullFlags::MIRROR` change the prefix.
+  address are the rules of `resolve_pull` ("Endpoint resolution"). The pull
+  reads the signature keys and `branches` of the named remote. By default,
+  the name gives the prefix of the refs. `PullOptions::remote` and
+  `PullFlags::MIRROR` change the prefix.
 - For an `Endpoint::Ssh`, `PullOptions::max_outstanding_fetches` sets
   `StreamSessionOptions::max_outstanding`, and `None` is 8. For an
   `Endpoint::Http`, a `Some` value replaces `FetcherOptions::max_outstanding`
-  of the endpoint, and `None` keeps it. An `Endpoint::Http` with no mirror is
-  `Error::InvalidInput` before any request.
+  of the endpoint, and `None` keeps it.
 - `Repo::pull` resolves the signature policy, then starts the ssh client with
-  `StreamSession::connect`, at the point where the HTTP pull sends its first
-  request, and then runs the pull of `pull_over_stream`.
-- `Repo::remote_fetch_summary` takes an `Option<Endpoint>`, and resolves
-  `None` as `Repo::pull` does. Over ssh it reads `summary.sig` and `summary`
-  as two calls in flight together, and ends the session before it returns.
+  `PullSession::connect`, at the point where the HTTP pull sends its first
+  request, and then runs the engine of `Repo::pull_with_session`.
+- `Repo::remote_fetch_summary` resolves the endpoint of the remote as
+  `Repo::pull` does, with the default overrides. Over ssh it reads
+  `summary.sig` and `summary` as two calls in flight together, and ends the
+  session before it returns.
 
 ## Static deltas
 

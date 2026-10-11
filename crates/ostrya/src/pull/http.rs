@@ -1,9 +1,9 @@
 //! The pull from a remote, over HTTP or over ssh.
 //!
-//! [`Repo::pull`], [`Repo::pull_with_session`], [`Repo::pull_over_stream`],
-//! and [`Repo::remote_fetch_summary`] are the entry points. [`Repo::pull`]
-//! holds the rules of the pull. [`Repo::pull`], [`Repo::pull_with_session`],
-//! and [`Repo::pull_over_stream`] run one engine.
+//! [`Repo::pull`], [`Repo::pull_with_session`], and
+//! [`Repo::remote_fetch_summary`] are the entry points. [`Repo::pull`] holds
+//! the rules of the pull. [`Repo::pull`] and [`Repo::pull_with_session`] run
+//! one engine.
 //!
 //! The loop that drives the steps owns the plan, so the plan needs no lock.
 //! The pull spawns no task: the step futures borrow the repository, the
@@ -21,7 +21,7 @@ use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
 use async_compression::futures::bufread::DeflateDecoder;
-use futures_io::{AsyncRead, AsyncWrite};
+use futures_io::AsyncRead;
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use ostrya_core::{
     Checksum, Commit, DirTree, FileHeader, ObjectName, ObjectType, RepoMode, loose_path,
@@ -77,11 +77,10 @@ impl Repo {
     /// repository. The section gives the signature policy and the `branches`
     /// key. By default, the name gives the prefix of the written refs.
     /// [`remote`](PullOptions::remote) and [`MIRROR`](PullFlags::MIRROR)
-    /// change this. With no
-    /// [`endpoint`](PullOptions::endpoint), the section also gives the
-    /// address, the TLS material, and the proxy. The pull fetches the objects
-    /// into one transaction, publishes them, and then writes the refs. It
-    /// returns the statistics of the pull.
+    /// change this. The section also gives the address, the TLS material, and
+    /// the proxy, and [`overrides`](PullOptions::overrides) changes them. The
+    /// pull fetches the objects into one transaction, publishes them, and then
+    /// writes the refs. It returns the statistics of the pull.
     ///
     /// The module [`pull`](mod@crate::pull) states the rules of the
     /// `.commitpartial` markers. It also states the concurrency, the write
@@ -96,12 +95,11 @@ impl Repo {
     ///
     /// # Address
     ///
-    /// The pull reads the remote at [`endpoint`](PullOptions::endpoint). If
-    /// the field is `None`, the pull calls
-    /// [`resolve_pull`] with the default
-    /// overrides, and uses the endpoint that it returns. `resolve_pull` reads
-    /// the address from the remote key `pull-url` or `url`, and states the
-    /// rules of the address.
+    /// The pull calls [`resolve_pull`] with
+    /// [`overrides`](PullOptions::overrides), and reads the remote at the
+    /// endpoint that it returns. `resolve_pull` reads the address from
+    /// [`EndpointOverrides::url`], or else from the remote key `pull-url` or
+    /// `url`, and states the rules of the address.
     ///
     /// An [`Endpoint::Http`] gives an HTTP pull through the fetcher, and an
     /// [`Endpoint::Ssh`] gives a pull over ssh. The fetcher gets each mirror
@@ -139,8 +137,7 @@ impl Repo {
     /// For an ssh endpoint, the pull runs the ssh client after it resolves the
     /// signature policy. The [`SshOptions`](crate::remote::SshOptions) of the
     /// endpoint give the commands of the client, by the rules of
-    /// [`StreamSession::connect`](crate::remote::StreamSession::connect). The
-    /// session obeys the rules of [`pull_over_stream`](Repo::pull_over_stream).
+    /// [`StreamSession::connect`](crate::remote::StreamSession::connect).
     ///
     /// `resolve_pull` reads no remote key that applies to HTTP alone for an
     /// ssh address: `contenturl`, `metalink`, `proxy`, and the `tls-*` keys.
@@ -149,10 +146,10 @@ impl Repo {
     ///
     /// The pull reads the remote through a source: the HTTP source over the
     /// fetcher, or the stream source over a stream session.
-    /// [`pull_over_stream`](Repo::pull_over_stream) opens the stream source
-    /// over a pair of streams. The two sources serve the same paths under the
-    /// same caps. Each rule of this method applies to both sources, with these
-    /// differences:
+    /// [`PullSession::over_stream`] opens a stream session over a pair of
+    /// streams, for [`pull_with_session`](Repo::pull_with_session). The two
+    /// sources serve the same paths under the same caps. Each rule of this
+    /// method applies to both sources, with these differences:
     ///
     /// - The stream source requests a ref by its name as written, with no
     ///   percent-encoding.
@@ -340,11 +337,9 @@ impl Repo {
     ///   [`collection_id`](PullOptions::collection_id) is set. The pull reads
     ///   no collection ref.
     /// - [`Error::Pull`] if a subpath does not start with `/`.
-    /// - The errors of [`resolve_pull`] if
-    ///   [`endpoint`](PullOptions::endpoint) is `None`. Among them,
-    ///   [`Error::Io`] names the key and the path of a PEM file that cannot be
-    ///   read, and a PEM file over 1 MiB is [`Error::InvalidInput`].
-    /// - [`Error::InvalidInput`] if an [`Endpoint::Http`] names no mirror.
+    /// - The errors of [`resolve_pull`]. Among them, [`Error::Io`] names the
+    ///   key and the path of a PEM file that cannot be read, and a PEM file
+    ///   over 1 MiB is [`Error::InvalidInput`].
     /// - [`Error::Remote`] with
     ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the ssh
     ///   command or the send command of an [`Endpoint::Ssh`] is empty or holds
@@ -439,10 +434,8 @@ impl Repo {
         refuse_remote_collection(&opts)?;
         // The endpoint is resolved first, so a remote the config does not
         // describe reports that before a policy is resolved for it.
-        let endpoint = match opts.endpoint.take() {
-            Some(endpoint) => endpoint,
-            None => resolve_pull(Some(self.config()), remote, EndpointOverrides::default()).await?,
-        };
+        let overrides = std::mem::take(&mut opts.overrides);
+        let endpoint = resolve_pull(Some(self.config()), remote, overrides).await?;
         // The trust comes before the session, so a refused policy starts no
         // fetcher and no ssh client.
         let trust = PullTrust::from_remote(self, remote, &opts.verify).await?;
@@ -490,8 +483,6 @@ impl Repo {
     ///
     /// The pull reads no remote section of the config of this repository. It
     /// reads the `[core]` keys that each transaction reads.
-    /// [`endpoint`](PullOptions::endpoint) has no effect, because the session
-    /// selects the server.
     ///
     /// # Refs
     ///
@@ -554,6 +545,8 @@ impl Repo {
     /// - [`Error::InvalidInput`] if
     ///   [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches) is
     ///   set. The limit of the session applies.
+    /// - [`Error::InvalidInput`] if [`overrides`](PullOptions::overrides) is
+    ///   not the default. The session selects the server.
     ///
     /// After these checks, the pull has the errors of [`pull`](Repo::pull)
     /// that stop it before it fetches an object, while it fetches, and at any
@@ -600,82 +593,6 @@ impl Repo {
         };
         self.run_session(session, trust, opts, Wanted::Named, subpaths, started)
             .await
-    }
-
-    /// Pulls refs and their objects from `ostrya send` over a pair of streams.
-    ///
-    /// `input` carries the bytes from the server, and `output` carries the
-    /// bytes to it. The caller connects them to `ostrya send` on the side of
-    /// the remote repository.
-    ///
-    /// `remote` names the remote whose config the pull reads, as for
-    /// [`pull`](Repo::pull): the signature policy, the `branches` key, and the
-    /// prefix of the written refs. The remote needs no config section, as for a
-    /// pull with an [`endpoint`](PullOptions::endpoint).
-    ///
-    /// The pull obeys every rule of [`pull`](Repo::pull): the transaction, the
-    /// commit walk, [`depth`](PullOptions::depth), the subpaths, the
-    /// verification of signatures, the static deltas, and the statistics.
-    ///
-    /// The session opens after the pull resolves the signature policy, so a
-    /// refused policy writes nothing to `output`. The session keeps at most
-    /// [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches)
-    /// requests in flight. It never sends a request again, and it puts no time
-    /// limit on a read. Before the transaction commits, the pull closes
-    /// `output`, which ends the session.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::InvalidInput`] if `opts` sets
-    ///   [`endpoint`](PullOptions::endpoint). The caller already connected the
-    ///   streams.
-    /// - [`Error::Unsupported`] if
-    ///   [`collection_id`](PullOptions::collection_id) is set, before the
-    ///   session opens.
-    /// - [`Error::Remote`] if the session fails. A failure ends the session and
-    ///   the pull.
-    /// - The other errors of [`pull`](Repo::pull) that apply to a pull over
-    ///   ssh.
-    pub async fn pull_over_stream<R, W>(
-        &self,
-        remote: &str,
-        input: R,
-        output: W,
-        mut opts: PullOptions,
-    ) -> Result<PullStats>
-    where
-        R: AsyncRead + Unpin + Send + 'static,
-        W: AsyncWrite + Unpin + Send + 'static,
-    {
-        let started = Instant::now();
-        let subpaths = Subpaths::parse(&opts.subpaths)?;
-        check_depth(opts.depth)?;
-        refuse_remote_collection(&opts)?;
-        if opts.endpoint.is_some() {
-            return Err(Error::InvalidInput(
-                "a pull over a pair of streams takes no endpoint, because the caller \
-                 already connected the streams"
-                    .into(),
-            ));
-        }
-        let trust = PullTrust::from_remote(self, remote, &opts.verify).await?;
-        let stream = StreamSessionOptions {
-            agent: None,
-            max_outstanding: opts.max_outstanding_fetches,
-        };
-        let session = PullSession::over_stream(input, output, stream).await?;
-        opts.verify = PullVerify::default();
-        opts.max_outstanding_fetches = None;
-        opts.remote = opts.remote.or_else(|| Some(remote.to_owned()));
-        self.run_session(
-            session,
-            trust,
-            opts,
-            Wanted::Config(remote),
-            subpaths,
-            started,
-        )
-        .await
     }
 
     /// Runs a pull through `session` to its end, under `trust`.
@@ -915,12 +832,11 @@ impl Repo {
     /// file that the remote does not serve is `None`. Each file has a cap of
     /// 64 MiB.
     ///
-    /// The call reaches the remote at `endpoint`, as [`pull`](Repo::pull)
-    /// does. If `endpoint` is `None`, the call resolves the endpoint of
-    /// `remote` with [`resolve_pull`] and the
-    /// default overrides. It then reads the address from `pull-url` or `url`,
-    /// and over HTTP it uses the TLS material and the proxy of the remote.
-    /// Over ssh, the remote keys `ssh-command` and `send-command` give the
+    /// The call reaches the remote as [`pull`](Repo::pull) does. It resolves
+    /// the endpoint of `remote` with [`resolve_pull`] and the default
+    /// overrides. It then reads the address from `pull-url` or `url`, and
+    /// over HTTP it uses the TLS material and the proxy of the remote. Over
+    /// ssh, the remote keys `ssh-command` and `send-command` give the
     /// commands. The `OSTRYA_SSH_COMMAND` environment variable has precedence
     /// over `ssh-command`.
     ///
@@ -930,9 +846,7 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - The errors of [`resolve_pull`] if
-    ///   `endpoint` is `None`.
-    /// - [`Error::InvalidInput`] if an [`Endpoint::Http`] names no mirror.
+    /// - The errors of [`resolve_pull`].
     /// - [`Error::Remote`] with
     ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the ssh
     ///   command or the send command of an [`Endpoint::Ssh`] is empty or holds
@@ -949,12 +863,9 @@ impl Repo {
     pub async fn remote_fetch_summary(
         &self,
         remote: &str,
-        endpoint: Option<Endpoint>,
     ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-        let endpoint = match endpoint {
-            Some(endpoint) => endpoint,
-            None => resolve_pull(Some(self.config()), remote, EndpointOverrides::default()).await?,
-        };
+        let endpoint =
+            resolve_pull(Some(self.config()), remote, EndpointOverrides::default()).await?;
         let session = connect(endpoint, StreamSessionOptions::default()).await?;
         let source = RemoteSource::new(session, Vec::new());
         let read = source.summary_files().await;
@@ -1636,8 +1547,6 @@ struct FetchedPull {
 ///
 /// Over ssh, the session takes the options `stream`. Over HTTP, the options
 /// of the endpoint give the request limit, and `stream` must be the default.
-/// The call refuses HTTP options that name no mirror with
-/// [`Error::InvalidInput`], before any request.
 async fn connect(endpoint: Endpoint, stream: StreamSessionOptions) -> Result<PullSession> {
     match endpoint {
         Endpoint::Http(http) => PullSession::connect(Endpoint::Http(http), stream)
@@ -1670,6 +1579,13 @@ fn check_session_pull(opts: &PullOptions) -> Result<Option<Subpaths>> {
         return Err(Error::InvalidInput(
             "a pull with a session takes its request limit from the session, and \
              takes no max_outstanding_fetches option"
+                .into(),
+        ));
+    }
+    if opts.overrides != EndpointOverrides::default() {
+        return Err(Error::InvalidInput(
+            "a pull with a session takes its server from the session, and takes \
+             no endpoint overrides"
                 .into(),
         ));
     }
@@ -2578,9 +2494,8 @@ pub(crate) async fn check_stream_end<R: AsyncRead + Unpin>(
     Ok(())
 }
 
-/// A compile-time check that the future of a pull is `Send`: over HTTP,
-/// through a session of the caller, through the stream source, and from a
-/// local repository.
+/// A compile-time check that the future of a pull is `Send`: from a remote,
+/// through a session of the caller, and from a local repository.
 const _: fn() = || {
     fn assert_send<T: Send>(_: &T) {}
     let _ = |repo: &Repo| assert_send(&repo.pull("origin", PullOptions::default()));
@@ -2592,14 +2507,6 @@ const _: fn() = || {
         ))
     };
     let _ = |repo: &Repo, src: &Repo| assert_send(&repo.pull_local(src, PullOptions::default()));
-    let _ = |repo: &Repo| {
-        assert_send(&repo.pull_over_stream(
-            "origin",
-            futures_lite::io::empty(),
-            futures_lite::io::sink(),
-            PullOptions::default(),
-        ))
-    };
 };
 
 #[cfg(test)]

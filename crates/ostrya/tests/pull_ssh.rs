@@ -1,5 +1,6 @@
-//! Tests of the pull through the ssh source. `Repo::pull_over_stream` is the
-//! client and `Repo::send` is the server, over two bounded in-process pipes.
+//! Tests of the pull through the stream source. `PullSession::over_stream`
+//! with `Repo::pull_with_session` is the client and `Repo::send` is the
+//! server, over two bounded in-process pipes.
 //!
 //! The oracle of each pull is the HTTP pull of the same remote into a second
 //! destination of the same mode. The refs, the objects, the markers, and the
@@ -24,11 +25,12 @@ use futures_lite::future;
 use futures_lite::io::AsyncRead;
 use ostrya::endpoint::{EndpointOverrides, resolve_pull};
 use ostrya::remote::proto::{FrameReader, Message};
-use ostrya::remote::{Endpoint, PullSession, SshAddress, SshOptions, StreamSessionOptions};
+use ostrya::remote::{PullSession, StreamSessionOptions};
 use ostrya::verify::PullTrust;
 use ostrya::{
     Checksum, CommitModifierFlags, CreateOptions, DeltaOptions, Error, FsckOptions, ObjectType,
-    PullFlags, PullOptions, PullProgress, PullStats, Repo, RepoMode, SummaryOptions, loose_path,
+    PullFlags, PullOptions, PullProgress, PullStats, PullVerify, Repo, RepoMode, SummaryOptions,
+    loose_path,
 };
 use ostrya_rt::block_on;
 use pull::{
@@ -72,24 +74,34 @@ async fn dest_with_keys(path: &Path, mode: RepoMode, keys: &str) -> Repo {
     Repo::open(path).await.unwrap()
 }
 
-/// Pulls from `remote` into `dest` through the ssh source, with `Repo::send`
-/// as the server of `remote`. Returns the result of the pull and the result
-/// of the server.
+/// Pulls from `remote` into `dest` over a stream session with
+/// `Repo::pull_with_session`, with `Repo::send` as the server of `remote`.
+/// Returns the result of the pull and the result of the server.
+///
+/// The function takes the trust of the remote `origin` of `dest` with
+/// `PullTrust::from_remote` under the policy of `opts`, and that trust must
+/// build. The session takes the request limit of `opts`. If `opts` names no
+/// remote, the refs go under `origin`.
 async fn pull_ssh(
     dest: &Repo,
     remote: &Repo,
     opts: PullOptions,
 ) -> (Result<PullStats, Error>, Result<(), Error>) {
-    let (to_server, server_in) = pipe(PIPE_CAP);
-    let (server_out, from_server) = pipe(PIPE_CAP);
-    within(
-        "the pull over ssh",
-        future::zip(
-            dest.pull_over_stream("origin", from_server, to_server, opts),
-            async move { remote.send(server_in, server_out).await },
-        ),
-    )
-    .await
+    let trust = PullTrust::from_remote(dest, "origin", &opts.verify)
+        .await
+        .unwrap();
+    let stream = StreamSessionOptions {
+        agent: None,
+        max_outstanding: opts.max_outstanding_fetches,
+    };
+    let opts = PullOptions {
+        verify: PullVerify::default(),
+        max_outstanding_fetches: None,
+        remote: opts.remote.or_else(|| Some("origin".to_owned())),
+        ..opts
+    };
+    let (pulled, served, _) = pull_session_ssh(dest, remote, trust, stream, opts).await;
+    (pulled, served)
 }
 
 /// The objects, the refs, and the state files of the repository at `path`.
@@ -484,29 +496,13 @@ fn a_stated_length_above_the_cap_ends_the_session() {
     });
 }
 
-/// A pull over a pair of streams refuses an endpoint of each transport. The
-/// resolution of an HTTP address refuses the ssh command and the send
-/// command. Each refusal occurs before the pull writes a byte.
+/// The resolution of an HTTP address refuses the ssh command and the send
+/// command.
 #[test]
-fn the_fields_of_the_other_transport_are_refused() {
+fn the_resolution_of_an_http_address_refuses_the_ssh_commands() {
     block_on(async {
         let dir = TmpDir::new("pull-ssh-refusals");
-        let (remote, _commit) = build_remote(dir.path()).await;
         let dest = dest_at(&dir.path().join("dest"), RepoMode::Archive, None).await;
-        let ssh = Endpoint::Ssh {
-            address: SshAddress::parse("ssh://localhost/srv/repo").unwrap(),
-            options: SshOptions::default(),
-        };
-        for endpoint in [Endpoint::parse("http://127.0.0.1:1/").unwrap(), ssh] {
-            let opts = PullOptions {
-                endpoint: Some(endpoint),
-                ..main_ref(0)
-            };
-            let (pulled, served) = pull_ssh(&dest, &remote, opts).await;
-            assert!(matches!(pulled, Err(Error::InvalidInput(_))), "{pulled:?}");
-            // The server read the end of its input before any `PullHello`.
-            served.unwrap();
-        }
         for (o, key) in [
             (
                 EndpointOverrides {
@@ -547,18 +543,16 @@ fn recording_ssh(record: &Path) -> Vec<String> {
     ]
 }
 
-/// Resolves the remote `origin` of `dest` with the overrides `o`, and pulls
-/// with the endpoint that the resolution gives.
+/// Pulls from the remote `origin` of `dest` with the overrides `o`.
 async fn pull_resolved(
     dest: &Repo,
     o: EndpointOverrides,
     opts: PullOptions,
 ) -> Result<PullStats, Error> {
-    let endpoint = resolve_pull(Some(dest.config()), "origin", o).await?;
     dest.pull(
         "origin",
         PullOptions {
-            endpoint: Some(endpoint),
+            overrides: o,
             ..opts
         },
     )
@@ -637,33 +631,40 @@ fn the_commands_of_the_caller_win_over_the_remote_keys() {
     });
 }
 
-/// A pull with no endpoint resolves the remote keys. It runs the
-/// `ssh-command` of the remote with the address of `pull-url` and the
-/// `send-command` of the remote.
+/// A destination at `dir/dest` whose remote `origin` has the ssh address
+/// `ssh://localhost/srv/repo` in `pull-url`, a stand-in `ssh-command`, and
+/// the keys `extra`. The stand-in writes its arguments, one to a line, to the
+/// returned path, and serves no session.
+async fn dest_with_standin_ssh(dir: &Path, extra: &str) -> (Repo, std::path::PathBuf) {
+    // A key value splits at white space and cannot hold the script of
+    // `recording_ssh`. The script goes in a file that `sh` reads.
+    let standin = dir.join("standin.sh");
+    std::fs::write(
+        &standin,
+        "record=$1; shift; printf '%s\\n' \"$@\" > \"$record\"\n",
+    )
+    .unwrap();
+    let record = dir.join("record");
+    let dest = dest_with_keys(
+        &dir.join("dest"),
+        RepoMode::Archive,
+        &format!(
+            "pull-url=ssh://localhost/srv/repo\nssh-command=sh {} {}\n{extra}",
+            standin.display(),
+            record.display()
+        ),
+    )
+    .await;
+    (dest, record)
+}
+
+/// A pull resolves the remote keys. It runs the `ssh-command` of the remote
+/// with the address of `pull-url` and the `send-command` of the remote.
 #[test]
-fn a_pull_with_no_endpoint_runs_the_ssh_keys_of_the_remote() {
+fn a_pull_runs_the_ssh_keys_of_the_remote() {
     block_on(async {
-        let dir = TmpDir::new("pull-ssh-no-endpoint");
-        // A key value splits at white space and cannot hold the script of
-        // `recording_ssh`. The script goes in a file that `sh` reads.
-        let standin = dir.path().join("standin.sh");
-        std::fs::write(
-            &standin,
-            "record=$1; shift; printf '%s\\n' \"$@\" > \"$record\"\n",
-        )
-        .unwrap();
-        let record = dir.path().join("record");
-        let dest = dest_with_keys(
-            &dir.path().join("dest"),
-            RepoMode::Archive,
-            &format!(
-                "pull-url=ssh://localhost/srv/repo\nssh-command=sh {} {}\n\
-                 send-command=my-send\n",
-                standin.display(),
-                record.display()
-            ),
-        )
-        .await;
+        let dir = TmpDir::new("pull-ssh-remote-keys");
+        let (dest, record) = dest_with_standin_ssh(dir.path(), "send-command=my-send\n").await;
         let pulled = dest.pull("origin", main_ref(0)).await;
         // The stand-in serves no session.
         assert!(pulled.is_err());
@@ -674,38 +675,69 @@ fn a_pull_with_no_endpoint_runs_the_ssh_keys_of_the_remote() {
     });
 }
 
-/// `remote_fetch_summary` with an ssh endpoint of the caller runs the
-/// address and the commands of the endpoint. It reads no `pull-url`, no
-/// `ssh-command`, and no `send-command` key of the remote.
+/// `remote_fetch_summary` resolves the remote keys as a pull does. It runs
+/// the `ssh-command` of the remote with the address of `pull-url` and the
+/// `send-command` of the remote.
 #[test]
-fn remote_fetch_summary_takes_an_ssh_endpoint_of_the_caller() {
+fn remote_fetch_summary_runs_the_ssh_keys_of_the_remote() {
     block_on(async {
-        let dir = TmpDir::new("pull-ssh-fetch-summary-endpoint");
-        let dest = dest_with_keys(
-            &dir.path().join("dest"),
-            RepoMode::Archive,
-            "pull-url=ssh://other/srv/other\nssh-command=/nonexistent/ssh\n\
-             send-command=/nonexistent/send\n",
+        let dir = TmpDir::new("pull-ssh-fetch-summary-keys");
+        let (dest, record) = dest_with_standin_ssh(dir.path(), "send-command=my-send\n").await;
+        let fetched = dest.remote_fetch_summary("origin").await;
+        // The stand-in serves no session.
+        assert!(fetched.is_err());
+        assert_eq!(
+            recorded(&record).unwrap(),
+            ["localhost", "my-send --repo='/srv/repo'"]
+        );
+    });
+}
+
+/// `PullSession::fetch_summary` over a stream returns the summary of the
+/// remote and its signature. A file that the remote does not serve is
+/// `None`. One session serves each call, and it ends with `Ok`.
+#[test]
+fn a_pull_session_fetches_the_summary_over_a_stream() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-session-fetch-summary");
+        let (remote, _commit) = build_remote(dir.path()).await;
+        let root = dir.path().join("remote");
+        let summary = std::fs::read(root.join("summary")).unwrap();
+        let (to_server, server_in) = pipe(PIPE_CAP);
+        let (server_out, from_server) = pipe(PIPE_CAP);
+        let (fetched, served) = within(
+            "the summary reads through a stream session",
+            future::zip(
+                async {
+                    let session = PullSession::over_stream(
+                        from_server,
+                        to_server,
+                        StreamSessionOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                    let mut fetched = vec![session.fetch_summary().await.unwrap()];
+                    std::fs::write(root.join("summary.sig"), b"signature bytes").unwrap();
+                    fetched.push(session.fetch_summary().await.unwrap());
+                    std::fs::remove_file(root.join("summary")).unwrap();
+                    fetched.push(session.fetch_summary().await.unwrap());
+                    session.finish().await.unwrap();
+                    fetched
+                },
+                async move { remote.send(server_in, server_out).await },
+            ),
         )
         .await;
-        for (tag, remote_command, sent) in [
-            ("given", Some("my-send"), "my-send --repo='/srv/repo'"),
-            ("default", None, "ostrya send --repo='/srv/repo'"),
-        ] {
-            let record = dir.path().join(tag);
-            let endpoint = Endpoint::Ssh {
-                address: SshAddress::parse("ssh://localhost/srv/repo").unwrap(),
-                options: SshOptions {
-                    command: Some(recording_ssh(&record)),
-                    remote_command: remote_command.map(str::to_owned),
-                    ..SshOptions::default()
-                },
-            };
-            let fetched = dest.remote_fetch_summary("origin", Some(endpoint)).await;
-            // The stand-in serves no session.
-            assert!(fetched.is_err(), "{tag}");
-            assert_eq!(recorded(&record).unwrap(), ["localhost", sent], "{tag}");
-        }
+        served.unwrap();
+        let signature = b"signature bytes".to_vec();
+        assert_eq!(
+            fetched,
+            [
+                (Some(summary.clone()), None),
+                (Some(summary), Some(signature.clone())),
+                (None, Some(signature)),
+            ]
+        );
     });
 }
 
@@ -940,15 +972,15 @@ fn the_ssh_source_with_no_ref_writes_writes_no_ref() {
 }
 
 /// A pull over ssh refuses a collection id. The pull over a pair of streams
-/// refuses it before it writes to the server. The pull from an ssh address
-/// refuses it before the ssh client starts. Neither pull publishes anything.
+/// refuses it before its first `Get`. The pull from an ssh address refuses it
+/// before the ssh client starts. Neither pull publishes anything.
 #[test]
 fn the_ssh_pull_refuses_a_collection_id() {
     block_on(async {
         let dir = TmpDir::new("pull-ssh-collection");
         let (remote, _commit) = build_remote(dir.path()).await;
         let dest_path = dir.path().join("dest");
-        let dest = dest_at(&dest_path, RepoMode::Archive, None).await;
+        let (dest, record) = dest_with_standin_ssh(dir.path(), "").await;
         let before = snapshot(&dest_path);
         let collection = || PullOptions {
             collection_id: Some("org.example.Os".to_owned()),
@@ -957,31 +989,25 @@ fn the_ssh_pull_refuses_a_collection_id() {
         };
         let expected = "only a local pull takes a collection id";
 
-        let (pulled, served) = pull_ssh(&dest, &remote, collection()).await;
+        let (pulled, served, messages) = pull_session_ssh(
+            &dest,
+            &remote,
+            PullTrust::unverified(),
+            StreamSessionOptions::default(),
+            collection(),
+        )
+        .await;
         match pulled {
             Err(Error::Unsupported(msg)) => assert_eq!(msg, expected),
             other => panic!("{other:?}"),
         }
-        // The server read the end of its input before any `PullHello`.
+        assert!(
+            matches!(messages.as_slice(), [Message::PullHello(_)]),
+            "{messages:?}"
+        );
         served.unwrap();
 
-        let record = dir.path().join("record");
-        let err = dest
-            .pull(
-                "origin",
-                PullOptions {
-                    endpoint: Some(Endpoint::Ssh {
-                        address: SshAddress::parse("ssh://localhost/srv/repo").unwrap(),
-                        options: SshOptions {
-                            command: Some(recording_ssh(&record)),
-                            ..SshOptions::default()
-                        },
-                    }),
-                    ..collection()
-                },
-            )
-            .await
-            .unwrap_err();
+        let err = dest.pull("origin", collection()).await.unwrap_err();
         match err {
             Error::Unsupported(msg) => assert_eq!(msg, expected),
             other => panic!("{other:?}"),
@@ -1013,13 +1039,14 @@ impl AsyncRead for Tap {
 }
 
 /// Pulls from `remote` into `dest` through a stream session that the test
-/// opens, with `Repo::send` as the server of `remote`. Returns the result of
-/// the pull, the result of the server, and the messages that the server read
-/// from the client.
+/// opens with the options `stream`, with `Repo::send` as the server of
+/// `remote`. Returns the result of the pull, the result of the server, and
+/// the messages that the server read from the client.
 async fn pull_session_ssh(
     dest: &Repo,
     remote: &Repo,
     trust: PullTrust,
+    stream: StreamSessionOptions,
     opts: PullOptions,
 ) -> (Result<PullStats, Error>, Result<(), Error>, Vec<Message>) {
     let (to_server, server_in) = pipe(PIPE_CAP);
@@ -1033,12 +1060,7 @@ async fn pull_session_ssh(
         "the pull through a stream session",
         future::zip(
             async {
-                let session = PullSession::over_stream(
-                    from_server,
-                    to_server,
-                    StreamSessionOptions::default(),
-                )
-                .await?;
+                let session = PullSession::over_stream(from_server, to_server, stream).await?;
                 dest.pull_with_session(session, trust, opts).await
             },
             async move { remote.send(server_in, server_out).await },
@@ -1054,11 +1076,13 @@ async fn pull_session_ssh(
     (pulled, served, messages)
 }
 
-/// A pull through a stream session with no check of signatures pulls what
-/// `pull_over_stream` pulls. The refs, the objects, the markers, the fetch
-/// statistics, and the progress counters agree.
+/// A stream pull with `Repo::pull_with_session` into a destination with no
+/// remote section, under `PullTrust::unverified()`, writes the same objects,
+/// refs, and state files as a stream pull under `PullTrust::from_remote` of the
+/// remote `origin` with `gpg-verify=false`. The fetch statistics and the
+/// progress counters agree, and the destination passes fsck.
 #[test]
-fn a_session_pull_over_a_stream_pulls_what_pull_over_stream_pulls() {
+fn an_unverified_stream_pull_pulls_what_a_pull_under_the_remote_pulls() {
     block_on(async {
         let dir = TmpDir::new("pull-ssh-session-same");
         let (remote, _first, _second) = build_remote_two_commits(dir.path()).await;
@@ -1087,6 +1111,7 @@ fn a_session_pull_over_a_stream_pulls_what_pull_over_stream_pulls() {
             &session_dest,
             &remote,
             PullTrust::unverified(),
+            StreamSessionOptions::default(),
             opts(&progress),
         )
         .await;
@@ -1123,6 +1148,7 @@ fn a_session_pull_over_a_stream_refuses_before_the_first_get() {
             &dest,
             &remote,
             PullTrust::unverified(),
+            StreamSessionOptions::default(),
             PullOptions::default(),
         )
         .await;

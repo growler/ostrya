@@ -3,20 +3,17 @@
 //! - [`Repo::pull_local`] reads a local repository directly.
 //! - [`Repo::pull`] fetches from an HTTP remote, or over ssh from a remote
 //!   with an ssh address.
-//! - [`Repo::pull_over_stream`] reads from a server of the pull over ssh,
-//!   with the rules of [`Repo::pull`].
 //! - [`Repo::pull_with_session`] reads through a
 //!   [`PullSession`](crate::remote::PullSession) that the caller opened,
 //!   under a [`PullTrust`](crate::verify::PullTrust) that the caller gives.
 //!   It reads no remote section of the config.
 //!
-//! The four pulls share [`PullOptions`], [`PullFlags`], [`PullStats`], the
+//! The three pulls share [`PullOptions`], [`PullFlags`], [`PullStats`], the
 //! ref-binding check, and the `.commitpartial` markers. [`PullVerify`] holds
 //! the signature policy of each pull other than [`Repo::pull_with_session`].
 //!
 //! The sections from "Concurrency" to "Retries" apply to a pull from a
-//! remote: [`Repo::pull`], [`Repo::pull_over_stream`], and
-//! [`Repo::pull_with_session`].
+//! remote: [`Repo::pull`] and [`Repo::pull_with_session`].
 //!
 //! # Commit state
 //!
@@ -70,9 +67,9 @@
 //!
 //! A pull from a remote keeps as many steps in flight as its session admits:
 //! [`PullSession::max_outstanding`](crate::remote::PullSession::max_outstanding).
-//! [`Repo::pull`] and [`Repo::pull_over_stream`] give the session the limit
-//! of [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches). If
-//! the value is `None`, an HTTP pull keeps up to
+//! [`Repo::pull`] gives the session the limit of
+//! [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches). If the
+//! value is `None`, an HTTP pull keeps up to
 //! [`max_outstanding`](crate::fetch::FetcherOptions::max_outstanding) of its
 //! endpoint, and a pull over ssh keeps up to 8. Each step fetches one object
 //! and stores it. The pull fills a free step from a plan of three classes, in
@@ -584,32 +581,30 @@ impl std::fmt::Debug for DetachedMetadataFilter {
 /// - Only a local pull reads [`collection_id`](PullOptions::collection_id).
 ///   A pull from a remote refuses it.
 /// - A pull from a remote also reads [`subpaths`](PullOptions::subpaths),
-///   [`endpoint`](PullOptions::endpoint),
+///   [`overrides`](PullOptions::overrides),
 ///   [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches),
 ///   [`timestamp_check`](PullOptions::timestamp_check), and
 ///   [`progress`](PullOptions::progress). A local pull refuses `subpaths`.
-/// - [`Repo::pull_with_session`] ignores `endpoint`. It refuses an empty
-///   `refs`, a `verify` other than the default, and a set
+/// - [`Repo::pull_with_session`] refuses an empty `refs`, a `verify` other
+///   than the default, `overrides` other than the default, and a set
 ///   `max_outstanding_fetches`.
 #[derive(Debug, Clone, Default)]
 pub struct PullOptions {
     /// The ref names to pull.
     ///
     /// With an empty list, a local pull takes each ref of the source under
-    /// `refs/heads`. [`Repo::pull`] and [`Repo::pull_over_stream`] take each
-    /// ref that the summary of the remote lists under
-    /// [`MIRROR`](PullFlags::MIRROR), and the configured `branches` of the
-    /// remote otherwise. [`Repo::pull_with_session`] refuses an empty list
-    /// with [`Error::InvalidInput`].
+    /// `refs/heads`. [`Repo::pull`] takes each ref that the summary of the
+    /// remote lists under [`MIRROR`](PullFlags::MIRROR), and the configured
+    /// `branches` of the remote otherwise. [`Repo::pull_with_session`]
+    /// refuses an empty list with [`Error::InvalidInput`].
     pub refs: Vec<String>,
     /// The remote name under which the pull writes the refs
     /// (`refs/remotes/<remote>/<ref>`).
     ///
     /// If the value is `None`, a local pull and [`Repo::pull_with_session`]
-    /// write local refs under `refs/heads/`. [`Repo::pull`] and
-    /// [`Repo::pull_over_stream`] then write the refs under the name of the
-    /// remote. A pull from a remote writes local refs under
-    /// [`MIRROR`](PullFlags::MIRROR), whatever the value. Under
+    /// write local refs under `refs/heads/`. [`Repo::pull`] then writes the
+    /// refs under the name of the remote. A pull from a remote writes local
+    /// refs under [`MIRROR`](PullFlags::MIRROR), whatever the value. Under
     /// [`no_ref_writes`](PullOptions::no_ref_writes) the pull writes no ref,
     /// and the name still selects the ref that the pull reads.
     pub remote: Option<String>,
@@ -665,9 +660,9 @@ pub struct PullOptions {
     ///
     /// Delta discovery reads the name as a refspec, where a `:` changes what
     /// the name refers to. The local pull makes these checks in this order,
-    /// before it reads the source. [`Repo::pull`],
-    /// [`Repo::pull_over_stream`], and [`Repo::pull_with_session`] refuse an
-    /// id with [`Error::Unsupported`] before they send a request.
+    /// before it reads the source. [`Repo::pull`] and
+    /// [`Repo::pull_with_session`] refuse an id with [`Error::Unsupported`]
+    /// before they send a request.
     pub collection_id: Option<String>,
     /// The flag set.
     pub flags: PullFlags,
@@ -738,44 +733,28 @@ pub struct PullOptions {
     /// mode, the pull applies a delta that it finds whole, and the walk after
     /// its last part finds the subpaths present.
     pub subpaths: Vec<String>,
-    /// The endpoint that a pull from a remote reads: the address and the
-    /// options of its transport.
+    /// The overrides of the endpoint resolution of [`Repo::pull`]: the values
+    /// of [`EndpointOverrides`](crate::endpoint::EndpointOverrides).
     ///
-    /// If the value is `None`, [`Repo::pull`] calls
+    /// [`Repo::pull`] gives them to
     /// [`resolve_pull`](crate::endpoint::resolve_pull) with the config of this
-    /// repository, the name of the remote, and the default
-    /// [`EndpointOverrides`](crate::endpoint::EndpointOverrides). The pull
-    /// defaults then apply: 5 retries, 8 requests in flight, and a low speed
-    /// limit of 1000 bytes per second for 30 seconds.
+    /// repository and the name of the remote. A value of the caller wins over
+    /// its remote key. `resolve_pull` refuses the push fields `push_token_file`
+    /// and `push_user` with [`Error::InvalidInput`]. The default value
+    /// overrides nothing, and the pull defaults then apply: 5 retries, 8
+    /// requests in flight, and a low speed limit of 1000 bytes per second for
+    /// 30 seconds.
     ///
-    /// If the value is set, the pull uses the endpoint as it is, with one
-    /// exception: a [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches)
-    /// value replaces the request limit of an HTTP endpoint. The pull reads
-    /// none of the remote keys `pull-url`, `url`, `tls-ca-path`,
-    /// `tls-client-cert-path`, `tls-client-key-path`, `tls-permissive`,
-    /// `proxy`, `ssh-command`, and `send-command`. It still reads the
-    /// signature keys and the `branches` key of the remote. By default, the
-    /// name of the remote gives the prefix of the written refs.
-    /// [`remote`](PullOptions::remote) and [`MIRROR`](PullFlags::MIRROR)
-    /// change this.
-    ///
-    /// An endpoint from [`FetcherOptions::new`](crate::fetch::FetcherOptions::new)
-    /// has the defaults of [`FetcherOptions`](crate::fetch::FetcherOptions),
-    /// with no low speed rule. To get the pull defaults, call `resolve_pull`
-    /// and change the endpoint that it returns.
-    ///
-    /// An [`Endpoint::Http`](crate::remote::Endpoint::Http) must name at least
-    /// one mirror. [`Repo::pull_over_stream`] refuses a value that is set.
-    /// [`Repo::pull_with_session`] ignores the value, because its session
-    /// selects the server.
-    pub endpoint: Option<crate::remote::Endpoint>,
+    /// [`Repo::pull_with_session`] refuses a value other than the default
+    /// with [`Error::InvalidInput`], because its session selects the server.
+    pub overrides: crate::endpoint::EndpointOverrides,
     /// The number of fetches that a pull from a remote keeps in flight.
     ///
     /// For an HTTP endpoint, a value replaces
     /// [`max_outstanding`](crate::fetch::FetcherOptions::max_outstanding) of
     /// the endpoint, and `None` keeps the value of the endpoint.
     /// [`resolve_pull`](crate::endpoint::resolve_pull) sets 8. For an ssh
-    /// endpoint and for [`Repo::pull_over_stream`], the value sets
+    /// endpoint, the value sets
     /// [`max_outstanding`](crate::remote::StreamSessionOptions::max_outstanding)
     /// of the stream session, and `None` is 8.
     ///

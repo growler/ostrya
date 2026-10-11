@@ -6,10 +6,12 @@
 //! `resolve_push`. [`EndpointOverrides`] holds the values of the caller. A
 //! value of the caller wins over its remote key.
 //!
-//! [`Repo::pull`](crate::Repo::pull) and
-//! [`Repo::remote_fetch_summary`](crate::Repo::remote_fetch_summary) call
-//! [`resolve_pull`] with the default overrides when the caller gives no
-//! endpoint.
+//! [`Repo::pull`](crate::Repo::pull) calls [`resolve_pull`] with
+//! [`PullOptions::overrides`](crate::PullOptions::overrides).
+//! [`Repo::remote_fetch_summary`](crate::Repo::remote_fetch_summary) calls it
+//! with the default overrides. A caller that selects its own server opens a
+//! [`PullSession`](crate::remote::PullSession) and calls
+//! [`Repo::pull_with_session`](crate::Repo::pull_with_session).
 //!
 //! [`read_token_file`] and [`read_pem_file`] read a token file and a PEM file.
 //! [`read_pem_file`] reads at most 1 MiB and one byte. [`read_token_file`]

@@ -34,7 +34,7 @@ use common::{
 };
 use futures_lite::future::poll_once;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
-use ostrya::endpoint::{EndpointOverrides, resolve_pull};
+use ostrya::endpoint::EndpointOverrides;
 use ostrya::fetch::{BearerToken, ClientIdentity, Fetcher, FetcherOptions, Proxy};
 use ostrya::remote::{Endpoint, PullSession, StreamSessionOptions};
 use ostrya::sign::Ed25519Verifier;
@@ -48,16 +48,6 @@ use ostrya::{
 use ostrya_rt::{TcpListener, block_on, spawn};
 use proxy::{TestProxy, Tunnel};
 use pull::*;
-
-/// Resolves the remote `origin` of `dest` with the overrides `o`, for
-/// [`PullOptions::endpoint`].
-async fn endpoint(dest: &Repo, o: EndpointOverrides) -> Option<Endpoint> {
-    Some(
-        resolve_pull(Some(dest.config()), "origin", o)
-            .await
-            .unwrap(),
-    )
-}
 
 /// The overrides that set the retry count alone.
 fn retries(max_retries: u32) -> EndpointOverrides {
@@ -2450,7 +2440,7 @@ fn a_connection_cut_mid_pull_fails_and_publishes_nothing() {
                     // With one slot, the failure stays on the object that the
                     // test cut.
                     max_outstanding_fetches: Some(1),
-                    endpoint: endpoint(&dest, retries(0)).await,
+                    overrides: retries(0),
                     ..PullOptions::default()
                 },
             )
@@ -2540,7 +2530,7 @@ fn a_body_cut_every_time_spends_the_retry_count() {
                 PullOptions {
                     refs: vec!["test/main".to_owned()],
                     max_outstanding_fetches: Some(1),
-                    endpoint: endpoint(&dest, retries(2)).await,
+                    overrides: retries(2),
                     ..PullOptions::default()
                 },
             )
@@ -2611,7 +2601,7 @@ fn a_tls_permissive_remote_keeps_the_name_check() {
                     // A failed handshake is retryable, so the test turns off
                     // the retry rounds. Then the pull reports the refusal at
                     // once.
-                    endpoint: endpoint(&dest, retries(0)).await,
+                    overrides: retries(0),
                     ..PullOptions::default()
                 },
             )
@@ -2639,7 +2629,7 @@ fn remote_fetch_summary_reports_both_files() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        let (summary, signature) = dest.remote_fetch_summary("origin", None).await.unwrap();
+        let (summary, signature) = dest.remote_fetch_summary("origin").await.unwrap();
         assert_eq!(
             summary.as_deref(),
             Some(
@@ -2653,7 +2643,7 @@ fn remote_fetch_summary_reports_both_files() {
         // If the remote publishes a signature, the call returns it with the
         // summary.
         std::fs::write(dir.path().join("remote/summary.sig"), b"signature bytes").unwrap();
-        let (_, signature) = dest.remote_fetch_summary("origin", None).await.unwrap();
+        let (_, signature) = dest.remote_fetch_summary("origin").await.unwrap();
         assert_eq!(signature.as_deref(), Some(b"signature bytes".as_slice()));
     });
 }
@@ -2809,7 +2799,7 @@ fn remote_fetch_summary_reads_an_http_pull_url() {
             ));
             std::fs::write(&config, text).unwrap();
             let dest = Repo::open(&path).await.unwrap();
-            let (summary, signature) = dest.remote_fetch_summary("origin", None).await.unwrap();
+            let (summary, signature) = dest.remote_fetch_summary("origin").await.unwrap();
             assert_eq!(summary.as_deref(), Some(expected.as_slice()), "{tag}");
             assert_eq!(signature, None, "{tag}");
         }
@@ -2851,18 +2841,10 @@ fn an_unconfigured_remote_needs_a_url() {
             "elsewhere",
             PullOptions {
                 refs: vec!["test/main".to_owned()],
-                endpoint: Some(
-                    resolve_pull(
-                        Some(dest.config()),
-                        "elsewhere",
-                        EndpointOverrides {
-                            url: Some(server.url()),
-                            ..EndpointOverrides::default()
-                        },
-                    )
-                    .await
-                    .unwrap(),
-                ),
+                overrides: EndpointOverrides {
+                    url: Some(server.url()),
+                    ..EndpointOverrides::default()
+                },
                 verify: PullVerify {
                     gpg: Some(false),
                     ..PullVerify::default()
@@ -5764,7 +5746,7 @@ fn remote_fetch_summary_goes_through_the_proxy_key() {
         )
         .await;
 
-        let (summary, _) = dest.remote_fetch_summary("origin", None).await.unwrap();
+        let (summary, _) = dest.remote_fetch_summary("origin").await.unwrap();
         assert!(summary.is_some());
         let target = format!("{}/summary", server.url());
         assert!(
@@ -5935,20 +5917,37 @@ fn no_proxy_key_reads_the_environment() {
     pull_through_the_environment_proxy("pull-http-proxy-key-absent", "");
 }
 
-// --- endpoints of the caller -------------------------------------------------
+// --- the transport of a pull ------------------------------------------------
 
 /// The address of a remote that answers no request. A pull that read it would
 /// fail.
 const DEAD_URL: &str = "http://127.0.0.1:1/";
 
-/// A caller endpoint with the fixture authority as `TrustRoots::Pem` pulls
-/// over HTTPS. The config of the remote holds no TLS key. The same endpoint
-/// refuses a leaf that another authority signed, and the pull publishes
-/// nothing.
+/// Pulls `test/main` through an HTTP session of the options `http`, with no
+/// check of signatures, into refs under the remote name `origin`.
+async fn pull_main_over(dest: &Repo, http: FetcherOptions) -> Result<PullStats, Error> {
+    let session = PullSession::connect(Endpoint::Http(http), StreamSessionOptions::default())
+        .await
+        .unwrap();
+    dest.pull_with_session(
+        session,
+        PullTrust::unverified(),
+        PullOptions {
+            refs: vec!["test/main".to_owned()],
+            remote: Some("origin".to_owned()),
+            ..PullOptions::default()
+        },
+    )
+    .await
+}
+
+/// A session with the fixture authority as `TrustRoots::Pem` pulls over
+/// HTTPS. The config of the remote holds no TLS key. The same options refuse
+/// a leaf that another authority signed, and the pull publishes nothing.
 #[test]
-fn a_caller_endpoint_with_a_ca_certificate_pulls_over_https() {
+fn a_session_with_a_ca_certificate_pulls_over_https() {
     block_on(async {
-        let dir = TmpDir::new("pull-http-endpoint-ca");
+        let dir = TmpDir::new("pull-http-session-ca");
         let (_remote, commit) = build_remote(dir.path()).await;
         let root = dir.path().join("remote");
         let dest = build_dest(dir.path(), RepoMode::Archive, DEAD_URL, "").await;
@@ -5958,28 +5957,14 @@ fn a_caller_endpoint_with_a_ca_certificate_pulls_over_https() {
         // A failed handshake is retryable, so the test turns off the retry
         // rounds.
         http.max_retries = 0;
-        let err = pull_main(
-            &dest,
-            PullOptions {
-                endpoint: Some(Endpoint::Http(http)),
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap_err();
+        let err = pull_main_over(&dest, http).await.unwrap_err();
         assert!(err.to_string().contains("UnknownIssuer"), "{err}");
         assert_nothing_published(&dest).await;
 
         let server = RepoServer::start(&root, true).await;
-        pull_main(
-            &dest,
-            PullOptions {
-                endpoint: Some(Endpoint::Http(https_endpoint(&server))),
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
+        pull_main_over(&dest, https_endpoint(&server))
+            .await
+            .unwrap();
         assert_eq!(
             dest.resolve_rev("origin:test/main", true).await.unwrap(),
             Some(commit)
@@ -5987,13 +5972,13 @@ fn a_caller_endpoint_with_a_ca_certificate_pulls_over_https() {
     });
 }
 
-/// A caller endpoint with a client identity pulls from a server that demands
-/// a client certificate. With no identity, the same server refuses the pull,
-/// and the pull publishes nothing.
+/// A session with a client identity pulls from a server that demands a client
+/// certificate. With no identity, the same server refuses the pull, and the
+/// pull publishes nothing.
 #[test]
-fn a_caller_endpoint_with_a_client_certificate_pulls_over_https() {
+fn a_session_with_a_client_certificate_pulls_over_https() {
     block_on(async {
-        let dir = TmpDir::new("pull-http-endpoint-client");
+        let dir = TmpDir::new("pull-http-session-client");
         let (_remote, commit) = build_remote(dir.path()).await;
         let server =
             RepoServer::start_demanding_client_certificate(&dir.path().join("remote")).await;
@@ -6001,15 +5986,7 @@ fn a_caller_endpoint_with_a_client_certificate_pulls_over_https() {
 
         let mut http = https_endpoint(&server);
         http.max_retries = 0;
-        let err = pull_main(
-            &dest,
-            PullOptions {
-                endpoint: Some(Endpoint::Http(http.clone())),
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap_err();
+        let err = pull_main_over(&dest, http.clone()).await.unwrap_err();
         assert!(matches!(err, Error::Fetch(_)), "{err}");
         assert_nothing_published(&dest).await;
 
@@ -6018,15 +5995,7 @@ fn a_caller_endpoint_with_a_client_certificate_pulls_over_https() {
             key_pem: CLIENT_KEY_PEM.to_vec(),
             key_passphrase: None,
         });
-        pull_main(
-            &dest,
-            PullOptions {
-                endpoint: Some(Endpoint::Http(http)),
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
+        pull_main_over(&dest, http).await.unwrap();
         assert_eq!(
             dest.resolve_rev("origin:test/main", true).await.unwrap(),
             Some(commit)
@@ -6034,13 +6003,12 @@ fn a_caller_endpoint_with_a_client_certificate_pulls_over_https() {
     });
 }
 
-/// A caller endpoint with a bearer token pulls from a server that demands the
-/// token. With no token, the server answers 401, and the pull publishes
-/// nothing.
+/// A session with a bearer token pulls from a server that demands the token.
+/// With no token, the server answers 401, and the pull publishes nothing.
 #[test]
-fn a_caller_endpoint_with_a_bearer_token_pulls_over_https() {
+fn a_session_with_a_bearer_token_pulls_over_https() {
     block_on(async {
-        let dir = TmpDir::new("pull-http-endpoint-bearer");
+        let dir = TmpDir::new("pull-http-session-bearer");
         let (_remote, commit) = build_remote(dir.path()).await;
         let server = RepoServer::start(&dir.path().join("remote"), true).await;
         server.require_bearer("pull-T0ken");
@@ -6048,15 +6016,7 @@ fn a_caller_endpoint_with_a_bearer_token_pulls_over_https() {
 
         let mut http = https_endpoint(&server);
         http.max_retries = 0;
-        let err = pull_main(
-            &dest,
-            PullOptions {
-                endpoint: Some(Endpoint::Http(http.clone())),
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap_err();
+        let err = pull_main_over(&dest, http.clone()).await.unwrap_err();
         assert!(
             matches!(err, Error::HttpStatus { status: 401, .. }),
             "{err}"
@@ -6066,15 +6026,7 @@ fn a_caller_endpoint_with_a_bearer_token_pulls_over_https() {
         http.bearer_token = Some(BearerToken {
             token: "pull-T0ken".to_owned(),
         });
-        pull_main(
-            &dest,
-            PullOptions {
-                endpoint: Some(Endpoint::Http(http)),
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
+        pull_main_over(&dest, http).await.unwrap();
         assert_eq!(
             dest.resolve_rev("origin:test/main", true).await.unwrap(),
             Some(commit)
@@ -6082,27 +6034,48 @@ fn a_caller_endpoint_with_a_bearer_token_pulls_over_https() {
     });
 }
 
-/// A caller endpoint replaces the address, the TLS keys, and the `proxy` key
-/// of the named remote. Each of these keys would fail the pull. The
-/// signature policy, the `branches` key, and the ref prefix still come from
-/// the remote name.
+/// A session pull under the trust of a named remote checks the commits
+/// against the signature keys of that remote. The session replaces the
+/// address, the TLS keys, and the `proxy` key of the remote. Each of these
+/// keys would fail the pull.
 #[test]
-fn a_caller_endpoint_replaces_the_tls_keys_and_keeps_the_remote_policy() {
+fn a_session_pull_under_the_trust_of_a_remote_reads_no_tls_key() {
     block_on(async {
-        let dir = TmpDir::new("pull-http-endpoint-keys");
+        let dir = TmpDir::new("pull-http-session-remote-trust");
         let (_remote, commit) = build_signed_remote(dir.path(), Some(SECRET_B64)).await;
         let server = RepoServer::start(&dir.path().join("remote"), true).await;
         let keys = |public: &str| {
             format!(
                 "tls-ca-path={}\ntls-permissive=maybe\nproxy={DEAD_URL}\n\
-                 branches=test/main;\nsign-verify=ed25519\n\
-                 verification-ed25519-key={public}\n",
+                 sign-verify=ed25519\nverification-ed25519-key={public}\n",
                 dir.path().join("absent-ca.pem").display()
             )
         };
-        let opts = || PullOptions {
-            endpoint: Some(Endpoint::Http(https_endpoint(&server))),
-            ..PullOptions::default()
+        let pull = |dest: Repo| {
+            let server = &server;
+            async move {
+                let trust = PullTrust::from_remote(&dest, "origin", &PullVerify::default())
+                    .await
+                    .unwrap();
+                let session = PullSession::connect(
+                    Endpoint::Http(https_endpoint(server)),
+                    StreamSessionOptions::default(),
+                )
+                .await
+                .unwrap();
+                let pulled = dest
+                    .pull_with_session(
+                        session,
+                        trust,
+                        PullOptions {
+                            refs: vec!["test/main".to_owned()],
+                            remote: Some("origin".to_owned()),
+                            ..PullOptions::default()
+                        },
+                    )
+                    .await;
+                (dest, pulled)
+            }
         };
 
         let dest = build_dest(
@@ -6112,7 +6085,8 @@ fn a_caller_endpoint_replaces_the_tls_keys_and_keeps_the_remote_policy() {
             &keys(OTHER_PUBLIC_B64),
         )
         .await;
-        let err = dest.pull("origin", opts()).await.unwrap_err();
+        let (dest, pulled) = pull(dest).await;
+        let err = pulled.unwrap_err();
         assert!(
             matches!(&err, Error::Signature(m) if m.contains("is from a trusted key")),
             "{err}"
@@ -6120,7 +6094,8 @@ fn a_caller_endpoint_replaces_the_tls_keys_and_keeps_the_remote_policy() {
         assert_nothing_published(&dest).await;
 
         let dest = reconfigure_dest(dir.path(), DEAD_URL, &keys(PUBLIC_B64)).await;
-        dest.pull("origin", opts()).await.unwrap();
+        let (dest, pulled) = pull(dest).await;
+        pulled.unwrap();
         assert_eq!(
             dest.resolve_rev("origin:test/main", true).await.unwrap(),
             Some(commit)
@@ -6128,68 +6103,8 @@ fn a_caller_endpoint_replaces_the_tls_keys_and_keeps_the_remote_policy() {
     });
 }
 
-/// `remote_fetch_summary` with an HTTP endpoint of the caller fetches the
-/// summary from the mirror of the endpoint. It reads no `url` key of the
-/// remote.
-#[test]
-fn remote_fetch_summary_takes_an_http_endpoint_of_the_caller() {
-    block_on(async {
-        let dir = TmpDir::new("pull-http-endpoint-fetch-summary");
-        build_remote(dir.path()).await;
-        let server = RepoServer::start(&dir.path().join("remote"), true).await;
-        let dest = build_dest(dir.path(), RepoMode::Archive, DEAD_URL, "").await;
-
-        let (summary, signature) = dest
-            .remote_fetch_summary("origin", Some(Endpoint::Http(https_endpoint(&server))))
-            .await
-            .unwrap();
-        let expected = std::fs::read(dir.path().join("remote/summary")).unwrap();
-        assert_eq!(summary.as_deref(), Some(expected.as_slice()));
-        assert_eq!(signature, None);
-    });
-}
-
-/// An HTTP endpoint that names no mirror is refused before any request, by
-/// the pull and by `remote_fetch_summary`. The pull publishes nothing.
-#[test]
-fn an_http_endpoint_with_no_mirror_is_refused() {
-    block_on(async {
-        let dir = TmpDir::new("pull-http-endpoint-no-mirror");
-        build_remote(dir.path()).await;
-        let server = RepoServer::start(&dir.path().join("remote"), false).await;
-        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
-        let mut http = FetcherOptions::new(server.url());
-        http.mirrors.clear();
-        let expected = "the HTTP endpoint of a pull names no mirror";
-
-        let err = pull_main(
-            &dest,
-            PullOptions {
-                endpoint: Some(Endpoint::Http(http.clone())),
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidInput(m) if m == expected),
-            "{err}"
-        );
-        let err = dest
-            .remote_fetch_summary("origin", Some(Endpoint::Http(http)))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidInput(m) if m == expected),
-            "{err}"
-        );
-        assert!(server.seen().is_empty(), "{:?}", server.seen());
-        assert_nothing_published(&dest).await;
-    });
-}
-
-/// A `tls-ca-path` file over 1 MiB fails a pull with no endpoint before any
-/// request. The pull publishes nothing.
+/// A `tls-ca-path` file over 1 MiB fails a pull before any request. The pull
+/// publishes nothing.
 #[test]
 fn a_ca_file_over_one_mib_fails_the_pull_before_any_request() {
     block_on(async {
@@ -6216,43 +6131,60 @@ fn a_ca_file_over_one_mib_fails_the_pull_before_any_request() {
     });
 }
 
+/// Builds an archive remote under `dir/remote` whose ref `test/main` names a
+/// commit of one directory of 32 files, with a summary. The 32 content
+/// objects give the pull 32 fetches that it can run at the same time.
+async fn build_wide_remote(dir: &Path) -> std::path::PathBuf {
+    let src = dir.join("src");
+    std::fs::create_dir(&src).unwrap();
+    for i in 0..32 {
+        std::fs::write(src.join(format!("file-{i}")), format!("{i}\n")).unwrap();
+    }
+    let root = dir.join("remote");
+    let remote = Repo::create(&root, CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap();
+    commit_tree(&remote, dir, "src", "test/main", None, FIXED_TS).await;
+    remote
+        .regenerate_summary(&SummaryOptions {
+            last_modified: Some(FIXED_TS),
+            ..SummaryOptions::default()
+        })
+        .await
+        .unwrap();
+    root
+}
+
 /// The peak of requests in flight that the server sees follows
-/// `max_outstanding_fetches` when it is set, and the request limit of the HTTP
-/// endpoint when it is `None`. A value of 1 holds the peak at 1 over an
-/// endpoint limit of 4. A value of 4 gives a peak above 1 over an endpoint
-/// limit of 1.
+/// `max_outstanding_fetches` when it is set, and the limit of the resolved
+/// endpoint, 8, when it is `None`. A value of 1 holds the peak at 1. A value
+/// of 16 gives a peak above 8.
 #[test]
-fn max_outstanding_fetches_replaces_the_limit_of_the_endpoint() {
+fn max_outstanding_fetches_sets_the_limit_of_the_resolved_endpoint() {
     block_on(async {
         let dir = TmpDir::new("pull-http-endpoint-outstanding");
-        build_remote(dir.path()).await;
-        let root = dir.path().join("remote");
-        for (tag, limit, max_outstanding_fetches, serial) in [
-            ("lower", 4, Some(1), true),
-            ("higher", 1, Some(4), false),
-            ("unset", 1, None, true),
-        ] {
+        let root = build_wide_remote(dir.path()).await;
+        for (tag, max_outstanding_fetches) in
+            [("serial", Some(1)), ("parallel", Some(16)), ("unset", None)]
+        {
             let server = RepoServer::start(&root, false).await;
             let base = dir.path().join(tag);
             std::fs::create_dir(&base).unwrap();
-            let dest = build_dest(&base, RepoMode::Archive, DEAD_URL, "").await;
-            let mut http = FetcherOptions::new(server.url());
-            http.proxy = Proxy::None;
-            http.max_outstanding = limit;
+            let dest = build_dest(&base, RepoMode::Archive, &server.url(), "").await;
             pull_main(
                 &dest,
                 PullOptions {
-                    endpoint: Some(Endpoint::Http(http)),
                     max_outstanding_fetches,
                     ..PullOptions::default()
                 },
             )
             .await
             .unwrap();
-            if serial {
-                assert_eq!(server.peak_inflight(), 1, "{tag}");
-            } else {
-                assert!(server.peak_inflight() > 1, "{tag}");
+            let peak = server.peak_inflight();
+            match max_outstanding_fetches {
+                Some(1) => assert_eq!(peak, 1, "{tag}"),
+                Some(_) => assert!(peak > 8, "{tag}: {peak}"),
+                None => assert!(peak <= 8, "{tag}: {peak}"),
             }
         }
     });
@@ -6390,6 +6322,16 @@ fn a_session_pull_refuses_its_options_before_the_first_request() {
                 },
             ),
             (
+                "overrides",
+                PullOptions {
+                    overrides: EndpointOverrides {
+                        url: Some(DEAD_URL.to_owned()),
+                        ..EndpointOverrides::default()
+                    },
+                    ..main()
+                },
+            ),
+            (
                 "depth",
                 PullOptions {
                     depth: -2,
@@ -6425,8 +6367,13 @@ fn a_session_pull_refuses_its_options_before_the_first_request() {
                 ("collection_id", Error::Unsupported(m)) => {
                     assert_eq!(m, "only a local pull takes a collection id")
                 }
+                ("overrides", Error::InvalidInput(m)) => assert_eq!(
+                    m,
+                    "a pull with a session takes its server from the session, and takes \
+                     no endpoint overrides"
+                ),
                 ("subpath", Error::Pull(_)) => {}
-                ("collection_id" | "subpath", _) => panic!("{tag}: {err:?}"),
+                ("collection_id" | "subpath" | "overrides", _) => panic!("{tag}: {err:?}"),
                 (_, Error::InvalidInput(_)) => {}
                 _ => panic!("{tag}: {err:?}"),
             }
@@ -6439,35 +6386,6 @@ fn a_session_pull_refuses_its_options_before_the_first_request() {
 
         assert!(server.seen().is_empty(), "{:?}", server.seen());
         assert_eq!(repo_snapshot(&dest_dir), before);
-    });
-}
-
-/// A pull through a session ignores `endpoint`. The session selects the
-/// server, so an endpoint that answers no request does not change the pull.
-#[test]
-fn a_session_pull_ignores_the_endpoint_option() {
-    block_on(async {
-        let dir = TmpDir::new("pull-http-session-endpoint");
-        let (_remote, commit) = build_remote(dir.path()).await;
-        let server = RepoServer::start(&dir.path().join("remote"), false).await;
-        let dest = dest_with_no_remote(dir.path()).await;
-
-        dest.pull_with_session(
-            http_session(&server).await,
-            PullTrust::unverified(),
-            PullOptions {
-                refs: vec!["test/main".to_owned()],
-                endpoint: Some(Endpoint::parse(DEAD_URL).unwrap()),
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            dest.resolve_rev("test/main", true).await.unwrap(),
-            Some(commit)
-        );
-        assert!(!server.seen().is_empty());
     });
 }
 
@@ -6660,25 +6578,7 @@ fn a_session_pull_counts_as_a_pull_of_a_named_remote() {
 fn a_session_pull_takes_its_request_limit_from_the_session() {
     block_on(async {
         let dir = TmpDir::new("pull-http-session-limit");
-        // One directory of 32 files gives 32 content objects that the pull
-        // can fetch at the same time.
-        let src = dir.path().join("src");
-        std::fs::create_dir(&src).unwrap();
-        for i in 0..32 {
-            std::fs::write(src.join(format!("file-{i}")), format!("{i}\n")).unwrap();
-        }
-        let root = dir.path().join("remote");
-        let remote = Repo::create(&root, CreateOptions::new(RepoMode::Archive))
-            .await
-            .unwrap();
-        commit_tree(&remote, dir.path(), "src", "test/main", None, FIXED_TS).await;
-        remote
-            .regenerate_summary(&SummaryOptions {
-                last_modified: Some(FIXED_TS),
-                ..SummaryOptions::default()
-            })
-            .await
-            .unwrap();
+        let root = build_wide_remote(dir.path()).await;
         for (tag, limit, serial) in [("serial", 1, true), ("parallel", 16, false)] {
             let server = RepoServer::start(&root, false).await;
             let base = dir.path().join(tag);

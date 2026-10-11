@@ -102,6 +102,23 @@ pub enum ReceiveVerify {
     #[default]
     Off,
     /// A valid signature on each axis of the trusted keys.
+    ///
+    /// # Trust groups
+    ///
+    /// A trust group, `[ex-ostrya trust "NAME"]`, uses the key names of a
+    /// remote section:
+    ///
+    /// - `gpgkeypath` for the GPG axis
+    /// - `verification-<engine>-key` and `verification-<engine>-file` for the
+    ///   sign-api axis
+    ///
+    /// `gpg-verify` and `sign-verify` turn on the axes. In a trust group,
+    /// `gpg-verify` has the default `false`.
+    ///
+    /// A trust group trusts these keys alone. It reads no system key store, no
+    /// revoked set, no per-remote keyring, and no global trusted directory. A
+    /// server verifies a commit against the keys that the group names, and
+    /// against no other key.
     Keys(Arc<TrustedKeys>),
 }
 

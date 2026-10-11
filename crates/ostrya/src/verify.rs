@@ -1,13 +1,19 @@
-//! The commit signature policy that the pull and the receive path share.
+//! The trusted keys and the trust of one pull.
 //!
-//! A policy holds up to two axes: GPG and the sign api. Each axis that a
-//! policy holds must find a valid signature. `PullVerify` states the keys of
-//! each axis for a pull. `TrustedKeys` states the keys of a trust group.
+//! [`TrustedKeys`] holds a set of verifiers and the signature axes that the set
+//! requires. The axes are GPG and the sign api. The axes are ANDed: each axis
+//! of a set must find a valid signature. The engines of the sign-api axis are
+//! ORed: one valid signature from one engine is enough.
 //!
-//! [`KeySource`] names the origin of the keys: the configuration section of a
-//! remote, or a trust group of the receive path. `PullVerify` states the rules
-//! of the pull: when the verification runs, and what a pull without a remote
-//! can ask for.
+//! [`PullTrust`] holds the trusted keys of one pull: one set for the commits
+//! and one set for the summary of the remote. [`PullTrust::from_remote`] reads
+//! the trust from the configuration of a remote, as [`Repo::pull`] does.
+//! [`PullTrust::commits`] and [`PullTrust::with_summary`] take keys that the
+//! caller holds.
+
+// The module also builds the policy of a target from a key source: the
+// configuration section of a remote, or a trust group of the receive path.
+// The pull and the receive path share this build.
 
 #[cfg(feature = "verify-gpg")]
 use std::os::fd::{AsFd, BorrowedFd};
@@ -18,15 +24,360 @@ use rustix::fs::{Mode, OFlags};
 #[cfg(feature = "verify-gpg")]
 use rustix::io::Errno;
 
-use crate::config::{Remote, SignVerify};
+use crate::config::{Remote, SignVerify, valid_remote_name};
 use crate::error::{Error, Result};
 #[cfg(feature = "verify-gpg")]
 use crate::gpg::read_keyring_fd;
+use crate::pull::PullVerify;
 use crate::repo::Repo;
 use crate::sign::{
     Ed25519Verifier, MAX_KEY_FILE, SignKeys, Verifier, key_text, load_sign_keys, read_key_source,
     signatures_for,
 };
+
+/// The detached-metadata key of the dummy engine.
+const DUMMY_METADATA_KEY: &str = "ostree.sign.dummy";
+
+/// A set of trusted keys and the signature axes that it requires.
+///
+/// A set with a GPG axis and a sign-api axis needs a valid signature on each
+/// axis. On the sign-api axis, one valid signature from one engine is enough.
+/// The set holds its verifiers, so the verification of a commit reads no key
+/// source.
+///
+/// [`PullTrust`] holds a set for the commits and a set for the summary of one
+/// pull. With the `receive` feature, a receive rule holds a set for the
+/// commits that it accepts.
+#[derive(Clone)]
+pub struct TrustedKeys {
+    /// The built axes. At least one axis applies.
+    policy: Policy,
+}
+
+impl TrustedKeys {
+    /// Creates trusted keys with a sign-api axis over `sign`.
+    ///
+    /// `sign` holds one verifier for each engine. The call refuses a verifier
+    /// of the dummy engine, because its signature is its key and proves
+    /// nothing about the signer.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if `sign` is empty, because an empty set
+    ///   trusts no key.
+    /// - [`Error::InvalidFormat`] if `sign` holds a verifier of the dummy
+    ///   engine.
+    pub fn new(sign: Vec<Arc<dyn Verifier>>) -> Result<TrustedKeys> {
+        if sign.is_empty() {
+            return Err(Error::InvalidFormat(
+                "the trusted keys name no verifier".into(),
+            ));
+        }
+        refuse_dummy(&sign)?;
+        Ok(TrustedKeys {
+            policy: Policy::from_axes(None, Some(sign)),
+        })
+    }
+
+    /// Creates trusted keys with a GPG axis over `gpg`.
+    ///
+    /// If `sign` is not empty, the set also gets a sign-api axis over `sign`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFormat`] if `sign` holds a verifier of the dummy engine,
+    /// as [`new`](TrustedKeys::new) refuses it.
+    #[cfg(feature = "verify-gpg")]
+    pub fn with_gpg(
+        gpg: crate::gpg::GpgVerifier,
+        sign: Vec<Arc<dyn Verifier>>,
+    ) -> Result<TrustedKeys> {
+        refuse_dummy(&sign)?;
+        let sign = (!sign.is_empty()).then_some(sign);
+        Ok(TrustedKeys {
+            policy: Policy::from_axes(Some(Arc::new(gpg)), sign),
+        })
+    }
+
+    /// Creates trusted keys over a built policy.
+    ///
+    /// The policy must apply: it holds at least one axis.
+    pub(crate) fn from_policy(policy: Policy) -> TrustedKeys {
+        debug_assert!(policy.applies(), "trusted keys need at least one axis");
+        TrustedKeys { policy }
+    }
+
+    /// Returns the policy of this set.
+    #[cfg(feature = "receive")]
+    pub(crate) fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
+    /// Returns the policy of this set, and drops the set.
+    pub(crate) fn into_policy(self) -> Policy {
+        self.policy
+    }
+}
+
+/// Refuses a verifier of the dummy engine in `sign`.
+fn refuse_dummy(sign: &[Arc<dyn Verifier>]) -> Result<()> {
+    if sign.iter().any(|v| v.metadata_key() == DUMMY_METADATA_KEY) {
+        return Err(Error::InvalidFormat(
+            "the trusted keys name a dummy verifier, whose signature is its key".into(),
+        ));
+    }
+    Ok(())
+}
+
+impl std::fmt::Debug for TrustedKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sign: Option<Vec<&str>> = self
+            .policy
+            .sign_axis()
+            .map(|engines| engines.iter().map(|v| v.metadata_key()).collect());
+        f.debug_struct("TrustedKeys")
+            .field("gpg", &self.policy.gpg_axis())
+            .field("sign", &sign)
+            .finish()
+    }
+}
+
+/// The trusted keys of one pull: a set for the commits, and a set for the
+/// summary of the remote.
+///
+/// A pull checks each commit that it carries against the commit set, and the
+/// summary against the summary set. The pull does not check a target that has
+/// no set. If the commit set has a sign-api axis and a static delta carries
+/// signatures that this axis reads, one of them must be valid. The pull does
+/// not check the signatures of other static deltas.
+///
+/// [`PullTrust::from_remote`] reads the trust that [`Repo::pull`] uses.
+/// [`PullTrust::commits`] and [`PullTrust::with_summary`] take keys that the
+/// caller holds. [`PullTrust::unverified`] checks nothing.
+///
+/// # Examples
+///
+/// The trust of a pull that checks each commit against one ed25519 key:
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use ostrya::base64;
+/// use ostrya::sign::Ed25519Verifier;
+/// use ostrya::verify::{PullTrust, TrustedKeys};
+///
+/// # fn main() -> ostrya::Result<()> {
+/// let public = base64::decode("wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=")?;
+/// let verifier = Ed25519Verifier::new([public], Vec::<Vec<u8>>::new())?;
+/// let trust = PullTrust::commits(TrustedKeys::new(vec![Arc::new(verifier)])?);
+/// # let _ = trust;
+/// # Ok(()) }
+/// ```
+#[derive(Clone, Debug)]
+pub struct PullTrust {
+    /// The keys of the commits, or `None` if the pull does not check them.
+    commit: Option<TrustedKeys>,
+    /// The keys of the summary, or `None` if the pull does not check it.
+    summary: Option<TrustedKeys>,
+}
+
+impl PullTrust {
+    /// Creates the trust of a pull that checks no signature.
+    pub fn unverified() -> PullTrust {
+        PullTrust {
+            commit: None,
+            summary: None,
+        }
+    }
+
+    /// Creates the trust of a pull that checks each commit against `keys`.
+    ///
+    /// The pull does not check the summary. `keys` is the whole trusted set of
+    /// the commits: the pull reads no system key store and no keyring of the
+    /// repository for them.
+    pub fn commits(keys: TrustedKeys) -> PullTrust {
+        PullTrust {
+            commit: Some(keys),
+            summary: None,
+        }
+    }
+
+    /// Sets the keys that the pull checks the summary of the remote against.
+    ///
+    /// `keys` replaces the summary keys that this trust held before. The
+    /// commit keys do not change. `keys` is the whole trusted set of the
+    /// summary: the pull reads no system key store and no keyring of the
+    /// repository for it.
+    pub fn with_summary(self, keys: TrustedKeys) -> PullTrust {
+        PullTrust {
+            summary: Some(keys),
+            ..self
+        }
+    }
+
+    /// Reads the trust that [`Repo::pull`] uses for a pull from `remote`.
+    ///
+    /// The keys come from the `[remote "NAME"]` section of the repository
+    /// config and from these key sources:
+    ///
+    /// - `gpgkeypath`
+    /// - the repository keyring `<repo>/NAME.trustedkeys.gpg`
+    /// - the system keyring `/etc/ostree/remotes.d/NAME.trustedkeys.gpg`
+    /// - the global GPG trusted directory
+    /// - the `verification-*` keys
+    /// - the system sign-api key store, minus its revoked set
+    ///
+    /// Each field of `verify` that is set overrides the config key of the
+    /// same name (see [`PullVerify`]). If the config has no section for
+    /// `remote`, the trust takes the defaults of a described remote: the GPG
+    /// verification of the commits is on, and the other checks are off.
+    ///
+    /// The call reads each key source before it returns. The trust that it
+    /// gives reads no key source again.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `remote`.
+    ///   The call refuses the name before it reads a key source.
+    /// - [`Error::Core`] if `gpg-verify` or `gpg-verify-summary` is not a
+    ///   boolean, if a value holds a malformed escape sequence, or if a
+    ///   sign-api key is not valid base64.
+    /// - [`Error::Signature`] if `sign-verify` or `sign-verify-summary` names
+    ///   an engine that has no trusted key, or if a check of every engine finds
+    ///   no engine with a trusted key.
+    /// - [`Error::Signature`] if a keyring or a key file cannot be read, or if
+    ///   its content is not valid for its engine.
+    /// - [`Error::Unsupported`] if `sign-verify` or `sign-verify-summary` names
+    ///   an engine that this build does not verify with.
+    /// - [`Error::Unsupported`] if the trust asks for GPG verification and the
+    ///   build has no `verify-gpg` feature.
+    /// - [`Error::Io`] if a directory of keys cannot be listed.
+    pub async fn from_remote(repo: &Repo, remote: &str, verify: &PullVerify) -> Result<PullTrust> {
+        if !valid_remote_name(remote) {
+            return Err(Error::InvalidInput(format!(
+                "invalid remote name: {remote}"
+            )));
+        }
+        PullTrust::resolve(repo, Some(remote), verify, Defaults::Config).await
+    }
+
+    /// Resolves the trust of a pull of `remote` from its config in `repo` and
+    /// the overrides in `verify`.
+    ///
+    /// The config section of `remote` supplies the policy and the keys. If a
+    /// local pull names no remote and asks for a verification, this function
+    /// fails with [`Error::Pull`]. The failure comes before the pull imports
+    /// an object.
+    pub(crate) async fn resolve(
+        repo: &Repo,
+        remote: Option<&str>,
+        verify: &PullVerify,
+        defaults: Defaults,
+    ) -> Result<PullTrust> {
+        let section = remote.and_then(|name| repo.config().remote(name));
+        let configured = defaults == Defaults::Config;
+
+        let gpg_commit = switch(verify.gpg, || match &section {
+            Some(section) if configured => section.gpg_verify(),
+            // If an HTTP pull names a remote that the config does not
+            // describe, the remote takes the default of a described remote.
+            None if configured => Ok(true),
+            _ => Ok(false),
+        })?;
+        let gpg_summary = switch(verify.gpg_summary, || match &section {
+            Some(section) if configured => section.gpg_verify_summary(),
+            _ => Ok(false),
+        })?;
+        let sign_commit = engines(verify.sign, || match &section {
+            Some(section) if configured => section.sign_verify(),
+            _ => Ok(SignVerify::Off),
+        })?;
+        let sign_summary = engines(verify.sign_summary, || match &section {
+            Some(section) if configured => section.sign_verify_summary(),
+            _ => Ok(SignVerify::Off),
+        })?;
+
+        let asks_for_a_check = gpg_commit
+            || gpg_summary
+            || sign_commit != SignVerify::Off
+            || sign_summary != SignVerify::Off;
+        let Some(name) = remote else {
+            if asks_for_a_check {
+                return Err(Error::Pull(
+                    "a signature check takes its keys from a remote's configuration, \
+                     so the pull has to name a remote"
+                        .into(),
+                ));
+            }
+            return Ok(PullTrust::unverified());
+        };
+
+        let source = KeySource::Remote {
+            name,
+            section: section.as_ref(),
+            repo_keyring: true,
+        };
+        let mut cache = Verifiers::default();
+        let commit = build_policy(repo, &source, &mut cache, gpg_commit, &sign_commit).await?;
+        let summary = build_policy(repo, &source, &mut cache, gpg_summary, &sign_summary).await?;
+        Ok(PullTrust {
+            commit: commit.applies().then(|| TrustedKeys::from_policy(commit)),
+            summary: summary.applies().then(|| TrustedKeys::from_policy(summary)),
+        })
+    }
+
+    /// Returns the commit policy and the summary policy of this trust. A
+    /// target with no keys gets a policy that holds no axis.
+    pub(crate) fn into_policies(self) -> (Policy, Policy) {
+        (
+            self.commit
+                .map(TrustedKeys::into_policy)
+                .unwrap_or_default(),
+            self.summary
+                .map(TrustedKeys::into_policy)
+                .unwrap_or_default(),
+        )
+    }
+}
+
+/// The trust types move freely across tasks and threads, so one trust can
+/// serve pulls on many tasks.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<TrustedKeys>();
+    assert_send_sync::<PullTrust>();
+};
+
+/// The source of the policy when the options of a pull state no policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Defaults {
+    /// Read the config of the remote. [`Repo::pull`] uses this source.
+    Config,
+    /// Verify nothing. [`Repo::pull_local`] uses this source.
+    Off,
+}
+
+/// Resolves one boolean switch: the override of the pull, or else the config.
+fn switch(override_: Option<bool>, configured: impl FnOnce() -> Result<bool>) -> Result<bool> {
+    match override_ {
+        Some(value) => Ok(value),
+        None => configured(),
+    }
+}
+
+/// Resolves one sign-api switch: the override of the pull, or else the config.
+///
+/// An override of `true` selects each engine of this build.
+fn engines(
+    override_: Option<bool>,
+    configured: impl FnOnce() -> Result<SignVerify>,
+) -> Result<SignVerify> {
+    match override_ {
+        Some(true) => Ok(SignVerify::All),
+        Some(false) => Ok(SignVerify::Off),
+        None => configured(),
+    }
+}
 
 /// The sign-api engines that `sign-verify=true` selects: every engine of this
 /// build.
@@ -48,8 +399,8 @@ pub(crate) const ALL_ENGINES: &[&str] = &[
 /// valid signature.
 ///
 /// The policy holds each verifier in an [`Arc`], so the two targets of one pull
-/// share the verifiers that both ask for.
-#[derive(Default)]
+/// share the verifiers that both ask for. The default policy holds no axis.
+#[derive(Clone, Default)]
 pub(crate) struct Policy {
     /// The GPG axis, if it applies.
     gpg: Option<Arc<dyn Verifier>>,
@@ -71,7 +422,6 @@ impl Policy {
     }
 
     /// Creates a policy from the given axes, each present if it applies.
-    #[cfg(feature = "receive")]
     pub(crate) fn from_axes(
         gpg: Option<Arc<dyn Verifier>>,
         sign: Option<Vec<Arc<dyn Verifier>>>,
@@ -80,7 +430,6 @@ impl Policy {
     }
 
     /// Returns `true` if the GPG axis applies.
-    #[cfg(feature = "receive")]
     pub(crate) fn gpg_axis(&self) -> bool {
         self.gpg.is_some()
     }
@@ -605,6 +954,83 @@ mod tests {
         section: None,
         repo_keyring: true,
     };
+
+    /// The base64 of a 64-byte ed25519 secret key (seed, then public key).
+    const SECRET_B64: &str =
+        "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
+    /// The matching 32-byte ed25519 public key.
+    const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
+
+    const PAYLOAD: &[u8] = b"the commit bytes";
+
+    /// The ed25519 signature of `secret` over [`PAYLOAD`], in its dict.
+    fn ed25519_signed(secret: &str) -> Value {
+        use crate::sign::{Ed25519Signer, Signer, append_signature};
+
+        let signer = Ed25519Signer::from_base64(secret).unwrap();
+        let blob = ostrya_rt::block_on(signer.sign(PAYLOAD)).unwrap();
+        let mut dict = Value::Array(Vec::new());
+        append_signature(&mut dict, signer.metadata_key(), blob).unwrap();
+        dict
+    }
+
+    /// An override takes precedence over the config. With no override, the
+    /// config applies.
+    #[test]
+    fn switches_resolve_the_override_first() {
+        assert!(switch(Some(true), || Ok(false)).unwrap());
+        assert!(!switch(Some(false), || Ok(true)).unwrap());
+        assert!(switch(None, || Ok(true)).unwrap());
+
+        assert_eq!(
+            engines(Some(true), || Ok(SignVerify::Off)).unwrap(),
+            SignVerify::All
+        );
+        assert_eq!(
+            engines(Some(false), || Ok(SignVerify::All)).unwrap(),
+            SignVerify::Off
+        );
+        assert_eq!(
+            engines(None, || Ok(SignVerify::Engines(vec!["ed25519".to_owned()]))).unwrap(),
+            SignVerify::Engines(vec!["ed25519".to_owned()])
+        );
+    }
+
+    /// `TrustedKeys::new` refuses an empty set, and a set with one verifier
+    /// verifies a signature from its key.
+    #[test]
+    fn explicit_keys_need_a_verifier() {
+        let err = TrustedKeys::new(Vec::new()).unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)), "{err}");
+        let verifier =
+            Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new())
+                .unwrap();
+        let keys = TrustedKeys::new(vec![Arc::new(verifier)]).unwrap();
+        ostrya_rt::block_on(keys.policy.check(
+            "commit",
+            PAYLOAD,
+            Some(&ed25519_signed(SECRET_B64)),
+        ))
+        .unwrap();
+    }
+
+    /// `TrustedKeys::new` refuses a dummy verifier, alone and next to a real
+    /// engine.
+    #[test]
+    fn explicit_keys_refuse_the_dummy_engine() {
+        let dummy = || -> Arc<dyn Verifier> { Arc::new(crate::sign::DummyVerifier::new([b"k"])) };
+        let ed25519: Arc<dyn Verifier> = Arc::new(
+            Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new())
+                .unwrap(),
+        );
+        for sign in [vec![dummy()], vec![ed25519, dummy()]] {
+            let err = TrustedKeys::new(sign).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidFormat(m) if m.contains("dummy verifier")),
+                "{err}"
+            );
+        }
+    }
 
     /// `sign-verify=true` names the engines of this build. It never names the
     /// dummy engine, because the dummy signature is its key.

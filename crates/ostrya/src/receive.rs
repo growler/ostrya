@@ -31,13 +31,13 @@ mod stream;
 mod trust;
 mod walk;
 
+pub use crate::verify::TrustedKeys;
 pub use hooks::{HookFuture, HookRefusal, HostEntry, ReceiveHooks, UpdatePlan};
 pub use pattern::RefPattern;
 pub use policy::{ReceivePolicy, ReceiveRule, ReceiveVerify};
 pub use service::ReceiveService;
 pub use session::{ReceiveReport, ReceiveStep, ReceiveWarning};
 pub use signer::ServerSigner;
-pub use trust::TrustedKeys;
 
 pub(crate) use merge::merge_detached;
 

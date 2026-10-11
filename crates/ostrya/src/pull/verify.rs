@@ -1,30 +1,18 @@
 //! The signature verification of a pull.
 //!
 //! A pull holds two independent policies: one for the commits that it fetches
-//! and one for the summary of the remote. The pull builds each policy once,
-//! from the config of the remote and the overrides of the pull.
+//! and one for the summary of the remote. The pull builds them once, from the
+//! [`PullTrust`] of the pull.
 //!
-//! The crate module `verify` holds the policy, its two axes, and the keys that
-//! the section of a remote names. The receive path shares that module.
-//! [`PullVerify`] states the rules that a caller sees.
+//! The crate module `verify` holds the policy, its two axes, the trusted keys,
+//! and the resolution of the trust from the config of a remote. The receive
+//! path shares that module. [`PullVerify`](crate::PullVerify) states the rules
+//! that a caller sees.
 
 use ostrya_core::{Checksum, Value};
 
-use crate::config::SignVerify;
 use crate::error::{Error, Result};
-use crate::repo::Repo;
-use crate::verify::{Found, KeySource, Policy, Verifiers, build_policy, examine};
-
-use super::PullVerify;
-
-/// The source of the policy when the options of a pull state no policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Defaults {
-    /// Read the config of the remote. [`Repo::pull`] uses this source.
-    Config,
-    /// Verify nothing. [`Repo::pull_local`] uses this source.
-    Off,
-}
+use crate::verify::{Found, Policy, PullTrust, examine};
 
 /// The signature verification of one pull.
 pub(crate) struct Verification {
@@ -35,69 +23,12 @@ pub(crate) struct Verification {
 }
 
 impl Verification {
-    /// Builds the verification of a pull of `remote` from its config in `repo`
-    /// and the overrides in `verify`.
+    /// Creates the verification of a pull from its trust.
     ///
-    /// The config section of `remote` supplies the policy and the keys. If a
-    /// local pull names no remote and asks for a verification, this function
-    /// fails with [`Error::Pull`]. The failure comes before the pull imports
-    /// an object.
-    pub(crate) async fn build(
-        repo: &Repo,
-        remote: Option<&str>,
-        verify: &PullVerify,
-        defaults: Defaults,
-    ) -> Result<Verification> {
-        let section = remote.and_then(|name| repo.config().remote(name));
-        let configured = defaults == Defaults::Config;
-
-        let gpg_commit = switch(verify.gpg, || match &section {
-            Some(section) if configured => section.gpg_verify(),
-            // If an HTTP pull names a remote that the config does not
-            // describe, the remote takes the default of a described remote.
-            None if configured => Ok(true),
-            _ => Ok(false),
-        })?;
-        let gpg_summary = switch(verify.gpg_summary, || match &section {
-            Some(section) if configured => section.gpg_verify_summary(),
-            _ => Ok(false),
-        })?;
-        let sign_commit = engines(verify.sign, || match &section {
-            Some(section) if configured => section.sign_verify(),
-            _ => Ok(SignVerify::Off),
-        })?;
-        let sign_summary = engines(verify.sign_summary, || match &section {
-            Some(section) if configured => section.sign_verify_summary(),
-            _ => Ok(SignVerify::Off),
-        })?;
-
-        let asks_for_a_check = gpg_commit
-            || gpg_summary
-            || sign_commit != SignVerify::Off
-            || sign_summary != SignVerify::Off;
-        let Some(name) = remote else {
-            if asks_for_a_check {
-                return Err(Error::Pull(
-                    "a signature check takes its keys from a remote's configuration, \
-                     so the pull has to name a remote"
-                        .into(),
-                ));
-            }
-            return Ok(Verification {
-                commit: Policy::default(),
-                summary: Policy::default(),
-            });
-        };
-
-        let source = KeySource::Remote {
-            name,
-            section: section.as_ref(),
-            repo_keyring: true,
-        };
-        let mut cache = Verifiers::default();
-        let commit = build_policy(repo, &source, &mut cache, gpg_commit, &sign_commit).await?;
-        let summary = build_policy(repo, &source, &mut cache, gpg_summary, &sign_summary).await?;
-        Ok(Verification { commit, summary })
+    /// The trust holds its verifiers, so this function reads no key source.
+    pub(crate) fn from_trust(trust: PullTrust) -> Verification {
+        let (commit, summary) = trust.into_policies();
+        Verification { commit, summary }
     }
 
     /// Returns `true` if this pull verifies the commits that it carries.
@@ -192,51 +123,257 @@ impl Verification {
     }
 }
 
-/// Resolves one boolean switch: the override of the pull, or else the config.
-fn switch(override_: Option<bool>, configured: impl FnOnce() -> Result<bool>) -> Result<bool> {
-    match override_ {
-        Some(value) => Ok(value),
-        None => configured(),
-    }
-}
-
-/// Resolves one sign-api switch: the override of the pull, or else the config.
-///
-/// An override of `true` selects each engine of this build.
-fn engines(
-    override_: Option<bool>,
-    configured: impl FnOnce() -> Result<SignVerify>,
-) -> Result<SignVerify> {
-    match override_ {
-        Some(true) => Ok(SignVerify::All),
-        Some(false) => Ok(SignVerify::Off),
-        None => configured(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::pull::PullVerify;
+    use crate::repo::Repo;
+    use crate::sign::{Ed25519Signer, Ed25519Verifier, Signer, Verifier, append_signature};
+    use crate::verify::TrustedKeys;
+    use crate::{CreateOptions, RepoMode};
 
-    /// An override takes precedence over the config. With no override, the
-    /// config applies.
+    /// The base64 of a 64-byte ed25519 secret key (seed, then public key).
+    const SECRET_B64: &str =
+        "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
+    /// The matching 32-byte ed25519 public key.
+    const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
+    /// Another ed25519 secret key.
+    const OTHER_SECRET_B64: &str =
+        "5ILWxT+l9G/u3h0BptRpmSi35C9uog7YDdD+Fp1Xk+Hz52p0NlYh6xBA73kJEJKhKbbnjcE0rsWA5XA/K5Sq5Q==";
+    /// The matching public key of [`OTHER_SECRET_B64`].
+    const OTHER_PUBLIC_B64: &str = "8+dqdDZWIesQQO95CRCSoSm2543BNK7FgOVwPyuUquU=";
+
+    /// The bytes that each test signs: a commit, a summary, or a superblock.
+    const PAYLOAD: &[u8] = b"the signed bytes";
+
+    /// The name of the commit in a message.
+    fn checksum() -> Checksum {
+        Checksum::from_bytes([0x5a; 32])
+    }
+
+    /// The trusted keys of one ed25519 public key.
+    fn keys(public: &str) -> TrustedKeys {
+        let verifier = Ed25519Verifier::new(
+            [ostrya_core::base64::decode(public).unwrap()],
+            Vec::<Vec<u8>>::new(),
+        )
+        .unwrap();
+        TrustedKeys::new(vec![Arc::new(verifier) as Arc<dyn Verifier>]).unwrap()
+    }
+
+    /// The ed25519 signature of `secret` over [`PAYLOAD`], in its dict.
+    fn signed(secret: &str) -> Value {
+        let signer = Ed25519Signer::from_base64(secret).unwrap();
+        let blob = ostrya_rt::block_on(signer.sign(PAYLOAD)).unwrap();
+        let mut dict = Value::Array(Vec::new());
+        append_signature(&mut dict, signer.metadata_key(), blob).unwrap();
+        dict
+    }
+
+    /// The bytes of a `summary.sig` that holds the signature of `secret` over
+    /// [`PAYLOAD`].
+    fn summary_sig(secret: &str) -> Vec<u8> {
+        crate::summary::serialize_signature_dict(&signed(secret)).unwrap()
+    }
+
+    /// Keys from `TrustedKeys::new` are the whole trusted set of the commits.
+    ///
+    /// The proof is by construction. A verification from a trust takes no
+    /// [`Repo`], so it cannot read the keyring of a repository or the config
+    /// of a remote. The system key store is under `/etc/ostree` and
+    /// `/usr/share/ostree`, and a test cannot write it to add the other key.
+    /// The verification reads no key source at all: it holds the verifiers
+    /// that the trust holds. So a commit signed with another key fails, on any
+    /// host.
     #[test]
-    fn switches_resolve_the_override_first() {
-        assert!(switch(Some(true), || Ok(false)).unwrap());
-        assert!(!switch(Some(false), || Ok(true)).unwrap());
-        assert!(switch(None, || Ok(true)).unwrap());
+    fn explicit_keys_are_the_whole_trusted_set() {
+        let verification = Verification::from_trust(PullTrust::commits(keys(PUBLIC_B64)));
+        assert!(verification.checks_commits());
+        assert!(!verification.checks_summary());
+        let (own, other) = (signed(SECRET_B64), signed(OTHER_SECRET_B64));
+        let (own, other, unsigned, summary) = ostrya_rt::block_on(async {
+            (
+                verification
+                    .check_commit(&checksum(), PAYLOAD, Some(&own))
+                    .await,
+                verification
+                    .check_commit(&checksum(), PAYLOAD, Some(&other))
+                    .await,
+                verification.check_commit(&checksum(), PAYLOAD, None).await,
+                verification.check_summary(None, None).await,
+            )
+        });
+        own.expect("a commit signed with the trusted key passes");
+        let err = other.expect_err("a commit signed with another key fails");
+        assert!(
+            matches!(&err, Error::Signature(m)
+                if m.contains("no sign-api signature is from a trusted key")),
+            "{err}"
+        );
+        let err = unsigned.expect_err("an unsigned commit fails");
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("carries no signature")),
+            "{err}"
+        );
+        summary.expect("the summary is not checked");
+    }
 
-        assert_eq!(
-            engines(Some(true), || Ok(SignVerify::Off)).unwrap(),
-            SignVerify::All
+    /// A trust with summary keys alone checks the summary, and no commit and
+    /// no static delta. `with_summary` replaces the summary keys of the trust.
+    #[test]
+    fn a_summary_trust_checks_the_summary_alone() {
+        let verification = Verification::from_trust(
+            PullTrust::unverified()
+                .with_summary(keys(OTHER_PUBLIC_B64))
+                .with_summary(keys(PUBLIC_B64)),
         );
-        assert_eq!(
-            engines(Some(false), || Ok(SignVerify::All)).unwrap(),
-            SignVerify::Off
+        assert!(!verification.checks_commits());
+        assert!(verification.checks_summary());
+        let other = signed(OTHER_SECRET_B64);
+        let (unsigned, other, delta) = ostrya_rt::block_on(async {
+            (
+                verification.check_commit(&checksum(), PAYLOAD, None).await,
+                verification
+                    .check_commit(&checksum(), PAYLOAD, Some(&other))
+                    .await,
+                verification
+                    .check_delta("delta", PAYLOAD, Some(&other))
+                    .await,
+            )
+        });
+        unsigned.expect("an unsigned commit passes");
+        other.expect("a commit signed with another key passes");
+        delta.expect("a delta signed with another key passes");
+
+        let own = summary_sig(SECRET_B64);
+        let other = summary_sig(OTHER_SECRET_B64);
+        let (own, other, missing) = ostrya_rt::block_on(async {
+            (
+                verification.check_summary(Some(PAYLOAD), Some(&own)).await,
+                verification
+                    .check_summary(Some(PAYLOAD), Some(&other))
+                    .await,
+                verification.check_summary(Some(PAYLOAD), None).await,
+            )
+        });
+        own.expect("a summary signed with the last summary key passes");
+        let err = other.expect_err("a summary signed with a replaced key fails");
+        assert!(
+            matches!(&err, Error::Signature(m)
+                if m.contains("no sign-api signature is from a trusted key")),
+            "{err}"
         );
-        assert_eq!(
-            engines(None, || Ok(SignVerify::Engines(vec!["ed25519".to_owned()]))).unwrap(),
-            SignVerify::Engines(vec!["ed25519".to_owned()])
+        let err = missing.expect_err("a summary with no summary.sig fails");
+        assert!(
+            matches!(&err, Error::Signature(m)
+                if m == "summary verification is enabled, but no summary.sig is published"),
+            "{err}"
         );
+    }
+
+    /// `PullTrust::from_remote` reads the keys and the switches of the
+    /// section of the remote. The fields of `PullVerify` override the
+    /// switches.
+    #[test]
+    fn from_remote_reads_the_remote_section() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-pull-trust-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outcome = ostrya_rt::block_on(async {
+            Repo::create(&root, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap();
+            let mut config = std::fs::read_to_string(root.join("config")).unwrap();
+            config.push_str(&format!(
+                "\n[remote \"origin\"]\nurl=http://localhost/\ngpg-verify=false\n\
+                 sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"
+            ));
+            std::fs::write(root.join("config"), config).unwrap();
+            let repo = Repo::open(&root).await.unwrap();
+            let plain = PullTrust::from_remote(&repo, "origin", &PullVerify::default()).await;
+            let summary = PullVerify {
+                sign_summary: Some(true),
+                ..PullVerify::default()
+            };
+            let summary = PullTrust::from_remote(&repo, "origin", &summary).await;
+            (plain, summary)
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        let (plain, summary) = outcome;
+
+        let verification = Verification::from_trust(plain.unwrap());
+        assert!(verification.checks_commits());
+        assert!(!verification.checks_summary());
+        let (own, other) = (signed(SECRET_B64), signed(OTHER_SECRET_B64));
+        let (own, unsigned, other) = ostrya_rt::block_on(async {
+            (
+                verification
+                    .check_commit(&checksum(), PAYLOAD, Some(&own))
+                    .await,
+                verification.check_commit(&checksum(), PAYLOAD, None).await,
+                verification
+                    .check_commit(&checksum(), PAYLOAD, Some(&other))
+                    .await,
+            )
+        });
+        own.expect("a commit signed with the key of the section passes");
+        unsigned.expect_err("an unsigned commit fails");
+        // The system key store adds its keys to the keys of the section. On a
+        // host with no store of its own, the other key is not trusted. The
+        // test reads the store only if the commit passes.
+        if other.is_ok() {
+            assert!(
+                crate::sign::load_sign_keys("ed25519").is_ok_and(|store| !store.trusted.is_empty()),
+                "a commit signed with another key passes, and the system key \
+                 store holds no ed25519 key"
+            );
+        }
+
+        let verification = Verification::from_trust(summary.unwrap());
+        assert!(verification.checks_commits());
+        assert!(verification.checks_summary());
+        let own = summary_sig(SECRET_B64);
+        ostrya_rt::block_on(verification.check_summary(Some(PAYLOAD), Some(&own)))
+            .expect("a summary signed with the key of the section passes");
+    }
+
+    /// `PullTrust::from_remote` refuses a name that `valid_remote_name`
+    /// refuses, before it reads a key source. The keyring paths hold the
+    /// name, so a name with `/` names a keyring outside the repository or
+    /// outside the system keyring directory.
+    #[test]
+    fn from_remote_refuses_an_invalid_remote_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-pull-trust-name-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outcome = ostrya_rt::block_on(async {
+            let repo = Repo::create(&root, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap();
+            let mut refused = Vec::new();
+            for name in ["../../x", ""] {
+                let result = PullTrust::from_remote(&repo, name, &PullVerify::default()).await;
+                refused.push((name, result));
+            }
+            refused
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        for (name, result) in outcome {
+            let err = result.expect_err("an invalid remote name is refused");
+            assert!(
+                matches!(&err, Error::InvalidInput(m) if m.contains("invalid remote name")),
+                "{name:?}: {err}"
+            );
+        }
     }
 }

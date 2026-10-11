@@ -1446,13 +1446,14 @@ impl Repo {
         // The pull builds the signature policy before it reads the source. So
         // a check that the options ask for with no remote to take keys from
         // fails here, before the walk of a chain.
-        let verification = verify::Verification::build(
+        let trust = crate::verify::PullTrust::resolve(
             self,
             opts.remote.as_deref(),
             &opts.verify,
-            verify::Defaults::Off,
+            crate::verify::Defaults::Off,
         )
         .await?;
+        let verification = verify::Verification::from_trust(trust);
         // A pull that requires static deltas reads the source as a fetch
         // reads a remote: the summary, then the deltas that it advertises. Its
         // counts are those of a fetch. These steps come before the walk of the

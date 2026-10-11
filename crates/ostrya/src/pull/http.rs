@@ -40,13 +40,14 @@ use crate::repo::Repo;
 use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE, Summary, put_root_file_blocking};
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
+use crate::verify::PullTrust;
 use crate::write::FileMeta;
 
 use super::delta::{self, DeltaJob, DeltaSource, PART_CAP};
 use super::drive::Slots;
 use super::source::{RemoteSource, Transfer, http_error, session_error};
 use super::subpath::{Scope, Subpaths};
-use super::verify::{Defaults, Verification};
+use super::verify::Verification;
 use super::{
     DetachedMetadataFilter, ModeChecks, PullCounters, PullFlags, PullOptions, PullStats,
     READ_CHUNK, TimestampCheck, apply_durability, check_depth, check_ref_binding, refspec,
@@ -347,6 +348,10 @@ impl Repo {
     ///   environment variable.
     /// - [`Error::Fetch`] if a mirror is not a valid absolute URL, if a header
     ///   is invalid, or if the TLS material does not parse.
+    /// - The errors of [`PullTrust::from_remote`]. Among them,
+    ///   [`Error::InvalidInput`] if
+    ///   [`valid_remote_name`](crate::config::valid_remote_name) refuses
+    ///   `remote`.
     ///
     /// These errors stop the pull before it fetches an object:
     ///
@@ -444,13 +449,15 @@ impl Repo {
                 // The connect sends no HTTP request, so a refused policy still
                 // stops the pull before its first fetch.
                 let session = connect(Endpoint::Http(http), &opts).await?;
-                let verification =
-                    Verification::build(self, Some(remote), &opts.verify, Defaults::Config).await?;
+                let verification = Verification::from_trust(
+                    PullTrust::from_remote(self, remote, &opts.verify).await?,
+                );
                 (session, verification)
             }
             endpoint @ Endpoint::Ssh { .. } => {
-                let verification =
-                    Verification::build(self, Some(remote), &opts.verify, Defaults::Config).await?;
+                let verification = Verification::from_trust(
+                    PullTrust::from_remote(self, remote, &opts.verify).await?,
+                );
                 // The ssh client starts where the HTTP pull sends its first
                 // request.
                 (connect(endpoint, &opts).await?, verification)
@@ -529,7 +536,7 @@ impl Repo {
         }
         let counters = PullCounters::new(opts.progress.as_ref());
         let verification =
-            Verification::build(self, Some(remote), &opts.verify, Defaults::Config).await?;
+            Verification::from_trust(PullTrust::from_remote(self, remote, &opts.verify).await?);
         let session = PullSession::over_stream(input, output, session_options(&opts)).await?;
         let source = RemoteSource::new(session, counters.transferred_sinks());
         self.pull_from(

@@ -28,6 +28,7 @@
 //! - Push and receive: [`remote`], the wire protocol of `ostrya-remote`, and `receive`.
 //! - Remote resolution: [`endpoint`], which reads the keys and files of a remote for a pull or a push.
 //! - Signing: [`sign`], `gpg`, and `spki`.
+//! - Signature trust: [`verify`], the trusted keys and the trust of one pull.
 //! - Maintenance: [`prune`], [`fsck`], [`diff`], [`update`], and [`config`].
 //! - Static deltas: [`DeltaSuperblock`], [`DeltaOptions`], and [`Repo::generate_static_delta`].
 //!
@@ -103,7 +104,7 @@ mod tombstone;
 pub mod traverse;
 pub mod tree;
 pub mod update;
-mod verify;
+pub mod verify;
 mod write;
 
 #[doc(hidden)]
@@ -180,7 +181,7 @@ pub use read::{CommitSizes, CommitState, MetadataReader};
 pub use receive::{
     HookFuture, HookRefusal, HostEntry, ReceiveHooks, ReceivePolicy, ReceiveReport, ReceiveRule,
     ReceiveService, ReceiveStep, ReceiveVerify, ReceiveWarning, RefPattern, ServerSigner,
-    TrustedKeys, UpdatePlan,
+    UpdatePlan,
 };
 #[doc(hidden)]
 pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
@@ -209,6 +210,8 @@ pub use transaction::{ContentWriter, FileMeta, Transaction, TransactionStats};
 pub use tree::{RepoTree, TreeEntry};
 #[doc(hidden)]
 pub use update::UpdateGuard;
+#[doc(hidden)]
+pub use verify::{PullTrust, TrustedKeys};
 
 /// Removes the staging directories of the live transactions of this process.
 ///

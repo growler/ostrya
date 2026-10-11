@@ -2396,7 +2396,8 @@ store. Each axis that applies has to find a valid signature, and within the
 sign-api axis one engine is enough. The summary is checked before it is read and
 a commit before its bytes are staged, so a refusal costs no object fetch. A
 fetched static delta is held to the sign-api axis over its raw superblock bytes
-before any part is requested.
+before any part is requested. `PullTrust::from_remote` gives this trust as a
+value (see "Trusted keys and the pull trust").
 
 `detached_metadata_filter` decides, property by property, which of a commit's
 detached metadata reaches this repository. The pull calls it once per property of
@@ -2612,6 +2613,67 @@ impl Remote<'_> {
 }
 ```
 
+## Trusted keys and the pull trust (`ostrya::verify`)
+
+The module `ostrya::verify` holds the trusted keys and the trust of one pull.
+It has no feature gate. The crate root re-exports `TrustedKeys` and
+`PullTrust`.
+
+A `TrustedKeys` holds built verifiers and the signature axes that they
+require. The axes are ANDed, and the sign-api engines are ORed. The set holds
+its verifiers, so a check reads no key source.
+
+A `PullTrust` holds one optional set for the commits and one optional set for
+the summary of the remote. A pull checks a target against its set and does not
+check a target that has no set. If the commit set has a sign-api axis and a
+static delta carries signatures that this axis reads, one of them must be
+valid. The pull does not check the signatures of other static deltas.
+
+- `PullTrust` has no `Default`. An unverified pull names
+  `PullTrust::unverified()`.
+- Keys from `TrustedKeys::new` and `TrustedKeys::with_gpg` are the whole
+  trusted set. A pull reads no system key store and no keyring of the
+  repository for them.
+- `PullTrust::from_remote` gives the trust that `Repo::pull` uses: the remote
+  section, its keyrings, the system store, and `verify` as overrides. A remote
+  with no section gets the defaults of a described remote: GPG verification of
+  the commits is on. `from_remote` refuses a name that `valid_remote_name`
+  refuses with `Error::InvalidInput`, before it reads a key source. The
+  keyring paths hold the name.
+- `with_summary` replaces the summary keys. The commit keys do not change.
+
+```rust
+/// The axes are ANDed, the sign-api engines are ORed.
+#[derive(Clone)]
+pub struct TrustedKeys { /* private: the built verifiers */ }
+impl TrustedKeys {
+    /// The keys a pull from the remote trusts for a commit. It needs a
+    /// section and refuses one that turns on no check.
+    #[cfg(feature = "receive")]
+    pub async fn for_remote(repo: &Repo, remote: &str) -> Result<TrustedKeys>;
+    /// A sign-api axis; an empty list and a dummy verifier are refused.
+    pub fn new(sign: Vec<Arc<dyn Verifier>>) -> Result<TrustedKeys>;
+    /// A GPG axis, and a sign-api axis where `sign` is not empty; a dummy
+    /// verifier is refused.
+    #[cfg(feature = "verify-gpg")]
+    pub fn with_gpg(gpg: GpgVerifier, sign: Vec<Arc<dyn Verifier>>) -> Result<TrustedKeys>;
+}
+
+#[derive(Clone, Debug)]
+pub struct PullTrust { /* private: the commit keys and the summary keys */ }
+impl PullTrust {
+    /// No check on the commits or the summary.
+    pub fn unverified() -> PullTrust;
+    /// `keys` checks each commit; the summary is not checked.
+    pub fn commits(keys: TrustedKeys) -> PullTrust;
+    /// `keys` checks the summary, in place of earlier summary keys.
+    pub fn with_summary(self, keys: TrustedKeys) -> PullTrust;
+    /// The trust of `Repo::pull` for `remote`, with `verify` as overrides.
+    pub async fn from_remote(repo: &Repo, remote: &str, verify: &PullVerify)
+        -> Result<PullTrust>;
+}
+```
+
 ## Receive policy (feature `receive`)
 
 The policy the server side of a push applies. `ReceivePolicy::from_config`
@@ -2625,6 +2687,8 @@ from a policy file alone. Both build each trust group and each key group once,
 so a key source the policy cannot use fails the call, and the rules share
 what they build. The structs are exhaustive, as the other option structs of
 the crate are.
+`ostrya::receive` re-exports `TrustedKeys` from `ostrya::verify` (see
+"Trusted keys and the pull trust").
 
 ```rust
 #[derive(Debug, Default)]
@@ -2662,19 +2726,6 @@ pub enum ReceiveVerify {
     #[default]
     Off,
     Keys(Arc<TrustedKeys>),
-}
-
-/// The axes are ANDed, the sign-api engines are ORed.
-pub struct TrustedKeys { /* private: the built verifiers */ }
-impl TrustedKeys {
-    /// The keys a pull from the remote trusts for a commit.
-    pub async fn for_remote(repo: &Repo, remote: &str) -> Result<TrustedKeys>;
-    /// A sign-api axis; an empty list and a dummy verifier are refused.
-    pub fn new(sign: Vec<Arc<dyn Verifier>>) -> Result<TrustedKeys>;
-    /// A GPG axis, and a sign-api axis where `sign` is not empty; a dummy
-    /// verifier is refused.
-    #[cfg(feature = "verify-gpg")]
-    pub fn with_gpg(gpg: GpgVerifier, sign: Vec<Arc<dyn Verifier>>) -> Result<TrustedKeys>;
 }
 
 impl ReceivePolicy {

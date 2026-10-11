@@ -1,48 +1,12 @@
-//! The trusted keys that a receive rule verifies a commit against.
-
-use std::sync::Arc;
+//! The receive-side constructors of the trusted keys: the keys of a remote and
+//! the keys of a trust group.
 
 use ostrya_core::{KeyFile, Value};
 
 use crate::config::{Remote, SignVerify};
 use crate::error::{Error, Result};
 use crate::repo::Repo;
-use crate::sign::Verifier;
-use crate::verify::{KeySource, Policy, Verifiers, build_policy};
-
-/// The detached-metadata key of the dummy engine.
-const DUMMY_METADATA_KEY: &str = "ostree.sign.dummy";
-
-/// A set of trusted keys and the signature axes that it requires.
-///
-/// A set with a GPG axis and a sign-api axis needs a valid signature on each
-/// axis. On the sign-api axis, one valid signature from one engine is enough.
-/// The set holds its verifiers, so the verification of a commit reads no key
-/// source.
-///
-/// [`ReceiveVerify::Keys`](crate::receive::ReceiveVerify::Keys) holds a set
-/// for a receive rule.
-///
-/// # Trust groups
-///
-/// A trust group, `[ex-ostrya trust "NAME"]`, uses the key names of a remote
-/// section:
-///
-/// - `gpgkeypath` for the GPG axis
-/// - `verification-<engine>-key` and `verification-<engine>-file` for the
-///   sign-api axis
-///
-/// `gpg-verify` and `sign-verify` turn on the axes. In a trust group,
-/// `gpg-verify` has the default `false`.
-///
-/// A trust group trusts these keys alone. It reads no system key store, no
-/// revoked set, no per-remote keyring, and no global trusted directory. A
-/// server verifies a commit against the keys that the group names, and
-/// against no other key.
-pub struct TrustedKeys {
-    /// The built axes.
-    policy: Policy,
-}
+use crate::verify::{KeySource, TrustedKeys, Verifiers, build_policy};
 
 impl TrustedKeys {
     /// Creates the trusted keys that a pull from `remote` uses for a commit.
@@ -58,6 +22,11 @@ impl TrustedKeys {
     /// - the global GPG trusted directory
     /// - `sign-verify` and the `verification-*` keys
     /// - the system sign-api key store, minus its revoked set
+    ///
+    /// [`PullTrust::from_remote`](crate::verify::PullTrust::from_remote) reads
+    /// the trust of a whole pull. This call is different in three ways: it
+    /// needs a section for `remote`, it refuses a section that turns on no
+    /// check, and it reads no summary keys and no `PullVerify`.
     ///
     /// # Errors
     ///
@@ -78,50 +47,6 @@ impl TrustedKeys {
     /// - [`Error::Io`] if a directory of keys cannot be listed.
     pub async fn for_remote(repo: &Repo, remote: &str) -> Result<TrustedKeys> {
         TrustedKeys::for_remote_in(repo, repo.config().keyfile(), remote, true).await
-    }
-
-    /// Creates trusted keys with a sign-api axis over `sign`.
-    ///
-    /// `sign` holds one verifier for each engine. The call refuses a verifier
-    /// of the dummy engine, because its signature is its key and proves
-    /// nothing about the signer.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::InvalidFormat`] if `sign` is empty, because an empty set
-    ///   trusts no key.
-    /// - [`Error::InvalidFormat`] if `sign` holds a verifier of the dummy
-    ///   engine.
-    pub fn new(sign: Vec<Arc<dyn Verifier>>) -> Result<TrustedKeys> {
-        if sign.is_empty() {
-            return Err(Error::InvalidFormat(
-                "the trusted keys name no verifier".into(),
-            ));
-        }
-        refuse_dummy(&sign)?;
-        Ok(TrustedKeys {
-            policy: Policy::from_axes(None, Some(sign)),
-        })
-    }
-
-    /// Creates trusted keys with a GPG axis over `gpg`.
-    ///
-    /// If `sign` is not empty, the set also gets a sign-api axis over `sign`.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidFormat`] if `sign` holds a verifier of the dummy engine,
-    /// as [`new`](TrustedKeys::new) refuses it.
-    #[cfg(feature = "verify-gpg")]
-    pub fn with_gpg(
-        gpg: crate::gpg::GpgVerifier,
-        sign: Vec<Arc<dyn Verifier>>,
-    ) -> Result<TrustedKeys> {
-        refuse_dummy(&sign)?;
-        let sign = (!sign.is_empty()).then_some(sign);
-        Ok(TrustedKeys {
-            policy: Policy::from_axes(Some(Arc::new(gpg)), sign),
-        })
     }
 
     /// Creates the pull trust of the `[remote "NAME"]` section of `keyfile`.
@@ -153,7 +78,7 @@ impl TrustedKeys {
             repo_keyring,
         };
         let policy = build_policy(repo, &source, &mut Verifiers::default(), gpg, &sign).await?;
-        Ok(TrustedKeys { policy })
+        Ok(TrustedKeys::from_policy(policy))
     }
 
     /// Creates the keys of the trust group `name` from the key-file group
@@ -175,7 +100,7 @@ impl TrustedKeys {
             section: &section,
         };
         let policy = build_policy(repo, &source, &mut Verifiers::default(), gpg, &sign).await?;
-        Ok(TrustedKeys { policy })
+        Ok(TrustedKeys::from_policy(policy))
     }
 
     /// Verifies `payload` against every axis of this set.
@@ -189,30 +114,7 @@ impl TrustedKeys {
         payload: &[u8],
         detached: Option<&Value>,
     ) -> Result<()> {
-        self.policy.check(subject, payload, detached).await
-    }
-}
-
-/// Refuses a verifier of the dummy engine in `sign`.
-fn refuse_dummy(sign: &[Arc<dyn Verifier>]) -> Result<()> {
-    if sign.iter().any(|v| v.metadata_key() == DUMMY_METADATA_KEY) {
-        return Err(Error::InvalidFormat(
-            "the trusted keys name a dummy verifier, whose signature is its key".into(),
-        ));
-    }
-    Ok(())
-}
-
-impl std::fmt::Debug for TrustedKeys {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let sign: Option<Vec<&str>> = self
-            .policy
-            .sign_axis()
-            .map(|engines| engines.iter().map(|v| v.metadata_key()).collect());
-        f.debug_struct("TrustedKeys")
-            .field("gpg", &self.policy.gpg_axis())
-            .field("sign", &sign)
-            .finish()
+        self.policy().check(subject, payload, detached).await
     }
 }
 
@@ -356,43 +258,6 @@ mod tests {
                 panic!("{remote} is refused");
             };
             assert!(matches!(err, Error::InvalidFormat(_)), "{remote}: {err}");
-        }
-    }
-
-    /// `TrustedKeys::new` refuses an empty set, and a set with one verifier
-    /// verifies a signature from its key.
-    #[test]
-    fn explicit_keys_need_a_verifier() {
-        let err = TrustedKeys::new(Vec::new()).unwrap_err();
-        assert!(matches!(err, Error::InvalidFormat(_)), "{err}");
-        let verifier = crate::sign::Ed25519Verifier::new(
-            [ostrya_core::base64::decode(PUBLIC_B64).unwrap()],
-            Vec::<Vec<u8>>::new(),
-        )
-        .unwrap();
-        let keys = TrustedKeys::new(vec![Arc::new(verifier)]).unwrap();
-        ostrya_rt::block_on(keys.check("commit", PAYLOAD, Some(&ed25519_signed(SECRET_B64))))
-            .unwrap();
-    }
-
-    /// `TrustedKeys::new` refuses a dummy verifier, alone and next to a real
-    /// engine.
-    #[test]
-    fn explicit_keys_refuse_the_dummy_engine() {
-        let dummy = || -> Arc<dyn Verifier> { Arc::new(crate::sign::DummyVerifier::new([b"k"])) };
-        let ed25519: Arc<dyn Verifier> = Arc::new(
-            crate::sign::Ed25519Verifier::new(
-                [ostrya_core::base64::decode(PUBLIC_B64).unwrap()],
-                Vec::<Vec<u8>>::new(),
-            )
-            .unwrap(),
-        );
-        for sign in [vec![dummy()], vec![ed25519, dummy()]] {
-            let err = TrustedKeys::new(sign).unwrap_err();
-            assert!(
-                matches!(&err, Error::InvalidFormat(m) if m.contains("dummy verifier")),
-                "{err}"
-            );
         }
     }
 

@@ -126,12 +126,12 @@ fn fetch_counts(stats: &PullStats) -> (u32, u32, u32, u32, u32, u64, u64) {
 }
 
 /// Pulls from the archive repository at `remote_path` over HTTP and through
-/// the ssh source, each into a new destination of `mode` under `dir`.
+/// the stream source, each into a new destination of `mode` under `dir`.
 ///
 /// Both pulls take the options that `opts` gives. The function asserts that
 /// both pulls give the same refs, objects, markers, and fetch statistics. If
 /// the pull is complete, it also asserts that the ssh destination passes
-/// fsck. Returns the statistics of the pull through the ssh source.
+/// fsck. Returns the statistics of the pull through the stream source.
 async fn pull_both(
     dir: &Path,
     tag: &str,
@@ -199,7 +199,7 @@ async fn summarize(repo: &Repo) {
     .unwrap();
 }
 
-/// The ssh source pulls the same data as the HTTP pull in each of these
+/// The stream source pulls the same data as the HTTP pull in each of these
 /// cases:
 ///
 /// - the whole tree, into an archive and into a bare-user destination
@@ -207,7 +207,7 @@ async fn summarize(repo: &Repo) {
 /// - the commit alone
 /// - the subpaths
 #[test]
-fn the_ssh_source_pulls_what_the_http_pull_pulls() {
+fn the_stream_source_pulls_what_the_http_pull_pulls() {
     block_on(async {
         let dir = TmpDir::new("pull-ssh-same");
         let (_remote, first, second) = build_remote_two_commits(dir.path()).await;
@@ -259,10 +259,10 @@ fn the_ssh_source_pulls_what_the_http_pull_pulls() {
     });
 }
 
-/// The ssh source takes a from-scratch static delta of an archive remote as
+/// The stream source takes a from-scratch static delta of an archive remote as
 /// the HTTP pull does. It fetches the parts of the delta as files.
 #[test]
-fn the_ssh_source_takes_a_static_delta() {
+fn the_stream_source_takes_a_static_delta() {
     block_on(async {
         let dir = TmpDir::new("pull-ssh-delta");
         let (remote, commit) = build_remote(dir.path()).await;
@@ -932,10 +932,10 @@ fn a_refused_policy_stops_the_pull_before_the_ssh_client_starts() {
     });
 }
 
-/// With `no_ref_writes`, a pull through the ssh source completes each commit
+/// With `no_ref_writes`, a pull through the stream source completes each commit
 /// that it pulls and writes no ref.
 #[test]
-fn the_ssh_source_with_no_ref_writes_writes_no_ref() {
+fn the_stream_source_with_no_ref_writes_writes_no_ref() {
     block_on(async {
         let dir = TmpDir::new("pull-ssh-no-ref-writes");
         let (remote, first, second) = build_remote_two_commits(dir.path()).await;

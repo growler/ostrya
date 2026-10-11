@@ -607,6 +607,11 @@ pub struct PullOptions {
     /// refs under [`MIRROR`](PullFlags::MIRROR), whatever the value. Under
     /// [`no_ref_writes`](PullOptions::no_ref_writes) the pull writes no ref,
     /// and the name still selects the ref that the pull reads.
+    ///
+    /// [`Repo::pull`] and [`Repo::pull_with_session`] refuse a name that
+    /// [`valid_remote_name`](crate::config::valid_remote_name) refuses, with
+    /// [`Error::InvalidInput`], before the first request. They refuse it also
+    /// under `MIRROR`.
     pub remote: Option<String>,
     /// The option to write no ref.
     ///
@@ -2387,6 +2392,20 @@ fn refuse_remote_collection(opts: &PullOptions) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Refuses a [`remote`](PullOptions::remote) that
+/// [`valid_remote_name`](crate::config::valid_remote_name) refuses.
+///
+/// The name is the prefix of the written refs. A pull from a remote makes this
+/// check before its first request, also under [`MIRROR`](PullFlags::MIRROR).
+fn check_remote_option(opts: &PullOptions) -> Result<()> {
+    match opts.remote.as_deref() {
+        Some(name) if !crate::config::valid_remote_name(name) => {
+            Err(Error::InvalidInput(format!("invalid remote name: {name}")))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Refuses a depth below -1.

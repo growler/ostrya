@@ -5057,6 +5057,38 @@ fn a_depth_below_minus_one_is_refused() {
     });
 }
 
+/// The pull refuses a `remote` option that is not a valid remote name, also
+/// under `MIRROR`. The refusal comes before the pull resolves the remote, so
+/// it sends no request and writes no object and no ref.
+#[test]
+fn an_invalid_remote_option_is_refused_before_the_first_request() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-remote-option-refused");
+        build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        let dest_dir = dir.path().join("dest");
+        let before = repo_snapshot(&dest_dir);
+        for flags in [PullFlags::NONE, PullFlags::MIRROR] {
+            for name in ["a:b", "a/b", ""] {
+                let opts = PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    remote: Some(name.to_owned()),
+                    flags,
+                    ..PullOptions::default()
+                };
+                let err = dest.pull("origin", opts).await.unwrap_err();
+                assert!(
+                    matches!(&err, Error::InvalidInput(m) if *m == format!("invalid remote name: {name}")),
+                    "{name:?}: {err:?}"
+                );
+            }
+        }
+        assert!(server.seen().is_empty(), "{:?}", server.seen());
+        assert_eq!(repo_snapshot(&dest_dir), before);
+    });
+}
+
 /// Builds a remote archive repository under `dir/remote` with two commits on
 /// `test/main`. The second commit is a child of the first. Both commits hold
 /// the small tree, each with a different marker. The remote holds no delta and
@@ -6278,9 +6310,10 @@ fn a_session_pull_checks_the_commits_against_the_keys_of_its_trust() {
     });
 }
 
-/// A pull through a session refuses each option that it cannot carry. Each
-/// refusal comes before the first request, writes no object and no ref, and
-/// leaves the progress handle of the caller at its default.
+/// A pull through a session refuses each option that it cannot carry, and a
+/// `remote` that is not a valid remote name, also under `MIRROR`. Each refusal
+/// comes before the first request and writes no object and no ref. A refusal
+/// of an option leaves the progress handle of the caller at its default.
 #[test]
 fn a_session_pull_refuses_its_options_before_the_first_request() {
     block_on(async {
@@ -6382,6 +6415,23 @@ fn a_session_pull_refuses_its_options_before_the_first_request() {
                 ostrya::PullProgressSnapshot::default(),
                 "{tag}"
             );
+        }
+        for flags in [PullFlags::NONE, PullFlags::MIRROR] {
+            for name in ["a:b", "a/b", ""] {
+                let opts = PullOptions {
+                    remote: Some(name.to_owned()),
+                    flags,
+                    ..main()
+                };
+                let err = dest
+                    .pull_with_session(http_session(&server).await, PullTrust::unverified(), opts)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&err, Error::InvalidInput(m) if *m == format!("invalid remote name: {name}")),
+                    "{name:?}: {err:?}"
+                );
+            }
         }
 
         assert!(server.seen().is_empty(), "{:?}", server.seen());

@@ -80,11 +80,14 @@ The project is a Cargo workspace of focused crates:
   signer through the `gpg` binary. Portable, with no repository knowledge.
 - `ostrya-fetch` -- the async HTTP/1.1 and HTTP/2 fetcher, with TLS over
   `rustls`. Portable, with no repository knowledge.
-- `ostrya-remote` -- the wire protocol of the push and of the pull over ssh:
-  the messages and their GVariant encoding, the frame codec, the chunked
-  object stream, the bodies of the pull, the push client session, and the
-  pull client session. It also holds the endpoint types `Endpoint`,
-  `SshAddress`, and `SshOptions`, and the ssh and HTTP transports. It holds
+- `ostrya-remote` -- the wire protocol and the client sessions of the push
+  and of the pull: the messages and their GVariant encoding, the frame
+  codec, the chunked object stream, the bodies of the pull, the push client
+  session, `StreamSession`, the framed session of a pull over ssh or over a
+  pair of byte streams, and `PullSession`, the session of a pull over the
+  HTTP fetcher or over a stream session. It also holds the endpoint types
+  `Endpoint`, `SshAddress`, and `SshOptions`, and the ssh and HTTP
+  transports. It holds
   the walk of a local directory into a tree model. It holds the tree push of
   that directory as one commit, signed when signers are given. The
   transports read no remote key and no file that a remote key names.

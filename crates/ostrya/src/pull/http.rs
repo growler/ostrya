@@ -52,7 +52,7 @@ use super::verify::Verification;
 use super::{
     DetachedMetadataFilter, ModeChecks, PullCounters, PullFlags, PullOptions, PullStats,
     PullVerify, READ_CHUNK, TimestampCheck, apply_durability, check_depth, check_ref_binding,
-    refspec, refuse_remote_collection,
+    check_remote_option, refspec, refuse_remote_collection,
 };
 
 /// The number of fetched content objects that stream into the object store at
@@ -336,6 +336,9 @@ impl Repo {
     /// - [`Error::Unsupported`] if
     ///   [`collection_id`](PullOptions::collection_id) is set. The pull reads
     ///   no collection ref.
+    /// - [`Error::InvalidInput`] if [`remote`](PullOptions::remote) holds a
+    ///   name that [`valid_remote_name`](crate::config::valid_remote_name)
+    ///   refuses, also under [`MIRROR`](PullFlags::MIRROR).
     /// - [`Error::Pull`] if a subpath does not start with `/`.
     /// - The errors of [`resolve_pull`]. Among them, [`Error::Io`] names the
     ///   key and the path of a PEM file that cannot be read, and a PEM file
@@ -432,6 +435,7 @@ impl Repo {
         let subpaths = Subpaths::parse(&opts.subpaths)?;
         check_depth(opts.depth)?;
         refuse_remote_collection(&opts)?;
+        check_remote_option(&opts)?;
         // The endpoint is resolved first, so a remote the config does not
         // describe reports that before a policy is resolved for it.
         let overrides = std::mem::take(&mut opts.overrides);
@@ -538,6 +542,9 @@ impl Repo {
     ///   `-1`.
     /// - [`Error::Unsupported`] if
     ///   [`collection_id`](PullOptions::collection_id) is set.
+    /// - [`Error::InvalidInput`] if [`remote`](PullOptions::remote) holds a
+    ///   name that [`valid_remote_name`](crate::config::valid_remote_name)
+    ///   refuses, also under `MIRROR`.
     /// - [`Error::InvalidInput`] if [`refs`](PullOptions::refs) is empty, also
     ///   under `MIRROR`.
     /// - [`Error::InvalidInput`] if [`verify`](PullOptions::verify) is not the
@@ -1565,6 +1572,7 @@ fn check_session_pull(opts: &PullOptions) -> Result<Option<Subpaths>> {
     let subpaths = Subpaths::parse(&opts.subpaths)?;
     check_depth(opts.depth)?;
     refuse_remote_collection(opts)?;
+    check_remote_option(opts)?;
     if opts.refs.is_empty() {
         return Err(no_refs());
     }

@@ -18,13 +18,14 @@
 //! - [`StagingTree`] and [`MutableTree`] build the tree of a new commit.
 //! - [`Repo::checkout_at`] writes the tree of a commit into a directory.
 //! - [`Repo::pull`] copies commits from a remote, and [`Repo::pull_local`] from a local repository.
+//! - [`Repo::pull_with_session`] copies commits from a remote through a session of the caller.
 //! - [`Error`] is the error of each fallible operation of the crate.
 //!
 //! # Modules
 //! - Read: [`read`], [`file`](mod@file), [`tree`], [`refs`], and [`traverse`].
 //! - Write: [`transaction`], [`mtree`], [`staging_tree`], [`commit`], [`modifier`], [`bootable`].
 //! - Checkout and export: [`checkout`], [`composefs`], [`tar`], and [`archive`].
-//! - Pull: [`pull`], [`summary`], [`fetch`], the HTTP client of `ostrya-fetch`, and [`remote`] for the pull over ssh.
+//! - Pull: [`pull`], [`summary`], [`fetch`], the HTTP client of `ostrya-fetch`, and [`remote`], which holds the session of a pull over HTTP, over ssh, or over a pair of byte streams.
 //! - Push and receive: [`remote`], the wire protocol of `ostrya-remote`, and `receive`.
 //! - Remote resolution: [`endpoint`], which reads the keys and files of a remote for a pull or a push.
 //! - Signing: [`sign`], `gpg`, and `spki`.

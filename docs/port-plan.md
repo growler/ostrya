@@ -168,22 +168,28 @@ bounded:
   Compiles on Linux, macOS, and Windows. On macOS and Windows,
   `rustls-native-certs` links system libraries of the operating system trust
   store.
-- `ostrya-remote` -- the wire protocol of the push and of the pull over ssh:
-  the messages and their GVariant encoding, the frame codec with its limit,
-  the chunked object stream with its abandon marker, and the bodies of the
-  pull. The pull has its own kinds, `PullHello`, `PullHelloReply`, `Get`,
-  and `GetReply`, and its own version, `PULL_PROTOCOL_VERSION`.
+- `ostrya-remote` -- the wire protocol and the client sessions of the push
+  and of the pull: the messages and their GVariant encoding, the frame codec
+  with its limit, the chunked object stream with its abandon marker, and the
+  bodies of the pull. The pull has its own kinds, `PullHello`,
+  `PullHelloReply`, `Get`, and `GetReply`, and its own version,
+  `PULL_PROTOCOL_VERSION`.
   `ObjectBody` reads the bytes of one object or of one pull body as an
   `AsyncRead`. The client session: `PushSession` over a pair of byte
   streams, the `ObjectSource` trait it reads objects through, and
-  `PushProgress`, `PushStats`, and `PushOutcome`. The transports:
-  `Endpoint`, `SshAddress`, `SshOptions`, and
-  `PushSession::connect`, which runs the ssh client as a child process
-  through `ostrya-rt`, or sends the steps of a session to an HTTP server. No repository
-  knowledge. Depends on `ostrya-gvariant`, `ostrya-core`, `ostrya-rt`,
-  `thiserror`, `futures-io`, and `futures-lite`, with the `smol` (default)
-  and `tokio` features that select the backend of `ostrya-rt`. Compiles on
-  Linux, macOS, and Windows.
+  `PushProgress`, `PushStats`, and `PushOutcome`. The pull sessions:
+  `StreamSession`, the framed session over ssh or over a pair of byte
+  streams, and `PullSession`, the session of a pull over the HTTP fetcher
+  or over a stream session. The transports: `Endpoint`, `SshAddress`,
+  `SshOptions`, `PushSession::connect`, which runs the ssh client as a child
+  process through `ostrya-rt`, or sends the steps of a session to an HTTP
+  server, and `PullSession::connect`, which opens the session of a pull over
+  HTTP or ssh. No repository knowledge. Depends on `ostrya-gvariant`,
+  `ostrya-core`, `ostrya-rt`, `ostrya-sign`, `ostrya-fetch`, `thiserror`,
+  `futures-io`, `futures-lite`, and `libc` on Unix, for the `O_NOFOLLOW` and
+  `O_NONBLOCK` flags and the error values of the file open in the walk of a
+  local directory. The `smol` (default) and `tokio` features select the
+  backend of `ostrya-rt`. Compiles on Linux, macOS, and Windows.
 - `ostrya-composefs` -- the byte-exact EROFS/composefs image writer and the
   fs-verity digest. Standalone and free of ostree and repository knowledge,
   like `ostrya-gvariant`: it takes a tree model and emits the image bytes and
@@ -3620,15 +3626,20 @@ commit, a dirtree, a dirmeta, or a `.commitmeta` -- is read whole, which is this
 project's rule for metadata, under the format's 128 MiB cap
 (`MAX_METADATA_SIZE`). The cap is applied to a declared `Content-Length` before
 the body is read and to the bytes as they arrive, so an undeclared body stops one
-frame past it. The buffer is sized from that declared length, one spare byte
-above it so the read that finds the end of the stream does not grow it, which
-holds the resident peak of one object to its own size instead of the capacity a
-regrowing vector reaches. One such buffer belongs to each step in flight, which puts the
-receive path's metadata ceiling at `max_outstanding_fetches` times the cap, 1 GiB
-at the default 8; a local pull imports one object at a time, so its ceiling is
-the cap itself. A slot holds kilobytes in practice: `ostree` 2026.1 writes a
-118-byte commit and a 12-byte dirmeta, and a dirtree of a 10,000-entry directory
-measures 710 KB, or 71 bytes an entry, so the cap stands as the format's ceiling.
+frame past it. The buffer has the declared length as its capacity. Each read
+goes into a separate chunk of 4 KiB to 128 KiB, also the read that finds the
+end of the stream, so a body of the declared length does not grow the buffer.
+This holds the resident peak of one object to its own size. A step in flight
+holds one such buffer, and a commit step holds two: the commit and its
+`.commitmeta`. So the metadata ceiling of the receive path is two times the cap
+times `PullSession::max_outstanding`, 2 GiB at the default 8. The pull also
+holds the `summary` and the `summary.sig` of the remote, each under a 64 MiB
+cap, until it ends. A local pull imports one object at a time, and the
+signature check of a commit reads the commit and its `.commitmeta` together,
+so its ceiling is two times the cap. A slot holds kilobytes in practice:
+`ostree` 2026.1 writes a 118-byte commit and a 12-byte dirmeta, and a
+dirtree of a 10,000-entry directory measures 710 KB, or 71 bytes an entry, so
+the cap stands as the format's ceiling.
 That header also declares the
 payload's uncompressed size, which bounds both sides of the stream. A payload that passes it
 is refused with `InvalidFormat` naming the object, so the bytes written before the
@@ -8851,3 +8862,102 @@ Resolved:
     of 1000 bytes per second for 30 seconds, where the caller gives no value.
     An endpoint from `FetcherOptions::new` also has 5 retries and 8 requests
     in flight, but no low-speed rule.
+
+    Revised on 2026-10-11 by decision 17 on the endpoint of a pull. A
+    library caller gives the `Endpoint` that it builds to
+    `PullSession::connect`, and pulls with `Repo::pull_with_session`.
+    `Repo::pull` gives `PullOptions::overrides` to `resolve_pull`.
+
+17. Pull entry points (Phase 19): a pull from a remote has two entry
+    points, `Repo::pull` and `Repo::pull_with_session`. This decision
+    revises decision 16 on the endpoint of a pull. `PullOptions` holds no
+    endpoint.
+
+    `Repo::pull(remote, opts)` does all the work of the `ostree pull`
+    command, and the CLI `pull` calls it. The pull first checks the
+    subpaths, the depth, `collection_id`, and `opts.remote`. A set
+    `opts.remote` that `valid_remote_name` refuses is
+    `Error::InvalidInput`, also under `MIRROR`. Then the pull calls
+    `resolve_pull` with `PullOptions::overrides`, reads the trust with
+    `PullTrust::from_remote`, and opens the session with
+    `PullSession::connect`. The trust comes before the session for HTTP and
+    for ssh. So a refused policy starts no fetcher and no ssh client. Over
+    HTTP, a set `max_outstanding_fetches` replaces
+    `FetcherOptions::max_outstanding` of the resolved endpoint. Over ssh,
+    the pull gives `max_outstanding_fetches` to
+    `StreamSessionOptions::max_outstanding`, and `None` gives a limit of
+    8. The default value of `overrides` overrides nothing. The CLI `pull`
+    puts `--url`, `--http-header`, the retry options, and the low-speed
+    options in this field. `PullStats::elapsed` starts at the call, so it
+    includes the time of `resolve_pull`.
+
+    `Repo::pull_with_session(session, trust, opts)` is the low-level entry.
+    The caller opens the `PullSession` and gives the `PullTrust`. A caller
+    that finds a server by its own discovery uses this entry. It gives its
+    own `Endpoint` to `PullSession::connect`. No entry takes an `Endpoint`
+    directly. The pull reads no remote section of the config. It reads the
+    `[core]` keys that each transaction reads. `PullStats::elapsed` starts
+    at the call.
+
+    Before its first request and before the transaction opens,
+    `pull_with_session` refuses these values. It then calls
+    `PullSession::finish`, ignores the result, and returns the refusal.
+
+    - The subpaths, the depth, and `collection_id` get the checks and the
+      errors of `Repo::pull`. A set `collection_id` is
+      `Error::Unsupported`.
+    - An empty `refs`, also under `MIRROR`, is `Error::InvalidInput`.
+    - A `verify` other than the default is `Error::InvalidInput`. The trust
+      holds the keys. `PullOptions::verify` stays for `Repo::pull` and
+      `Repo::pull_local`.
+    - A set `max_outstanding_fetches` is `Error::InvalidInput`. The limit
+      of the session applies.
+    - `overrides` other than the default is `Error::InvalidInput`. The
+      session selects the server.
+    - A set `opts.remote` that `valid_remote_name` refuses, also under
+      `MIRROR`, is `Error::InvalidInput`. The name is the prefix of the
+      written refs.
+
+    If `opts.remote` is `None`, `pull_with_session` writes local refs under
+    `refs/heads/<ref>`, as `pull_local` does. If it is `Some(name)`, the
+    refs go under `refs/remotes/<name>/<ref>`. `MIRROR` writes local refs
+    and ignores `opts.remote`. Under `MIRROR`, `pull_with_session` copies
+    no `summary`, because it refuses an empty `refs`. `Repo::pull` keeps
+    the copy. The library does not protect the local refs from the caller.
+
+    `PullSession` of `ostrya-remote` is a public enum with two variants,
+    `Http(Fetcher)` and `Stream(StreamSession)`. `StreamSession` and
+    `StreamSessionOptions` are the framed session of `ostrya send` and its
+    options. `PullSession::over_stream` opens a stream session over a pair
+    of byte streams. For an `Endpoint::Http`, `PullSession::connect`
+    refuses stream options with a field set, and `FetcherOptions` with an
+    empty `mirrors` list. The agent and the request limit of HTTP come from
+    `FetcherOptions`. `PullSession::fetch_summary` takes `&self`. So a
+    caller reads the refs of the summary and then gives the same session to
+    the pull. The pull reads `summary.sig` and `summary` again, and does not
+    use the bytes that `fetch_summary` returned. Over a stream session, it
+    also reads `config` at the same time.
+
+    `ostrya::verify` holds `TrustedKeys` and `PullTrust`, with no feature
+    gate. `ostrya::receive`, under the `receive` feature, re-exports
+    `TrustedKeys`. The crate root re-exports both types under
+    `#[doc(hidden)]`. An unverified pull names
+    `PullTrust::unverified()`, and `PullTrust` has no `Default`. Keys from
+    `TrustedKeys::new` and from `TrustedKeys::with_gpg`, under the
+    `verify-gpg` feature, are the whole trusted set. The pull reads no
+    system store and no keyring of the repository for them.
+    `PullTrust::from_remote` gives the trust of `Repo::pull`: the remote
+    section, its keyrings, the system store, and `PullVerify` as overrides.
+
+    The byte counters are on the `Fetcher` handle. `Fetcher::counted` gives
+    a handle on the same connection pool with more counters. The pull
+    attaches its counters to the fetcher of a session in this way. A
+    counter that the caller attaches gets the bytes of each body that the
+    fetcher reads, the `summary`, the `config`, and the ref files included.
+    So its count can be larger than `PullStats::bytes_transferred`.
+
+    `Repo::remote_fetch_summary(remote)` resolves the endpoint of the
+    remote with the default overrides, opens the session, reads
+    `summary.sig` and `summary`, and ends the session. A resolved endpoint
+    has one mirror. So the refusal of `FetcherOptions` with an empty
+    `mirrors` list is in `PullSession::connect` alone.

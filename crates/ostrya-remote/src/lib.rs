@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
 
-//! The wire codec and the client sessions of the ostrya push and ssh pull.
+//! The wire codec and the client sessions of the ostrya push and pull.
 //!
 //! A caller pushes a local directory as one commit with [`push_tree`](fn@push_tree), or the
 //! objects of its own source with a [`PushSession`]. A [`StreamSession`] reads the files of a
-//! server repository over ssh or over a pair of byte streams. The crate has no repository
-//! knowledge, and it compiles on Linux, macOS, and Windows.
+//! server repository over ssh or over a pair of byte streams. A [`PullSession`] is the session of
+//! a pull over HTTP or over a stream session. The crate has no repository knowledge, and it
+//! compiles on Linux, macOS, and Windows.
 //!
 //! # Entry points
 //!

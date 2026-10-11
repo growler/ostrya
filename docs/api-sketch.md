@@ -2366,6 +2366,8 @@ refuses these values:
   session applies;
 - `overrides` other than the default, with `InvalidInput`. The session
   selects the server;
+- a set `remote` that `valid_remote_name` refuses, also under `MIRROR`, with
+  `InvalidInput`, as `pull` does before it resolves the remote;
 - a set `collection_id`, with `Unsupported`, as `pull` does.
 
 On a refusal, the pull calls `PullSession::finish`, ignores its result, and
@@ -2501,7 +2503,9 @@ pub struct PullOptions {
                                           // pull_with_session: InvalidInput
     pub remote: Option<String>,           // refs/remotes/<remote>/<ref>; None:
                                           // local refs for pull_local and
-                                          // pull_with_session
+                                          // pull_with_session; pull /
+                                          // pull_with_session: InvalidInput
+                                          // if valid_remote_name refuses it
     pub no_ref_writes: bool,              // write no ref and no mirror summary;
                                           // the caller writes the refs
     pub collection_id: Option<String>,    // local pull: refs/mirrors/<id>/<ref>;
@@ -2634,8 +2638,9 @@ impl Repo {
     /// The pull through a session of the caller, under its trust. It reads
     /// no remote section. Before the first request it refuses an empty
     /// `refs`, a `verify` other than the default, a set
-    /// `max_outstanding_fetches`, and `overrides` other than the default
-    /// with InvalidInput, and a set `collection_id` with Unsupported.
+    /// `max_outstanding_fetches`, `overrides` other than the default, and
+    /// a `remote` that `valid_remote_name` refuses with InvalidInput, and a
+    /// set `collection_id` with Unsupported.
     pub async fn pull_with_session(&self, session: PullSession,
                                    trust: PullTrust, opts: PullOptions)
         -> Result<PullStats>;
@@ -5034,7 +5039,8 @@ The pull through the stream source:
   requests one after another.
 - A content object of the stream source takes no write permit. The session
   streams one body at a time, and the stores that finish after the end of
-  their body are bounded by `max_outstanding_fetches`. The HTTP pull keeps
+  their body are bounded by the request limit of the session,
+  `PullSession::max_outstanding`. The HTTP pull keeps
   its three write permits.
 - `PullStats::bytes_transferred` counts the bytes of the bodies the source
   reads, from the same point as the HTTP count, so it equals the HTTP count

@@ -2130,6 +2130,8 @@ struct Inner {
     progress_timeout: Duration,
     low_speed: Option<LowSpeed>,
     fetch_timeout: Option<Duration>,
+    /// The number of requests that the gate admits at one time, at least 1.
+    max_outstanding: usize,
     gate: Arc<Gate>,
     h2_connection_window: u32,
     pool: Mutex<HashMap<PoolKey, PoolEntry>>,
@@ -2470,6 +2472,7 @@ impl Fetcher {
                 progress_timeout: options.progress_timeout,
                 low_speed: options.low_speed,
                 fetch_timeout: options.fetch_timeout,
+                max_outstanding,
                 gate: Arc::new(Gate::new(max_outstanding)),
                 h2_connection_window: h2_connection_window(max_outstanding),
                 pool: Mutex::new(HashMap::new()),
@@ -2502,6 +2505,15 @@ impl Fetcher {
             inner: Arc::clone(&self.inner),
             received: self.received.iter().cloned().chain(received).collect(),
         }
+    }
+
+    /// Returns the number of requests that the fetcher admits at one time.
+    ///
+    /// The number is [`max_outstanding`](FetcherOptions::max_outstanding) of
+    /// the options, and at least 1. All handles on one fetcher share this
+    /// limit.
+    pub fn max_outstanding(&self) -> usize {
+        self.inner.max_outstanding
     }
 
     /// Sends `request` to each destination in turn and returns the response.

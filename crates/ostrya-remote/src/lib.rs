@@ -17,6 +17,8 @@
 //! - [`PushSession::over_stream`] opens a push session over a pair of byte streams.
 //! - [`StreamSession::connect`] opens a stream session over ssh, and [`StreamSession::get`] reads
 //!   a file.
+//! - [`PullSession::connect`] opens the session of a pull to an [`Endpoint`], over HTTP or ssh,
+//!   and [`PullSession::fetch_summary`] reads the summary of the remote.
 //! - [`Error`] is the error of each fallible operation, and [`ErrorCode`] names its wire codes.
 //!
 //! # Modules
@@ -59,9 +61,9 @@ pub use push_tree::{
 };
 #[doc(hidden)]
 pub use session::{
-    BoxFuture, Compression, ObjectData, ObjectReader, ObjectSource, PullBody, PushOutcome,
-    PushPhase, PushProgress, PushProgressFn, PushProgressSnapshot, PushSession, PushStats,
-    ServerInfo, SessionOptions, StreamSession, StreamSessionOptions,
+    BoxFuture, Compression, ObjectData, ObjectReader, ObjectSource, PullBody, PullSession,
+    PushOutcome, PushPhase, PushProgress, PushProgressFn, PushProgressSnapshot, PushSession,
+    PushStats, ServerInfo, SessionOptions, StreamSession, StreamSessionOptions,
 };
 #[doc(hidden)]
 pub use transport::{Endpoint, PreparedSession, SshAddress, SshOptions, without_userinfo};
@@ -92,6 +94,7 @@ const _: fn() = || {
     assert_send_sync::<tree::EntryPath>();
     assert_send_sync::<ParentPolicy>();
     assert_send_sync::<StreamSession>();
+    assert_send_sync::<PullSession>();
     assert_send_sync::<PullBody>();
     assert_send_sync::<StreamSessionOptions>();
     assert_send_sync::<Endpoint>();
@@ -119,6 +122,23 @@ fn stream_session_futures_are_send(
         StreamSessionOptions::default(),
     ));
     assert_send(&session.get("config", 1));
+    assert_send(&owned.finish());
+}
+
+/// The futures of a pull session can run on a multi-threaded executor.
+#[allow(dead_code)]
+fn pull_session_futures_are_send(endpoint: &Endpoint, session: &PullSession, owned: PullSession) {
+    fn assert_send<T: Send>(_: &T) {}
+    assert_send(&PullSession::connect(
+        endpoint.clone(),
+        StreamSessionOptions::default(),
+    ));
+    assert_send(&PullSession::over_stream(
+        futures_lite::io::empty(),
+        futures_lite::io::sink(),
+        StreamSessionOptions::default(),
+    ));
+    assert_send(&session.fetch_summary());
     assert_send(&owned.finish());
 }
 

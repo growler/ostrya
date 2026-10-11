@@ -104,8 +104,12 @@ pub struct StreamSession {
 
 struct StreamInner {
     shared: Arc<Shared>,
+    /// The number of calls that hold a place in the pipeline at one time, at
+    /// least 1.
+    max_outstanding: usize,
     /// The ssh client, for a session that [`StreamSession::connect`] opened.
-    transport: Option<Transport>,
+    /// The box keeps the session small.
+    transport: Option<Box<Transport>>,
 }
 
 /// The state that the session, its calls, and its bodies share.
@@ -444,6 +448,7 @@ impl StreamSession {
                     }),
                     pending_limit,
                 }),
+                max_outstanding: outstanding,
                 transport: None,
             },
         })
@@ -451,8 +456,14 @@ impl StreamSession {
 
     /// Attaches the child process whose standard streams the session uses.
     pub(crate) fn with_transport(mut self, child: Transport) -> StreamSession {
-        self.inner.transport = Some(child);
+        self.inner.transport = Some(Box::new(child));
         self
+    }
+
+    /// Returns the number of calls that hold a place in the pipeline at one
+    /// time, at least 1.
+    pub(crate) fn max_outstanding(&self) -> usize {
+        self.inner.max_outstanding
     }
 
     /// Asks for the file at `path` and waits for the head of its reply.

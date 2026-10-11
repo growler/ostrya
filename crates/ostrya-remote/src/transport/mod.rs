@@ -7,7 +7,9 @@
 //! and [`PreparedSession::open`] opens the session later.
 //!
 //! [`StreamSession::connect`] opens a stream session over ssh to an
-//! [`SshAddress`] with [`SshOptions`].
+//! [`SshAddress`] with [`SshOptions`]. [`PullSession::connect`] opens the
+//! session of a pull to an endpoint: a stream session over ssh, or the fetcher
+//! of an HTTP remote.
 //!
 //! Over ssh, the client runs the ssh client as a child process, and the remote
 //! side runs the receive command or the send command. The frames of the
@@ -23,7 +25,9 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::session::http::Endpoint as HttpEndpoint;
-use crate::session::{PushSession, SessionOptions, StreamSession, StreamSessionOptions};
+use crate::session::{
+    PullSession, PushSession, SessionOptions, StreamSession, StreamSessionOptions,
+};
 
 pub(crate) use ssh::Transport;
 pub use ssh::{SshAddress, SshOptions, without_userinfo};
@@ -478,6 +482,50 @@ impl StreamSession {
         let env = std::env::var_os("OSTRYA_SSH_COMMAND");
         let argv = pull_command_line(address, options, env.as_deref())?;
         spawn_and_open_pull(&argv, session, PENDING_READ_LIMIT).await
+    }
+}
+
+/// The open of the session of a pull over ssh or HTTP.
+impl PullSession {
+    /// Opens the session of a pull to `endpoint`.
+    ///
+    /// For an [`Endpoint::Ssh`], the call is [`StreamSession::connect`] with
+    /// the address, the ssh options, and `opts`. The result is
+    /// [`PullSession::Stream`].
+    ///
+    /// For an [`Endpoint::Http`], the call builds the fetcher with
+    /// [`Fetcher::new`](ostrya_fetch::Fetcher::new), and the result is
+    /// [`PullSession::Http`]. The options of the endpoint give the agent and
+    /// the request limit, so `opts` must set no field. Before the call builds
+    /// the fetcher, it refuses `opts` with a field set, and then options that
+    /// name no mirror. The call sends no HTTP request. An `https://` mirror
+    /// with [`TrustRoots::System`](ostrya_fetch::TrustRoots::System) reads the
+    /// trust store of the host, as [`Fetcher::new`](ostrya_fetch::Fetcher::new)
+    /// states.
+    ///
+    /// Under the tokio backend, the call must run within a runtime that has
+    /// the IO driver and the time driver enabled, as [`PushSession::connect`]
+    /// states.
+    ///
+    /// # Errors
+    ///
+    /// - The errors of [`StreamSession::connect`] for an ssh endpoint.
+    /// - [`Error::InvalidInput`] if `opts` sets a field for an HTTP endpoint.
+    /// - [`Error::InvalidInput`] if the options of an HTTP endpoint name no
+    ///   mirror.
+    /// - [`Error::Fetch`] if [`Fetcher::new`](ostrya_fetch::Fetcher::new)
+    ///   refuses the options of an HTTP endpoint.
+    pub async fn connect(endpoint: Endpoint, opts: StreamSessionOptions) -> Result<PullSession> {
+        match endpoint {
+            Endpoint::Ssh { address, options } => StreamSession::connect(&address, &options, opts)
+                .await
+                .map(PullSession::Stream),
+            // The future of the fetcher construction is boxed, so that the
+            // future of an ssh connect does not hold it.
+            Endpoint::Http(http) => Ok(PullSession::Http(
+                Box::pin(http::prepare_pull(http, opts)).await?,
+            )),
+        }
     }
 }
 

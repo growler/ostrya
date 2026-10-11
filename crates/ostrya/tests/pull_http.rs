@@ -2,7 +2,8 @@
 //!
 //! Each test serves a repository directory from an in-process static file
 //! server. The server uses cleartext HTTP/1.1. If the transport matters, it
-//! uses TLS, and ALPN selects HTTP/2.
+//! uses TLS, and ALPN selects HTTP/2. The test of the size cap of the summary
+//! uses a scripted peer that states a length and sends no body.
 //!
 //! ostrya builds the source repositories. If the `ostree` command is absent,
 //! each interop test that needs it returns early.
@@ -23,23 +24,26 @@ mod proxy;
 mod pull;
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use common::{
     TmpDir, file_inventory, ostree_available, ostree_supports_ed25519, wait_for_commit_under_guard,
     within, writer_child_main, writer_child_with,
 };
 use futures_lite::future::poll_once;
+use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use ostrya::endpoint::{EndpointOverrides, resolve_pull};
 use ostrya::fetch::{BearerToken, ClientIdentity, FetcherOptions, Proxy};
-use ostrya::remote::Endpoint;
+use ostrya::remote::{Endpoint, PullSession, StreamSessionOptions};
 use ostrya::{
     Checksum, CommitModifierFlags, CommitState, CreateOptions, DeltaEndianness, DeltaOptions,
     DetachedMetadataFilter, Ed25519Signer, Error, FilterResult, FsckOptions, PullFlags,
     PullOptions, PullStats, PullVerify, Repo, RepoMode, SummaryOptions, TimestampCheck, TreeEntry,
     Type, Value, static_delta_relative_dir,
 };
-use ostrya_rt::{block_on, spawn};
+use ostrya_rt::{TcpListener, block_on, spawn};
 use proxy::{TestProxy, Tunnel};
 use pull::*;
 
@@ -2650,6 +2654,133 @@ fn remote_fetch_summary_reports_both_files() {
         let (_, signature) = dest.remote_fetch_summary("origin", None).await.unwrap();
         assert_eq!(signature.as_deref(), Some(b"signature bytes".as_slice()));
     });
+}
+
+/// `PullSession::fetch_summary` over HTTP asks for `summary.sig` and then for
+/// `summary`, and returns the summary first. A file that the remote does not
+/// serve is `None`. One session serves each call.
+#[test]
+fn a_pull_session_fetches_the_summary_over_http() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-session-fetch-summary");
+        build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), true).await;
+        let session = PullSession::connect(
+            Endpoint::Http(https_endpoint(&server)),
+            StreamSessionOptions::default(),
+        )
+        .await
+        .unwrap();
+        let summary = std::fs::read(dir.path().join("remote/summary")).unwrap();
+
+        let (got, signature) = session.fetch_summary().await.unwrap();
+        assert_eq!(got.as_deref(), Some(summary.as_slice()));
+        assert_eq!(signature, None);
+        assert_eq!(server.seen(), ["summary.sig", "summary"]);
+
+        std::fs::write(dir.path().join("remote/summary.sig"), SUMMARY_SIG).unwrap();
+        let (got, signature) = session.fetch_summary().await.unwrap();
+        assert_eq!(got.as_deref(), Some(summary.as_slice()));
+        assert_eq!(signature.as_deref(), Some(SUMMARY_SIG));
+
+        std::fs::remove_file(dir.path().join("remote/summary")).unwrap();
+        let (got, signature) = session.fetch_summary().await.unwrap();
+        assert_eq!(got, None);
+        assert_eq!(signature.as_deref(), Some(SUMMARY_SIG));
+        assert_eq!(
+            server.seen(),
+            [
+                "summary.sig",
+                "summary",
+                "summary.sig",
+                "summary",
+                "summary.sig",
+                "summary"
+            ]
+        );
+        session.finish().await.unwrap();
+    });
+}
+
+/// Starts a peer that answers a request for `oversized` with a head that
+/// states a length of 64 MiB + 1, and sends no body. The peer answers each
+/// other request with a 404. Each answer closes its connection.
+///
+/// The list gives the request paths that the peer read, in order, without the
+/// leading slash.
+async fn oversized_file_server(oversized: &'static str) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    drop(spawn(async move {
+        while let Ok((mut stream, _peer)) = listener.accept().await {
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let line = String::from_utf8_lossy(&head);
+            let Some(path) = line.split(' ').nth(1) else {
+                continue;
+            };
+            let path = path.trim_start_matches('/').to_owned();
+            let answer = if path == oversized {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    64 * 1024 * 1024 + 1
+                )
+            } else {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_owned()
+            };
+            log.lock().unwrap().push(path);
+            let _ = stream.write_all(answer.as_bytes()).await;
+            let _ = stream.flush().await;
+            let _ = stream.close().await;
+        }
+    }));
+    (addr, seen)
+}
+
+/// `PullSession::fetch_summary` over HTTP refuses a `summary.sig` or a
+/// `summary` whose stated length is over the cap of 64 MiB. The refusal comes
+/// from the head of the answer, before the body, and the call does not ask
+/// again.
+#[test]
+fn a_pull_session_refuses_a_summary_file_over_the_cap_over_http() {
+    for (oversized, asked) in [
+        ("summary.sig", &["summary.sig"][..]),
+        ("summary", &["summary.sig", "summary"][..]),
+    ] {
+        block_on(async {
+            let (addr, seen) = oversized_file_server(oversized).await;
+            let mut http = FetcherOptions::new(format!("http://{addr}"));
+            http.proxy = Proxy::None;
+            let session =
+                PullSession::connect(Endpoint::Http(http), StreamSessionOptions::default())
+                    .await
+                    .unwrap();
+
+            let err = session.fetch_summary().await.unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ostrya::remote::Error::Fetch(ostrya::fetch::Error::FetchTooLarge {
+                        limit: 67_108_864
+                    })
+                ),
+                "{oversized}: {err}"
+            );
+            assert_eq!(*seen.lock().unwrap(), asked, "{oversized}");
+            session.finish().await.unwrap();
+        });
+    }
 }
 
 /// `remote_fetch_summary` reads from an HTTP `pull-url` when no `url` is set.

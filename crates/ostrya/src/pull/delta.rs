@@ -33,7 +33,7 @@ use crate::repo::Repo;
 use crate::summary::{INDEXED_DELTAS_KEY, Summary};
 use crate::transaction::Transaction;
 
-use super::source::{RemoteSource, session_error};
+use super::source::{RemoteSource, Transfer, session_error};
 
 /// The number of delta parts that one pull fetches at a time.
 pub(crate) const PART_CAP: usize = 2;
@@ -743,21 +743,21 @@ pub(crate) async fn apply_job_part(
     let path = format!("{}/{index}", job.dir);
     let staging = txn.staging_fd().try_clone_to_owned()?;
     let blob = match source {
-        DeltaSource::Remote(RemoteSource::Http(fetcher)) => {
-            fetch_part_blob(fetcher, &path, entry, &staging).await?
-        }
-        // The size of the part in the superblock caps the body.
-        DeltaSource::Remote(RemoteSource::Stream(stream)) => {
-            let body = stream.get(&path, entry.size).await?.ok_or_else(|| {
-                Error::InvalidFormat(format!(
-                    "static delta {}: the remote holds no part {index}",
-                    job.name
-                ))
-            })?;
-            decode_part_stream(body, entry, &staging)
-                .await
-                .map_err(session_error)?
-        }
+        DeltaSource::Remote(remote) => match remote.transfer() {
+            Transfer::Http(fetcher) => fetch_part_blob(fetcher, &path, entry, &staging).await?,
+            // The size of the part in the superblock caps the body.
+            Transfer::Stream(stream) => {
+                let body = stream.get(&path, entry.size).await?.ok_or_else(|| {
+                    Error::InvalidFormat(format!(
+                        "static delta {}: the remote holds no part {index}",
+                        job.name
+                    ))
+                })?;
+                decode_part_stream(body, entry, &staging)
+                    .await
+                    .map_err(session_error)?
+            }
+        },
         DeltaSource::Local(repo) => {
             let (file, len) = open_local(repo, &path).await?.ok_or_else(|| {
                 Error::InvalidFormat(format!(

@@ -1,7 +1,8 @@
 //! The client session of the pull against scripted servers over a bounded
 //! in-process pipe. The tests cover the hello and the version, the pipeline,
 //! the reply bodies, the length checks, the end of the session, and the errors
-//! that later calls repeat.
+//! that later calls repeat. They also cover the open of a `PullSession` over
+//! each transport, its request limit, and its read of the summary.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -14,11 +15,15 @@ use std::time::Duration;
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::future;
 use futures_lite::io::AsyncReadExt;
+use ostrya_fetch::{FetcherOptions, Proxy};
 use ostrya_remote::proto::{
     ErrorMessage, FrameReader, FrameWriter, GetReply, Message, PULL_PROTOCOL_VERSION,
     PullHelloReply,
 };
-use ostrya_remote::{Error, ErrorCode, PullBody, StreamSession, StreamSessionOptions};
+use ostrya_remote::transport::Endpoint;
+use ostrya_remote::{
+    Error, ErrorCode, PullBody, PullSession, Result, StreamSession, StreamSessionOptions,
+};
 
 /// The capacity of each pipe. It is smaller than a large body, so the server
 /// waits for the client to read.
@@ -829,4 +834,185 @@ fn a_dropped_session_closes_its_output_while_a_body_is_held() {
         },
     );
     drop(held);
+}
+
+/// Returns the error of an open of a pull session that must fail.
+fn refused(opened: Result<PullSession>) -> Error {
+    match opened {
+        Ok(_) => panic!("the session opened"),
+        Err(e) => e,
+    }
+}
+
+/// `connect` refuses a set field of the stream options for an HTTP endpoint,
+/// before it checks the mirrors and before it builds the fetcher. The
+/// fetcher refuses the `ftp` mirror, and the check of the mirrors refuses the
+/// options with no mirror, so the refusal of the stream options comes first.
+#[test]
+fn connect_refuses_stream_options_for_an_http_endpoint() {
+    for http in [FetcherOptions::new("ftp://h/"), FetcherOptions::default()] {
+        for (opts, message) in [
+            (
+                StreamSessionOptions {
+                    agent: Some("agent".to_owned()),
+                    max_outstanding: None,
+                },
+                "an HTTP pull takes no agent of a stream session",
+            ),
+            (
+                StreamSessionOptions {
+                    agent: None,
+                    max_outstanding: Some(4),
+                },
+                "an HTTP pull takes no request limit of a stream session",
+            ),
+        ] {
+            let e = refused(ostrya_rt::block_on(PullSession::connect(
+                Endpoint::Http(http.clone()),
+                opts,
+            )));
+            assert!(
+                matches!(&e, Error::InvalidInput(m) if m.starts_with(message)),
+                "{e:?}"
+            );
+        }
+    }
+    let e = refused(ostrya_rt::block_on(PullSession::connect(
+        Endpoint::Http(FetcherOptions::new("ftp://h/")),
+        StreamSessionOptions::default(),
+    )));
+    assert!(matches!(e, Error::Fetch(_)), "{e:?}");
+}
+
+/// `connect` refuses an HTTP endpoint that names no mirror.
+#[test]
+fn connect_refuses_an_http_endpoint_with_no_mirror() {
+    let e = refused(ostrya_rt::block_on(PullSession::connect(
+        Endpoint::Http(FetcherOptions::default()),
+        StreamSessionOptions::default(),
+    )));
+    assert!(
+        matches!(&e, Error::InvalidInput(m) if m == "the HTTP endpoint of a pull names no mirror"),
+        "{e:?}"
+    );
+}
+
+/// `connect` for an HTTP endpoint gives the fetcher of the endpoint. The
+/// fetcher admits the request limit of the options, and at least 1. `finish`
+/// of an HTTP session is `Ok`.
+///
+/// The mirror is cleartext and the fetcher follows no redirect and uses no
+/// proxy, so the open reads no trust store. No server listens, and the open
+/// sends no request.
+#[test]
+fn connect_for_http_gives_the_fetcher_and_its_limit() {
+    for (asked, admitted) in [(5, 5), (0, 1)] {
+        let mut http = FetcherOptions::new("http://127.0.0.1:9/");
+        http.max_redirects = 0;
+        http.proxy = Proxy::None;
+        http.max_outstanding = asked;
+        ostrya_rt::block_on(async {
+            let session =
+                PullSession::connect(Endpoint::Http(http), StreamSessionOptions::default())
+                    .await
+                    .unwrap();
+            assert!(matches!(session, PullSession::Http(_)));
+            assert_eq!(session.max_outstanding(), admitted);
+            session.finish().await.unwrap();
+        });
+    }
+}
+
+/// `over_stream` gives a stream session with the request limit of the
+/// options: 8 if the options give no number, and at least 1.
+#[test]
+fn over_stream_gives_the_limit_of_the_stream_session() {
+    for (asked, admitted) in [(Some(3), 3), (None, 8), (Some(0), 1)] {
+        let ((input, output), mut server) = ends();
+        run(
+            async {
+                let session = PullSession::over_stream(input, output, options(asked))
+                    .await
+                    .unwrap();
+                assert!(matches!(session, PullSession::Stream(_)));
+                assert_eq!(session.max_outstanding(), admitted);
+                session.finish().await.unwrap();
+            },
+            async {
+                server.hello(1).await;
+                assert!(server.recv().await.is_none());
+            },
+        );
+    }
+}
+
+/// `fetch_summary` over a stream session asks for `summary.sig` and then for
+/// `summary`, with both calls in flight together. It returns the summary
+/// first. A file that the server does not serve is `None`.
+#[test]
+fn fetch_summary_over_a_stream_returns_both_files() {
+    let summary = body_of("summary");
+    let signature = body_of("summary.sig");
+    for (sig_served, summary_served) in [(true, true), (false, true), (true, false)] {
+        let ((input, output), mut server) = ends();
+        let got = run(
+            async {
+                let session = PullSession::over_stream(input, output, options(None))
+                    .await
+                    .unwrap();
+                let got = session.fetch_summary().await.unwrap();
+                session.finish().await.unwrap();
+                got
+            },
+            async {
+                server.hello(1).await;
+                // Both `Get` frames arrive before the first reply.
+                assert_eq!(server.path().await, "summary.sig");
+                assert_eq!(server.path().await, "summary");
+                for (served, body) in [(sig_served, &signature), (summary_served, &summary)] {
+                    if served {
+                        server.body(Some(body.len() as u64), body, 1000).await;
+                    } else {
+                        server.not_found().await;
+                    }
+                }
+                assert!(server.recv().await.is_none());
+            },
+        );
+        assert_eq!(got.0, summary_served.then(|| summary.clone()));
+        assert_eq!(got.1, sig_served.then(|| signature.clone()));
+    }
+}
+
+/// `fetch_summary` caps each file at 64 MiB. A stated length over the cap
+/// ends the session with `LimitExceeded` before the client reads the body.
+#[test]
+fn fetch_summary_refuses_a_stated_length_over_64_mib() {
+    const CAP: u64 = 64 * 1024 * 1024;
+    let ((input, output), mut server) = ends();
+    run(
+        async {
+            let session = PullSession::over_stream(input, output, options(None))
+                .await
+                .unwrap();
+            let e = session.fetch_summary().await.unwrap_err();
+            assert!(
+                matches!(&e, Error::LimitExceeded(m) if m.contains(&format!("over the limit {CAP}"))),
+                "{e:?}"
+            );
+        },
+        async {
+            server.hello(1).await;
+            server.path().await;
+            server.path().await;
+            server
+                .send(&Message::GetReply(GetReply {
+                    found: true,
+                    len: Some(CAP + 1),
+                }))
+                .await;
+            // The client reads no body and closes its output.
+            assert!(server.recv_or_eof().await);
+        },
+    );
 }

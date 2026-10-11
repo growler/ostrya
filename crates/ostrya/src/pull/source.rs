@@ -18,26 +18,33 @@ use futures_io::AsyncRead;
 
 use crate::error::{Error, Result};
 use crate::fetch::{Fetcher, Priority};
-use crate::remote::{self, PullBody, StreamSession};
+use crate::remote::{self, PullBody, PullSession, StreamSession};
 use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE};
 
-use super::http::{
-    CONFIG_FILE, MAX_ROOT_FILE, fetch_optional, fetch_summary, read_whole, ref_request_path,
-};
+use super::http::{CONFIG_FILE, MAX_ROOT_FILE, fetch_optional, read_whole, ref_request_path};
 
-/// The remote a pull reads from.
-pub(crate) enum RemoteSource {
-    /// An HTTP remote, through the pull's fetcher.
-    Http(Fetcher),
-    /// A stream session, over ssh or over a pair of streams. The session can
-    /// hold the ssh client, so the variant boxes it.
-    Stream(Box<StreamSource>),
+/// The remote a pull reads from: the session of the pull, and the counters of
+/// the transferred bytes.
+pub(crate) struct RemoteSource {
+    /// The session. The fetcher of an HTTP session adds the byte count of each
+    /// body to the counters itself.
+    session: PullSession,
+    /// The counters that get the byte count of each body of a stream session.
+    transferred: Vec<Arc<AtomicU64>>,
+}
+
+/// The transport of a remote source, for one request.
+pub(crate) enum Transfer<'a> {
+    /// An HTTP remote, through the counted fetcher of the pull.
+    Http(&'a Fetcher),
+    /// A stream session, over ssh or over a pair of streams.
+    Stream(StreamSource<'a>),
 }
 
 /// A stream session, and the counters that get the byte count of each body.
-pub(crate) struct StreamSource {
-    session: StreamSession,
-    transferred: Vec<Arc<AtomicU64>>,
+pub(crate) struct StreamSource<'a> {
+    session: &'a StreamSession,
+    transferred: &'a [Arc<AtomicU64>],
 }
 
 /// The files at the root of the remote that a pull reads first.
@@ -66,6 +73,33 @@ impl RootFiles {
 }
 
 impl RemoteSource {
+    /// Creates a source over `session`, which adds the byte count of each
+    /// body to each counter in `transferred`.
+    ///
+    /// An HTTP session gets a handle on its fetcher with the counters. A
+    /// stream session adds the count of each body through [`Counted`].
+    pub(crate) fn new(session: PullSession, transferred: Vec<Arc<AtomicU64>>) -> RemoteSource {
+        let session = match session {
+            PullSession::Http(fetcher) => PullSession::Http(fetcher.counted(transferred.clone())),
+            stream => stream,
+        };
+        RemoteSource {
+            session,
+            transferred,
+        }
+    }
+
+    /// Returns the transport of the source.
+    pub(crate) fn transfer(&self) -> Transfer<'_> {
+        match &self.session {
+            PullSession::Http(fetcher) => Transfer::Http(fetcher),
+            PullSession::Stream(session) => Transfer::Stream(StreamSource {
+                session,
+                transferred: &self.transferred,
+            }),
+        }
+    }
+
     /// Reads the file at `path` whole, under `cap`, or returns `None` if the
     /// remote does not serve it.
     ///
@@ -77,9 +111,9 @@ impl RemoteSource {
         priority: Priority,
         cap: u64,
     ) -> Result<Option<Vec<u8>>> {
-        match self {
-            RemoteSource::Http(fetcher) => fetch_optional(fetcher, path, priority, cap).await,
-            RemoteSource::Stream(stream) => stream.read_optional(path, cap).await,
+        match self.transfer() {
+            Transfer::Http(fetcher) => fetch_optional(fetcher, path, priority, cap).await,
+            Transfer::Stream(stream) => stream.read_optional(path, cap).await,
         }
     }
 
@@ -90,16 +124,17 @@ impl RemoteSource {
     /// of the `ostree` command. The stream source keeps the three requests in
     /// flight together.
     pub(crate) async fn root_files(&self) -> Result<RootFiles> {
-        match self {
-            RemoteSource::Http(fetcher) => {
-                let (summary, signature) = fetch_summary(fetcher).await?;
+        match self.transfer() {
+            Transfer::Http(_) => {
+                let (summary, signature) =
+                    self.session.fetch_summary().await.map_err(http_error)?;
                 Ok(RootFiles {
                     summary,
                     signature,
                     config: None,
                 })
             }
-            RemoteSource::Stream(stream) => {
+            Transfer::Stream(stream) => {
                 let ((signature, summary), config) = futures_lite::future::zip(
                     futures_lite::future::zip(
                         stream.read_optional(SUMMARY_SIG_FILE, MAX_ROOT_FILE),
@@ -123,9 +158,9 @@ impl RemoteSource {
     /// the order of the `ostree` command. The stream source keeps the two
     /// requests in flight together.
     pub(crate) async fn summary_files(&self) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-        match self {
-            RemoteSource::Http(fetcher) => fetch_summary(fetcher).await,
-            RemoteSource::Stream(stream) => {
+        match self.transfer() {
+            Transfer::Http(_) => self.session.fetch_summary().await.map_err(http_error),
+            Transfer::Stream(stream) => {
                 let (signature, summary) = futures_lite::future::zip(
                     stream.read_optional(SUMMARY_SIG_FILE, MAX_ROOT_FILE),
                     stream.read_optional(SUMMARY_FILE, MAX_ROOT_FILE),
@@ -141,9 +176,9 @@ impl RemoteSource {
     /// An HTTP request takes the path percent-encoded. The stream source
     /// takes the name as written, because its `Get` carries no escape.
     pub(crate) fn ref_path(&self, name: &str) -> String {
-        match self {
-            RemoteSource::Http(_) => ref_request_path(name),
-            RemoteSource::Stream(_) => format!("refs/heads/{name}"),
+        match self.transfer() {
+            Transfer::Http(_) => ref_request_path(name),
+            Transfer::Stream(_) => format!("refs/heads/{name}"),
         }
     }
 
@@ -158,10 +193,10 @@ impl RemoteSource {
     /// That error carries the exit status of an ssh client that failed with an
     /// I/O error. The function returns any other failure unchanged.
     pub(crate) async fn finish<T>(self, result: Result<T>) -> Result<T> {
-        match self {
-            RemoteSource::Http(_) => result,
-            RemoteSource::Stream(stream) => {
-                let ended = stream.session.finish().await;
+        match self.session {
+            PullSession::Http(_) => result,
+            PullSession::Stream(session) => {
+                let ended = session.finish().await;
                 match (result, ended) {
                     (Ok(value), ended) => ended.map(|()| value).map_err(Error::Remote),
                     (Err(Error::Remote(_)), Err(ended)) => Err(Error::Remote(ended)),
@@ -172,25 +207,14 @@ impl RemoteSource {
     }
 }
 
-impl StreamSource {
-    /// Creates a source over `session`.
-    ///
-    /// The source adds the byte count of each body to each counter in
-    /// `transferred`.
-    pub(crate) fn new(session: StreamSession, transferred: Vec<Arc<AtomicU64>>) -> StreamSource {
-        StreamSource {
-            session,
-            transferred,
-        }
-    }
-
+impl<'a> StreamSource<'a> {
     /// Asks for the file at `path`, with a body of at most `cap` bytes.
     ///
     /// The result is `None` if the server does not serve the path.
-    pub(crate) async fn get(&self, path: &str, cap: u64) -> Result<Option<Counted<'_>>> {
+    pub(crate) async fn get(&self, path: &str, cap: u64) -> Result<Option<Counted<'a>>> {
         Ok(self.session.get(path, cap).await?.map(|body| Counted {
             body,
-            sinks: &self.transferred,
+            sinks: self.transferred,
         }))
     }
 
@@ -240,6 +264,19 @@ impl AsyncRead for Counted<'_> {
             sink.fetch_add(n as u64, Ordering::Relaxed);
         }
         Poll::Ready(Ok(n))
+    }
+}
+
+/// Returns the error of `ostrya` for an error of an HTTP pull session.
+///
+/// A fetch error maps as [`From`] maps it, and an I/O error and an invalid
+/// input keep their variant. Each other error is [`Error::Remote`].
+pub(crate) fn http_error(error: remote::Error) -> Error {
+    match error {
+        remote::Error::Fetch(e) => Error::from(e),
+        remote::Error::Io(e) => Error::Io(e),
+        remote::Error::InvalidInput(message) => Error::InvalidInput(message),
+        other => Error::Remote(other),
     }
 }
 
@@ -307,8 +344,11 @@ mod tests {
             )
             .await
             .unwrap();
-            let source = StreamSource::new(session, Vec::new());
-            source.read_optional("summary", 1 << 20).await.unwrap()
+            let source = RemoteSource::new(PullSession::Stream(session), Vec::new());
+            source
+                .read_optional("summary", Priority::High, 1 << 20)
+                .await
+                .unwrap()
         })
         .unwrap();
         assert_eq!(out, body);

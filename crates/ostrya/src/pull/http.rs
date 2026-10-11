@@ -16,7 +16,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
@@ -32,11 +31,11 @@ use crate::delta::IO_CHUNK;
 use crate::endpoint::{EndpointOverrides, resolve_pull};
 use crate::error::{Error, Result};
 use crate::fetch::gate::Gate;
-use crate::fetch::{FetchRequest, Fetched, Fetcher, FetcherOptions, Priority};
+use crate::fetch::{FetchRequest, Fetched, Fetcher, Priority};
 use crate::inflate::BufSource;
 use crate::object::{MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
 use crate::read::CommitState;
-use crate::remote::{Endpoint, StreamSession, StreamSessionOptions};
+use crate::remote::{Endpoint, PullSession, StreamSessionOptions};
 use crate::repo::Repo;
 use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE, Summary, put_root_file_blocking};
 use crate::transaction::Transaction;
@@ -45,7 +44,7 @@ use crate::write::FileMeta;
 
 use super::delta::{self, DeltaJob, DeltaSource, PART_CAP};
 use super::drive::Slots;
-use super::source::{RemoteSource, StreamSource, session_error};
+use super::source::{RemoteSource, Transfer, http_error, session_error};
 use super::subpath::{Scope, Subpaths};
 use super::verify::{Defaults, Verification};
 use super::{
@@ -133,8 +132,8 @@ impl Repo {
     /// For an ssh endpoint, the pull runs the ssh client after it resolves the
     /// signature policy. The [`SshOptions`](crate::remote::SshOptions) of the
     /// endpoint give the commands of the client, by the rules of
-    /// [`StreamSession::connect`]. The session obeys the rules of
-    /// [`pull_over_stream`](Repo::pull_over_stream).
+    /// [`StreamSession::connect`](crate::remote::StreamSession::connect). The
+    /// session obeys the rules of [`pull_over_stream`](Repo::pull_over_stream).
     ///
     /// `resolve_pull` reads no remote key that applies to HTTP alone for an
     /// ssh address: `contenturl`, `metalink`, `proxy`, and the `tls-*` keys.
@@ -434,7 +433,7 @@ impl Repo {
             None => resolve_pull(Some(self.config()), remote, EndpointOverrides::default()).await?,
         };
         let counters = PullCounters::new(opts.progress.as_ref());
-        let (source, verification) = match endpoint {
+        let (session, verification) = match endpoint {
             Endpoint::Http(mut http) => {
                 // A limit of the caller replaces the limit of the endpoint. The
                 // pull keeps as many steps in flight as the fetcher admits.
@@ -442,29 +441,22 @@ impl Repo {
                     http.max_outstanding = n;
                 }
                 opts.max_outstanding_fetches = Some(http.max_outstanding);
-                // `remote_fetcher` sends no request, so a refused policy still
+                // The connect sends no HTTP request, so a refused policy still
                 // stops the pull before its first fetch.
-                let fetcher = self
-                    .remote_fetcher(http, counters.transferred_sinks())
-                    .await?;
+                let session = connect(Endpoint::Http(http), &opts).await?;
                 let verification =
                     Verification::build(self, Some(remote), &opts.verify, Defaults::Config).await?;
-                (RemoteSource::Http(fetcher), verification)
+                (session, verification)
             }
-            Endpoint::Ssh { address, options } => {
+            endpoint @ Endpoint::Ssh { .. } => {
                 let verification =
                     Verification::build(self, Some(remote), &opts.verify, Defaults::Config).await?;
                 // The ssh client starts where the HTTP pull sends its first
                 // request.
-                let session =
-                    StreamSession::connect(&address, &options, session_options(&opts)).await?;
-                let source = RemoteSource::Stream(Box::new(StreamSource::new(
-                    session,
-                    counters.transferred_sinks(),
-                )));
-                (source, verification)
+                (connect(endpoint, &opts).await?, verification)
             }
         };
+        let source = RemoteSource::new(session, counters.transferred_sinks());
         // The state of `pull_from` is on the heap, which keeps the future of
         // `pull` small.
         Box::pin(self.pull_from(
@@ -538,11 +530,8 @@ impl Repo {
         let counters = PullCounters::new(opts.progress.as_ref());
         let verification =
             Verification::build(self, Some(remote), &opts.verify, Defaults::Config).await?;
-        let session = StreamSession::over_stream(input, output, session_options(&opts)).await?;
-        let source = RemoteSource::Stream(Box::new(StreamSource::new(
-            session,
-            counters.transferred_sinks(),
-        )));
+        let session = PullSession::over_stream(input, output, session_options(&opts)).await?;
+        let source = RemoteSource::new(session, counters.transferred_sinks());
         self.pull_from(
             remote,
             source,
@@ -804,44 +793,10 @@ impl Repo {
             Some(endpoint) => endpoint,
             None => resolve_pull(Some(self.config()), remote, EndpointOverrides::default()).await?,
         };
-        let source = match endpoint {
-            Endpoint::Http(http) => {
-                RemoteSource::Http(self.remote_fetcher(http, Vec::new()).await?)
-            }
-            Endpoint::Ssh { address, options } => {
-                let session = StreamSession::connect(
-                    &address,
-                    &options,
-                    session_options(&PullOptions::default()),
-                )
-                .await?;
-                RemoteSource::Stream(Box::new(StreamSource::new(session, Vec::new())))
-            }
-        };
+        let session = connect(endpoint, &PullOptions::default()).await?;
+        let source = RemoteSource::new(session, Vec::new());
         let read = source.summary_files().await;
         source.finish(read).await
-    }
-
-    /// Builds the fetcher of a pull from `http`, the options of an HTTP
-    /// endpoint. The fetcher adds the bytes of each body that it reads to each
-    /// counter of `received`.
-    ///
-    /// The call refuses options that name no mirror with
-    /// [`Error::InvalidInput`], before any request.
-    async fn remote_fetcher(
-        &self,
-        http: FetcherOptions,
-        received: Vec<Arc<AtomicU64>>,
-    ) -> Result<Fetcher> {
-        if http.mirrors.is_empty() {
-            return Err(Error::InvalidInput(
-                "the HTTP endpoint of a pull names no mirror".into(),
-            ));
-        }
-        Ok(Fetcher::new(http)
-            .await
-            .map_err(Error::from)?
-            .counted(received))
     }
 
     /// Resolves what to pull: the requested refs, the summary refs of the
@@ -1253,7 +1208,7 @@ impl Repo {
         };
         match cached_detached_metadata(ctx.sources, commit).await? {
             Some(detached) => Ok((Some(detached), fetch().await?)),
-            None if matches!(ctx.source, RemoteSource::Stream(_)) => {
+            None if matches!(ctx.source.transfer(), Transfer::Stream(_)) => {
                 let (detached, fetched) =
                     futures_lite::future::zip(self.fetch_remote_detached(ctx, commit), fetch())
                         .await;
@@ -1359,9 +1314,9 @@ impl Repo {
         // stores on its disk. The framed, deflated form is the one form that an
         // HTTP client can read.
         let path = object_path(&name.checksum, ObjectType::File);
-        let fetcher = match ctx.source {
-            RemoteSource::Http(fetcher) => fetcher,
-            RemoteSource::Stream(stream) => {
+        let fetcher = match ctx.source.transfer() {
+            Transfer::Http(fetcher) => fetcher,
+            Transfer::Stream(stream) => {
                 // A `.filez` has no whole read. The header read caps its header,
                 // and the size that the header declares caps its payload.
                 let body = stream
@@ -1516,6 +1471,22 @@ fn session_options(opts: &PullOptions) -> StreamSessionOptions {
     StreamSessionOptions {
         agent: None,
         max_outstanding: Some(opts.max_outstanding_fetches.unwrap_or(DEFAULT_OUTSTANDING)),
+    }
+}
+
+/// Opens the session of a pull to `endpoint`.
+///
+/// Over ssh, the session takes the options of `opts`. Over HTTP, the options
+/// of the endpoint give the request limit. The call refuses HTTP options that
+/// name no mirror with [`Error::InvalidInput`], before any request.
+async fn connect(endpoint: Endpoint, opts: &PullOptions) -> Result<PullSession> {
+    match endpoint {
+        Endpoint::Http(http) => {
+            PullSession::connect(Endpoint::Http(http), StreamSessionOptions::default())
+                .await
+                .map_err(http_error)
+        }
+        ssh @ Endpoint::Ssh { .. } => Ok(PullSession::connect(ssh, session_options(opts)).await?),
     }
 }
 
@@ -1975,19 +1946,6 @@ fn object_not_found(error: Error, name: ObjectName) -> Error {
         },
         other => other,
     }
-}
-
-/// Fetches the summary of the remote and its signature. An absent file is
-/// `None`.
-///
-/// The signature comes first, which is the order of the `ostree` command. The
-/// signature covers the summary that follows. In the other order, a summary
-/// can pair with the signature of a summary that the remote replaced before.
-pub(super) async fn fetch_summary(fetcher: &Fetcher) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-    let signature =
-        fetch_optional(fetcher, SUMMARY_SIG_FILE, Priority::High, MAX_ROOT_FILE).await?;
-    let summary = fetch_optional(fetcher, SUMMARY_FILE, Priority::High, MAX_ROOT_FILE).await?;
-    Ok((summary, signature))
 }
 
 /// Refuses a remote whose `[core] mode` is not archive, from the bytes of its

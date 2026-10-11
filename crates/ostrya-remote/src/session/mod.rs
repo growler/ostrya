@@ -13,7 +13,9 @@
 //! gives the result of a session that committed.
 //!
 //! A [`StreamSession`] reads files of a server repository by their path, and
-//! gives the body of each file as a [`PullBody`].
+//! gives the body of each file as a [`PullBody`]. A [`PullSession`] is the
+//! session of a pull over either transport: the HTTP fetcher or a stream
+//! session.
 //!
 //! [`export_stream`] writes a one-way stream: the messages of a push session in
 //! one direction, for a receiver that sends no reply.
@@ -22,6 +24,7 @@ pub(crate) mod http;
 mod one_way;
 mod progress;
 mod pull;
+mod pull_session;
 pub(crate) mod stream;
 mod writer;
 
@@ -39,6 +42,7 @@ use ostrya_gvariant::Value;
 pub use one_way::export_stream;
 pub use progress::{PushPhase, PushProgress, PushProgressFn, PushProgressSnapshot, PushStats};
 pub use pull::{PullBody, StreamSession, StreamSessionOptions};
+pub use pull_session::PullSession;
 
 use self::http::{Endpoint, HttpLink};
 use self::progress::Counters;

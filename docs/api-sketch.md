@@ -2090,6 +2090,7 @@ impl Fetcher {
     pub async fn new(options: FetcherOptions) -> Result<Fetcher>;
     pub async fn fetch(&self, request: FetchRequest<'_>) -> Result<Fetched>;
     pub async fn upload(&self, request: UploadRequest<'_>) -> Result<Uploaded>;
+    pub fn max_outstanding(&self) -> usize;   // the admitted limit, at least 1
 }
 
 /// An upload body: given whole, which declares `Content-Length` and is sent
@@ -4827,7 +4828,54 @@ pub struct PullBody { /* private */ }           // AsyncRead, Send + Sync
 impl PullBody {
     pub fn len(&self) -> Option<u64>;           // the stated length
 }
+
+pub enum PullSession {                          // Send + Sync
+    Http(Fetcher),
+    Stream(StreamSession),
+}
+
+impl PullSession {
+    pub async fn connect(endpoint: Endpoint, opts: StreamSessionOptions)
+        -> Result<PullSession>;
+    pub async fn over_stream<R, W>(input: R, output: W,
+                                   opts: StreamSessionOptions)
+        -> Result<PullSession>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static;
+    pub async fn fetch_summary(&self)
+        -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)>; // (summary, summary.sig)
+    pub fn max_outstanding(&self) -> usize;
+    pub async fn finish(self) -> Result<()>;
+}
 ```
+
+The pull session:
+
+- `PullSession` is the session of a pull over either transport. The enum
+  has no common `get`. A caller that reads the raw files of the remote
+  matches on the variant: `Fetcher::fetch` for `Http`, and
+  `StreamSession::get` for `Stream`.
+- `connect` with an `Endpoint::Ssh` is `StreamSession::connect` with the
+  address, the `SshOptions`, and `opts`.
+- `connect` with an `Endpoint::Http` refuses `opts` with a field set, and
+  then options that name no mirror, with `Error::InvalidInput`. Both
+  refusals come before any request. The call then builds the fetcher with
+  `Fetcher::new` and sends no request. The HTTP agent and the HTTP request
+  limit come from `FetcherOptions`.
+- `over_stream` is `StreamSession::over_stream`.
+- `fetch_summary` takes `&self`, so a caller can read the refs of the
+  summary and then give the same session to the pull. It returns the bytes
+  of `summary` and of `summary.sig`, in this order. A file that the remote
+  does not serve is `None`, and each file has a cap of 64 MiB. Over HTTP the
+  call asks for `summary.sig` and then for `summary` at `Priority::High`. A
+  404 is an absent file, and a body that fails in transit is fetched again.
+  Over a stream session, the two `Get` calls are in flight together.
+- `max_outstanding` is the admitted request limit, at least 1:
+  `Fetcher::max_outstanding` over HTTP, and the limit of the stream session
+  otherwise.
+- `finish` returns `Ok(())` for HTTP, and is `StreamSession::finish` for a
+  stream session.
 
 The session:
 

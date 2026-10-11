@@ -100,6 +100,12 @@ impl RemoteSource {
         }
     }
 
+    /// Returns the number of requests that the session keeps in flight at one
+    /// time, at least 1.
+    pub(crate) fn max_outstanding(&self) -> usize {
+        self.session.max_outstanding()
+    }
+
     /// Reads the file at `path` whole, under `cap`, or returns `None` if the
     /// remote does not serve it.
     ///

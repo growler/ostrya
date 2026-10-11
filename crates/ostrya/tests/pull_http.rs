@@ -35,8 +35,10 @@ use common::{
 use futures_lite::future::poll_once;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use ostrya::endpoint::{EndpointOverrides, resolve_pull};
-use ostrya::fetch::{BearerToken, ClientIdentity, FetcherOptions, Proxy};
+use ostrya::fetch::{BearerToken, ClientIdentity, Fetcher, FetcherOptions, Proxy};
 use ostrya::remote::{Endpoint, PullSession, StreamSessionOptions};
+use ostrya::sign::Ed25519Verifier;
+use ostrya::verify::{PullTrust, TrustedKeys};
 use ostrya::{
     Checksum, CommitModifierFlags, CommitState, CreateOptions, DeltaEndianness, DeltaOptions,
     DetachedMetadataFilter, Ed25519Signer, Error, FilterResult, FsckOptions, PullFlags,
@@ -6251,6 +6253,456 @@ fn max_outstanding_fetches_replaces_the_limit_of_the_endpoint() {
                 assert_eq!(server.peak_inflight(), 1, "{tag}");
             } else {
                 assert!(server.peak_inflight() > 1, "{tag}");
+            }
+        }
+    });
+}
+
+// --- a pull through a session of the caller ----------------------------------
+
+/// Creates an archive destination under `dir/dest` whose config has no remote
+/// section.
+async fn dest_with_no_remote(dir: &Path) -> Repo {
+    Repo::create(&dir.join("dest"), CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap()
+}
+
+/// Returns the options of a fetcher for the cleartext `server`, with no proxy
+/// and a request limit of `max_outstanding`.
+///
+/// The server sends no redirect. With no redirect to follow, the fetcher
+/// reads no trust store.
+fn session_options(server: &RepoServer, max_outstanding: usize) -> FetcherOptions {
+    let mut http = FetcherOptions::new(server.url());
+    http.proxy = Proxy::None;
+    http.max_redirects = 0;
+    http.max_outstanding = max_outstanding;
+    http
+}
+
+/// Opens an HTTP session to the cleartext `server` with the default request
+/// limit of the fetcher.
+async fn http_session(server: &RepoServer) -> PullSession {
+    let http = session_options(server, FetcherOptions::default().max_outstanding);
+    PullSession::Http(Fetcher::new(http).await.unwrap())
+}
+
+/// Returns the trusted keys of the ed25519 public key `public`, in base64.
+fn ed25519_keys(public: &str) -> TrustedKeys {
+    let public = ostrya::base64::decode(public).unwrap();
+    let verifier = Ed25519Verifier::new([public], Vec::<Vec<u8>>::new()).unwrap();
+    TrustedKeys::new(vec![Arc::new(verifier)]).unwrap()
+}
+
+/// The objects, the refs, and the state files of the repository at `path`.
+fn repo_snapshot(path: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = file_inventory(path, "objects");
+    out.extend(file_inventory(path, "refs"));
+    out.extend(file_inventory(path, "state"));
+    out
+}
+
+/// A pull through a session checks each commit against the keys of its trust
+/// alone. The destination has no remote section. A trust of another key
+/// refuses the commit, and the pull publishes nothing. A trust of the signing
+/// key, for the commits and the summary, accepts the pull.
+#[test]
+fn a_session_pull_checks_the_commits_against_the_keys_of_its_trust() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-session-trust");
+        let (_remote, commit) = build_signed_remote(dir.path(), Some(SECRET_B64)).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = dest_with_no_remote(dir.path()).await;
+        let dest_dir = dir.path().join("dest");
+        let before = repo_snapshot(&dest_dir);
+        let opts = || PullOptions {
+            refs: vec!["test/main".to_owned()],
+            ..PullOptions::default()
+        };
+
+        let trust = PullTrust::commits(ed25519_keys(OTHER_PUBLIC_B64));
+        let err = dest
+            .pull_with_session(http_session(&server).await, trust, opts())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("is from a trusted key")),
+            "{err}"
+        );
+        assert_nothing_published(&dest).await;
+        assert_eq!(repo_snapshot(&dest_dir), before);
+
+        let trust =
+            PullTrust::commits(ed25519_keys(PUBLIC_B64)).with_summary(ed25519_keys(PUBLIC_B64));
+        dest.pull_with_session(http_session(&server).await, trust, opts())
+            .await
+            .unwrap();
+        assert_eq!(
+            dest.resolve_rev("test/main", true).await.unwrap(),
+            Some(commit)
+        );
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// A pull through a session refuses each option that it cannot carry. Each
+/// refusal comes before the first request, writes no object and no ref, and
+/// leaves the progress handle of the caller at its default.
+#[test]
+fn a_session_pull_refuses_its_options_before_the_first_request() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-session-refusals");
+        build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = dest_with_no_remote(dir.path()).await;
+        let dest_dir = dir.path().join("dest");
+        let before = repo_snapshot(&dest_dir);
+        let main = || PullOptions {
+            refs: vec!["test/main".to_owned()],
+            ..PullOptions::default()
+        };
+
+        let cases = [
+            ("no refs", PullOptions::default()),
+            (
+                "no refs under mirror",
+                PullOptions {
+                    flags: PullFlags::MIRROR,
+                    ..PullOptions::default()
+                },
+            ),
+            (
+                "verify",
+                PullOptions {
+                    verify: PullVerify {
+                        gpg: Some(false),
+                        ..PullVerify::default()
+                    },
+                    ..main()
+                },
+            ),
+            (
+                "max_outstanding_fetches",
+                PullOptions {
+                    max_outstanding_fetches: Some(1),
+                    ..main()
+                },
+            ),
+            (
+                "depth",
+                PullOptions {
+                    depth: -2,
+                    ..main()
+                },
+            ),
+            (
+                "subpath",
+                PullOptions {
+                    subpaths: vec!["relative".to_owned()],
+                    ..main()
+                },
+            ),
+            (
+                "collection_id",
+                PullOptions {
+                    collection_id: Some("org.example.Os".to_owned()),
+                    ..main()
+                },
+            ),
+        ];
+        for (tag, opts) in cases {
+            let progress = ostrya::PullProgress::new();
+            let opts = PullOptions {
+                progress: Some(progress.clone()),
+                ..opts
+            };
+            let err = dest
+                .pull_with_session(http_session(&server).await, PullTrust::unverified(), opts)
+                .await
+                .unwrap_err();
+            match (tag, &err) {
+                ("collection_id", Error::Unsupported(m)) => {
+                    assert_eq!(m, "only a local pull takes a collection id")
+                }
+                ("subpath", Error::Pull(_)) => {}
+                ("collection_id" | "subpath", _) => panic!("{tag}: {err:?}"),
+                (_, Error::InvalidInput(_)) => {}
+                _ => panic!("{tag}: {err:?}"),
+            }
+            assert_eq!(
+                progress.snapshot(),
+                ostrya::PullProgressSnapshot::default(),
+                "{tag}"
+            );
+        }
+
+        assert!(server.seen().is_empty(), "{:?}", server.seen());
+        assert_eq!(repo_snapshot(&dest_dir), before);
+    });
+}
+
+/// A pull through a session ignores `endpoint`. The session selects the
+/// server, so an endpoint that answers no request does not change the pull.
+#[test]
+fn a_session_pull_ignores_the_endpoint_option() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-session-endpoint");
+        let (_remote, commit) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = dest_with_no_remote(dir.path()).await;
+
+        dest.pull_with_session(
+            http_session(&server).await,
+            PullTrust::unverified(),
+            PullOptions {
+                refs: vec!["test/main".to_owned()],
+                endpoint: Some(Endpoint::parse(DEAD_URL).unwrap()),
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dest.resolve_rev("test/main", true).await.unwrap(),
+            Some(commit)
+        );
+        assert!(!server.seen().is_empty());
+    });
+}
+
+/// `remote` selects the prefix of the refs that a pull through a session
+/// writes. `None` writes a local ref, and `Some(name)` writes a ref under
+/// `refs/remotes/<name>`. A `MIRROR` pull of a named ref with
+/// `Some(name)` writes a local ref and leaves no summary.
+#[test]
+fn a_session_pull_names_its_refs_after_the_remote_option() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-session-refs");
+        let (_remote, commit) = build_remote(dir.path()).await;
+        std::fs::write(dir.path().join("remote/summary.sig"), SUMMARY_SIG).unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let pull = |tag: &'static str, remote: Option<&str>, flags: PullFlags| {
+            let base = dir.path().join(tag);
+            let remote = remote.map(str::to_owned);
+            let server = &server;
+            async move {
+                std::fs::create_dir(&base).unwrap();
+                let dest = dest_with_no_remote(&base).await;
+                dest.pull_with_session(
+                    http_session(server).await,
+                    PullTrust::unverified(),
+                    PullOptions {
+                        refs: vec!["test/main".to_owned()],
+                        remote,
+                        flags,
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+                (dest, base.join("dest"))
+            }
+        };
+
+        let (dest, _) = pull("to-local", None, PullFlags::NONE).await;
+        assert_eq!(
+            dest.resolve_rev("test/main", true).await.unwrap(),
+            Some(commit)
+        );
+        assert!(
+            dest.list_refs(Some("refs/remotes"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let (dest, _) = pull("to-remote", Some("up"), PullFlags::NONE).await;
+        assert_eq!(
+            dest.resolve_rev("up:test/main", true).await.unwrap(),
+            Some(commit)
+        );
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+
+        let (dest, dest_dir) = pull("to-mirror", Some("up"), PullFlags::MIRROR).await;
+        assert_eq!(
+            dest.resolve_rev("test/main", true).await.unwrap(),
+            Some(commit)
+        );
+        assert_eq!(dest.resolve_rev("up:test/main", true).await.unwrap(), None);
+        assert!(!dest_dir.join("summary").exists());
+        assert!(!dest_dir.join("summary.sig").exists());
+    });
+}
+
+/// Under `no_ref_writes`, `remote` still selects the ref that a pull through
+/// a session reads. `TimestampCheck::CurrentRef` compares the tip with the
+/// local ref for `None`, and with the ref under `refs/remotes/<name>` for
+/// `Some(name)`.
+#[test]
+fn a_session_pull_with_no_ref_writes_reads_the_selected_ref() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-session-current-ref");
+        let (_remote, older) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = dest_with_no_remote(dir.path()).await;
+        build_tree(&dir.path().join("newer"), b"newer\n");
+        let newer = commit_tree(
+            &dest,
+            dir.path(),
+            "newer",
+            "test/main",
+            None,
+            FIXED_TS + 100,
+        )
+        .await;
+        let opts = |remote: Option<&str>| PullOptions {
+            refs: vec!["test/main".to_owned()],
+            remote: remote.map(str::to_owned),
+            no_ref_writes: true,
+            timestamp_check: TimestampCheck::CurrentRef,
+            ..PullOptions::default()
+        };
+
+        let err = dest
+            .pull_with_session(
+                http_session(&server).await,
+                PullTrust::unverified(),
+                opts(None),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::Pull(_)), "{err}");
+        assert!(err.to_string().contains(&newer.to_hex()), "{err}");
+
+        dest.pull_with_session(
+            http_session(&server).await,
+            PullTrust::unverified(),
+            opts(Some("up")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dest.resolve_rev("test/main", true).await.unwrap(),
+            Some(newer)
+        );
+        assert_eq!(dest.resolve_rev("up:test/main", true).await.unwrap(), None);
+        assert_eq!(
+            dest.commit_state(&older).await.unwrap(),
+            CommitState::Normal
+        );
+    });
+}
+
+/// A pull through a session counts as `Repo::pull` counts. The statistics,
+/// less the run time, and the progress counters of the two pulls agree. A
+/// counter that the caller attaches to its fetcher also counts the summary
+/// and the config.
+#[test]
+fn a_session_pull_counts_as_a_pull_of_a_named_remote() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-session-counters");
+        build_remote(dir.path()).await;
+        let root = dir.path().join("remote");
+        let server = RepoServer::start(&root, false).await;
+        let opts = |progress: &ostrya::PullProgress| PullOptions {
+            refs: vec!["test/main".to_owned()],
+            progress: Some(progress.clone()),
+            ..PullOptions::default()
+        };
+
+        let named_base = dir.path().join("named");
+        std::fs::create_dir(&named_base).unwrap();
+        let named = build_dest(&named_base, RepoMode::Archive, &server.url(), "").await;
+        let named_progress = ostrya::PullProgress::new();
+        let expected = named.pull("origin", opts(&named_progress)).await.unwrap();
+
+        let session_base = dir.path().join("session");
+        std::fs::create_dir(&session_base).unwrap();
+        let dest = dest_with_no_remote(&session_base).await;
+        let counted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let fetcher = Fetcher::new(session_options(&server, 8))
+            .await
+            .unwrap()
+            .counted(vec![Arc::clone(&counted)]);
+        let progress = ostrya::PullProgress::new();
+        let stats = dest
+            .pull_with_session(
+                PullSession::Http(fetcher),
+                PullTrust::unverified(),
+                opts(&progress),
+            )
+            .await
+            .unwrap();
+
+        let timeless = |stats: PullStats| PullStats {
+            elapsed: Default::default(),
+            ..stats
+        };
+        assert_eq!(timeless(stats), timeless(expected));
+        assert_eq!(progress.snapshot(), named_progress.snapshot());
+        assert!(stats.bytes_transferred > 0);
+        let root_files = ["summary", "config"]
+            .iter()
+            .map(|file| std::fs::metadata(root.join(file)).unwrap().len())
+            .sum::<u64>();
+        assert_eq!(
+            counted.load(std::sync::atomic::Ordering::Relaxed),
+            stats.bytes_transferred + root_files
+        );
+    });
+}
+
+/// A pull through a session keeps as many requests in flight as its fetcher
+/// admits. A limit of 1 holds the peak at 1. A limit of 16 gives a peak above
+/// 8, the limit of a pull that names no limit.
+#[test]
+fn a_session_pull_takes_its_request_limit_from_the_session() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-session-limit");
+        // One directory of 32 files gives 32 content objects that the pull
+        // can fetch at the same time.
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        for i in 0..32 {
+            std::fs::write(src.join(format!("file-{i}")), format!("{i}\n")).unwrap();
+        }
+        let root = dir.path().join("remote");
+        let remote = Repo::create(&root, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        commit_tree(&remote, dir.path(), "src", "test/main", None, FIXED_TS).await;
+        remote
+            .regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_TS),
+                ..SummaryOptions::default()
+            })
+            .await
+            .unwrap();
+        for (tag, limit, serial) in [("serial", 1, true), ("parallel", 16, false)] {
+            let server = RepoServer::start(&root, false).await;
+            let base = dir.path().join(tag);
+            std::fs::create_dir(&base).unwrap();
+            let dest = dest_with_no_remote(&base).await;
+            let fetcher = Fetcher::new(session_options(&server, limit)).await.unwrap();
+            dest.pull_with_session(
+                PullSession::Http(fetcher),
+                PullTrust::unverified(),
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            if serial {
+                assert_eq!(server.peak_inflight(), 1, "{tag}");
+            } else {
+                assert!(
+                    server.peak_inflight() > 8,
+                    "{tag}: {}",
+                    server.peak_inflight()
+                );
             }
         }
     });

@@ -11,17 +11,24 @@ mod common;
 mod pull;
 
 use std::future::Future;
+use std::io;
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use common::TmpDir;
-use common::pipe::pipe;
+use common::pipe::{PipeReader, pipe};
 use futures_lite::future;
+use futures_lite::io::AsyncRead;
 use ostrya::endpoint::{EndpointOverrides, resolve_pull};
-use ostrya::remote::{Endpoint, SshAddress, SshOptions};
+use ostrya::remote::proto::{FrameReader, Message};
+use ostrya::remote::{Endpoint, PullSession, SshAddress, SshOptions, StreamSessionOptions};
+use ostrya::verify::PullTrust;
 use ostrya::{
     Checksum, CommitModifierFlags, CreateOptions, DeltaOptions, Error, FsckOptions, ObjectType,
-    PullFlags, PullOptions, PullStats, Repo, RepoMode, SummaryOptions, loose_path,
+    PullFlags, PullOptions, PullProgress, PullStats, Repo, RepoMode, SummaryOptions, loose_path,
 };
 use ostrya_rt::block_on;
 use pull::{
@@ -980,6 +987,151 @@ fn the_ssh_pull_refuses_a_collection_id() {
             other => panic!("{other:?}"),
         }
         assert_eq!(recorded(&record), None);
+        assert_eq!(snapshot(&dest_path), before);
+    });
+}
+
+/// The read half of the pipe into the server. It keeps a copy of each byte
+/// that the server reads.
+struct Tap {
+    inner: PipeReader,
+    read: Arc<Mutex<Vec<u8>>>,
+}
+
+impl AsyncRead for Tap {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(n)) = &polled {
+            self.read.lock().unwrap().extend_from_slice(&buf[..*n]);
+        }
+        polled
+    }
+}
+
+/// Pulls from `remote` into `dest` through a stream session that the test
+/// opens, with `Repo::send` as the server of `remote`. Returns the result of
+/// the pull, the result of the server, and the messages that the server read
+/// from the client.
+async fn pull_session_ssh(
+    dest: &Repo,
+    remote: &Repo,
+    trust: PullTrust,
+    opts: PullOptions,
+) -> (Result<PullStats, Error>, Result<(), Error>, Vec<Message>) {
+    let (to_server, server_in) = pipe(PIPE_CAP);
+    let (server_out, from_server) = pipe(PIPE_CAP);
+    let read = Arc::new(Mutex::new(Vec::new()));
+    let server_in = Tap {
+        inner: server_in,
+        read: Arc::clone(&read),
+    };
+    let (pulled, served) = within(
+        "the pull through a stream session",
+        future::zip(
+            async {
+                let session = PullSession::over_stream(
+                    from_server,
+                    to_server,
+                    StreamSessionOptions::default(),
+                )
+                .await?;
+                dest.pull_with_session(session, trust, opts).await
+            },
+            async move { remote.send(server_in, server_out).await },
+        ),
+    )
+    .await;
+    let read = read.lock().unwrap().clone();
+    let mut reader = FrameReader::new(&read[..]);
+    let mut messages = Vec::new();
+    while let Some(message) = reader.read_message().await.unwrap() {
+        messages.push(message);
+    }
+    (pulled, served, messages)
+}
+
+/// A pull through a stream session with no check of signatures pulls what
+/// `pull_over_stream` pulls. The refs, the objects, the markers, the fetch
+/// statistics, and the progress counters agree.
+#[test]
+fn a_session_pull_over_a_stream_pulls_what_pull_over_stream_pulls() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-session-same");
+        let (remote, _first, _second) = build_remote_two_commits(dir.path()).await;
+        let opts = |progress: &PullProgress| PullOptions {
+            remote: Some("origin".to_owned()),
+            progress: Some(progress.clone()),
+            ..main_ref(-1)
+        };
+
+        let stream_path = dir.path().join("stream");
+        let stream_dest = dest_at(&stream_path, RepoMode::Archive, None).await;
+        let stream_progress = PullProgress::new();
+        let (pulled, served) = pull_ssh(&stream_dest, &remote, opts(&stream_progress)).await;
+        let expected = pulled.unwrap();
+        served.unwrap();
+
+        let session_path = dir.path().join("session");
+        drop(
+            Repo::create(&session_path, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap(),
+        );
+        let session_dest = Repo::open(&session_path).await.unwrap();
+        let progress = PullProgress::new();
+        let (pulled, served, _) = pull_session_ssh(
+            &session_dest,
+            &remote,
+            PullTrust::unverified(),
+            opts(&progress),
+        )
+        .await;
+        let stats = pulled.unwrap();
+        served.unwrap();
+
+        assert_eq!(snapshot(&session_path), snapshot(&stream_path));
+        assert_eq!(fetch_counts(&stats), fetch_counts(&expected));
+        assert_eq!(progress.snapshot(), stream_progress.snapshot());
+        assert!(
+            session_dest
+                .fsck(&FsckOptions::default())
+                .await
+                .unwrap()
+                .is_ok()
+        );
+    });
+}
+
+/// A pull through a stream session refuses an option after the session
+/// opens and before its first `Get`. The server reads the `PullHello` of the
+/// session and no other message, and returns `Ok`. The pull publishes
+/// nothing.
+#[test]
+fn a_session_pull_over_a_stream_refuses_before_the_first_get() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-session-refusal");
+        let (remote, _commit) = build_remote(dir.path()).await;
+        let dest_path = dir.path().join("dest");
+        let dest = dest_at(&dest_path, RepoMode::Archive, None).await;
+        let before = snapshot(&dest_path);
+
+        let (pulled, served, messages) = pull_session_ssh(
+            &dest,
+            &remote,
+            PullTrust::unverified(),
+            PullOptions::default(),
+        )
+        .await;
+        assert!(matches!(pulled, Err(Error::InvalidInput(_))), "{pulled:?}");
+        assert!(
+            matches!(messages.as_slice(), [Message::PullHello(_)]),
+            "{messages:?}"
+        );
+        served.unwrap();
         assert_eq!(snapshot(&dest_path), before);
     });
 }

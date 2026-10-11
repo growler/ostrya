@@ -2308,8 +2308,9 @@ nothing, so no pull repairs that commit.
 `pull` fetches the same thing from an HTTP remote, or over ssh from a remote
 with an ssh address, into one transaction. The endpoint is
 `PullOptions::endpoint`, or the endpoint that `resolve_pull` reads from the
-repository's config. The pull keeps up to `max_outstanding_fetches` objects in
-flight. If the value is `None`, an HTTP pull keeps up to
+repository's config. The pull keeps as many objects in flight as its session
+admits, `PullSession::max_outstanding`. `pull` gives the session the limit
+`max_outstanding_fetches`. If the value is `None`, an HTTP pull keeps up to
 `FetcherOptions::max_outstanding` of its endpoint, and a pull over ssh keeps
 up to 8. The plan is drained commits first, then the dirtree and dirmeta objects
 the scan is blocked on, then the content, and each class carries the matching
@@ -2347,6 +2348,35 @@ stream source sends no request again. A content object reads the end of its
 stream before its store finishes, so a stream session moves to its next
 reply while the object is stored.
 
+`pull_with_session` is the low-level entry. The caller opens the
+`PullSession` and gives the `PullTrust`. The pull reads no remote section of
+the configuration, and it reads the `[core]` keys that each transaction
+reads. `pull` reads the trust with `PullTrust::from_remote` before it opens
+the session, so a refused policy starts no fetcher and no ssh client. Then
+`pull` runs the engine of `pull_with_session`, with the `branches` key and
+the summary copy of a named remote. `pull_with_session` ignores `endpoint`,
+because the session selects the server. Before its first request, before the
+transaction opens, and before it counts into `progress`, it refuses these
+values:
+
+- an empty `refs`, also under `MIRROR`, with `InvalidInput`;
+- a `verify` other than the default, with `InvalidInput`;
+- a set `max_outstanding_fetches`, with `InvalidInput`. The limit of the
+  session applies;
+- a set `collection_id`, with `Unsupported`, as `pull` does.
+
+On a refusal, the pull calls `PullSession::finish`, ignores its result, and
+returns the refusal. The refs of `pull_with_session` go under
+`refs/remotes/<remote>/<ref>` when `opts.remote` is `Some(remote)`, and under
+`refs/heads/<ref>` when it is `None`, as `pull_local` writes them. `MIRROR`
+writes local refs whatever `opts.remote` holds, and copies no `summary`,
+because the pull refuses an empty `refs`. The library does not protect the
+local refs from the caller. `PullStats::elapsed` starts at the call. A
+counter that the caller attaches to its fetcher with `Fetcher::counted`
+counts each body, the `summary`, the `config`, and the ref files included, so
+it can be larger than `bytes_transferred`. A stream session ends before the
+transaction commits.
+
 Each requested ref resolves against the remote's summary first and then
 `refs/heads/<ref>`, the name percent-encoded where it becomes that path. An empty
 ref list takes every summary ref under `MIRROR` and the remote's configured
@@ -2363,7 +2393,9 @@ resolves each name as a ref name, through the summary or the ref file. A
 checksum given as a name fails with `RefNotFound`, unless the remote holds a
 ref of that name. `pull` and `pull_over_stream` refuse `collection_id` with
 `Unsupported` before the first request, so no ssh client starts and the remote
-needs no section in the configuration.
+needs no section in the configuration. `pull_with_session` refuses
+`collection_id` with `Unsupported` before its first request on the session of
+the caller.
 
 A remote that publishes static deltas delivers a commit as one delta instead of
 one request per object. A pull looks for one delta per tip: `<from>-<to>`, where
@@ -2462,13 +2494,17 @@ pub enum TimestampCheck {
 #[derive(Default)]
 pub struct PullOptions {
     pub refs: Vec<String>,                // empty: every ref under refs/heads,
-                                          // or the summary / `branches` remotely
-    pub remote: Option<String>,           // refs/remotes/<remote>/<ref>
+                                          // or the summary / `branches` remotely;
+                                          // pull_with_session: InvalidInput
+    pub remote: Option<String>,           // refs/remotes/<remote>/<ref>; None:
+                                          // local refs for pull_local and
+                                          // pull_with_session
     pub no_ref_writes: bool,              // write no ref and no mirror summary;
                                           // the caller writes the refs
     pub collection_id: Option<String>,    // local pull: refs/mirrors/<id>/<ref>;
                                           // needs no_ref_writes and named refs;
-                                          // pull / pull_over_stream: Unsupported
+                                          // pull / pull_over_stream /
+                                          // pull_with_session: Unsupported
     pub flags: PullFlags,
     pub depth: i32,                       // 0 = the commit alone, -1 = all;
                                           // below -1: InvalidInput, nothing written
@@ -2486,15 +2522,20 @@ pub struct PullOptions {
                                           // address, tls-*, proxy, ssh-command,
                                           // or send-command key; an Http
                                           // endpoint names at least one mirror;
-                                          // pull_over_stream refuses Some
+                                          // pull_over_stream refuses Some;
+                                          // pull_with_session ignores it
     pub max_outstanding_fetches: Option<usize>,  // HTTP: Some replaces the
                                                  // max_outstanding of the
                                                  // endpoint, None keeps it;
-                                                 // ssh: None is 8
+                                                 // ssh: None is 8;
+                                                 // pull_with_session refuses
+                                                 // Some
     pub timestamp_check: TimestampCheck,
     pub disable_static_deltas: bool,      // fetch every object loose
     pub require_static_deltas: bool,      // refuse where no delta can be taken
-    pub verify: PullVerify,               // the signature checks to make
+    pub verify: PullVerify,               // the signature checks to make;
+                                          // pull_with_session refuses a
+                                          // value other than the default
     pub detached_metadata_filter: DetachedMetadataFilter,  // what to store
     pub progress: Option<PullProgress>,   // live counters for the caller
 }
@@ -2590,6 +2631,14 @@ impl Repo {
         -> Result<PullStats>;
     pub async fn pull(&self, remote: &str, opts: PullOptions)
         -> Result<PullStats>;
+    /// The pull through a session of the caller, under its trust. It reads
+    /// no remote section. Before the first request it refuses an empty
+    /// `refs`, a `verify` other than the default, and a set
+    /// `max_outstanding_fetches` with InvalidInput, and a set
+    /// `collection_id` with Unsupported. It ignores `endpoint`.
+    pub async fn pull_with_session(&self, session: PullSession,
+                                   trust: PullTrust, opts: PullOptions)
+        -> Result<PullStats>;
     /// The pull through the stream source, over a pair of streams to `ostrya
     /// send` (see "Pull over ssh: the client side").
     pub async fn pull_over_stream<R, W>(&self, remote: &str, input: R,
@@ -2641,6 +2690,7 @@ valid. The pull does not check the signatures of other static deltas.
   refuses with `Error::InvalidInput`, before it reads a key source. The
   keyring paths hold the name.
 - `with_summary` replaces the summary keys. The commit keys do not change.
+- `Repo::pull_with_session` takes a `PullTrust` of the caller.
 
 ```rust
 /// The axes are ANDed, the sign-api engines are ORed.

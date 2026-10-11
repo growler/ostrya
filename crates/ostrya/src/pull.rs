@@ -5,13 +5,18 @@
 //!   with an ssh address.
 //! - [`Repo::pull_over_stream`] reads from a server of the pull over ssh,
 //!   with the rules of [`Repo::pull`].
+//! - [`Repo::pull_with_session`] reads through a
+//!   [`PullSession`](crate::remote::PullSession) that the caller opened,
+//!   under a [`PullTrust`](crate::verify::PullTrust) that the caller gives.
+//!   It reads no remote section of the config.
 //!
-//! The three pulls share [`PullOptions`], [`PullFlags`], [`PullStats`], the
+//! The four pulls share [`PullOptions`], [`PullFlags`], [`PullStats`], the
 //! ref-binding check, and the `.commitpartial` markers. [`PullVerify`] holds
-//! the signature policy of a pull.
+//! the signature policy of each pull other than [`Repo::pull_with_session`].
 //!
 //! The sections from "Concurrency" to "Retries" apply to a pull from a
-//! remote: [`Repo::pull`] and [`Repo::pull_over_stream`].
+//! remote: [`Repo::pull`], [`Repo::pull_over_stream`], and
+//! [`Repo::pull_with_session`].
 //!
 //! # Commit state
 //!
@@ -63,9 +68,11 @@
 //!
 //! # Concurrency
 //!
-//! A pull from a remote keeps up to
-//! [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches) steps
-//! in flight. If the value is `None`, an HTTP pull keeps up to
+//! A pull from a remote keeps as many steps in flight as its session admits:
+//! [`PullSession::max_outstanding`](crate::remote::PullSession::max_outstanding).
+//! [`Repo::pull`] and [`Repo::pull_over_stream`] give the session the limit
+//! of [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches). If
+//! the value is `None`, an HTTP pull keeps up to
 //! [`max_outstanding`](crate::fetch::FetcherOptions::max_outstanding) of its
 //! endpoint, and a pull over ssh keeps up to 8. Each step fetches one object
 //! and stores it. The pull fills a free step from a plan of three classes, in
@@ -581,23 +588,30 @@ impl std::fmt::Debug for DetachedMetadataFilter {
 ///   [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches),
 ///   [`timestamp_check`](PullOptions::timestamp_check), and
 ///   [`progress`](PullOptions::progress). A local pull refuses `subpaths`.
+/// - [`Repo::pull_with_session`] ignores `endpoint`. It refuses an empty
+///   `refs`, a `verify` other than the default, and a set
+///   `max_outstanding_fetches`.
 #[derive(Debug, Clone, Default)]
 pub struct PullOptions {
     /// The ref names to pull.
     ///
     /// With an empty list, a local pull takes each ref of the source under
-    /// `refs/heads`. A pull from a remote takes each ref that the summary of
-    /// the remote lists under [`MIRROR`](PullFlags::MIRROR), and the
-    /// configured `branches` of the remote otherwise.
+    /// `refs/heads`. [`Repo::pull`] and [`Repo::pull_over_stream`] take each
+    /// ref that the summary of the remote lists under
+    /// [`MIRROR`](PullFlags::MIRROR), and the configured `branches` of the
+    /// remote otherwise. [`Repo::pull_with_session`] refuses an empty list
+    /// with [`Error::InvalidInput`].
     pub refs: Vec<String>,
     /// The remote name under which the pull writes the refs
     /// (`refs/remotes/<remote>/<ref>`).
     ///
-    /// If the value is `None`, a local pull writes local refs under
-    /// `refs/heads/`. A pull from a remote then writes the refs under the name
-    /// of the remote, or as local refs under [`MIRROR`](PullFlags::MIRROR).
-    /// Under [`no_ref_writes`](PullOptions::no_ref_writes) the pull writes no
-    /// ref, and the name still selects the ref that the pull reads.
+    /// If the value is `None`, a local pull and [`Repo::pull_with_session`]
+    /// write local refs under `refs/heads/`. [`Repo::pull`] and
+    /// [`Repo::pull_over_stream`] then write the refs under the name of the
+    /// remote. A pull from a remote writes local refs under
+    /// [`MIRROR`](PullFlags::MIRROR), whatever the value. Under
+    /// [`no_ref_writes`](PullOptions::no_ref_writes) the pull writes no ref,
+    /// and the name still selects the ref that the pull reads.
     pub remote: Option<String>,
     /// The option to write no ref.
     ///
@@ -651,9 +665,9 @@ pub struct PullOptions {
     ///
     /// Delta discovery reads the name as a refspec, where a `:` changes what
     /// the name refers to. The local pull makes these checks in this order,
-    /// before it reads the source. [`Repo::pull`] and
-    /// [`Repo::pull_over_stream`] refuse an id with [`Error::Unsupported`]
-    /// before they send a request.
+    /// before it reads the source. [`Repo::pull`],
+    /// [`Repo::pull_over_stream`], and [`Repo::pull_with_session`] refuse an
+    /// id with [`Error::Unsupported`] before they send a request.
     pub collection_id: Option<String>,
     /// The flag set.
     pub flags: PullFlags,
@@ -752,6 +766,8 @@ pub struct PullOptions {
     ///
     /// An [`Endpoint::Http`](crate::remote::Endpoint::Http) must name at least
     /// one mirror. [`Repo::pull_over_stream`] refuses a value that is set.
+    /// [`Repo::pull_with_session`] ignores the value, because its session
+    /// selects the server.
     pub endpoint: Option<crate::remote::Endpoint>,
     /// The number of fetches that a pull from a remote keeps in flight.
     ///
@@ -762,6 +778,9 @@ pub struct PullOptions {
     /// endpoint and for [`Repo::pull_over_stream`], the value sets
     /// [`max_outstanding`](crate::remote::StreamSessionOptions::max_outstanding)
     /// of the stream session, and `None` is 8.
+    ///
+    /// [`Repo::pull_with_session`] refuses a value that is set with
+    /// [`Error::InvalidInput`]. The limit of its session applies.
     pub max_outstanding_fetches: Option<usize>,
     /// The commit that the timestamp of a fetched tip is compared against.
     pub timestamp_check: TimestampCheck,
@@ -800,6 +819,10 @@ pub struct PullOptions {
     pub require_static_deltas: bool,
     /// The signature policy of this pull, over the configured policy of the
     /// remote.
+    ///
+    /// [`Repo::pull_with_session`] refuses a value other than the default
+    /// with [`Error::InvalidInput`]. Its
+    /// [`PullTrust`](crate::verify::PullTrust) holds the keys.
     pub verify: PullVerify,
     /// The properties of the detached metadata of a commit that this pull
     /// stores.

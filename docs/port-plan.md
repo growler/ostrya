@@ -3557,10 +3557,12 @@ remote is refused with `Unsupported` naming its mode rather than surfacing as a
 404 on the first content object, and a remote serving no `config` is treated as
 archive.
 
-Concurrency. A pull holds up to `max_outstanding_fetches` (8) steps in flight,
-each a future that fetches one object and stores it, over an in-tree poll core
-(`pull/drive.rs`) rather than `FuturesUnordered`: `futures-lite` carries no
-unordered join and `futures-util` is not in the graph. The plan the slots are
+Concurrency. A pull holds as many steps in flight as its session admits,
+`PullSession::max_outstanding`. `Repo::pull` gives the session the limit
+`max_outstanding_fetches` (8). Each step is a future that fetches one object
+and stores it, over an in-tree poll core (`pull/drive.rs`) rather than
+`FuturesUnordered`: `futures-lite` carries no unordered join and
+`futures-util` is not in the graph. The plan the slots are
 refilled from holds three classes, drained in this order and carrying the
 matching fetch priority -- the commits (the tips, and their parents under
 `depth`), the scan (dirtree and dirmeta), and the content (file objects). That
@@ -3679,6 +3681,16 @@ The HTTP pull, the ssh pull, and `pull_over_stream` refuse
 `PullOptions::collection_id` with `Unsupported` after the depth check, before
 the first request, before the ssh client starts, and before the remote's
 configuration is read.
+`Repo::pull_with_session` pulls through a `PullSession` that the caller
+opened, under a `PullTrust` that the caller gives, and reads no remote section
+of the configuration. `Repo::pull` reads the trust, opens the session, and
+then runs the same engine. Before the first request and before the
+transaction opens, `pull_with_session` refuses an empty `refs`, a `verify`
+other than the default, and a set `max_outstanding_fetches` with
+`InvalidInput`, and a set `collection_id` with `Unsupported`. It then calls
+`PullSession::finish` and returns the refusal. It ignores `endpoint`.
+`opts.remote` gives the prefix of its refs: `None` writes local refs, and
+`MIRROR` writes local refs and copies no summary.
 `TimestampCheck` refuses a fetched tip strictly older than the commit the ref
 currently names here (`CurrentRef`, where an absent ref passes) or than a given
 commit (`Rev`), naming both revisions and both timestamps. The ref-binding check

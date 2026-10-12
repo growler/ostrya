@@ -1206,10 +1206,10 @@ fn a_session_pull_over_a_stream_refuses_before_the_first_get() {
     });
 }
 
-/// A pull through a stream session refuses a `static_deltas` list after the
-/// session opens and before its first `Get`: a list that it cannot take with
-/// `InvalidInput`, and a valid list with `Unsupported`. The server reads the
-/// `PullHello` of the session and no other message.
+/// A pull through a stream session refuses a `static_deltas` list that it
+/// cannot take with `InvalidInput`, after the session opens and before its
+/// first `Get`. The server reads the `PullHello` of the session and no other
+/// message.
 #[test]
 fn a_session_pull_over_a_stream_refuses_a_static_delta_list() {
     block_on(async {
@@ -1224,7 +1224,7 @@ fn a_session_pull_over_a_stream_refuses_a_static_delta_list() {
         };
         let cases = static_delta_list_cases(main)
             .into_iter()
-            .filter(|(tag, _, _)| ["two digests", "a valid list"].contains(tag));
+            .filter(|(tag, _, _)| *tag == "two digests");
         for (tag, opts, expected) in cases {
             let (pulled, served, messages) = pull_session_ssh(
                 &dest,

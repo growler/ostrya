@@ -11,8 +11,9 @@
 //! `PullOptions::static_deltas` replaces the search with a list of deltas
 //! that the caller gives. The sibling module `chain` plans chains of deltas
 //! from such a list, and [`discover`] then fetches the steps of the chains. A
-//! pull refuses a list before its first request, so only the search of this
-//! module runs for each pull that it accepts.
+//! pull from a remote runs its plan one time for each level of intermediate
+//! commits, with the jobs of that level, and then one time for the targets.
+//! A local pull refuses a list before it reads its source.
 //!
 //! The discovery of a chain keeps one record for each step of the plan, and
 //! drops each parsed superblock after its checks. So the heap holds one
@@ -74,23 +75,29 @@ use super::{check_commit_signatures, count_fetched, detached_bytes_from, source_
 /// The number of delta parts that one pull fetches at a time.
 pub(crate) const PART_CAP: usize = 2;
 
-/// A static delta that a pull applies for one target commit.
+/// A static delta that a pull applies for one commit.
 ///
-/// Discovery builds a job, and the job lives until the pull returns. A pull
-/// keeps one job for each target commit. A job holds only what the
-/// application of the parts reads.
+/// Without a list of static deltas, discovery builds the job of each target
+/// commit that has a delta, and the job lives until the pull returns. With a
+/// list, discovery keeps a record for each step of the chains, and the pull
+/// builds the jobs from the records. [`DeltaPlan::parse_level`] builds the
+/// jobs of the intermediate commits of one level before the run of that
+/// level, and the jobs live for that run alone. [`DeltaPlan::target_jobs`]
+/// builds the jobs of the target commits after the run of the last level. A
+/// job holds only what the application of the parts reads.
 ///
-/// Discovery reads the raw superblock bytes, the signature array, and the
-/// metadata dict, and drops them there. The heap cost of a job is one
-/// meta-entry for each part and at most 128 KiB of inline part bodies. The
-/// meta-entries list each object that the delta produces. The superblock size
-/// that a remote chooses does not change this cost.
+/// The parse of a superblock reads the raw superblock bytes, the signature
+/// array, and the metadata dict, and drops them before the job exists. The
+/// heap cost of a job is one meta-entry for each part and at most 128 KiB of
+/// inline part bodies. The meta-entries list each object that the delta
+/// produces. The superblock size that a remote chooses does not change this
+/// cost.
 ///
 /// The job keeps the inline part bodies in one [`Blob`]. If the bodies total
 /// 128 KiB or less, the blob is on the heap. If they total more, the blob is
 /// one read-only map of an anonymous temp file in `tmp/` of the repository.
 /// This file costs disk space and address space up to the superblock size,
-/// and the pull releases it when it returns.
+/// and the pull releases it when it drops the job.
 pub(crate) struct DeltaJob {
     /// The request path prefix of the delta, `deltas/<fanout>/<rest>`.
     dir: String,
@@ -160,7 +167,9 @@ impl DeltaJob {
 /// Without a list of static deltas, `jobs` holds the delta of each target
 /// commit that has one, and the plan holds no record. With a list, `jobs` is
 /// empty. The plan then holds one record for each commit that a chain makes,
-/// and the levels of the intermediate commits.
+/// and the levels of the intermediate commits. The pull applies the levels in
+/// order. A commit with a record and in no level is a target, and the pull
+/// applies it last.
 #[derive(Default)]
 pub(crate) struct DeltaPlan {
     /// The job of each target commit, from the search for one delta.
@@ -171,10 +180,6 @@ pub(crate) struct DeltaPlan {
     /// commit of level `k + 1` is made from a commit of level `k`. A commit
     /// with a record and in no level is a target, which the pull applies
     /// last.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the chain apply of the pull reads the levels")
-    )]
     levels: Vec<Vec<Checksum>>,
     /// The file of the raw bytes of the records from a remote.
     store: Option<RecordStore>,
@@ -205,10 +210,6 @@ impl DeltaPlan {
     ///   not have the listed digest.
     /// - [`Error::InvalidFormat`] if a local source no longer holds a
     ///   superblock.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the chain apply of the pull parses the levels")
-    )]
     pub(crate) async fn parse_level(
         &self,
         repo: &Repo,
@@ -225,6 +226,77 @@ impl DeltaPlan {
         }
         Ok(jobs)
     }
+
+    /// Returns the intermediate commits of the chains, by level, in plan
+    /// order.
+    pub(crate) fn levels(&self) -> &[Vec<Checksum>] {
+        &self.levels
+    }
+
+    /// Takes the jobs of the target commits.
+    ///
+    /// Without a list, these are the jobs of the search for one delta. With a
+    /// list, the call also parses the records of the commits that are in no
+    /// level, as [`parse_level`](DeltaPlan::parse_level) does, in checksum
+    /// order. The pull calls it after the run of the last level, so the heap
+    /// holds the jobs of one run at a time.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`parse_level`](DeltaPlan::parse_level).
+    pub(crate) async fn target_jobs(
+        &mut self,
+        repo: &Repo,
+        source: &DeltaSource<'_>,
+    ) -> Result<HashMap<Checksum, DeltaJob>> {
+        let mut jobs = std::mem::take(&mut self.jobs);
+        let in_level: HashSet<&Checksum> = self.levels.iter().flatten().collect();
+        let mut targets: Vec<Checksum> = self
+            .records
+            .keys()
+            .filter(|commit| !in_level.contains(commit))
+            .copied()
+            .collect();
+        targets.sort_unstable();
+        jobs.extend(self.parse_level(repo, source, &targets).await?);
+        Ok(jobs)
+    }
+
+    /// Returns the check that discovery made of the signatures of `commit`.
+    ///
+    /// For a checked commit, the result holds the verified `.commitmeta` from
+    /// the record file, or `None` if no repository holds one. The result is
+    /// valid for a plan from a remote alone: a record from a local source
+    /// keeps no bytes.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if the record file cannot be read.
+    /// - [`Error::InvalidFormat`] if the plan holds no record file.
+    pub(crate) async fn commit_check(&self, commit: &Checksum) -> Result<CommitCheck> {
+        let Some(record) = self.records.get(commit) else {
+            return Ok(CommitCheck::NotChecked);
+        };
+        match (&record.detached, self.store.as_ref()) {
+            (Detached::NotChecked, _) => Ok(CommitCheck::NotChecked),
+            (Detached::Checked { kept: Some(range) }, Some(store)) => {
+                Ok(CommitCheck::Checked(Some(store.read(range.clone()).await?)))
+            }
+            (Detached::Checked { kept: Some(_) }, None) => Err(Error::InvalidFormat(
+                "the record file holds no record".into(),
+            )),
+            (Detached::Checked { kept: None }, _) => Ok(CommitCheck::Checked(None)),
+        }
+    }
+}
+
+/// The check that discovery made of the signatures of one commit.
+pub(crate) enum CommitCheck {
+    /// Discovery did not check the commit. The commit step checks it.
+    NotChecked,
+    /// Discovery checked the commit. The value is the verified `.commitmeta`,
+    /// or `None` if no repository holds one.
+    Checked(Option<Vec<u8>>),
 }
 
 /// A step of a chain whose superblock discovery fetched and verified.
@@ -251,13 +323,6 @@ enum Detached {
         /// The range of the verified `.commitmeta` in the record file. `None`
         /// if the remote and the localcache repositories hold none, and for a
         /// local source, which keeps no bytes.
-        #[cfg_attr(
-            not(test),
-            expect(
-                dead_code,
-                reason = "the chain apply of the pull stages the detached metadata"
-            )
-        )]
         kept: Option<Range<u64>>,
     },
 }
@@ -2669,7 +2734,7 @@ mod tests {
                     ..PullOptions::default()
                 };
                 let counters = PullCounters::new(None);
-                let plan = discover(
+                let mut plan = discover(
                     &f.dst,
                     &source,
                     None,
@@ -2696,6 +2761,18 @@ mod tests {
                 }
                 let jobs = plan.parse_level(&f.dst, &source, &[f.b]).await.unwrap();
                 assert_eq!(Checksum::sha256(&jobs[&f.b].commit_bytes), f.b);
+                let CommitCheck::Checked(Some(read)) = plan.commit_check(&f.b).await.unwrap()
+                else {
+                    panic!("no checked .commitmeta");
+                };
+                assert_eq!(read, meta);
+                assert!(matches!(
+                    plan.commit_check(&f.d).await.unwrap(),
+                    CommitCheck::NotChecked
+                ));
+                let jobs = plan.target_jobs(&f.dst, &source).await.unwrap();
+                assert_eq!(jobs.keys().copied().collect::<Vec<_>>(), [f.d]);
+                assert_eq!(Checksum::sha256(&jobs[&f.d].commit_bytes), f.d);
             }
         });
     }

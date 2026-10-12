@@ -40,10 +40,10 @@ use ostrya::remote::{Endpoint, PullSession, StreamSessionOptions};
 use ostrya::sign::Ed25519Verifier;
 use ostrya::verify::{PullTrust, TrustedKeys};
 use ostrya::{
-    Checksum, CommitModifierFlags, CommitState, CreateOptions, DeltaEndianness, DeltaOptions,
-    DetachedMetadataFilter, Ed25519Signer, Error, FilterResult, FsckOptions, PullFlags,
-    PullOptions, PullStats, PullVerify, Repo, RepoMode, SummaryOptions, TimestampCheck, TreeEntry,
-    Type, Value, static_delta_relative_dir,
+    AdvertisedDelta, Checksum, CommitModifierFlags, CommitState, CreateOptions, DeltaEndianness,
+    DeltaOptions, DeltaSuperblock, DetachedMetadataFilter, Ed25519Signer, Error, FilterResult,
+    FsckOptions, PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode, SummaryOptions,
+    TimestampCheck, TreeEntry, Type, Value, static_delta_relative_dir,
 };
 use ostrya_rt::{TcpListener, block_on, spawn};
 use proxy::{TestProxy, Tunnel};
@@ -5116,9 +5116,9 @@ fn a_depth_below_minus_one_is_refused() {
 }
 
 /// The pull refuses a `static_deltas` list that it cannot take with
-/// `InvalidInput`, and each other list with `Unsupported`. Each refusal comes
-/// before the first request and before the transaction opens, so the pull
-/// writes no object, no ref, and no staging directory.
+/// `InvalidInput`. Each refusal comes before the first request and before the
+/// transaction opens, so the pull writes no object, no ref, and no staging
+/// directory.
 #[test]
 fn a_static_delta_list_is_refused_before_the_first_request() {
     block_on(async {
@@ -5501,6 +5501,833 @@ fn required_deltas_look_for_a_delta_for_a_commit_held_partial() {
         assert!(seen.iter().any(|p| p.ends_with(".index")), "{seen:?}");
         assert!(!seen.iter().any(|p| p.ends_with("/superblock")), "{seen:?}");
         assert!(seen.iter().any(|p| p.ends_with(".filez")), "{seen:?}");
+    });
+}
+
+// --- chains of static deltas -----------------------------------------------
+
+/// Creates an empty archive repository under `dir/remote`.
+async fn create_remote(dir: &Path) -> Repo {
+    Repo::create(&dir.join("remote"), CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap()
+}
+
+/// Builds the small tree under `dir/<name>` with the marker `<name>`, and
+/// commits it into `remote` on `branch`, with `parent` and the timestamp
+/// `FIXED_TS + offset`.
+async fn chain_commit(
+    remote: &Repo,
+    dir: &Path,
+    name: &str,
+    branch: &str,
+    parent: Option<Checksum>,
+    offset: u64,
+) -> Checksum {
+    build_tree(&dir.join(name), format!("{name}\n").as_bytes());
+    commit_tree(remote, dir, name, branch, parent, FIXED_TS + offset).await
+}
+
+/// Builds a remote archive repository under `dir/remote` with the commits A,
+/// B, C, and D on `test/main`. Each commit is a child of the commit before it,
+/// and holds the small tree with its own marker. The remote holds no summary
+/// and no delta.
+///
+/// Returns the remote and the four commits, A first.
+async fn build_chain_remote(dir: &Path) -> (Repo, [Checksum; 4]) {
+    let remote = create_remote(dir).await;
+    let mut commits = Vec::new();
+    let mut parent = None;
+    for (offset, name) in ["a", "b", "c", "d"].into_iter().enumerate() {
+        let commit = chain_commit(&remote, dir, name, "test/main", parent, offset as u64).await;
+        commits.push(commit);
+        parent = Some(commit);
+    }
+    (remote, commits.try_into().unwrap())
+}
+
+/// Signs each commit of `commits` in `remote` with the key of `SECRET_B64`.
+async fn sign_commits(remote: &Repo, commits: &[Checksum]) {
+    let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+    for commit in commits {
+        remote.sign_commit(commit, &signer).await.unwrap();
+    }
+}
+
+/// Generates the delta from `from` to `to` in `remote` with `opts` and a fixed
+/// timestamp. Returns the entry of the delta for a list, with the SHA-256 of
+/// its superblock.
+async fn listed(
+    remote: &Repo,
+    from: &Checksum,
+    to: &Checksum,
+    opts: DeltaOptions,
+) -> AdvertisedDelta {
+    let opts = DeltaOptions {
+        timestamp: Some(FIXED_TS),
+        ..opts
+    };
+    remote
+        .generate_static_delta(Some(from), to, &opts)
+        .await
+        .unwrap();
+    let bytes = std::fs::read(remote.path().join(superblock_path(from, to))).unwrap();
+    AdvertisedDelta {
+        from: Some(*from),
+        to: *to,
+        superblock: Checksum::sha256(&bytes),
+    }
+}
+
+/// Returns the request path of the superblock of the delta from `from` to
+/// `to`.
+fn superblock_path(from: &Checksum, to: &Checksum) -> String {
+    format!("{}/superblock", static_delta_relative_dir(Some(from), to))
+}
+
+/// Returns the request path of each part file of the delta from `from` to
+/// `to` in `remote`, in part order. The delta holds no inline part.
+fn part_paths(remote: &Repo, from: &Checksum, to: &Checksum) -> Vec<String> {
+    let dir = static_delta_relative_dir(Some(from), to);
+    let bytes = std::fs::read(remote.path().join(superblock_path(from, to))).unwrap();
+    let parts = DeltaSuperblock::parse(bytes).unwrap().parts().len();
+    assert!(parts > 0, "{dir} has no part");
+    (0..parts).map(|index| format!("{dir}/{index}")).collect()
+}
+
+/// Returns the position in `seen` of each request for a path of `paths`, in
+/// order.
+fn positions(seen: &[String], paths: &[String]) -> Vec<usize> {
+    seen.iter()
+        .enumerate()
+        .filter(|(_, path)| paths.contains(path))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Asserts that each path of `paths` is requested once in `seen`, and that
+/// each of these requests comes before each request for a path of `later`.
+fn assert_before(seen: &[String], paths: &[String], later: &[String]) {
+    let first = positions(seen, paths);
+    let second = positions(seen, later);
+    assert_eq!(first.len(), paths.len(), "{paths:?}: {seen:?}");
+    assert!(!second.is_empty(), "{later:?}: {seen:?}");
+    assert!(
+        first.iter().max() < second.iter().min(),
+        "{paths:?} before {later:?}: {seen:?}"
+    );
+}
+
+/// Asserts that the repository at `dest_dir` keeps no `.commitpartial`
+/// marker.
+fn assert_no_markers(dest_dir: &Path) {
+    let markers: Vec<String> = std::fs::read_dir(dest_dir.join("state"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".commitpartial"))
+        .collect();
+    assert!(markers.is_empty(), "{markers:?}");
+}
+
+/// Returns the options of a pull of `test/main` with the list `list`.
+fn chain_opts(list: Vec<AdvertisedDelta>) -> PullOptions {
+    PullOptions {
+        refs: vec!["test/main".to_owned()],
+        static_deltas: Some(list),
+        ..PullOptions::default()
+    }
+}
+
+/// The policy keys that check each commit against the key of `PUBLIC_B64`.
+fn signed_policy() -> String {
+    format!("sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n")
+}
+
+/// A pull applies a chain of three static deltas from the commit that the
+/// destination holds. The remote serves no summary. The pull requests the
+/// three superblocks and their parts, and no loose object of a tree, no
+/// commit object, and no delta index. The parts of each step come after the
+/// parts of the step before it. Each intermediate commit ends complete with
+/// no marker.
+#[test]
+fn a_chain_of_three_steps_is_applied_with_no_loose_request() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-three-steps");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        let steps = [(a, b), (b, c), (c, d)];
+        let mut list = Vec::new();
+        for (from, to) in &steps {
+            list.push(listed(&remote, from, to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &a).await;
+        let dest_dir = dir.path().join("dest");
+        server.forget();
+
+        let stats = dest.pull("origin", chain_opts(list)).await.unwrap();
+
+        let seen = server.seen();
+        let superblocks: HashSet<String> = seen
+            .iter()
+            .filter(|path| path.ends_with("/superblock"))
+            .cloned()
+            .collect();
+        let expected: HashSet<String> = steps
+            .iter()
+            .map(|(from, to)| superblock_path(from, to))
+            .collect();
+        assert_eq!(superblocks, expected);
+        for ext in [".filez", ".dirtree", ".dirmeta", ".index", ".commit"] {
+            assert!(
+                !seen.iter().any(|path| path.ends_with(ext)),
+                "{ext}: {seen:?}"
+            );
+        }
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(d)
+        );
+        for commit in [b, c, d] {
+            assert_complete(&remote, &dest, &dest_dir, &commit).await;
+        }
+        assert_no_markers(&dest_dir);
+        assert_eq!(stats.content_fetched, 0);
+        let parts: Vec<Vec<String>> = steps
+            .iter()
+            .map(|(from, to)| part_paths(&remote, from, to))
+            .collect();
+        assert_eq!(
+            stats.delta_parts as usize,
+            parts.iter().map(Vec::len).sum::<usize>()
+        );
+        assert_eq!(part_requests(&seen).len(), stats.delta_parts as usize);
+        for pair in parts.windows(2) {
+            assert_before(&seen, &pair[0], &pair[1]);
+        }
+        let report = dest.fsck(&FsckOptions::default()).await.unwrap();
+        assert!(report.is_ok(), "{:?}", report.errors);
+    });
+}
+
+/// A later step of a chain patches against an object that an earlier step
+/// hands over loose. The delta from A to B hands over the large file of B as
+/// a fallback. The delta from B to C reads that file as the source of an
+/// edit. The pull requests no part of the later step before each part and the
+/// fallback of the earlier step arrive.
+#[test]
+fn a_later_step_reads_a_fallback_of_an_earlier_step() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-fallback-barrier");
+        let remote = create_remote(dir.path()).await;
+        let big = incompressible(300_000);
+        let mut edited = big.clone();
+        edited[150_000..150_016].copy_from_slice(&[0x5a; 16]);
+        build_tree(&dir.path().join("a"), b"a\n");
+        build_tree(&dir.path().join("b"), b"a\n");
+        std::fs::write(dir.path().join("b/big"), &big).unwrap();
+        build_tree(&dir.path().join("c"), b"a\n");
+        std::fs::write(dir.path().join("c/big"), &edited).unwrap();
+        let a = commit_tree(&remote, dir.path(), "a", "test/main", None, FIXED_TS).await;
+        let b = commit_tree(&remote, dir.path(), "b", "test/main", Some(a), FIXED_TS + 1).await;
+        let c = commit_tree(&remote, dir.path(), "c", "test/main", Some(b), FIXED_TS + 2).await;
+        let in_a = content_checksums(&remote, &a).await;
+        let added: Vec<Checksum> = content_checksums(&remote, &b)
+            .await
+            .into_iter()
+            .filter(|checksum| !in_a.contains(checksum))
+            .collect();
+        let [x1] = added[..] else {
+            panic!("B adds {added:?}");
+        };
+
+        let ab = listed(
+            &remote,
+            &a,
+            &b,
+            DeltaOptions {
+                min_fallback_size: 100_000,
+                ..DeltaOptions::default()
+            },
+        )
+        .await;
+        let bc = listed(
+            &remote,
+            &b,
+            &c,
+            DeltaOptions {
+                min_fallback_size: 0,
+                ..DeltaOptions::default()
+            },
+        )
+        .await;
+        let ab_superblock = DeltaSuperblock::parse(
+            std::fs::read(remote.path().join(superblock_path(&a, &b))).unwrap(),
+        )
+        .unwrap();
+        let fallbacks: Vec<Checksum> = ab_superblock
+            .fallbacks()
+            .iter()
+            .map(|fallback| *fallback.checksum())
+            .collect();
+        assert_eq!(fallbacks, [x1]);
+        let bc_dir = remote.path().join(static_delta_relative_dir(Some(&b), &c));
+        let bc_superblock =
+            DeltaSuperblock::parse(std::fs::read(bc_dir.join("superblock")).unwrap()).unwrap();
+        let mut reads = 0;
+        for index in 0..bc_superblock.parts().len() {
+            reads += bc_superblock
+                .part_stats(index, &bc_dir)
+                .await
+                .unwrap()
+                .ops
+                .set_read_source;
+        }
+        assert!(reads > 0, "the delta from B to C reads no source object");
+
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &a).await;
+        let dest_dir = dir.path().join("dest");
+        server.forget();
+
+        dest.pull("origin", chain_opts(vec![ab, bc])).await.unwrap();
+
+        for commit in [b, c] {
+            assert_complete(&remote, &dest, &dest_dir, &commit).await;
+        }
+        assert_no_markers(&dest_dir);
+        let seen = server.seen();
+        let x1_path = filez_path(&x1.to_hex());
+        assert_eq!(server.requests_for(&x1_path), 1, "{seen:?}");
+        let mut earlier = part_paths(&remote, &a, &b);
+        earlier.push(x1_path);
+        assert_before(&seen, &earlier, &part_paths(&remote, &b, &c));
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(c)
+        );
+    });
+}
+
+/// A listed digest that the superblock of a step does not have fails the pull
+/// before the transaction opens. The pull requests no part, publishes no ref,
+/// writes no object, and leaves no marker.
+#[test]
+fn a_wrong_listed_digest_fails_before_the_transaction() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-wrong-digest");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        let list = vec![
+            listed(&remote, &a, &b, DeltaOptions::default()).await,
+            AdvertisedDelta {
+                superblock: Checksum::from_bytes([0xee; 32]),
+                ..listed(&remote, &b, &c, DeltaOptions::default()).await
+            },
+            listed(&remote, &c, &d, DeltaOptions::default()).await,
+        ];
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &a).await;
+        let dest_dir = dir.path().join("dest");
+        let held = dest.list_objects().await.unwrap();
+        server.forget();
+
+        let err = dest.pull("origin", chain_opts(list)).await.unwrap_err();
+        assert!(matches!(err, Error::ChecksumMismatch { .. }), "{err:?}");
+        assert_nothing_published(&dest).await;
+        assert_no_markers(&dest_dir);
+        let seen = server.seen();
+        assert!(part_requests(&seen).is_empty(), "{seen:?}");
+        assert_eq!(dest.list_objects().await.unwrap(), held);
+    });
+}
+
+/// The remote does not hold the superblock of the middle step of the one
+/// chain of the list. Under `require_static_deltas`, the pull fails and
+/// publishes nothing. Without it, the pull fetches the target loose and
+/// requests no part.
+#[test]
+fn a_missing_superblock_in_the_middle_of_a_chain() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-missing-superblock");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        server.hide(&superblock_path(&b, &c));
+        let dest = dest_holding(dir.path(), &server.url(), &a).await;
+        let dest_dir = dir.path().join("dest");
+        server.forget();
+
+        let required = PullOptions {
+            require_static_deltas: true,
+            ..chain_opts(list.clone())
+        };
+        let err = dest.pull("origin", required).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("pull: Static deltas required, but none found for test/main to {d}")
+        );
+        assert_nothing_published(&dest).await;
+        assert_no_markers(&dest_dir);
+        assert!(part_requests(&server.seen()).is_empty());
+
+        server.forget();
+        dest.pull("origin", chain_opts(list)).await.unwrap();
+        let seen = server.seen();
+        assert_complete(&remote, &dest, &dest_dir, &d).await;
+        assert_no_markers(&dest_dir);
+        assert!(seen.iter().any(|path| path.ends_with(".filez")), "{seen:?}");
+        assert!(part_requests(&seen).is_empty(), "{seen:?}");
+        assert_eq!(server.statuses_for(&superblock_path(&b, &c)), [404]);
+        assert_eq!(server.requests_for(&superblock_path(&c, &d)), 0);
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(d)
+        );
+    });
+}
+
+/// A pull of depth 1 through a chain under a signature policy passes.
+/// Discovery checks each intermediate commit with its `.commitmeta`, and the
+/// pull requests neither file again: the step of the parent under depth reads
+/// the commit that an earlier run made complete.
+#[test]
+fn depth_one_through_a_chain_under_verification() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-depth-verify");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        sign_commits(&remote, &[a, b, c, d]).await;
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        drop(dest_holding(dir.path(), &server.url(), &a).await);
+        let dest = reconfigure_dest(dir.path(), &server.url(), &signed_policy()).await;
+        let dest_dir = dir.path().join("dest");
+        server.forget();
+
+        let opts = PullOptions {
+            depth: 1,
+            ..chain_opts(list)
+        };
+        dest.pull("origin", opts).await.unwrap();
+
+        let seen = server.seen();
+        for commit in [b, c] {
+            assert_eq!(server.requests_for(&meta_path(&commit, "commit")), 0);
+            assert_eq!(
+                server.requests_for(&meta_path(&commit, "commitmeta")),
+                1,
+                "{seen:?}"
+            );
+            assert_complete(&remote, &dest, &dest_dir, &commit).await;
+        }
+        assert_complete(&remote, &dest, &dest_dir, &d).await;
+        assert_no_markers(&dest_dir);
+        assert_eq!(
+            dest.read_commit_detached_metadata(&c).await.unwrap(),
+            remote.read_commit_detached_metadata(&c).await.unwrap()
+        );
+        assert!(
+            dest.read_commit_detached_metadata(&c)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(d)
+        );
+    });
+}
+
+/// A requested target is also an intermediate commit of the chain of another
+/// target. The pull passes under a signature policy, makes both refs, and
+/// requests the `.commitmeta` of each intermediate commit once. The binding
+/// check applies to the ref that names the intermediate commit: a ref that
+/// the binding of that commit does not list fails the pull.
+#[test]
+fn a_target_that_is_an_intermediate_commit_of_another_target() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-target-in-level");
+        let remote = create_remote(dir.path()).await;
+        let a = chain_commit(&remote, dir.path(), "a", "test/main", None, 0).await;
+        let b = chain_commit(&remote, dir.path(), "b", "test/main", Some(a), 1).await;
+        let c = chain_commit(&remote, dir.path(), "c", "test/mid", Some(b), 2).await;
+        let d = chain_commit(&remote, dir.path(), "d", "test/main", Some(c), 3).await;
+        let txn = remote.transaction().await.unwrap();
+        txn.set_ref("test/alias", Some(&c));
+        txn.commit().await.unwrap();
+        sign_commits(&remote, &[a, b, c, d]).await;
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        drop(dest_holding(dir.path(), &server.url(), &a).await);
+        let dest = reconfigure_dest(dir.path(), &server.url(), &signed_policy()).await;
+        let dest_dir = dir.path().join("dest");
+        let held = dest.list_objects().await.unwrap();
+        server.forget();
+
+        let alias = PullOptions {
+            refs: vec!["test/main".to_owned(), "test/alias".to_owned()],
+            ..chain_opts(list.clone())
+        };
+        let err = dest.pull("origin", alias).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("'test/alias'")),
+            "{err:?}"
+        );
+        assert_nothing_published(&dest).await;
+        assert_no_markers(&dest_dir);
+        assert_eq!(dest.list_objects().await.unwrap(), held);
+
+        server.forget();
+        let opts = PullOptions {
+            refs: vec!["test/main".to_owned(), "test/mid".to_owned()],
+            ..chain_opts(list)
+        };
+        dest.pull("origin", opts).await.unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(d)
+        );
+        assert_eq!(
+            dest.resolve_rev("origin:test/mid", true).await.unwrap(),
+            Some(c)
+        );
+        let seen = server.seen();
+        for commit in [b, c] {
+            assert_eq!(
+                server.requests_for(&meta_path(&commit, "commitmeta")),
+                1,
+                "{seen:?}"
+            );
+            assert_complete(&remote, &dest, &dest_dir, &commit).await;
+        }
+        assert!(
+            !seen.iter().any(|path| path.ends_with(".commit")),
+            "{seen:?}"
+        );
+        assert_complete(&remote, &dest, &dest_dir, &d).await;
+        assert_no_markers(&dest_dir);
+    });
+}
+
+/// Two targets share the first step of their chains. The pull fetches the
+/// superblock and each part of the shared step once, and applies them before
+/// each part of the two later steps.
+#[test]
+fn two_targets_share_a_step() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-shared-step");
+        let remote = create_remote(dir.path()).await;
+        let a = chain_commit(&remote, dir.path(), "a", "test/main", None, 0).await;
+        let b = chain_commit(&remote, dir.path(), "b", "test/main", Some(a), 1).await;
+        let c = chain_commit(&remote, dir.path(), "c", "test/main", Some(b), 2).await;
+        let d = chain_commit(&remote, dir.path(), "d", "test/other", Some(b), 3).await;
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (b, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &a).await;
+        let dest_dir = dir.path().join("dest");
+        server.forget();
+
+        let opts = PullOptions {
+            refs: vec!["test/main".to_owned(), "test/other".to_owned()],
+            ..chain_opts(list)
+        };
+        dest.pull("origin", opts).await.unwrap();
+
+        let seen = server.seen();
+        assert_eq!(server.requests_for(&superblock_path(&a, &b)), 1);
+        let mut later = part_paths(&remote, &b, &c);
+        later.extend(part_paths(&remote, &b, &d));
+        assert_before(&seen, &part_paths(&remote, &a, &b), &later);
+        for commit in [b, c, d] {
+            assert_complete(&remote, &dest, &dest_dir, &commit).await;
+        }
+        assert_no_markers(&dest_dir);
+        assert!(
+            !seen.iter().any(|path| path.ends_with(".filez")),
+            "{seen:?}"
+        );
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(c)
+        );
+        assert_eq!(
+            dest.resolve_rev("origin:test/other", true).await.unwrap(),
+            Some(d)
+        );
+    });
+}
+
+/// A `COMMIT_ONLY` pull ignores the list, also under `require_static_deltas`
+/// from a remote with no summary. It requests no delta file, and fetches the
+/// target commit object alone, which stays partial with its marker.
+#[test]
+fn a_commit_only_pull_ignores_the_list() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-commit-only");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        let dest_dir = dir.path().join("dest");
+
+        let opts = PullOptions {
+            flags: PullFlags::COMMIT_ONLY,
+            require_static_deltas: true,
+            ..chain_opts(list)
+        };
+        dest.pull("origin", opts).await.unwrap();
+
+        let seen = server.seen();
+        assert!(
+            !seen.iter().any(|path| path.starts_with("deltas/")),
+            "{seen:?}"
+        );
+        assert!(seen.contains(&meta_path(&d, "commit")), "{seen:?}");
+        assert_eq!(dest.commit_state(&d).await.unwrap(), CommitState::Partial);
+        assert!(
+            dest_dir
+                .join(format!("state/{}.commitpartial", d.to_hex()))
+                .exists()
+        );
+    });
+}
+
+/// A pull with an empty list passes. It requests no delta file and no delta
+/// index, and fetches the target loose.
+#[test]
+fn an_empty_list_fetches_loose() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-empty-list");
+        let (remote, [a, _, _, d]) = build_chain_remote(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &a).await;
+        let dest_dir = dir.path().join("dest");
+        server.forget();
+
+        dest.pull("origin", chain_opts(Vec::new())).await.unwrap();
+
+        let seen = server.seen();
+        assert!(
+            !seen
+                .iter()
+                .any(|path| path.starts_with("deltas/") || path.starts_with("delta-indexes/")),
+            "{seen:?}"
+        );
+        assert!(seen.iter().any(|path| path.ends_with(".filez")), "{seen:?}");
+        assert_complete(&remote, &dest, &dest_dir, &d).await;
+        assert_no_markers(&dest_dir);
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(d)
+        );
+    });
+}
+
+/// A list that holds one entry twice passes. The pull applies the chain and
+/// requests each superblock once.
+#[test]
+fn a_list_with_an_entry_twice_applies_the_chain() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-equal-entry");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        let steps = [(a, b), (b, c), (c, d)];
+        let mut list = Vec::new();
+        for (from, to) in &steps {
+            list.push(listed(&remote, from, to, DeltaOptions::default()).await);
+        }
+        list.push(list[1]);
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &a).await;
+        let dest_dir = dir.path().join("dest");
+        server.forget();
+
+        dest.pull("origin", chain_opts(list)).await.unwrap();
+
+        let seen = server.seen();
+        for (from, to) in &steps {
+            assert_eq!(
+                server.requests_for(&superblock_path(from, to)),
+                1,
+                "{seen:?}"
+            );
+        }
+        assert!(
+            !seen.iter().any(|path| path.ends_with(".filez")),
+            "{seen:?}"
+        );
+        for commit in [b, c, d] {
+            assert_complete(&remote, &dest, &dest_dir, &commit).await;
+        }
+        assert_no_markers(&dest_dir);
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(d)
+        );
+    });
+}
+
+/// A requested ref names an intermediate commit of the chain of another
+/// target. The ref in the destination names a newer commit, so the timestamp
+/// check refuses the intermediate commit in the run of the targets. The pull
+/// fails, keeps the refs and the objects of the destination, and leaves no
+/// marker.
+#[test]
+fn the_timestamp_check_refuses_an_older_intermediate_commit() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-timestamp");
+        let remote = create_remote(dir.path()).await;
+        let a = chain_commit(&remote, dir.path(), "a", "test/main", None, 0).await;
+        let b = chain_commit(&remote, dir.path(), "b", "test/main", Some(a), 1).await;
+        let c = chain_commit(&remote, dir.path(), "c", "test/mid", Some(b), 2).await;
+        let d = chain_commit(&remote, dir.path(), "d", "test/main", Some(c), 3).await;
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &a).await;
+        let dest_dir = dir.path().join("dest");
+        build_tree(&dir.path().join("newer"), b"newer\n");
+        let newer = commit_tree(
+            &dest,
+            dir.path(),
+            "newer",
+            "origin:test/mid",
+            None,
+            FIXED_TS + 100,
+        )
+        .await;
+        let held = dest.list_objects().await.unwrap();
+        server.forget();
+
+        let opts = PullOptions {
+            refs: vec!["test/main".to_owned(), "test/mid".to_owned()],
+            timestamp_check: TimestampCheck::CurrentRef,
+            ..chain_opts(list)
+        };
+        let err = dest.pull("origin", opts).await.unwrap_err();
+
+        assert!(matches!(err, Error::Pull(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains(&c.to_hex()), "{message}");
+        assert!(message.contains(&newer.to_hex()), "{message}");
+        // The runs of the levels applied the steps to B and to C before the
+        // check failed.
+        let seen = server.seen();
+        let bc_parts = part_paths(&remote, &b, &c);
+        assert_eq!(
+            positions(&seen, &bc_parts).len(),
+            bc_parts.len(),
+            "{seen:?}"
+        );
+        assert!(!seen.contains(&meta_path(&c, "commit")), "{seen:?}");
+        assert_eq!(
+            dest.resolve_rev("origin:test/mid", true).await.unwrap(),
+            Some(newer)
+        );
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            None
+        );
+        assert_eq!(dest.list_objects().await.unwrap(), held);
+        assert_no_markers(&dest_dir);
+    });
+}
+
+/// The detached-metadata filter applies to the `.commitmeta` that discovery
+/// keeps for an intermediate commit. The remote adds a private key to the
+/// signed `.commitmeta` of each commit. The pull passes under a signature
+/// policy, requests each intermediate `.commitmeta` once, and stores each
+/// with the signature and without the private key.
+#[test]
+fn the_detached_filter_applies_to_an_intermediate_commit() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-detached-filter");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        sign_commits(&remote, &[a, b, c, d]).await;
+        for commit in [b, c, d] {
+            let Some(Value::Array(mut entries)) =
+                remote.read_commit_detached_metadata(&commit).await.unwrap()
+            else {
+                panic!("{commit} has no signed .commitmeta");
+            };
+            entries.push(Value::Tuple(vec![
+                Value::Str("test.private".to_owned()),
+                Value::Variant(Box::new((
+                    Type::parse("s").unwrap(),
+                    Value::Str("repository-local".to_owned()),
+                ))),
+            ]));
+            remote
+                .write_commit_detached_metadata(&commit, Some(&Value::Array(entries)))
+                .await
+                .unwrap();
+        }
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        drop(dest_holding(dir.path(), &server.url(), &a).await);
+        let dest = reconfigure_dest(dir.path(), &server.url(), &signed_policy()).await;
+        let dest_dir = dir.path().join("dest");
+        server.forget();
+
+        let opts = PullOptions {
+            detached_metadata_filter: DetachedMetadataFilter::new(|_, key, _| {
+                if key == "test.private" {
+                    FilterResult::Skip
+                } else {
+                    FilterResult::Allow
+                }
+            }),
+            ..chain_opts(list)
+        };
+        dest.pull("origin", opts).await.unwrap();
+
+        let seen = server.seen();
+        for commit in [b, c, d] {
+            assert_eq!(
+                server.requests_for(&meta_path(&commit, "commitmeta")),
+                1,
+                "{seen:?}"
+            );
+            let held = remote
+                .read_commit_detached_metadata(&commit)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(held.dict_get("test.private").is_some());
+            let stored = dest
+                .read_commit_detached_metadata(&commit)
+                .await
+                .unwrap()
+                .expect("the signature is stored");
+            assert!(
+                stored.dict_get("ostree.sign.ed25519").is_some(),
+                "{commit}: {stored:?}"
+            );
+            assert!(
+                stored.dict_get("test.private").is_none(),
+                "{commit}: {stored:?}"
+            );
+            assert_complete(&remote, &dest, &dest_dir, &commit).await;
+        }
+        assert_no_markers(&dest_dir);
     });
 }
 

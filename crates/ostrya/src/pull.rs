@@ -798,6 +798,12 @@ pub struct PullOptions {
     /// loose. The pull does not look up a commit that this repository holds
     /// complete, so a pull with nothing to fetch is not refused.
     ///
+    /// With a list in [`static_deltas`](PullOptions::static_deltas), a pull
+    /// from a remote needs no summary. It fails with [`Error::Pull`] for a
+    /// target commit that no chain of the list reaches. A listed delta from
+    /// scratch to the target that the rule above leaves alone counts as found:
+    /// the pull does not fail, and fetches that target loose.
+    ///
     /// A local pull reads a delta from the source directory only under this
     /// option. [`Repo::pull_local`] states the static delta rules of a local
     /// pull. The fetch counters of [`PullStats`] count the files that the
@@ -826,9 +832,13 @@ pub struct PullOptions {
     ///   is not empty. [`Repo::pull_local`] refuses subpaths with
     ///   [`Error::Unsupported`] before this check.
     ///
-    /// The pull does not apply a list yet. After all checks of its options,
-    /// each pull with a list, an empty list included, fails with
-    /// [`Error::Unsupported`] before its first request.
+    /// A pull from a remote, [`Repo::pull`] or [`Repo::pull_with_session`],
+    /// applies the chain with the fewest steps to each target commit, by the
+    /// rules of [`Repo::pull`] under `# Static deltas`. A
+    /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull ignores the list. A local
+    /// pull does not apply a list yet: after all checks of its options, a
+    /// local pull with a list, an empty list included, fails with
+    /// [`Error::Unsupported`] before it reads `src`.
     ///
     /// [`Summary::static_deltas`]: crate::Summary::static_deltas
     pub static_deltas: Option<Vec<AdvertisedDelta>>,
@@ -2528,8 +2538,9 @@ async fn take_static_deltas(opts: &mut PullOptions) -> Result<Option<chain::Edge
         .map(Some)
 }
 
-/// Refuses a pull with a list of static deltas, because no pull applies a
-/// list yet. `edges` is the index that [`take_static_deltas`] gives.
+/// Refuses a local pull with a list of static deltas, because a local pull
+/// does not apply a list yet. `edges` is the index that
+/// [`take_static_deltas`] gives.
 fn refuse_static_delta_list(edges: Option<&chain::Edges>) -> Result<()> {
     if edges.is_some() {
         return Err(Error::Unsupported(

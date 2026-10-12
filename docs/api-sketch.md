@@ -2482,9 +2482,22 @@ directory, which must be an archive repository, and applies the delta.
 first request and before its transaction opens. It refuses two digests for one
 delta, the list with `disable_static_deltas`, and the list with subpaths with
 `InvalidInput`, and drops an entry equal to an earlier entry. `pull_local`
-refuses subpaths with `Unsupported` before this check. No pull applies a
-list yet, so each pull with a list that passes all checks of its options, an
-empty list included, fails with `Unsupported`.
+refuses subpaths with `Unsupported` before this check. A pull from a remote
+reads no delta index and needs no summary for the list. For each target commit
+it applies the chain with the fewest steps. A chain starts at a commit that
+this repository holds complete, or with a delta from scratch if the ref names
+neither a complete commit nor the target in this repository. Of two chains with
+the same number of steps, the chain from a complete commit wins. Before the
+transaction opens, it fetches the superblock of each step and checks it against
+its listed digest, and it fetches the `.commitmeta` of each intermediate commit
+and checks the signatures of that commit. It applies the chains one level at a
+time: the parts, the loose objects, and the tree walk of one level end before
+the next level starts. Each intermediate commit ends complete with no
+`.commitpartial` marker. The ref-binding check and the timestamp check apply to
+an intermediate commit only for a requested ref that names it. A `COMMIT_ONLY`
+pull ignores the list. `pull_local` does not apply a list yet: a list that
+passes all checks of its options, an empty list included, fails with
+`Unsupported`.
 
 A pull checks the signatures on the commits it carries and on the remote's
 summary. `verify` holds four switches, each overriding the remote configuration
@@ -2603,10 +2616,12 @@ pub struct PullOptions {
     pub static_deltas: Option<Vec<AdvertisedDelta>>,  // replaces the delta
                                           // search; two digests for one
                                           // delta, disable_static_deltas,
-                                          // or subpaths: InvalidInput; a
-                                          // list that passes each option
-                                          // check: Unsupported; all before
-                                          // the first request
+                                          // or subpaths: InvalidInput,
+                                          // before the first request; a
+                                          // pull from a remote applies the
+                                          // chain; pull_local refuses a
+                                          // list that passes the checks:
+                                          // Unsupported
     pub verify: PullVerify,               // the signature checks to make;
                                           // pull_with_session refuses a
                                           // value other than the default
@@ -2725,8 +2740,7 @@ impl Repo {
     /// a `remote` that `valid_remote_name` refuses with InvalidInput, and a
     /// set `collection_id` with Unsupported. It refuses a `static_deltas`
     /// list with two digests for one delta, or with
-    /// `disable_static_deltas` or subpaths, with InvalidInput. After all
-    /// of these checks, it refuses each other list with Unsupported.
+    /// `disable_static_deltas` or subpaths, with InvalidInput.
     pub async fn pull_with_session(&self, session: PullSession,
                                    trust: PullTrust, opts: PullOptions)
         -> Result<PullStats>;

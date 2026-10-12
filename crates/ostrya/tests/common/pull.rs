@@ -38,7 +38,7 @@ use hyper::{Request, Response, StatusCode};
 use ostrya::fetch::{FetcherOptions, Proxy, TrustRoots};
 use ostrya::{
     AdvertisedDelta, Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
-    Error, MutableTree, PullFlags, PullOptions, Repo, RepoMode, SummaryOptions, Type, Value,
+    Error, MutableTree, PullOptions, Repo, RepoMode, SummaryOptions, Type, Value,
 };
 use ostrya_rt::{TcpListener, spawn};
 
@@ -850,13 +850,7 @@ pub async fn assert_nothing_published(repo: &Repo) {
 pub enum ListRefusal {
     /// [`Error::InvalidInput`] with this message.
     InvalidInput(String),
-    /// [`Error::Unsupported`] with this message.
-    Unsupported(&'static str),
 }
-
-/// The message of the refusal of a `static_deltas` list that passes the
-/// checks of the pull.
-pub const LIST_NOT_APPLIED: &str = "a pull does not apply a static_deltas list";
 
 /// Returns a listed delta. Each byte names the checksum of 32 equal bytes,
 /// and `None` is a delta from scratch.
@@ -869,8 +863,8 @@ pub fn listed_delta(from: Option<u8>, to: u8, digest: u8) -> AdvertisedDelta {
 }
 
 /// Returns the options of each pull that its `static_deltas` list makes the
-/// pull refuse, with a tag and the error of the pull. `base` gives the other
-/// options, with an empty subpath list.
+/// pull refuse with [`Error::InvalidInput`], with a tag and the error of the
+/// pull. `base` gives the other options, with an empty subpath list.
 pub fn static_delta_list_cases(
     base: impl Fn() -> PullOptions,
 ) -> Vec<(&'static str, PullOptions, ListRefusal)> {
@@ -913,42 +907,6 @@ pub fn static_delta_list_cases(
             },
             ListRefusal::InvalidInput("a pull with static_deltas takes no subpath".to_owned()),
         ),
-        (
-            "a valid list",
-            PullOptions {
-                static_deltas: Some(vec![listed_delta(Some(1), 2, 3), listed_delta(None, 2, 4)]),
-                ..base()
-            },
-            ListRefusal::Unsupported(LIST_NOT_APPLIED),
-        ),
-        (
-            "an empty list",
-            PullOptions {
-                static_deltas: Some(Vec::new()),
-                ..base()
-            },
-            ListRefusal::Unsupported(LIST_NOT_APPLIED),
-        ),
-        (
-            "COMMIT_ONLY",
-            PullOptions {
-                static_deltas: Some(vec![listed_delta(Some(1), 2, 3)]),
-                flags: PullFlags::COMMIT_ONLY,
-                ..base()
-            },
-            ListRefusal::Unsupported(LIST_NOT_APPLIED),
-        ),
-        (
-            "an equal entry",
-            PullOptions {
-                static_deltas: Some(vec![
-                    listed_delta(Some(1), 2, 3),
-                    listed_delta(Some(1), 2, 3),
-                ]),
-                ..base()
-            },
-            ListRefusal::Unsupported(LIST_NOT_APPLIED),
-        ),
     ]
 }
 
@@ -956,9 +914,6 @@ pub fn static_delta_list_cases(
 pub fn assert_list_refusal(tag: &str, err: &Error, expected: &ListRefusal) {
     match (expected, err) {
         (ListRefusal::InvalidInput(want), Error::InvalidInput(got)) => {
-            assert_eq!(got, want, "{tag}")
-        }
-        (ListRefusal::Unsupported(want), Error::Unsupported(got)) => {
             assert_eq!(got, want, "{tag}")
         }
         _ => panic!("{tag}: {err:?}"),

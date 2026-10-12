@@ -13,6 +13,11 @@
 //! The plan walks a dirtree when it applies the step of the dirtree, under
 //! each position that reached the dirtree by then. If a later position widens
 //! that scope, the plan walks the dirtree again from the transaction.
+//!
+//! With a list of static deltas, the loop runs the plan one time for each
+//! level of intermediate commits, and then one time for the targets, in one
+//! transaction. Each run starts from the objects that the earlier runs
+//! queued.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
@@ -45,7 +50,7 @@ use crate::verify::PullTrust;
 use crate::write::FileMeta;
 
 use super::chain::Edges;
-use super::delta::{self, DeltaJob, DeltaSource, PART_CAP};
+use super::delta::{self, CommitCheck, DeltaJob, DeltaPlan, DeltaSource, PART_CAP};
 use super::drive::Slots;
 use super::source::{RemoteSource, Transfer, http_error, session_error};
 use super::subpath::{Scope, Subpaths};
@@ -54,7 +59,7 @@ use super::{
     DetachedMetadataFilter, ModeChecks, PullCounters, PullFlags, PullOptions, PullStats,
     PullVerify, READ_CHUNK, TimestampCheck, apply_durability, check_commit_signatures, check_depth,
     check_ref_binding, check_remote_option, check_static_deltas, refspec, refuse_remote_collection,
-    refuse_static_delta_list, take_static_deltas,
+    take_static_deltas,
 };
 
 /// The number of fetched content objects that stream into the object store at
@@ -303,10 +308,10 @@ impl Repo {
     /// the superblock states onto the staging file system for one part. The
     /// pull writes each object of a part with its expected checksum asserted.
     ///
-    /// The pull applies the parts in the order that they arrive. The format
-    /// allows this order: a part patches against the objects of the source
-    /// commit, which are present before the delta applies. A part never
-    /// patches against the output of another part.
+    /// The pull applies the parts of one delta in the order that they arrive.
+    /// The format allows this order: a part patches against the objects of the
+    /// source commit, which are present before the delta applies. A part never
+    /// patches against the output of another part of the same delta.
     ///
     /// After the last part, the pull walks the tree of the commit and fetches
     /// loose each object that no part delivered. The `ostree` command takes
@@ -317,6 +322,39 @@ impl Repo {
     /// part body and the payload that it decompresses to. Each blob is on the
     /// heap while it is small. After a blob passes its heap threshold, it is a
     /// mapped temp file.
+    ///
+    /// [`static_deltas`](PullOptions::static_deltas) replaces this search with
+    /// a list. The pull then reads no delta index and no `ostree.static-deltas`
+    /// map, and it needs no summary for the deltas. For each target commit, it
+    /// plans the chain with the fewest steps. A chain starts at a commit that
+    /// this repository holds complete, or with a delta from scratch if the
+    /// rules above for a map allow a from-scratch delta to the target. Of two
+    /// chains with the same number of steps, the chain from a complete commit
+    /// wins.
+    ///
+    /// Before the transaction opens, the pull fetches the superblock of each
+    /// step and compares its SHA-256 with the digest in the list. For each
+    /// intermediate commit, it also fetches the `.commitmeta` and checks the
+    /// signatures of the commit. The pull does not request these files again.
+    ///
+    /// The pull applies a chain one level at a time, in its one transaction. A
+    /// part of a later step can patch against an object that an earlier step
+    /// wrote, also an object that the earlier step hands over loose. So the
+    /// parts, the loose objects, and the tree walk of one level end before the
+    /// next level starts. Each intermediate commit ends complete, with no
+    /// `.commitpartial` marker. The pull writes a ref for an intermediate
+    /// commit only if a requested ref names it.
+    ///
+    /// The pull makes no ref-binding check and no timestamp check on an
+    /// intermediate commit. If a requested ref names an intermediate commit,
+    /// the pull makes both checks for that ref.
+    ///
+    /// If the remote does not hold a superblock of a chain, the pull plans
+    /// again without that delta. If no chain reaches a target, the pull
+    /// fetches its objects loose, or fails under `require_static_deltas`. A
+    /// listed delta from scratch to the target that the rules above refuse
+    /// counts as found: the pull does not fail, and fetches that target loose.
+    /// A [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull ignores the list.
     ///
     /// [`disable_static_deltas`](PullOptions::disable_static_deltas) and
     /// [`require_static_deltas`](PullOptions::require_static_deltas) control
@@ -347,8 +385,6 @@ impl Repo {
     ///   one delta, or is set together with
     ///   [`disable_static_deltas`](PullOptions::disable_static_deltas) or with
     ///   [`subpaths`](PullOptions::subpaths).
-    /// - [`Error::Unsupported`] if `static_deltas` is set and passes these
-    ///   checks.
     /// - The errors of [`resolve_pull`]. Among them, [`Error::Io`] names the
     ///   key and the path of a PEM file that cannot be read, and a PEM file
     ///   over 1 MiB is [`Error::InvalidInput`].
@@ -386,7 +422,10 @@ impl Repo {
     ///   serves no summary under `MIRROR`, or the remote has no `branches`.
     /// - [`Error::Pull`] if
     ///   [`require_static_deltas`](PullOptions::require_static_deltas) is set
-    ///   and the pull finds no delta.
+    ///   and the pull finds no delta, or no chain to a target under a list. A
+    ///   listed delta from scratch to the target that the from-scratch rules
+    ///   of `# Static deltas` refuse counts as found, and the pull fetches
+    ///   that target loose.
     /// - [`Error::Pull`] if a superblock names other commits than its delta
     ///   name.
     ///
@@ -447,7 +486,6 @@ impl Repo {
         check_remote_option(&opts)?;
         check_static_deltas(&opts)?;
         let edges = take_static_deltas(&mut opts).await?;
-        refuse_static_delta_list(edges.as_ref())?;
         // The endpoint is resolved first, so a remote the config does not
         // describe reports that before a policy is resolved for it.
         let overrides = std::mem::take(&mut opts.overrides);
@@ -572,8 +610,6 @@ impl Repo {
     ///   set. The limit of the session applies.
     /// - [`Error::InvalidInput`] if [`overrides`](PullOptions::overrides) is
     ///   not the default. The session selects the server.
-    /// - [`Error::Unsupported`] if `static_deltas` is set and passes the
-    ///   checks above.
     ///
     /// After these checks, the pull has the errors of [`pull`](Repo::pull)
     /// that stop it before it fetches an object, while it fetches, and at any
@@ -790,8 +826,9 @@ impl Repo {
 
     /// Fetches what a pull from `source` reaches into a new transaction: the
     /// summary and its checks, the refs, the deltas, and then the plan, to
-    /// its end. The commits whose `.commitpartial` marker the pull wrote go
-    /// into `marked`.
+    /// its end. With a list of static deltas, the plan runs one time for each
+    /// level of intermediate commits, and then one time for the targets. The
+    /// commits whose `.commitpartial` marker the pull wrote go into `marked`.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_from(
         &self,
@@ -829,9 +866,10 @@ impl Repo {
         // The deltas that can deliver these commits, found before the first
         // object request. A commit that a delta carries has no `.commit`
         // request of its own.
-        let deltas = delta::discover(
+        let delta_source = DeltaSource::Remote(source);
+        let mut deltas = delta::discover(
             self,
-            &DeltaSource::Remote(source),
+            &delta_source,
             summary.as_ref(),
             &targets,
             opts,
@@ -845,16 +883,69 @@ impl Repo {
 
         let mut txn = self.transaction().await?;
         apply_durability(&mut txn, opts);
+        // A part of a later step of a chain can patch against an object that
+        // an earlier step wrote. So the run of each level of intermediate
+        // commits ends before the next run starts. The jobs of a level live
+        // for its run alone.
+        let none = HashMap::new();
+        let mut done = HashSet::new();
+        let mut carry = Carry::default();
+        for level in deltas.levels() {
+            let jobs = deltas.parse_level(self, &delta_source, level).await?;
+            let phase = Phase {
+                roots: level,
+                tips: &none,
+                depth: 0,
+                subpaths: None,
+                deltas: &jobs,
+                done: &done,
+                last: false,
+            };
+            self.drive(
+                &txn,
+                source,
+                opts,
+                prefix,
+                phase,
+                &deltas,
+                verification,
+                counters,
+                &mut carry,
+                marked,
+            )
+            .await?;
+            drop(jobs);
+            done.extend(level.iter().copied());
+        }
+        let jobs = deltas.target_jobs(self, &delta_source).await?;
+        // The refs of each requested tip. The binding check and the timestamp
+        // check apply to each ref. The plan fetches a commit once, whatever the
+        // number of refs that name it. So the step that fetches a commit runs
+        // the checks of every ref in its entry here.
+        let mut tips: HashMap<Checksum, Vec<String>> = HashMap::new();
+        for (name, tip) in &targets {
+            tips.entry(*tip).or_default().push(name.clone());
+        }
+        let roots: Vec<Checksum> = targets.iter().map(|(_, tip)| *tip).collect();
+        let phase = Phase {
+            roots: &roots,
+            tips: &tips,
+            depth: opts.depth,
+            subpaths,
+            deltas: &jobs,
+            done: &done,
+            last: true,
+        };
         self.drive(
             &txn,
             source,
             opts,
             prefix,
-            &targets,
-            &deltas.jobs,
+            phase,
+            &deltas,
             verification,
-            subpaths,
             counters,
+            &mut carry,
             marked,
         )
         .await?;
@@ -977,8 +1068,15 @@ impl Repo {
         Ok(out)
     }
 
-    /// Runs the plan to its end. The commits whose `.commitpartial` marker
-    /// this pull wrote, and must clear, go into `marked`.
+    /// Runs one run of the plan to its end, from the roots of `phase`. The
+    /// commits whose `.commitpartial` marker this pull wrote, and must clear,
+    /// go into `marked`.
+    ///
+    /// The run starts from the objects that the earlier runs of this pull
+    /// queued, and gives them back in `carry` when it ends. So the pull
+    /// fetches an object once over all runs. `carry` also keeps a running
+    /// count of the units of work, for the progress total. `delta_plan` holds
+    /// the checks that discovery made on the commits of the chains.
     ///
     /// `marked` is an argument, so the caller holds the written markers when a
     /// step fails.
@@ -989,21 +1087,13 @@ impl Repo {
         source: &RemoteSource,
         opts: &PullOptions,
         ref_prefix: Option<&str>,
-        targets: &[(String, Checksum)],
-        deltas: &HashMap<Checksum, DeltaJob>,
+        phase: Phase<'_>,
+        delta_plan: &DeltaPlan,
         verification: &Verification,
-        subpaths: Option<Subpaths>,
         progress: &PullCounters,
+        carry: &mut Carry,
         marked: &mut Vec<Checksum>,
     ) -> Result<()> {
-        // The refs of each requested tip. The binding check and the timestamp
-        // check apply to each ref. The plan fetches a commit once, whatever the
-        // number of refs that name it. So the step that fetches a commit runs
-        // the checks of every ref in its entry here.
-        let mut tips: HashMap<Checksum, Vec<String>> = HashMap::new();
-        for (name, tip) in targets {
-            tips.entry(*tip).or_default().push(name.clone());
-        }
         let ctx = StepCtx {
             txn,
             source,
@@ -1013,17 +1103,20 @@ impl Repo {
             checks: ModeChecks::new(opts.flags, self.mode()),
             ref_prefix,
             timestamp_check: &opts.timestamp_check,
-            tips: &tips,
-            deltas,
+            tips: phase.tips,
+            deltas: phase.deltas,
+            done: phase.done,
+            delta_plan,
             verification,
             detached_filter: &opts.detached_metadata_filter,
             progress,
         };
-        let mut plan = Plan::new(subpaths);
-        for (_, tip) in targets {
+        let mut plan = Plan::new(phase.subpaths);
+        plan.queued = std::mem::take(&mut carry.queued);
+        for root in phase.roots {
             plan.push_commit(CommitItem {
-                checksum: *tip,
-                depth: opts.depth,
+                checksum: *root,
+                depth: phase.depth,
                 optional: false,
             });
         }
@@ -1038,8 +1131,9 @@ impl Repo {
         // step that fails takes its buffer with it, and the failure ends the
         // pull.
         let mut buffers: Vec<Vec<u8>> = Vec::new();
-        // The units of work given to a slot, for the progress total.
-        let mut started: usize = 0;
+        // The units of work given to a slot by this pull, for the progress
+        // total.
+        let mut started = carry.started;
         loop {
             while slots.has_room()
                 && let Some(item) = plan.next()
@@ -1048,7 +1142,7 @@ impl Repo {
                 slots.push(self.step(&ctx, item, buffer));
                 started += 1;
             }
-            plan.report(progress, started);
+            plan.report(progress, started, !phase.last);
             let Some(outcome) = slots.next_ready().await else {
                 break;
             };
@@ -1057,6 +1151,8 @@ impl Repo {
             progress.object_done();
             plan.apply(step, marked);
         }
+        carry.queued = plan.queued;
+        carry.started = started;
         Ok(())
     }
 
@@ -1109,6 +1205,16 @@ impl Repo {
     ) -> Result<Step> {
         let checksum = item.checksum;
         let name = ObjectName::new(checksum, ObjectType::Commit);
+        if ctx.done.contains(&checksum) {
+            return self.done_commit(ctx, checksum).await;
+        }
+        // Discovery checked the signatures of each intermediate commit of a
+        // chain, and kept the verified `.commitmeta`. The step stages these
+        // bytes and does not request them again.
+        let (prechecked, mut known) = match ctx.delta_plan.commit_check(&checksum).await? {
+            CommitCheck::NotChecked => (false, None),
+            CommitCheck::Checked(detached) => (true, Some(detached)),
+        };
 
         let present = self.has_object(ObjectType::Commit, &checksum).await?;
         let complete = present && self.commit_state(&checksum).await? == CommitState::Normal;
@@ -1120,8 +1226,13 @@ impl Repo {
         // pair in this order. The pull holds the bytes until the commit object
         // is here, so a commit that the remote does not hold leaves none.
         let (detached, bytes) = if present {
-            let detached =
-                fetch_detached_metadata(ctx.source, ctx.sources, ctx.progress, &checksum).await?;
+            let detached = match known.take() {
+                Some(detached) => detached,
+                None => {
+                    fetch_detached_metadata(ctx.source, ctx.sources, ctx.progress, &checksum)
+                        .await?
+                }
+            };
             let bytes = self
                 .load_object_bytes(ObjectType::Commit, &checksum)
                 .await?;
@@ -1131,8 +1242,13 @@ impl Repo {
             // from there, and the import runs after the checks, in the order of
             // the fetched branches.
             staging = CommitStaging::Import(src);
-            let detached =
-                fetch_detached_metadata(ctx.source, ctx.sources, ctx.progress, &checksum).await?;
+            let detached = match known.take() {
+                Some(detached) => detached,
+                None => {
+                    fetch_detached_metadata(ctx.source, ctx.sources, ctx.progress, &checksum)
+                        .await?
+                }
+            };
             (
                 detached,
                 src.load_object_bytes(ObjectType::Commit, &checksum).await?,
@@ -1143,8 +1259,13 @@ impl Repo {
             // they hash to this checksum. The write at staging verifies it
             // again.
             staging = CommitStaging::Write;
-            let detached =
-                fetch_detached_metadata(ctx.source, ctx.sources, ctx.progress, &checksum).await?;
+            let detached = match known.take() {
+                Some(detached) => detached,
+                None => {
+                    fetch_detached_metadata(ctx.source, ctx.sources, ctx.progress, &checksum)
+                        .await?
+                }
+            };
             (detached, job.commit_bytes.clone())
         } else {
             match self.fetch_remote_commit(ctx, &checksum).await? {
@@ -1170,28 +1291,24 @@ impl Repo {
         let commit = Commit::parse(&bytes)?;
         // The signature verification runs before the pull stages the commit
         // and requests its tree, so a commit that the policy refuses costs no
-        // object fetch. The verification reads the detached metadata that this
-        // pull puts in place. That is the copy of the remote if it served one,
-        // else the copy of this repository. A later verification of the stored
-        // commit reads the same metadata.
-        check_commit_signatures(
-            self,
-            ctx.verification,
-            &checksum,
-            &bytes,
-            detached.as_deref(),
-        )
-        .await?;
-        // The pull checks each requested ref that names this commit here. The
-        // plan fetches a commit once, so a second ref at the same commit has no
-        // step of its own for its checks.
-        for ref_name in ctx.tips.get(&checksum).into_iter().flatten() {
-            if !ctx.flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS) {
-                check_ref_binding(&checksum, &commit, ref_name)?;
-            }
-            self.check_timestamp(ctx, ref_name, &checksum, &commit)
-                .await?;
+        // fetch of its own objects. A target at the end of a chain comes after
+        // the runs of the levels of its chain, so a refused target still costs
+        // the objects of those levels. Discovery checked each intermediate
+        // commit before the transaction opened. The verification reads the
+        // detached metadata that this pull puts in place. That is the copy of
+        // the remote if it served one, else the copy of this repository. A
+        // later verification of the stored commit reads the same metadata.
+        if !prechecked {
+            check_commit_signatures(
+                self,
+                ctx.verification,
+                &checksum,
+                &bytes,
+                detached.as_deref(),
+            )
+            .await?;
         }
+        self.check_tips(ctx, &checksum, &commit).await?;
 
         // The pull writes no partial marker for a commit that this repository
         // holds complete: a pull that fails elsewhere must not demote it.
@@ -1270,6 +1387,46 @@ impl Repo {
             next,
             parent: commit.parent,
             marked: !complete,
+        }))
+    }
+
+    /// Makes the ref-binding check and the timestamp check of each requested
+    /// ref that names `checksum`.
+    ///
+    /// The plan fetches a commit once, so a second ref at the same commit has
+    /// no step of its own for its checks.
+    async fn check_tips(
+        &self,
+        ctx: &StepCtx<'_>,
+        checksum: &Checksum,
+        commit: &Commit,
+    ) -> Result<()> {
+        for ref_name in ctx.tips.get(checksum).into_iter().flatten() {
+            if !ctx.flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS) {
+                check_ref_binding(checksum, commit, ref_name)?;
+            }
+            self.check_timestamp(ctx, ref_name, checksum, commit)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Runs the step of a commit that an earlier run of this pull made
+    /// complete in the transaction.
+    ///
+    /// The step reads the commit from the transaction, and makes the checks
+    /// of each requested ref that names it. It checks no signature, requests
+    /// nothing, and stages nothing. The plan follows the parent of the commit
+    /// under `depth`.
+    async fn done_commit(&self, ctx: &StepCtx<'_>, checksum: Checksum) -> Result<Step> {
+        let bytes = ctx.txn.load_commit_bytes_staged_first(&checksum).await?;
+        let commit = Commit::parse(&bytes)?;
+        self.check_tips(ctx, &checksum, &commit).await?;
+        Ok(Step::Commit(CommitOutcome {
+            checksum,
+            next: CommitNext::Nothing,
+            parent: commit.parent,
+            marked: false,
         }))
     }
 
@@ -1604,7 +1761,6 @@ async fn check_session_pull(opts: &mut PullOptions) -> Result<(Option<Subpaths>,
         ));
     }
     let edges = take_static_deltas(opts).await?;
-    refuse_static_delta_list(edges.as_ref())?;
     Ok((subpaths, edges))
 }
 
@@ -1646,12 +1802,19 @@ struct StepCtx<'a> {
     timestamp_check: &'a TimestampCheck,
     /// The requested refs of each tip commit, for the binding check and the
     /// timestamp check. A commit with no entry is a parent under `depth`,
-    /// which no ref names.
+    /// which no ref names. The map is empty in the run of a level of
+    /// intermediate commits.
     tips: &'a HashMap<Checksum, Vec<String>>,
-    /// The static delta that delivers each target commit, if the remote
+    /// The static delta that delivers each commit of this run, if the remote
     /// publishes one. The pull fetches a commit with no entry object by
     /// object.
     deltas: &'a HashMap<Checksum, DeltaJob>,
+    /// The commits that an earlier run of this pull made complete in the
+    /// transaction. The step stages nothing for them and checks no signature
+    /// again.
+    done: &'a HashSet<Checksum>,
+    /// The checks that discovery made on the commit of each step of a chain.
+    delta_plan: &'a DeltaPlan,
     /// The signature policy of this pull. The pull verifies each commit of a
     /// step before it stages its bytes.
     verification: &'a Verification,
@@ -1660,6 +1823,34 @@ struct StepCtx<'a> {
     detached_filter: &'a DetachedMetadataFilter,
     /// The live counters of the pull.
     progress: &'a PullCounters,
+}
+
+/// The commits of one run of the plan, and how the pull fetches them.
+struct Phase<'a> {
+    /// The commits that the run starts from.
+    roots: &'a [Checksum],
+    /// The requested refs of each tip commit, as [`StepCtx`] holds them.
+    tips: &'a HashMap<Checksum, Vec<String>>,
+    /// The number of parents to follow from each root, `-1` for all of them.
+    depth: i32,
+    /// The subpaths of the walk. `None` walks every tree whole.
+    subpaths: Option<Subpaths>,
+    /// The static delta of each commit of this run.
+    deltas: &'a HashMap<Checksum, DeltaJob>,
+    /// The commits that an earlier run made complete in the transaction.
+    done: &'a HashSet<Checksum>,
+    /// `true` for the last run of the pull.
+    last: bool,
+}
+
+/// What one run of the plan leaves for the next run.
+#[derive(Default)]
+struct Carry {
+    /// The objects that the runs queued, so that the pull fetches an object
+    /// once over all runs.
+    queued: HashSet<ObjectName>,
+    /// The units of work that the runs gave to a slot, for the progress total.
+    started: usize,
 }
 
 /// One commit to fetch.
@@ -1929,11 +2120,15 @@ impl Plan {
     }
 
     /// Stores the progress total and the scan state: the `started` units of
-    /// work given to a slot, and the queued work.
-    fn report(&self, progress: &PullCounters, started: usize) {
+    /// work given to a slot, and the queued work. `more` is `true` if a later
+    /// run of the plan follows this run. The pull then still scans.
+    fn report(&self, progress: &PullCounters, started: usize, more: bool) {
         let queued = self.commits.len() + self.parts.len() + self.scan.len() + self.content.len();
         let total = u32::try_from(started + queued).unwrap_or(u32::MAX);
-        progress.report(total, !self.commits.is_empty() || !self.scan.is_empty());
+        progress.report(
+            total,
+            more || !self.commits.is_empty() || !self.scan.is_empty(),
+        );
     }
 
     /// Adds the outcome of one step to the plan.

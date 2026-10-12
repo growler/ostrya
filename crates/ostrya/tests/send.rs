@@ -739,6 +739,37 @@ fn list_refs_with_a_bad_prefix_is_protocol() {
     }
 }
 
+/// A `ListRefs` with more than `MAX_REF_PREFIXES` prefixes is `protocol`.
+/// A prefix given two times counts two times, and the limit itself passes.
+#[test]
+fn list_refs_over_the_prefix_limit_is_protocol() {
+    let tmp = TmpDir::new("send-list-refs-many");
+    let repo = listing_repo(&tmp);
+    let (result, reply) = session(&repo, PIPE_CAP, |mut c| async move {
+        c.open().await;
+        c.send(&Message::ListRefs(vec![
+            "a/b".to_owned();
+            ostrya::MAX_REF_PREFIXES
+        ]))
+        .await;
+        read_reply(&mut c.reader).await
+    });
+    result.unwrap();
+    assert!(reply.found);
+    let (result, error) = session(&repo, PIPE_CAP, |mut c| async move {
+        c.open().await;
+        c.send(&Message::ListRefs(vec![
+            "a/b".to_owned();
+            ostrya::MAX_REF_PREFIXES + 1
+        ]))
+        .await;
+        c.error().await
+    });
+    assert_eq!(error.code, ErrorCode::Protocol);
+    assert!(error.message.contains("over the limit of 256"), "{error:?}");
+    assert_eq!(returned_code(&result), Some(ErrorCode::Protocol));
+}
+
 /// A failure of the build of the listing is `internal` on the wire, and
 /// `send` returns the error of the build.
 #[test]

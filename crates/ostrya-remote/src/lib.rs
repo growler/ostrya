@@ -20,7 +20,8 @@
 //!   a file, and [`StreamSession::list_refs`] reads a ref listing.
 //! - [`PullSession::connect`] opens the session of a pull to an [`Endpoint`], over HTTP or ssh,
 //!   [`PullSession::fetch_summary`] reads the summary of the remote, and
-//!   [`PullSession::fetch_refs`] reads the ref listing of a set of prefixes.
+//!   [`PullSession::fetch_refs`] reads the ref listing of a set of prefixes, over HTTP from
+//!   `_ostrya/refs/v1` or over a stream session.
 //! - [`Error`] is the error of each fallible operation, and [`ErrorCode`] names its wire codes.
 //!
 //! # Modules

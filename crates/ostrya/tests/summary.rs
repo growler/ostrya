@@ -896,6 +896,27 @@ fn a_ref_listing_selects_refs_by_prefix() {
     });
 }
 
+/// A prefix with a part longer than 255 bytes, which no file name can have,
+/// selects no ref, as an absent prefix does. This holds for a long first
+/// part, a long last part, and a long part under a ref directory.
+#[test]
+fn a_ref_listing_of_a_too_long_part_selects_nothing() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-long-part");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        add_prefix_refs(&repo).await;
+        let long = "l".repeat(256);
+        let absent = repo.build_ref_listing(&["absent"]).await.unwrap();
+        let only_a = repo.build_ref_listing(&["a"]).await.unwrap();
+        for prefix in [long.clone(), format!("a/{long}"), format!("{long}/b")] {
+            let listing = repo.build_ref_listing(&[prefix.as_str()]).await;
+            assert_eq!(listing.unwrap(), absent, "{prefix}");
+            let listing = repo.build_ref_listing(&["a", prefix.as_str()]).await;
+            assert_eq!(listing.unwrap(), only_a, "{prefix}");
+        }
+    });
+}
+
 /// Each entry of a listing has the bytes of the entry of the same ref in the
 /// summary. The listing is in normal form, so equal values are equal bytes.
 #[test]

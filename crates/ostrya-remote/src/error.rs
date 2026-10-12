@@ -133,11 +133,6 @@ pub enum Error {
     /// call on a broken session.
     #[error("invalid input: {0}")]
     InvalidInput(String),
-    /// A call that the session does not support over its transport.
-    ///
-    /// No wire code carries this variant.
-    #[error("unsupported: {0}")]
-    Unsupported(String),
     /// A failure of the transport under the session.
     ///
     /// - Over ssh, the ssh client cannot start, or it exits with a failure
@@ -294,7 +289,6 @@ impl Error {
     /// - [`Error::CommitOutcomeUnknown`]
     /// - [`Error::Source`]
     /// - [`Error::InvalidInput`]
-    /// - [`Error::Unsupported`]
     /// - [`Error::Transport`]
     /// - [`Error::Fetch`]
     /// - [`Error::Io`]
@@ -322,7 +316,6 @@ impl Error {
             | Error::CommitOutcomeUnknown { .. }
             | Error::Source(_)
             | Error::InvalidInput(_)
-            | Error::Unsupported(_)
             | Error::Transport(_)
             | Error::Fetch(_)
             | Error::Io(_)
@@ -364,7 +357,6 @@ impl Error {
             | Error::CommitOutcomeUnknown { .. }
             | Error::Source(_)
             | Error::InvalidInput(_)
-            | Error::Unsupported(_)
             | Error::Transport(_)
             | Error::Fetch(_)
             | Error::Io(_)

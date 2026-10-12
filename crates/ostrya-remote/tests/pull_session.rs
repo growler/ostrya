@@ -1273,19 +1273,91 @@ fn a_reply_to_list_refs_with_no_length_is_protocol() {
     );
 }
 
-/// `fetch_refs` over HTTP is `Unsupported`, and it sends no request. No
-/// server listens on the address.
-#[test]
-fn fetch_refs_over_http_is_unsupported() {
+/// Returns a session over HTTP to an address where no server listens. The
+/// fetcher makes no retry, so a request fails at once.
+fn dead_http_session() -> PullSession {
     let mut http = FetcherOptions::new("http://127.0.0.1:9/");
     http.max_redirects = 0;
+    http.max_retries = 0;
     http.proxy = Proxy::None;
+    ostrya_rt::block_on(PullSession::connect(
+        Endpoint::Http(http),
+        StreamSessionOptions::default(),
+    ))
+    .unwrap()
+}
+
+/// Returns `count` distinct prefixes, of which none covers another.
+fn distinct_prefixes(count: usize) -> Vec<String> {
+    (0..count).map(|n| format!("r{n}")).collect()
+}
+
+/// Over HTTP, a bad prefix, more than 256 prefixes after the removal of
+/// duplicates and covered prefixes, and a request target over 16 KiB are
+/// `InvalidInput`. The call sends no request: no server listens on the
+/// address, and a request would fail with `Fetch`.
+#[test]
+fn fetch_refs_over_http_refuses_bad_input_before_a_request() {
+    let session = dead_http_session();
+    let many = distinct_prefixes(257);
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    // 256 prefixes of 64 bytes take 256 * 72 bytes of query, with the key
+    // and the separator, which is more than 16 KiB.
+    let long = (0..256)
+        .map(|n| format!("{n:0>64}"))
+        .collect::<Vec<String>>();
+    let long: Vec<&str> = long.iter().map(String::as_str).collect();
+    // One prefix of 5,500 spaces is 16,500 bytes encoded.
+    let spaces = " ".repeat(5_500);
     ostrya_rt::block_on(async {
-        let session = PullSession::connect(Endpoint::Http(http), StreamSessionOptions::default())
-            .await
-            .unwrap();
-        let e = session.fetch_refs(&["main"]).await.unwrap_err();
-        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
-        session.finish().await.unwrap();
+        for (case, prefixes) in [
+            ("bad prefix", &["main", "a/../b"][..]),
+            ("257 prefixes", &many),
+            ("long target", &long),
+            ("escaped target", &[spaces.as_str()][..]),
+        ] {
+            let e = session.fetch_refs(prefixes).await.unwrap_err();
+            assert!(matches!(e, Error::InvalidInput(_)), "{case}: {e:?}");
+        }
+        // 300 copies of one prefix are one prefix, and the client sends the
+        // request.
+        let e = session.fetch_refs(&["main"; 300]).await.unwrap_err();
+        assert!(matches!(e, Error::Fetch(_)), "{e:?}");
+        // 256 distinct prefixes pass the client checks.
+        let e = session.fetch_refs(&many[..256]).await.unwrap_err();
+        assert!(matches!(e, Error::Fetch(_)), "{e:?}");
     });
+    ostrya_rt::block_on(session.finish()).unwrap();
+}
+
+/// Over a stream session, more than 256 prefixes after the removal is
+/// `InvalidInput`, and the call writes nothing. The client removes
+/// duplicates and covered prefixes before it sends `ListRefs`.
+#[test]
+fn fetch_refs_over_a_stream_counts_the_prefixes_that_stay() {
+    let ((input, output), mut server) = ends();
+    let listing = body_of("listing");
+    let got = run(
+        async {
+            let session = PullSession::over_stream(input, output, options(None))
+                .await
+                .unwrap();
+            let many = distinct_prefixes(257);
+            let many: Vec<&str> = many.iter().map(String::as_str).collect();
+            let e = session.fetch_refs(&many).await.unwrap_err();
+            assert!(matches!(e, Error::InvalidInput(_)), "{e:?}");
+            let mut prefixes = vec!["a/b", "main", "a"];
+            prefixes.extend(["main"; 300]);
+            let got = session.fetch_refs(&prefixes).await.unwrap();
+            session.finish().await.unwrap();
+            got
+        },
+        async {
+            server.hello(1).await;
+            assert_eq!(server.list_refs().await, ["main", "a"]);
+            server.body(Some(listing.len() as u64), &listing, 700).await;
+            assert!(server.recv().await.is_none());
+        },
+    );
+    assert_eq!(got, Some(listing));
 }

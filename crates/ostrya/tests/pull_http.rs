@@ -2694,13 +2694,74 @@ fn a_pull_session_fetches_the_summary_over_http() {
     });
 }
 
+/// `PullSession::fetch_refs` against a static server of the repository files
+/// gives `None`: the server answers 404 to the listing. The session still
+/// reads the summary.
+#[test]
+fn a_pull_session_fetches_no_ref_listing_from_a_static_server() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-session-fetch-refs-static");
+        build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), true).await;
+        let session = PullSession::connect(
+            Endpoint::Http(https_endpoint(&server)),
+            StreamSessionOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.fetch_refs(&["main"]).await.unwrap(), None);
+        assert_eq!(session.fetch_refs(&[]).await.unwrap(), None);
+        assert_eq!(server.seen(), ["_ostrya/refs/v1", "_ostrya/refs/v1"]);
+
+        let summary = std::fs::read(dir.path().join("remote/summary")).unwrap();
+        let (got, _) = session.fetch_summary().await.unwrap();
+        assert_eq!(got.as_deref(), Some(summary.as_slice()));
+        session.finish().await.unwrap();
+    });
+}
+
+/// `PullSession::fetch_refs` over HTTP refuses a listing whose stated length
+/// is over the cap of 128 MiB, from the head of the answer. The request
+/// target holds each prefix that stays, percent-encoded, and the call does
+/// not ask again.
+#[test]
+fn a_pull_session_refuses_a_ref_listing_over_the_cap_over_http() {
+    block_on(async {
+        let target = "_ostrya/refs/v1?prefix=a%2Fb&prefix=x%20y%2Bz&prefix=%C3%A9%3F%23%26%3D%25";
+        let (addr, seen) = oversized_file_server(target, ostrya::MAX_REF_LISTING + 1).await;
+        let mut http = FetcherOptions::new(format!("http://{addr}"));
+        http.proxy = Proxy::None;
+        let session = PullSession::connect(Endpoint::Http(http), StreamSessionOptions::default())
+            .await
+            .unwrap();
+        let err = session
+            .fetch_refs(&["a/b", "x y+z", "a/b/c", "é?#&=%", "x y+z"])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ostrya::remote::Error::Fetch(ostrya::fetch::Error::FetchTooLarge {
+                    limit: 134_217_728
+                })
+            ),
+            "{err}"
+        );
+        assert_eq!(*seen.lock().unwrap(), [target]);
+        session.finish().await.unwrap();
+    });
+}
+
 /// Starts a peer that answers a request for `oversized` with a head that
-/// states a length of 64 MiB + 1, and sends no body. The peer answers each
+/// states a length of `len` bytes, and sends no body. The peer answers each
 /// other request with a 404. Each answer closes its connection.
 ///
-/// The list gives the request paths that the peer read, in order, without the
-/// leading slash.
-async fn oversized_file_server(oversized: &'static str) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+/// The list gives the request targets that the peer read, in order, without
+/// the leading slash. A target holds its query.
+async fn oversized_file_server(
+    oversized: &'static str,
+    len: u64,
+) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
@@ -2723,10 +2784,7 @@ async fn oversized_file_server(oversized: &'static str) -> (SocketAddr, Arc<Mute
             };
             let path = path.trim_start_matches('/').to_owned();
             let answer = if path == oversized {
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    64 * 1024 * 1024 + 1
-                )
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n")
             } else {
                 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     .to_owned()
@@ -2751,7 +2809,7 @@ fn a_pull_session_refuses_a_summary_file_over_the_cap_over_http() {
         ("summary", &["summary.sig", "summary"][..]),
     ] {
         block_on(async {
-            let (addr, seen) = oversized_file_server(oversized).await;
+            let (addr, seen) = oversized_file_server(oversized, 64 * 1024 * 1024 + 1).await;
             let mut http = FetcherOptions::new(format!("http://{addr}"));
             http.proxy = Proxy::None;
             let session =

@@ -19,7 +19,7 @@ use futures_io::AsyncRead;
 use futures_lite::io::Cursor;
 use hyper::header::{ALLOW, HeaderValue, RETRY_AFTER};
 use hyper::{Method, Response, StatusCode};
-use ostrya::Repo;
+use ostrya::{MAX_REF_PREFIXES, Repo};
 
 use crate::body::ServeBody;
 use crate::router::{empty, percent_decode, with_length};
@@ -30,10 +30,6 @@ pub(crate) const PATH: &str = "/_ostrya/refs/v1";
 
 /// The key of each pair of the query.
 const PREFIX_KEY: &str = "prefix";
-
-/// The most prefixes in one query. A prefix given two times counts two
-/// times.
-const MAX_PREFIXES: usize = 256;
 
 /// The most listings that the server holds at the same time, over all
 /// connections. A listing holds its slot from the start of its build until
@@ -172,7 +168,7 @@ fn status_of(error: &ostrya::Error) -> StatusCode {
 /// [`percent_decode`], so `+` stays `+`. A prefix given two times stays two
 /// times. If a pair is empty, has no `=`, has another key, or has a value
 /// that does not decode, the function returns `None`. If the query has more
-/// than [`MAX_PREFIXES`] pairs, the function returns `None` before it
+/// than [`MAX_REF_PREFIXES`] pairs, the function returns `None` before it
 /// decodes the pair after the limit. The function does not check the ref
 /// name: [`Repo::build_ref_listing`] checks each prefix before it reads the
 /// repository.
@@ -183,7 +179,7 @@ fn parse_query(query: Option<&str>) -> Option<Vec<String>> {
     };
     let mut prefixes = Vec::new();
     for pair in query.split('&') {
-        if prefixes.len() == MAX_PREFIXES {
+        if prefixes.len() == MAX_REF_PREFIXES {
             return None;
         }
         let (key, value) = pair.split_once('=')?;
@@ -251,8 +247,8 @@ mod tests {
     #[test]
     fn a_query_takes_at_most_256_prefixes() {
         let query = |count: usize| vec!["prefix=a"; count].join("&");
-        assert_eq!(prefixes(&query(MAX_PREFIXES)).unwrap().len(), 256);
-        assert_eq!(prefixes(&query(MAX_PREFIXES + 1)), None);
+        assert_eq!(prefixes(&query(MAX_REF_PREFIXES)).unwrap().len(), 256);
+        assert_eq!(prefixes(&query(MAX_REF_PREFIXES + 1)), None);
     }
 
     /// A slot counts while it lives, and leaves the count when it drops. No

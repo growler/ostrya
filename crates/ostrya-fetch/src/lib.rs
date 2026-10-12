@@ -8,6 +8,10 @@
 //! downloads files with `GET` and sends uploads with `POST` or `DELETE`. A
 //! response body streams in bounded chunks, so no object is held whole in memory.
 //!
+//! The [`Target`] of a request is a path under each mirror, a path with a
+//! query string under each mirror, or an absolute URL. The fetcher sends a
+//! path and a query as written, so the caller escapes them.
+//!
 //! # Entry points
 //!
 //! - [`Fetcher::new`] builds a fetcher from [`FetcherOptions`].
@@ -669,12 +673,13 @@ impl std::fmt::Debug for RedactedUrls<'_> {
 #[derive(Clone)]
 pub struct FetcherOptions {
     /// The base URLs, tried in order for each request that names a
-    /// [`Target::Path`].
+    /// [`Target::Path`] or a [`Target::PathQuery`].
     ///
     /// A remote with a mirror list gives one entry for each mirror. A base URL
     /// is a scheme, an authority, and a path. A query string or userinfo fails
-    /// [`Fetcher::new`]. A request target is the base path with the request
-    /// path added, so neither part reaches the wire.
+    /// [`Fetcher::new`], so neither part of a base URL reaches the wire. A
+    /// request target is the base path, then `/` and the request path, then
+    /// `?` and the query of a [`Target::PathQuery`].
     ///
     /// An empty list serves [`Target::Url`] requests alone. The default is an
     /// empty list.
@@ -946,11 +951,23 @@ impl FetcherOptions {
 ///
 /// The [`Debug`] output shows no userinfo of a URL. A query shows as
 /// `?<redacted>`, and a fragment shows as `#<redacted>`, in a URL and in a
-/// path.
+/// path. The query of [`Target::PathQuery`] shows as `<redacted>`.
 #[derive(Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Target<'a> {
     /// A path under the base URL of each mirror.
     Path(&'a str),
+    /// A path under the base URL of each mirror, with a query string.
+    ///
+    /// The fetcher adds `?` and the query to the URL of each mirror. It sends
+    /// the query as written, so the query carries the escapes that the server
+    /// expects.
+    PathQuery {
+        /// The path, read as [`Target::Path`] is.
+        path: &'a str,
+        /// The query string, without the `?`.
+        query: &'a str,
+    },
     /// An absolute `http` or `https` URL.
     ///
     /// The fetcher does not use the mirror list for it.
@@ -964,18 +981,24 @@ impl std::fmt::Debug for Target<'_> {
                 .debug_tuple("Path")
                 .field(&RedactedUrl::path(path))
                 .finish(),
+            Target::PathQuery { path, query: _ } => f
+                .debug_struct("PathQuery")
+                .field("path", &RedactedUrl::path(path))
+                .field("query", &"<redacted>")
+                .finish(),
             Target::Url(url) => f.debug_tuple("Url").field(&RedactedUrl::url(url)).finish(),
         }
     }
 }
 
-impl Target<'_> {
-    /// Returns the string of the target. Each message names the target with
-    /// this string.
-    fn as_str(&self) -> &str {
-        match self {
-            Target::Path(path) => path,
-            Target::Url(url) => url,
+impl<'a> Target<'a> {
+    /// Returns the text that names the target in each message: the path, the
+    /// path with `?` and its query, or the URL, as the caller wrote it.
+    fn describe(&self) -> Cow<'a, str> {
+        match *self {
+            Target::Path(path) => Cow::Borrowed(path),
+            Target::PathQuery { path, query } => Cow::Owned(format!("{path}?{query}")),
+            Target::Url(url) => Cow::Borrowed(url),
         }
     }
 }
@@ -987,13 +1010,18 @@ impl Target<'_> {
 /// shows it.
 #[derive(Clone)]
 pub struct FetchRequest<'a> {
-    /// The target: a path under the base URL of each mirror, or an absolute
-    /// URL.
+    /// The target: a path under the base URL of each mirror, the same with a
+    /// query string, or an absolute URL.
     ///
     /// The fetcher adds a path to the base path as written, so the path carries
     /// the escapes that the server expects. A path holds no `?` and no `#`,
     /// because neither is part of a path. Either one fails the fetch before
     /// admission.
+    ///
+    /// The fetcher adds `?` and the query of [`Target::PathQuery`] after the
+    /// path, as written, so the query carries the escapes that the server
+    /// expects. A query holds no `#`, because a `#` starts a fragment. A `#`
+    /// fails the fetch before admission.
     ///
     /// The fetcher sends the query string of a URL as written. A fragment in a
     /// URL fails the fetch, because no request sends a fragment. A character
@@ -1126,6 +1154,16 @@ impl<'a> FetchRequest<'a> {
         FetchRequest::for_target(Target::Path(path))
     }
 
+    /// Creates a request for `path` with the query string `query` under each
+    /// mirror.
+    ///
+    /// The query has no leading `?`. The request has normal priority, no
+    /// validators, and no size cap. It carries the headers and the
+    /// credentials of the fetcher.
+    pub fn path_query(path: &'a str, query: &'a str) -> FetchRequest<'a> {
+        FetchRequest::for_target(Target::PathQuery { path, query })
+    }
+
     /// Creates a request for the absolute URL `url`.
     ///
     /// The request has normal priority, no validators, and no size cap. It
@@ -1254,7 +1292,9 @@ impl std::fmt::Debug for UploadBody {
 /// place of its value. The target shows as the [`Debug`] output of [`Target`]
 /// shows it.
 pub struct UploadRequest<'a> {
-    /// The target, read as [`FetchRequest::target`] is.
+    /// The target, read as [`FetchRequest::target`] is. A
+    /// [`Target::PathQuery`] goes to the mirrors with its query, as for a
+    /// fetch.
     ///
     /// The fetcher tries the mirrors in order until one of them takes the
     /// request. It never asks a mirror after that one.
@@ -1463,19 +1503,20 @@ struct Mirror {
 }
 
 impl Mirror {
-    /// Returns the destination of a request for `path` under this mirror. The
-    /// one string of the destination is the prefix and the base path of the
-    /// mirror, then the request path.
-    fn destination(&self, path: &str) -> Destination {
+    /// Returns the destination of a request for `path` and `query` under this
+    /// mirror. The one string of the destination is the prefix and the base
+    /// path of the mirror, then the request path, then `?` and the query if
+    /// there is one.
+    fn destination(&self, path: &str, query: Option<&str>) -> Destination {
+        let path = path.trim_start_matches('/');
+        let url = match query {
+            None => format!("{}{}/{path}", self.prefix, self.base),
+            Some(query) => format!("{}{}/{path}?{query}", self.prefix, self.base),
+        };
         Destination {
             origin: self.origin.clone(),
             authority: self.authority.clone(),
-            url: format!(
-                "{}{}/{}",
-                self.prefix,
-                self.base,
-                path.trim_start_matches('/')
-            ),
+            url,
             path_at: self.prefix.len(),
         }
     }
@@ -1512,7 +1553,7 @@ impl Destination {
 
     /// Returns the origin-form request target, which an HTTP/1.1 request to an
     /// origin server carries. It is the path, and the query string of a URL
-    /// target.
+    /// target or of a path target with a query.
     fn target(&self) -> &str {
         &self.url[self.path_at..]
     }
@@ -1532,8 +1573,11 @@ impl Destination {
 /// list. A URL target names one destination, which the fetch parses once.
 #[derive(Debug)]
 enum Route<'a> {
-    /// Each mirror in order, for this request path.
-    Mirrors(&'a str),
+    /// Each mirror in order, for this request path and query string.
+    Mirrors {
+        path: &'a str,
+        query: Option<&'a str>,
+    },
     /// The one destination that a URL target names.
     One(Destination),
 }
@@ -2642,8 +2686,9 @@ impl Fetcher {
     /// If more than one destination fails, the failure order rules state which
     /// error the fetch reports.
     ///
-    /// - [`Error::Fetch`] before admission, if a path holds a `?` or a `#`, or
-    ///   if the fetcher has no mirror for a path target.
+    /// - [`Error::Fetch`] before admission, if a path holds a `?` or a `#`, if
+    ///   the query of a [`Target::PathQuery`] holds a `#`, or if the fetcher
+    ///   has no mirror for a path target.
     /// - [`Error::Fetch`] before admission, if a URL target is not a valid
     ///   absolute URL, or holds a fragment or userinfo.
     /// - [`Error::Unsupported`] if the scheme of a URL target is neither `http`
@@ -2729,7 +2774,7 @@ impl Fetcher {
             Some(result) => result,
             None => Err(Error::Fetch(format!(
                 "fetch of {} timed out after {limit:?}",
-                request.target.as_str()
+                request.target.describe()
             ))),
         }
     }
@@ -2738,21 +2783,25 @@ impl Fetcher {
     /// the fetch asks them.
     ///
     /// A URL target names its one destination, which this function parses. A
-    /// path target goes to the mirrors, so a fetcher with no mirror has no
-    /// destination for it.
+    /// path target, with or without a query, goes to the mirrors, so a
+    /// fetcher with no mirror has no destination for it.
     fn route<'a>(&self, target: Target<'a>) -> Result<Route<'a>> {
-        match target {
-            Target::Url(url) => Ok(Route::One(parse_url(url)?)),
-            Target::Path(path) => {
-                check_path(path)?;
-                if self.inner.mirrors.is_empty() {
-                    return Err(Error::Fetch(format!(
-                        "fetch of the path {path} has nowhere to go: no mirror is configured"
-                    )));
-                }
-                Ok(Route::Mirrors(path))
-            }
+        let (path, query) = match target {
+            Target::Url(url) => return Ok(Route::One(parse_url(url)?)),
+            Target::Path(path) => (path, None),
+            Target::PathQuery { path, query } => (path, Some(query)),
+        };
+        check_path(path)?;
+        if let Some(query) = query {
+            check_query(path, query)?;
         }
+        if self.inner.mirrors.is_empty() {
+            return Err(Error::Fetch(format!(
+                "fetch of the path {} has nowhere to go: no mirror is configured",
+                target.describe()
+            )));
+        }
+        Ok(Route::Mirrors { path, query })
     }
 
     /// Refuses a fetch if its headers carry a credential that a cleartext
@@ -2814,7 +2863,7 @@ impl Fetcher {
         wanted: fn(&Origin) -> bool,
     ) -> Option<&'a str> {
         match route {
-            Route::Mirrors(_) => self
+            Route::Mirrors { .. } => self
                 .inner
                 .mirrors
                 .iter()
@@ -2841,7 +2890,7 @@ impl Fetcher {
         max_retries: u32,
     ) -> Result<(Fetched, u32)> {
         let destination_count = match route {
-            Route::Mirrors(_) => self.inner.mirrors.len(),
+            Route::Mirrors { .. } => self.inner.mirrors.len(),
             Route::One(_) => 1,
         };
         // A destination with a definitive answer gives the same answer in each
@@ -2866,8 +2915,8 @@ impl Fetcher {
                 // that uses it. So if the first mirror answers, the fetch builds
                 // one destination, whatever the length of the list.
                 let destination = match route {
-                    Route::Mirrors(path) => {
-                        Cow::Owned(self.inner.mirrors[position].destination(path))
+                    Route::Mirrors { path, query } => {
+                        Cow::Owned(self.inner.mirrors[position].destination(path, *query))
                     }
                     Route::One(destination) => Cow::Borrowed(destination),
                 };
@@ -3365,8 +3414,9 @@ impl Fetcher {
     /// order of [`fetch`](Fetcher::fetch) states which error the upload
     /// returns.
     ///
-    /// - [`Error::Fetch`] before admission, if a path holds a `?` or a `#`, or
-    ///   if the fetcher has no mirror for a path target.
+    /// - [`Error::Fetch`] before admission, if a path holds a `?` or a `#`, if
+    ///   the query of a [`Target::PathQuery`] holds a `#`, or if the fetcher
+    ///   has no mirror for a path target.
     /// - [`Error::Fetch`] before admission, if a URL target is not a valid
     ///   absolute URL, or holds a fragment or userinfo.
     /// - [`Error::Unsupported`] if the scheme of a URL target is neither `http`
@@ -3444,7 +3494,7 @@ impl Fetcher {
             return Err(Error::Fetch(format!(
                 "the delete of {} carries a body, which a delete does not send: pass an empty \
                  UploadBody::bytes",
-                target.as_str()
+                target.describe()
             )));
         }
         let plan = UploadPlan {
@@ -3467,7 +3517,7 @@ impl Fetcher {
                 None => {
                     return Err(Error::Fetch(format!(
                         "upload of {} was not sent within {limit:?}",
-                        target.as_str()
+                        target.describe()
                     )));
                 }
             },
@@ -3490,7 +3540,7 @@ impl Fetcher {
         handed: &AtomicBool,
     ) -> Result<Uploaded> {
         let destination_count = match route {
-            Route::Mirrors(_) => self.inner.mirrors.len(),
+            Route::Mirrors { .. } => self.inner.mirrors.len(),
             Route::One(_) => 1,
         };
         let mut settled = vec![false; destination_count];
@@ -3507,8 +3557,8 @@ impl Fetcher {
                     continue;
                 }
                 let destination = match route {
-                    Route::Mirrors(path) => {
-                        Cow::Owned(self.inner.mirrors[position].destination(path))
+                    Route::Mirrors { path, query } => {
+                        Cow::Owned(self.inner.mirrors[position].destination(path, *query))
                     }
                     Route::One(destination) => Cow::Borrowed(destination),
                 };
@@ -5033,6 +5083,21 @@ fn check_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Checks that the query string `query` of a request for `path` can go after
+/// the path.
+///
+/// The target is the path with `?` and the query added as written. So a `#`
+/// in the query is a delimiter. The `#` and its tail drop out when the URL is
+/// built, and the server gets a query other than the query of the caller.
+fn check_query(path: &str, query: &str) -> Result<()> {
+    if query.contains('#') {
+        return Err(Error::Fetch(format!(
+            "fetch query of {path}?{query} carries #: a query holds no fragment"
+        )));
+    }
+    Ok(())
+}
+
 /// Returns the headers of one request: the headers of the fetcher, with the
 /// headers of the request merged over them.
 ///
@@ -6113,7 +6178,7 @@ mod tests {
     fn mirror_urls_join_base_and_path() {
         let mirror = parse_mirror("https://example.com/repo/").unwrap();
         assert_eq!(
-            mirror.destination("objects/ab/cd.filez").url(),
+            mirror.destination("objects/ab/cd.filez", None).url(),
             "https://example.com/repo/objects/ab/cd.filez"
         );
         assert_eq!(mirror.origin.port, 443);
@@ -6121,7 +6186,7 @@ mod tests {
 
         let root = parse_mirror("http://example.com").unwrap();
         assert_eq!(
-            root.destination("summary").url(),
+            root.destination("summary", None).url(),
             "http://example.com/summary"
         );
         assert_eq!(root.origin.port, 80);
@@ -6130,11 +6195,33 @@ mod tests {
         // A non-default port stays in the URL and in the host header. A leading
         // slash on the path is not doubled.
         let ported = parse_mirror("http://127.0.0.1:8080/r").unwrap();
-        let config = ported.destination("/config");
+        let config = ported.destination("/config", None);
         assert_eq!(config.url(), "http://127.0.0.1:8080/r/config");
         assert_eq!(config.target(), "/r/config");
         assert_eq!(ported.authority, "127.0.0.1:8080");
         assert_eq!(root.authority, "example.com");
+    }
+
+    /// A query string goes after the request path, as written, in the URL
+    /// and in the origin-form target.
+    #[test]
+    fn mirror_urls_join_base_path_and_query() {
+        let mirror = parse_mirror("http://127.0.0.1:8080/base/").unwrap();
+        let destination = mirror.destination("_ostrya/refs/v1", Some("prefix=a%2Fb&prefix=c"));
+        assert_eq!(
+            destination.url(),
+            "http://127.0.0.1:8080/base/_ostrya/refs/v1?prefix=a%2Fb&prefix=c"
+        );
+        assert_eq!(
+            destination.target(),
+            "/base/_ostrya/refs/v1?prefix=a%2Fb&prefix=c"
+        );
+        // An empty query keeps its `?`.
+        let root = parse_mirror("https://example.com").unwrap();
+        assert_eq!(
+            root.destination("/p", Some("")).url(),
+            "https://example.com/p?"
+        );
     }
 
     /// An IPv6 literal has brackets in the authority, and has none where the
@@ -6147,7 +6234,7 @@ mod tests {
         assert_eq!(ported.origin.port, 8080);
         assert_eq!(ported.authority, "[::1]:8080");
         assert_eq!(
-            ported.destination("summary").url(),
+            ported.destination("summary", None).url(),
             "http://[::1]:8080/r/summary"
         );
 
@@ -6156,7 +6243,7 @@ mod tests {
         assert_eq!(tls.origin.port, 443);
         assert_eq!(tls.authority, "[2001:db8::1]");
         assert_eq!(
-            tls.destination("summary").url(),
+            tls.destination("summary", None).url(),
             "https://[2001:db8::1]/repo/summary"
         );
         // The server name the TLS handshake is opened with comes from the same
@@ -6388,6 +6475,52 @@ mod tests {
         check_path("refs/heads/a").unwrap();
     }
 
+    /// A path with a query goes to the mirrors. The path has the rules of a
+    /// path target, and a `#` in the query is refused before admission.
+    #[test]
+    fn a_path_query_target_is_checked_and_goes_to_the_mirrors() {
+        rt::block_on(async {
+            let fetcher = Fetcher::new(direct_options("http://example.com/r"))
+                .await
+                .unwrap();
+            let route = fetcher
+                .route(Target::PathQuery {
+                    path: "_ostrya/refs/v1",
+                    query: "prefix=a",
+                })
+                .unwrap();
+            let Route::Mirrors { path, query } = route else {
+                panic!("a path query target goes to the mirrors");
+            };
+            assert_eq!((path, query), ("_ostrya/refs/v1", Some("prefix=a")));
+
+            let refused = [
+                ("p?x", "q", "no query and no fragment"),
+                ("p#x", "q", "no query and no fragment"),
+                ("p", "q#x", "a query holds no fragment"),
+            ];
+            for (path, query, message) in refused {
+                let err = fetcher
+                    .route(Target::PathQuery { path, query })
+                    .unwrap_err();
+                assert!(matches!(err, Error::Fetch(_)), "{err:?}");
+                assert!(err.to_string().contains(message), "{path}?{query}: {err}");
+            }
+
+            let fetcher = Fetcher::new(mirrorless_options()).await.unwrap();
+            let err = fetcher
+                .route(Target::PathQuery {
+                    path: "p",
+                    query: "q",
+                })
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("path p?q has nowhere to go"),
+                "{err}"
+            );
+        });
+    }
+
     /// The request path is added to the base path of the mirror, and the
     /// target carries the origin form for HTTP/1.1.
     #[test]
@@ -6397,7 +6530,7 @@ mod tests {
                 .await
                 .unwrap();
             let mirror = &fetcher.inner.mirrors[0];
-            let destination = mirror.destination("refs/heads/a");
+            let destination = mirror.destination("refs/heads/a", None);
             let request = fetcher
                 .build_request(
                     &destination,
@@ -7435,7 +7568,7 @@ mod tests {
             })
             .await
             .unwrap();
-            let destination = fetcher.inner.mirrors[0].destination("refs/heads/a");
+            let destination = fetcher.inner.mirrors[0].destination("refs/heads/a", None);
             let request = FetchRequest::path("refs/heads/a");
             let built = |via: Via<'_>, headers: &[(HeaderName, HeaderValue)]| {
                 fetcher
@@ -8733,6 +8866,20 @@ mod tests {
         assert_eq!(
             format!("{path:#?}"),
             "Path(\n    \"summary?<redacted>#<redacted>\",\n)"
+        );
+        let path_query = Target::PathQuery {
+            path: "p?QXZ",
+            query: "prefix=QXZ",
+        };
+        assert_eq!(
+            format!("{path_query:?}"),
+            r#"PathQuery { path: "p?<redacted>", query: "<redacted>" }"#
+        );
+        let rendered = format!("{:?}", FetchRequest::path_query("refs/v1", "prefix=QXZ"));
+        assert!(!rendered.contains("QXZ"), "{rendered}");
+        assert!(
+            rendered.contains(r#"target: PathQuery { path: "refs/v1", query: "<redacted>" }"#),
+            "{rendered}"
         );
     }
 

@@ -1,8 +1,8 @@
 //! The client session of a pull: the pipeline of `Get` and `ListRefs` frames
 //! and the bodies of the replies.
 
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashSet};
 use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
@@ -18,8 +18,8 @@ use ostrya_fetch::gate::{Gate, Permit};
 use super::stream::{Input, Output};
 use crate::error::{Error, Result};
 use crate::proto::{
-    FrameReader, FrameWriter, GetReply, Kind, MIN_FRAME_LIMIT, Message, PULL_PROTOCOL_VERSION,
-    PullHello, Step, encode_frame, protocol,
+    FrameReader, FrameWriter, GetReply, Kind, MAX_REF_PREFIXES, MIN_FRAME_LIMIT, Message,
+    PULL_PROTOCOL_VERSION, PullHello, Step, encode_frame, protocol,
 };
 use crate::transport::Transport;
 
@@ -182,16 +182,47 @@ fn body_error(e: Error) -> io::Error {
     io::Error::new(kind, e)
 }
 
-/// Checks that each prefix of a ref listing is a ref name.
+/// Returns the prefixes of a ref listing that a request sends.
 ///
-/// A prefix that is not a ref name is [`Error::InvalidInput`].
-fn check_prefixes(prefixes: &[&str]) -> Result<()> {
-    match prefixes.iter().find(|p| !ostrya_core::is_ref_name(p)) {
-        Some(bad) => Err(Error::InvalidInput(format!(
+/// The function checks that each prefix is a ref name. Then it removes each
+/// duplicate and each prefix that another prefix covers. A prefix covers the
+/// ref of its name and each ref below it, so `a` covers `a/b` and does not
+/// cover `ab`. The result keeps the order of the first appearance of each
+/// prefix that stays. It selects the same refs as `prefixes`.
+///
+/// # Errors
+///
+/// [`Error::InvalidInput`] if a prefix is not a ref name, or if more than
+/// [`MAX_REF_PREFIXES`] prefixes stay.
+pub(super) fn reduce_prefixes<'a>(prefixes: &[&'a str]) -> Result<Vec<&'a str>> {
+    if let Some(bad) = prefixes.iter().find(|p| !ostrya_core::is_ref_name(p)) {
+        return Err(Error::InvalidInput(format!(
             "the ref prefix '{bad}' is not a ref name"
-        ))),
-        None => Ok(()),
+        )));
     }
+    let given: HashSet<&str> = prefixes.iter().copied().collect();
+    let lens: HashSet<usize> = prefixes.iter().map(|p| p.len()).collect();
+    let mut kept = Vec::new();
+    let mut seen = HashSet::new();
+    for &prefix in prefixes {
+        // The prefixes that cover `prefix` are the parts of it before each
+        // `/`. A part is hashed only if a given prefix has the same length.
+        // So the hashed parts of one prefix have distinct lengths, and their
+        // sum is at most the total length of the given prefixes.
+        let covered = prefix
+            .match_indices('/')
+            .any(|(at, _)| lens.contains(&at) && given.contains(&prefix[..at]));
+        if !covered && seen.insert(prefix) {
+            kept.push(prefix);
+        }
+    }
+    if kept.len() > MAX_REF_PREFIXES {
+        return Err(Error::InvalidInput(format!(
+            "the ref listing names {} distinct prefixes, over the limit of {MAX_REF_PREFIXES}",
+            kept.len()
+        )));
+    }
+    Ok(kept)
 }
 
 fn eof(what: &str) -> Error {
@@ -545,9 +576,13 @@ impl StreamSession {
     ///
     /// Each prefix is a ref name. A prefix selects the ref of that name and
     /// each ref below it, under `refs/heads`. An empty list selects all refs
-    /// under `refs/heads`. The server removes duplicate prefixes and prefixes
-    /// that another prefix covers. The [`PullBody`] holds the listing to
-    /// `max_len` bytes and to its stated length.
+    /// under `refs/heads`. The [`PullBody`] holds the listing to `max_len`
+    /// bytes and to its stated length.
+    ///
+    /// Before it sends the request, the call removes duplicate prefixes and
+    /// each prefix that another prefix covers. So `["a", "a/b", "a"]` sends
+    /// `["a"]`. The prefixes that stay keep the order of their first
+    /// appearance. At most [`MAX_REF_PREFIXES`] prefixes can stay.
     ///
     /// The call takes its place in the [pipeline](StreamSession#pipeline) as
     /// [`get`](StreamSession::get) does, and it has the same rules for the
@@ -559,7 +594,8 @@ impl StreamSession {
     /// nothing. Each other error is a failure of the session, as
     /// [Failures](StreamSession#failures) states.
     ///
-    /// - [`Error::InvalidInput`] if a prefix is not a ref name.
+    /// - [`Error::InvalidInput`] if a prefix is not a ref name, or if more
+    ///   than [`MAX_REF_PREFIXES`] prefixes stay after the removal.
     /// - [`Error::LimitExceeded`] if the `ListRefs` frame is longer than
     ///   [`MIN_FRAME_LIMIT`].
     /// - [`Error::Protocol`] if the reply is a `GetReply` whose `found` is
@@ -569,7 +605,7 @@ impl StreamSession {
     ///   `limit-exceeded` for a listing over its cap.
     pub async fn list_refs(&self, prefixes: &[&str], max_len: u64) -> Result<PullBody> {
         self.inner.shared.check()?;
-        check_prefixes(prefixes)?;
+        let prefixes = reduce_prefixes(prefixes)?;
         let frame = {
             let list = Message::ListRefs(prefixes.iter().map(|p| (*p).to_owned()).collect());
             encode_frame(&list, MIN_FRAME_LIMIT)?
@@ -961,5 +997,32 @@ impl Drop for PullBody {
                 "a pull body was dropped before its end".into(),
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The removal keeps the first appearance of each prefix that no other
+    /// prefix covers, in the given order.
+    #[test]
+    fn duplicates_and_covered_prefixes_are_removed() {
+        let reduced = reduce_prefixes(&["a/b", "x", "a/b/c", "ab", "a", "x", "a/bc"]).unwrap();
+        assert_eq!(reduced, ["x", "ab", "a"]);
+        let reduced = reduce_prefixes(&["a/b", "a/bc", "a/b"]).unwrap();
+        assert_eq!(reduced, ["a/b", "a/bc"]);
+        assert!(reduce_prefixes(&[]).unwrap().is_empty());
+    }
+
+    /// The limit counts the prefixes that stay after the removal.
+    #[test]
+    fn the_limit_counts_the_prefixes_that_stay() {
+        let many: Vec<String> = (0..=MAX_REF_PREFIXES).map(|n| format!("r{n}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let err = reduce_prefixes(&many).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        assert_eq!(reduce_prefixes(&many[1..]).unwrap().len(), MAX_REF_PREFIXES);
+        assert_eq!(reduce_prefixes(&["main"; 300]).unwrap(), ["main"]);
     }
 }

@@ -5,7 +5,7 @@
 //! - `HEAD`
 //! - client certificates
 //! - the stop on drop
-//! - the ref listing and its query
+//! - the ref listing and its query, and `PullSession::fetch_refs` over HTTP
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -19,6 +19,7 @@ use ostrya::fetch::{
     ClientIdentity, FetchRequest, Fetched, Fetcher, FetcherOptions, Protocol, Proxy, TlsOptions,
     TrustRoots,
 };
+use ostrya::remote::PullSession;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree,
     ObjectType, Repo, RepoMode, Summary, loose_path,
@@ -730,4 +731,122 @@ fn the_view_still_serves_refs_heads() {
         assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
         assert!(body.starts_with(b"[core]\n"));
     });
+}
+
+/// Ref names that hold bytes that the query of the listing escapes.
+const ESCAPED_REFS: [&str; 8] = [
+    "odd/a b", "odd/a+b", "odd/a?b", "odd/a#b", "odd/a&b", "odd/a=b", "odd/a%b", "odd/é",
+];
+
+/// Returns the names of the refs of a listing, in the order of the listing.
+fn listed_names(listing: &[u8]) -> Vec<String> {
+    Summary::parse(listing)
+        .unwrap()
+        .refs
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect()
+}
+
+/// `PullSession::fetch_refs` over HTTP/1.1 and over HTTP/2 gives the bytes of
+/// `build_ref_listing`. The client removes duplicate and covered prefixes,
+/// and a ref name with bytes that the query escapes comes back unchanged.
+#[test]
+fn fetch_refs_over_http_gives_the_built_listing() {
+    let tmp = TmpDir::new("fetch-refs");
+    let (_, repo, commit, _) = block_on(repo(tmp.path()));
+    block_on(async {
+        add_refs(&repo, &commit).await;
+        let txn = repo.transaction().await.unwrap();
+        for name in ESCAPED_REFS {
+            txn.set_ref(name, Some(&commit));
+        }
+        txn.commit().await.unwrap();
+    });
+    for (opts, scheme, http2) in [(local(), "http", false), (tls(false), "https", true)] {
+        let repo = repo.clone();
+        with_server(repo.clone(), opts, |addrs| async move {
+            let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
+            let session = PullSession::Http(fetcher(url, http2, None).await);
+            let cases: [(&[&str], &[&str]); 4] = [
+                (&["a/b", "main"], &["a/b", "main"]),
+                (&[], &[]),
+                (&["main", "a/b/c", "a", "main", "a/b"], &["main", "a"]),
+                (&ESCAPED_REFS, &ESCAPED_REFS),
+            ];
+            for (prefixes, built) in cases {
+                let got = session.fetch_refs(prefixes).await.unwrap().unwrap();
+                let want = repo.build_ref_listing(built).await.unwrap();
+                assert_eq!(got, want, "{scheme}: {prefixes:?}");
+            }
+            let got = session.fetch_refs(&ESCAPED_REFS).await.unwrap().unwrap();
+            let mut names = ESCAPED_REFS.map(str::to_owned).to_vec();
+            names.sort();
+            assert_eq!(listed_names(&got), names, "{scheme}");
+            for name in ESCAPED_REFS {
+                let got = session.fetch_refs(&[name]).await.unwrap().unwrap();
+                assert_eq!(listed_names(&got), [name], "{scheme}: {name}");
+            }
+        });
+    }
+}
+
+/// Returns a ref name whose percent-encoded form has `len` bytes, for a `len`
+/// of at least one. The name is parts of 100 bytes, each with a `/` after
+/// it, which the query writes as `%2F`, and a last part of the remaining
+/// length.
+fn prefix_of_encoded_len(len: usize) -> String {
+    let mut name = String::new();
+    let mut left = len;
+    while left > 103 {
+        name.push_str(&"a".repeat(100));
+        name.push('/');
+        left -= 103;
+    }
+    name.push_str(&"a".repeat(left));
+    name
+}
+
+/// A request target of exactly 16 KiB, the client limit, gets the listing over
+/// HTTP/1.1 and over HTTP/2. The target is `_ostrya/refs/v1?prefix=` and the
+/// encoded prefix.
+#[test]
+fn fetch_refs_takes_a_target_at_the_client_limit() {
+    let tmp = TmpDir::new("fetch-refs-target");
+    let (_, repo, _, _) = block_on(repo(tmp.path()));
+    let fixed = "_ostrya/refs/v1?prefix=".len();
+    let prefix = prefix_of_encoded_len(16 * 1024 - fixed);
+    let encoded = prefix.len() + 2 * prefix.matches('/').count();
+    assert_eq!(fixed + encoded, 16 * 1024);
+    for (opts, scheme, http2) in [(local(), "http", false), (tls(false), "https", true)] {
+        let repo = repo.clone();
+        let prefix = prefix.clone();
+        with_server(repo.clone(), opts, |addrs| async move {
+            let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
+            let session = PullSession::Http(fetcher(url, http2, None).await);
+            let got = session.fetch_refs(&[prefix.as_str()]).await;
+            let want = repo.build_ref_listing(&[prefix.as_str()]).await.unwrap();
+            assert_eq!(got.unwrap(), Some(want), "{scheme}");
+        });
+    }
+}
+
+/// A prefix with a part longer than 255 bytes gets the listing of an absent
+/// prefix over HTTP/1.1 and over HTTP/2.
+#[test]
+fn fetch_refs_of_a_too_long_part_gets_an_empty_listing() {
+    let tmp = TmpDir::new("fetch-refs-long-part");
+    let (_, repo, _, _) = block_on(repo(tmp.path()));
+    let long = "l".repeat(256);
+    for (opts, scheme, http2) in [(local(), "http", false), (tls(false), "https", true)] {
+        let repo = repo.clone();
+        let long = long.clone();
+        with_server(repo.clone(), opts, |addrs| async move {
+            let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
+            let session = PullSession::Http(fetcher(url, http2, None).await);
+            let got = session.fetch_refs(&[long.as_str()]).await;
+            let want = repo.build_ref_listing(&["absent"]).await.unwrap();
+            assert_eq!(got.unwrap(), Some(want), "{scheme}");
+        });
+    }
 }

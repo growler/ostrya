@@ -1007,6 +1007,51 @@ fn http1_requests_use_origin_form_with_a_host_header() {
     });
 }
 
+/// A path with a query goes to each mirror with the query as written. The
+/// first mirror answers 404, and the second mirror gets the same target under
+/// its own base path. An upload takes the same target form.
+#[test]
+fn a_path_query_goes_to_each_mirror_as_written() {
+    block_on(async {
+        let absent = TestServer::start(Transport::Cleartext, always_status(404)).await;
+        let live = TestServer::start(Transport::Cleartext, always(b"listing")).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            mirrors: vec![
+                format!("{}/one", absent.url(false)),
+                format!("{}/two/", live.url(false)),
+            ],
+            ..direct_options("unused")
+        })
+        .await
+        .unwrap();
+        let query = "prefix=a%2Fb&prefix=x%20y%2Bz";
+        let fetched = fetcher
+            .fetch(FetchRequest::path_query("_ostrya/refs/v1", query))
+            .await
+            .unwrap();
+        assert_eq!(read_body(fetched).await, b"listing");
+        let absent_seen = absent.seen();
+        let live_seen = live.seen();
+        assert_eq!(absent_seen.len(), 1);
+        assert_eq!(
+            absent_seen[0].target,
+            format!("/one/_ostrya/refs/v1?{query}")
+        );
+        assert_eq!(live_seen.len(), 1);
+        assert_eq!(live_seen[0].path, "/two/_ostrya/refs/v1");
+        assert_eq!(live_seen[0].target, format!("/two/_ostrya/refs/v1?{query}"));
+
+        let mut upload = UploadRequest::path("unused", UploadBody::bytes(b"x".to_vec()));
+        upload.target = ostrya::fetch::Target::PathQuery {
+            path: "inbox",
+            query: "id=1",
+        };
+        let uploaded = fetcher.upload(upload).await.unwrap();
+        assert_eq!(uploaded.status(), 404);
+        assert_eq!(absent.seen()[1].target, "/one/inbox?id=1");
+    });
+}
+
 #[test]
 fn alpn_selects_http2_over_tls() {
     block_on(async {

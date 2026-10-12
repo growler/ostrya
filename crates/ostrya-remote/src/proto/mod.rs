@@ -160,7 +160,8 @@
 //!
 //! A `ListRefs` names a set of ref prefixes. Each prefix is a ref name. A
 //! prefix selects the ref of that name and each ref below it, under
-//! `refs/heads`. An empty list selects all refs under `refs/heads`. The server
+//! `refs/heads`. An empty list selects all refs under `refs/heads`. A
+//! `ListRefs` holds at most [`MAX_REF_PREFIXES`] prefixes. The server
 //! answers with a `GetReply` whose `found` is `true` and that holds the length
 //! of the listing. The listing is a summary GVariant of at most
 //! [`MAX_REF_LISTING`] bytes, and the body carries it. A reply to a `ListRefs`
@@ -168,7 +169,8 @@
 //! server sends an `Error` message in place of the `GetReply` for these
 //! conditions:
 //!
-//! - `protocol` for a prefix that is not a ref name
+//! - `protocol` for a prefix that is not a ref name, and for more than
+//!   [`MAX_REF_PREFIXES`] prefixes
 //! - `limit-exceeded` for a listing larger than [`MAX_REF_LISTING`]
 //! - `internal` for any other failure of the build of the listing
 //!
@@ -251,6 +253,13 @@ pub const MAX_FRAME: u32 = 1 << 20;
 /// server builds for each request. The builder refuses a larger listing with
 /// [`Error::LimitExceeded`].
 pub const MAX_REF_LISTING: u64 = 128 * 1024 * 1024;
+
+/// The most prefixes in one request of a ref listing: 256.
+///
+/// A server refuses a request with more prefixes. A prefix given two times
+/// counts two times. A client removes duplicate prefixes, and each prefix
+/// that another prefix covers, before it counts.
+pub const MAX_REF_PREFIXES: usize = 256;
 
 /// The `max-have` value that an ostrya server announces: 16,384 entries.
 ///

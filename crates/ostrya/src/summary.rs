@@ -709,7 +709,9 @@ impl Repo {
     /// ref below `<prefix>/`. The prefix `a/b` selects `a/b` and `a/b/c`. It
     /// does not select `a/bc`. This is the rule of
     /// [`list_refs`](Repo::list_refs) with a prefix. An empty slice selects
-    /// each ref under `refs/heads`.
+    /// each ref under `refs/heads`. A prefix with a part longer than the file
+    /// system permits for a file name selects no ref, as a missing prefix
+    /// does.
     ///
     /// The listing holds each selected ref one time, sorted byte-wise by name.
     /// An alias is in the listing under its own name, with the commit of its

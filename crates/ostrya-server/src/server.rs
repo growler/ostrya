@@ -34,6 +34,16 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// The most streams one HTTP/2 connection carries at the same time.
 const MAX_CONCURRENT_STREAMS: u32 = 32;
 
+/// The largest header list of one request that an HTTP/2 connection takes:
+/// 32 KiB.
+///
+/// The size of the list is the sum, for each header field, of the name, the
+/// value, and 32 bytes. The pseudo-header `:path` counts, so the request
+/// target counts. The client of a ref listing sends a target of at most
+/// 16 KiB, which comes after the base path of the mirror. The limit leaves
+/// 16 KiB for the base path and the other fields. A larger list gets 431.
+const MAX_HEADER_LIST_SIZE: u32 = 32 * 1024;
+
 /// The wait after an accept fails, for example when the process is out of
 /// descriptors, before the listener accepts again.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
@@ -64,8 +74,9 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 ///   prefix list. The checks come in this order:
 ///   1. A method other than `GET`, `HEAD` included, gets 405 with
 ///      `Allow: GET`.
-///   2. A bad pair, and a query of more than 256 pairs, get 400. A prefix
-///      given two times counts two times.
+///   2. A bad pair, and a query of more than 256 pairs
+///      ([`ostrya::MAX_REF_PREFIXES`]), get 400. A prefix given two times
+///      counts two times.
 ///   3. If 4 listings are in flight over all connections, the request gets
 ///      503 with `Retry-After: 1`. A listing is in flight from the start of
 ///      its build until its response body drops.
@@ -89,7 +100,10 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 ///   of the file. For a `.filez` built on request, it reads no xattr and
 ///   does no deflate work.
 /// - Plain HTTP serves HTTP/1.1. Over TLS, ALPN selects HTTP/2 or HTTP/1.1.
-///   An HTTP/2 connection carries at most 32 streams at the same time.
+///   An HTTP/2 connection carries at most 32 streams at the same time. It
+///   takes a header list of at most 32 KiB for one request, counted as the
+///   name, the value, and 32 bytes of each header field. A larger list gets
+///   431.
 /// - A TLS handshake has 30 seconds to complete. An HTTP/1.1 connection has
 ///   30 seconds to send the headers of each request.
 /// - With a receive endpoint, the HTTP/2 windows are the windows of
@@ -363,6 +377,7 @@ async fn serve_connection(stream: rt::TcpStream, serving: Arc<Serving>, stall: A
         builder
             .timer(RtTimer)
             .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+            .max_header_list_size(MAX_HEADER_LIST_SIZE)
             .keep_alive_interval(Some(serving.body_timeout / 2))
             .keep_alive_timeout(serving.body_timeout);
         // With a receive endpoint, the windows bound the bytes of the request

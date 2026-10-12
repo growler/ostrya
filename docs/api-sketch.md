@@ -485,8 +485,10 @@ impl Repo {
     /// A ref listing for one request: a `(a(s(taya{sv}))a{sv})` summary of
     /// the refs under `refs/heads` that `prefixes` select. The prefix `a/b`
     /// selects `a/b` and each ref below `a/b/`, and not `a/bc`, as
-    /// `list_refs` with a prefix does. An empty slice selects each ref. The
-    /// refs are sorted byte-wise, each one time. An alias is listed under its
+    /// `list_refs` with a prefix does. An empty slice selects each ref. A
+    /// prefix with a part longer than the file system permits for a file name
+    /// selects no ref, as a missing prefix does. The refs are sorted
+    /// byte-wise, each one time. An alias is listed under its
     /// own name with the commit of its target. No mirror ref is listed, and
     /// each entry has the bytes of the entry of the same ref in a summary of
     /// the same repository state. A prefix that a shorter prefix selects is
@@ -514,6 +516,12 @@ impl Repo {
 /// The cap of a ref listing: 128 MiB. `ostrya_remote::proto::MAX_REF_LISTING`,
 /// also at `ostrya::MAX_REF_LISTING`.
 pub const MAX_REF_LISTING: u64 = 128 * 1024 * 1024;
+
+/// The most prefixes in one request of a ref listing: 256.
+/// `ostrya_remote::proto::MAX_REF_PREFIXES`, also at
+/// `ostrya::MAX_REF_PREFIXES`. A server counts a duplicate; a client removes
+/// duplicates and covered prefixes before it counts.
+pub const MAX_REF_PREFIXES: usize = 256;
 
 /// Held by one caller at a time, across processes and inside the process.
 /// `Send + Sync`. While you hold it, write through it: the receive commit and
@@ -1840,10 +1848,12 @@ type, `ostrya::fetch::Error`, and every `Error::` item this section names is a
 variant of that type. One `Fetcher` serves one remote: it holds the
 mirrors, headers, credentials, and TLS configuration, pools connections per
 endpoint, and admits a bounded number of requests at a time in priority order. A
-request names a `Target`: a path under every mirror's base URL, or an absolute
-`http` or `https` URL of its own, which is served from that URL's origin and
-consults no mirror. A request carries headers and credentials of its own as
-well, merged over the fetcher's, one of a name replacing the fetcher's.
+request names a `Target`: a path under every mirror's base URL, the same path
+with a query string, or an absolute `http` or `https` URL of its own, which is
+served from that URL's origin and consults no mirror. The fetcher sends a path
+and a query as written, so the caller escapes them. A request carries headers
+and credentials of its own as well, merged over the fetcher's, one of a name
+replacing the fetcher's.
 Protocol selection is the TLS handshake's -- ALPN offers `h2` and `http/1.1`.
 Two deadlines bound one attempt's cost: `connect_timeout` over opening a
 connection, and `progress_timeout` over a response delivering bytes, restarted
@@ -2047,20 +2057,33 @@ pub enum Protocol { Http11, Http2 }
 /// The server's own validator strings, replayed to make a fetch conditional.
 pub struct Validators { pub etag: Option<String>, pub last_modified: Option<String> }
 
-/// What a request names. A path is served under every mirror; a URL is served
-/// from its own origin, and the mirror list is not consulted. The `Debug`
-/// rendering shows no userinfo of a URL. A query shows as `?<redacted>`, and a
-/// fragment shows as `#<redacted>`, in a URL and in a path.
-pub enum Target<'a> { Path(&'a str), Url(&'a str) }
+/// What a request names. A path, with or without a query, is served under
+/// every mirror; a URL is served from its own origin, and the mirror list is
+/// not consulted. The `Debug` rendering shows no userinfo of a URL. A query
+/// shows as `?<redacted>`, and a fragment shows as `#<redacted>`, in a URL and
+/// in a path. The query of `PathQuery` shows as `<redacted>`. The enum is
+/// `#[non_exhaustive]`.
+#[non_exhaustive]
+pub enum Target<'a> {
+    Path(&'a str),
+    PathQuery { path: &'a str, query: &'a str }, // base path + "/" + path
+                                          // + "?" + query; the query holds
+                                          // no `#`
+    Url(&'a str),
+}
 
 /// The `Debug` rendering shows each header name and `<redacted>` in place of
 /// its value. The target shows as the `Debug` rendering of `Target` shows it.
 pub struct FetchRequest<'a> {
     pub target: Target<'a>,               // a path is appended to each mirror's
                                           // base path as written and holds no
-                                          // query and no fragment; a URL sends
-                                          // its query as written and holds
-                                          // neither a fragment nor userinfo
+                                          // query and no fragment; the query
+                                          // of a PathQuery goes after `?` as
+                                          // written and holds no `#`; a URL
+                                          // sends its query as written and
+                                          // holds neither a fragment nor
+                                          // userinfo; an UploadRequest reads
+                                          // its target the same way
     pub priority: Priority,
     pub validators: Option<&'a Validators>,
     pub max_size: Option<u64>,
@@ -2084,6 +2107,7 @@ impl<'a> FetchRequest<'a> {
     // A normal-priority, unconditional, uncapped request carrying the
     // fetcher's headers and credentials.
     pub fn path(path: &'a str) -> FetchRequest<'a>;
+    pub fn path_query(path: &'a str, query: &'a str) -> FetchRequest<'a>;
     pub fn url(url: &'a str) -> FetchRequest<'a>;
 }
 
@@ -4518,9 +4542,10 @@ A connection ends when one of its response bodies waits longer than
 `body_timeout` for the client to take its next bytes, so a client that stops
 reading releases its file and its compressor. An HTTP/2 connection sends a
 ping after half of `body_timeout` with no frame from the peer and ends when
-the ping gets no answer within `body_timeout`. A stream body gives at most
-256 KiB before it yields to the executor. Each listener accepts in a task of
-its own.
+the ping gets no answer within `body_timeout`. It takes a header list of at
+most 32 KiB for one request, and a larger list gets 431. A stream body gives
+at most 256 KiB before it yields to the executor. Each listener accepts in a
+task of its own.
 
 With `receive` set, the HTTP/2 receive window of a stream is 2 MiB, and the
 window of a connection is 2 MiB times `parallel_uploads`. The request bodies
@@ -4855,8 +4880,14 @@ It builds the listing for each request, from a clone of the `Repo` that
   `+`. The decoded value must be a ref name. A prefix given two times is
   accepted.
 - No query, or a `?` alone, is an empty prefix list, which takes all refs.
-- A query holds at most 256 pairs. A prefix given two times counts two
-  times.
+- A query holds at most `MAX_REF_PREFIXES`, 256, pairs. A prefix given two
+  times counts two times.
+- An HTTP/2 connection takes a header list of at most 32 KiB for one
+  request, and a larger list gets 431. The list counts, for each header
+  field, the name, the value, and 32 bytes, and the `:path` field holds the
+  request target. The client sends a target of at most 16 KiB after the
+  base path of the mirror, so the limit leaves 16 KiB for the base path and
+  the other fields.
 - The checks come in this order, before the build: the method, then the
   query, then the count of listings in flight.
 - A method other than `GET`, `HEAD` included, gets 405 with `Allow: GET`.
@@ -4929,8 +4960,10 @@ Rules:
 - The session answers a `ListRefs` with the bytes of
   `Repo::build_ref_listing` for its prefixes: `GetReply` with found true
   and the length of the listing, then the listing as a body of chunks. The
-  session checks each prefix with `ostrya_core::is_ref_name` before the
-  build. An empty list is all refs under `refs/heads`. The listing is whole
+  session checks the count of the prefixes against `MAX_REF_PREFIXES`, 256,
+  and each prefix with `ostrya_core::is_ref_name` before the build. A
+  prefix given two times counts two times. An empty list is all refs under
+  `refs/heads`. The listing is whole
   in memory, up to `MAX_REF_LISTING`, 128 MiB.
 - The session opens no transaction and takes no lock, neither the
   repository lock nor the update lock. Read access to the repository is
@@ -4963,8 +4996,9 @@ Failures:
   version 0; `protocol` for a `Get` before `PullHello`, a second
   `PullHello`, a `ListRefs` before `PullHello`, a kind of the push,
   `PullHelloReply`, `GetReply`, or `Error` from the client, a malformed
-  frame, an end of input inside a frame, and a `ListRefs` prefix that is
-  not a ref name; `limit-exceeded` for a frame over 1 MiB and for a ref
+  frame, an end of input inside a frame, a `ListRefs` with more than
+  `MAX_REF_PREFIXES` prefixes, and a `ListRefs` prefix that is not a ref
+  name; `limit-exceeded` for a frame over 1 MiB and for a ref
   listing over `MAX_REF_LISTING`.
 - Each other error of `build_ref_listing` goes to the client as `Error`
   with `internal` in place of the reply, and returns as the error it is.
@@ -5069,10 +5103,41 @@ The pull session:
   prefixes: a summary GVariant that the server builds for the request, with
   the refs under `refs/heads` that the prefixes select. An empty list
   selects all refs. The listing has a cap of `MAX_REF_LISTING`, 128 MiB.
-  Over a stream session the call is `StreamSession::list_refs`, and it
+  No signature covers the listing.
+- On both transports, `fetch_refs` first checks each prefix with
+  `ostrya_core::is_ref_name`. It then removes duplicate prefixes and each
+  prefix that another prefix covers (`a` covers `a/b`, and does not cover
+  `ab`), and keeps the order of the first appearance. More than
+  `MAX_REF_PREFIXES`, 256, prefixes that stay is `Error::InvalidInput`. A
+  refusal sends no request.
+- Over a stream session the call is `StreamSession::list_refs`, and it
   returns `Some` with the bytes. The buffer of the listing gets the stated
-  length, within the cap. Over HTTP the call is `Error::Unsupported`, and it
-  sends no request. No signature covers the listing.
+  length, within the cap.
+- Over HTTP the call sends `GET _ostrya/refs/v1` under the base URL of each
+  mirror, at `Priority::High`, with the cap on `max_size`. Each prefix that
+  stays is one `prefix=VALUE` pair of the query, joined with `&`. The value
+  keeps `A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, and `~`, and writes each other
+  byte as `%XX` in upper case, `/` included. An empty list sends no query.
+  The client refuses with `Error::InvalidInput`, before any request, a
+  target from `_ostrya/refs/v1` to the end of the query of more than
+  16 KiB. The base path of the mirror adds to the target on the wire.
+- Over HTTP, a 404 is `None`, so a static server of the repository files
+  gives `None`. A body that fails in transit is fetched again, as for
+  `fetch_summary`. Each other status is `Error::Fetch` with
+  `HttpStatus`: 400 for a prefix that the server refuses, 414 or 431 for a
+  target too long for the server, and 503 when the server builds too many
+  listings. The fetcher retries a 503 with its backoff and does not read
+  `Retry-After`. Of a static mirror beside a busy server, the fetcher
+  keeps the 404 of the static mirror from the first round and asks only
+  the busy server again. A 200 of the busy server in a later round gives
+  `Some`. The call gives `None` only if the busy server answers 503 to
+  each retry, and only after the full backoff, because a 404 has priority
+  over a 503. A stated length over the cap is `Error::Fetch` with
+  `FetchTooLarge`, and a body that grows past the cap fails its read with
+  the kind `FileTooLarge`.
+- The buffer of `fetch_summary` and of `fetch_refs` gets the stated length,
+  within the cap. With no stated length it doubles as it fills, and its
+  capacity never goes past the cap.
 - `max_outstanding` is the admitted request limit, at least 1:
   `Fetcher::max_outstanding` over HTTP, and the limit of the stream session
   otherwise.
@@ -5095,8 +5160,11 @@ The session:
   places. The places and the writes are each served in the order the calls
   arrive.
 - `list_refs` checks each prefix with `ostrya_core::is_ref_name` before it
-  takes a place. A prefix that is not a ref name is `Error::InvalidInput`,
-  the call writes nothing, and the session stays usable. A `GetReply` with
+  takes a place. It then removes duplicate prefixes and covered prefixes,
+  as `PullSession::fetch_refs` states, and counts the prefixes that stay. A
+  prefix that is not a ref name, and more than `MAX_REF_PREFIXES` prefixes
+  that stay, are `Error::InvalidInput`, the call writes nothing, and the
+  session stays usable. A `GetReply` with
   found false, or with no length, in reply to `ListRefs` is
   `Error::Protocol` and ends the session.
 - The call returns at the head of its reply. `None` is a path that the

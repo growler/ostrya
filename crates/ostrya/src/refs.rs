@@ -1127,10 +1127,11 @@ pub(crate) fn walk_ref_dir(
 /// part with `SYMLINK_NOFOLLOW`, as `walk_ref_dir` does:
 ///
 /// - Each part before the last part must be a real directory. If such a part
-///   is missing, or is a file, a symlink, or another entry that is not a
-///   directory, the prefix selects nothing. `walk_ref_dir` does not descend
+///   is missing, is longer than a file name can be, or is a file, a symlink,
+///   or another entry that is not a directory, the prefix selects nothing. `walk_ref_dir` does not descend
 ///   into such an entry, so it reports no path below it.
-/// - If the last part is missing, the prefix selects nothing.
+/// - If the last part is missing, or is longer than a file name can be, the
+///   prefix selects nothing.
 /// - If the last part is a real directory, the call walks it with
 ///   `walk_ref_dir`.
 /// - Each other last part goes to `visit` as one entry, as `walk_ref_dir`
@@ -1171,10 +1172,13 @@ fn walk_ref_prefix(
 
 /// Returns the type of the entry `name` of `dir`, read with no symlink
 /// followed, or `None` if the entry does not exist.
+///
+/// A name longer than the file system permits (`ENAMETOOLONG`) names no
+/// entry, so it also gives `None`.
 fn ref_entry_type(dir: BorrowedFd<'_>, name: &str) -> Result<Option<FileType>> {
     match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => Ok(Some(FileType::from_raw_mode(stat.st_mode))),
-        Err(Errno::NOENT) => Ok(None),
+        Err(Errno::NOENT | Errno::NAMETOOLONG) => Ok(None),
         Err(e) => Err(Error::Io(e.into())),
     }
 }

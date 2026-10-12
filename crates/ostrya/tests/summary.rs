@@ -20,7 +20,8 @@ use std::process::Command;
 use common::{TmpDir, fixture_root, ostree_available, ostree_supports_ed25519};
 use ostrya::base64;
 use ostrya::{
-    Checksum, DeltaOptions, Ed25519Signer, Ed25519Verifier, Repo, Summary, SummaryOptions, Value,
+    AdvertisedDelta, Checksum, DeltaOptions, Ed25519Signer, Ed25519Verifier, Repo, Summary,
+    SummaryOptions, Value,
 };
 use ostrya_rt::block_on;
 
@@ -263,6 +264,7 @@ fn the_summary_advertises_the_deltas_the_repository_holds() {
         let bytes = repo.read_summary().await.unwrap().unwrap();
         let summary = Summary::parse(&bytes).unwrap();
         assert!(summary.metadata_value("ostree.static-deltas").is_none());
+        assert_eq!(summary.static_deltas().unwrap(), []);
 
         // One delta of each shape: from scratch, and from a source commit.
         let refs = repo.list_refs(None).await.unwrap();
@@ -312,6 +314,25 @@ fn the_summary_advertises_the_deltas_the_repository_holds() {
             digest_of(&from_to_dir).as_bytes(),
             "the map must carry the from-to delta's superblock digest"
         );
+
+        // The parsed map gives the same two deltas, in delta-name order.
+        let mut expected = vec![
+            AdvertisedDelta {
+                from: None,
+                to: *to,
+                superblock: digest_of(&scratch_dir),
+            },
+            AdvertisedDelta {
+                from: Some(*from),
+                to: *to,
+                superblock: digest_of(&from_to_dir),
+            },
+        ];
+        expected.sort_by_key(|delta| match delta.from {
+            Some(from) => format!("{}-{}", from.to_hex(), delta.to.to_hex()),
+            None => delta.to.to_hex(),
+        });
+        assert_eq!(summary.static_deltas().unwrap(), expected);
 
         // The neighbors of the key: the entries appear in the order that byte
         // identity needs.

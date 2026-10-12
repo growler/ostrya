@@ -2620,6 +2620,13 @@ pub struct SummaryRef {
     pub commit_size: u64,
     pub metadata: Value,
 }
+/// One delta of a delta map: the source commit (`None` from scratch), the
+/// target commit, and the SHA-256 digest of its `superblock` file.
+pub struct AdvertisedDelta {
+    pub from: Option<Checksum>,
+    pub to: Checksum,
+    pub superblock: Checksum,
+}
 impl Summary {
     pub fn parse(bytes: &[u8]) -> Result<Summary>;
     /// The global metadata dict alone, the ref list left undecoded.
@@ -2628,6 +2635,11 @@ impl Summary {
     pub fn metadata_value(&self, key: &str) -> Option<&Value>;
     /// The refs of each collection `ostree.summary.collection-map` lists.
     pub fn collection_map(&self) -> Result<Vec<(String, Vec<SummaryRef>)>>;
+    /// The deltas `ostree.static-deltas` lists, in map order. A map whose
+    /// variant type is not `a{sv}`, a key that is not a delta name in
+    /// lowercase hex, or a digest that is not an `ay` of 32 bytes, is
+    /// InvalidFormat. No map gives an empty list.
+    pub fn static_deltas(&self) -> Result<Vec<AdvertisedDelta>>;
 }
 
 impl Repo {
@@ -5080,6 +5092,11 @@ megabytes. Generation signs the superblock with the signers `DeltaOptions`
 names before it writes the superblock, so a signer that fails leaves no
 superblock. `sign_static_delta` adds a signature to a delta already written.
 Index publication is a separate call, so a caller publishes once.
+
+An index file holds the same map as the `ostree.static-deltas` key of a
+summary, for one target commit. The crate reads the index files back from a
+set of commits to find the deltas that lead to them. This read uses
+`delta-indexes/` alone and does not open `deltas/`.
 
 ```rust
 pub struct DeltaOptions {

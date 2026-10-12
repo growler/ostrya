@@ -11,6 +11,8 @@
 //! - [`Repo::read_summary`] and [`Repo::read_summary_signature`] read the two
 //!   files.
 //! - [`Summary`] is the parsed form of a `summary` file.
+//!   [`Summary::static_deltas`] reads its delta map as [`AdvertisedDelta`]
+//!   values.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -24,7 +26,7 @@ use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::commit::{CommitOptions, append_dict_entry};
-use crate::deltagen::STATIC_DELTAS_KEY;
+use crate::deltagen::{STATIC_DELTAS_KEY, parse_delta_name};
 use crate::error::{Error, Result};
 use crate::lock::{LockKind, UpdateLockHeld};
 use crate::mtree::MutableTree;
@@ -38,6 +40,9 @@ const METADATA_SIGNATURE: &str = "a{sv}";
 /// The type of the `ostree.summary.collection-map` value: a map from a
 /// collection id to a ref array with the shape of the ref list of the summary.
 const COLLECTION_MAP_SIGNATURE: &str = "a{sa(s(taya{sv}))}";
+/// The type of a delta map: the `ostree.static-deltas` value of a summary, and
+/// the map of an index file under `delta-indexes/`.
+const DELTA_MAP_SIGNATURE: &str = "a{sv}";
 
 /// The name of the summary file at the repository root.
 pub(crate) const SUMMARY_FILE: &str = "summary";
@@ -80,6 +85,21 @@ pub struct Summary {
     pub refs: Vec<SummaryRef>,
     /// The global metadata dict, as the `a{sv}` [`Value`] of the file.
     pub metadata: Value,
+}
+
+/// One static delta that a delta map advertises.
+///
+/// The map is the `ostree.static-deltas` map of a summary, or the map of an
+/// index file under `delta-indexes/`. [`Summary::static_deltas`] reads the map
+/// of a summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AdvertisedDelta {
+    /// The source commit of the delta, or `None` for a delta from scratch.
+    pub from: Option<Checksum>,
+    /// The target commit of the delta.
+    pub to: Checksum,
+    /// The SHA-256 digest of the `superblock` file of the delta.
+    pub superblock: Checksum,
 }
 
 /// One entry of the ref list of a summary.
@@ -199,6 +219,31 @@ impl Summary {
         Ok(collections)
     }
 
+    /// Returns the deltas in `ostree.static-deltas`, in map order.
+    ///
+    /// The key of each entry is the name of a delta in lowercase hex: `<to>`
+    /// for a delta from scratch, and `<from>-<to>` for other deltas. The value
+    /// is the SHA-256 digest of the `superblock` file of the delta, as an `ay`
+    /// variant. A key that occurs two times gives two entries. If the summary
+    /// has no such key, the list is empty.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if the variant that holds the map has a type
+    ///   other than `a{sv}`, if a key is not a delta name, or if a value is
+    ///   not an `ay` variant of 32 bytes.
+    pub fn static_deltas(&self) -> Result<Vec<AdvertisedDelta>> {
+        let Some((ty, map)) = self
+            .metadata
+            .dict_get(STATIC_DELTAS_KEY)
+            .and_then(Value::as_variant)
+        else {
+            return Ok(Vec::new());
+        };
+        check_delta_map_type(ty)?;
+        parse_delta_map(map)
+    }
+
     /// Returns the commit that `ref_name` names, or `None` if the summary does
     /// not list the ref.
     pub fn lookup(&self, ref_name: &str) -> Option<Checksum> {
@@ -241,6 +286,90 @@ fn parse_ref_entry(entry: Value) -> Result<SummaryRef> {
         commit_size: size,
         metadata: std::mem::replace(metadata, Value::Array(Vec::new())),
     })
+}
+
+/// Checks that `ty`, the type in the variant that holds a delta map, is
+/// `a{sv}`.
+///
+/// The value of a decoded variant cannot show its type: an `a(sv)`, or an
+/// empty array of any type, has the shape of an `a{sv}`. The type in the
+/// variant is the only record of it.
+///
+/// # Errors
+///
+/// - [`Error::InvalidFormat`] if `ty` is not `a{sv}`.
+pub(crate) fn check_delta_map_type(ty: &Type) -> Result<()> {
+    let signature = ty.signature();
+    if signature != DELTA_MAP_SIGNATURE {
+        return Err(Error::InvalidFormat(format!(
+            "the static delta map has type `{signature}`, not `{DELTA_MAP_SIGNATURE}`"
+        )));
+    }
+    Ok(())
+}
+
+/// Parses a delta map: an `a{sv}` from the name of each delta to the digest
+/// of its superblock. The result is in map order, with each entry kept.
+///
+/// A summary and an index file under `delta-indexes/` carry a map of this
+/// form. The caller checks the type of the map with
+/// [`check_delta_map_type`] first.
+///
+/// # Errors
+///
+/// - [`Error::InvalidFormat`] if `map` is not an array of `{sv}` entries, if
+///   a key is not a name that [`delta_name`](crate::deltagen::delta_name)
+///   gives, or if a value fails [`delta_digest`].
+pub(crate) fn parse_delta_map(map: &Value) -> Result<Vec<AdvertisedDelta>> {
+    let Some(entries) = map.as_array() else {
+        return Err(Error::InvalidFormat(
+            "the static delta map is not an array".into(),
+        ));
+    };
+    let mut deltas = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some([Value::Str(name), value]) = entry.as_tuple() else {
+            return Err(Error::InvalidFormat(
+                "a static delta map entry is not (name, digest)".into(),
+            ));
+        };
+        let Some((from, to)) = parse_delta_name(name) else {
+            return Err(Error::InvalidFormat(format!(
+                "the static delta map key '{name}' is not a delta name"
+            )));
+        };
+        deltas.push(AdvertisedDelta {
+            from,
+            to,
+            superblock: delta_digest(name, value)?,
+        });
+    }
+    Ok(deltas)
+}
+
+/// Returns the superblock digest in the value `value` of the delta `name` in
+/// a delta map.
+///
+/// # Errors
+///
+/// - [`Error::InvalidFormat`] if `value` is not a variant that holds an `ay`
+///   of 32 bytes.
+pub(crate) fn delta_digest(name: &str, value: &Value) -> Result<Checksum> {
+    let bytes = value
+        .as_variant()
+        .and_then(|(_, value)| value.as_bytes())
+        .ok_or_else(|| {
+            Error::InvalidFormat(format!(
+                "the static delta map gives delta {name} no superblock digest"
+            ))
+        })?;
+    let raw: [u8; 32] = bytes.try_into().map_err(|_| {
+        Error::InvalidFormat(format!(
+            "the static delta map gives delta {name} a {}-byte superblock digest",
+            bytes.len()
+        ))
+    })?;
+    Ok(Checksum::from_bytes(raw))
 }
 
 /// Returns the error for a summary that does not have the shape of its type.
@@ -1239,6 +1368,111 @@ mod tests {
         let err = Summary::parse(&bytes).unwrap_err();
         assert!(err.to_string().contains("'short'"), "{err}");
         assert!(err.to_string().contains("16-byte"), "{err}");
+    }
+
+    /// Returns a summary with no refs whose metadata holds `map` under
+    /// `ostree.static-deltas`, in a variant of type `ty`.
+    fn with_delta_map(ty: &str, map: Value) -> Summary {
+        let mut metadata = Value::Array(Vec::new());
+        append_dict_entry(&mut metadata, STATIC_DELTAS_KEY, variant(ty, map).unwrap()).unwrap();
+        Summary {
+            refs: Vec::new(),
+            metadata,
+        }
+    }
+
+    /// Returns a delta map that gives each name its value.
+    fn delta_map(entries: Vec<(String, Value)>) -> Value {
+        let mut map = Value::Array(Vec::new());
+        for (name, value) in entries {
+            append_dict_entry(&mut map, &name, value).unwrap();
+        }
+        map
+    }
+
+    /// Returns the `ay` variant of a digest.
+    fn digest_value(bytes: &[u8]) -> Value {
+        variant("ay", Value::Bytes(bytes.to_vec())).unwrap()
+    }
+
+    /// The delta map reads in map order, with one delta of each shape.
+    #[test]
+    fn static_deltas_reads_the_map_in_map_order() {
+        let (from, to) = (checksum(0xee), checksum(0x11));
+        let map = delta_map(vec![
+            (
+                format!("{}-{}", from.to_hex(), to.to_hex()),
+                digest_value(checksum(2).as_bytes()),
+            ),
+            (to.to_hex(), digest_value(checksum(3).as_bytes())),
+        ]);
+        let summary = with_delta_map("a{sv}", map);
+        assert_eq!(
+            summary.static_deltas().unwrap(),
+            [
+                AdvertisedDelta {
+                    from: Some(from),
+                    to,
+                    superblock: checksum(2),
+                },
+                AdvertisedDelta {
+                    from: None,
+                    to,
+                    superblock: checksum(3),
+                },
+            ]
+        );
+    }
+
+    /// A summary with no delta map, or with an empty one, lists no delta.
+    #[test]
+    fn static_deltas_is_empty_without_a_map() {
+        let summary = Summary::parse(&encode(&[])).unwrap();
+        assert_eq!(summary.static_deltas().unwrap(), Vec::new());
+        let summary = with_delta_map("a{sv}", Value::Array(Vec::new()));
+        assert_eq!(summary.static_deltas().unwrap(), Vec::new());
+    }
+
+    /// A key that is not a delta name, a digest that is not an `ay` of 32
+    /// bytes, and a map that is not an `a{sv}` are refused. The type in the
+    /// variant decides: an `a(sv)` map with a valid entry and an empty `as`
+    /// map are refused too.
+    #[test]
+    fn static_deltas_refuses_a_malformed_map() {
+        let to = checksum(0xab).to_hex();
+        let good = || digest_value(checksum(2).as_bytes());
+        let summaries = [
+            with_delta_map("a{sv}", delta_map(vec![("zz".to_owned(), good())])),
+            with_delta_map("a{sv}", delta_map(vec![(format!("{to}-"), good())])),
+            with_delta_map("a{sv}", delta_map(vec![(to.to_uppercase(), good())])),
+            with_delta_map(
+                "a{sv}",
+                delta_map(vec![(to.clone(), digest_value(&[0u8; 31]))]),
+            ),
+            with_delta_map(
+                "a{sv}",
+                delta_map(vec![(to.clone(), digest_value(&[0u8; 33]))]),
+            ),
+            with_delta_map(
+                "a{sv}",
+                delta_map(vec![(
+                    to.clone(),
+                    variant("s", Value::Str("nope".into())).unwrap(),
+                )]),
+            ),
+            with_delta_map("s", Value::Str("nope".into())),
+            with_delta_map("as", Value::Array(vec![Value::Str(to.clone())])),
+            with_delta_map("as", Value::Array(Vec::new())),
+            with_delta_map("a(sv)", delta_map(vec![(to.clone(), good())])),
+        ];
+        for summary in summaries {
+            let outcome = summary.static_deltas();
+            assert!(
+                matches!(outcome, Err(Error::InvalidFormat(_))),
+                "{:?}: {outcome:?}",
+                summary.metadata
+            );
+        }
     }
 
     /// `build_summary` gives the bytes `regenerate_summary` writes, for a

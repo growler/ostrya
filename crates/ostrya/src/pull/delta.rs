@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
-use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode, Type, Value, from_bytes};
+use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode, Value};
 use ostrya_rt::FileReader;
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
@@ -22,6 +22,7 @@ use crate::delta::{
 };
 use crate::deltagen::{
     STATIC_DELTAS_KEY, SUPERBLOCK_FILE, delta_index_relative_path, delta_name, delta_relative_dir,
+    index_delta_map, parse_delta_name,
 };
 use crate::error::{Error, Result};
 use crate::fetch::{FetchRequest, Fetched, Fetcher, Priority};
@@ -30,7 +31,7 @@ use crate::pull::verify::Verification;
 use crate::pull::{ModeChecks, PullCounters, PullFlags, PullOptions, refspec};
 use crate::read::CommitState;
 use crate::repo::Repo;
-use crate::summary::{INDEXED_DELTAS_KEY, Summary};
+use crate::summary::{INDEXED_DELTAS_KEY, Summary, delta_digest};
 use crate::transaction::Transaction;
 
 use super::source::{RemoteSource, Transfer, session_error};
@@ -392,24 +393,11 @@ async fn choose_delta(
             digest,
         });
     }
-    let suffix = format!("-{}", to.to_hex());
-    for entry in map.as_array().unwrap_or_default() {
-        let Some([key, value]) = entry.as_tuple() else {
-            continue;
-        };
-        let Some(name) = key.as_str() else {
-            continue;
-        };
-        let Some(candidate) = name
-            .strip_suffix(&suffix)
-            .and_then(|hex| Checksum::from_hex(hex).ok())
-        else {
-            continue;
-        };
+    for (candidate, name, value) in source_candidates(map, to) {
         if Some(candidate) != from && complete_here(repo, &candidate).await? {
             return Ok(Choice::Take {
                 from: Some(candidate),
-                digest: entry_digest(name, value)?,
+                digest: delta_digest(name, value)?,
             });
         }
     }
@@ -418,6 +406,36 @@ async fn choose_delta(
         Some(_) => Choice::Declined,
         None => Choice::None,
     })
+}
+
+/// Returns the source commit, the name, and the value of each `<from>-<to>`
+/// entry of `map`, in map order.
+///
+/// The scan skips each entry that is not a `{sv}`, each key for another
+/// target, and each key that is not a delta name in lowercase hex. A key that
+/// does not end in `-<to>` is skipped before the hex parse.
+fn source_candidates<'a>(
+    map: &'a Value,
+    to: &Checksum,
+) -> impl Iterator<Item = (Checksum, &'a str, &'a Value)> {
+    let to = *to;
+    let suffix = format!("-{}", to.to_hex());
+    map.as_array()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(move |entry| {
+            let [key, value] = entry.as_tuple()? else {
+                return None;
+            };
+            let name = key.as_str()?;
+            if !name.ends_with(&suffix) {
+                return None;
+            }
+            match parse_delta_name(name)? {
+                (Some(from), target) if target == to => Some((from, name, value)),
+                _ => None,
+            }
+        })
 }
 
 /// What a remote states about the deltas that it holds.
@@ -446,6 +464,10 @@ enum Advertisement {
 /// 2. `<c>-<to>`, for each commit `c` that this repository holds complete, in
 ///    map order
 /// 3. the from-scratch `<to>`, if `scratch` is `true`
+///
+/// Step 2 skips each key that is not a delta name in lowercase hex. A digest
+/// of the chosen delta that is not an `ay` of 32 bytes fails the pull with
+/// [`Error::InvalidFormat`].
 ///
 /// Observed: the `ostree` command also takes a from-to delta from a commit
 /// that it holds under no ref. If nothing advertises a map, the pull requests
@@ -645,17 +667,11 @@ async fn advertised_map(
         let fetched = source.read(&path, MAX_METADATA_SIZE, progress).await?;
         progress.metadata_fetched();
         if let Some(bytes) = fetched {
-            let ty = Type::parse("a{sv}").map_err(ostrya_core::Error::from)?;
-            let dict = from_bytes(&ty, &bytes).map_err(ostrya_core::Error::from)?;
-            let map = dict
-                .dict_get(STATIC_DELTAS_KEY)
-                .and_then(Value::as_variant)
-                .map(|(_, map)| map.clone())
-                .ok_or_else(|| {
-                    Error::InvalidFormat(format!(
-                        "the remote's delta index for {to} holds no {STATIC_DELTAS_KEY} map"
-                    ))
-                })?;
+            let map = index_delta_map(&bytes)?.ok_or_else(|| {
+                Error::InvalidFormat(format!(
+                    "the remote's delta index for {to} holds no {STATIC_DELTAS_KEY} map"
+                ))
+            })?;
             return Ok(Some(map));
         }
     }
@@ -679,21 +695,7 @@ fn map_digest(map: &Value, name: &str) -> Result<Option<Checksum>> {
     let Some(entry) = map.dict_get(name) else {
         return Ok(None);
     };
-    entry_digest(name, entry).map(Some)
-}
-
-/// Returns the superblock digest in the map entry `entry` of the delta `name`.
-fn entry_digest(name: &str, entry: &Value) -> Result<Checksum> {
-    let bytes = entry
-        .as_variant()
-        .map(|(_, value)| value)
-        .and_then(Value::as_bytes)
-        .ok_or_else(|| {
-            Error::InvalidFormat(format!(
-                "the remote advertises static delta {name} with no superblock digest"
-            ))
-        })?;
-    Ok(Checksum::from_ay(bytes)?)
+    delta_digest(name, entry).map(Some)
 }
 
 /// Reads one part of a delta from `source` and applies it into the
@@ -822,13 +824,15 @@ async fn fetch_part_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ostrya_core::Type;
 
     fn checksum(byte: u8) -> Checksum {
         Checksum::from_bytes([byte; 32])
     }
 
     /// The digest lookup reads the `ay` in the variant, returns `None` for an
-    /// absent delta, and refuses an entry of another type.
+    /// absent delta, and refuses an entry of another type or of another
+    /// length.
     #[test]
     fn map_digest_reads_the_advertised_ay() {
         let digest = checksum(0x33);
@@ -846,6 +850,14 @@ mod tests {
             Value::variant(Type::parse("s").unwrap(), Value::Str("nope".to_owned())),
         )
         .unwrap();
+        for len in [31, 33] {
+            crate::commit::append_dict_entry(
+                &mut map,
+                &format!("digest-of-{len}"),
+                Value::variant(Type::parse("ay").unwrap(), Value::Bytes(vec![0x33; len])),
+            )
+            .unwrap();
+        }
 
         assert_eq!(map_digest(&map, "delta-name").unwrap(), Some(digest));
         assert_eq!(map_digest(&map, "absent").unwrap(), None);
@@ -853,5 +865,48 @@ mod tests {
             map_digest(&map, "not-a-digest"),
             Err(Error::InvalidFormat(_))
         ));
+        for name in ["digest-of-31", "digest-of-33"] {
+            assert!(
+                matches!(map_digest(&map, name), Err(Error::InvalidFormat(_))),
+                "{name}"
+            );
+        }
+    }
+
+    /// The scan for `<from>-<to>` keys finds the lowercase key to `to` alone.
+    /// It skips an uppercase source, another target, the from-scratch key,
+    /// and a key that is not a delta name, and these keys do not stop it.
+    #[test]
+    fn source_candidates_finds_the_keys_to_the_target() {
+        let (from, to, other) = (checksum(0xa1), checksum(0xf0), checksum(0xb2));
+        let (from_hex, to_hex) = (from.to_hex(), to.to_hex());
+        let found = delta_name(Some(&from), &to);
+        let mut map = Value::Array(Vec::new());
+        for name in [
+            format!("{}-{to_hex}", from_hex.to_uppercase()),
+            delta_name(Some(&from), &other),
+            delta_name(None, &to),
+            format!("zz-{to_hex}"),
+            found.clone(),
+        ] {
+            crate::commit::append_dict_entry(
+                &mut map,
+                &name,
+                Value::variant(
+                    Type::parse("ay").unwrap(),
+                    Value::Bytes(name.as_bytes().to_vec()),
+                ),
+            )
+            .unwrap();
+        }
+
+        let candidates: Vec<_> = source_candidates(&map, &to).collect();
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        let (candidate, name, value) = candidates[0];
+        assert_eq!((candidate, name), (from, found.as_str()));
+        assert_eq!(
+            value.as_variant().and_then(|(_, bytes)| bytes.as_bytes()),
+            Some(found.as_bytes())
+        );
     }
 }

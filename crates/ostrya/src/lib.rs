@@ -31,7 +31,7 @@
 //! - Signing: [`sign`], `gpg`, and `spki`.
 //! - Signature trust: [`verify`], the trusted keys and the trust of one pull.
 //! - Maintenance: [`prune`], [`fsck`], [`diff`], [`update`], and [`config`].
-//! - Static deltas: [`DeltaSuperblock`], [`DeltaOptions`], and [`Repo::generate_static_delta`].
+//! - Static deltas: [`DeltaSuperblock`], [`DeltaOptions`], [`AdvertisedDelta`], and [`Repo::generate_static_delta`].
 //!
 //! # Features
 //! - `smol` (default): the `smol` backend of `ostrya-rt`.
@@ -202,7 +202,7 @@ pub use staging_tree::{
     MergeOptions, RootDirmeta, StagedFileWriter, StagingEntry, StagingLookup, StagingTree,
 };
 #[doc(hidden)]
-pub use summary::{Summary, SummaryOptions, SummaryRef};
+pub use summary::{AdvertisedDelta, Summary, SummaryOptions, SummaryRef};
 #[doc(hidden)]
 pub use tar::{TarExportOptions, TarImportOptions, TarRename};
 #[doc(hidden)]

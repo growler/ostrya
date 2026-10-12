@@ -14,8 +14,10 @@
 //!   [`MMAP_THRESHOLD`] and in a temp file after it.
 //! - [`compress_part`] and [`bsdiff_stream`] run the CPU-bound stages on the
 //!   blocking pool. [`PART_XZ_LEVEL`] sets the memory of the xz encoder.
+//! - [`Repo::walk_delta_indexes`] reads the `delta-indexes/` cache back from a
+//!   set of commits, through the source commit of each delta that it finds.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::SeekFrom;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -44,9 +46,11 @@ use crate::delta::{
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject};
 use crate::hashing::HashingWriter;
+use crate::object::MAX_METADATA_SIZE;
 use crate::repo::Repo;
 use crate::rollsum::{self, Run};
 use crate::sign::{Signer, append_signature};
+use crate::summary::{AdvertisedDelta, check_delta_map_type, parse_delta_map};
 
 /// The format version of a delta part that the meta-entry records.
 const PART_VERSION: u32 = 0;
@@ -386,7 +390,7 @@ impl Repo {
     ///   [`DeltaOptions::superblock_file`] path is not UTF-8 or is a part file
     ///   name.
     /// - [`Error::InvalidFormat`] if the superblock is larger than 128 MiB
-    ///   ([`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE)), or if inline parts
+    ///   ([`MAX_METADATA_SIZE`]), or if inline parts
     ///   pass this limit.
     /// - [`Error::InvalidFormat`] if the mode table and the xattr table of a
     ///   part are larger than 128 MiB together.
@@ -771,6 +775,44 @@ impl Repo {
     pub async fn list_static_delta_indexes(&self) -> Result<Vec<Checksum>> {
         let repo = self.clone();
         ostrya_rt::unblock(move || list_delta_indexes_blocking(repo.repo_fd())).await
+    }
+
+    /// Returns the deltas that the index files advertise on the paths back
+    /// from `commits`, sorted by delta name.
+    ///
+    /// The walk reads the index file of each commit in `commits`. For each
+    /// delta from a source commit, it then reads the index file of that source
+    /// commit, and so on. The walk reads the index file of a commit one time
+    /// at most, so a cycle of deltas ends the walk. A commit with no index
+    /// file adds no delta. An index file is a file that
+    /// [`list_static_delta_indexes`](Repo::list_static_delta_indexes) lists.
+    ///
+    /// An index file lists only the deltas to its own commit, so a delta name
+    /// can occur in one index file alone. If an index file lists a delta name
+    /// more than one time, the first entry applies, as in a pull.
+    ///
+    /// The walk reads `delta-indexes/` alone. It does not open `deltas/`, and
+    /// it does not check that a commit or a delta exists. It takes no lock.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if an index file is larger than
+    ///   [`MAX_METADATA_SIZE`], if it does not decode as an `a{sv}`, if it
+    ///   holds no `ostree.static-deltas` map, if the map fails the rules of
+    ///   [`Summary::static_deltas`], or if an entry names a delta to another
+    ///   commit. The message names the index file.
+    /// - [`Error::Io`] if `delta-indexes/` is not a directory, or if an open
+    ///   or a read fails.
+    ///
+    /// [`Summary::static_deltas`]: crate::Summary::static_deltas
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn walk_delta_indexes(
+        &self,
+        commits: impl IntoIterator<Item = Checksum>,
+    ) -> Result<Vec<AdvertisedDelta>> {
+        let repo = self.clone();
+        let commits: Vec<Checksum> = commits.into_iter().collect();
+        ostrya_rt::unblock(move || walk_delta_indexes_blocking(repo.repo_fd(), commits)).await
     }
 
     /// Removes the index files under `delta-indexes/` that this pass did not
@@ -1977,6 +2019,45 @@ fn index_value(deltas: &BTreeMap<String, Checksum>) -> Result<Vec<u8>> {
     Ok(to_bytes(&map_ty, &dict).map_err(ostrya_core::Error::from)?)
 }
 
+/// Returns the delta map of an index file, with no variant wrapper, or `None`
+/// if the file has no [`STATIC_DELTAS_KEY`] entry that holds a variant.
+///
+/// The file is the `a{sv}` that [`index_value`] writes. If the key occurs
+/// more than once, the first entry applies, as for [`Value::dict_get`].
+///
+/// # Errors
+///
+/// - [`Error::Core`] if the bytes do not decode as an `a{sv}`.
+/// - [`Error::InvalidFormat`] if the variant of the entry holds a type other
+///   than `a{sv}`.
+pub(crate) fn index_delta_map(bytes: &[u8]) -> Result<Option<Value>> {
+    let ty = Type::parse("a{sv}").map_err(ostrya_core::Error::from)?;
+    let Value::Array(entries) = from_bytes(&ty, bytes).map_err(ostrya_core::Error::from)? else {
+        return Ok(None);
+    };
+    // The dict is owned, so the map moves out of it with no clone.
+    for entry in entries {
+        let Value::Tuple(fields) = entry else {
+            continue;
+        };
+        let Ok([key, value]) = <[Value; 2]>::try_from(fields) else {
+            continue;
+        };
+        if key.as_str() != Some(STATIC_DELTAS_KEY) {
+            continue;
+        }
+        return Ok(match value {
+            Value::Variant(inner) => {
+                let (map_ty, map) = *inner;
+                check_delta_map_type(&map_ty)?;
+                Some(map)
+            }
+            _ => None,
+        });
+    }
+    Ok(None)
+}
+
 /// Returns the name of a delta, as an advertisement keys it and a message
 /// names it.
 ///
@@ -1986,6 +2067,19 @@ pub(crate) fn delta_name(from: Option<&Checksum>, to: &Checksum) -> String {
     match from {
         Some(from) => format!("{}-{}", from.to_hex(), to.to_hex()),
         None => to.to_hex(),
+    }
+}
+
+/// Returns the source commit and the target commit of a delta name, the
+/// inverse of [`delta_name`].
+///
+/// The name is `<to>` or `<from>-<to>`, and each checksum is 64 lowercase hex
+/// characters. Each other name gives `None`.
+pub(crate) fn parse_delta_name(name: &str) -> Option<(Option<Checksum>, Checksum)> {
+    let hex = |s: &str| Checksum::from_hex_lower(s).ok();
+    match name.split_once('-') {
+        Some((from, to)) => Some((Some(hex(from)?), hex(to)?)),
+        None => Some((None, hex(name)?)),
     }
 }
 
@@ -2350,6 +2444,130 @@ fn list_delta_indexes_blocking(repo_fd: BorrowedFd<'_>) -> Result<Vec<Checksum>>
     Ok(out)
 }
 
+/// Walks the index files back from `commits`, by the rule of
+/// [`Repo::walk_delta_indexes`].
+fn walk_delta_indexes_blocking(
+    repo_fd: BorrowedFd<'_>,
+    commits: Vec<Checksum>,
+) -> Result<Vec<AdvertisedDelta>> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let indexes = match openat(repo_fd, DELTA_INDEXES_DIR, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(Vec::new()),
+        Err(e) => return Err(Error::Io(e.into())),
+    };
+    let mut seen: HashSet<Checksum> = HashSet::new();
+    let mut queue: VecDeque<Checksum> = commits
+        .into_iter()
+        .filter(|commit| seen.insert(*commit))
+        .collect();
+    let mut found: BTreeMap<String, AdvertisedDelta> = BTreeMap::new();
+    while let Some(to) = queue.pop_front() {
+        let Some(bytes) = read_delta_index_blocking(indexes.as_fd(), &to)? else {
+            continue;
+        };
+        let path = delta_index_relative_path(&to);
+        let at_path = |e: Error| match e {
+            Error::InvalidFormat(message) => Error::InvalidFormat(format!("{path}: {message}")),
+            Error::Core(e) => Error::InvalidFormat(format!("{path}: {e}")),
+            e => e,
+        };
+        // Each stage drops its input, so one index file is held in one form
+        // at a time.
+        let map = index_delta_map(&bytes).map_err(at_path)?;
+        drop(bytes);
+        let map = map.ok_or_else(|| {
+            Error::InvalidFormat(format!("{path} holds no {STATIC_DELTAS_KEY} map"))
+        })?;
+        let deltas = parse_delta_map(&map).map_err(at_path)?;
+        drop(map);
+        for delta in deltas {
+            let name = delta_name(delta.from.as_ref(), &delta.to);
+            if delta.to != to {
+                return Err(Error::InvalidFormat(format!(
+                    "{path} lists static delta {name}, whose target is not {to}"
+                )));
+            }
+            if let Some(from) = delta.from
+                && seen.insert(from)
+            {
+                queue.push_back(from);
+            }
+            found.entry(name).or_insert(delta);
+        }
+    }
+    Ok(found.into_values().collect())
+}
+
+/// Reads the index file of the target commit `to` in the open
+/// `delta-indexes/` directory `indexes`, or returns `None` if the repository
+/// holds no index file for it.
+///
+/// The rule is the rule of [`list_delta_indexes_blocking`]. The call follows
+/// no symlink. A fanout that is not a directory, and an index path that is
+/// not a regular file, count as no index file. The call reads the type of the
+/// index path before the open, so it opens no socket, FIFO, or device node.
+/// The open does not block. A second type check after the open gives `None`
+/// for a file that another process puts at the path after the first check.
+fn read_delta_index_blocking(indexes: BorrowedFd<'_>, to: &Checksum) -> Result<Option<Vec<u8>>> {
+    use std::io::Read;
+
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, openat, statat};
+    use rustix::io::Errno;
+
+    let (fanout, name) = delta_index_parts(to);
+    let fan_fd = match openat(
+        indexes,
+        fanout.as_str(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => return Ok(None),
+        Err(e) => return Err(Error::Io(e.into())),
+    };
+    match statat(&fan_fd, name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => {}
+        Ok(_) | Err(Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(Error::Io(e.into())),
+    }
+    let fd = match openat(
+        &fan_fd,
+        name.as_str(),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT | Errno::LOOP) => return Ok(None),
+        Err(e) => return Err(Error::Io(e.into())),
+    };
+    let stat = fstat(&fd).map_err(|e| Error::Io(e.into()))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Ok(None);
+    }
+    let too_large = || {
+        Error::InvalidFormat(format!(
+            "{} is larger than the {MAX_METADATA_SIZE}-byte metadata ceiling",
+            delta_index_relative_path(to)
+        ))
+    };
+    let len = stat.st_size.max(0) as u64;
+    if len > MAX_METADATA_SIZE {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::with_capacity(len as usize + 1);
+    std::fs::File::from(fd)
+        .take(MAX_METADATA_SIZE + 1)
+        .read_to_end(&mut bytes)
+        .map_err(Error::Io)?;
+    if bytes.len() as u64 > MAX_METADATA_SIZE {
+        return Err(too_large());
+    }
+    Ok(Some(bytes))
+}
+
 /// Returns the names of the entries of type `ty` in an open directory, with no
 /// symlink followed.
 ///
@@ -2586,6 +2804,67 @@ mod tests {
             delta_name(Some(&from), &to),
             format!("{}-{}", from.to_hex(), to.to_hex())
         );
+    }
+
+    /// The parse of a delta name gives back the commits of each shape, and
+    /// gives `None` for each name that [`delta_name`] does not write.
+    #[test]
+    fn delta_names_parse_back_to_their_commits() {
+        let to = checksum(0xab);
+        let from = checksum(0xcd);
+        assert_eq!(parse_delta_name(&delta_name(None, &to)), Some((None, to)));
+        assert_eq!(
+            parse_delta_name(&delta_name(Some(&from), &to)),
+            Some((Some(from), to))
+        );
+
+        let to_hex = to.to_hex();
+        let from_hex = from.to_hex();
+        for name in [
+            String::new(),
+            "zz".to_owned(),
+            to_hex.to_uppercase(),
+            format!("{}-{to_hex}", from_hex.to_uppercase()),
+            to_hex[1..].to_owned(),
+            format!("{}-{to_hex}", &from_hex[1..]),
+            format!("{from_hex}-"),
+            format!("-{to_hex}"),
+            format!("{from_hex}-{to_hex}-{to_hex}"),
+        ] {
+            assert_eq!(parse_delta_name(&name), None, "{name}");
+        }
+    }
+
+    /// The map of an index file reads back with no variant wrapper. A dict
+    /// with no delta map gives `None`, and bytes that are not an `a{sv}` are
+    /// refused.
+    #[test]
+    fn the_index_map_reads_back() {
+        let deltas = BTreeMap::from([
+            (delta_name(None, &checksum(1)), checksum(2)),
+            (delta_name(Some(&checksum(3)), &checksum(1)), checksum(4)),
+        ]);
+        let map = index_delta_map(&index_value(&deltas).unwrap())
+            .unwrap()
+            .expect("the index holds the map");
+        let expected =
+            delta_map_value(deltas.iter().map(|(name, digest)| (name.as_str(), digest))).unwrap();
+        assert_eq!(map, expected);
+
+        let ty = Type::parse("a{sv}").unwrap();
+        let mut dict = Value::Array(Vec::new());
+        append_dict_entry(
+            &mut dict,
+            "other",
+            Value::variant(Type::parse("b").unwrap(), Value::Bool(true)),
+        )
+        .unwrap();
+        let bytes = to_bytes(&ty, &dict).unwrap();
+        assert_eq!(index_delta_map(&bytes).unwrap(), None);
+        assert!(matches!(
+            index_delta_map(b"\x01\x02\x03"),
+            Err(Error::Core(_))
+        ));
     }
 
     #[test]
@@ -2923,6 +3202,359 @@ mod tests {
         };
         assert_eq!(budget, (1 << 20) - bytes.len());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Returns an empty `archive` repository at `root/repo`.
+    async fn empty_repo(root: &Path) -> Repo {
+        Repo::create(
+            &root.join("repo"),
+            crate::CreateOptions::new(ostrya_core::RepoMode::Archive),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Returns the delta from `from` to `to`, with a superblock digest that
+    /// its name gives.
+    fn advertised(from: Option<Checksum>, to: Checksum) -> AdvertisedDelta {
+        AdvertisedDelta {
+            from,
+            to,
+            superblock: Checksum::sha256(delta_name(from.as_ref(), &to).as_bytes()),
+        }
+    }
+
+    /// Writes the index file of `to` into the repository at `repo_dir`. The
+    /// file lists `deltas`, each with the digest of [`advertised`].
+    fn write_index(repo_dir: &Path, to: &Checksum, deltas: &[AdvertisedDelta]) {
+        let map = deltas
+            .iter()
+            .map(|delta| (delta_name(delta.from.as_ref(), &delta.to), delta.superblock))
+            .collect();
+        let path = repo_dir.join(delta_index_relative_path(to));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, index_value(&map).unwrap()).unwrap();
+    }
+
+    /// Writes the index file of `to` into the repository at `repo_dir`. The
+    /// file holds `map` under the delta map key, in a variant of type `ty`.
+    fn write_index_map(repo_dir: &Path, to: &Checksum, ty: &str, map: Value) {
+        let mut dict = Value::Array(Vec::new());
+        append_dict_entry(
+            &mut dict,
+            STATIC_DELTAS_KEY,
+            Value::variant(Type::parse(ty).unwrap(), map),
+        )
+        .unwrap();
+        let path = repo_dir.join(delta_index_relative_path(to));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = to_bytes(&Type::parse("a{sv}").unwrap(), &dict).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+    }
+
+    /// Returns `deltas` sorted by delta name, the order of the walk.
+    fn by_name(mut deltas: Vec<AdvertisedDelta>) -> Vec<AdvertisedDelta> {
+        deltas.sort_by_key(|delta| delta_name(delta.from.as_ref(), &delta.to));
+        deltas
+    }
+
+    /// The walk follows the source commit of each delta back to the start of
+    /// the chain.
+    #[test]
+    fn the_walk_follows_a_chain() {
+        let root = scratch("walk-chain");
+        let [a, b, c, d] = [
+            checksum(0xa1),
+            checksum(0xb2),
+            checksum(0xc3),
+            checksum(0xd4),
+        ];
+        let outcome = ostrya_rt::block_on(async {
+            let repo = empty_repo(&root).await;
+            let repo_dir = root.join("repo");
+            write_index(&repo_dir, &b, &[advertised(Some(a), b)]);
+            write_index(&repo_dir, &c, &[advertised(Some(b), c)]);
+            write_index(&repo_dir, &d, &[advertised(Some(c), d)]);
+            repo.walk_delta_indexes([d]).await
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            outcome.unwrap(),
+            by_name(vec![
+                advertised(Some(a), b),
+                advertised(Some(b), c),
+                advertised(Some(c), d),
+            ])
+        );
+    }
+
+    /// A cycle of deltas ends the walk, because the walk reads the index of
+    /// each commit one time.
+    #[test]
+    fn the_walk_ends_on_a_cycle() {
+        let root = scratch("walk-cycle");
+        let [a, b] = [checksum(0xa1), checksum(0xb2)];
+        let outcome = ostrya_rt::block_on(async {
+            let repo = empty_repo(&root).await;
+            let repo_dir = root.join("repo");
+            write_index(
+                &repo_dir,
+                &a,
+                &[advertised(Some(b), a), advertised(Some(a), a)],
+            );
+            write_index(&repo_dir, &b, &[advertised(Some(a), b)]);
+            repo.walk_delta_indexes([a, a]).await
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            outcome.unwrap(),
+            by_name(vec![
+                advertised(Some(b), a),
+                advertised(Some(a), a),
+                advertised(Some(a), b),
+            ])
+        );
+    }
+
+    /// If an index file lists a delta name two times, the first entry
+    /// applies, as in a pull.
+    #[test]
+    fn the_walk_takes_the_first_entry_of_a_duplicate_name() {
+        let root = scratch("walk-duplicate");
+        let [a, t] = [checksum(0xa1), checksum(0xf0)];
+        let name = delta_name(Some(&a), &t);
+        let outcome = ostrya_rt::block_on(async {
+            let repo = empty_repo(&root).await;
+            let map = delta_map_value(
+                [(name.as_str(), &checksum(1)), (name.as_str(), &checksum(2))].into_iter(),
+            )
+            .unwrap();
+            write_index_map(&root.join("repo"), &t, "a{sv}", map);
+            repo.walk_delta_indexes([t]).await
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            outcome.unwrap(),
+            [AdvertisedDelta {
+                from: Some(a),
+                to: t,
+                superblock: checksum(1),
+            }]
+        );
+    }
+
+    /// The walk reads `delta-indexes/` alone. A delta under `deltas/` that no
+    /// index lists adds nothing, and a `deltas` entry that is not a directory
+    /// changes nothing. A `deltas` directory that grants no access changes
+    /// nothing too, because an open under it would fail.
+    #[test]
+    fn the_walk_reads_no_deltas_dir() {
+        let root = scratch("walk-no-deltas");
+        let target = checksum(0x77);
+        ostrya_rt::block_on(async {
+            let (repo, commit) = noise_commit(&root, 1, 64).await;
+            let repo_dir = root.join("repo");
+            let opts = DeltaOptions {
+                timestamp: Some(1_700_000_000),
+                ..DeltaOptions::default()
+            };
+            repo.generate_static_delta(None, &commit, &opts)
+                .await
+                .unwrap();
+            assert!(repo_dir.join(DELTAS_DIR).is_dir());
+            assert_eq!(repo.walk_delta_indexes([commit]).await.unwrap(), []);
+
+            let listed = advertised(Some(commit), target);
+            write_index(&repo_dir, &target, &[listed]);
+            assert_eq!(repo.walk_delta_indexes([target]).await.unwrap(), [listed]);
+
+            std::fs::remove_dir_all(repo_dir.join(DELTAS_DIR)).unwrap();
+            std::fs::write(repo_dir.join(DELTAS_DIR), b"not a directory").unwrap();
+            assert_eq!(repo.walk_delta_indexes([target]).await.unwrap(), [listed]);
+
+            // Root passes the mode check, so this step runs for other users
+            // alone.
+            std::fs::remove_file(repo_dir.join(DELTAS_DIR)).unwrap();
+            if !rustix::process::geteuid().is_root() {
+                use std::os::unix::fs::PermissionsExt;
+
+                let deltas_dir = repo_dir.join(DELTAS_DIR);
+                std::fs::create_dir(&deltas_dir).unwrap();
+                std::fs::set_permissions(&deltas_dir, std::fs::Permissions::from_mode(0o000))
+                    .unwrap();
+                let outcome = repo.walk_delta_indexes([target]).await;
+                std::fs::set_permissions(&deltas_dir, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                assert_eq!(outcome.unwrap(), [listed]);
+            }
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An index entry whose target is not the indexed commit fails the walk,
+    /// and the error names the index file and the delta.
+    #[test]
+    fn the_walk_refuses_an_entry_to_another_commit() {
+        let root = scratch("walk-other-target");
+        let [a, b, c] = [checksum(0xa1), checksum(0xb2), checksum(0xc3)];
+        let outcome = ostrya_rt::block_on(async {
+            let repo = empty_repo(&root).await;
+            write_index(&root.join("repo"), &c, &[advertised(Some(a), b)]);
+            repo.walk_delta_indexes([c]).await
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        let Err(Error::InvalidFormat(message)) = outcome else {
+            panic!("an entry to another commit must be refused: {outcome:?}");
+        };
+        assert!(
+            message.contains(&delta_index_relative_path(&c))
+                && message.contains(&delta_name(Some(&a), &b)),
+            "{message}"
+        );
+    }
+
+    /// An index file with no delta map, with a key that is not a delta name,
+    /// with a map of type `a(sv)`, or with bytes that do not decode fails the
+    /// walk. The error of the last two names the index file.
+    #[test]
+    fn the_walk_refuses_an_index_with_no_valid_map() {
+        let root = scratch("walk-no-map");
+        let [a, b, c, d] = [
+            checksum(0xa1),
+            checksum(0xb2),
+            checksum(0xc3),
+            checksum(0xd4),
+        ];
+        let outcomes = ostrya_rt::block_on(async {
+            let repo = empty_repo(&root).await;
+            let repo_dir = root.join("repo");
+            let ty = Type::parse("a{sv}").unwrap();
+            let mut dict = Value::Array(Vec::new());
+            append_dict_entry(
+                &mut dict,
+                "other",
+                Value::variant(Type::parse("b").unwrap(), Value::Bool(true)),
+            )
+            .unwrap();
+            let path = repo_dir.join(delta_index_relative_path(&a));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, to_bytes(&ty, &dict).unwrap()).unwrap();
+            let no_map = repo.walk_delta_indexes([a]).await;
+
+            let map = BTreeMap::from([("zz".to_owned(), checksum(1))]);
+            let path = repo_dir.join(delta_index_relative_path(&b));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, index_value(&map).unwrap()).unwrap();
+            let bad_key = repo.walk_delta_indexes([b]).await;
+
+            let map = delta_map_value([(delta_name(None, &c).as_str(), &checksum(1))].into_iter())
+                .unwrap();
+            write_index_map(&repo_dir, &c, "a(sv)", map);
+            let bad_type = repo.walk_delta_indexes([c]).await;
+
+            let path = repo_dir.join(delta_index_relative_path(&d));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"\x01\x02\x03").unwrap();
+            let undecoded = repo.walk_delta_indexes([d]).await;
+            [no_map, bad_key, bad_type, undecoded]
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            let Err(Error::InvalidFormat(message)) = outcome else {
+                panic!("case {index} must be refused: {outcome:?}");
+            };
+            if index >= 2 {
+                let named = delta_index_relative_path(&[a, b, c, d][index]);
+                assert!(message.contains(&named), "{message}");
+            }
+        }
+    }
+
+    /// An index file past the metadata ceiling fails the walk before a read.
+    /// The file is sparse, so the test writes no data.
+    #[test]
+    fn the_walk_refuses_an_index_past_the_ceiling() {
+        let root = scratch("walk-oversize");
+        let a = checksum(0xa1);
+        let outcome = ostrya_rt::block_on(async {
+            let repo = empty_repo(&root).await;
+            let path = root.join("repo").join(delta_index_relative_path(&a));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(MAX_METADATA_SIZE + 1)
+                .unwrap();
+            repo.walk_delta_indexes([a]).await
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(outcome, Err(Error::InvalidFormat(_))),
+            "{outcome:?}"
+        );
+    }
+
+    /// A symlink, a FIFO, a socket, or a directory at the index path counts as
+    /// no index file, and so does a symlinked fanout. The FIFO does not stop
+    /// the walk.
+    #[test]
+    fn the_walk_skips_an_index_that_is_not_a_regular_file() {
+        use rustix::fs::{FileType, Mode};
+
+        let root = scratch("walk-not-regular");
+        let a = checksum(0xa1);
+        let (fanout, name) = delta_index_parts(&a);
+        let outcomes = ostrya_rt::block_on(async {
+            let repo = empty_repo(&root).await;
+            let repo_dir = root.join("repo");
+            let path = repo_dir.join(delta_index_relative_path(&a));
+            let fan_dir = path.parent().unwrap().to_owned();
+            let elsewhere = root.join("elsewhere.index");
+            let map = BTreeMap::from([(delta_name(Some(&a), &a), checksum(1))]);
+            std::fs::write(&elsewhere, index_value(&map).unwrap()).unwrap();
+            std::fs::create_dir_all(&fan_dir).unwrap();
+            let mut outcomes = Vec::new();
+
+            std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+            outcomes.push(("symlink", repo.walk_delta_indexes([a]).await));
+            std::fs::remove_file(&path).unwrap();
+
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                &path,
+                FileType::Fifo,
+                Mode::from_raw_mode(0o600),
+                0,
+            )
+            .unwrap();
+            outcomes.push(("fifo", repo.walk_delta_indexes([a]).await));
+            std::fs::remove_file(&path).unwrap();
+
+            // The path of a socket has a short length limit, so the bind uses
+            // a short path and a rename moves the socket into place.
+            let short = root.join("sock");
+            let listener = std::os::unix::net::UnixListener::bind(&short).unwrap();
+            std::fs::rename(&short, &path).unwrap();
+            outcomes.push(("socket", repo.walk_delta_indexes([a]).await));
+            drop(listener);
+            std::fs::remove_file(&path).unwrap();
+
+            std::fs::create_dir(&path).unwrap();
+            outcomes.push(("directory", repo.walk_delta_indexes([a]).await));
+            std::fs::remove_dir(&path).unwrap();
+
+            let real = repo_dir.join(DELTA_INDEXES_DIR).join("real");
+            std::fs::create_dir(&real).unwrap();
+            std::fs::copy(&elsewhere, real.join(&name)).unwrap();
+            std::fs::remove_dir(&fan_dir).unwrap();
+            std::os::unix::fs::symlink("real", repo_dir.join(DELTA_INDEXES_DIR).join(&fanout))
+                .unwrap();
+            outcomes.push(("symlinked fanout", repo.walk_delta_indexes([a]).await));
+            outcomes
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        for (case, outcome) in outcomes {
+            assert_eq!(outcome.unwrap(), [], "{case}");
+        }
     }
 
     #[test]

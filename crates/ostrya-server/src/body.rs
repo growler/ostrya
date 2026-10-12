@@ -55,8 +55,10 @@ pub(crate) struct StreamBody {
     reader: Box<dyn AsyncRead + Unpin + Send>,
     /// The bytes still to give, when the length is known.
     remaining: Option<u64>,
-    /// The buffer the next read lands in. A read that completes moves it
-    /// into its frame, so the bytes are not copied again.
+    /// The buffer the next read lands in. A read that fills the whole buffer
+    /// moves it into its frame, so the bytes are not copied again. A shorter
+    /// read copies its bytes into a frame of their length and keeps the
+    /// buffer, so the next read does not fill a new buffer with zeros.
     buf: Vec<u8>,
     /// The bytes given since the body last returned `Pending`.
     run: usize,
@@ -101,9 +103,13 @@ impl StreamBody {
         }
         self.run += n;
         self.tracker.progress();
-        let mut data = std::mem::take(&mut self.buf);
-        data.truncate(n);
-        Poll::Ready(Some(Ok(Frame::data(Bytes::from(data)))))
+        if n == self.buf.len() {
+            let data = std::mem::take(&mut self.buf);
+            return Poll::Ready(Some(Ok(Frame::data(Bytes::from(data)))));
+        }
+        Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(
+            &self.buf[..n],
+        )))))
     }
 }
 
@@ -230,6 +236,41 @@ pub(crate) mod tests {
         for len in [None, Some(200_000)] {
             let frames = block_on(frames(stream(data.clone(), len))).unwrap();
             assert!(frames.iter().all(|f| f.len() <= MAX_FRAME && !f.is_empty()));
+            assert_eq!(frames.concat(), data);
+        }
+    }
+
+    /// A reader that gives at most `max` bytes for each read.
+    struct Short {
+        data: Cursor<Vec<u8>>,
+        max: usize,
+    }
+
+    impl AsyncRead for Short {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let max = this.max.min(buf.len());
+            Pin::new(&mut this.data).poll_read(cx, &mut buf[..max])
+        }
+    }
+
+    /// Each short read gives a frame of its bytes. The frames hold the bytes
+    /// of the reader in order, with and without a known length.
+    #[test]
+    fn short_reads_give_frames_of_their_length() {
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        for len in [None, Some(100_000)] {
+            let reader = Box::new(Short {
+                data: Cursor::new(data.clone()),
+                max: 3000,
+            });
+            let body = ServeBody::stream(reader, len, tracker());
+            let frames = block_on(frames(body)).unwrap();
+            assert!(frames[..frames.len() - 1].iter().all(|f| f.len() == 3000));
             assert_eq!(frames.concat(), data);
         }
     }

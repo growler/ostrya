@@ -4732,8 +4732,8 @@ be equal to a digest, and the prefix keeps the keys of two methods apart. A
 bearer token and a Basic credential of one line give one key. Every request
 of a session is authorized again, and a request with another key gets the
 404 of an unknown id. A `GET` and a
-`HEAD` of the archive view ignore `Authorization`, so a read with a Basic
-credential over plain HTTP succeeds.
+`HEAD` of the archive view, and a `GET` of the ref listing, ignore
+`Authorization`, so a read with a Basic credential over plain HTTP succeeds.
 
 The endpoint takes the requests under the raw path prefix
 `/_ostrya/receive/v1/`. The path is not percent-decoded. In the server, a
@@ -4838,6 +4838,44 @@ succeeds. When `after_update` returns an error, the client gets 500 with
 `internal`, the refs and the detached metadata stay written, the session
 ends as aborted, and `on_report` is not called. The host has the report in
 `after_update`.
+
+The ref listing. The server answers `GET /_ostrya/refs/v1?prefix=P&prefix=Q`
+with the bytes of `Repo::build_ref_listing` for the prefixes of the query.
+It builds the listing for each request, from a clone of the `Repo` that
+`bind` takes. The listing is served with and without `receive`.
+
+- The server compares the raw request path with `/_ostrya/refs/v1`, and
+  the path must match exactly. Another path goes to the archive view, which
+  gives 404 under `/_ostrya/`.
+- The HTTP layer removes a `#` fragment before the routing, so the server
+  does not see a fragment.
+- Each pair of the query is `prefix=VALUE`, and `&` separates two pairs.
+  The server compares the key with the raw bytes `prefix`. It decodes the
+  value with the percent-decoding of a request path, in which `+` stays
+  `+`. The decoded value must be a ref name. A prefix given two times is
+  accepted.
+- No query, or a `?` alone, is an empty prefix list, which takes all refs.
+- A query holds at most 256 pairs. A prefix given two times counts two
+  times.
+- The checks come in this order, before the build: the method, then the
+  query, then the count of listings in flight.
+- A method other than `GET`, `HEAD` included, gets 405 with `Allow: GET`.
+- An empty pair, a pair with no `=`, another key, a bad escape, a NUL, a
+  value that is not UTF-8, a query of more than 256 pairs, and a prefix that
+  is not a ref name get 400 with no body.
+- The server holds at most 4 listings at the same time, over all
+  connections. A listing is in flight from the start of its build until its
+  response body drops, so a client that does not read its body keeps its
+  listing until `body_timeout` ends the connection. A request when 4
+  listings are in flight gets 503 with `Retry-After: 1` and no body.
+- A 200 carries `Content-Length` and no `Content-Type`. The server builds
+  the listing whole in memory, then sends it in frames of at most 64 KiB
+  under `body_timeout`.
+- A listing larger than `MAX_REF_LISTING`, and each other error of the
+  build, get 500 with no body.
+- A static server that serves the repository files alone gives 404.
+- A host with a router of its own calls `Repo::build_ref_listing` in its own
+  handler. The crate exports no handler of the listing.
 
 `ostrya_fetch::server_config` builds the TLS configuration from the PEM
 bytes, with the provider and the key loaders of the fetcher, and ALPN `h2`

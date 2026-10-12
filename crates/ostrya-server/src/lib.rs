@@ -7,7 +7,8 @@
 //! (see [`ostrya::ArchiveView`]). With a receive policy, the server also runs
 //! the receive endpoint of a push. A host with its own HTTP router mounts
 //! that endpoint as a [`ReceiveEndpoint`] and authenticates the requests
-//! itself. The crate builds on Linux alone.
+//! itself. The server also answers `GET /_ostrya/refs/v1` with the bytes of
+//! [`ostrya::Repo::build_ref_listing`]. The crate builds on Linux alone.
 //!
 //! # Entry points
 //!
@@ -47,6 +48,7 @@ mod error;
 mod options;
 mod receive;
 mod receive_auth;
+mod refs;
 mod request;
 mod router;
 mod server;

@@ -3,6 +3,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use futures_lite::future;
@@ -41,24 +42,49 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 ///
 /// # HTTP behavior
 ///
-/// - The server answers `GET` and `HEAD`. Outside the receive endpoint,
-///   another method gets 405 with `Allow: GET, HEAD`.
+/// - The server answers `GET` and `HEAD`, except on the ref listing. Outside
+///   the receive endpoint and the ref listing, another method gets 405 with
+///   `Allow: GET, HEAD`.
 /// - With a receive endpoint, a request under the raw path prefix
 ///   `/_ostrya/receive/v1/` goes to the endpoint if its method is not `GET`
 ///   or `HEAD`. A `GET` or a `HEAD` under the prefix goes to the archive
 ///   view and gets 404.
-/// - A `GET` and a `HEAD` of the archive view ignore `Authorization`.
-/// - The server percent-decodes the request path and ignores the query. If
-///   the path has a bad escape, a NUL, or bytes that are not UTF-8, the
-///   response is 404.
+/// - A `GET` and a `HEAD` of the archive view, and a `GET` of the ref
+///   listing, ignore `Authorization`.
+/// - The HTTP layer removes a `#` fragment before the routing, so the server
+///   does not see a fragment.
+/// - The server percent-decodes the request path. Outside the ref listing,
+///   it ignores the query. If the path has a bad escape, a NUL, or bytes
+///   that are not UTF-8, the response is 404.
+/// - The server answers the raw path `/_ostrya/refs/v1`, with and without a
+///   receive endpoint, with the bytes of [`Repo::build_ref_listing`]. The
+///   path must match exactly, and the server reads its query. Each pair of
+///   the query is `prefix=VALUE`, with the raw key `prefix` and a
+///   percent-decoded value in which `+` stays `+`. No query is an empty
+///   prefix list. The checks come in this order:
+///   1. A method other than `GET`, `HEAD` included, gets 405 with
+///      `Allow: GET`.
+///   2. A bad pair, and a query of more than 256 pairs, get 400. A prefix
+///      given two times counts two times.
+///   3. If 4 listings are in flight over all connections, the request gets
+///      503 with `Retry-After: 1`. A listing is in flight from the start of
+///      its build until its response body drops.
+///
+///   Then the server builds the listing. A value that is not a ref name gets
+///   400, and each other error of the build gets 500. A 400, a 405, a 500,
+///   and a 503 have an empty body. A 200 carries `Content-Length`, and the
+///   server sends the body in frames of at most 64 KiB under the body
+///   timeout.
 /// - A path that the view does not find gets 404 with an empty body. A path
 ///   that the view refuses gets the same response, so a client cannot tell
 ///   a private path from an absent one.
 /// - If the view returns an error, the response is 500 with an empty body.
 /// - A response with a known length carries `Content-Length`. A `.filez`
 ///   built on request carries no `Content-Length`.
-/// - The server reads a response body in frames of at most 64 KiB. It never
-///   collects the body whole.
+/// - The server reads a file of the archive view in frames of at most
+///   64 KiB, and never collects the file whole. The server builds a ref
+///   listing whole in memory, at most [`ostrya::MAX_REF_LISTING`] bytes, and
+///   sends it in frames of at most 64 KiB.
 /// - A `HEAD` takes the answer of [`ArchiveView::head`], which reads no byte
 ///   of the file. For a `.filez` built on request, it reads no xattr and
 ///   does no deflate work.
@@ -80,6 +106,7 @@ pub struct Server {
     listeners: Vec<rt::TcpListener>,
     addrs: Vec<SocketAddr>,
     view: Arc<ArchiveView>,
+    repo: Repo,
     receive: Option<Arc<ReceiveEndpoint<FileAuth>>>,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,
@@ -163,7 +190,8 @@ pub async fn bind(repo: Repo, opts: ServeOptions) -> Result<Server> {
     Ok(Server {
         listeners,
         addrs,
-        view: Arc::new(ArchiveView::new(repo)),
+        view: Arc::new(ArchiveView::new(repo.clone())),
+        repo,
         receive,
         tls,
         body_timeout: opts.body_timeout,
@@ -219,6 +247,8 @@ impl Server {
         }
         let serving = Arc::new(Serving {
             view: self.view,
+            repo: self.repo,
+            listings: Arc::new(AtomicUsize::new(0)),
             receive: self.receive,
             tls: self.tls,
             body_timeout: self.body_timeout,
@@ -234,6 +264,9 @@ impl Server {
 /// The state that each connection of a server shares.
 struct Serving {
     view: Arc<ArchiveView>,
+    repo: Repo,
+    /// The count of ref listings in flight, over all connections.
+    listings: Arc<AtomicUsize>,
     receive: Option<Arc<ReceiveEndpoint<FileAuth>>>,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,
@@ -279,7 +312,15 @@ async fn serve_connection(stream: rt::TcpStream, serving: Arc<Serving>, stall: A
             }
             async move {
                 let receive = serving.receive.as_deref();
-                let response = router::handle(&serving.view, receive, &stall, req).await;
+                let response = router::handle(
+                    &serving.view,
+                    &serving.repo,
+                    &serving.listings,
+                    receive,
+                    &stall,
+                    req,
+                )
+                .await;
                 Ok::<_, Infallible>(response)
             }
         })

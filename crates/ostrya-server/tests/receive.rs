@@ -3,6 +3,7 @@
 //!
 //! - a push through the steps of one session
 //! - the routes, and the status of each error
+//! - the ref listing beside the endpoint
 //! - the session limit, the idle timeout, and the silent body
 //! - `DELETE`, and the commit that holds its session
 //! - the refusals of the steps in flight
@@ -658,6 +659,38 @@ fn routes_unknown_ids_and_methods() {
         let post = raw(addr, &request).await;
         assert!(post.starts_with("HTTP/1.1 405 "), "{post}");
         assert_eq!(header(&post, "allow"), Some("GET, HEAD"));
+    });
+}
+
+/// With the receive endpoint, a `GET` of the ref listing gives the bytes of
+/// `build_ref_listing`, and a `HEAD` and a `POST` get 405 with `Allow: GET`.
+#[test]
+fn the_ref_listing_is_served_beside_the_endpoint() {
+    let tmp = TmpDir::new("listing");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    with_server(repo.clone(), options(), |_, addr| async move {
+        let mut stream = ostrya_rt::TcpStream::connect("127.0.0.1", addr.port())
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /_ostrya/refs/v1 HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        let end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert!(out.starts_with(b"HTTP/1.1 200 "));
+        assert_eq!(out[end..], repo.build_ref_listing(&[]).await.unwrap());
+
+        for request in [
+            "HEAD /_ostrya/refs/v1 HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n",
+            "POST /_ostrya/refs/v1 HTTP/1.1\r\nhost: x\r\ncontent-length: 0\r\n\
+             connection: close\r\n\r\n",
+        ] {
+            let response = raw(addr, request).await;
+            assert!(response.starts_with("HTTP/1.1 405 "), "{response}");
+            assert_eq!(header(&response, "allow"), Some("GET"));
+        }
     });
 }
 

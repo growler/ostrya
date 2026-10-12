@@ -3626,6 +3626,13 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   request at `[archive] zlib-level`, and `deltas/` and `delta-indexes/` are
   not served. A path the server refuses and a path it does not find both get
   404. `../format-reference.md`, "The archive view", states the rules.
+- The command also answers `GET /_ostrya/refs/v1?prefix=P&prefix=Q`, with
+  and without `--read-only`. The body is the ref listing of the refs under
+  the prefixes, a summary GVariant built for each request. No query takes
+  all refs. A bad pair of the query, a query of more than 256 pairs, and a
+  prefix that is not a ref name get 400, and a method other than `GET` gets
+  405 with `Allow: GET`. The command holds at most 4 listings at the same
+  time. A request over this limit gets 503 with `Retry-After: 1`.
 - `--read-only` serves the files of a pull alone. Without it the command
   also runs the receive endpoint of a push, and needs an authentication
   method of push: `--push-credentials`, `--client-ca`, or

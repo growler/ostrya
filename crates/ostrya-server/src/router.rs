@@ -1,27 +1,33 @@
 //! The HTTP mapping of the archive view, and the routing to the receive
-//! endpoint.
+//! endpoint and to the ref listing.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{ALLOW, CONTENT_LENGTH, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
-use ostrya::{ArchiveAnswer, ArchiveHead, ArchiveView};
+use ostrya::{ArchiveAnswer, ArchiveHead, ArchiveView, Repo};
 
 use crate::auth::FileAuth;
 use crate::body::{ReceiveBody, ServeBody};
 use crate::endpoint::ReceiveEndpoint;
-use crate::receive;
 use crate::stall::Stall;
+use crate::{receive, refs};
 
 /// Returns the response to one request. The function records a stream body
-/// in `stall`, the deadline of its connection.
+/// in `stall`, the deadline of its connection. `listings` is the count of
+/// ref listings in flight in the server.
 ///
 /// With a receive endpoint, a request under its raw path prefix with a
 /// method other than `GET` and `HEAD` goes to the endpoint. A `GET` or a
-/// `HEAD` there goes to the view, which finds nothing.
+/// `HEAD` there goes to the view, which finds nothing. A request of the raw
+/// path [`refs::PATH`] goes to the ref listing of `repo`, with each method.
+/// Each other request goes to the view.
 pub(crate) async fn handle(
     view: &ArchiveView,
+    repo: &Repo,
+    listings: &Arc<AtomicUsize>,
     receive: Option<&ReceiveEndpoint<FileAuth>>,
     stall: &Arc<Stall>,
     req: Request<Incoming>,
@@ -31,6 +37,9 @@ pub(crate) async fn handle(
         if !read && req.uri().path().starts_with(receive::PREFIX) {
             return receive.handle(req).await.map(ReceiveBody::into_serve);
         }
+    }
+    if req.uri().path() == refs::PATH {
+        return refs::handle(repo, listings, req.method(), req.uri().query(), stall).await;
     }
     let head = match *req.method() {
         Method::GET => false,
@@ -84,7 +93,10 @@ fn respond_head(answer: ostrya::Result<ArchiveHead>) -> Response<ServeBody> {
 
 /// Returns `response` with a `Content-Length` of `len`. If `len` is `None`,
 /// the response gets no `Content-Length`.
-fn with_length(mut response: Response<ServeBody>, len: Option<u64>) -> Response<ServeBody> {
+pub(crate) fn with_length(
+    mut response: Response<ServeBody>,
+    len: Option<u64>,
+) -> Response<ServeBody> {
     if let Some(len) = len {
         response
             .headers_mut()
@@ -105,10 +117,18 @@ pub(crate) fn empty(status: StatusCode) -> Response<ServeBody> {
 }
 
 /// Returns the repository path of a request path. It removes the leading `/`
-/// and decodes the percent escapes. If the path has no leading `/`, a bad
-/// escape, a NUL, or bytes that are not UTF-8, it returns `None`.
+/// and decodes the rest with [`percent_decode`]. If the path has no leading
+/// `/`, it returns `None`.
 fn decode_path(raw: &str) -> Option<String> {
-    let raw = raw.strip_prefix('/')?.as_bytes();
+    percent_decode(raw.strip_prefix('/')?)
+}
+
+/// Returns `raw` with each percent escape decoded. An escape takes hex digits
+/// in either case. Each other byte, `+` included, stays as it is. If `raw`
+/// has a bad escape, or if the result holds a NUL or bytes that are not
+/// UTF-8, the function returns `None`.
+pub(crate) fn percent_decode(raw: &str) -> Option<String> {
+    let raw = raw.as_bytes();
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0;
     while i < raw.len() {
@@ -162,6 +182,8 @@ mod tests {
         for bad in ["config", "*", "/a%2", "/a%zz", "/a%00b", "/%ff"] {
             assert_eq!(decode_path(bad), None, "{bad}");
         }
+        assert_eq!(percent_decode("a%2fb+c").as_deref(), Some("a/b+c"));
+        assert_eq!(percent_decode("").as_deref(), Some(""));
     }
 
     /// A `HEAD` keeps the length that a `GET` sends and has no body. A refusal

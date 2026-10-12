@@ -5,6 +5,7 @@
 //! - `HEAD`
 //! - client certificates
 //! - the stop on drop
+//! - the ref listing and its query
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -20,7 +21,7 @@ use ostrya::fetch::{
 };
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree,
-    ObjectType, Repo, RepoMode, loose_path,
+    ObjectType, Repo, RepoMode, Summary, loose_path,
 };
 use ostrya_rt::block_on;
 use ostrya_server::{ServeOptions, ServerTls};
@@ -209,6 +210,26 @@ fn header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
     let head = response.split("\r\n\r\n").next().unwrap();
     head.split("\r\n")
         .find_map(|line| line.strip_prefix(&format!("{name}: ")))
+}
+
+/// Sends `request` on a new connection, reads the response until the server
+/// closes the connection, and returns its head and its body.
+async fn exchange(addr: SocketAddr, request: &str) -> (String, Vec<u8>) {
+    let mut stream = ostrya_rt::TcpStream::connect("127.0.0.1", addr.port())
+        .await
+        .unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut out = Vec::new();
+    stream.read_to_end(&mut out).await.unwrap();
+    let end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let body = out.split_off(end);
+    (String::from_utf8(out).unwrap(), body)
+}
+
+/// A request of `method` for `target` that closes its connection.
+fn ask(method: &str, target: &str) -> String {
+    format!("{method} {target} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
 }
 
 /// Over plain HTTP, the server serves the built `config`, a stored object
@@ -557,5 +578,156 @@ fn a_stalled_body_releases_its_compressor() {
         assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
         assert!(out.ends_with("0\r\n\r\n"), "the chunked body ends");
         drop(stalled);
+    });
+}
+
+/// Sets the refs `a/b/c`, `a/b/d`, and `a/bc` of `repo` to `commit`.
+async fn add_refs(repo: &Repo, commit: &Checksum) {
+    let txn = repo.transaction().await.unwrap();
+    for name in ["a/b/c", "a/b/d", "a/bc"] {
+        txn.set_ref(name, Some(commit));
+    }
+    txn.commit().await.unwrap();
+}
+
+/// A `GET` of the ref listing gives the bytes of `build_ref_listing` for the
+/// prefixes of its query, with their length. No query takes all refs, and a
+/// prefix given two times gives the bytes of one time. The server does not
+/// see a `#` fragment. The requests go one
+/// after the other, more of them than the listings that the server holds at
+/// the same time, so each listing frees its place when its body ends.
+#[test]
+fn the_ref_listing_is_served() {
+    let tmp = TmpDir::new("listing");
+    let (_, repo, commit, _) = block_on(repo(tmp.path()));
+    block_on(add_refs(&repo, &commit));
+    with_server(repo.clone(), local(), |addrs| async move {
+        let addr = addrs[0];
+        let get = |query: &str| {
+            let request = ask("GET", &format!("/_ostrya/refs/v1{query}"));
+            async move { exchange(addr, &request).await }
+        };
+
+        let (head, body) = get("?prefix=a%2Fb&prefix=main").await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert_eq!(
+            body,
+            repo.build_ref_listing(&["a/b", "main"]).await.unwrap()
+        );
+        assert_eq!(
+            header(&head, "content-length"),
+            Some(body.len().to_string().as_str())
+        );
+        assert_eq!(header(&head, "content-type"), None);
+        let names: Vec<String> = Summary::parse(&body)
+            .unwrap()
+            .refs
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(names, ["a/b/c", "a/b/d", "main"]);
+
+        let all = repo.build_ref_listing(&[]).await.unwrap();
+        for query in ["", "?", "#prefix=main"] {
+            let (head, body) = get(query).await;
+            assert!(head.starts_with("HTTP/1.1 200 "), "{query}: {head}");
+            assert_eq!(body, all, "{query}");
+        }
+        let main = repo.build_ref_listing(&["main"]).await.unwrap();
+        for query in ["?prefix=main&prefix=main", "?prefix=main", "?prefix=main#x"] {
+            let (head, body) = get(query).await;
+            assert!(head.starts_with("HTTP/1.1 200 "), "{query}: {head}");
+            assert_eq!(body, main, "{query}");
+        }
+    });
+}
+
+/// A listed ref that names an absent commit fails the build. Each such
+/// request gets 500 with an empty body and frees its place, so a listing
+/// after more of them than the server holds at the same time gets 200.
+#[test]
+fn a_failed_listing_gets_500() {
+    let tmp = TmpDir::new("listing-500");
+    let (path, repo, _, _) = block_on(repo(tmp.path()));
+    std::fs::write(
+        path.join("refs/heads/absent"),
+        format!("{}\n", "ab".repeat(32)),
+    )
+    .unwrap();
+    with_server(repo.clone(), local(), |addrs| async move {
+        let target = "/_ostrya/refs/v1?prefix=absent";
+        for _ in 0..6 {
+            let (head, body) = exchange(addrs[0], &ask("GET", target)).await;
+            assert!(head.starts_with("HTTP/1.1 500 "), "{head}");
+            assert_eq!(header(&head, "content-length"), Some("0"));
+            assert!(body.is_empty());
+        }
+        let (head, body) = exchange(addrs[0], &ask("GET", "/_ostrya/refs/v1?prefix=main")).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert_eq!(body, repo.build_ref_listing(&["main"]).await.unwrap());
+    });
+}
+
+/// A bad pair of the query and a prefix that is not a ref name get 400 with
+/// an empty body.
+#[test]
+fn the_ref_listing_refuses_bad_queries() {
+    let tmp = TmpDir::new("listing-bad");
+    let (_, repo, _, _) = block_on(repo(tmp.path()));
+    with_server(repo, local(), |addrs| async move {
+        for query in [
+            "?x=1",
+            "?prefix",
+            "?prefix=",
+            "?prefix=a&&prefix=b",
+            "?prefix=a%zz",
+            "?prefix=a%00",
+            "?prefix=%ff",
+            "?prefix=a%2F%2Fb",
+            "?prefix=..",
+            "?prefix=a/",
+        ] {
+            let target = format!("/_ostrya/refs/v1{query}");
+            let (head, body) = exchange(addrs[0], &ask("GET", &target)).await;
+            assert!(head.starts_with("HTTP/1.1 400 "), "{query}: {head}");
+            assert_eq!(header(&head, "content-length"), Some("0"), "{query}");
+            assert!(body.is_empty(), "{query}");
+        }
+    });
+}
+
+/// A `HEAD` and a `POST` of the ref listing get 405 with `Allow: GET`.
+#[test]
+fn the_ref_listing_takes_get_alone() {
+    let tmp = TmpDir::new("listing-method");
+    let (_, repo, _, _) = block_on(repo(tmp.path()));
+    with_server(repo, local(), |addrs| async move {
+        for method in ["HEAD", "POST"] {
+            let (head, _) = exchange(addrs[0], &ask(method, "/_ostrya/refs/v1")).await;
+            assert!(head.starts_with("HTTP/1.1 405 "), "{method}: {head}");
+            assert_eq!(header(&head, "allow"), Some("GET"), "{method}");
+        }
+    });
+}
+
+/// The archive view still serves the files under `refs/heads`, and still
+/// ignores the query. A path near the path of the listing gets 404.
+#[test]
+fn the_view_still_serves_refs_heads() {
+    let tmp = TmpDir::new("listing-view");
+    let (path, repo, _, _) = block_on(repo(tmp.path()));
+    with_server(repo, local(), |addrs| async move {
+        let addr = addrs[0];
+        let stored = std::fs::read(path.join("refs/heads/main")).unwrap();
+        let (head, body) = exchange(addr, &ask("GET", "/refs/heads/main")).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert_eq!(body, stored);
+        for target in ["/_ostrya/refs/v1/", "/_ostrya/refs", "/_ostrya/refs/v1%2F"] {
+            let (head, _) = exchange(addr, &ask("GET", target)).await;
+            assert!(head.starts_with("HTTP/1.1 404 "), "{target}: {head}");
+        }
+        let (head, body) = exchange(addr, &ask("GET", "/config?prefix=x")).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert!(body.starts_with(b"[core]\n"));
     });
 }

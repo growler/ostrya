@@ -1387,7 +1387,8 @@ impl ListingWriter {
     }
 
     /// Closes the ref array, appends the serialized metadata dict `metadata`,
-    /// and returns the listing.
+    /// and returns the listing. The function gives the unused capacity of the
+    /// buffer back to the allocator.
     ///
     /// The ref array starts at offset 0. Its framing offsets follow its
     /// entries, in entry order. An empty array has no offsets. The tuple then
@@ -1406,6 +1407,7 @@ impl ListingWriter {
         let width = choose_offset_size(self.out.len(), 1);
         self.make_room(width)?;
         write_offset(&mut self.out, array_end, width);
+        self.out.shrink_to_fit();
         Ok(self.out)
     }
 }
@@ -2003,6 +2005,15 @@ mod tests {
             let listing = listing_both_ways(Vec::new(), metadata);
             assert_eq!(listing.len(), listing_len, "{data_and_offset}");
         }
+    }
+
+    /// The listing that the writer returns holds no large unused capacity,
+    /// after the buffer grew from a capacity of 0.
+    #[test]
+    fn the_listing_writer_returns_a_buffer_near_its_length() {
+        let listing = listing_both_ways(entries_of(1000, 40), Value::Array(Vec::new()));
+        let spare = listing.capacity() - listing.len();
+        assert!(spare < listing.len() / 8, "{spare} of {}", listing.len());
     }
 
     /// The floor of a ref entry is at most the size of each entry, and is the

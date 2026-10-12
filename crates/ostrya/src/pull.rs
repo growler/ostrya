@@ -190,13 +190,6 @@ use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::write::FileMeta;
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "only the tests call the chain planner until the delta discovery uses it"
-    )
-)]
 mod chain;
 mod delta;
 mod drive;
@@ -1486,7 +1479,7 @@ impl Repo {
     /// - [`Error::Io`] for an I/O failure of the file system. Also for a held
     ///   dirtree that the pull cannot read, that is not a regular file, or that
     ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
-    pub async fn pull_local(&self, src: &Repo, opts: PullOptions) -> Result<PullStats> {
+    pub async fn pull_local(&self, src: &Repo, mut opts: PullOptions) -> Result<PullStats> {
         let started = Instant::now();
         // A local pull copies whole trees. The `ostree pull-local` command
         // takes no subpath either.
@@ -1496,7 +1489,8 @@ impl Repo {
         check_depth(opts.depth)?;
         check_static_deltas(&opts)?;
         let collection_relpaths = check_local_collection(&opts)?;
-        refuse_static_delta_list(&opts)?;
+        let edges = take_static_deltas(&mut opts).await?;
+        refuse_static_delta_list(edges.as_ref())?;
         // The pull builds the signature policy before it reads the source. So
         // a check that the options ask for with no remote to take keys from
         // fails here, before the walk of a chain.
@@ -1575,12 +1569,13 @@ impl Repo {
                     &targets,
                     &opts,
                     opts.remote.as_deref(),
+                    edges,
                     &verification,
                     &counters,
                 )
                 .await?
             }
-            None => HashMap::new(),
+            None => delta::DeltaPlan::default(),
         };
         drop(summary);
         let mut deltas = deltas;
@@ -1664,7 +1659,7 @@ impl Repo {
             // imports what no part produced.
             let checks = ModeChecks::new(flags, self.mode());
             for (_, tip) in &targets {
-                let Some(job) = deltas.get(tip) else {
+                let Some(job) = deltas.jobs.get(tip) else {
                     continue;
                 };
                 if txn.is_staged(tip, ObjectType::Commit) {
@@ -2174,14 +2169,41 @@ impl ChainCheck<'_> {
         // else that of this repository. A filter makes the stored metadata
         // smaller, so a later verification of the stored commit reads what the
         // filter kept.
-        let detached = match detached_bytes_from(self.sources, commit).await? {
-            Some(bytes) => crate::summary::parse_signature_dict(&bytes)?,
-            None => self.repo.read_commit_detached_metadata(commit).await?,
-        };
-        self.verification
-            .check_commit(commit, bytes, detached.as_ref())
-            .await
+        let detached = detached_bytes_from(self.sources, commit).await?;
+        check_commit_signatures(
+            self.repo,
+            self.verification,
+            commit,
+            bytes,
+            detached.as_deref(),
+        )
+        .await
     }
+}
+
+/// Checks the signatures of `commit`, whose object holds `bytes`, against the
+/// commit policy of `verification`.
+///
+/// `detached` is the `.commitmeta` that the pull puts in place. If it is
+/// `None`, the check reads the detached metadata of `repo`. A policy that does
+/// not apply to commits passes each commit and reads nothing.
+async fn check_commit_signatures(
+    repo: &Repo,
+    verification: &verify::Verification,
+    commit: &Checksum,
+    bytes: &[u8],
+    detached: Option<&[u8]>,
+) -> Result<()> {
+    if !verification.checks_commits() {
+        return Ok(());
+    }
+    let dict = match detached {
+        Some(detached) => crate::summary::parse_signature_dict(detached)?,
+        None => repo.read_commit_detached_metadata(commit).await?,
+    };
+    verification
+        .check_commit(commit, bytes, dict.as_ref())
+        .await
 }
 
 /// The object names that the plans of a pull met so far, planned or found
@@ -2463,14 +2485,15 @@ fn check_depth(depth: i32) -> Result<()> {
     Ok(())
 }
 
-/// Refuses a list of static deltas that a pull cannot take.
+/// Refuses a list of static deltas that a pull cannot take with its other
+/// options.
 ///
 /// The check reads `opts` alone, so a refusal sends no request and opens no
 /// transaction. A pull with no list passes.
 fn check_static_deltas(opts: &PullOptions) -> Result<()> {
-    let Some(list) = opts.static_deltas.as_deref() else {
+    if opts.static_deltas.is_none() {
         return Ok(());
-    };
+    }
     if opts.disable_static_deltas {
         return Err(Error::InvalidInput(
             "a pull with static_deltas takes no disable_static_deltas option".into(),
@@ -2481,13 +2504,34 @@ fn check_static_deltas(opts: &PullOptions) -> Result<()> {
             "a pull with static_deltas takes no subpath".into(),
         ));
     }
-    chain::Edges::new(list).map(drop)
+    Ok(())
+}
+
+/// Takes the list of static deltas out of `opts` as the index of its deltas.
+///
+/// The index sorts the list on the blocking pool. The entry points call this
+/// function after their other checks, because the sort of a long list costs
+/// time. A pull with no list gets `None`. After the call,
+/// `opts.static_deltas` is `None`, and the pull reads the list from the index
+/// alone.
+///
+/// # Errors
+///
+/// [`Error::InvalidInput`] if two entries have the same source and target
+/// and different digests.
+async fn take_static_deltas(opts: &mut PullOptions) -> Result<Option<chain::Edges>> {
+    let Some(list) = opts.static_deltas.take() else {
+        return Ok(None);
+    };
+    ostrya_rt::unblock(move || chain::Edges::new(list))
+        .await
+        .map(Some)
 }
 
 /// Refuses a pull with a list of static deltas, because no pull applies a
-/// list yet.
-fn refuse_static_delta_list(opts: &PullOptions) -> Result<()> {
-    if opts.static_deltas.is_some() {
+/// list yet. `edges` is the index that [`take_static_deltas`] gives.
+fn refuse_static_delta_list(edges: Option<&chain::Edges>) -> Result<()> {
+    if edges.is_some() {
         return Err(Error::Unsupported(
             "a pull does not apply a static_deltas list".into(),
         ));

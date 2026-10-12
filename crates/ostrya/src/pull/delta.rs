@@ -10,11 +10,36 @@
 //!
 //! `PullOptions::static_deltas` replaces the search with a list of deltas
 //! that the caller gives. The sibling module `chain` plans chains of deltas
-//! from such a list. A pull refuses a list before its first request, so the
-//! search of this module runs for each pull that it accepts.
+//! from such a list, and [`discover`] then fetches the steps of the chains. A
+//! pull refuses a list before its first request, so only the search of this
+//! module runs for each pull that it accepts.
+//!
+//! The discovery of a chain keeps one record for each step of the plan, and
+//! drops each parsed superblock after its checks. So the heap holds one
+//! parsed superblock at a time. A record from a remote keeps the raw
+//! superblock in one unlinked temp file in `tmp/` of the repository, with no
+//! map. Discovery writes the bytes to the file after the digest check and
+//! before the other checks. A failed check stops the pull, so each record
+//! that discovery keeps holds verified bytes. A record from a local source
+//! keeps no bytes, and the parse of a level reads the superblock from the
+//! source again and checks its digest. The parse of a level gives the jobs
+//! of that level alone.
+//!
+//! For each intermediate commit of a chain, discovery fetches the
+//! `.commitmeta` right after the superblock, and checks the signatures of the
+//! commit that the superblock carries. If the source does not hold a
+//! superblock of the plan, discovery excludes that delta, plans again, and
+//! fetches only the steps that it did not fetch before. The planner limits
+//! the number of deltas that one discovery plans again around.
+//!
+//! The digest check, the parse, and the check of the inline parts of a
+//! superblock run on the blocking pool.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::FileExt;
+use std::sync::Arc;
 
 use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode, Value};
 use ostrya_rt::FileReader;
@@ -22,8 +47,9 @@ use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::delta::{
-    Blob, DeltaFallback, DeltaPart, DeltaSuperblock, MAX_SUPERBLOCK, apply_part, concat_to_blob,
-    decode_inline_part, decode_part_stream, inline_part_at, verify_inline_part,
+    Blob, DeltaFallback, DeltaPart, DeltaSuperblock, MAX_SUPERBLOCK, apply_part, check_inline_part,
+    concat_to_blob, decode_inline_part, decode_part_stream, inline_part_at, open_rw_temp,
+    verify_inline_part,
 };
 use crate::deltagen::{
     STATIC_DELTAS_KEY, SUPERBLOCK_FILE, delta_index_relative_path, delta_name, delta_relative_dir,
@@ -36,10 +62,14 @@ use crate::pull::verify::Verification;
 use crate::pull::{ModeChecks, PullCounters, PullFlags, PullOptions, refspec};
 use crate::read::CommitState;
 use crate::repo::Repo;
-use crate::summary::{INDEXED_DELTAS_KEY, Summary, delta_digest};
+use crate::summary::{AdvertisedDelta, INDEXED_DELTAS_KEY, Summary, delta_digest};
 use crate::transaction::Transaction;
 
+use super::chain::{
+    ChainPlan, ChainSearch, Edges, Planned, check_complete, complete_sources, scratch_allowed,
+};
 use super::source::{RemoteSource, Transfer, session_error};
+use super::{check_commit_signatures, count_fetched, detached_bytes_from, source_size};
 
 /// The number of delta parts that one pull fetches at a time.
 pub(crate) const PART_CAP: usize = 2;
@@ -120,8 +150,319 @@ impl DeltaJob {
             .zip(&self.inline)
             .filter(|(_, inline)| inline.is_none())
             .fold((0, 0), |(parts, bytes), (entry, _)| {
-                (parts + 1, bytes + entry.size)
+                (parts + 1, bytes.saturating_add(entry.size))
             })
+    }
+}
+
+/// The deltas that discovery found for one pull.
+///
+/// Without a list of static deltas, `jobs` holds the delta of each target
+/// commit that has one, and the plan holds no record. With a list, `jobs` is
+/// empty. The plan then holds one record for each commit that a chain makes,
+/// and the levels of the intermediate commits.
+#[derive(Default)]
+pub(crate) struct DeltaPlan {
+    /// The job of each target commit, from the search for one delta.
+    pub(crate) jobs: HashMap<Checksum, DeltaJob>,
+    /// The record of the step that makes each commit of the chains.
+    records: HashMap<Checksum, StepRecord>,
+    /// The intermediate commits of the chains, by level, in plan order. A
+    /// commit of level `k + 1` is made from a commit of level `k`. A commit
+    /// with a record and in no level is a target, which the pull applies
+    /// last.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the chain apply of the pull reads the levels")
+    )]
+    levels: Vec<Vec<Checksum>>,
+    /// The file of the raw bytes of the records from a remote.
+    store: Option<RecordStore>,
+}
+
+impl DeltaPlan {
+    /// Adds the part files of each job and of each record, and their declared
+    /// sizes, to the planned counts in `progress`.
+    pub(crate) fn plan_parts(&self, progress: &PullCounters) {
+        let jobs = self.jobs.values().map(DeltaJob::fetched_parts);
+        let records = self.records.values().map(|record| record.parts);
+        for (parts, bytes) in jobs.chain(records) {
+            progress.parts_planned(parts, bytes);
+        }
+    }
+
+    /// Parses the records of `commits` again, and returns the job of each
+    /// commit that has a record.
+    ///
+    /// A record from a remote reads the bytes that discovery verified from
+    /// the record file. A record from a local source reads the superblock
+    /// from `source` again and checks it against the listed digest. The parse
+    /// takes the inline parts of each job, as [`take_inline_parts`] states.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ChecksumMismatch`] if a superblock of a local source does
+    ///   not have the listed digest.
+    /// - [`Error::InvalidFormat`] if a local source no longer holds a
+    ///   superblock.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the chain apply of the pull parses the levels")
+    )]
+    pub(crate) async fn parse_level(
+        &self,
+        repo: &Repo,
+        source: &DeltaSource<'_>,
+        commits: &[Checksum],
+    ) -> Result<HashMap<Checksum, DeltaJob>> {
+        let mut jobs = HashMap::with_capacity(commits.len());
+        for commit in commits {
+            let Some(record) = self.records.get(commit) else {
+                continue;
+            };
+            let fetched = read_record(self.store.as_ref(), source, record).await?;
+            jobs.insert(*commit, fetched.into_job(repo).await?);
+        }
+        Ok(jobs)
+    }
+}
+
+/// A step of a chain whose superblock discovery fetched and verified.
+struct StepRecord {
+    /// The delta of the step, as the list gives it.
+    delta: AdvertisedDelta,
+    /// The number of part files of the delta and the sum of their declared
+    /// sizes.
+    parts: (u32, u64),
+    /// The range of the raw superblock in the record file. `None` for a local
+    /// source, which keeps no bytes.
+    superblock: Option<Range<u64>>,
+    /// The check of the commit of the step.
+    detached: Detached,
+}
+
+/// The check of the commit of a step, which discovery runs for an
+/// intermediate commit.
+enum Detached {
+    /// Discovery did not check the commit, because it is a target alone.
+    NotChecked,
+    /// Discovery checked the signatures of the commit.
+    Checked {
+        /// The range of the verified `.commitmeta` in the record file. `None`
+        /// if the remote and the localcache repositories hold none, and for a
+        /// local source, which keeps no bytes.
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "the chain apply of the pull stages the detached metadata"
+            )
+        )]
+        kept: Option<Range<u64>>,
+    },
+}
+
+/// The result of the check of one intermediate commit.
+struct Checked {
+    /// The range of the verified `.commitmeta` in the record file, from a
+    /// remote.
+    kept: Option<Range<u64>>,
+    /// What the check read of the `.commitmeta` in a local source.
+    local: LocalRead,
+}
+
+/// What the check of an intermediate commit read of its `.commitmeta` in a
+/// local source.
+enum LocalRead {
+    /// The check read nothing from a local source: the source is a remote,
+    /// or the policy checks no commit.
+    Nothing,
+    /// The local source holds no `.commitmeta` of the commit.
+    Absent,
+    /// The local source holds a `.commitmeta` of this size.
+    Size(u64),
+}
+
+/// The file that keeps the raw superblocks and the verified `.commitmeta`
+/// files of a discovery from a remote.
+///
+/// The file is one unlinked temp file in `tmp/` of the repository, open for
+/// reads and writes and not mapped. It opens at the first write. Discovery
+/// appends to it, and a record holds the range of its bytes. The bytes of a
+/// record that discovery drops stay in the file. The file goes away when the
+/// pull drops it.
+struct RecordStore {
+    /// The repository whose `tmp/` holds the file.
+    repo: Repo,
+    /// The file, after the first write.
+    file: Option<Arc<std::fs::File>>,
+    /// The length of the file.
+    len: u64,
+}
+
+impl RecordStore {
+    /// Returns a record store in `tmp/` of `repo`, with no file yet.
+    fn new(repo: &Repo) -> RecordStore {
+        RecordStore {
+            repo: repo.clone(),
+            file: None,
+            len: 0,
+        }
+    }
+
+    /// Returns the file, and opens it if it is not open.
+    async fn file(&mut self) -> Result<Arc<std::fs::File>> {
+        if let Some(file) = &self.file {
+            return Ok(Arc::clone(file));
+        }
+        let tmp = self.repo.open_tmp_dir().await?;
+        let fd = ostrya_rt::unblock(move || open_rw_temp(tmp.as_fd())).await?;
+        let file = Arc::new(std::fs::File::from(fd));
+        self.file = Some(Arc::clone(&file));
+        Ok(file)
+    }
+
+    /// Appends `bytes` on the blocking pool, and returns their range.
+    async fn append(&mut self, bytes: Vec<u8>) -> Result<Range<u64>> {
+        let file = self.file().await?;
+        let start = self.len;
+        let end = start + bytes.len() as u64;
+        ostrya_rt::unblock(move || file.write_all_at(&bytes, start)).await?;
+        self.len = end;
+        Ok(start..end)
+    }
+
+    /// Reads the bytes at `range` on the blocking pool.
+    async fn read(&self, range: Range<u64>) -> Result<Vec<u8>> {
+        let file = self
+            .file
+            .clone()
+            .ok_or_else(|| Error::InvalidFormat("the record file holds no record".into()))?;
+        ostrya_rt::unblock(move || {
+            let len = usize::try_from(range.end - range.start)
+                .map_err(|_| Error::InvalidFormat("a record is larger than memory".into()))?;
+            let mut bytes = vec![0; len];
+            file.read_exact_at(&mut bytes, range.start)?;
+            Ok(bytes)
+        })
+        .await
+    }
+}
+
+/// A superblock that discovery fetched and parsed, with its source and
+/// target checked against the request, its signatures checked, and its
+/// inline parts verified.
+struct FetchedDelta {
+    /// The request path prefix of the delta, `deltas/<fanout>/<rest>`.
+    dir: String,
+    /// The name of the delta in hex, `<to>` or `<from>-<to>`.
+    name: String,
+    /// The normal-form bytes of the target commit.
+    commit_bytes: Vec<u8>,
+    meta_entries: Vec<DeltaPart>,
+    fallbacks: Vec<DeltaFallback>,
+    /// The metadata dict, which carries the inline parts.
+    metadata: Value,
+    /// The position in `metadata` of each inline part, in part order.
+    inline_index: Vec<Option<usize>>,
+}
+
+impl FetchedDelta {
+    /// Copies the inline parts out of the metadata dict, and returns the job.
+    async fn into_job(self, repo: &Repo) -> Result<DeltaJob> {
+        let (inline, inline_bodies) = take_inline_parts(
+            repo,
+            &self.metadata,
+            &self.inline_index,
+            &self.dir,
+            &self.meta_entries,
+        )
+        .await?;
+        let FetchedDelta {
+            dir,
+            name,
+            commit_bytes,
+            meta_entries,
+            fallbacks,
+            metadata,
+            ..
+        } = self;
+        drop(metadata);
+        Ok(DeltaJob {
+            dir,
+            name,
+            commit_bytes,
+            meta_entries,
+            fallbacks,
+            inline,
+            inline_bodies,
+        })
+    }
+
+    /// Returns the number of part files and the sum of their declared sizes.
+    fn parts(&self) -> (u32, u64) {
+        self.meta_entries
+            .iter()
+            .enumerate()
+            .filter(|(part, _)| self.inline_index.get(*part).copied().flatten().is_none())
+            .fold((0, 0), |(parts, bytes), (_, entry)| {
+                (parts + 1, bytes.saturating_add(entry.size))
+            })
+    }
+
+    /// Verifies each inline part in place against its meta-entry, with no
+    /// copy.
+    fn verify_inline_parts(&self) -> Result<()> {
+        for (part, entry) in self.meta_entries.iter().enumerate() {
+            if let Some((compression, body)) =
+                inline_part_at(&self.metadata, &self.inline_index, part, || {
+                    self.dir.clone()
+                })?
+            {
+                verify_inline_part(compression, body, entry)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A superblock that the blocking pool parsed, before the check of its
+/// signatures.
+struct ParsedDelta {
+    delta: FetchedDelta,
+    /// The raw superblock bytes that the signatures cover.
+    superblock_bytes: Vec<u8>,
+    /// The signature array.
+    signatures: Option<Value>,
+    /// The result of the check of the inline parts. The pull reports it after
+    /// the check of the signatures.
+    inline: Result<()>,
+}
+
+impl ParsedDelta {
+    /// Checks the signatures of the superblock if `verification` is set, as
+    /// [`verify_fetched_delta`] states, then gives the result of the check of
+    /// the inline parts. Returns the delta, with the raw bytes and the
+    /// signature array dropped.
+    async fn verify(self, verification: Option<&Verification>) -> Result<FetchedDelta> {
+        let ParsedDelta {
+            delta,
+            superblock_bytes,
+            signatures,
+            inline,
+        } = self;
+        if let Some(verification) = verification {
+            verify_fetched_delta(
+                verification,
+                &delta.name,
+                &superblock_bytes,
+                signatures.as_ref(),
+            )
+            .await?;
+        }
+        drop(superblock_bytes);
+        inline?;
+        Ok(delta)
     }
 }
 
@@ -153,7 +494,15 @@ impl DeltaJob {
 ///
 /// Each delta index request and each superblock request adds one to the
 /// metadata count in `progress`, whatever the source answers. The `ostree`
-/// command counts the same way.
+/// command counts the same way. The discovery of a chain also counts the
+/// `.commitmeta` of each intermediate commit, as [`check_intermediate`]
+/// states.
+///
+/// `edges` is the index of a list of static deltas. With a list, discovery
+/// reads no summary and no delta index, and [`discover_chain`] plans and
+/// fetches the chains. A [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull ignores
+/// the list. A pull that requires static deltas needs no summary for the
+/// list.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn discover(
     repo: &Repo,
@@ -162,13 +511,30 @@ pub(crate) async fn discover(
     targets: &[(String, Checksum)],
     opts: &PullOptions,
     ref_prefix: Option<&str>,
+    edges: Option<Edges>,
     verification: &Verification,
     progress: &PullCounters,
-) -> Result<HashMap<Checksum, DeltaJob>> {
-    let mut jobs = HashMap::new();
+) -> Result<DeltaPlan> {
     if opts.disable_static_deltas {
-        return Ok(jobs);
+        return Ok(DeltaPlan::default());
     }
+    if let Some(edges) = edges {
+        if opts.flags.contains(PullFlags::COMMIT_ONLY) {
+            return Ok(DeltaPlan::default());
+        }
+        return discover_chain(
+            repo,
+            source,
+            targets,
+            opts,
+            ref_prefix,
+            edges,
+            verification,
+            progress,
+        )
+        .await;
+    }
+    let mut jobs = HashMap::new();
     // If there is no summary, nothing advertises a delta, so a pull that
     // requires a delta fails whatever it looks for.
     if opts.require_static_deltas && summary.is_none() {
@@ -179,7 +545,7 @@ pub(crate) async fn discover(
             && repo.mode() == RepoMode::Archive
             && !opts.require_static_deltas)
     {
-        return Ok(jobs);
+        return Ok(DeltaPlan::default());
     }
     for (ref_name, to) in targets {
         if jobs.contains_key(to) || complete_here(repo, to).await? {
@@ -187,7 +553,7 @@ pub(crate) async fn discover(
         }
         let tip = repo.resolve_ref_tip(&refspec(ref_prefix, ref_name)).await?;
         let from = source_commit(repo, tip, to).await?;
-        let scratch = super::chain::scratch_allowed(tip, from, to);
+        let scratch = scratch_allowed(tip, from, to);
         if let Some(job) = discover_one(
             repo,
             source,
@@ -205,7 +571,426 @@ pub(crate) async fn discover(
             jobs.insert(*to, job);
         }
     }
-    Ok(jobs)
+    Ok(DeltaPlan {
+        jobs,
+        ..DeltaPlan::default()
+    })
+}
+
+/// Plans the chains of static deltas to the targets over `edges`, and fetches
+/// and verifies the superblock of each step.
+///
+/// The targets are the commits of `targets` that this repository does not
+/// hold complete, each once, in the order of the refs, as [`chain_targets`]
+/// states. The planner of the sibling module `chain` finds and merges the
+/// chains.
+///
+/// Discovery fetches the steps of the plan in level order, and the steps to
+/// the targets last. For each step it fetches the superblock, checks its
+/// digest, its source and target, its signatures, and its inline parts, and
+/// keeps a record. Then it drops the parsed superblock. For each
+/// intermediate commit it also fetches the `.commitmeta` and checks the
+/// signatures of the commit, as [`check_intermediate`] states.
+///
+/// If the source does not hold the superblock of a step, discovery excludes
+/// that delta and plans again. It fetches only the steps that it did not
+/// fetch before. Each pass excludes one delta, so the loop ends. The planner
+/// limits the number of deltas that it plans again around. At the end
+/// discovery drops each record that the last plan does not use. A target
+/// with no chain gets no record, and the pull fetches its objects loose.
+///
+/// # Errors
+///
+/// - [`Error::Pull`] if the pull requires static deltas and a plan has no
+///   chain to a target. A delta from scratch to the target that the scratch
+///   rule refuses counts as a chain, and the pull fetches loose.
+/// - [`Error::ChecksumMismatch`] if a superblock does not have its listed
+///   digest.
+/// - [`Error::Pull`] if a superblock produces another commit, or from
+///   another commit, than its entry of the list.
+/// - [`Error::Signature`] if the signatures of a superblock or of an
+///   intermediate commit fail the policy of the pull.
+/// - [`Error::InvalidFormat`] if a superblock or an inline part is
+///   malformed.
+#[allow(clippy::too_many_arguments)]
+async fn discover_chain(
+    repo: &Repo,
+    source: &DeltaSource<'_>,
+    targets: &[(String, Checksum)],
+    opts: &PullOptions,
+    ref_prefix: Option<&str>,
+    edges: Edges,
+    verification: &Verification,
+    progress: &PullCounters,
+) -> Result<DeltaPlan> {
+    let (wanted, names) = chain_targets(repo, targets, ref_prefix).await?;
+    if wanted.is_empty() {
+        return Ok(DeltaPlan::default());
+    }
+    let target_commits: Vec<Checksum> = wanted.iter().map(|(target, _)| *target).collect();
+    let (edges, complete) = complete_sources(repo, edges, &target_commits).await?;
+    let (mut search, mut pass) = ostrya_rt::unblock(move || {
+        let search = ChainSearch::new(edges, complete, wanted);
+        let pass = Pass::new(&search);
+        (search, pass)
+    })
+    .await;
+
+    let mut store = match source {
+        DeltaSource::Remote(_) => Some(RecordStore::new(repo)),
+        DeltaSource::Local(_) => None,
+    };
+    // The record of each fetched step, by list index.
+    let mut records: HashMap<usize, StepRecord> = HashMap::new();
+    // The check of each intermediate commit, by commit. A commit keeps its
+    // check when a later plan makes it from another step.
+    let mut checked: HashMap<Checksum, Checked> = HashMap::new();
+    'plan: loop {
+        if opts.require_static_deltas {
+            for ((target, planned), name) in search.targets().zip(&names) {
+                if !pass.plan.steps.contains_key(target) && *planned != Planned::Declined {
+                    return Err(none_found_error(name, target));
+                }
+            }
+        }
+        for commit in std::mem::take(&mut pass.order) {
+            let index = pass.plan.steps[&commit];
+            let check = pass.intermediate.contains(&commit) && !checked.contains_key(&commit);
+            let commit_bytes = match records.get(&index) {
+                Some(_) if !check => continue,
+                // A commit that an earlier plan made as a target alone is an
+                // intermediate commit of this plan.
+                Some(record) => {
+                    let FetchedDelta { commit_bytes, .. } =
+                        read_record(store.as_ref(), source, record).await?;
+                    commit_bytes
+                }
+                None => {
+                    let delta = *search.edges().delta(index);
+                    let Some((fetched, kept)) = fetch_job(
+                        source,
+                        delta.from,
+                        delta.to,
+                        Some(delta.superblock),
+                        verification,
+                        progress,
+                        store.as_mut(),
+                    )
+                    .await?
+                    else {
+                        (search, pass) = ostrya_rt::unblock(move || {
+                            search.exclude(index);
+                            let pass = Pass::new(&search);
+                            (search, pass)
+                        })
+                        .await;
+                        continue 'plan;
+                    };
+                    records.insert(
+                        index,
+                        StepRecord {
+                            delta,
+                            parts: fetched.parts(),
+                            superblock: kept,
+                            detached: Detached::NotChecked,
+                        },
+                    );
+                    // Only the commit bytes stay for the check below.
+                    let FetchedDelta { commit_bytes, .. } = fetched;
+                    commit_bytes
+                }
+            };
+            if check {
+                let result = check_intermediate(
+                    repo,
+                    source,
+                    &opts.localcache_repos,
+                    &commit,
+                    &commit_bytes,
+                    verification,
+                    progress,
+                    store.as_mut(),
+                )
+                .await?;
+                checked.insert(commit, result);
+            }
+        }
+        break;
+    }
+
+    // A local source counts the `.commitmeta` of each intermediate commit of
+    // the last plan alone, by the rule of the import of the pull.
+    if let DeltaSource::Local(src) = source {
+        for commit in pass.plan.levels.iter().flatten() {
+            let size = match checked.get(commit).map(|check| &check.local) {
+                Some(LocalRead::Size(size)) => Some(*size),
+                Some(LocalRead::Absent) => None,
+                Some(LocalRead::Nothing) | None => {
+                    source_size(src, ObjectType::CommitMeta, commit).await?
+                }
+            };
+            if let Some(size) = size {
+                count_fetched(progress, ObjectType::CommitMeta, size);
+            }
+        }
+    }
+
+    let mut kept_records = HashMap::with_capacity(pass.plan.steps.len());
+    for (commit, index) in &pass.plan.steps {
+        let Some(mut record) = records.remove(index) else {
+            continue;
+        };
+        if let Some(check) = checked.remove(commit) {
+            record.detached = Detached::Checked { kept: check.kept };
+        }
+        kept_records.insert(*commit, record);
+    }
+    Ok(DeltaPlan {
+        jobs: HashMap::new(),
+        records: kept_records,
+        levels: pass.plan.levels,
+        store,
+    })
+}
+
+/// The plan of one pass of the discovery of a chain, with the order in which
+/// discovery fetches its steps.
+struct Pass {
+    plan: ChainPlan,
+    /// The intermediate commits of the plan.
+    intermediate: HashSet<Checksum>,
+    /// The commits of the plan in fetch order: the levels in order, then the
+    /// targets that no step reads, in the order of the targets.
+    order: Vec<Checksum>,
+}
+
+impl Pass {
+    /// Merges the chains of `search`, and orders the steps of the result.
+    fn new(search: &ChainSearch) -> Pass {
+        let plan = search.merged();
+        let intermediate: HashSet<Checksum> = plan.levels.iter().flatten().copied().collect();
+        let order = plan
+            .levels
+            .iter()
+            .flatten()
+            .copied()
+            .chain(
+                search
+                    .targets()
+                    .map(|(target, _)| *target)
+                    .filter(|target| {
+                        plan.steps.contains_key(target) && !intermediate.contains(target)
+                    }),
+            )
+            .collect();
+        Pass {
+            plan,
+            intermediate,
+            order,
+        }
+    }
+}
+
+/// Returns each commit of `targets` that this repository does not hold
+/// complete, once, in the order of the refs, with its scratch rule. Also
+/// returns the first ref that names each commit, for an error.
+///
+/// A step from scratch to a target is allowed if the scratch rule allows it
+/// for one of the refs that name the target. The checks of the commits run on
+/// the blocking pool in batches: one pass for the targets, and one for the
+/// commits that the refs name here.
+async fn chain_targets<'t>(
+    repo: &Repo,
+    targets: &'t [(String, Checksum)],
+    ref_prefix: Option<&str>,
+) -> Result<(Vec<(Checksum, bool)>, Vec<&'t str>)> {
+    let mut unique: Vec<Checksum> = Vec::new();
+    let mut seen: HashSet<Checksum> = HashSet::new();
+    for (_, to) in targets {
+        if seen.insert(*to) {
+            unique.push(*to);
+        }
+    }
+    let held: HashSet<Checksum> = check_complete(repo, &unique)
+        .await?
+        .into_iter()
+        .filter_map(|(commit, complete)| complete.then_some(commit))
+        .collect();
+    let mut tips: Vec<(&str, Checksum, Option<Checksum>)> = Vec::new();
+    for (ref_name, to) in targets {
+        if held.contains(to) {
+            continue;
+        }
+        let tip = repo.resolve_ref_tip(&refspec(ref_prefix, ref_name)).await?;
+        tips.push((ref_name.as_str(), *to, tip));
+    }
+    // A tip can be the source commit only if it is not the target.
+    let mut candidates: Vec<Checksum> = Vec::new();
+    let mut seen: HashSet<Checksum> = HashSet::new();
+    for (_, to, tip) in &tips {
+        if let Some(tip) = tip
+            && tip != to
+            && seen.insert(*tip)
+        {
+            candidates.push(*tip);
+        }
+    }
+    let complete: HashSet<Checksum> = check_complete(repo, &candidates)
+        .await?
+        .into_iter()
+        .filter_map(|(commit, complete)| complete.then_some(commit))
+        .collect();
+    let mut wanted: Vec<(Checksum, bool)> = Vec::new();
+    let mut names: Vec<&str> = Vec::new();
+    let mut position: HashMap<Checksum, usize> = HashMap::new();
+    for (name, to, tip) in tips {
+        let from = tip.filter(|tip| *tip != to && complete.contains(tip));
+        let scratch = scratch_allowed(tip, from, &to);
+        match position.get(&to) {
+            Some(&i) => wanted[i].1 |= scratch,
+            None => {
+                position.insert(to, wanted.len());
+                wanted.push((to, scratch));
+                names.push(name);
+            }
+        }
+    }
+    Ok((wanted, names))
+}
+
+/// Fetches the `.commitmeta` of the intermediate commit `commit` and checks
+/// the signatures of the commit, and returns the check.
+///
+/// `commit_bytes` are the bytes of the commit that its superblock carries.
+/// The parse of the superblock verified that they hash to `commit`. The
+/// check reads the `.commitmeta` that the pull puts in place, as the check of
+/// a fetched commit does.
+///
+/// - From a remote, the `.commitmeta` comes from the first localcache
+///   repository that holds it, else from the remote. A file that the remote
+///   serves adds one to the metadata count. The record file keeps the
+///   verified bytes, and the result holds their range.
+/// - From a local source, the `.commitmeta` comes from the source, else from
+///   the first localcache repository that holds it. The record keeps no
+///   bytes. If the policy checks no commit, discovery reads no
+///   `.commitmeta`. The result holds the size of the file that the source
+///   holds. [`discover_chain`] counts the file at its end, for each
+///   intermediate commit of the last plan alone.
+///
+/// If no repository holds a `.commitmeta`, the check reads the detached
+/// metadata of this repository.
+#[allow(clippy::too_many_arguments)]
+async fn check_intermediate(
+    repo: &Repo,
+    source: &DeltaSource<'_>,
+    localcache: &[Repo],
+    commit: &Checksum,
+    commit_bytes: &[u8],
+    verification: &Verification,
+    progress: &PullCounters,
+    store: Option<&mut RecordStore>,
+) -> Result<Checked> {
+    match source {
+        DeltaSource::Remote(remote) => {
+            let detached =
+                super::http::fetch_detached_metadata(remote, localcache, progress, commit).await?;
+            check_commit_signatures(
+                repo,
+                verification,
+                commit,
+                commit_bytes,
+                detached.as_deref(),
+            )
+            .await?;
+            let kept = match (detached, store) {
+                (Some(bytes), Some(store)) => Some(store.append(bytes).await?),
+                _ => None,
+            };
+            Ok(Checked {
+                kept,
+                local: LocalRead::Nothing,
+            })
+        }
+        DeltaSource::Local(src) => {
+            if !verification.checks_commits() {
+                return Ok(Checked {
+                    kept: None,
+                    local: LocalRead::Nothing,
+                });
+            }
+            let (detached, local) =
+                match src.load_object_bytes(ObjectType::CommitMeta, commit).await {
+                    Ok(bytes) => {
+                        let size = bytes.len() as u64;
+                        (Some(bytes), LocalRead::Size(size))
+                    }
+                    Err(Error::ObjectNotFound { .. }) => {
+                        let sources: Vec<&Repo> = localcache.iter().collect();
+                        (
+                            detached_bytes_from(&sources, commit).await?,
+                            LocalRead::Absent,
+                        )
+                    }
+                    Err(e) => return Err(e),
+                };
+            check_commit_signatures(
+                repo,
+                verification,
+                commit,
+                commit_bytes,
+                detached.as_deref(),
+            )
+            .await?;
+            Ok(Checked { kept: None, local })
+        }
+    }
+}
+
+/// Reads the superblock of `record` again and parses it on the blocking
+/// pool.
+///
+/// A record from a remote reads its range of `store`. These are the bytes
+/// that discovery verified, so the parse checks no signature and no inline
+/// part again. A record from a local source reads the superblock from the
+/// source again and checks it against the listed digest. The same digest
+/// gives the bytes that discovery verified.
+async fn read_record(
+    store: Option<&RecordStore>,
+    source: &DeltaSource<'_>,
+    record: &StepRecord,
+) -> Result<FetchedDelta> {
+    let AdvertisedDelta {
+        from,
+        to,
+        superblock: digest,
+    } = record.delta;
+    let (bytes, digest) = match (&record.superblock, store, source) {
+        (Some(range), Some(store), _) => (store.read(range.clone()).await?, None),
+        (None, _, DeltaSource::Local(src)) => {
+            let path = format!(
+                "{}/{SUPERBLOCK_FILE}",
+                delta_relative_dir(from.as_ref(), &to)
+            );
+            let bytes = read_local(src, &path, MAX_SUPERBLOCK)
+                .await?
+                .ok_or_else(|| {
+                    Error::InvalidFormat(format!(
+                        "static delta {}: the source repository holds no superblock",
+                        delta_name(from.as_ref(), &to)
+                    ))
+                })?;
+            (bytes, Some(digest))
+        }
+        _ => {
+            return Err(Error::InvalidFormat(format!(
+                "static delta {}: discovery kept no superblock",
+                delta_name(from.as_ref(), &to)
+            )));
+        }
+    };
+    let (parsed, _) =
+        ostrya_rt::unblock(move || parse_superblock(bytes, digest, None, from, to, false)).await?;
+    parsed.verify(None).await
 }
 
 /// Returns `true` if this repository holds a commit and each object that it
@@ -530,27 +1315,103 @@ async fn discover_one(
         Advertisement::Unlisted => (from, None),
         Advertisement::Nothing => return none_found(),
     };
-    let name = delta_name(from.as_ref(), &to);
+    // If the remote does not hold an advertised superblock, the advertisement
+    // is stale. The pull then fetches the objects loose. If the pull requires
+    // static deltas, it fails.
+    let Some((fetched, _)) =
+        fetch_job(source, from, to, digest, verification, progress, None).await?
+    else {
+        return none_found();
+    };
+    fetched.into_job(repo).await.map(Some)
+}
 
+/// Fetches the superblock of the delta from `from` to `to`, and verifies it.
+///
+/// Returns `None` if the source does not hold the superblock. The request
+/// adds one to the metadata count in `progress`, whatever the source answers.
+/// If `digest` is set, the SHA-256 of the superblock must be `digest`. The
+/// superblock must produce `to` from `from`. Its signatures must pass the
+/// policy of the pull, as [`verify_fetched_delta`] states. Each inline part
+/// must pass its meta-entry.
+///
+/// If `keep` is set, the function appends the raw bytes to that record file
+/// after the digest check, and returns their range with the parsed delta.
+///
+/// The digest check, the write to the record file, the parse, and the check
+/// of the inline parts run in one call on the blocking pool. The check of the
+/// signatures comes after it, and a failed inline part fails after the check
+/// of the signatures.
+///
+/// # Errors
+///
+/// - [`Error::ChecksumMismatch`] if the superblock does not have `digest`.
+/// - [`Error::Pull`] if the superblock produces another commit, or from
+///   another commit.
+/// - [`Error::Signature`] if the signatures fail the policy.
+/// - [`Error::InvalidFormat`] or [`Error::Core`] if the superblock or an
+///   inline part is malformed.
+async fn fetch_job(
+    source: &DeltaSource<'_>,
+    from: Option<Checksum>,
+    to: Checksum,
+    digest: Option<Checksum>,
+    verification: &Verification,
+    progress: &PullCounters,
+    mut keep: Option<&mut RecordStore>,
+) -> Result<Option<(FetchedDelta, Option<Range<u64>>)>> {
     let path = format!(
         "{}/{SUPERBLOCK_FILE}",
         delta_relative_dir(from.as_ref(), &to)
     );
-    // If the remote does not hold an advertised superblock, the advertisement
-    // is stale. The pull then fetches the objects loose. If the pull requires
-    // static deltas, it fails.
     let fetched = source.read(&path, MAX_SUPERBLOCK, progress).await?;
     progress.metadata_fetched();
     let Some(bytes) = fetched else {
-        return none_found();
+        return Ok(None);
     };
+    let sink = match keep.as_mut() {
+        Some(store) => Some((store.file().await?, store.len)),
+        None => None,
+    };
+    let (parsed, kept) =
+        ostrya_rt::unblock(move || parse_superblock(bytes, digest, sink, from, to, true)).await?;
+    if let (Some(store), Some(range)) = (keep, &kept) {
+        store.len = range.end;
+    }
+    let fetched = parsed.verify(Some(verification)).await?;
+    Ok(Some((fetched, kept)))
+}
+
+/// Checks and parses the superblock `bytes` of the delta from `from` to `to`
+/// on the calling thread, and checks its source and target.
+///
+/// If `digest` is set, the SHA-256 of `bytes` must be `digest`. If `sink` is
+/// set, the function then writes `bytes` to that file at that offset, before
+/// the parse consumes them, and returns their range. If `check_inline` is
+/// set, the result holds the check of each inline part against its
+/// meta-entry.
+fn parse_superblock(
+    bytes: Vec<u8>,
+    digest: Option<Checksum>,
+    sink: Option<(Arc<std::fs::File>, u64)>,
+    from: Option<Checksum>,
+    to: Checksum,
+    check_inline: bool,
+) -> Result<(ParsedDelta, Option<Range<u64>>)> {
     if let Some(expected) = digest {
         let actual = Checksum::sha256(&bytes);
         if actual != expected {
             return Err(Error::ChecksumMismatch { expected, actual });
         }
     }
-
+    let kept = match sink {
+        Some((file, start)) => {
+            file.write_all_at(&bytes, start)?;
+            Some(start..start + bytes.len() as u64)
+        }
+        None => None,
+    };
+    let name = delta_name(from.as_ref(), &to);
     let superblock = DeltaSuperblock::parse(bytes)?;
     if superblock.to != to || superblock.from != from {
         return Err(Error::Pull(format!(
@@ -562,10 +1423,9 @@ async fn discover_one(
             }
         )));
     }
-    // The destructure lets the compiler prove where the raw bytes, the
-    // signature array, and the metadata dict go. They go to verification and
-    // to the inline parts alone. The job carries only what the application
-    // reads.
+    // The destructure lets the compiler prove where the raw bytes and the
+    // signature array go. They go to verification alone. The metadata dict
+    // goes to the inline parts.
     let DeltaSuperblock {
         commit_bytes,
         meta_entries,
@@ -576,31 +1436,40 @@ async fn discover_one(
         inline_index,
         ..
     } = superblock;
-    verify_fetched_delta(verification, &name, &superblock_bytes, signatures.as_ref()).await?;
-    drop(superblock_bytes);
-    let dir = delta_relative_dir(from.as_ref(), &to);
-    let (inline, inline_bodies) =
-        take_inline_parts(repo, &metadata, &inline_index, &dir, &meta_entries).await?;
-    drop(metadata);
-    Ok(Some(DeltaJob {
-        dir,
+    let delta = FetchedDelta {
+        dir: delta_relative_dir(from.as_ref(), &to),
         name,
         commit_bytes,
         meta_entries,
         fallbacks,
-        inline,
-        inline_bodies,
-    }))
+        metadata,
+        inline_index,
+    };
+    let inline = if check_inline {
+        delta.verify_inline_parts()
+    } else {
+        Ok(())
+    };
+    Ok((
+        ParsedDelta {
+            delta,
+            superblock_bytes,
+            signatures,
+            inline,
+        },
+        kept,
+    ))
 }
 
-/// Verifies each inline part against its meta-entry and copies the bodies into
-/// one [`Blob`].
+/// Copies the bodies of the inline parts into one [`Blob`].
 ///
-/// The function works in part order and copies the bodies out of the metadata
-/// dict, so the caller can drop the dict. The heap threshold is 128 KiB. If
-/// the bodies total more, the blob is one anonymous temp file in `tmp/` of the
-/// repository, mapped read-only. The job then keeps no copy of the bodies on
-/// the heap.
+/// The caller verified each inline part against its meta-entry. The function
+/// checks again the size and the compression byte of each part, and does not
+/// hash it again. It works in part order and copies the bodies out of the
+/// metadata dict, so the caller can drop the dict. The heap threshold is 128
+/// KiB. If the bodies total more, the blob is one anonymous temp file in
+/// `tmp/` of the repository, mapped read-only. The job then keeps no copy of
+/// the bodies on the heap.
 async fn take_inline_parts(
     repo: &Repo,
     metadata: &Value,
@@ -617,7 +1486,7 @@ async fn take_inline_parts(
             inline.push(None);
             continue;
         };
-        verify_inline_part(compression, body, entry)?;
+        check_inline_part(compression, body, entry)?;
         inline.push(Some(InlinePart {
             compression,
             start,
@@ -917,5 +1786,960 @@ mod tests {
             value.as_variant().and_then(|(_, bytes)| bytes.as_bytes()),
             Some(found.as_bytes())
         );
+    }
+
+    /// The base64 of a 64-byte ed25519 secret key (seed, then public key).
+    const SECRET_B64: &str =
+        "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
+    /// The matching 32-byte ed25519 public key.
+    const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
+
+    /// The verification of a pull that checks the commits against the
+    /// ed25519 key [`PUBLIC_B64`].
+    fn ed25519_verification() -> Verification {
+        use crate::sign::{Ed25519Verifier, Verifier};
+        let verifier = Ed25519Verifier::new(
+            [ostrya_core::base64::decode(PUBLIC_B64).unwrap()],
+            Vec::<Vec<u8>>::new(),
+        )
+        .unwrap();
+        let keys = crate::verify::TrustedKeys::new(vec![
+            std::sync::Arc::new(verifier) as Arc<dyn Verifier>
+        ])
+        .unwrap();
+        Verification::from_trust(crate::verify::PullTrust::commits(keys))
+    }
+
+    fn unverified() -> Verification {
+        Verification::from_trust(crate::verify::PullTrust::unverified())
+    }
+
+    /// Signs `commit` in `repo` with the key [`SECRET_B64`].
+    async fn sign(repo: &Repo, commit: &Checksum) {
+        let signer = crate::sign::Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        repo.sign_commit(commit, &signer).await.unwrap();
+    }
+
+    /// Writes a commit whose tree holds the file `f` with `content`, and
+    /// returns it.
+    async fn commit(repo: &Repo, parent: Option<Checksum>, content: &[u8]) -> Checksum {
+        let txn = repo.transaction().await.unwrap();
+        let dirmeta = ostrya_core::DirMeta {
+            uid: 0,
+            gid: 0,
+            mode: 0o40755,
+            xattrs: Default::default(),
+        };
+        let dirmeta = txn
+            .write_metadata(ObjectType::DirMeta, None, &dirmeta.serialize().unwrap())
+            .await
+            .unwrap();
+        let file = txn
+            .write_regfile_inline(None, &crate::write::FileMeta::regular(0, 0, 0o644), content)
+            .await
+            .unwrap();
+        let mut mtree = crate::mtree::MutableTree::new();
+        mtree.set_metadata_checksum(dirmeta);
+        mtree.replace_file("f", file).unwrap();
+        let root = txn.write_mtree(&mut mtree).await.unwrap();
+        let options = crate::commit::CommitOptions {
+            parent,
+            subject: None,
+            body: None,
+            timestamp: Some(1_700_000_000),
+            metadata: None,
+        };
+        let commit = txn.write_commit(options, &root).await.unwrap();
+        txn.commit().await.unwrap();
+        commit
+    }
+
+    /// A source repository with the commits `A-B-C-D` and `A-X-Y`, and a
+    /// repository that holds `A` complete under the ref `main`.
+    struct Fixture {
+        root: std::path::PathBuf,
+        src: Repo,
+        dst: Repo,
+        a: Checksum,
+        b: Checksum,
+        c: Checksum,
+        d: Checksum,
+        x: Checksum,
+        y: Checksum,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl Fixture {
+        async fn new() -> Fixture {
+            let root = std::env::temp_dir().join(format!(
+                "ostrya-delta-chain-{}-{}",
+                std::process::id(),
+                crate::write::unique()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let create = || crate::CreateOptions::new(RepoMode::Archive);
+            let src = Repo::create(&root.join("src"), create()).await.unwrap();
+            let dst = Repo::create(&root.join("dst"), create()).await.unwrap();
+            let a = commit(&src, None, b"a").await;
+            let b = commit(&src, Some(a), b"b").await;
+            let c = commit(&src, Some(b), b"c").await;
+            let d = commit(&src, Some(c), b"d").await;
+            let x = commit(&src, Some(a), b"x").await;
+            let y = commit(&src, Some(x), b"y").await;
+            src.set_ref_immediate("main", Some(&a)).await.unwrap();
+            let opts = PullOptions {
+                refs: vec!["main".to_owned()],
+                ..PullOptions::default()
+            };
+            dst.pull_local(&src, opts).await.unwrap();
+            Fixture {
+                root,
+                src,
+                dst,
+                a,
+                b,
+                c,
+                d,
+                x,
+                y,
+            }
+        }
+
+        /// Generates the delta from `from` to `to` in the source, and returns
+        /// its entry of a list.
+        async fn delta(&self, from: Option<Checksum>, to: Checksum) -> AdvertisedDelta {
+            let options = crate::DeltaOptions {
+                timestamp: Some(1_700_000_000),
+                ..crate::DeltaOptions::default()
+            };
+            self.src
+                .generate_static_delta(from.as_ref(), &to, &options)
+                .await
+                .unwrap();
+            AdvertisedDelta {
+                from,
+                to,
+                superblock: Checksum::sha256(&std::fs::read(self.superblock(from, to)).unwrap()),
+            }
+        }
+
+        /// Returns the path of the superblock of a delta in the source.
+        fn superblock(&self, from: Option<Checksum>, to: Checksum) -> std::path::PathBuf {
+            self.src
+                .path()
+                .join(delta_relative_dir(from.as_ref(), &to))
+                .join(SUPERBLOCK_FILE)
+        }
+
+        /// Runs the discovery of `list` for the targets `targets`.
+        async fn discover(
+            &self,
+            list: Vec<AdvertisedDelta>,
+            targets: &[(&str, Checksum)],
+            opts: &PullOptions,
+            verification: &Verification,
+            counters: &PullCounters,
+        ) -> Result<DeltaPlan> {
+            let targets: Vec<(String, Checksum)> = targets
+                .iter()
+                .map(|(name, commit)| ((*name).to_owned(), *commit))
+                .collect();
+            discover(
+                &self.dst,
+                &DeltaSource::Local(&self.src),
+                None,
+                &targets,
+                opts,
+                None,
+                Some(Edges::new(list)?),
+                verification,
+                counters,
+            )
+            .await
+        }
+    }
+
+    fn required() -> PullOptions {
+        PullOptions {
+            require_static_deltas: true,
+            ..PullOptions::default()
+        }
+    }
+
+    /// Returns the source and the target of the record of each commit.
+    fn record_steps(plan: &DeltaPlan) -> HashMap<Checksum, (Option<Checksum>, Checksum)> {
+        plan.records
+            .iter()
+            .map(|(commit, record)| (*commit, (record.delta.from, record.delta.to)))
+            .collect()
+    }
+
+    /// A chain of three steps gives three records and two levels, in order.
+    /// It needs no summary, also if the pull requires static deltas. The
+    /// parse of a level gives the job of each of its commits.
+    #[test]
+    fn a_chain_of_three_steps_gives_three_records_and_two_levels() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            let list = vec![
+                f.delta(Some(f.a), f.b).await,
+                f.delta(Some(f.b), f.c).await,
+                f.delta(Some(f.c), f.d).await,
+            ];
+            let counters = PullCounters::new(None);
+            let plan = f
+                .discover(
+                    list,
+                    &[("main", f.d)],
+                    &required(),
+                    &unverified(),
+                    &counters,
+                )
+                .await
+                .unwrap();
+            assert!(plan.jobs.is_empty());
+            assert_eq!(plan.levels, [vec![f.b], vec![f.c]]);
+            assert_eq!(
+                record_steps(&plan),
+                HashMap::from([
+                    (f.b, (Some(f.a), f.b)),
+                    (f.c, (Some(f.b), f.c)),
+                    (f.d, (Some(f.c), f.d)),
+                ])
+            );
+            assert!(plan.store.is_none());
+            for commit in [f.b, f.c] {
+                assert!(matches!(
+                    plan.records[&commit].detached,
+                    Detached::Checked { kept: None }
+                ));
+            }
+            assert!(matches!(plan.records[&f.d].detached, Detached::NotChecked));
+            assert_eq!(counters.metadata(), 3);
+
+            let source = DeltaSource::Local(&f.src);
+            for level in &plan.levels {
+                let jobs = plan.parse_level(&f.dst, &source, level).await.unwrap();
+                assert_eq!(jobs.len(), 1);
+                let (commit, job) = jobs.iter().next().unwrap();
+                assert_eq!(Checksum::sha256(&job.commit_bytes), *commit);
+                assert_eq!(job.fetched_parts(), plan.records[commit].parts);
+            }
+            // The second read of a superblock counts nothing.
+            assert_eq!(counters.metadata(), 3);
+            let jobs = plan
+                .parse_level(&f.dst, &source, &[f.d, f.a])
+                .await
+                .unwrap();
+            assert_eq!(jobs.keys().collect::<Vec<_>>(), [&f.d]);
+        });
+    }
+
+    /// A missing superblock in the middle of a chain makes discovery plan
+    /// again and take the second chain. The record of the step that it
+    /// fetched before the miss is dropped.
+    #[test]
+    fn a_missing_superblock_makes_discovery_take_another_chain() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            let list = vec![
+                f.delta(Some(f.a), f.b).await,
+                f.delta(Some(f.b), f.c).await,
+                f.delta(Some(f.c), f.d).await,
+                f.delta(Some(f.a), f.x).await,
+                f.delta(Some(f.x), f.y).await,
+                f.delta(Some(f.y), f.d).await,
+            ];
+            std::fs::remove_file(f.superblock(Some(f.b), f.c)).unwrap();
+            let counters = PullCounters::new(None);
+            let plan = f
+                .discover(
+                    list,
+                    &[("main", f.d)],
+                    &required(),
+                    &unverified(),
+                    &counters,
+                )
+                .await
+                .unwrap();
+            assert_eq!(plan.levels, [vec![f.x], vec![f.y]]);
+            assert_eq!(
+                record_steps(&plan),
+                HashMap::from([
+                    (f.x, (Some(f.a), f.x)),
+                    (f.y, (Some(f.x), f.y)),
+                    (f.d, (Some(f.y), f.d)),
+                ])
+            );
+            assert_eq!(counters.metadata(), 5);
+        });
+    }
+
+    /// A missing superblock in the middle of the only chain gives no chain.
+    /// A pull that requires static deltas then fails.
+    #[test]
+    fn a_missing_superblock_with_no_other_chain_gives_no_chain() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            let list = vec![
+                f.delta(Some(f.a), f.b).await,
+                f.delta(Some(f.b), f.c).await,
+                f.delta(Some(f.c), f.d).await,
+            ];
+            std::fs::remove_file(f.superblock(Some(f.b), f.c)).unwrap();
+            let counters = PullCounters::new(None);
+            let plan = f
+                .discover(
+                    list.clone(),
+                    &[("main", f.d)],
+                    &PullOptions::default(),
+                    &unverified(),
+                    &counters,
+                )
+                .await
+                .unwrap();
+            assert!(plan.records.is_empty());
+            assert!(plan.levels.is_empty());
+            assert_eq!(counters.metadata(), 2);
+
+            let err = f
+                .discover(
+                    list,
+                    &[("main", f.d)],
+                    &required(),
+                    &unverified(),
+                    &PullCounters::new(None),
+                )
+                .await
+                .err()
+                .unwrap();
+            let Error::Pull(message) = err else {
+                panic!("{err:?}");
+            };
+            assert_eq!(
+                message,
+                format!("Static deltas required, but none found for main to {}", f.d)
+            );
+        });
+    }
+
+    /// A wrong digest gives `ChecksumMismatch`. A superblock that produces
+    /// another commit than its entry fails. The parse of a level checks the
+    /// superblock of a local source again.
+    #[test]
+    fn a_superblock_that_does_not_match_the_list_fails() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            let ab = f.delta(Some(f.a), f.b).await;
+            let bc = f.delta(Some(f.b), f.c).await;
+            let mut cd = f.delta(Some(f.c), f.d).await;
+            let run = |list: Vec<AdvertisedDelta>| async {
+                f.discover(
+                    list,
+                    &[("main", f.d)],
+                    &PullOptions::default(),
+                    &unverified(),
+                    &PullCounters::new(None),
+                )
+                .await
+            };
+
+            let right = cd.superblock;
+            cd.superblock = Checksum::from_bytes([0xee; 32]);
+            let err = run(vec![ab, bc, cd]).await.err().unwrap();
+            assert!(
+                matches!(err, Error::ChecksumMismatch { expected, actual }
+                    if expected == cd.superblock && actual == right),
+                "{err:?}"
+            );
+
+            let ab_bytes = std::fs::read(f.superblock(Some(f.a), f.b)).unwrap();
+            std::fs::write(f.superblock(Some(f.c), f.d), &ab_bytes).unwrap();
+            cd.superblock = ab.superblock;
+            let err = run(vec![ab, bc, cd]).await.err().unwrap();
+            assert!(matches!(err, Error::Pull(_)), "{err:?}");
+
+            // The parse of a level reads the superblock of the source again.
+            let cd = f.delta(Some(f.c), f.d).await;
+            let plan = run(vec![ab, bc, cd]).await.unwrap();
+            let source = DeltaSource::Local(&f.src);
+            std::fs::write(f.superblock(Some(f.b), f.c), &ab_bytes).unwrap();
+            let err = plan
+                .parse_level(&f.dst, &source, &plan.levels[1])
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                matches!(err, Error::ChecksumMismatch { expected, .. } if expected == bc.superblock),
+                "{err:?}"
+            );
+            std::fs::remove_file(f.superblock(Some(f.b), f.c)).unwrap();
+            let err = plan
+                .parse_level(&f.dst, &source, &plan.levels[1])
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(err, Error::InvalidFormat(_)), "{err:?}");
+        });
+    }
+
+    /// An intermediate commit with no valid signature fails discovery. With
+    /// valid signatures, discovery counts the `.commitmeta` of each
+    /// intermediate commit once.
+    #[test]
+    fn an_intermediate_commit_with_no_valid_signature_fails() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            sign(&f.src, &f.c).await;
+            sign(&f.src, &f.d).await;
+            let list = vec![
+                f.delta(Some(f.a), f.b).await,
+                f.delta(Some(f.b), f.c).await,
+                f.delta(Some(f.c), f.d).await,
+            ];
+            let err = f
+                .discover(
+                    list.clone(),
+                    &[("main", f.d)],
+                    &PullOptions::default(),
+                    &ed25519_verification(),
+                    &PullCounters::new(None),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(err, Error::Signature(_)), "{err:?}");
+
+            sign(&f.src, &f.b).await;
+            let counters = PullCounters::new(None);
+            let plan = f
+                .discover(
+                    list,
+                    &[("main", f.d)],
+                    &PullOptions::default(),
+                    &ed25519_verification(),
+                    &counters,
+                )
+                .await
+                .unwrap();
+            assert_eq!(plan.records.len(), 3);
+            assert_eq!(counters.metadata(), 5);
+        });
+    }
+
+    /// A target that an earlier plan fetched as a target alone, and that a
+    /// later plan makes an intermediate commit, gets the check of an
+    /// intermediate commit.
+    #[test]
+    fn a_target_that_becomes_an_intermediate_commit_is_checked() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            sign(&f.src, &f.d).await;
+            let list = vec![
+                f.delta(Some(f.a), f.c).await,
+                f.delta(Some(f.a), f.d).await,
+                f.delta(Some(f.c), f.d).await,
+            ];
+            std::fs::remove_file(f.superblock(Some(f.a), f.d)).unwrap();
+            let targets = [("main", f.c), ("other", f.d)];
+            let counters = PullCounters::new(None);
+            let plan = f
+                .discover(
+                    list.clone(),
+                    &targets,
+                    &PullOptions::default(),
+                    &unverified(),
+                    &counters,
+                )
+                .await
+                .unwrap();
+            assert_eq!(plan.levels, [vec![f.c]]);
+            assert!(matches!(
+                plan.records[&f.c].detached,
+                Detached::Checked { .. }
+            ));
+            assert_eq!(counters.metadata(), 3);
+
+            let err = f
+                .discover(
+                    list,
+                    &targets,
+                    &PullOptions::default(),
+                    &ed25519_verification(),
+                    &PullCounters::new(None),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(err, Error::Signature(_)), "{err:?}");
+        });
+    }
+
+    /// A listed delta from scratch that the scratch rule refuses meets the
+    /// requirement, and discovery keeps no record for it. With no delta to
+    /// the target, a pull that requires static deltas fails.
+    #[test]
+    fn a_refused_delta_from_scratch_meets_the_requirement() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            let list = vec![f.delta(None, f.d).await];
+            let counters = PullCounters::new(None);
+            let plan = f
+                .discover(
+                    list,
+                    &[("main", f.d)],
+                    &required(),
+                    &unverified(),
+                    &counters,
+                )
+                .await
+                .unwrap();
+            assert!(plan.records.is_empty());
+            assert_eq!(counters.metadata(), 0);
+
+            let err = f
+                .discover(
+                    Vec::new(),
+                    &[("main", f.d)],
+                    &required(),
+                    &unverified(),
+                    &PullCounters::new(None),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(err, Error::Pull(_)), "{err:?}");
+        });
+    }
+
+    /// A commit-only pull ignores the list and sends no request.
+    #[test]
+    fn a_commit_only_pull_ignores_the_list() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            let list = vec![f.delta(Some(f.a), f.d).await];
+            let opts = PullOptions {
+                flags: PullFlags::COMMIT_ONLY,
+                ..required()
+            };
+            let counters = PullCounters::new(None);
+            let plan = f
+                .discover(list, &[("main", f.d)], &opts, &unverified(), &counters)
+                .await
+                .unwrap();
+            assert!(plan.records.is_empty() && plan.jobs.is_empty());
+            assert_eq!(counters.metadata(), 0);
+        });
+    }
+
+    /// A superblock with the listed target and another source fails.
+    #[test]
+    fn a_superblock_from_another_source_fails() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            let ax = f.delta(Some(f.a), f.x).await;
+            let xy = f.delta(Some(f.x), f.y).await;
+            f.delta(Some(f.c), f.d).await;
+            let cd_bytes = std::fs::read(f.superblock(Some(f.c), f.d)).unwrap();
+            let yd_path = f.superblock(Some(f.y), f.d);
+            std::fs::create_dir_all(yd_path.parent().unwrap()).unwrap();
+            std::fs::write(&yd_path, &cd_bytes).unwrap();
+            let yd = AdvertisedDelta {
+                from: Some(f.y),
+                to: f.d,
+                superblock: Checksum::sha256(&cd_bytes),
+            };
+            let err = f
+                .discover(
+                    vec![ax, xy, yd],
+                    &[("main", f.d)],
+                    &PullOptions::default(),
+                    &unverified(),
+                    &PullCounters::new(None),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(err, Error::Pull(_)), "{err:?}");
+        });
+    }
+
+    /// An intermediate commit that a later plan makes a target alone keeps
+    /// its check. Discovery does not read its `.commitmeta` again and does
+    /// not count it.
+    #[test]
+    fn an_intermediate_commit_that_becomes_a_target_keeps_its_check() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            for commit in [f.c, f.x] {
+                sign(&f.src, &commit).await;
+            }
+            let list = vec![
+                f.delta(Some(f.a), f.c).await,
+                f.delta(Some(f.c), f.d).await,
+                f.delta(Some(f.a), f.x).await,
+                f.delta(Some(f.x), f.d).await,
+            ];
+            std::fs::remove_file(f.superblock(Some(f.c), f.d)).unwrap();
+            let counters = PullCounters::new(None);
+            let plan = f
+                .discover(
+                    list,
+                    &[("c", f.c), ("main", f.d)],
+                    &PullOptions::default(),
+                    &ed25519_verification(),
+                    &counters,
+                )
+                .await
+                .unwrap();
+            assert_eq!(plan.levels, [vec![f.x]]);
+            assert_eq!(
+                record_steps(&plan),
+                HashMap::from([
+                    (f.c, (Some(f.a), f.c)),
+                    (f.x, (Some(f.a), f.x)),
+                    (f.d, (Some(f.x), f.d)),
+                ])
+            );
+            for commit in [f.c, f.x] {
+                assert!(matches!(
+                    plan.records[&commit].detached,
+                    Detached::Checked { kept: None }
+                ));
+            }
+            // Four superblock requests and the `.commitmeta` of `X`.
+            assert_eq!(counters.metadata(), 5);
+        });
+    }
+
+    /// A step from scratch to a target is allowed if the scratch rule allows
+    /// it for one of the refs that name the target, in each order of the
+    /// refs.
+    #[test]
+    fn one_ref_that_allows_a_step_from_scratch_is_sufficient() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            let list = vec![f.delta(None, f.d).await];
+            for targets in [
+                [("main", f.d), ("other", f.d)],
+                [("other", f.d), ("main", f.d)],
+            ] {
+                let plan = f
+                    .discover(
+                        list.clone(),
+                        &targets,
+                        &required(),
+                        &unverified(),
+                        &PullCounters::new(None),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(record_steps(&plan), HashMap::from([(f.d, (None, f.d))]));
+            }
+        });
+    }
+
+    /// Two refs that name one target give one chain. A target that this
+    /// repository holds complete gives no record and no request.
+    #[test]
+    fn a_target_is_planned_once_and_a_complete_target_not_at_all() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            let list = vec![
+                f.delta(Some(f.a), f.b).await,
+                f.delta(Some(f.b), f.c).await,
+                f.delta(Some(f.c), f.d).await,
+            ];
+            let counters = PullCounters::new(None);
+            let plan = f
+                .discover(
+                    list.clone(),
+                    &[("main", f.a), ("main", f.d), ("copy", f.d)],
+                    &required(),
+                    &unverified(),
+                    &counters,
+                )
+                .await
+                .unwrap();
+            assert_eq!(plan.levels, [vec![f.b], vec![f.c]]);
+            assert_eq!(plan.records.len(), 3);
+            assert_eq!(counters.metadata(), 3);
+
+            let counters = PullCounters::new(None);
+            let plan = f
+                .discover(
+                    list,
+                    &[("main", f.a)],
+                    &required(),
+                    &unverified(),
+                    &counters,
+                )
+                .await
+                .unwrap();
+            assert!(plan.records.is_empty() && plan.levels.is_empty());
+            assert_eq!(counters.metadata(), 0);
+        });
+    }
+
+    /// A local source counts the `.commitmeta` of the intermediate commits of
+    /// the last plan alone. An intermediate commit that a later plan drops is
+    /// not counted, also if the check read its `.commitmeta`.
+    #[test]
+    fn a_dropped_intermediate_commit_is_not_counted() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            for commit in [f.b, f.x, f.y] {
+                sign(&f.src, &commit).await;
+            }
+            let list = vec![
+                f.delta(Some(f.a), f.b).await,
+                f.delta(Some(f.b), f.c).await,
+                f.delta(Some(f.c), f.d).await,
+                f.delta(Some(f.a), f.x).await,
+                f.delta(Some(f.x), f.y).await,
+                f.delta(Some(f.y), f.d).await,
+            ];
+            std::fs::remove_file(f.superblock(Some(f.b), f.c)).unwrap();
+            for verification in [unverified(), ed25519_verification()] {
+                let counters = PullCounters::new(None);
+                let plan = f
+                    .discover(
+                        list.clone(),
+                        &[("main", f.d)],
+                        &PullOptions::default(),
+                        &verification,
+                        &counters,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(plan.levels, [vec![f.x], vec![f.y]]);
+                // Five superblock requests, and the `.commitmeta` of `X` and
+                // `Y`. The `.commitmeta` of `B` is not counted.
+                assert_eq!(counters.metadata(), 7);
+            }
+        });
+    }
+
+    /// Discovery plans again around a limited number of missing superblocks.
+    /// After the limit, a target whose chain holds a missing delta gets no
+    /// chain, and a pull that requires static deltas fails.
+    #[test]
+    fn discovery_plans_again_around_a_limited_number_of_missing_deltas() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            let ab = f.delta(Some(f.a), f.b).await;
+            let bd = f.delta(Some(f.b), f.d).await;
+            let list = |missing: usize| {
+                let mut list = Vec::new();
+                for i in 0..missing {
+                    let mut bytes = [0x80; 32];
+                    bytes[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                    let alternative = Checksum::from_bytes(bytes);
+                    list.push(AdvertisedDelta {
+                        from: Some(f.a),
+                        to: alternative,
+                        superblock: checksum(0x11),
+                    });
+                    list.push(AdvertisedDelta {
+                        from: Some(alternative),
+                        to: f.d,
+                        superblock: checksum(0x11),
+                    });
+                }
+                list.extend([ab, bd]);
+                list
+            };
+            let limit = super::super::chain::MAX_EXCLUDED;
+
+            let counters = PullCounters::new(None);
+            let plan = f
+                .discover(
+                    list(limit),
+                    &[("main", f.d)],
+                    &required(),
+                    &unverified(),
+                    &counters,
+                )
+                .await
+                .unwrap();
+            assert_eq!(plan.levels, [vec![f.b]]);
+            assert_eq!(plan.records.len(), 2);
+            assert_eq!(counters.metadata(), limit as u32 + 2);
+
+            let counters = PullCounters::new(None);
+            let plan = f
+                .discover(
+                    list(limit + 1),
+                    &[("main", f.d)],
+                    &PullOptions::default(),
+                    &unverified(),
+                    &counters,
+                )
+                .await
+                .unwrap();
+            assert!(plan.records.is_empty() && plan.levels.is_empty());
+            assert_eq!(counters.metadata(), limit as u32 + 1);
+
+            let err = f
+                .discover(
+                    list(limit + 1),
+                    &[("main", f.d)],
+                    &required(),
+                    &unverified(),
+                    &PullCounters::new(None),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(err, Error::Pull(_)), "{err:?}");
+        });
+    }
+
+    /// Returns the bytes that a server sends for the reply to `PullHello`
+    /// and one found reply for each of `bodies`, in order.
+    async fn served(bodies: &[&[u8]]) -> Vec<u8> {
+        use crate::remote::proto::{
+            FrameWriter, GetReply, Message, PULL_PROTOCOL_VERSION, PullHelloReply,
+        };
+        let mut writer = FrameWriter::new(futures_lite::io::Cursor::new(Vec::new()));
+        writer
+            .write_message(&Message::PullHelloReply(PullHelloReply {
+                version: PULL_PROTOCOL_VERSION,
+            }))
+            .await
+            .unwrap();
+        for body in bodies {
+            writer
+                .write_message(&Message::GetReply(GetReply {
+                    found: true,
+                    len: Some(body.len() as u64),
+                }))
+                .await
+                .unwrap();
+            writer.write_object_data(body).await.unwrap();
+            writer.end_object().await.unwrap();
+        }
+        writer.into_inner().into_inner()
+    }
+
+    /// Returns a remote source whose server answers with `bodies`, in order.
+    async fn remote(bodies: &[&[u8]]) -> RemoteSource {
+        let session = crate::remote::StreamSession::over_stream(
+            futures_lite::io::Cursor::new(served(bodies).await),
+            futures_lite::io::sink(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        RemoteSource::new(crate::remote::PullSession::Stream(session), Vec::new())
+    }
+
+    /// From a remote, the record file keeps each superblock and the
+    /// `.commitmeta` of each intermediate commit. A localcache repository
+    /// that holds the `.commitmeta` comes first, and the remote does not
+    /// serve it. The parse of a level reads the record file.
+    #[test]
+    fn a_remote_record_keeps_the_superblock_and_the_commitmeta() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            sign(&f.src, &f.b).await;
+            let list = vec![f.delta(Some(f.a), f.b).await, f.delta(Some(f.b), f.d).await];
+            let ab = std::fs::read(f.superblock(Some(f.a), f.b)).unwrap();
+            let bd = std::fs::read(f.superblock(Some(f.b), f.d)).unwrap();
+            let meta = f
+                .src
+                .load_object_bytes(ObjectType::CommitMeta, &f.b)
+                .await
+                .unwrap();
+            let targets = vec![("main".to_owned(), f.d)];
+            for (localcache, bodies, metadata) in [
+                (Vec::new(), vec![&ab[..], &meta[..], &bd[..]], 3),
+                (vec![f.src.clone()], vec![&ab[..], &bd[..]], 2),
+            ] {
+                let source = remote(&bodies).await;
+                let source = DeltaSource::Remote(&source);
+                let opts = PullOptions {
+                    localcache_repos: localcache,
+                    ..PullOptions::default()
+                };
+                let counters = PullCounters::new(None);
+                let plan = discover(
+                    &f.dst,
+                    &source,
+                    None,
+                    &targets,
+                    &opts,
+                    None,
+                    Some(Edges::new(list.clone()).unwrap()),
+                    &ed25519_verification(),
+                    &counters,
+                )
+                .await
+                .unwrap();
+                assert_eq!(counters.metadata(), metadata);
+                assert_eq!(plan.levels, [vec![f.b]]);
+                let store = plan.store.as_ref().unwrap();
+                let b = &plan.records[&f.b];
+                let Detached::Checked { kept: Some(kept) } = &b.detached else {
+                    panic!("no kept .commitmeta");
+                };
+                assert_eq!(store.read(kept.clone()).await.unwrap(), meta);
+                for (commit, bytes) in [(f.b, &ab), (f.d, &bd)] {
+                    let range = plan.records[&commit].superblock.clone().unwrap();
+                    assert_eq!(&store.read(range).await.unwrap(), bytes);
+                }
+                let jobs = plan.parse_level(&f.dst, &source, &[f.b]).await.unwrap();
+                assert_eq!(Checksum::sha256(&jobs[&f.b].commit_bytes), f.b);
+            }
+        });
+    }
+
+    /// The record file keeps the raw superblock, and a record reads it back
+    /// from there, also after the source drops the superblock.
+    #[test]
+    fn the_record_file_keeps_the_superblock() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            let delta = f.delta(Some(f.a), f.b).await;
+            let mut store = RecordStore::new(&f.dst);
+            assert!(store.file.is_none());
+            let range = store.append(b"padding".to_vec()).await.unwrap();
+            assert_eq!(range, 0..7);
+            assert_eq!(store.read(range).await.unwrap(), b"padding");
+            let source = DeltaSource::Local(&f.src);
+            let (fetched, kept) = fetch_job(
+                &source,
+                delta.from,
+                delta.to,
+                Some(delta.superblock),
+                &unverified(),
+                &PullCounters::new(None),
+                Some(&mut store),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let len = std::fs::metadata(f.superblock(delta.from, delta.to))
+                .unwrap()
+                .len();
+            assert_eq!(kept, Some(7..7 + len));
+            let record = StepRecord {
+                delta,
+                parts: fetched.parts(),
+                superblock: kept,
+                detached: Detached::NotChecked,
+            };
+            std::fs::remove_file(f.superblock(delta.from, delta.to)).unwrap();
+            let read = read_record(Some(&store), &source, &record).await.unwrap();
+            assert_eq!(read.commit_bytes, fetched.commit_bytes);
+            assert_eq!(Checksum::sha256(&read.commit_bytes), f.b);
+            assert_eq!(read.meta_entries.len(), fetched.meta_entries.len());
+        });
     }
 }

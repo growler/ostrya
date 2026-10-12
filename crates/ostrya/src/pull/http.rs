@@ -44,6 +44,7 @@ use crate::traverse::reaches_at_least;
 use crate::verify::PullTrust;
 use crate::write::FileMeta;
 
+use super::chain::Edges;
 use super::delta::{self, DeltaJob, DeltaSource, PART_CAP};
 use super::drive::Slots;
 use super::source::{RemoteSource, Transfer, http_error, session_error};
@@ -51,9 +52,9 @@ use super::subpath::{Scope, Subpaths};
 use super::verify::Verification;
 use super::{
     DetachedMetadataFilter, ModeChecks, PullCounters, PullFlags, PullOptions, PullStats,
-    PullVerify, READ_CHUNK, TimestampCheck, apply_durability, check_depth, check_ref_binding,
-    check_remote_option, check_static_deltas, refspec, refuse_remote_collection,
-    refuse_static_delta_list,
+    PullVerify, READ_CHUNK, TimestampCheck, apply_durability, check_commit_signatures, check_depth,
+    check_ref_binding, check_remote_option, check_static_deltas, refspec, refuse_remote_collection,
+    refuse_static_delta_list, take_static_deltas,
 };
 
 /// The number of fetched content objects that stream into the object store at
@@ -445,7 +446,8 @@ impl Repo {
         refuse_remote_collection(&opts)?;
         check_remote_option(&opts)?;
         check_static_deltas(&opts)?;
-        refuse_static_delta_list(&opts)?;
+        let edges = take_static_deltas(&mut opts).await?;
+        refuse_static_delta_list(edges.as_ref())?;
         // The endpoint is resolved first, so a remote the config does not
         // describe reports that before a policy is resolved for it.
         let overrides = std::mem::take(&mut opts.overrides);
@@ -481,6 +483,7 @@ impl Repo {
             opts,
             Wanted::Config(remote),
             subpaths,
+            edges,
             started,
         )
         .await
@@ -603,11 +606,11 @@ impl Repo {
         &self,
         session: PullSession,
         trust: PullTrust,
-        opts: PullOptions,
+        mut opts: PullOptions,
     ) -> Result<PullStats> {
         let started = Instant::now();
-        let subpaths = match check_session_pull(&opts) {
-            Ok(subpaths) => subpaths,
+        let (subpaths, edges) = match check_session_pull(&mut opts).await {
+            Ok(checked) => checked,
             Err(e) => {
                 // The refusal comes before the first request. The result of
                 // the session end does not change it.
@@ -615,16 +618,26 @@ impl Repo {
                 return Err(e);
             }
         };
-        self.run_session(session, trust, opts, Wanted::Named, subpaths, started)
-            .await
+        self.run_session(
+            session,
+            trust,
+            opts,
+            Wanted::Named,
+            subpaths,
+            edges,
+            started,
+        )
+        .await
     }
 
     /// Runs a pull through `session` to its end, under `trust`.
     ///
     /// The caller made each check of `opts` that applies to its entry.
     /// [`remote`](PullOptions::remote) gives the prefix of the written refs,
-    /// and the session gives the number of steps in flight. `started` is the
-    /// start of [`PullStats::elapsed`].
+    /// and the session gives the number of steps in flight. `edges` is the
+    /// index of the list of static deltas that the caller took out of `opts`.
+    /// `started` is the start of [`PullStats::elapsed`].
+    #[allow(clippy::too_many_arguments)]
     async fn run_session(
         &self,
         session: PullSession,
@@ -632,6 +645,7 @@ impl Repo {
         opts: PullOptions,
         wanted: Wanted<'_>,
         subpaths: Option<Subpaths>,
+        edges: Option<Edges>,
         started: Instant,
     ) -> Result<PullStats> {
         let counters = PullCounters::new(opts.progress.as_ref());
@@ -645,6 +659,7 @@ impl Repo {
             &opts,
             &verification,
             subpaths,
+            edges,
             &counters,
             started,
         ))
@@ -662,6 +677,7 @@ impl Repo {
         opts: &PullOptions,
         verification: &Verification,
         subpaths: Option<Subpaths>,
+        edges: Option<Edges>,
         counters: &PullCounters,
         started: Instant,
     ) -> Result<PullStats> {
@@ -679,6 +695,7 @@ impl Repo {
                 prefix,
                 verification,
                 subpaths,
+                edges,
                 counters,
                 &mut marked,
             )
@@ -784,6 +801,7 @@ impl Repo {
         prefix: Option<&str>,
         verification: &Verification,
         subpaths: Option<Subpaths>,
+        edges: Option<Edges>,
         counters: &PullCounters,
         marked: &mut Vec<Checksum>,
     ) -> Result<FetchedPull> {
@@ -818,14 +836,12 @@ impl Repo {
             &targets,
             opts,
             prefix,
+            edges,
             verification,
             counters,
         )
         .await?;
-        for job in deltas.values() {
-            let (parts, bytes) = job.fetched_parts();
-            counters.parts_planned(parts, bytes);
-        }
+        deltas.plan_parts(counters);
 
         let mut txn = self.transaction().await?;
         apply_durability(&mut txn, opts);
@@ -835,7 +851,7 @@ impl Repo {
             opts,
             prefix,
             &targets,
-            &deltas,
+            &deltas.jobs,
             verification,
             subpaths,
             counters,
@@ -1104,7 +1120,8 @@ impl Repo {
         // pair in this order. The pull holds the bytes until the commit object
         // is here, so a commit that the remote does not hold leaves none.
         let (detached, bytes) = if present {
-            let detached = self.fetch_detached_metadata(ctx, &checksum).await?;
+            let detached =
+                fetch_detached_metadata(ctx.source, ctx.sources, ctx.progress, &checksum).await?;
             let bytes = self
                 .load_object_bytes(ObjectType::Commit, &checksum)
                 .await?;
@@ -1114,7 +1131,8 @@ impl Repo {
             // from there, and the import runs after the checks, in the order of
             // the fetched branches.
             staging = CommitStaging::Import(src);
-            let detached = self.fetch_detached_metadata(ctx, &checksum).await?;
+            let detached =
+                fetch_detached_metadata(ctx.source, ctx.sources, ctx.progress, &checksum).await?;
             (
                 detached,
                 src.load_object_bytes(ObjectType::Commit, &checksum).await?,
@@ -1125,7 +1143,8 @@ impl Repo {
             // they hash to this checksum. The write at staging verifies it
             // again.
             staging = CommitStaging::Write;
-            let detached = self.fetch_detached_metadata(ctx, &checksum).await?;
+            let detached =
+                fetch_detached_metadata(ctx.source, ctx.sources, ctx.progress, &checksum).await?;
             (detached, job.commit_bytes.clone())
         } else {
             match self.fetch_remote_commit(ctx, &checksum).await? {
@@ -1155,15 +1174,14 @@ impl Repo {
         // pull puts in place. That is the copy of the remote if it served one,
         // else the copy of this repository. A later verification of the stored
         // commit reads the same metadata.
-        if ctx.verification.checks_commits() {
-            let dict = match &detached {
-                Some(bytes) => crate::summary::parse_signature_dict(bytes)?,
-                None => self.read_commit_detached_metadata(&checksum).await?,
-            };
-            ctx.verification
-                .check_commit(&checksum, &bytes, dict.as_ref())
-                .await?;
-        }
+        check_commit_signatures(
+            self,
+            ctx.verification,
+            &checksum,
+            &bytes,
+            detached.as_deref(),
+        )
+        .await?;
         // The pull checks each requested ref that names this commit here. The
         // plan fetches a commit once, so a second ref at the same commit has no
         // step of its own for its checks.
@@ -1255,39 +1273,6 @@ impl Repo {
         }))
     }
 
-    /// Reads the `.commitmeta` of a commit from the first localcache source
-    /// that holds it, else from the remote. The caller writes the bytes when
-    /// the commit object is here. A 404 means that the commit has none, and
-    /// the copy of this repository stays as it is.
-    async fn fetch_detached_metadata(
-        &self,
-        ctx: &StepCtx<'_>,
-        commit: &Checksum,
-    ) -> Result<Option<Vec<u8>>> {
-        if let Some(bytes) = cached_detached_metadata(ctx.sources, commit).await? {
-            return Ok(Some(bytes));
-        }
-        self.fetch_remote_detached(ctx, commit).await
-    }
-
-    /// Fetches the `.commitmeta` of a commit from the remote, or `None` if the
-    /// remote serves none.
-    async fn fetch_remote_detached(
-        &self,
-        ctx: &StepCtx<'_>,
-        commit: &Checksum,
-    ) -> Result<Option<Vec<u8>>> {
-        let path = object_path(commit, ObjectType::CommitMeta);
-        let fetched = ctx
-            .source
-            .read_optional(&path, Priority::High, MAX_METADATA_SIZE)
-            .await?;
-        if fetched.is_some() {
-            ctx.progress.metadata_fetched();
-        }
-        Ok(fetched)
-    }
-
     /// Fetches a commit that only the remote can give, with its detached
     /// metadata. The `.commitmeta` comes from the first localcache source that
     /// holds it, else from the remote. The commit object comes after it.
@@ -1310,13 +1295,15 @@ impl Repo {
         match cached_detached_metadata(ctx.sources, commit).await? {
             Some(detached) => Ok((Some(detached), fetch().await?)),
             None if matches!(ctx.source.transfer(), Transfer::Stream(_)) => {
-                let (detached, fetched) =
-                    futures_lite::future::zip(self.fetch_remote_detached(ctx, commit), fetch())
-                        .await;
+                let (detached, fetched) = futures_lite::future::zip(
+                    fetch_remote_detached(ctx.source, ctx.progress, commit),
+                    fetch(),
+                )
+                .await;
                 Ok((detached?, fetched?))
             }
             None => {
-                let detached = self.fetch_remote_detached(ctx, commit).await?;
+                let detached = fetch_remote_detached(ctx.source, ctx.progress, commit).await?;
                 Ok((detached, fetch().await?))
             }
         }
@@ -1581,11 +1568,12 @@ async fn connect(endpoint: Endpoint, stream: StreamSessionOptions) -> Result<Pul
 }
 
 /// Makes the checks of [`Repo::pull_with_session`] over `opts`, and returns
-/// the parsed subpaths.
+/// the parsed subpaths and the index of the list of static deltas.
 ///
 /// Each check reads `opts` alone, so a refusal sends no request and opens no
-/// transaction.
-fn check_session_pull(opts: &PullOptions) -> Result<Option<Subpaths>> {
+/// transaction. The call takes the list out of `opts`, as
+/// [`take_static_deltas`] states.
+async fn check_session_pull(opts: &mut PullOptions) -> Result<(Option<Subpaths>, Option<Edges>)> {
     let subpaths = Subpaths::parse(&opts.subpaths)?;
     check_depth(opts.depth)?;
     refuse_remote_collection(opts)?;
@@ -1615,8 +1603,9 @@ fn check_session_pull(opts: &PullOptions) -> Result<Option<Subpaths>> {
                 .into(),
         ));
     }
-    refuse_static_delta_list(opts)?;
-    Ok(subpaths)
+    let edges = take_static_deltas(opts).await?;
+    refuse_static_delta_list(edges.as_ref())?;
+    Ok((subpaths, edges))
 }
 
 /// Returns the refusal of a pull with a session that names no ref.
@@ -2057,6 +2046,41 @@ fn children_of(dirtree: &DirTree) -> Vec<ObjectName> {
 /// repository stores.
 fn object_path(checksum: &Checksum, ty: ObjectType) -> String {
     format!("objects/{}", loose_path(checksum, ty, RepoMode::Archive))
+}
+
+/// Reads the `.commitmeta` of a commit from the first localcache source in
+/// `sources` that holds it, else from `source`, the remote.
+///
+/// The caller writes the bytes when the commit object is here. A 404 means
+/// that the commit has none, and the copy of this repository stays as it is.
+pub(super) async fn fetch_detached_metadata(
+    source: &RemoteSource,
+    sources: &[Repo],
+    progress: &PullCounters,
+    commit: &Checksum,
+) -> Result<Option<Vec<u8>>> {
+    if let Some(bytes) = cached_detached_metadata(sources, commit).await? {
+        return Ok(Some(bytes));
+    }
+    fetch_remote_detached(source, progress, commit).await
+}
+
+/// Fetches the `.commitmeta` of a commit from the remote, or `None` if the
+/// remote serves none. A file that the remote serves adds one to the metadata
+/// count in `progress`.
+async fn fetch_remote_detached(
+    source: &RemoteSource,
+    progress: &PullCounters,
+    commit: &Checksum,
+) -> Result<Option<Vec<u8>>> {
+    let path = object_path(commit, ObjectType::CommitMeta);
+    let fetched = source
+        .read_optional(&path, Priority::High, MAX_METADATA_SIZE)
+        .await?;
+    if fetched.is_some() {
+        progress.metadata_fetched();
+    }
+    Ok(fetched)
 }
 
 /// Returns the `.commitmeta` of a commit from the first localcache repository

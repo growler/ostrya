@@ -25,11 +25,17 @@
 //! commits of the result go into levels. A commit of a level is made from a
 //! complete commit, from scratch, or from a commit of an earlier level.
 //!
-//! [`Edges`] sorts the indices of the list once, by target. A search finds
-//! the steps to a commit with a binary search, and visits only the steps that
-//! reach its target. Each commit enters a search once. [`complete_sources`]
-//! checks each commit that reaches a target at most once, in batches on the
-//! blocking pool.
+//! [`Edges`] owns the list and sorts its indices once, by target. A search
+//! finds the steps to a commit with a binary search, and visits only the
+//! steps that reach its target. Each commit enters a search once.
+//! [`complete_sources`] checks each commit that reaches a target at most
+//! once, in batches on the blocking pool.
+//!
+//! [`ChainSearch`] owns the list, the complete commits, and the result of the
+//! search of each target. Discovery moves it to the blocking pool for each
+//! pass. If the remote does not hold a delta of the plan, discovery excludes
+//! that delta. The search then plans again only the targets whose chain holds
+//! it, and merges the chains again.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -61,17 +67,17 @@ pub(super) fn scratch_allowed(
 }
 
 /// The deltas of a list, by target commit.
-pub(super) struct Edges<'a> {
+pub(super) struct Edges {
     /// The list that the caller gives.
-    list: &'a [AdvertisedDelta],
+    list: Vec<AdvertisedDelta>,
     /// The indices into `list`, sorted by target commit and then by source
     /// commit. Each pair of source and target is here once, at the index of
     /// its first entry in `list`.
     by_target: Vec<usize>,
 }
 
-impl<'a> Edges<'a> {
-    /// Sorts the indices of `list` by target commit.
+impl Edges {
+    /// Sorts the indices of `list` by target commit, and keeps `list`.
     ///
     /// An entry that is equal to an earlier entry is dropped, and the earlier
     /// entry keeps its index.
@@ -80,7 +86,7 @@ impl<'a> Edges<'a> {
     ///
     /// [`Error::InvalidInput`] if two entries have the same source and target
     /// and different digests. The message names the delta.
-    pub(super) fn new(list: &'a [AdvertisedDelta]) -> Result<Edges<'a>> {
+    pub(super) fn new(list: Vec<AdvertisedDelta>) -> Result<Edges> {
         let mut by_target: Vec<usize> = (0..list.len()).collect();
         // The index breaks a tie, so the first entry of a pair comes first.
         by_target.sort_unstable_by(|&a, &b| {
@@ -124,7 +130,7 @@ impl<'a> Edges<'a> {
 }
 
 /// The result of the search for a chain to one target.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Planned {
     /// The list indices of the steps of the chain, first step first.
     Chain(Vec<usize>),
@@ -145,7 +151,7 @@ pub(super) enum Planned {
 /// hold. The caller gives a target that this repository does not hold
 /// complete. The module doc states the rules of the search.
 pub(super) fn plan_chain(
-    edges: &Edges<'_>,
+    edges: &Edges,
     target: &Checksum,
     complete: &HashSet<Checksum>,
     scratch: bool,
@@ -218,12 +224,7 @@ pub(super) fn plan_chain(
 
 /// Returns the result of a search that finds no chain to `target`:
 /// [`Planned::Declined`] or [`Planned::None`].
-fn no_chain(
-    edges: &Edges<'_>,
-    target: &Checksum,
-    scratch: bool,
-    excluded: &HashSet<usize>,
-) -> Planned {
+fn no_chain(edges: &Edges, target: &Checksum, scratch: bool, excluded: &HashSet<usize>) -> Planned {
     let declined = !scratch
         && edges
             .steps_to(target)
@@ -252,13 +253,13 @@ pub(super) struct ChainPlan {
 
 /// Joins the chains of the targets of one pull.
 ///
-/// `chains` holds the chain of each target that has one, in the order of the
+/// `chains` gives the chain of each target that has one, in the order of the
 /// targets. `targets` holds each requested target that this repository does
 /// not hold complete. A target that the chain of another target makes stays
 /// in the plan, also if its own scratch rule refuses that step.
-pub(super) fn merge(
-    edges: &Edges<'_>,
-    chains: &[Vec<usize>],
+pub(super) fn merge<'a>(
+    edges: &Edges,
+    chains: impl IntoIterator<Item = &'a Vec<usize>>,
     targets: &HashSet<Checksum>,
 ) -> ChainPlan {
     // The first chain that makes a commit gives its step. A step reads a
@@ -327,6 +328,110 @@ pub(super) fn merge(
     ChainPlan { steps, levels }
 }
 
+/// The number of deltas that one search excludes and plans again around.
+///
+/// Each exclusion costs a new search for each target whose chain holds the
+/// delta. The limit bounds this cost for a list that names many deltas that
+/// the remote does not hold. After the limit, a target whose chain holds an
+/// excluded delta gets no chain.
+pub(super) const MAX_EXCLUDED: usize = 64;
+
+/// The search for the chains of the targets of one pull.
+///
+/// The search owns its data, so a caller can move it to the blocking pool for
+/// each pass. A pass plans each target that needs it and merges the chains.
+pub(super) struct ChainSearch {
+    edges: Edges,
+    /// The commits that this repository holds complete.
+    complete: HashSet<Checksum>,
+    /// The list indices of the deltas that the remote does not hold.
+    excluded: HashSet<usize>,
+    /// Each target and its scratch rule, in the order of the targets.
+    targets: Vec<(Checksum, bool)>,
+    /// The commits of `targets`.
+    target_set: HashSet<Checksum>,
+    /// The result of the search of each target, in the order of `targets`.
+    planned: Vec<Planned>,
+}
+
+impl ChainSearch {
+    /// Plans the chain of each target in `targets` over `edges`.
+    ///
+    /// `targets` holds each target that this repository does not hold
+    /// complete, once, with its scratch rule. `complete` holds the commits
+    /// that [`complete_sources`] found.
+    pub(super) fn new(
+        edges: Edges,
+        complete: HashSet<Checksum>,
+        targets: Vec<(Checksum, bool)>,
+    ) -> ChainSearch {
+        let excluded = HashSet::new();
+        let planned = targets
+            .iter()
+            .map(|(target, scratch)| plan_chain(&edges, target, &complete, *scratch, &excluded))
+            .collect();
+        let target_set = targets.iter().map(|(target, _)| *target).collect();
+        ChainSearch {
+            edges,
+            complete,
+            excluded,
+            targets,
+            target_set,
+            planned,
+        }
+    }
+
+    /// Excludes the delta at list index `index`, and plans again each target
+    /// whose chain holds it.
+    ///
+    /// After [`MAX_EXCLUDED`] deltas, the search does not plan again. Each
+    /// target whose chain holds `index` then gets no chain. A delta from
+    /// scratch to such a target that the scratch rule refuses still gives
+    /// [`Planned::Declined`].
+    pub(super) fn exclude(&mut self, index: usize) {
+        let again = self.excluded.len() < MAX_EXCLUDED;
+        self.excluded.insert(index);
+        for ((target, scratch), planned) in self.targets.iter().zip(&mut self.planned) {
+            if matches!(planned, Planned::Chain(chain) if chain.contains(&index)) {
+                *planned = if again {
+                    plan_chain(
+                        &self.edges,
+                        target,
+                        &self.complete,
+                        *scratch,
+                        &self.excluded,
+                    )
+                } else {
+                    no_chain(&self.edges, target, *scratch, &self.excluded)
+                };
+            }
+        }
+    }
+
+    /// Joins the chains of the targets with [`merge`].
+    pub(super) fn merged(&self) -> ChainPlan {
+        let chains = self.planned.iter().filter_map(|planned| match planned {
+            Planned::Chain(chain) => Some(chain),
+            _ => None,
+        });
+        merge(&self.edges, chains, &self.target_set)
+    }
+
+    /// Returns each target, in the order of the targets, with the result of
+    /// its search.
+    pub(super) fn targets(&self) -> impl Iterator<Item = (&Checksum, &Planned)> {
+        self.targets
+            .iter()
+            .map(|(target, _)| target)
+            .zip(&self.planned)
+    }
+
+    /// Returns the deltas of the search.
+    pub(super) fn edges(&self) -> &Edges {
+        &self.edges
+    }
+}
+
 /// The maximum number of commits that one blocking call of
 /// [`complete_sources`] checks.
 const COMPLETE_BATCH: usize = 4096;
@@ -336,50 +441,72 @@ const COMPLETE_BATCH: usize = 4096;
 ///
 /// `targets` holds the requested targets that this repository does not hold
 /// complete. The walk goes backward over the list from the targets, one level
-/// at a time. It checks the new source commits of a level on the blocking
-/// pool, at most [`COMPLETE_BATCH`] commits in one call. It checks each source
-/// commit once, and does not walk past a complete commit.
+/// at a time. The walk of each level and the check of its new source commits
+/// run on the blocking pool, at most [`COMPLETE_BATCH`] commits in one call.
+/// The walk checks each source commit once, and does not walk past a complete
+/// commit. The function takes `edges` and gives it back, so that the walk can
+/// move it to the blocking pool.
 pub(super) async fn complete_sources(
     repo: &Repo,
-    edges: &Edges<'_>,
+    edges: Edges,
     targets: &[Checksum],
-) -> Result<HashSet<Checksum>> {
+) -> Result<(Edges, HashSet<Checksum>)> {
+    let mut edges = edges;
     let mut complete = HashSet::new();
     let mut seen: HashSet<Checksum> = targets.iter().copied().collect();
     let mut frontier: Vec<Checksum> = targets.to_vec();
     while !frontier.is_empty() {
-        let mut sources = Vec::new();
-        for node in &frontier {
-            for &index in edges.steps_to(node) {
-                if let Some(source) = edges.delta(index).from
-                    && seen.insert(source)
-                {
-                    sources.push(source);
+        let sources;
+        (edges, seen, sources) = ostrya_rt::unblock(move || {
+            let mut sources = Vec::new();
+            for node in &frontier {
+                for &index in edges.steps_to(node) {
+                    if let Some(source) = edges.delta(index).from
+                        && seen.insert(source)
+                    {
+                        sources.push(source);
+                    }
                 }
             }
+            (edges, seen, sources)
+        })
+        .await;
+        frontier = Vec::new();
+        for (commit, is_complete) in check_complete(repo, &sources).await? {
+            if is_complete {
+                complete.insert(commit);
+            } else {
+                frontier.push(commit);
+            }
         }
-        let mut next = Vec::new();
-        for batch in sources.chunks(COMPLETE_BATCH) {
-            let repo = repo.clone();
-            let batch = batch.to_vec();
-            let checked = ostrya_rt::unblock(move || {
+    }
+    Ok((edges, complete))
+}
+
+/// Returns each commit of `commits` with `true` if this repository holds it
+/// complete, in order.
+///
+/// The checks run on the blocking pool, at most [`COMPLETE_BATCH`] commits in
+/// one call.
+pub(super) async fn check_complete(
+    repo: &Repo,
+    commits: &[Checksum],
+) -> Result<Vec<(Checksum, bool)>> {
+    let mut checked = Vec::with_capacity(commits.len());
+    for batch in commits.chunks(COMPLETE_BATCH) {
+        let repo = repo.clone();
+        let batch = batch.to_vec();
+        checked.extend(
+            ostrya_rt::unblock(move || {
                 batch
                     .into_iter()
                     .map(|commit| Ok((commit, complete_here_blocking(&repo, &commit)?)))
                     .collect::<Result<Vec<_>>>()
             })
-            .await?;
-            for (commit, is_complete) in checked {
-                if is_complete {
-                    complete.insert(commit);
-                } else {
-                    next.push(commit);
-                }
-            }
-        }
-        frontier = next;
+            .await?,
+        );
     }
-    Ok(complete)
+    Ok(checked)
 }
 
 #[cfg(test)]
@@ -416,7 +543,7 @@ mod tests {
         scratch: bool,
         excluded: &[usize],
     ) -> Planned {
-        let edges = Edges::new(list).unwrap();
+        let edges = Edges::new(list.to_vec()).unwrap();
         let excluded = excluded.iter().copied().collect();
         plan_chain(&edges, &cs(target), &set(complete), scratch, &excluded)
     }
@@ -598,7 +725,7 @@ mod tests {
             d(Some(R), T),
             d(Some(Q), T),
         ];
-        let edges = Edges::new(&list).unwrap();
+        let edges = Edges::new(list.to_vec()).unwrap();
         let planned = plan_chain(&edges, &cs(T), &set(&[A]), false, &HashSet::new());
         assert_eq!(planned, Planned::Chain(vec![0, 1, 4]));
     }
@@ -606,7 +733,7 @@ mod tests {
     /// Asserts that each step of `plan` reads a complete commit, nothing, or
     /// a commit of an earlier level, and that each commit is in one level at
     /// most.
-    fn assert_acyclic(edges: &Edges<'_>, plan: &ChainPlan, complete: &HashSet<Checksum>) {
+    fn assert_acyclic(edges: &Edges, plan: &ChainPlan, complete: &HashSet<Checksum>) {
         let mut level_of = HashMap::new();
         for (level, commits) in plan.levels.iter().enumerate() {
             for commit in commits {
@@ -639,7 +766,7 @@ mod tests {
     #[test]
     fn two_targets_share_a_step() {
         let list = [d(Some(A), B), d(Some(B), T1), d(Some(B), T2)];
-        let edges = Edges::new(&list).unwrap();
+        let edges = Edges::new(list.to_vec()).unwrap();
         let complete = set(&[A]);
         let none = HashSet::new();
         let chains: Vec<Vec<usize>> = [T1, T2]
@@ -663,7 +790,7 @@ mod tests {
     #[test]
     fn a_target_is_an_intermediate_commit_of_another_target() {
         let list = [d(Some(A), T1), d(Some(T1), T2)];
-        let edges = Edges::new(&list).unwrap();
+        let edges = Edges::new(list.to_vec()).unwrap();
         let complete = set(&[A]);
         let none = HashSet::new();
         let chain_of = |target: u8| match plan_chain(&edges, &cs(target), &complete, false, &none) {
@@ -684,7 +811,7 @@ mod tests {
     #[test]
     fn merge_removes_a_step_that_no_kept_step_reads() {
         let list = [d(None, X), d(Some(A), P), d(Some(P), X), d(Some(X), T)];
-        let edges = Edges::new(&list).unwrap();
+        let edges = Edges::new(list.to_vec()).unwrap();
         let complete = set(&[A]);
         let none = HashSet::new();
         let to_x = plan_chain(&edges, &cs(X), &complete, true, &none);
@@ -706,7 +833,7 @@ mod tests {
             d(Some(Q), X),
             d(Some(X), T),
         ];
-        let edges = Edges::new(&list).unwrap();
+        let edges = Edges::new(list.to_vec()).unwrap();
         let plan = merge(&edges, &[vec![0], vec![1, 2, 3, 4]], &set(&[X, T]));
         assert_eq!(plan_steps(&list, &plan), [(None, X), (Some(X), T)]);
         assert_eq!(plan.levels, [vec![cs(X)]]);
@@ -721,10 +848,115 @@ mod tests {
         assert_eq!(plan(&list, T, &[A], false, &[0, 1, 2]), Planned::None);
     }
 
+    /// An exclusion plans again each target whose chain holds the excluded
+    /// delta, and gives the result of a new search with the same exclusion.
+    #[test]
+    fn an_exclusion_plans_again_the_targets_that_use_the_delta() {
+        let list = [
+            d(Some(A), B),
+            d(Some(B), T1),
+            d(Some(A), X),
+            d(Some(X), T1),
+            d(Some(A), T2),
+            d(Some(B), T2),
+        ];
+        let targets = vec![(cs(T1), false), (cs(T2), false)];
+        let mut search = ChainSearch::new(
+            Edges::new(list.to_vec()).unwrap(),
+            set(&[A]),
+            targets.clone(),
+        );
+        let planned: Vec<_> = search.targets().map(|(_, p)| p.clone()).collect();
+        assert_eq!(
+            planned,
+            [Planned::Chain(vec![0, 1]), Planned::Chain(vec![4])]
+        );
+        assert_eq!(search.merged().levels, [vec![cs(B)]]);
+
+        search.exclude(0);
+        let planned: Vec<_> = search.targets().map(|(_, p)| p.clone()).collect();
+        assert_eq!(
+            planned,
+            [Planned::Chain(vec![2, 3]), Planned::Chain(vec![4])]
+        );
+        let edges = Edges::new(list.to_vec()).unwrap();
+        let excluded = HashSet::from([0]);
+        for ((target, scratch), planned) in targets.iter().zip(&planned) {
+            assert_eq!(
+                plan_chain(&edges, target, &set(&[A]), *scratch, &excluded),
+                *planned
+            );
+        }
+        let plan = search.merged();
+        assert_eq!(
+            plan_steps(&list, &plan),
+            [(Some(A), X), (Some(A), T2), (Some(X), T1)]
+        );
+        assert_eq!(plan.levels, [vec![cs(X)]]);
+        assert_eq!(search.edges().delta(2).to, cs(X));
+
+        search.exclude(4);
+        let planned: Vec<_> = search.targets().map(|(_, p)| p.clone()).collect();
+        assert_eq!(planned[1], Planned::None);
+    }
+
+    /// The search plans again around the first excluded deltas alone. After
+    /// the limit, a target whose chain holds an excluded delta gets no chain,
+    /// also if the list holds another chain. A refused delta from scratch to
+    /// that target still counts.
+    #[test]
+    fn the_search_stops_planning_again_after_the_limit() {
+        let source = cs(A);
+        let target = cs(T);
+        let alternative = |i: usize| {
+            let mut bytes = [0x80; 32];
+            bytes[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            Checksum::from_bytes(bytes)
+        };
+        let mut list = Vec::new();
+        for i in 0..=MAX_EXCLUDED + 1 {
+            list.push(AdvertisedDelta {
+                from: Some(source),
+                to: alternative(i),
+                superblock: cs(0),
+            });
+            list.push(AdvertisedDelta {
+                from: Some(alternative(i)),
+                to: target,
+                superblock: cs(0),
+            });
+        }
+        list.push(AdvertisedDelta {
+            from: None,
+            to: target,
+            superblock: cs(0),
+        });
+        let mut search = ChainSearch::new(
+            Edges::new(list).unwrap(),
+            HashSet::from([source]),
+            vec![(target, false)],
+        );
+        for i in 0..MAX_EXCLUDED {
+            let Some((_, Planned::Chain(chain))) = search.targets().next() else {
+                panic!("no chain after {i} exclusions");
+            };
+            assert_eq!(chain, &vec![2 * i, 2 * i + 1]);
+            search.exclude(2 * i);
+        }
+        let planned = search.targets().next().unwrap().1.clone();
+        assert_eq!(
+            planned,
+            Planned::Chain(vec![2 * MAX_EXCLUDED, 2 * MAX_EXCLUDED + 1])
+        );
+        search.exclude(2 * MAX_EXCLUDED);
+        assert_eq!(*search.targets().next().unwrap().1, Planned::Declined);
+        assert!(search.merged().steps.is_empty());
+    }
+
     #[test]
     fn edges_drop_an_equal_entry_and_refuse_two_digests() {
         let list = [d(Some(A), T), d(Some(B), T), d(Some(A), T)];
-        let edges = Edges::new(&list).unwrap();
+        let edges = Edges::new(list.to_vec()).unwrap();
         assert_eq!(edges.steps_to(&cs(T)), [0, 1]);
         let planned = plan_chain(&edges, &cs(T), &set(&[A, B]), false, &HashSet::new());
         assert_eq!(planned, Planned::Chain(vec![0]));
@@ -732,7 +964,7 @@ mod tests {
         let mut other = d(Some(A), T);
         other.superblock = cs(0xee);
         let list = [d(Some(A), T), d(Some(B), T), other];
-        let Err(Error::InvalidInput(message)) = Edges::new(&list) else {
+        let Err(Error::InvalidInput(message)) = Edges::new(list.to_vec()) else {
             panic!("two digests for one delta pass");
         };
         assert_eq!(
@@ -812,16 +1044,16 @@ mod tests {
                     superblock: cs(0),
                 },
             ];
-            let edges = Edges::new(&list).unwrap();
-            let found = complete_sources(&repo, &edges, &[t]).await.unwrap();
+            let edges = Edges::new(list.to_vec()).unwrap();
+            let (_, found) = complete_sources(&repo, edges, &[t]).await.unwrap();
             assert_eq!(found, HashSet::from([a, q]));
 
             // The walk goes through a commit that this repository does not
             // hold, and does not check a target.
             let x = cs(X);
             let list = [delta(z, x), delta(x, t), delta(t, x), delta(p, a)];
-            let edges = Edges::new(&list).unwrap();
-            let found = complete_sources(&repo, &edges, &[t, a]).await.unwrap();
+            let edges = Edges::new(list.to_vec()).unwrap();
+            let (_, found) = complete_sources(&repo, edges, &[t, a]).await.unwrap();
             assert_eq!(found, HashSet::from([z]));
         });
         let _ = std::fs::remove_dir_all(&dir);
@@ -830,6 +1062,6 @@ mod tests {
     /// The future of the walk moves across threads.
     const _: fn() = || {
         fn assert_send<T: Send>(_: &T) {}
-        let _ = |repo: &Repo, edges: &Edges<'_>| assert_send(&complete_sources(repo, edges, &[]));
+        let _ = |repo: &Repo, edges: Edges| assert_send(&complete_sources(repo, edges, &[]));
     };
 }

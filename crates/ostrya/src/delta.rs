@@ -1398,6 +1398,25 @@ pub(crate) fn verify_inline_part(compression: u8, body: &[u8], entry: &DeltaPart
     }
 }
 
+/// Checks the size and the compression byte of an inline part against its
+/// meta-entry, as [`verify_inline_part`] does, and does not hash the part.
+///
+/// A caller that verified the part before uses this check.
+pub(crate) fn check_inline_part(compression: u8, body: &[u8], entry: &DeltaPart) -> Result<()> {
+    let limit = entry.size.saturating_sub(1);
+    if body.len() as u64 > limit {
+        return Err(op_error(&format!(
+            "a stream passed the {limit} byte(s) declared for it"
+        )));
+    }
+    match compression {
+        COMPRESSION_NONE | COMPRESSION_XZ => Ok(()),
+        other => Err(Error::InvalidFormat(format!(
+            "static delta part compression byte {other:#x} is not supported"
+        ))),
+    }
+}
+
 /// The payload of an inline part: the body itself if it is uncompressed, and
 /// the decompressed [`Blob`] if it is xz.
 pub(crate) enum InlinePayload<'a> {

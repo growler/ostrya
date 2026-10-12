@@ -7,8 +7,9 @@ use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::io::AsyncReadExt;
 use ostrya_fetch::{FetchRequest, Fetched, Fetcher, Priority};
 
-use super::pull::{StreamSession, StreamSessionOptions};
+use super::pull::{PullBody, StreamSession, StreamSessionOptions};
 use crate::error::{Error, Result};
+use crate::proto::MAX_REF_LISTING;
 
 /// The cap on the `summary` and the `summary.sig` that
 /// [`PullSession::fetch_summary`] reads: 64 MiB.
@@ -29,8 +30,9 @@ const SUMMARY_SIG_FILE: &str = "summary.sig";
 /// [`Endpoint`](crate::transport::Endpoint), and
 /// [`over_stream`](PullSession::over_stream) opens one over a pair of byte
 /// streams. The session is `Send + Sync`.
-/// [`fetch_summary`](PullSession::fetch_summary) takes `&self`, so the session
-/// stays usable after the read.
+/// [`fetch_summary`](PullSession::fetch_summary) and
+/// [`fetch_refs`](PullSession::fetch_refs) take `&self`, so the session stays
+/// usable after the read.
 ///
 /// The enum has no common `get`. A caller that reads the raw files of the
 /// remote matches on the variant: [`Fetcher::fetch`] for
@@ -115,6 +117,40 @@ impl PullSession {
         }
     }
 
+    /// Reads the ref listing of `prefixes` from the remote.
+    ///
+    /// The listing is a summary of the refs under `refs/heads` that the
+    /// prefixes select, built by the server for this request. Each prefix is
+    /// a ref name. A prefix selects the ref of that name and each ref below
+    /// it. An empty list selects all refs. The listing has a cap of
+    /// [`MAX_REF_LISTING`] bytes.
+    ///
+    /// Over a stream session, the call is [`StreamSession::list_refs`], in
+    /// the pipeline with the `get` calls. It returns `Some` with the bytes of
+    /// the listing. The buffer gets the size that the server states, within
+    /// the cap. Each read goes into a chunk of at most 128 KiB.
+    ///
+    /// No signature covers the listing, and the call checks none.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] over HTTP. The call sends no request.
+    /// - The errors of [`StreamSession::list_refs`] over a stream session. A
+    ///   stated length over the cap is [`Error::LimitExceeded`], and a listing
+    ///   that the server refuses for its cap is also [`Error::LimitExceeded`].
+    /// - The error of the session that a failed read of the body carries.
+    pub async fn fetch_refs(&self, prefixes: &[&str]) -> Result<Option<Vec<u8>>> {
+        match self {
+            PullSession::Http(_) => Err(Error::Unsupported(
+                "the ref listing over HTTP is not supported".into(),
+            )),
+            PullSession::Stream(session) => {
+                let body = session.list_refs(prefixes, MAX_REF_LISTING).await?;
+                read_body(body, MAX_REF_LISTING).await.map(Some)
+            }
+        }
+    }
+
     /// Returns the number of requests that the session keeps in flight at one
     /// time, at least 1.
     ///
@@ -173,7 +209,7 @@ async fn fetch_whole(fetcher: &Fetcher, path: &str) -> Result<Vec<u8>> {
             ))));
         };
         let declared = body.content_length();
-        match read_whole(body, declared).await {
+        match read_whole(body, declared, MAX_SUMMARY_FILE).await {
             Ok(out) => return Ok(out),
             Err(e) => refetch.retry(Error::Io(e)).await?,
         }
@@ -186,25 +222,31 @@ async fn read_optional(session: &StreamSession, path: &str) -> Result<Option<Vec
     let Some(body) = session.get(path, MAX_SUMMARY_FILE).await? else {
         return Ok(None);
     };
+    read_body(body, MAX_SUMMARY_FILE).await.map(Some)
+}
+
+/// Reads a stream `body` whole, with a buffer of at most `cap` bytes before
+/// the first read.
+async fn read_body(body: PullBody, cap: u64) -> Result<Vec<u8>> {
     let declared = body.len();
-    match read_whole(body, declared).await {
-        Ok(out) => Ok(Some(out)),
-        // A failed read of a body carries the error of the session.
-        Err(e) => Err(e.downcast::<Error>().unwrap_or_else(Error::Io)),
-    }
+    // A failed read of a body carries the error of the session.
+    read_whole(body, declared, cap)
+        .await
+        .map_err(|e| e.downcast::<Error>().unwrap_or_else(Error::Io))
 }
 
 /// Reads `body` to its end into one buffer.
 ///
 /// The size of the buffer comes from `declared`, the stated length, within
-/// [`MAX_SUMMARY_FILE`]. Each read goes into a chunk of at most
-/// [`READ_CHUNK`] bytes, also the read that finds the end of the body. So a
-/// buffer filled to its stated length does not grow.
+/// `cap`. Each read goes into a chunk of at most [`READ_CHUNK`] bytes, also
+/// the read that finds the end of the body. So a buffer filled to its stated
+/// length does not grow.
 async fn read_whole<R: AsyncRead + Unpin>(
     mut body: R,
     declared: Option<u64>,
+    cap: u64,
 ) -> io::Result<Vec<u8>> {
-    let declared = usize::try_from(declared.unwrap_or(0).min(MAX_SUMMARY_FILE)).unwrap_or(0);
+    let declared = usize::try_from(declared.unwrap_or(0).min(cap)).unwrap_or(0);
     let mut out = Vec::with_capacity(declared);
     let mut chunk = vec![0u8; declared.saturating_add(1).clamp(4096, READ_CHUNK)];
     loop {

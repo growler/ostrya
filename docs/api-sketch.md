@@ -4870,9 +4870,9 @@ The session:
    `PULL_PROTOCOL_VERSION`. `PullHello` with version 0 gets `Error` with
    `version-unsupported`.
 2. The client sends `Get` frames, each with the path of one file relative to
-   the repository root. The server answers each `Get` with one `GetReply`,
-   in the order of the `Get` frames. A body of chunks follows each reply
-   with found true.
+   the repository root, and `ListRefs` frames, each with a list of ref
+   prefixes. The server answers each frame with one `GetReply`, in the order
+   of the frames. A body of chunks follows each reply with found true.
 3. The client closes the input of the server at a frame boundary. `send`
    returns `Ok`.
 
@@ -4886,8 +4886,14 @@ Rules:
 - `GetReply` holds the length of the body when the view knows it: the built
   `config` and a stored file. A `.filez` built on request has no length.
 - The session reads one `Get`, answers it to the end of its body, and then
-  reads the next. It drops each body before the next `Get`, so a built
-  `.filez` gives its compressor back first.
+  reads the next request. It drops each body before the next request, so a
+  built `.filez` gives its compressor back first.
+- The session answers a `ListRefs` with the bytes of
+  `Repo::build_ref_listing` for its prefixes: `GetReply` with found true
+  and the length of the listing, then the listing as a body of chunks. The
+  session checks each prefix with `ostrya_core::is_ref_name` before the
+  build. An empty list is all refs under `refs/heads`. The listing is whole
+  in memory, up to `MAX_REF_LISTING`, 128 MiB.
 - The session opens no transaction and takes no lock, neither the
   repository lock nor the update lock. Read access to the repository is
   sufficient for an `archive`, `bare-user`, `bare-user-only`, or
@@ -4917,9 +4923,13 @@ Failures:
 - A failure with a wire code goes to the client as `Error` and returns as
   `Error::Remote` with that code: `version-unsupported` for `PullHello` with
   version 0; `protocol` for a `Get` before `PullHello`, a second
-  `PullHello`, a kind of the push, `PullHelloReply`, `GetReply`, or `Error`
-  from the client, a malformed frame, and an end of input inside a frame;
-  `limit-exceeded` for a frame over 1 MiB.
+  `PullHello`, a `ListRefs` before `PullHello`, a kind of the push,
+  `PullHelloReply`, `GetReply`, or `Error` from the client, a malformed
+  frame, an end of input inside a frame, and a `ListRefs` prefix that is
+  not a ref name; `limit-exceeded` for a frame over 1 MiB and for a ref
+  listing over `MAX_REF_LISTING`.
+- Each other error of `build_ref_listing` goes to the client as `Error`
+  with `internal` in place of the reply, and returns as the error it is.
 - A failure of the view before the reply, for example a file that the
   account cannot read (`EACCES`), goes to the client as `Error` with
   `internal` in place of the reply, and returns as the error it is. An error
@@ -4945,7 +4955,7 @@ stream source of the pull driver. `StreamSession`, `PullSession`, and
 #[derive(Debug, Clone, Default)]
 pub struct StreamSessionOptions {
     pub agent: Option<String>,                  // default "ostrya/<version>"
-    pub max_outstanding: Option<usize>,         // Get frames in flight; 8;
+    pub max_outstanding: Option<usize>,         // frames in flight; 8;
                                                 // 0 is raised to 1
 }
 
@@ -4963,6 +4973,8 @@ impl StreamSession {
         -> Result<StreamSession>;
     pub async fn get(&self, path: &str, max_len: u64)
         -> Result<Option<PullBody>>;
+    pub async fn list_refs(&self, prefixes: &[&str], max_len: u64)
+        -> Result<PullBody>;
     pub async fn finish(self) -> Result<()>;
 }
 
@@ -4987,6 +4999,8 @@ impl PullSession {
         W: AsyncWrite + Unpin + Send + 'static;
     pub async fn fetch_summary(&self)
         -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)>; // (summary, summary.sig)
+    pub async fn fetch_refs(&self, prefixes: &[&str])
+        -> Result<Option<Vec<u8>>>;             // a ref listing
     pub fn max_outstanding(&self) -> usize;
     pub async fn finish(self) -> Result<()>;
 }
@@ -5013,6 +5027,14 @@ The pull session:
   call asks for `summary.sig` and then for `summary` at `Priority::High`. A
   404 is an absent file, and a body that fails in transit is fetched again.
   Over a stream session, the two `Get` calls are in flight together.
+- `fetch_refs` takes `&self` and returns the ref listing of a set of
+  prefixes: a summary GVariant that the server builds for the request, with
+  the refs under `refs/heads` that the prefixes select. An empty list
+  selects all refs. The listing has a cap of `MAX_REF_LISTING`, 128 MiB.
+  Over a stream session the call is `StreamSession::list_refs`, and it
+  returns `Some` with the bytes. The buffer of the listing gets the stated
+  length, within the cap. Over HTTP the call is `Error::Unsupported`, and it
+  sends no request. No signature covers the listing.
 - `max_outstanding` is the admitted request limit, at least 1:
   `Fetcher::max_outstanding` over HTTP, and the limit of the stream session
   otherwise.
@@ -5029,10 +5051,16 @@ The session:
   `SshOptions::command`, then `OSTRYA_SSH_COMMAND`, then
   `SshOptions::config_command`, then `ssh`, as for the push.
   `SEND_COMMAND` is `SshOptions::remote_command`, or `ostrya send`.
-- A `get` waits while `max_outstanding` calls hold a place in the pipeline.
-  It then takes its place, and writes and flushes its `Get` frame under one
-  lock, so the frames go on the wire in the order of the places. The places
-  and the writes are each served in the order the calls arrive.
+- A `get` or a `list_refs` waits while `max_outstanding` calls hold a place
+  in the pipeline. It then takes its place, and writes and flushes its
+  frame under one lock, so the frames go on the wire in the order of the
+  places. The places and the writes are each served in the order the calls
+  arrive.
+- `list_refs` checks each prefix with `ostrya_core::is_ref_name` before it
+  takes a place. A prefix that is not a ref name is `Error::InvalidInput`,
+  the call writes nothing, and the session stays usable. A `GetReply` with
+  found false, or with no length, in reply to `ListRefs` is
+  `Error::Protocol` and ends the session.
 - The call returns at the head of its reply. `None` is a path that the
   server does not serve. The session moves to the next reply when it reads
   the chunk that ends a body, also while the caller still holds that body.
@@ -5044,11 +5072,11 @@ The session:
 - A failed read of a body gives an `io::Error` that carries the error of the
   session, with the kind of an I/O error.
 - A failure ends the session: an `Error` of the server, a reply out of order,
-  a length check, a failed read or write, a `get` future dropped after it
-  took its place, and a body dropped before its end. Each later call, and
-  each later read of a body, fails with an error of the variant and the
-  message of the first failure, and an I/O error keeps its kind. A dropped
-  call or body is `Error::InvalidInput`.
+  a length check, a failed read or write, a `get` or `list_refs` future
+  dropped after it took its place, and a body dropped before its end. Each
+  later call, and each later read of a body, fails with an error of the
+  variant and the message of the first failure, and an I/O error keeps its
+  kind. A dropped call or body is `Error::InvalidInput`.
 - When the write of a `Get` frame fails, the call reads the message that the
   server can have sent, at the turn of its reply, for at most 5 seconds on a
   session that `connect` opened. An `Error` is the error of the call.

@@ -4,6 +4,7 @@
 //! - the files of a commit from a repository of each mode
 //! - the replies to paths that are not found
 //! - the pipeline of `Get` frames and the version reply
+//! - the ref listing of a `ListRefs`
 //! - each error code of the pull
 //! - the abandon marker of a body that fails after its reply
 //! - the shape of the writes and the flushes on the output
@@ -604,8 +605,9 @@ fn version_0_is_version_unsupported() {
     assert_eq!(returned_code(&result), Some(ErrorCode::VersionUnsupported));
 }
 
-/// A `Get` before `PullHello`, a second `PullHello`, a message kind of the
-/// push, and a message of the server from the client are `protocol`.
+/// A `Get` or a `ListRefs` before `PullHello`, a second `PullHello`, a
+/// message kind of the push, and a message of the server from the client are
+/// `protocol`.
 #[test]
 fn a_message_out_of_order_is_protocol() {
     let tmp = TmpDir::new("send-protocol");
@@ -663,6 +665,101 @@ fn a_message_out_of_order_is_protocol() {
     });
     assert_eq!(error.code, ErrorCode::Protocol);
     assert_eq!(returned_code(&result), Some(ErrorCode::Protocol));
+
+    // A `ListRefs` as the first frame.
+    let (result, error) = session(&repo, PIPE_CAP, |mut c| async move {
+        c.send(&Message::ListRefs(Vec::new())).await;
+        c.error().await
+    });
+    assert_eq!(error.code, ErrorCode::Protocol);
+    assert_eq!(returned_code(&result), Some(ErrorCode::Protocol));
+}
+
+// ---------------------------------------------------------------------------
+// The ref listing.
+// ---------------------------------------------------------------------------
+
+/// Returns a repository with the refs `a/b`, `a/bc`, and `z` on one commit.
+fn listing_repo(tmp: &TmpDir) -> Repo {
+    let src = build_tree(tmp.path());
+    let (_, repo, commit) = block_on(repo_of(tmp.path(), RepoMode::BareUser, &src));
+    for name in ["a/b", "a/bc", "z"] {
+        block_on(repo.set_ref_immediate(name, Some(&commit))).unwrap();
+    }
+    repo
+}
+
+/// The session answers each `ListRefs` with a found reply that states the
+/// length of the listing, and the body is the listing that
+/// `build_ref_listing` builds. A `Get` between two `ListRefs` keeps its
+/// place.
+#[test]
+fn list_refs_answers_with_the_built_listing() {
+    let tmp = TmpDir::new("send-list-refs");
+    let repo = listing_repo(&tmp);
+    let (result, replies) = session(&repo, PIPE_CAP, |mut c| async move {
+        c.open().await;
+        c.send(&Message::ListRefs(vec!["a/b".to_owned()])).await;
+        c.send(&Message::Get("config".to_owned())).await;
+        c.send(&Message::ListRefs(Vec::new())).await;
+        let mut replies = Vec::new();
+        for _ in 0..3 {
+            replies.push(read_reply(&mut c.reader).await);
+        }
+        replies
+    });
+    result.unwrap();
+    for (reply, prefixes) in [(&replies[0], &["a/b"][..]), (&replies[2], &[])] {
+        let listing = block_on(repo.build_ref_listing(prefixes)).unwrap();
+        assert!(reply.found, "{prefixes:?}");
+        assert_eq!(reply.len, Some(listing.len() as u64), "{prefixes:?}");
+        assert_eq!(reply.body, listing, "{prefixes:?}");
+    }
+    assert_eq!(replies[1].body, BASE_CONFIG);
+    let one = ostrya::Summary::parse(&replies[0].body).unwrap();
+    let names: Vec<&str> = one.refs.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["a/b"]);
+}
+
+/// A prefix that is not a ref name is `protocol`. The session sends no
+/// reply before the `Error` message.
+#[test]
+fn list_refs_with_a_bad_prefix_is_protocol() {
+    let tmp = TmpDir::new("send-list-refs-bad");
+    let repo = listing_repo(&tmp);
+    for bad in ["", "a/../b", "a/", "/a"] {
+        let (result, error) = session(&repo, PIPE_CAP, |mut c| async move {
+            c.open().await;
+            c.send(&Message::ListRefs(vec!["z".to_owned(), bad.to_owned()]))
+                .await;
+            c.error().await
+        });
+        assert_eq!(error.code, ErrorCode::Protocol, "{bad:?}");
+        assert_eq!(returned_code(&result), Some(ErrorCode::Protocol), "{bad:?}");
+    }
+}
+
+/// A failure of the build of the listing is `internal` on the wire, and
+/// `send` returns the error of the build.
+#[test]
+fn list_refs_with_a_failed_build_is_internal() {
+    let tmp = TmpDir::new("send-list-refs-internal");
+    let repo = listing_repo(&tmp);
+    std::fs::write(
+        repo.path().join("refs/heads/x"),
+        format!("{}\n", "ab".repeat(32)),
+    )
+    .unwrap();
+    let (result, error) = session(&repo, PIPE_CAP, |mut c| async move {
+        c.open().await;
+        c.send(&Message::ListRefs(vec!["x".to_owned()])).await;
+        c.error().await
+    });
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert!(
+        matches!(result, Err(Error::ObjectNotFound { .. })),
+        "{result:?}"
+    );
 }
 
 /// An end of the input inside a frame is `protocol`.

@@ -197,6 +197,7 @@ fn samples() -> Vec<Message> {
         Message::PullHelloReply(PullHelloReply { version: 1 }),
         Message::Get("objects/ab/cd.filez".into()),
         get_reply(true, Some(3)),
+        Message::ListRefs(vec!["a".into(), "b/c".into()]),
     ]
 }
 
@@ -260,20 +261,27 @@ fn every_message_round_trips() {
     ] {
         round_trip(get_reply(found, len));
     }
+    // The codec does not check the prefixes.
+    for prefixes in [vec![], vec![""], vec!["a"; 3], vec!["a b", "/x/"]] {
+        round_trip(Message::ListRefs(
+            prefixes.into_iter().map(Into::into).collect(),
+        ));
+    }
 }
 
 #[test]
-fn the_pull_kinds_are_12_to_15() {
+fn the_pull_kinds_are_12_to_16() {
     for (byte, kind) in [
         (12, Kind::PullHello),
         (13, Kind::PullHelloReply),
         (14, Kind::Get),
         (15, Kind::GetReply),
+        (16, Kind::ListRefs),
     ] {
         assert_eq!(Kind::from_u8(byte).unwrap(), kind);
         assert_eq!(kind.as_u8(), byte);
     }
-    assert_protocol(Kind::from_u8(16));
+    assert_protocol(Kind::from_u8(17));
     assert_eq!(PULL_PROTOCOL_VERSION, 1);
 }
 
@@ -528,6 +536,17 @@ fn golden_bytes_pin_the_pull_messages() {
         get_reply(true, Some(0)),
         hex("00 00 00 11 0f 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"),
     );
+    // An empty `as` is 0 bytes. Each string ends with a zero byte, and the
+    // offsets of the string ends follow, one byte each.
+    golden(Message::ListRefs(vec![]), hex("00 00 00 01 10"));
+    golden(
+        Message::ListRefs(vec!["a".into()]),
+        hex("00 00 00 04 10 61 00 02"),
+    );
+    golden(
+        Message::ListRefs(vec!["a".into(), "b/c".into()]),
+        hex("00 00 00 09 10 61 00 62 2f 63 00 02 06"),
+    );
 }
 
 #[test]
@@ -552,6 +571,15 @@ fn malformed_pull_bodies_decode_to_protocol() {
         hex("00 00 00 04 0e 61 00 62 00"),
         frame(14, &[]),
         frame(15, &[]),
+        // A ListRefs whose offset points past the end, one whose offset
+        // table holds its own offset, and one with no terminating zero byte.
+        frame(16, &hex("61")),
+        frame(16, &hex("61 00 03")),
+        frame(16, &hex("61 62 02")),
+        // A ListRefs with a prefix that is not UTF-8, and one with a zero
+        // inside a prefix.
+        frame(16, &hex("ff 00 02")),
+        frame(16, &hex("61 00 62 00 04")),
     ];
     for bytes in cases {
         assert_protocol(read_one(&bytes));
@@ -711,7 +739,7 @@ fn header_body(ty: u8, sum: Value, enc: u8) -> Vec<u8> {
 
 #[test]
 fn malformed_bodies_decode_to_protocol() {
-    for kind in [0, 16, 255] {
+    for kind in [0, 17, 255] {
         assert_protocol(read_one(&frame(kind, &[0])));
     }
 

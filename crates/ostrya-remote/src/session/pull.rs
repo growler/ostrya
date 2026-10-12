@@ -1,5 +1,5 @@
-//! The client session of a pull: the pipeline of `Get` frames and the bodies
-//! of the replies.
+//! The client session of a pull: the pipeline of `Get` and `ListRefs` frames
+//! and the bodies of the replies.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -18,8 +18,8 @@ use ostrya_fetch::gate::{Gate, Permit};
 use super::stream::{Input, Output};
 use crate::error::{Error, Result};
 use crate::proto::{
-    FrameReader, FrameWriter, GetReply, MIN_FRAME_LIMIT, Message, PULL_PROTOCOL_VERSION, PullHello,
-    Step, encode_frame, protocol,
+    FrameReader, FrameWriter, GetReply, Kind, MIN_FRAME_LIMIT, Message, PULL_PROTOCOL_VERSION,
+    PullHello, Step, encode_frame, protocol,
 };
 use crate::transport::Transport;
 
@@ -39,7 +39,8 @@ pub struct StreamSessionOptions {
     ///
     /// The default is `ostrya/<version>`, with the version of this crate.
     pub agent: Option<String>,
-    /// The most [`get`](StreamSession::get) calls that hold a place in the
+    /// The most [`get`](StreamSession::get) and
+    /// [`list_refs`](StreamSession::list_refs) calls that hold a place in the
     /// [pipeline](StreamSession#pipeline) at a time.
     ///
     /// The default is 8. The session raises a value of 0 to 1.
@@ -51,9 +52,9 @@ pub struct StreamSessionOptions {
 /// [`connect`](StreamSession::connect) opens a session over ssh, and
 /// [`over_stream`](StreamSession::over_stream) opens one over a pair of byte
 /// streams. The session is `Send + Sync`. Concurrent
-/// [`get`](StreamSession::get) calls share the
-/// [pipeline](StreamSession#pipeline), and the replies come in the order of
-/// the `Get` frames.
+/// [`get`](StreamSession::get) and [`list_refs`](StreamSession::list_refs)
+/// calls share the [pipeline](StreamSession#pipeline), and the replies come
+/// in the order of the frames.
 ///
 /// If the session is dropped without [`finish`](StreamSession::finish), it
 /// sends nothing more and closes its output, so the server reads the end of
@@ -63,23 +64,24 @@ pub struct StreamSessionOptions {
 ///
 /// # Pipeline
 ///
-/// The session opens with [`PullHello`] and asks for files by their path
-/// with [`get`](StreamSession::get). All requests share one stream as a
-/// pipeline. A `get` takes its place in the pipeline and writes its `Get`
-/// frame under one lock. Because of this lock, the frames go on the wire in
-/// the order of the places.
+/// The session opens with [`PullHello`]. It asks for files by their path
+/// with [`get`](StreamSession::get), and for ref listings with
+/// [`list_refs`](StreamSession::list_refs). All requests share one stream as
+/// a pipeline. A call takes its place in the pipeline and writes its frame
+/// under one lock. Because of this lock, the frames go on the wire in the
+/// order of the places.
 ///
 /// A reply carries no request id. The reply of a call is the next reply
 /// after the reply of the call before it.
 ///
 /// At most [`max_outstanding`](StreamSessionOptions::max_outstanding) calls
 /// hold a place at a time. A call holds its place from the write of its
-/// `Get` frame to the end of its reply.
+/// frame to the end of its reply.
 ///
-/// The end of a reply is a [`GetReply`] whose `found` is `false`. For a reply
-/// whose `found` is `true`, the end is the chunk that ends the body. When the
-/// session reads that chunk, it moves to the next reply, also while the
-/// caller still holds the [`PullBody`].
+/// For a [`get`](StreamSession::get), the end of a reply is a [`GetReply`]
+/// whose `found` is `false`. For a reply whose `found` is `true`, the end is
+/// the chunk that ends the body. When the session reads that chunk, it moves
+/// to the next reply, also while the caller still holds the [`PullBody`].
 ///
 /// # Failures
 ///
@@ -87,11 +89,13 @@ pub struct StreamSessionOptions {
 ///
 /// - an `Error` message from the server
 /// - a reply of a kind that the session does not expect
+/// - a [`GetReply`] whose `found` is `false`, or that states no length, in
+///   reply to `ListRefs`
 /// - a stated length that is more than the cap of the call, or that is
 ///   different from the sum of the chunks
 /// - a body that is longer than the cap of the call
 /// - a failed read or write
-/// - a drop of a `get` future after the call took its place
+/// - a drop of a `get` or `list_refs` future after the call took its place
 /// - a drop of a [`PullBody`] before its end
 /// - a [`finish`](StreamSession::finish) while the body of a reply is not read
 ///   to its end
@@ -176,6 +180,18 @@ fn body_error(e: Error) -> io::Error {
         _ => io::ErrorKind::Other,
     };
     io::Error::new(kind, e)
+}
+
+/// Checks that each prefix of a ref listing is a ref name.
+///
+/// A prefix that is not a ref name is [`Error::InvalidInput`].
+fn check_prefixes(prefixes: &[&str]) -> Result<()> {
+    match prefixes.iter().find(|p| !ostrya_core::is_ref_name(p)) {
+        Some(bad) => Err(Error::InvalidInput(format!(
+            "the ref prefix '{bad}' is not a ref name"
+        ))),
+        None => Ok(()),
+    }
 }
 
 fn eof(what: &str) -> Error {
@@ -338,7 +354,7 @@ impl Drop for Placed<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.shared.fail(Error::InvalidInput(
-                "a get call was dropped before its reply".into(),
+                "a call was dropped before its reply".into(),
             ));
         }
     }
@@ -515,13 +531,70 @@ impl StreamSession {
     /// message before it closed, the call returns the variant of that
     /// message. Otherwise it returns the [`Error::Io`] of the write.
     pub async fn get(&self, path: &str, max_len: u64) -> Result<Option<PullBody>> {
-        let shared = &self.inner.shared;
-        shared.check()?;
+        self.inner.shared.check()?;
         let get = Message::Get(path.to_owned());
         let frame = encode_frame(&get, MIN_FRAME_LIMIT)?;
         let Message::Get(path) = get else {
             unreachable!("the message is a Get");
         };
+        self.request(Kind::Get, frame, path, max_len).await
+    }
+
+    /// Asks for the ref listing of `prefixes` and waits for the head of its
+    /// reply.
+    ///
+    /// Each prefix is a ref name. A prefix selects the ref of that name and
+    /// each ref below it, under `refs/heads`. An empty list selects all refs
+    /// under `refs/heads`. The server removes duplicate prefixes and prefixes
+    /// that another prefix covers. The [`PullBody`] holds the listing to
+    /// `max_len` bytes and to its stated length.
+    ///
+    /// The call takes its place in the [pipeline](StreamSession#pipeline) as
+    /// [`get`](StreamSession::get) does, and it has the same rules for the
+    /// body and for a drop of its future.
+    ///
+    /// # Errors
+    ///
+    /// The first two errors leave the session usable, and the call writes
+    /// nothing. Each other error is a failure of the session, as
+    /// [Failures](StreamSession#failures) states.
+    ///
+    /// - [`Error::InvalidInput`] if a prefix is not a ref name.
+    /// - [`Error::LimitExceeded`] if the `ListRefs` frame is longer than
+    ///   [`MIN_FRAME_LIMIT`].
+    /// - [`Error::Protocol`] if the reply is a `GetReply` whose `found` is
+    ///   `false`, or that states no length.
+    /// - Each failure of the session that [`get`](StreamSession::get) lists.
+    ///   The server sends `protocol` for a prefix that it refuses, and
+    ///   `limit-exceeded` for a listing over its cap.
+    pub async fn list_refs(&self, prefixes: &[&str], max_len: u64) -> Result<PullBody> {
+        self.inner.shared.check()?;
+        check_prefixes(prefixes)?;
+        let frame = {
+            let list = Message::ListRefs(prefixes.iter().map(|p| (*p).to_owned()).collect());
+            encode_frame(&list, MIN_FRAME_LIMIT)?
+        };
+        let body = self
+            .request(Kind::ListRefs, frame, "ListRefs".to_owned(), max_len)
+            .await?;
+        Ok(body.expect("a ListRefs reply always has a body"))
+    }
+
+    /// Writes `frame`, a request of `kind`, in the pipeline and reads the
+    /// head of its reply.
+    ///
+    /// `label` names the request in the errors and in the body. A `GetReply`
+    /// whose `found` is `false` gives `None` for a `Get`, and fails the
+    /// session for a `ListRefs`. A `GetReply` that states no length also fails
+    /// the session for a `ListRefs`.
+    async fn request(
+        &self,
+        kind: Kind,
+        frame: Vec<u8>,
+        label: String,
+        max_len: u64,
+    ) -> Result<Option<PullBody>> {
+        let shared = &self.inner.shared;
         let place = shared.places.acquire(Priority::Normal).await;
         let turn = shared.writing.acquire(Priority::Normal).await;
         shared.check()?;
@@ -571,6 +644,19 @@ impl StreamSession {
         let reply = reader.read_message().await;
         placed.disarm();
         match reply {
+            Ok(Some(Message::GetReply(GetReply { found: false, .. })))
+                if kind == Kind::ListRefs =>
+            {
+                drop(reader);
+                Err(shared.fail(protocol("GetReply with found false in reply to ListRefs")))
+            }
+            Ok(Some(Message::GetReply(GetReply {
+                found: true,
+                len: None,
+            }))) if kind == Kind::ListRefs => {
+                drop(reader);
+                Err(shared.fail(protocol("GetReply with no length in reply to ListRefs")))
+            }
             Ok(Some(Message::GetReply(GetReply { found: false, .. }))) => {
                 shared.advance(reader, seq);
                 drop(place);
@@ -582,7 +668,7 @@ impl StreamSession {
                 {
                     drop(reader);
                     return Err(shared.fail(Error::LimitExceeded(format!(
-                        "{path}: a body of {len} bytes is over the limit {max_len}"
+                        "{label}: a body of {len} bytes is over the limit {max_len}"
                     ))));
                 }
                 shared.lend(reader)?;
@@ -593,7 +679,7 @@ impl StreamSession {
                         state: BodyState::Reading,
                         place: Some(place),
                         seq,
-                        path,
+                        path: label,
                         len,
                         max_len,
                         read: 0,
@@ -602,9 +688,9 @@ impl StreamSession {
             }
             Ok(Some(Message::Error(e))) => Err(shared.fail(e.into())),
             Ok(Some(other)) => {
-                Err(shared.fail(protocol(format!("{:?} in reply to Get", other.kind()))))
+                Err(shared.fail(protocol(format!("{:?} in reply to {kind:?}", other.kind()))))
             }
-            Ok(None) => Err(shared.fail(eof("the reply to Get"))),
+            Ok(None) => Err(shared.fail(eof(&format!("the reply to {kind:?}")))),
             Err(e) => Err(shared.fail(e)),
         }
     }

@@ -10,7 +10,8 @@ use crate::archive::{ArchiveAnswer, ArchiveView};
 use crate::error::{Error, Result};
 use crate::remote;
 use crate::remote::proto::{
-    FrameReader, FrameWriter, GetReply, Message, PULL_PROTOCOL_VERSION, PullHello, PullHelloReply,
+    FrameReader, FrameWriter, GetReply, MAX_REF_LISTING, Message, PULL_PROTOCOL_VERSION, PullHello,
+    PullHelloReply,
 };
 use crate::repo::Repo;
 
@@ -87,23 +88,28 @@ fn complete_frame(buf: &[u8]) -> bool {
 impl Repo {
     /// Serves one pull session over the streams `input` and `output`.
     ///
-    /// The session reads a `PullHello` message and then `Get` messages of a
-    /// client from `input`. It writes the replies and the bodies to `output`.
-    /// This method is the serving side of a pull over ssh. It does not close
-    /// `output`.
+    /// The session reads a `PullHello` message and then `Get` and `ListRefs`
+    /// messages of a client from `input`. It writes the replies and the bodies
+    /// to `output`. This method is the serving side of a pull over ssh. It
+    /// does not close `output`.
     ///
     /// # Requests
     ///
     /// The session answers each `Get` through one [`ArchiveView`] of this
     /// repository. All requests of the session share the parsed `config` and
     /// the idle compressors of the view. The session reads one `Get`, answers
-    /// it to the end of its body, and then reads the next `Get`.
+    /// it to the end of its body, and then reads the next request.
     ///
     /// - If the view does not find the path, or refuses it, the reply is a
     ///   `GetReply` with `found` set to `false`. The session continues.
     /// - If the view serves the path, the reply is a `GetReply` with `found`
     ///   set to `true`. The reply holds the length if the view knows it. The
     ///   body follows as chunks.
+    ///
+    /// The session answers each `ListRefs` with the listing that
+    /// [`build_ref_listing`](Repo::build_ref_listing) builds for its prefixes.
+    /// The reply is a `GetReply` with `found` set to `true` and the length of
+    /// the listing. The listing follows as chunks.
     ///
     /// # Access
     ///
@@ -121,7 +127,8 @@ impl Repo {
     ///
     /// A body streams through one chunk buffer, so no content object is whole
     /// in memory. For a stored file, the session reads at most one byte past
-    /// the stated length.
+    /// the stated length. A ref listing is whole in memory, up to
+    /// [`MAX_REF_LISTING`] bytes.
     ///
     /// If the input buffer holds no whole frame, the next read can wait. The
     /// session flushes `output` before that read. It also flushes `output`
@@ -156,12 +163,18 @@ impl Repo {
     ///   order or is a kind of the push.
     /// - [`Error::Remote`] with the code `protocol` if a frame is malformed, or
     ///   if `input` ends inside a frame.
+    /// - [`Error::Remote`] with the code `protocol` if a prefix of a
+    ///   `ListRefs` is not a ref name.
+    /// - [`Error::Remote`] with the code `limit-exceeded` if a ref listing is
+    ///   larger than [`MAX_REF_LISTING`].
     /// - [`Error::Remote`] with the code `limit-exceeded` if a frame is larger
     ///   than the limit.
     /// - [`Error::Remote`] with the code `internal` if the codec refuses a
     ///   message that the session writes.
     /// - Each error of [`ArchiveView::get`] if the view fails before the
     ///   reply.
+    /// - Each other error of [`build_ref_listing`](Repo::build_ref_listing).
+    ///   The session sends it as `internal`.
     /// - [`Error::Io`] if a read of `input` fails with an error other than an
     ///   end of file.
     /// - [`Error::Io`] with the error of the read if a body fails after its
@@ -174,7 +187,24 @@ impl Repo {
         R: AsyncRead + Unpin + Send,
         W: AsyncWrite + Unpin + Send,
     {
+        self.send_capped(input, output, MAX_REF_LISTING).await
+    }
+
+    /// Serves the session of [`send`](Repo::send) with a cap of `listing_cap`
+    /// bytes on each ref listing.
+    pub(crate) async fn send_capped<R, W>(
+        &self,
+        input: R,
+        output: W,
+        listing_cap: u64,
+    ) -> Result<()>
+    where
+        R: AsyncRead + Unpin + Send,
+        W: AsyncWrite + Unpin + Send,
+    {
         let mut session = Session {
+            repo: self.clone(),
+            listing_cap,
             view: ArchiveView::new(self.clone()),
             reader: FrameReader::new(BufReader::with_capacity(STREAM_BUFFER, input)),
             writer: FrameWriter::new(BufWriter::with_capacity(STREAM_BUFFER, output)),
@@ -205,6 +235,9 @@ impl Repo {
 }
 
 struct Session<R, W> {
+    repo: Repo,
+    /// The size cap of each ref listing.
+    listing_cap: u64,
     view: ArchiveView,
     reader: FrameReader<BufReader<R>>,
     writer: FrameWriter<BufWriter<W>>,
@@ -232,6 +265,7 @@ where
             }
             match self.next().await? {
                 Some(Message::Get(path)) => self.get(&path).await?,
+                Some(Message::ListRefs(prefixes)) => self.list_refs(&prefixes).await?,
                 Some(other) => return Err(out_of_order(&other)),
                 None => return Ok(()),
             }
@@ -297,6 +331,33 @@ where
                 self.reply(&Message::GetReply(reply)).await
             }
         }
+    }
+
+    /// Answers one `ListRefs` with the listing of `prefixes`.
+    ///
+    /// Each failure comes before the reply, so the session sends an `Error`
+    /// message in place of the reply.
+    async fn list_refs(&mut self, prefixes: &[String]) -> std::result::Result<(), Failure> {
+        if let Some(bad) = prefixes.iter().find(|p| !ostrya_core::is_ref_name(p)) {
+            return Err(Failure::Wire(remote::Error::Protocol(format!(
+                "ListRefs: prefix '{bad}' is not a ref name"
+            ))));
+        }
+        let prefixes: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        let listing = self
+            .repo
+            .build_ref_listing_capped(&prefixes, self.listing_cap)
+            .await
+            .map_err(|e| match e {
+                Error::Remote(e @ remote::Error::LimitExceeded(_)) => Failure::Wire(e),
+                other => Failure::Internal(other),
+            })?;
+        let reply = GetReply {
+            found: true,
+            len: Some(listing.len() as u64),
+        };
+        self.reply(&Message::GetReply(reply)).await?;
+        write_bytes(&mut self.writer, &listing).await
     }
 }
 
@@ -607,6 +668,80 @@ mod tests {
         assert!(!complete_frame(&[0xff, 0xff, 0xff, 0xff, 0]));
         // A frame of length 0 is whole. The reader refuses it.
         assert!(complete_frame(&[0, 0, 0, 0]));
+    }
+
+    /// A ref listing over the cap of the session is `limit-exceeded` in place
+    /// of the reply. A listing of exactly the cap goes out whole.
+    #[test]
+    fn a_ref_listing_over_the_cap_is_limit_exceeded() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-send-listing-cap-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ostrya_rt::block_on(async {
+            let repo = Repo::create(&dir, crate::CreateOptions::new(crate::RepoMode::BareUser))
+                .await
+                .unwrap();
+            let listing = repo.build_ref_listing(&[]).await.unwrap();
+            let mut input = FrameWriter::new(Vec::new());
+            for msg in [
+                Message::PullHello(PullHello {
+                    version: 1,
+                    agent: None,
+                }),
+                Message::ListRefs(Vec::new()),
+            ] {
+                input.write_message(&msg).await.unwrap();
+            }
+            let input = input.into_inner();
+
+            let mut out = Vec::new();
+            let result = repo
+                .send_capped(&input[..], &mut out, listing.len() as u64 - 1)
+                .await;
+            assert!(
+                matches!(result, Err(Error::Remote(remote::Error::LimitExceeded(_)))),
+                "{result:?}"
+            );
+            let mut reader = FrameReader::new(&out[..]);
+            assert!(matches!(
+                reader.read_message().await.unwrap(),
+                Some(Message::PullHelloReply(_))
+            ));
+            let Some(Message::Error(e)) = reader.read_message().await.unwrap() else {
+                panic!("the session sent no Error");
+            };
+            assert_eq!(e.code, ErrorCode::LimitExceeded);
+            assert_eq!(reader.read_message().await.unwrap(), None);
+
+            let mut out = Vec::new();
+            repo.send_capped(&input[..], &mut out, listing.len() as u64)
+                .await
+                .unwrap();
+            let mut reader = FrameReader::new(&out[..]);
+            reader.read_message().await.unwrap();
+            assert_eq!(
+                reader.read_message().await.unwrap(),
+                Some(Message::GetReply(GetReply {
+                    found: true,
+                    len: Some(listing.len() as u64)
+                }))
+            );
+            let mut body = Vec::new();
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match reader.read_object_data(&mut buf).await.unwrap() {
+                    ObjectRead::Data(n) => body.extend_from_slice(&buf[..n]),
+                    ObjectRead::End => break,
+                    ObjectRead::Abandoned => panic!("the body was abandoned"),
+                }
+            }
+            assert_eq!(body, listing);
+            assert_eq!(reader.read_message().await.unwrap(), None);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The chunk payload is equal to the chunk payload of the push, so the

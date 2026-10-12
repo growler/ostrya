@@ -233,10 +233,10 @@ pub struct PullHelloReply {
     pub version: u32,
 }
 
-/// The reply to one `Get`.
+/// The reply to one `Get` or one `ListRefs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetReply {
-    /// The flag that is `true` if the server serves the path.
+    /// The flag that is `true` if the server serves the path or the listing.
     ///
     /// If `found` is `true`, a [body](super#pull) follows the reply.
     pub found: bool,
@@ -287,6 +287,10 @@ pub enum Message {
     Get(String),
     /// The `GetReply` message.
     GetReply(GetReply),
+    /// The `ListRefs` message, with the ref prefixes of a ref listing.
+    ///
+    /// Each prefix is a ref name. The codec does not check the names.
+    ListRefs(Vec<String>),
 }
 
 impl Message {
@@ -308,6 +312,7 @@ impl Message {
             Message::PullHelloReply(_) => Kind::PullHelloReply,
             Message::Get(_) => Kind::Get,
             Message::GetReply(_) => Kind::GetReply,
+            Message::ListRefs(_) => Kind::ListRefs,
         }
     }
 
@@ -474,6 +479,10 @@ impl Message {
                 let len = Value::Maybe(r.len.map(|n| Box::new(Value::U64(n))));
                 (&GET_REPLY, Value::Tuple(vec![Value::Bool(r.found), len]))
             }
+            Message::ListRefs(prefixes) => {
+                let prefixes = prefixes.iter().cloned().map(Value::Str).collect();
+                (&STRV, Value::Array(prefixes))
+            }
         };
         ostrya_gvariant::to_bytes(ty, &value).map_err(|e| protocol(format!("encode: {e}")))
     }
@@ -592,6 +601,10 @@ impl Message {
                 let r = GetReply { found, len: len.0 };
                 check_get_reply(&r)?;
                 Message::GetReply(r)
+            }
+            Kind::ListRefs => {
+                let prefixes: ArrayIter<&str> = parse_body(body)?;
+                Message::ListRefs(collect(prefixes, |p| Ok(p.to_owned()))?)
             }
         })
     }

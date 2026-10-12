@@ -334,7 +334,8 @@ fn a_message_out_of_order_is_protocol() {
 }
 
 /// A message kind of the pull protocol gets `protocol` at the receive side.
-/// The cases are `PullHello` as the first frame and `Get` after `Hello`.
+/// The cases are `PullHello` as the first frame, and `Get` and `ListRefs`
+/// after `Hello`.
 #[test]
 fn a_pull_kind_is_protocol() {
     let cases: Vec<(&str, Script)> = vec![
@@ -353,6 +354,13 @@ fn a_pull_kind_is_protocol() {
             Box::pin(async move {
                 c.hello_reply(&[]).await;
                 c.send(&Message::Get("config".into())).await.unwrap();
+                c.error().await
+            })
+        }),
+        ("ListRefs after Hello", |mut c| {
+            Box::pin(async move {
+                c.hello_reply(&[]).await;
+                c.send(&Message::ListRefs(Vec::new())).await.unwrap();
                 c.error().await
             })
         }),

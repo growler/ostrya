@@ -46,11 +46,12 @@
 //! - 13 `PullHelloReply` -- `(ua{sv})`
 //! - 14 `Get` -- `s`
 //! - 15 `GetReply` -- `(bmt)`
+//! - 16 `ListRefs` -- `as`
 //!
 //! The kinds belong to the two protocols as follows:
 //!
 //! - Kinds 1 to 9 and 11 belong to the push.
-//! - Kinds 12 to 15 belong to the pull.
+//! - Kinds 12 to 16 belong to the pull.
 //! - Kind 10, the `Error` message, belongs to both.
 //!
 //! The codec reads and writes every kind. A session refuses a kind of the
@@ -142,11 +143,11 @@
 //! In version 1, `PullHelloReply` holds an empty dict. A decoder ignores a
 //! key of `PullHello` or of `PullHelloReply` that it does not know.
 //!
-//! The client then sends `Get` frames. The server answers each `Get` with one
-//! `GetReply`, in the order of the `Get` frames. A [`GetReply`] holds `found`
-//! and, if the server knows it, the length of the body. The frame limit of
-//! the pull is [`MIN_FRAME_LIMIT`] in both directions, and no message
-//! announces another limit.
+//! The client then sends `Get` and `ListRefs` frames. The server answers each
+//! of them with one `GetReply`, in the order of the frames. A [`GetReply`]
+//! holds `found` and, if the server knows it, the length of the body. The
+//! frame limit of the pull is [`MIN_FRAME_LIMIT`] in both directions, and no
+//! message announces another limit.
 //!
 //! A body follows a `GetReply` whose `found` is `true`. The body is a
 //! sequence of chunks, as in the object stream. A chunk of length 0 ends the
@@ -157,7 +158,19 @@
 //! the marker, an object of the push takes `Abort`, and a body of the pull
 //! takes an `Error` message.
 //!
-//! [`MAX_REF_LISTING`] is the size cap of a ref listing.
+//! A `ListRefs` names a set of ref prefixes. Each prefix is a ref name. A
+//! prefix selects the ref of that name and each ref below it, under
+//! `refs/heads`. An empty list selects all refs under `refs/heads`. The server
+//! answers with a `GetReply` whose `found` is `true` and that holds the length
+//! of the listing. The listing is a summary GVariant of at most
+//! [`MAX_REF_LISTING`] bytes, and the body carries it. A reply to a `ListRefs`
+//! whose `found` is `false`, or that holds no length, is a protocol error. The
+//! server sends an `Error` message in place of the `GetReply` for these
+//! conditions:
+//!
+//! - `protocol` for a prefix that is not a ref name
+//! - `limit-exceeded` for a listing larger than [`MAX_REF_LISTING`]
+//! - `internal` for any other failure of the build of the listing
 //!
 //! # Codec
 //!
@@ -299,8 +312,13 @@ pub enum Kind {
     Get = 14,
     /// The `GetReply` message, from the server to a pull client.
     ///
-    /// A body follows a reply whose `found` is `true`.
+    /// It answers a `Get` or a `ListRefs`. A body follows a reply whose
+    /// `found` is `true`.
     GetReply = 15,
+    /// The `ListRefs` message, from a pull client to the server.
+    ///
+    /// The server answers it with one `GetReply`.
+    ListRefs = 16,
 }
 
 impl Kind {
@@ -326,6 +344,7 @@ impl Kind {
             13 => Kind::PullHelloReply,
             14 => Kind::Get,
             15 => Kind::GetReply,
+            16 => Kind::ListRefs,
             _ => return Err(protocol(format!("unknown message kind {byte}"))),
         })
     }

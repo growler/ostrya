@@ -16,10 +16,11 @@
 //! - [`Endpoint::parse`] reads an address into an endpoint with the default options.
 //! - [`PushSession::prepare`] checks an endpoint, and [`PreparedSession::open`] opens its session.
 //! - [`PushSession::over_stream`] opens a push session over a pair of byte streams.
-//! - [`StreamSession::connect`] opens a stream session over ssh, and [`StreamSession::get`] reads
-//!   a file.
+//! - [`StreamSession::connect`] opens a stream session over ssh, [`StreamSession::get`] reads
+//!   a file, and [`StreamSession::list_refs`] reads a ref listing.
 //! - [`PullSession::connect`] opens the session of a pull to an [`Endpoint`], over HTTP or ssh,
-//!   and [`PullSession::fetch_summary`] reads the summary of the remote.
+//!   [`PullSession::fetch_summary`] reads the summary of the remote, and
+//!   [`PullSession::fetch_refs`] reads the ref listing of a set of prefixes.
 //! - [`Error`] is the error of each fallible operation, and [`ErrorCode`] names its wire codes.
 //!
 //! # Modules
@@ -123,6 +124,7 @@ fn stream_session_futures_are_send(
         StreamSessionOptions::default(),
     ));
     assert_send(&session.get("config", 1));
+    assert_send(&session.list_refs(&["main"], 1));
     assert_send(&owned.finish());
 }
 
@@ -140,6 +142,7 @@ fn pull_session_futures_are_send(endpoint: &Endpoint, session: &PullSession, own
         StreamSessionOptions::default(),
     ));
     assert_send(&session.fetch_summary());
+    assert_send(&session.fetch_refs(&["main"]));
     assert_send(&owned.finish());
 }
 

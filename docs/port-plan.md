@@ -172,7 +172,7 @@ bounded:
   and of the pull: the messages and their GVariant encoding, the frame codec
   with its limit, the chunked object stream with its abandon marker, and the
   bodies of the pull. The pull has its own kinds, `PullHello`,
-  `PullHelloReply`, `Get`, and `GetReply`, and its own version,
+  `PullHelloReply`, `Get`, `GetReply`, and `ListRefs`, and its own version,
   `PULL_PROTOCOL_VERSION`.
   `ObjectBody` reads the bytes of one object or of one pull body as an
   `AsyncRead`. The client session: `PushSession` over a pair of byte

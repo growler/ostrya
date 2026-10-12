@@ -17,8 +17,8 @@ use futures_lite::future;
 use futures_lite::io::AsyncReadExt;
 use ostrya_fetch::{FetcherOptions, Proxy};
 use ostrya_remote::proto::{
-    ErrorMessage, FrameReader, FrameWriter, GetReply, Message, PULL_PROTOCOL_VERSION,
-    PullHelloReply,
+    ErrorMessage, FrameReader, FrameWriter, GetReply, MAX_REF_LISTING, Message,
+    PULL_PROTOCOL_VERSION, PullHelloReply,
 };
 use ostrya_remote::transport::Endpoint;
 use ostrya_remote::{
@@ -188,6 +188,14 @@ impl Server {
         }
         self.writer.end_object().await.unwrap();
         self.writer.flush().await.unwrap();
+    }
+
+    /// Reads one `ListRefs` and returns its prefixes.
+    async fn list_refs(&mut self) -> Vec<String> {
+        match self.recv().await {
+            Some(Message::ListRefs(prefixes)) => prefixes,
+            other => panic!("{other:?}"),
+        }
     }
 
     async fn not_found(&mut self) {
@@ -1015,4 +1023,269 @@ fn fetch_summary_refuses_a_stated_length_over_64_mib() {
             assert!(server.recv_or_eof().await);
         },
     );
+}
+
+/// A `fetch_refs` and a `get` in flight on one session keep the order of
+/// their frames. The server reads both frames before it answers, and each
+/// call gets the body of its own reply. The test runs both orders.
+#[test]
+fn fetch_refs_and_get_keep_their_order() {
+    let listing = body_of("listing");
+    let config = body_of("config");
+    for refs_first in [false, true] {
+        let ((input, output), mut server) = ends();
+        let (refs, got) = run(
+            async {
+                let session = PullSession::over_stream(input, output, options(None))
+                    .await
+                    .unwrap();
+                let PullSession::Stream(stream) = &session else {
+                    unreachable!("over_stream gives a stream session");
+                };
+                let get = async {
+                    let body = stream.get("config", u64::MAX).await.unwrap().unwrap();
+                    read_all(body).await.unwrap()
+                };
+                let refs = async { session.fetch_refs(&["a", "b/c"]).await.unwrap() };
+                let out = if refs_first {
+                    future::zip(refs, get).await
+                } else {
+                    let (got, refs) = future::zip(get, refs).await;
+                    (refs, got)
+                };
+                session.finish().await.unwrap();
+                out
+            },
+            async {
+                server.hello(1).await;
+                let prefixes = vec!["a".to_owned(), "b/c".to_owned()];
+                if refs_first {
+                    assert_eq!(server.list_refs().await, prefixes);
+                    assert_eq!(server.path().await, "config");
+                    server
+                        .body(Some(listing.len() as u64), &listing, 1000)
+                        .await;
+                    server.body(Some(config.len() as u64), &config, 1000).await;
+                } else {
+                    assert_eq!(server.path().await, "config");
+                    assert_eq!(server.list_refs().await, prefixes);
+                    server.body(Some(config.len() as u64), &config, 1000).await;
+                    server
+                        .body(Some(listing.len() as u64), &listing, 1000)
+                        .await;
+                }
+                assert!(server.recv().await.is_none());
+            },
+        );
+        assert_eq!(refs, Some(listing.clone()), "{refs_first}");
+        assert_eq!(got, config, "{refs_first}");
+    }
+}
+
+/// `fetch_refs` sends an empty prefix list as it is, and reads the listing in
+/// chunks.
+#[test]
+fn fetch_refs_sends_an_empty_list_and_reads_the_listing() {
+    let listing = body_of("all");
+    let ((input, output), mut server) = ends();
+    let got = run(
+        async {
+            let session = PullSession::over_stream(input, output, options(None))
+                .await
+                .unwrap();
+            let got = session.fetch_refs(&[]).await.unwrap();
+            session.finish().await.unwrap();
+            got
+        },
+        async {
+            server.hello(1).await;
+            assert!(server.list_refs().await.is_empty());
+            server.body(Some(listing.len() as u64), &listing, 700).await;
+            assert!(server.recv().await.is_none());
+        },
+    );
+    assert_eq!(got, Some(listing));
+}
+
+/// `fetch_refs` caps the listing at `MAX_REF_LISTING`. A stated length over
+/// the cap ends the session with `LimitExceeded` before the client reads the
+/// body.
+#[test]
+fn fetch_refs_refuses_a_stated_length_over_the_cap() {
+    let ((input, output), mut server) = ends();
+    run(
+        async {
+            let session = PullSession::over_stream(input, output, options(None))
+                .await
+                .unwrap();
+            let e = session.fetch_refs(&["main"]).await.unwrap_err();
+            assert!(
+                matches!(&e, Error::LimitExceeded(m)
+                    if m.contains(&format!("over the limit {MAX_REF_LISTING}"))),
+                "{e:?}"
+            );
+        },
+        async {
+            server.hello(1).await;
+            server.list_refs().await;
+            server
+                .send(&Message::GetReply(GetReply {
+                    found: true,
+                    len: Some(MAX_REF_LISTING + 1),
+                }))
+                .await;
+            // The client reads no body and closes its output.
+            assert!(server.recv_or_eof().await);
+        },
+    );
+}
+
+/// A server that refuses a listing over its cap sends `limit-exceeded`.
+/// `fetch_refs` returns `LimitExceeded`, and a later call repeats it.
+#[test]
+fn fetch_refs_gives_the_limit_exceeded_of_the_server() {
+    let ((input, output), mut server) = ends();
+    run(
+        async {
+            let session = PullSession::over_stream(input, output, options(None))
+                .await
+                .unwrap();
+            let e = session.fetch_refs(&[]).await.unwrap_err();
+            assert!(
+                matches!(&e, Error::LimitExceeded(m) if m == "too large"),
+                "{e:?}"
+            );
+            let e = session.fetch_refs(&[]).await.unwrap_err();
+            assert!(
+                matches!(&e, Error::LimitExceeded(m) if m == "too large"),
+                "{e:?}"
+            );
+        },
+        async {
+            server.hello(1).await;
+            server.list_refs().await;
+            server.error(ErrorCode::LimitExceeded, "too large").await;
+            assert!(server.recv_or_eof().await);
+        },
+    );
+}
+
+/// A prefix that is not a ref name is `InvalidInput`. The call writes
+/// nothing, and the session stays usable: the next frame that the server
+/// reads is the `Get` of a later call.
+#[test]
+fn fetch_refs_refuses_a_bad_prefix_and_writes_nothing() {
+    let ((input, output), mut server) = ends();
+    let config = body_of("config");
+    let got = run(
+        async {
+            let session = PullSession::over_stream(input, output, options(None))
+                .await
+                .unwrap();
+            for bad in [&[""][..], &["a/../b"], &["a/"], &["main", "/main"]] {
+                let e = session.fetch_refs(bad).await.unwrap_err();
+                assert!(matches!(e, Error::InvalidInput(_)), "{bad:?}: {e:?}");
+            }
+            let PullSession::Stream(stream) = &session else {
+                unreachable!("over_stream gives a stream session");
+            };
+            let body = stream.get("config", u64::MAX).await.unwrap().unwrap();
+            let got = read_all(body).await.unwrap();
+            session.finish().await.unwrap();
+            got
+        },
+        async {
+            server.hello(1).await;
+            assert_eq!(server.path().await, "config");
+            server.body(Some(config.len() as u64), &config, 1000).await;
+            assert!(server.recv().await.is_none());
+        },
+    );
+    assert_eq!(got, config);
+}
+
+/// A `GetReply` whose `found` is `false` in reply to `ListRefs` is
+/// `Protocol`. It ends the session, and a later call repeats it.
+#[test]
+fn a_not_found_reply_to_list_refs_is_protocol() {
+    let ((input, output), mut server) = ends();
+    run(
+        async {
+            let session = PullSession::over_stream(input, output, options(None))
+                .await
+                .unwrap();
+            let e = session.fetch_refs(&["main"]).await.unwrap_err();
+            assert!(
+                matches!(&e, Error::Protocol(m) if m.contains("ListRefs")),
+                "{e:?}"
+            );
+            let PullSession::Stream(stream) = &session else {
+                unreachable!("over_stream gives a stream session");
+            };
+            let e = stream.get("config", 1).await.unwrap_err();
+            assert!(matches!(e, Error::Protocol(_)), "{e:?}");
+        },
+        async {
+            server.hello(1).await;
+            server.list_refs().await;
+            server.not_found().await;
+            assert!(server.recv_or_eof().await);
+        },
+    );
+}
+
+/// A `GetReply` that states no length in reply to `ListRefs` is `Protocol`.
+/// It ends the session before the client reads the body, and a later call
+/// repeats it.
+#[test]
+fn a_reply_to_list_refs_with_no_length_is_protocol() {
+    let ((input, output), mut server) = ends();
+    run(
+        async {
+            let session = PullSession::over_stream(input, output, options(None))
+                .await
+                .unwrap();
+            let e = session.fetch_refs(&["main"]).await.unwrap_err();
+            assert!(
+                matches!(&e, Error::Protocol(m) if m.contains("no length")),
+                "{e:?}"
+            );
+            let PullSession::Stream(stream) = &session else {
+                unreachable!("over_stream gives a stream session");
+            };
+            let e = stream.get("config", 1).await.unwrap_err();
+            assert!(
+                matches!(&e, Error::Protocol(m) if m.contains("no length")),
+                "{e:?}"
+            );
+        },
+        async {
+            server.hello(1).await;
+            server.list_refs().await;
+            server
+                .send(&Message::GetReply(GetReply {
+                    found: true,
+                    len: None,
+                }))
+                .await;
+            assert!(server.recv_or_eof().await);
+        },
+    );
+}
+
+/// `fetch_refs` over HTTP is `Unsupported`, and it sends no request. No
+/// server listens on the address.
+#[test]
+fn fetch_refs_over_http_is_unsupported() {
+    let mut http = FetcherOptions::new("http://127.0.0.1:9/");
+    http.max_redirects = 0;
+    http.proxy = Proxy::None;
+    ostrya_rt::block_on(async {
+        let session = PullSession::connect(Endpoint::Http(http), StreamSessionOptions::default())
+            .await
+            .unwrap();
+        let e = session.fetch_refs(&["main"]).await.unwrap_err();
+        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
+        session.finish().await.unwrap();
+    });
 }

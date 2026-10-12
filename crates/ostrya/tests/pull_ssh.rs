@@ -741,6 +741,50 @@ fn a_pull_session_fetches_the_summary_over_a_stream() {
     });
 }
 
+/// `PullSession::fetch_refs` over a stream returns the listing that
+/// `Repo::build_ref_listing` builds on the server, for a prefix and for an
+/// empty list. The session ends with `Ok`.
+#[test]
+fn a_pull_session_fetches_the_ref_listing_over_a_stream() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-session-fetch-refs");
+        let (remote, _commit) = build_remote(dir.path()).await;
+        let expected = [
+            remote.build_ref_listing(&["test"]).await.unwrap(),
+            remote.build_ref_listing(&[]).await.unwrap(),
+        ];
+        let (to_server, server_in) = pipe(PIPE_CAP);
+        let (server_out, from_server) = pipe(PIPE_CAP);
+        let (fetched, served) = within(
+            "the ref listing reads through a stream session",
+            future::zip(
+                async {
+                    let session = PullSession::over_stream(
+                        from_server,
+                        to_server,
+                        StreamSessionOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                    let fetched = [
+                        session.fetch_refs(&["test"]).await.unwrap(),
+                        session.fetch_refs(&[]).await.unwrap(),
+                    ];
+                    session.finish().await.unwrap();
+                    fetched
+                },
+                async move { remote.send(server_in, server_out).await },
+            ),
+        )
+        .await;
+        served.unwrap();
+        let listing = ostrya::Summary::parse(&expected[0]).unwrap();
+        assert_eq!(fetched, expected.map(Some));
+        assert_eq!(listing.refs.len(), 1);
+        assert_eq!(listing.refs[0].name, "test/main");
+    });
+}
+
 /// The resolution of a pull refuses an ssh address in the `url` key, in the
 /// `ssh://` form and in the scp form. The ssh client does not start.
 #[test]

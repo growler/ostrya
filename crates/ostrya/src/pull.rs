@@ -185,10 +185,19 @@ use crate::modifier::FilterResult;
 use crate::perm;
 use crate::refs::{CollectionRef, collection_ref_to_relpath};
 use crate::repo::Repo;
+use crate::summary::AdvertisedDelta;
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::write::FileMeta;
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "only the tests call the chain planner until the delta discovery uses it"
+    )
+)]
+mod chain;
 mod delta;
 mod drive;
 #[doc(hidden)]
@@ -576,6 +585,7 @@ impl std::fmt::Debug for DetachedMetadataFilter {
 ///   [`per_object_fsync`](PullOptions::per_object_fsync),
 ///   [`disable_static_deltas`](PullOptions::disable_static_deltas),
 ///   [`require_static_deltas`](PullOptions::require_static_deltas),
+///   [`static_deltas`](PullOptions::static_deltas),
 ///   [`verify`](PullOptions::verify), and
 ///   [`detached_metadata_filter`](PullOptions::detached_metadata_filter).
 /// - Only a local pull reads [`collection_id`](PullOptions::collection_id).
@@ -775,6 +785,9 @@ pub struct PullOptions {
     /// that asks for no delta looks for none, so it finds nothing to require. A
     /// local pull reads no delta unless it requires one, so the field changes
     /// nothing there. [`Repo::pull`] states the static delta rules of a pull.
+    ///
+    /// A pull refuses this option together with
+    /// [`static_deltas`](PullOptions::static_deltas).
     pub disable_static_deltas: bool,
     /// The option to require a static delta for each commit that the pull
     /// looks up.
@@ -801,6 +814,31 @@ pub struct PullOptions {
     /// the size cap of a summary, 64 MiB. It refuses a file of the source that
     /// is not a regular file, so no read waits on a FIFO.
     pub require_static_deltas: bool,
+    /// A list of static deltas that replaces the delta search of the pull.
+    ///
+    /// `None` keeps the search that [`Repo::pull`] and [`Repo::pull_local`]
+    /// state. The list can come from [`Summary::static_deltas`] of a ref
+    /// listing. Each entry names the source commit, the target commit, and the
+    /// SHA-256 digest of the superblock of one delta. The pull ignores an
+    /// entry that is equal to an earlier entry.
+    ///
+    /// The pull refuses these lists with [`Error::InvalidInput`], before its
+    /// first request and before its transaction opens:
+    ///
+    /// - a list with two entries that have the same source and target and
+    ///   different digests.
+    /// - a list together with
+    ///   [`disable_static_deltas`](PullOptions::disable_static_deltas).
+    /// - a list together with a [`subpaths`](PullOptions::subpaths) list that
+    ///   is not empty. [`Repo::pull_local`] refuses subpaths with
+    ///   [`Error::Unsupported`] before this check.
+    ///
+    /// The pull does not apply a list yet. After all checks of its options,
+    /// each pull with a list, an empty list included, fails with
+    /// [`Error::Unsupported`] before its first request.
+    ///
+    /// [`Summary::static_deltas`]: crate::Summary::static_deltas
+    pub static_deltas: Option<Vec<AdvertisedDelta>>,
     /// The signature policy of this pull, over the configured policy of the
     /// remote.
     ///
@@ -1407,8 +1445,15 @@ impl Repo {
     ///   `src` is not an `archive` repository.
     /// - [`Error::InvalidInput`] if [`depth`](PullOptions::depth) is below
     ///   `-1`, before the pull reads `src`.
+    /// - [`Error::InvalidInput`] if
+    ///   [`static_deltas`](PullOptions::static_deltas) holds two digests for
+    ///   one delta, or is set together with
+    ///   [`disable_static_deltas`](PullOptions::disable_static_deltas), before
+    ///   the pull reads `src`.
     /// - [`Error::InvalidRefspec`] if the collection id or a name is invalid,
     ///   or if a name holds `:`, before the pull reads `src`.
+    /// - [`Error::Unsupported`] if `static_deltas` is set and passes the
+    ///   checks above, before the pull reads `src`.
     /// - [`Error::Pull`] if the options ask for a signature verification and
     ///   name no [`remote`](PullOptions::remote).
     /// - [`Error::Pull`] if the pull requires static deltas and `src` has no
@@ -1449,7 +1494,9 @@ impl Repo {
             return Err(Error::Unsupported("a local pull takes no subpath".into()));
         }
         check_depth(opts.depth)?;
+        check_static_deltas(&opts)?;
         let collection_relpaths = check_local_collection(&opts)?;
+        refuse_static_delta_list(&opts)?;
         // The pull builds the signature policy before it reads the source. So
         // a check that the options ask for with no remote to take keys from
         // fails here, before the walk of a chain.
@@ -2412,6 +2459,38 @@ fn check_remote_option(opts: &PullOptions) -> Result<()> {
 fn check_depth(depth: i32) -> Result<()> {
     if depth < -1 {
         return Err(Error::InvalidInput(format!("depth {depth} is below -1")));
+    }
+    Ok(())
+}
+
+/// Refuses a list of static deltas that a pull cannot take.
+///
+/// The check reads `opts` alone, so a refusal sends no request and opens no
+/// transaction. A pull with no list passes.
+fn check_static_deltas(opts: &PullOptions) -> Result<()> {
+    let Some(list) = opts.static_deltas.as_deref() else {
+        return Ok(());
+    };
+    if opts.disable_static_deltas {
+        return Err(Error::InvalidInput(
+            "a pull with static_deltas takes no disable_static_deltas option".into(),
+        ));
+    }
+    if !opts.subpaths.is_empty() {
+        return Err(Error::InvalidInput(
+            "a pull with static_deltas takes no subpath".into(),
+        ));
+    }
+    chain::Edges::new(list).map(drop)
+}
+
+/// Refuses a pull with a list of static deltas, because no pull applies a
+/// list yet.
+fn refuse_static_delta_list(opts: &PullOptions) -> Result<()> {
+    if opts.static_deltas.is_some() {
+        return Err(Error::Unsupported(
+            "a pull does not apply a static_deltas list".into(),
+        ));
     }
     Ok(())
 }

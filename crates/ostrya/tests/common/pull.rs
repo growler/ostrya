@@ -37,8 +37,8 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use ostrya::fetch::{FetcherOptions, Proxy, TrustRoots};
 use ostrya::{
-    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree, Repo,
-    RepoMode, SummaryOptions, Type, Value,
+    AdvertisedDelta, Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
+    Error, MutableTree, PullFlags, PullOptions, Repo, RepoMode, SummaryOptions, Type, Value,
 };
 use ostrya_rt::{TcpListener, spawn};
 
@@ -842,6 +842,127 @@ pub async fn assert_nothing_published(repo: &Repo) {
             .unwrap()
             .is_empty()
     );
+}
+
+// --- static delta lists ----------------------------------------------------
+
+/// The error that a pull gives for a `static_deltas` list.
+pub enum ListRefusal {
+    /// [`Error::InvalidInput`] with this message.
+    InvalidInput(String),
+    /// [`Error::Unsupported`] with this message.
+    Unsupported(&'static str),
+}
+
+/// The message of the refusal of a `static_deltas` list that passes the
+/// checks of the pull.
+pub const LIST_NOT_APPLIED: &str = "a pull does not apply a static_deltas list";
+
+/// Returns a listed delta. Each byte names the checksum of 32 equal bytes,
+/// and `None` is a delta from scratch.
+pub fn listed_delta(from: Option<u8>, to: u8, digest: u8) -> AdvertisedDelta {
+    AdvertisedDelta {
+        from: from.map(|byte| Checksum::from_bytes([byte; 32])),
+        to: Checksum::from_bytes([to; 32]),
+        superblock: Checksum::from_bytes([digest; 32]),
+    }
+}
+
+/// Returns the options of each pull that its `static_deltas` list makes the
+/// pull refuse, with a tag and the error of the pull. `base` gives the other
+/// options, with an empty subpath list.
+pub fn static_delta_list_cases(
+    base: impl Fn() -> PullOptions,
+) -> Vec<(&'static str, PullOptions, ListRefusal)> {
+    let (from, to) = (Checksum::from_bytes([1; 32]), Checksum::from_bytes([2; 32]));
+    let two_digests = format!(
+        "static delta {}-{} is listed with two superblock digests",
+        from.to_hex(),
+        to.to_hex()
+    );
+    vec![
+        (
+            "two digests",
+            PullOptions {
+                static_deltas: Some(vec![
+                    listed_delta(None, 2, 5),
+                    listed_delta(Some(1), 2, 3),
+                    listed_delta(Some(1), 2, 4),
+                ]),
+                ..base()
+            },
+            ListRefusal::InvalidInput(two_digests),
+        ),
+        (
+            "disable_static_deltas",
+            PullOptions {
+                static_deltas: Some(vec![listed_delta(Some(1), 2, 3)]),
+                disable_static_deltas: true,
+                ..base()
+            },
+            ListRefusal::InvalidInput(
+                "a pull with static_deltas takes no disable_static_deltas option".to_owned(),
+            ),
+        ),
+        (
+            "subpaths",
+            PullOptions {
+                static_deltas: Some(Vec::new()),
+                subpaths: vec!["/".to_owned()],
+                ..base()
+            },
+            ListRefusal::InvalidInput("a pull with static_deltas takes no subpath".to_owned()),
+        ),
+        (
+            "a valid list",
+            PullOptions {
+                static_deltas: Some(vec![listed_delta(Some(1), 2, 3), listed_delta(None, 2, 4)]),
+                ..base()
+            },
+            ListRefusal::Unsupported(LIST_NOT_APPLIED),
+        ),
+        (
+            "an empty list",
+            PullOptions {
+                static_deltas: Some(Vec::new()),
+                ..base()
+            },
+            ListRefusal::Unsupported(LIST_NOT_APPLIED),
+        ),
+        (
+            "COMMIT_ONLY",
+            PullOptions {
+                static_deltas: Some(vec![listed_delta(Some(1), 2, 3)]),
+                flags: PullFlags::COMMIT_ONLY,
+                ..base()
+            },
+            ListRefusal::Unsupported(LIST_NOT_APPLIED),
+        ),
+        (
+            "an equal entry",
+            PullOptions {
+                static_deltas: Some(vec![
+                    listed_delta(Some(1), 2, 3),
+                    listed_delta(Some(1), 2, 3),
+                ]),
+                ..base()
+            },
+            ListRefusal::Unsupported(LIST_NOT_APPLIED),
+        ),
+    ]
+}
+
+/// Asserts that `err` is the error that `expected` states.
+pub fn assert_list_refusal(tag: &str, err: &Error, expected: &ListRefusal) {
+    match (expected, err) {
+        (ListRefusal::InvalidInput(want), Error::InvalidInput(got)) => {
+            assert_eq!(got, want, "{tag}")
+        }
+        (ListRefusal::Unsupported(want), Error::Unsupported(got)) => {
+            assert_eq!(got, want, "{tag}")
+        }
+        _ => panic!("{tag}: {err:?}"),
+    }
 }
 
 /// Returns the checksum of each content object of the tree that `build_tree`

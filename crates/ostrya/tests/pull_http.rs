@@ -5115,6 +5115,36 @@ fn a_depth_below_minus_one_is_refused() {
     });
 }
 
+/// The pull refuses a `static_deltas` list that it cannot take with
+/// `InvalidInput`, and each other list with `Unsupported`. Each refusal comes
+/// before the first request and before the transaction opens, so the pull
+/// writes no object, no ref, and no staging directory.
+#[test]
+fn a_static_delta_list_is_refused_before_the_first_request() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-static-delta-list-refused");
+        build_subpath_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        let dest_dir = dir.path().join("dest");
+        let before = repo_snapshot(&dest_dir);
+        for (tag, opts, expected) in static_delta_list_cases(|| subpath_opts(&[])) {
+            let err = dest.pull("origin", opts).await.unwrap_err();
+            assert_list_refusal(tag, &err, &expected);
+        }
+        assert!(server.seen().is_empty(), "{:?}", server.seen());
+        assert_nothing_published(&dest).await;
+        assert!(dest.list_objects().await.unwrap().is_empty());
+        assert_eq!(repo_snapshot(&dest_dir), before);
+        let staging = std::fs::read_dir(dest_dir.join("tmp"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("staging-"))
+            .collect::<Vec<_>>();
+        assert!(staging.is_empty(), "{staging:?}");
+    });
+}
+
 /// The pull refuses a `remote` option that is not a valid remote name, also
 /// under `MIRROR`. The refusal comes before the pull resolves the remote, so
 /// it sends no request and writes no object and no ref.
@@ -6490,6 +6520,34 @@ fn a_session_pull_refuses_its_options_before_the_first_request() {
                     "{name:?}: {err:?}"
                 );
             }
+        }
+        // A pull with no ref names the missing refs, and not the list.
+        let no_refs = (
+            "no refs with a list",
+            PullOptions {
+                static_deltas: Some(vec![listed_delta(Some(1), 2, 3)]),
+                ..PullOptions::default()
+            },
+            ListRefusal::InvalidInput(
+                "a pull with a session needs at least one ref name".to_owned(),
+            ),
+        );
+        for (tag, opts, expected) in static_delta_list_cases(main).into_iter().chain([no_refs]) {
+            let progress = ostrya::PullProgress::new();
+            let opts = PullOptions {
+                progress: Some(progress.clone()),
+                ..opts
+            };
+            let err = dest
+                .pull_with_session(http_session(&server).await, PullTrust::unverified(), opts)
+                .await
+                .unwrap_err();
+            assert_list_refusal(tag, &err, &expected);
+            assert_eq!(
+                progress.snapshot(),
+                ostrya::PullProgressSnapshot::default(),
+                "{tag}"
+            );
         }
 
         assert!(server.seen().is_empty(), "{:?}", server.seen());

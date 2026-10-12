@@ -34,8 +34,8 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 use pull::{
-    FIXED_TS, RepoServer, build_remote, build_tree, commit_tree, commit_tree_with,
-    content_checksums, filez_path, incompressible,
+    FIXED_TS, RepoServer, assert_list_refusal, build_remote, build_tree, commit_tree,
+    commit_tree_with, content_checksums, filez_path, incompressible, static_delta_list_cases,
 };
 
 /// The capacity of each pipe.
@@ -1202,6 +1202,45 @@ fn a_session_pull_over_a_stream_refuses_before_the_first_get() {
             "{messages:?}"
         );
         served.unwrap();
+        assert_eq!(snapshot(&dest_path), before);
+    });
+}
+
+/// A pull through a stream session refuses a `static_deltas` list after the
+/// session opens and before its first `Get`: a list that it cannot take with
+/// `InvalidInput`, and a valid list with `Unsupported`. The server reads the
+/// `PullHello` of the session and no other message.
+#[test]
+fn a_session_pull_over_a_stream_refuses_a_static_delta_list() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-static-delta-list-refusal");
+        let (remote, _commit) = build_remote(dir.path()).await;
+        let dest_path = dir.path().join("dest");
+        let dest = dest_at(&dest_path, RepoMode::Archive, None).await;
+        let before = snapshot(&dest_path);
+        let main = || PullOptions {
+            refs: vec!["test/main".to_owned()],
+            ..PullOptions::default()
+        };
+        let cases = static_delta_list_cases(main)
+            .into_iter()
+            .filter(|(tag, _, _)| ["two digests", "a valid list"].contains(tag));
+        for (tag, opts, expected) in cases {
+            let (pulled, served, messages) = pull_session_ssh(
+                &dest,
+                &remote,
+                PullTrust::unverified(),
+                StreamSessionOptions::default(),
+                opts,
+            )
+            .await;
+            assert_list_refusal(tag, &pulled.unwrap_err(), &expected);
+            assert!(
+                matches!(messages.as_slice(), [Message::PullHello(_)]),
+                "{tag}: {messages:?}"
+            );
+            served.unwrap();
+        }
         assert_eq!(snapshot(&dest_path), before);
     });
 }

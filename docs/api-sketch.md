@@ -2477,6 +2477,14 @@ taken.
 `pull_local` reads no delta unless `require_static_deltas` is set; with it set,
 it reads the summary, the index, the superblock, and the parts from the source
 directory, which must be an archive repository, and applies the delta.
+`static_deltas` replaces the delta search with a list, such as the
+`Summary::static_deltas` of a ref listing. Each pull checks the list before its
+first request and before its transaction opens. It refuses two digests for one
+delta, the list with `disable_static_deltas`, and the list with subpaths with
+`InvalidInput`, and drops an entry equal to an earlier entry. `pull_local`
+refuses subpaths with `Unsupported` before this check. No pull applies a
+list yet, so each pull with a list that passes all checks of its options, an
+empty list included, fails with `Unsupported`.
 
 A pull checks the signatures on the commits it carries and on the remote's
 summary. `verify` holds four switches, each overriding the remote configuration
@@ -2592,6 +2600,13 @@ pub struct PullOptions {
     pub timestamp_check: TimestampCheck,
     pub disable_static_deltas: bool,      // fetch every object loose
     pub require_static_deltas: bool,      // refuse where no delta can be taken
+    pub static_deltas: Option<Vec<AdvertisedDelta>>,  // replaces the delta
+                                          // search; two digests for one
+                                          // delta, disable_static_deltas,
+                                          // or subpaths: InvalidInput; a
+                                          // list that passes each option
+                                          // check: Unsupported; all before
+                                          // the first request
     pub verify: PullVerify,               // the signature checks to make;
                                           // pull_with_session refuses a
                                           // value other than the default
@@ -2708,7 +2723,10 @@ impl Repo {
     /// `refs`, a `verify` other than the default, a set
     /// `max_outstanding_fetches`, `overrides` other than the default, and
     /// a `remote` that `valid_remote_name` refuses with InvalidInput, and a
-    /// set `collection_id` with Unsupported.
+    /// set `collection_id` with Unsupported. It refuses a `static_deltas`
+    /// list with two digests for one delta, or with
+    /// `disable_static_deltas` or subpaths, with InvalidInput. After all
+    /// of these checks, it refuses each other list with Unsupported.
     pub async fn pull_with_session(&self, session: PullSession,
                                    trust: PullTrust, opts: PullOptions)
         -> Result<PullStats>;

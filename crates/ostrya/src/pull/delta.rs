@@ -7,6 +7,11 @@
 //! limit of part fetches in flight from a remote. The rules that a caller
 //! sees are on `Repo::pull`, under `# Static deltas`, and on
 //! `PullOptions::require_static_deltas`.
+//!
+//! `PullOptions::static_deltas` replaces the search with a list of deltas
+//! that the caller gives. The sibling module `chain` plans chains of deltas
+//! from such a list. A pull refuses a list before its first request, so the
+//! search of this module runs for each pull that it accepts.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -182,10 +187,7 @@ pub(crate) async fn discover(
         }
         let tip = repo.resolve_ref_tip(&refspec(ref_prefix, ref_name)).await?;
         let from = source_commit(repo, tip, to).await?;
-        // If the ref names the target and the target is partial here, the
-        // pull takes no from-scratch delta. A ref that names a complete
-        // commit has the same effect.
-        let scratch = from.is_none() && tip != Some(*to);
+        let scratch = super::chain::scratch_allowed(tip, from, to);
         if let Some(job) = discover_one(
             repo,
             source,
@@ -209,8 +211,15 @@ pub(crate) async fn discover(
 /// Returns `true` if this repository holds a commit and each object that it
 /// references.
 pub(super) async fn complete_here(repo: &Repo, commit: &Checksum) -> Result<bool> {
-    Ok(repo.has_object(ObjectType::Commit, commit).await?
-        && repo.commit_state(commit).await? == CommitState::Normal)
+    let repo = repo.clone();
+    let commit = *commit;
+    ostrya_rt::unblock(move || complete_here_blocking(&repo, &commit)).await
+}
+
+/// Runs [`complete_here`] on the calling thread.
+pub(super) fn complete_here_blocking(repo: &Repo, commit: &Checksum) -> Result<bool> {
+    Ok(repo.has_object_blocking(ObjectType::Commit, commit)?
+        && repo.commit_state_blocking(commit)? == CommitState::Normal)
 }
 
 /// Returns the source commit of a from-to delta: `tip`, if this repository

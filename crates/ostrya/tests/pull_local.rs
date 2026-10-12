@@ -16,10 +16,10 @@ use std::process::Command;
 use common::{TmpDir, file_inventory, ostree_available, wait_for_commit_under_guard, within};
 use futures_lite::future::poll_once;
 use ostrya::{
-    Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CommitState,
-    CreateOptions, DeltaOptions, DetachedMetadataFilter, DetachedMetadataFilterFn, Ed25519Signer,
-    Error, FilterResult, FsckOptions, MutableTree, ObjectName, ObjectType, PullFlags, PullOptions,
-    PullStats, PullVerify, Repo, RepoMode, SummaryOptions, Type, Value,
+    AdvertisedDelta, Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions,
+    CommitState, CreateOptions, DeltaOptions, DetachedMetadataFilter, DetachedMetadataFilterFn,
+    Ed25519Signer, Error, FilterResult, FsckOptions, MutableTree, ObjectName, ObjectType,
+    PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode, SummaryOptions, Type, Value,
 };
 use ostrya_rt::{block_on, spawn};
 
@@ -3150,6 +3150,139 @@ fn a_local_pull_refuses_a_depth_below_minus_one() {
         }
         assert!(dst.list_refs(None).await.unwrap().is_empty());
         assert!(dst.list_objects().await.unwrap().is_empty());
+    });
+}
+
+/// Returns a listed delta. Each byte names the checksum of 32 equal bytes,
+/// and `None` is a delta from scratch.
+fn listed_delta(from: Option<u8>, to: u8, digest: u8) -> AdvertisedDelta {
+    AdvertisedDelta {
+        from: from.map(|byte| Checksum::from_bytes([byte; 32])),
+        to: Checksum::from_bytes([to; 32]),
+        superblock: Checksum::from_bytes([digest; 32]),
+    }
+}
+
+/// A local pull refuses a `static_deltas` list before it reads the source:
+/// two digests for one delta and `disable_static_deltas` with
+/// `InvalidInput`, subpaths with `Unsupported` before the list check, an
+/// invalid collection ref name with `InvalidRefspec` before the refusal of
+/// the list, and a valid list with `Unsupported`. It writes no object, no
+/// ref, no state, and no staging directory.
+#[test]
+fn a_local_pull_refuses_a_static_delta_list() {
+    let tmp = TmpDir::new("pull-static-delta-list-refused");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, _c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let inventory = |dir: &Path| {
+            let mut out = file_inventory(dir, "objects");
+            out.extend(file_inventory(dir, "refs"));
+            out.extend(file_inventory(dir, "state"));
+            out
+        };
+        let before = inventory(&dst_dir);
+        let main = || PullOptions {
+            refs: vec!["main".to_owned()],
+            ..PullOptions::default()
+        };
+        let two_digests = format!(
+            "static delta {}-{} is listed with two superblock digests",
+            Checksum::from_bytes([1; 32]).to_hex(),
+            Checksum::from_bytes([2; 32]).to_hex()
+        );
+        let not_applied = "a pull does not apply a static_deltas list";
+        let cases = [
+            (
+                PullOptions {
+                    static_deltas: Some(vec![
+                        listed_delta(Some(1), 2, 3),
+                        listed_delta(Some(1), 2, 4),
+                    ]),
+                    ..main()
+                },
+                Error::InvalidInput(two_digests),
+            ),
+            (
+                PullOptions {
+                    static_deltas: Some(vec![listed_delta(Some(1), 2, 3)]),
+                    disable_static_deltas: true,
+                    ..main()
+                },
+                Error::InvalidInput(
+                    "a pull with static_deltas takes no disable_static_deltas option".to_owned(),
+                ),
+            ),
+            (
+                PullOptions {
+                    static_deltas: Some(vec![
+                        listed_delta(Some(1), 2, 3),
+                        listed_delta(Some(1), 2, 4),
+                    ]),
+                    subpaths: vec!["/".to_owned()],
+                    ..main()
+                },
+                Error::Unsupported("a local pull takes no subpath".to_owned()),
+            ),
+            (
+                PullOptions {
+                    static_deltas: Some(vec![
+                        listed_delta(Some(1), 2, 3),
+                        listed_delta(None, 2, 4),
+                        listed_delta(Some(1), 2, 3),
+                    ]),
+                    ..main()
+                },
+                Error::Unsupported(not_applied.to_owned()),
+            ),
+            (
+                PullOptions {
+                    static_deltas: Some(Vec::new()),
+                    require_static_deltas: true,
+                    ..main()
+                },
+                Error::Unsupported(not_applied.to_owned()),
+            ),
+            (
+                PullOptions {
+                    static_deltas: Some(vec![listed_delta(Some(1), 2, 3)]),
+                    flags: PullFlags::COMMIT_ONLY,
+                    ..main()
+                },
+                Error::Unsupported(not_applied.to_owned()),
+            ),
+            (
+                PullOptions {
+                    refs: vec!["a:b".to_owned()],
+                    collection_id: Some(COLLECTION.to_owned()),
+                    no_ref_writes: true,
+                    static_deltas: Some(vec![listed_delta(Some(1), 2, 3)]),
+                    ..PullOptions::default()
+                },
+                Error::InvalidRefspec(format!("{COLLECTION}:a:b")),
+            ),
+        ];
+        for (opts, expected) in cases {
+            let err = dst.pull_local(&src, opts).await.unwrap_err();
+            match (&expected, &err) {
+                (Error::InvalidInput(want), Error::InvalidInput(got))
+                | (Error::Unsupported(want), Error::Unsupported(got))
+                | (Error::InvalidRefspec(want), Error::InvalidRefspec(got)) => {
+                    assert_eq!(got, want)
+                }
+                _ => panic!("{expected:?}: {err:?}"),
+            }
+        }
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert!(dst.list_objects().await.unwrap().is_empty());
+        assert_eq!(inventory(&dst_dir), before);
+        let staging = std::fs::read_dir(dst_dir.join("tmp"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("staging-"))
+            .collect::<Vec<_>>();
+        assert!(staging.is_empty(), "{staging:?}");
     });
 }
 

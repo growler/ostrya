@@ -52,7 +52,8 @@ use super::verify::Verification;
 use super::{
     DetachedMetadataFilter, ModeChecks, PullCounters, PullFlags, PullOptions, PullStats,
     PullVerify, READ_CHUNK, TimestampCheck, apply_durability, check_depth, check_ref_binding,
-    check_remote_option, refspec, refuse_remote_collection,
+    check_remote_option, check_static_deltas, refspec, refuse_remote_collection,
+    refuse_static_delta_list,
 };
 
 /// The number of fetched content objects that stream into the object store at
@@ -340,6 +341,13 @@ impl Repo {
     ///   name that [`valid_remote_name`](crate::config::valid_remote_name)
     ///   refuses, also under [`MIRROR`](PullFlags::MIRROR).
     /// - [`Error::Pull`] if a subpath does not start with `/`.
+    /// - [`Error::InvalidInput`] if
+    ///   [`static_deltas`](PullOptions::static_deltas) holds two digests for
+    ///   one delta, or is set together with
+    ///   [`disable_static_deltas`](PullOptions::disable_static_deltas) or with
+    ///   [`subpaths`](PullOptions::subpaths).
+    /// - [`Error::Unsupported`] if `static_deltas` is set and passes these
+    ///   checks.
     /// - The errors of [`resolve_pull`]. Among them, [`Error::Io`] names the
     ///   key and the path of a PEM file that cannot be read, and a PEM file
     ///   over 1 MiB is [`Error::InvalidInput`].
@@ -436,6 +444,8 @@ impl Repo {
         check_depth(opts.depth)?;
         refuse_remote_collection(&opts)?;
         check_remote_option(&opts)?;
+        check_static_deltas(&opts)?;
+        refuse_static_delta_list(&opts)?;
         // The endpoint is resolved first, so a remote the config does not
         // describe reports that before a policy is resolved for it.
         let overrides = std::mem::take(&mut opts.overrides);
@@ -545,6 +555,11 @@ impl Repo {
     /// - [`Error::InvalidInput`] if [`remote`](PullOptions::remote) holds a
     ///   name that [`valid_remote_name`](crate::config::valid_remote_name)
     ///   refuses, also under `MIRROR`.
+    /// - [`Error::InvalidInput`] if
+    ///   [`static_deltas`](PullOptions::static_deltas) holds two digests for
+    ///   one delta, or is set together with
+    ///   [`disable_static_deltas`](PullOptions::disable_static_deltas) or with
+    ///   [`subpaths`](PullOptions::subpaths).
     /// - [`Error::InvalidInput`] if [`refs`](PullOptions::refs) is empty, also
     ///   under `MIRROR`.
     /// - [`Error::InvalidInput`] if [`verify`](PullOptions::verify) is not the
@@ -554,6 +569,8 @@ impl Repo {
     ///   set. The limit of the session applies.
     /// - [`Error::InvalidInput`] if [`overrides`](PullOptions::overrides) is
     ///   not the default. The session selects the server.
+    /// - [`Error::Unsupported`] if `static_deltas` is set and passes the
+    ///   checks above.
     ///
     /// After these checks, the pull has the errors of [`pull`](Repo::pull)
     /// that stop it before it fetches an object, while it fetches, and at any
@@ -1573,6 +1590,7 @@ fn check_session_pull(opts: &PullOptions) -> Result<Option<Subpaths>> {
     check_depth(opts.depth)?;
     refuse_remote_collection(opts)?;
     check_remote_option(opts)?;
+    check_static_deltas(opts)?;
     if opts.refs.is_empty() {
         return Err(no_refs());
     }
@@ -1597,6 +1615,7 @@ fn check_session_pull(opts: &PullOptions) -> Result<Option<Subpaths>> {
                 .into(),
         ));
     }
+    refuse_static_delta_list(opts)?;
     Ok(subpaths)
 }
 

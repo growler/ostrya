@@ -1581,12 +1581,13 @@ pub(crate) fn put_root_file_blocking(
     })
 }
 
-/// `SummaryOptions` and the parsed summary move across tasks and threads, and
-/// so does the future of a ref listing.
+/// `SummaryOptions`, the parsed summary, and its deltas move across tasks and
+/// threads, and so does the future of a ref listing.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<SummaryOptions>();
     assert_send_sync::<Summary>();
+    assert_send_sync::<AdvertisedDelta>();
     fn assert_send<T: Send>(_: &T) {}
     let _ = |repo: &Repo| assert_send(&repo.build_ref_listing(&[]));
 };

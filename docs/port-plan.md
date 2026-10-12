@@ -3119,8 +3119,9 @@ verifier never sees a commit whose signatures have not arrived. A pull that
 fails before that ref step, a `LockTimeout` at the step included, leaves no
 `.commitmeta` of its own; a failure in the step itself keeps the `.commitmeta`
 files the step installed before it. The local pull reads no static delta unless `require_static_deltas`
-is set, and then applies the deltas the source's summary advertises (Phase 17f,
-`pull-local`).
+is set or a `static_deltas` list applies. Under `require_static_deltas` with no
+list, it applies the deltas the source's summary advertises (Phase 17f,
+`pull-local`). With a list, it applies the chains of the list.
 
 The order is: resolve every requested ref in the source, check each tip's ref
 binding, follow each tip's parents to `depth`, write the commitpartial markers,
@@ -3133,7 +3134,7 @@ removes the markers as without the option, and the caller writes the refs
 itself. Without `PullOptions::collection_id`, the pull resolves each name in
 `refs` on the source with revision syntax, so the caller pins a commit when it
 gives the checksum as the name. It reads the ref it would write only for delta
-discovery under `require_static_deltas`.
+discovery, under `require_static_deltas` or with a `static_deltas` list.
 
 With `PullOptions::collection_id` set, the local pull resolves each name in
 `refs` as the collection ref `refs/mirrors/<collection-id>/<name>` of the

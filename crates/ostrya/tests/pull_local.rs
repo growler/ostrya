@@ -12,14 +12,17 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::{TmpDir, file_inventory, ostree_available, wait_for_commit_under_guard, within};
 use futures_lite::future::poll_once;
 use ostrya::{
     AdvertisedDelta, Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions,
-    CommitState, CreateOptions, DeltaOptions, DetachedMetadataFilter, DetachedMetadataFilterFn,
-    Ed25519Signer, Error, FilterResult, FsckOptions, MutableTree, ObjectName, ObjectType,
-    PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode, SummaryOptions, Type, Value,
+    CommitState, CreateOptions, DeltaOptions, DeltaSuperblock, DetachedMetadataFilter,
+    DetachedMetadataFilterFn, Ed25519Signer, Error, FilterResult, FsckOptions, MutableTree,
+    ObjectName, ObjectType, PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode,
+    SummaryOptions, Type, Value,
 };
 use ostrya_rt::{block_on, spawn};
 
@@ -3163,14 +3166,13 @@ fn listed_delta(from: Option<u8>, to: u8, digest: u8) -> AdvertisedDelta {
     }
 }
 
-/// A local pull refuses a `static_deltas` list before it reads the source:
-/// two digests for one delta and `disable_static_deltas` with
-/// `InvalidInput`, subpaths with `Unsupported` before the list check, an
-/// invalid collection ref name with `InvalidRefspec` before the refusal of
-/// the list, and a valid list with `Unsupported`. It writes no object, no
-/// ref, no state, and no staging directory.
+/// A local pull refuses a `static_deltas` list that it cannot take before it
+/// reads the source: two digests for one delta and `disable_static_deltas`
+/// with `InvalidInput`, subpaths with `Unsupported` before the list check,
+/// and an invalid collection ref name with `InvalidRefspec`. It writes no
+/// object, no ref, no state, and no staging directory.
 #[test]
-fn a_local_pull_refuses_a_static_delta_list() {
+fn a_local_pull_refuses_a_static_delta_list_it_cannot_take() {
     let tmp = TmpDir::new("pull-static-delta-list-refused");
     block_on(async {
         let base = tmp.path();
@@ -3192,7 +3194,6 @@ fn a_local_pull_refuses_a_static_delta_list() {
             Checksum::from_bytes([1; 32]).to_hex(),
             Checksum::from_bytes([2; 32]).to_hex()
         );
-        let not_applied = "a pull does not apply a static_deltas list";
         let cases = [
             (
                 PullOptions {
@@ -3224,33 +3225,6 @@ fn a_local_pull_refuses_a_static_delta_list() {
                     ..main()
                 },
                 Error::Unsupported("a local pull takes no subpath".to_owned()),
-            ),
-            (
-                PullOptions {
-                    static_deltas: Some(vec![
-                        listed_delta(Some(1), 2, 3),
-                        listed_delta(None, 2, 4),
-                        listed_delta(Some(1), 2, 3),
-                    ]),
-                    ..main()
-                },
-                Error::Unsupported(not_applied.to_owned()),
-            ),
-            (
-                PullOptions {
-                    static_deltas: Some(Vec::new()),
-                    require_static_deltas: true,
-                    ..main()
-                },
-                Error::Unsupported(not_applied.to_owned()),
-            ),
-            (
-                PullOptions {
-                    static_deltas: Some(vec![listed_delta(Some(1), 2, 3)]),
-                    flags: PullFlags::COMMIT_ONLY,
-                    ..main()
-                },
-                Error::Unsupported(not_applied.to_owned()),
             ),
             (
                 PullOptions {
@@ -3345,6 +3319,12 @@ fn required(flags: PullFlags) -> PullOptions {
 /// complete, with no ref.
 async fn dst_holding(base: &Path, name: &str, src: &Repo, commit: &Checksum) -> (PathBuf, Repo) {
     let (path, dst) = make_repo(base, name, RepoMode::BareUser).await;
+    hold_commit(&dst, src, commit).await;
+    (path, dst)
+}
+
+/// Pulls `commit` of `src` into `dst` complete, and leaves `dst` with no ref.
+async fn hold_commit(dst: &Repo, src: &Repo, commit: &Checksum) {
     dst.pull_local(
         src,
         PullOptions {
@@ -3359,7 +3339,6 @@ async fn dst_holding(base: &Path, name: &str, src: &Repo, commit: &Checksum) -> 
     txn.set_ref(&commit.to_hex(), None);
     txn.commit().await.unwrap();
     assert!(dst.list_refs(None).await.unwrap().is_empty());
-    (path, dst)
 }
 
 /// Returns the sum of the sizes of the files under `dir`.
@@ -4776,5 +4755,686 @@ fn a_hole_in_a_commit_held_complete_is_filled_after_fsck_marks_it() {
         assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
         assert!(!has_partial_marker(&dst_dir, &c2));
         assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+// --- chains of static deltas ---------------------------------------------
+
+/// Creates an archive source under `base/src` with one commit on `main` for
+/// each name of `names`. Each commit is a child of the commit before it, and
+/// holds the small tree with its name as the marker. The source holds no
+/// summary and no delta.
+async fn chain_source(base: &Path, names: &[&str]) -> (PathBuf, Repo, Vec<Checksum>) {
+    let (path, repo) = make_repo(base, "src", RepoMode::Archive).await;
+    let mut commits: Vec<Checksum> = Vec::new();
+    for name in names {
+        build_tree(&base.join(name), format!("{name}\n").as_bytes());
+        let parent = commits.last().copied();
+        commits.push(commit_tree(&repo, base, name, "main", parent).await);
+    }
+    (path, repo, commits)
+}
+
+/// Generates the delta of each step of `steps` in `src`. Returns the entry of
+/// each delta for a list, with the SHA-256 of its superblock, and the
+/// directory of each delta.
+async fn chain_list(
+    src: &Repo,
+    steps: &[(Checksum, Checksum)],
+) -> (Vec<AdvertisedDelta>, Vec<PathBuf>) {
+    let mut list = Vec::new();
+    let mut dirs = Vec::new();
+    for (from, to) in steps {
+        let (delta, dir) = listed_step(src, from, to, DeltaOptions::default()).await;
+        list.push(delta);
+        dirs.push(dir);
+    }
+    (list, dirs)
+}
+
+/// Generates the delta from `from` to `to` in `src` under `opts`. Returns the
+/// entry of the delta for a list, with the SHA-256 of its superblock, and the
+/// directory of the delta.
+async fn listed_step(
+    src: &Repo,
+    from: &Checksum,
+    to: &Checksum,
+    opts: DeltaOptions,
+) -> (AdvertisedDelta, PathBuf) {
+    let dir = delta_with(src, Some(from), to, opts).await;
+    let bytes = std::fs::read(dir.join("superblock")).unwrap();
+    let delta = AdvertisedDelta {
+        from: Some(*from),
+        to: *to,
+        superblock: Checksum::sha256(&bytes),
+    };
+    (delta, dir)
+}
+
+/// Returns `len` bytes of a fixed xorshift sequence, which a compressor
+/// cannot make smaller.
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + 8);
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// Returns the number of part files in the delta directory `dir`.
+fn part_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.parse::<u32>().is_ok())
+        })
+        .count()
+}
+
+/// Returns the options of a pull of `main` with the list `list`.
+fn chain_pull(list: Vec<AdvertisedDelta>) -> PullOptions {
+    PullOptions {
+        refs: vec!["main".to_owned()],
+        static_deltas: Some(list),
+        ..PullOptions::default()
+    }
+}
+
+/// Returns the options of a pull with the list `list` under the remote
+/// `origin`, which checks the signapi signature of each commit.
+fn signed_chain_pull(list: Vec<AdvertisedDelta>) -> PullOptions {
+    PullOptions {
+        remote: Some("origin".to_owned()),
+        verify: PullVerify {
+            sign: Some(true),
+            ..PullVerify::default()
+        },
+        ..chain_pull(list)
+    }
+}
+
+/// Creates a destination under `base/dst` that checks the commits of the
+/// remote `origin` against the key of `PUBLIC_B64`. The destination holds
+/// `commit` of `src` complete, with no ref.
+async fn signed_dst_holding(base: &Path, src: &Repo, commit: &Checksum) -> (PathBuf, Repo) {
+    let dst = dest_with_remote(base, &format!("verification-ed25519-key={PUBLIC_B64}\n")).await;
+    hold_commit(&dst, src, commit).await;
+    (base.join("dst"), dst)
+}
+
+/// Signs each commit of `commits` in `repo` with the key of `SECRET_B64`.
+async fn sign_commits(repo: &Repo, commits: &[Checksum]) {
+    let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+    for commit in commits {
+        repo.sign_commit(commit, &signer).await.unwrap();
+    }
+}
+
+/// Asserts that the repository at `dst_dir` keeps no `.commitpartial` marker
+/// and no staging directory.
+fn assert_no_markers(dst_dir: &Path) {
+    let markers: Vec<String> = std::fs::read_dir(dst_dir.join("state"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".commitpartial"))
+        .collect();
+    assert!(markers.is_empty(), "{markers:?}");
+    let staging: Vec<String> = std::fs::read_dir(dst_dir.join("tmp"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("staging-"))
+        .collect();
+    assert!(staging.is_empty(), "{staging:?}");
+}
+
+/// Returns a filter that allows each property, and the count of its calls for
+/// the detached metadata of `commit`.
+fn counting_filter(commit: Checksum) -> (DetachedMetadataFilter, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let filter = DetachedMetadataFilter::new(move |seen, _, _| {
+        if *seen == commit {
+            counted.fetch_add(1, Ordering::Relaxed);
+        }
+        FilterResult::Allow
+    });
+    (filter, calls)
+}
+
+/// A local pull applies a chain of two static deltas from the commit that the
+/// destination holds, with no summary and with `require_static_deltas` off.
+/// The intermediate commit and the target end complete with no marker. The
+/// pull reads the two superblocks and their part files, and no loose object.
+#[test]
+fn a_chain_of_two_steps_is_applied() {
+    let tmp = TmpDir::new("pull-chain-two-steps");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, commits) = chain_source(base, &["a", "b", "c"]).await;
+        let [a, b, c] = commits[..] else {
+            unreachable!()
+        };
+        let (list, dirs) = chain_list(&src, &[(a, b), (b, c)]).await;
+        let (dst_dir, dst) = dst_holding(base, "dst", &src, &a).await;
+
+        let stats = dst.pull_local(&src, chain_pull(list)).await.unwrap();
+
+        assert_eq!(dst.resolve_rev("main", false).await.unwrap(), Some(c));
+        for commit in [b, c] {
+            assert_complete(&src, &dst, &dst_dir, &commit).await;
+        }
+        assert_no_markers(&dst_dir);
+        assert_eq!(stats.content_fetched, 0);
+        assert_eq!(stats.metadata_fetched, 2);
+        assert_eq!(
+            stats.delta_parts as usize,
+            dirs.iter().map(|dir| part_files(dir)).sum::<usize>()
+        );
+        assert_eq!(
+            stats.bytes_transferred,
+            dirs.iter().map(|dir| tree_size(dir)).sum::<u64>()
+        );
+        assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// The source does not hold the superblock of the middle step of the one
+/// chain of the list. Under `require_static_deltas`, the pull fails and
+/// publishes nothing. Without it, the pull imports the target loose and
+/// applies no part.
+#[test]
+fn a_missing_superblock_in_the_middle_of_a_local_chain() {
+    let tmp = TmpDir::new("pull-chain-missing-superblock");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, commits) = chain_source(base, &["a", "b", "c", "d"]).await;
+        let [a, b, c, d] = commits[..] else {
+            unreachable!()
+        };
+        let (list, dirs) = chain_list(&src, &[(a, b), (b, c), (c, d)]).await;
+        std::fs::remove_file(dirs[1].join("superblock")).unwrap();
+        let (dst_dir, dst) = dst_holding(base, "dst", &src, &a).await;
+        let held = dst.list_objects().await.unwrap();
+
+        let required = PullOptions {
+            require_static_deltas: true,
+            ..chain_pull(list.clone())
+        };
+        let err = dst.pull_local(&src, required).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("pull: Static deltas required, but none found for main to {d}")
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(dst.list_objects().await.unwrap(), held);
+        assert_no_markers(&dst_dir);
+
+        let stats = dst.pull_local(&src, chain_pull(list)).await.unwrap();
+        assert_eq!(stats.delta_parts, 0);
+        assert!(stats.content_fetched > 0, "{stats:?}");
+        assert_complete(&src, &dst, &dst_dir, &d).await;
+        assert_no_markers(&dst_dir);
+        assert_eq!(dst.resolve_rev("main", false).await.unwrap(), Some(d));
+    });
+}
+
+/// A listed digest that the superblock of a step does not have fails the pull
+/// before the transaction opens. The pull publishes no ref, writes no object,
+/// and leaves no marker.
+#[test]
+fn a_wrong_listed_digest_fails_a_local_pull() {
+    let tmp = TmpDir::new("pull-chain-wrong-digest");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, commits) = chain_source(base, &["a", "b", "c", "d"]).await;
+        let [a, b, c, d] = commits[..] else {
+            unreachable!()
+        };
+        let (mut list, _dirs) = chain_list(&src, &[(a, b), (b, c), (c, d)]).await;
+        list[1].superblock = Checksum::from_bytes([0xee; 32]);
+        let (dst_dir, dst) = dst_holding(base, "dst", &src, &a).await;
+        let held = dst.list_objects().await.unwrap();
+
+        let err = dst.pull_local(&src, chain_pull(list)).await.unwrap_err();
+        assert!(matches!(err, Error::ChecksumMismatch { .. }), "{err:?}");
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(dst.list_objects().await.unwrap(), held);
+        assert_no_markers(&dst_dir);
+    });
+}
+
+/// An intermediate commit with no valid signature fails the pull before the
+/// transaction opens: the pull publishes nothing and leaves no marker and no
+/// staging directory. After the source signs that commit, the pull passes.
+#[test]
+fn an_unsigned_intermediate_commit_fails_a_local_pull() {
+    let tmp = TmpDir::new("pull-chain-unsigned-intermediate");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, commits) = chain_source(base, &["a", "b", "c", "d"]).await;
+        let [a, b, c, d] = commits[..] else {
+            unreachable!()
+        };
+        sign_commits(&src, &[a, c, d]).await;
+        let (list, _dirs) = chain_list(&src, &[(a, b), (b, c), (c, d)]).await;
+        let (dst_dir, dst) = signed_dst_holding(base, &src, &a).await;
+        let held = dst.list_objects().await.unwrap();
+
+        let err = dst
+            .pull_local(&src, signed_chain_pull(list.clone()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Signature(_)), "{err:?}");
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(dst.list_objects().await.unwrap(), held);
+        assert_no_markers(&dst_dir);
+
+        sign_commits(&src, &[b]).await;
+        dst.pull_local(&src, signed_chain_pull(list)).await.unwrap();
+        assert_eq!(dst.resolve_rev("origin:main", true).await.unwrap(), Some(d));
+        for commit in [b, c, d] {
+            assert_complete(&src, &dst, &dst_dir, &commit).await;
+        }
+        assert_no_markers(&dst_dir);
+    });
+}
+
+/// A pull of depth 1 through a chain under a signature policy passes. The
+/// parent of the target is an intermediate commit. The pull counts the
+/// `.commitmeta` of that commit once, and imports it once: three superblocks
+/// and the `.commitmeta` of B, C, and D make six metadata reads.
+#[test]
+fn depth_one_through_a_local_chain_under_verification() {
+    let tmp = TmpDir::new("pull-chain-depth-verify");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, commits) = chain_source(base, &["a", "b", "c", "d"]).await;
+        let [a, b, c, d] = commits[..] else {
+            unreachable!()
+        };
+        sign_commits(&src, &[a, b, c, d]).await;
+        let (list, _dirs) = chain_list(&src, &[(a, b), (b, c), (c, d)]).await;
+        let (dst_dir, dst) = signed_dst_holding(base, &src, &a).await;
+        let (filter, calls) = counting_filter(c);
+
+        let opts = PullOptions {
+            depth: 1,
+            detached_metadata_filter: filter,
+            ..signed_chain_pull(list)
+        };
+        let stats = dst.pull_local(&src, opts).await.unwrap();
+
+        assert_eq!(stats.metadata_fetched, 6);
+        assert_eq!(stats.content_fetched, 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        for commit in [b, c, d] {
+            assert_complete(&src, &dst, &dst_dir, &commit).await;
+        }
+        assert_no_markers(&dst_dir);
+        let detached = dst.read_commit_detached_metadata(&c).await.unwrap();
+        assert!(detached.is_some());
+        assert_eq!(
+            detached,
+            src.read_commit_detached_metadata(&c).await.unwrap()
+        );
+        assert_eq!(dst.resolve_rev("origin:main", true).await.unwrap(), Some(d));
+    });
+}
+
+/// A requested target is also an intermediate commit of the chain of another
+/// target. The pull writes both refs and imports the detached metadata of
+/// that commit once. The binding check applies to the ref that names the
+/// intermediate commit: a ref that the binding of that commit does not list
+/// fails the pull.
+#[test]
+fn a_local_target_that_is_an_intermediate_commit_of_another_target() {
+    let tmp = TmpDir::new("pull-chain-target-in-level");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        for name in ["a", "b", "c", "d"] {
+            build_tree(&base.join(name), format!("{name}\n").as_bytes());
+        }
+        let a = commit_tree(&src, base, "a", "main", None).await;
+        let b = commit_tree(&src, base, "b", "main", Some(a)).await;
+        let c = commit_tree(&src, base, "c", "mid", Some(b)).await;
+        let d = commit_tree(&src, base, "d", "main", Some(c)).await;
+        let txn = src.transaction().await.unwrap();
+        txn.set_ref("alias", Some(&c));
+        txn.commit().await.unwrap();
+        sign_commits(&src, &[a, b, c, d]).await;
+        let (list, _dirs) = chain_list(&src, &[(a, b), (b, c), (c, d)]).await;
+        let (dst_dir, dst) = signed_dst_holding(base, &src, &a).await;
+        let held = dst.list_objects().await.unwrap();
+
+        let alias = PullOptions {
+            refs: vec!["main".to_owned(), "alias".to_owned()],
+            ..signed_chain_pull(list.clone())
+        };
+        let err = dst.pull_local(&src, alias).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("'alias'")),
+            "{err:?}"
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(dst.list_objects().await.unwrap(), held);
+        assert_no_markers(&dst_dir);
+
+        let (filter, calls) = counting_filter(c);
+        let opts = PullOptions {
+            refs: vec!["main".to_owned(), "mid".to_owned()],
+            detached_metadata_filter: filter,
+            ..signed_chain_pull(list)
+        };
+        dst.pull_local(&src, opts).await.unwrap();
+        assert_eq!(dst.resolve_rev("origin:main", true).await.unwrap(), Some(d));
+        assert_eq!(dst.resolve_rev("origin:mid", true).await.unwrap(), Some(c));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        for commit in [b, c, d] {
+            assert_complete(&src, &dst, &dst_dir, &commit).await;
+        }
+        assert_no_markers(&dst_dir);
+    });
+}
+
+/// A local pull with a list reads only a source in `archive` mode. It refuses
+/// a `bare-user` source with no summary before it resolves a ref.
+#[test]
+fn a_local_chain_refuses_a_source_outside_archive_mode() {
+    let tmp = TmpDir::new("pull-chain-bare-source");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::BareUser).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        let opts = PullOptions {
+            refs: vec!["absent".to_owned()],
+            ..chain_pull(vec![listed_delta(Some(1), 2, 3)])
+        };
+        let err = dst.pull_local(&src, opts).await.unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("bare-user"), "{err}");
+        assert_nothing_left(&dst_dir, &dst, &c2).await;
+    });
+}
+
+/// A pull with an empty list finds no chain and imports the commit loose.
+/// The fetch counters count what it reads from the source.
+#[test]
+fn an_empty_local_list_imports_loose_and_counts_the_reads() {
+    let tmp = TmpDir::new("pull-chain-empty-list");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+
+        let stats = dst.pull_local(&src, chain_pull(Vec::new())).await.unwrap();
+
+        assert_eq!(dst.resolve_rev("main", false).await.unwrap(), Some(c2));
+        assert_complete(&src, &dst, &dst_dir, &c2).await;
+        assert_eq!(stats.delta_parts, 0);
+        assert!(stats.content_fetched > 0, "{stats:?}");
+        assert_eq!(stats.content_fetched, stats.content_imported);
+        assert_eq!(stats.metadata_fetched, stats.metadata_imported);
+        assert!(stats.bytes_transferred > 0, "{stats:?}");
+    });
+}
+
+/// A pull with an empty list under `require_static_deltas` finds no chain to
+/// the target and fails. It needs no summary, and it publishes nothing.
+#[test]
+fn an_empty_local_list_fails_under_require() {
+    let tmp = TmpDir::new("pull-chain-empty-list-required");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        let opts = PullOptions {
+            require_static_deltas: true,
+            ..chain_pull(Vec::new())
+        };
+        let err = dst.pull_local(&src, opts).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("pull: Static deltas required, but none found for main to {c2}")
+        );
+        assert_nothing_left(&dst_dir, &dst, &c2).await;
+    });
+}
+
+/// A commit-only pull ignores the list, also a list that names no commit of
+/// the source. It needs no summary, also under `require_static_deltas`.
+#[test]
+fn a_commit_only_local_pull_ignores_the_list() {
+    let tmp = TmpDir::new("pull-chain-commit-only");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        for require_static_deltas in [false, true] {
+            let name = format!("dst-{require_static_deltas}");
+            let (_dst_dir, dst) = make_repo(base, &name, RepoMode::BareUser).await;
+            let opts = PullOptions {
+                flags: PullFlags::COMMIT_ONLY,
+                require_static_deltas,
+                ..chain_pull(vec![listed_delta(Some(1), 2, 3)])
+            };
+            let stats = dst.pull_local(&src, opts).await.unwrap();
+            assert_eq!(stats.delta_parts, 0, "{name}");
+            assert_eq!(
+                dst.commit_state(&c2).await.unwrap(),
+                CommitState::Partial,
+                "{name}"
+            );
+            assert_eq!(dst.resolve_rev("main", false).await.unwrap(), Some(c2));
+        }
+    });
+}
+
+/// A later step of a chain patches against an object that an earlier level
+/// hands over loose. The delta from A to B hands over the large file of B as
+/// a fallback. The delta from B to C reads that file as the source of an
+/// edit. The walk of the first level imports the fallback before the pull
+/// applies the later step.
+#[test]
+fn a_later_local_step_reads_a_fallback_of_an_earlier_step() {
+    let tmp = TmpDir::new("pull-chain-fallback-barrier");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let big = incompressible(300_000);
+        let mut edited = big.clone();
+        edited[150_000..150_016].copy_from_slice(&[0x5a; 16]);
+        build_tree(&base.join("a"), b"a\n");
+        build_tree(&base.join("b"), b"a\n");
+        std::fs::write(base.join("b/big"), &big).unwrap();
+        build_tree(&base.join("c"), b"a\n");
+        std::fs::write(base.join("c/big"), &edited).unwrap();
+        let a = commit_tree(&src, base, "a", "main", None).await;
+        let b = commit_tree(&src, base, "b", "main", Some(a)).await;
+        let c = commit_tree(&src, base, "c", "main", Some(b)).await;
+        let (ab, ab_dir) = listed_step(
+            &src,
+            &a,
+            &b,
+            DeltaOptions {
+                min_fallback_size: 100_000,
+                ..DeltaOptions::default()
+            },
+        )
+        .await;
+        let (bc, bc_dir) = listed_step(
+            &src,
+            &b,
+            &c,
+            DeltaOptions {
+                min_fallback_size: 0,
+                ..DeltaOptions::default()
+            },
+        )
+        .await;
+        let ab_superblock =
+            DeltaSuperblock::parse(std::fs::read(ab_dir.join("superblock")).unwrap()).unwrap();
+        assert_eq!(ab_superblock.fallbacks().len(), 1);
+        let bc_superblock =
+            DeltaSuperblock::parse(std::fs::read(bc_dir.join("superblock")).unwrap()).unwrap();
+        let mut reads = 0;
+        for index in 0..bc_superblock.parts().len() {
+            reads += bc_superblock
+                .part_stats(index, &bc_dir)
+                .await
+                .unwrap()
+                .ops
+                .set_read_source;
+        }
+        assert!(reads > 0, "the delta from B to C reads no source object");
+        let (dst_dir, dst) = dst_holding(base, "dst", &src, &a).await;
+
+        let stats = dst
+            .pull_local(&src, chain_pull(vec![ab, bc]))
+            .await
+            .unwrap();
+
+        assert_eq!(dst.resolve_rev("main", false).await.unwrap(), Some(c));
+        for commit in [b, c] {
+            assert_complete(&src, &dst, &dst_dir, &commit).await;
+        }
+        assert_no_markers(&dst_dir);
+        assert_eq!(stats.content_fetched, 1, "{stats:?}");
+        assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// A part file of the step from B to C does not decode. The pull fails in
+/// the second level, after it wrote the markers. It removes each marker, and
+/// publishes no ref and no object.
+#[test]
+fn a_failure_inside_a_local_level_clears_the_markers() {
+    let tmp = TmpDir::new("pull-chain-fail-in-level");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, commits) = chain_source(base, &["a", "b", "c", "d"]).await;
+        let [a, b, c, d] = commits[..] else {
+            unreachable!()
+        };
+        let (list, dirs) = chain_list(&src, &[(a, b), (b, c), (c, d)]).await;
+        assert!(part_files(&dirs[1]) > 0);
+        let part = dirs[1].join("0");
+        let mut bytes = std::fs::read(&part).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&part, bytes).unwrap();
+        let (dst_dir, dst) = dst_holding(base, "dst", &src, &a).await;
+        let held = dst.list_objects().await.unwrap();
+
+        let err = dst.pull_local(&src, chain_pull(list)).await.unwrap_err();
+
+        assert!(matches!(err, Error::InvalidFormat(_)), "{err:?}");
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(dst.list_objects().await.unwrap(), held);
+        assert_no_markers(&dst_dir);
+    });
+}
+
+/// The intermediate commits B and C are signed, and the target D is not. The
+/// pull refuses D in the walk of the commit chains, before its transaction
+/// opens. It writes no marker and no object, so it applies no part.
+#[test]
+fn an_unsigned_local_target_fails_before_the_transaction() {
+    let tmp = TmpDir::new("pull-chain-unsigned-target");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, commits) = chain_source(base, &["a", "b", "c", "d"]).await;
+        let [a, b, c, d] = commits[..] else {
+            unreachable!()
+        };
+        sign_commits(&src, &[a, b, c]).await;
+        let (list, _dirs) = chain_list(&src, &[(a, b), (b, c), (c, d)]).await;
+        let (dst_dir, dst) = signed_dst_holding(base, &src, &a).await;
+        let held = dst.list_objects().await.unwrap();
+
+        let err = dst
+            .pull_local(&src, signed_chain_pull(list))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Signature(_)), "{err:?}");
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(dst.list_objects().await.unwrap(), held);
+        assert_no_markers(&dst_dir);
+    });
+}
+
+/// Two targets share the first step of their chains. The pull reads the
+/// superblock and each part file of the shared step once, and writes both
+/// refs.
+#[test]
+fn two_local_targets_share_a_step() {
+    let tmp = TmpDir::new("pull-chain-shared-step");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        for name in ["a", "b", "c", "d"] {
+            build_tree(&base.join(name), format!("{name}\n").as_bytes());
+        }
+        let a = commit_tree(&src, base, "a", "main", None).await;
+        let b = commit_tree(&src, base, "b", "main", Some(a)).await;
+        let c = commit_tree(&src, base, "c", "main", Some(b)).await;
+        let d = commit_tree(&src, base, "d", "other", Some(b)).await;
+        let (list, dirs) = chain_list(&src, &[(a, b), (b, c), (b, d)]).await;
+        let (dst_dir, dst) = dst_holding(base, "dst", &src, &a).await;
+
+        let opts = PullOptions {
+            refs: vec!["main".to_owned(), "other".to_owned()],
+            ..chain_pull(list)
+        };
+        let stats = dst.pull_local(&src, opts).await.unwrap();
+
+        assert_eq!(dst.resolve_rev("main", false).await.unwrap(), Some(c));
+        assert_eq!(dst.resolve_rev("other", false).await.unwrap(), Some(d));
+        for commit in [b, c, d] {
+            assert_complete(&src, &dst, &dst_dir, &commit).await;
+        }
+        assert_no_markers(&dst_dir);
+        assert_eq!(stats.content_fetched, 0);
+        assert_eq!(stats.metadata_fetched, 3);
+        assert_eq!(
+            stats.delta_parts as usize,
+            dirs.iter().map(|dir| part_files(dir)).sum::<usize>()
+        );
+        assert_eq!(
+            stats.bytes_transferred,
+            dirs.iter().map(|dir| tree_size(dir)).sum::<u64>()
+        );
+    });
+}
+
+/// A commit-only pull ignores the list, so it reads a source outside
+/// `archive` mode. The commit stays partial with its marker.
+#[test]
+fn a_commit_only_local_pull_with_a_list_reads_a_bare_source() {
+    let tmp = TmpDir::new("pull-chain-commit-only-bare");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::BareUser).await;
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        let opts = PullOptions {
+            flags: PullFlags::COMMIT_ONLY,
+            ..chain_pull(vec![listed_delta(Some(1), 2, 3)])
+        };
+
+        let stats = dst.pull_local(&src, opts).await.unwrap();
+
+        assert_eq!(stats.delta_parts, 0);
+        assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Partial);
+        assert_eq!(dst.resolve_rev("main", false).await.unwrap(), Some(c2));
     });
 }

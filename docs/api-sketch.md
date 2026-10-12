@@ -2311,11 +2311,12 @@ published. With `no_ref_writes` set, the pull writes no ref, and the caller
 writes the refs itself. `PullStats` does not report the pulled commits. Without
 `collection_id`, the local pull resolves each name in `refs` on `src` with
 revision syntax, so the caller pins a commit when it gives the checksum as the
-name. The local pull reads the ref it would write only for delta discovery
-under `require_static_deltas`. When a pulled commit has detached metadata, a
-pull with `no_ref_writes` still takes the update lock to write it. A caller
-that holds an `UpdateGuard` of the destination during the pull then waits for
-its own guard until the lock timeout.
+name. The local pull reads the ref it would write only for delta discovery,
+under `require_static_deltas` or with a `static_deltas` list. When a pulled
+commit has detached metadata, a pull with `no_ref_writes` still takes the
+update lock to write it. A caller that holds an `UpdateGuard` of the
+destination during the pull then waits for its own guard until the lock
+timeout.
 
 With `collection_id` set, the local pull resolves each name in `refs` as the
 collection ref `refs/mirrors/<collection-id>/<name>` of `src`. The name is a
@@ -2474,15 +2475,16 @@ published commit is whole. `disable_static_deltas` asks for no delta;
 `require_static_deltas` refuses a remote that serves no summary, and a commit
 this repository does not hold complete for which no advertised delta can be
 taken.
-`pull_local` reads no delta unless `require_static_deltas` is set; with it set,
-it reads the summary, the index, the superblock, and the parts from the source
+`pull_local` reads no delta unless `require_static_deltas` is set or a
+`static_deltas` list applies. With `require_static_deltas` and no list, it reads
+the summary, the index, the superblock, and the parts from the source
 directory, which must be an archive repository, and applies the delta.
 `static_deltas` replaces the delta search with a list, such as the
 `Summary::static_deltas` of a ref listing. Each pull checks the list before its
 first request and before its transaction opens. It refuses two digests for one
 delta, the list with `disable_static_deltas`, and the list with subpaths with
 `InvalidInput`, and drops an entry equal to an earlier entry. `pull_local`
-refuses subpaths with `Unsupported` before this check. A pull from a remote
+refuses subpaths with `Unsupported` before this check. A pull with a list
 reads no delta index and needs no summary for the list. For each target commit
 it applies the chain with the fewest steps. A chain starts at a commit that
 this repository holds complete, or with a delta from scratch if the ref names
@@ -2495,9 +2497,14 @@ time: the parts, the loose objects, and the tree walk of one level end before
 the next level starts. Each intermediate commit ends complete with no
 `.commitpartial` marker. The ref-binding check and the timestamp check apply to
 an intermediate commit only for a requested ref that names it. A `COMMIT_ONLY`
-pull ignores the list. `pull_local` does not apply a list yet: a list that
-passes all checks of its options, an empty list included, fails with
-`Unsupported`.
+pull ignores the list. `pull_local` reads the superblocks and the parts of a
+list from the source directory, which must be an archive repository, and the
+counters of `PullStats` count these reads as fetches. It applies one step at
+a time, in each level and in the run of the targets. Before it applies a step,
+it reads the superblock of the step again and checks it against its listed
+digest again. A superblock that is gone at that point fails the pull with
+`InvalidFormat`. `pull_local` checks the signatures and the ref binding of
+each target commit before its transaction opens.
 
 A pull checks the signatures on the commits it carries and on the remote's
 summary. `verify` holds four switches, each overriding the remote configuration
@@ -2617,11 +2624,10 @@ pub struct PullOptions {
                                           // search; two digests for one
                                           // delta, disable_static_deltas,
                                           // or subpaths: InvalidInput,
-                                          // before the first request; a
-                                          // pull from a remote applies the
-                                          // chain; pull_local refuses a
-                                          // list that passes the checks:
-                                          // Unsupported
+                                          // before the first request; each
+                                          // pull applies the chain with the
+                                          // fewest steps; pull_local reads
+                                          // it from an archive source only
     pub verify: PullVerify,               // the signature checks to make;
                                           // pull_with_session refuses a
                                           // value other than the default
@@ -2684,9 +2690,11 @@ pub struct PullStats {
     pub content_imported: u32,
     pub content_bytes_written: u64,       // stored size, hardlinks included
     pub content_bytes_unpacked: u64,      // payload written, the tool's figure
-    pub metadata_fetched: u32,            // HTTP only, delta index and
-                                          // superblock requests included
-    pub content_fetched: u32,             // HTTP only
+    pub metadata_fetched: u32,            // a pull from a remote, or a
+                                          // local pull that reads deltas;
+                                          // delta index and superblock
+                                          // requests included
+    pub content_fetched: u32,             // as metadata_fetched
     pub delta_parts: u32,                 // parts fetched as files
     pub bytes_transferred: u64,           // successful bodies after the
                                           // summary, config, and ref files

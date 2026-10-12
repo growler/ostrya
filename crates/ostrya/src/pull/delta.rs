@@ -13,7 +13,9 @@
 //! from such a list, and [`discover`] then fetches the steps of the chains. A
 //! pull from a remote runs its plan one time for each level of intermediate
 //! commits, with the jobs of that level, and then one time for the targets.
-//! A local pull refuses a list before it reads its source.
+//! A local pull applies and imports each level of intermediate commits in
+//! turn, and then the targets. It parses, applies, and drops the job of one
+//! step of a list at a time, so the heap holds one job of the list.
 //!
 //! The discovery of a chain keeps one record for each step of the plan, and
 //! drops each parsed superblock after its checks. So the heap holds one
@@ -24,7 +26,7 @@
 //! that discovery keeps holds verified bytes. A record from a local source
 //! keeps no bytes, and the parse of a level reads the superblock from the
 //! source again and checks its digest. The parse of a level gives the jobs
-//! of that level alone.
+//! of that level alone, and the parse of a record gives the job of one step.
 //!
 //! For each intermediate commit of a chain, discovery fetches the
 //! `.commitmeta` right after the superblock, and checks the signatures of the
@@ -80,11 +82,13 @@ pub(crate) const PART_CAP: usize = 2;
 /// Without a list of static deltas, discovery builds the job of each target
 /// commit that has a delta, and the job lives until the pull returns. With a
 /// list, discovery keeps a record for each step of the chains, and the pull
-/// builds the jobs from the records. [`DeltaPlan::parse_level`] builds the
-/// jobs of the intermediate commits of one level before the run of that
-/// level, and the jobs live for that run alone. [`DeltaPlan::target_jobs`]
-/// builds the jobs of the target commits after the run of the last level. A
-/// job holds only what the application of the parts reads.
+/// builds the jobs from the records. For a pull from a remote,
+/// [`DeltaPlan::parse_level`] builds the jobs of the intermediate commits of
+/// one level before the run of that level, and the jobs live for that run
+/// alone. [`DeltaPlan::target_jobs`] builds the jobs of the target commits
+/// after the run of the last level. A local pull builds the job of one step
+/// at a time with [`DeltaPlan::parse_record`], and drops it after its parts.
+/// A job holds only what the application of the parts reads.
 ///
 /// The parse of a superblock reads the raw superblock bytes, the signature
 /// array, and the metadata dict, and drops them before the job exists. The
@@ -218,13 +222,31 @@ impl DeltaPlan {
     ) -> Result<HashMap<Checksum, DeltaJob>> {
         let mut jobs = HashMap::with_capacity(commits.len());
         for commit in commits {
-            let Some(record) = self.records.get(commit) else {
-                continue;
-            };
-            let fetched = read_record(self.store.as_ref(), source, record).await?;
-            jobs.insert(*commit, fetched.into_job(repo).await?);
+            if let Some(job) = self.parse_record(repo, source, commit).await? {
+                jobs.insert(*commit, job);
+            }
         }
         Ok(jobs)
+    }
+
+    /// Parses the record of `commit` again, as
+    /// [`parse_level`](DeltaPlan::parse_level) does, and returns its job.
+    /// Returns `None` if the plan holds no record of `commit`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`parse_level`](DeltaPlan::parse_level).
+    pub(crate) async fn parse_record(
+        &self,
+        repo: &Repo,
+        source: &DeltaSource<'_>,
+        commit: &Checksum,
+    ) -> Result<Option<DeltaJob>> {
+        let Some(record) = self.records.get(commit) else {
+            return Ok(None);
+        };
+        let fetched = read_record(self.store.as_ref(), source, record).await?;
+        fetched.into_job(repo).await.map(Some)
     }
 
     /// Returns the intermediate commits of the chains, by level, in plan
@@ -238,8 +260,8 @@ impl DeltaPlan {
     /// Without a list, these are the jobs of the search for one delta. With a
     /// list, the call also parses the records of the commits that are in no
     /// level, as [`parse_level`](DeltaPlan::parse_level) does, in checksum
-    /// order. The pull calls it after the run of the last level, so the heap
-    /// holds the jobs of one run at a time.
+    /// order. A pull from a remote calls it after the run of the last level,
+    /// so the heap holds the jobs of one run at a time.
     ///
     /// # Errors
     ///
@@ -265,9 +287,10 @@ impl DeltaPlan {
     /// Returns the check that discovery made of the signatures of `commit`.
     ///
     /// For a checked commit, the result holds the verified `.commitmeta` from
-    /// the record file, or `None` if no repository holds one. The result is
-    /// valid for a plan from a remote alone: a record from a local source
-    /// keeps no bytes.
+    /// the record file, or `None` if no repository holds one. A record from a
+    /// local source keeps no bytes, so for a plan from a local source the
+    /// result holds `None` and states only whether discovery checked the
+    /// commit. The call then reads nothing.
     ///
     /// # Errors
     ///
@@ -992,7 +1015,9 @@ async fn check_intermediate(
                     Err(Error::ObjectNotFound { .. }) => {
                         let sources: Vec<&Repo> = localcache.iter().collect();
                         (
-                            detached_bytes_from(&sources, commit).await?,
+                            detached_bytes_from(&sources, commit)
+                                .await?
+                                .map(|(_, bytes)| bytes),
                             LocalRead::Absent,
                         )
                     }

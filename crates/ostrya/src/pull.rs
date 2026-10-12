@@ -637,8 +637,9 @@ pub struct PullOptions {
     /// option. Delta discovery takes the commit of that ref as the source of a
     /// delta, and [`TimestampCheck::CurrentRef`] compares against it. A local
     /// pull reads that ref only for delta discovery, under
-    /// [`require_static_deltas`](PullOptions::require_static_deltas). Under
-    /// this option, a [`MIRROR`](PullFlags::MIRROR) pull of each ref copies no
+    /// [`require_static_deltas`](PullOptions::require_static_deltas) or with a
+    /// list of [`static_deltas`](PullOptions::static_deltas). Under this
+    /// option, a [`MIRROR`](PullFlags::MIRROR) pull of each ref copies no
     /// `summary` and no `summary.sig`.
     ///
     /// If a pulled commit has detached metadata, the pull takes the update
@@ -776,8 +777,10 @@ pub struct PullOptions {
     /// This option wins over
     /// [`require_static_deltas`](PullOptions::require_static_deltas): a pull
     /// that asks for no delta looks for none, so it finds nothing to require. A
-    /// local pull reads no delta unless it requires one, so the field changes
-    /// nothing there. [`Repo::pull`] states the static delta rules of a pull.
+    /// local pull reads a delta only if it requires one or applies a list of
+    /// [`static_deltas`](PullOptions::static_deltas). So with this option, a
+    /// local pull reads no delta. [`Repo::pull`] states the static delta rules
+    /// of a pull.
     ///
     /// A pull refuses this option together with
     /// [`static_deltas`](PullOptions::static_deltas).
@@ -799,15 +802,15 @@ pub struct PullOptions {
     /// complete, so a pull with nothing to fetch is not refused.
     ///
     /// With a list in [`static_deltas`](PullOptions::static_deltas), a pull
-    /// from a remote needs no summary. It fails with [`Error::Pull`] for a
-    /// target commit that no chain of the list reaches. A listed delta from
-    /// scratch to the target that the rule above leaves alone counts as found:
-    /// the pull does not fail, and fetches that target loose.
+    /// needs no summary. It fails with [`Error::Pull`] for a target commit
+    /// that no chain of the list reaches. A listed delta from scratch to the
+    /// target that the rule above leaves alone counts as found: the pull does
+    /// not fail, and fetches that target loose.
     ///
     /// A local pull reads a delta from the source directory only under this
-    /// option. [`Repo::pull_local`] states the static delta rules of a local
-    /// pull. The fetch counters of [`PullStats`] count the files that the
-    /// local pull reads.
+    /// option or with a list. [`Repo::pull_local`] states the static delta
+    /// rules of a local pull. The fetch counters of [`PullStats`] count the
+    /// files that the local pull reads.
     ///
     /// A local pull reads the summary of the source and its signature under
     /// the size cap of a summary, 64 MiB. It refuses a file of the source that
@@ -832,13 +835,11 @@ pub struct PullOptions {
     ///   is not empty. [`Repo::pull_local`] refuses subpaths with
     ///   [`Error::Unsupported`] before this check.
     ///
-    /// A pull from a remote, [`Repo::pull`] or [`Repo::pull_with_session`],
-    /// applies the chain with the fewest steps to each target commit, by the
-    /// rules of [`Repo::pull`] under `# Static deltas`. A
-    /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull ignores the list. A local
-    /// pull does not apply a list yet: after all checks of its options, a
-    /// local pull with a list, an empty list included, fails with
-    /// [`Error::Unsupported`] before it reads `src`.
+    /// Each pull applies the chain with the fewest steps to each target
+    /// commit, by the rules of [`Repo::pull`] under `# Static deltas`.
+    /// [`Repo::pull_local`] states the rules of a local pull under the same
+    /// heading. A [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull ignores the
+    /// list.
     ///
     /// [`Summary::static_deltas`]: crate::Summary::static_deltas
     pub static_deltas: Option<Vec<AdvertisedDelta>>,
@@ -906,9 +907,10 @@ pub struct PullStats {
     /// delta superblock, whatever the remote answered.
     ///
     /// A local pull that
-    /// [requires static deltas](PullOptions::require_static_deltas) counts the
-    /// same files when it reads them from the source. Each other local pull
-    /// counts zero.
+    /// [requires static deltas](PullOptions::require_static_deltas), or that
+    /// applies a list of [`static_deltas`](PullOptions::static_deltas), counts
+    /// the same files when it reads them from the source. Each other local
+    /// pull counts zero.
     pub metadata_fetched: u32,
     /// The number of content objects that a pull fetched loose from the
     /// remote.
@@ -926,9 +928,9 @@ pub struct PullStats {
     ///
     /// The count starts after the summary, the config, and the ref files of
     /// the remote, and it includes retried bodies. A local pull that requires
-    /// static deltas counts the stored size of each file that the other fetch
-    /// counters count, and of each part file. Each other local pull counts
-    /// zero.
+    /// static deltas, or that applies a list of static deltas, counts the
+    /// stored size of each file that the other fetch counters count, and of
+    /// each part file. Each other local pull counts zero.
     ///
     /// A pull over ssh counts the payload bytes of each body that it reads.
     /// So the HTTP count and the ssh count agree for the same files.
@@ -1438,13 +1440,45 @@ impl Repo {
     /// at a time, and stages the commit from the superblock. The import then
     /// walks each commit and imports what no part produced.
     ///
+    /// [`static_deltas`](PullOptions::static_deltas) replaces this search with
+    /// a list. The pull then needs no summary for the deltas. For each target
+    /// commit, it plans the chain with the fewest steps, by the rules of
+    /// [`Repo::pull`] under `# Static deltas`. The pull reads the deltas of
+    /// a list only from a source in `archive` mode. A
+    /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull ignores the list.
+    ///
+    /// Before the transaction opens, the pull reads the superblock of each
+    /// step and compares its SHA-256 with the digest in the list. For each
+    /// intermediate commit, it also checks the signatures of the commit. The
+    /// walk of the commit chains does not check that commit again.
+    ///
+    /// The pull applies a chain one level at a time, in its one transaction.
+    /// The parts, the loose objects, and the tree walk of one level end before
+    /// the next level starts. The pull applies one step at a time, in each
+    /// level and in the run of the targets. Before it applies a step, it reads
+    /// the superblock of the step again from the source and compares it with
+    /// the digest in the list again. Each intermediate commit ends complete,
+    /// with no `.commitpartial` marker. The pull writes a ref for an
+    /// intermediate commit only if a requested ref names it.
+    ///
+    /// If the source does not hold a superblock of a chain when the pull reads
+    /// it before the transaction, the pull plans again without that delta. If
+    /// no chain reaches a target, the pull imports its objects loose, or fails
+    /// under `require_static_deltas`.
+    ///
+    /// The pull checks the signatures and the ref binding of a target commit
+    /// in the walk of the commit chains, after discovery and before the
+    /// transaction opens. So a target that the policy refuses costs the reads
+    /// of discovery, and the pull applies no part.
+    ///
     /// # Errors
     ///
     /// - [`Error::Unsupported`] if [`subpaths`](PullOptions::subpaths) is not
     ///   empty, or if [`collection_id`](PullOptions::collection_id) is set and
     ///   [`no_ref_writes`](PullOptions::no_ref_writes) is not set or
     ///   [`refs`](PullOptions::refs) is empty. The pull makes these checks
-    ///   before it reads `src`. Also if the pull requires static deltas and
+    ///   before it reads `src`. Also if the pull requires static deltas or
+    ///   applies a [`static_deltas`](PullOptions::static_deltas) list, and
     ///   `src` is not an `archive` repository.
     /// - [`Error::InvalidInput`] if [`depth`](PullOptions::depth) is below
     ///   `-1`, before the pull reads `src`.
@@ -1455,19 +1489,25 @@ impl Repo {
     ///   the pull reads `src`.
     /// - [`Error::InvalidRefspec`] if the collection id or a name is invalid,
     ///   or if a name holds `:`, before the pull reads `src`.
-    /// - [`Error::Unsupported`] if `static_deltas` is set and passes the
-    ///   checks above, before the pull reads `src`.
     /// - [`Error::Pull`] if the options ask for a signature verification and
     ///   name no [`remote`](PullOptions::remote).
     /// - [`Error::Pull`] if the pull requires static deltas and `src` has no
-    ///   summary, or no delta for a commit.
+    ///   summary, or no delta for a commit. With a `static_deltas` list, the
+    ///   pull needs no summary, and fails if no chain of the list reaches a
+    ///   target commit. A listed delta from scratch to the target that the
+    ///   rule of [`require_static_deltas`](PullOptions::require_static_deltas)
+    ///   leaves alone counts as found: the pull does not fail, and imports
+    ///   that target loose.
+    /// - [`Error::Pull`] if a superblock of the list produces another commit,
+    ///   or from another commit, than its entry of the list.
     /// - [`Error::Pull`] if the ref binding of a commit does not name its ref.
     /// - [`Error::Pull`] if an object fails the
     ///   [`BAREUSERONLY_FILES`](PullFlags::BAREUSERONLY_FILES) check or the
     ///   check of a `bare-user-only` destination.
     /// - [`Error::Signature`] if a commit or the summary fails the signature
-    ///   policy. Also if the policy covers the summary and `src` has no
-    ///   `summary` or no `summary.sig`.
+    ///   policy, an intermediate commit of a chain included. Also if the
+    ///   policy covers the summary and `src` has no `summary` or no
+    ///   `summary.sig`.
     /// - [`Error::RefNotFound`] if `src` does not hold a requested ref or
     ///   collection ref.
     /// - [`Error::ObjectNotFound`] if neither this repository nor a source
@@ -1475,7 +1515,8 @@ impl Repo {
     ///   this repository holds is a symlink that points to no file.
     /// - [`Error::ChecksumMismatch`] if an imported object does not hash to its
     ///   name, under [`UNTRUSTED`](PullFlags::UNTRUSTED) or on the re-ingest
-    ///   path. Also if a delta superblock does not match its advertised digest.
+    ///   path. Also if a delta superblock does not match its advertised digest
+    ///   or its digest in the list.
     /// - [`Error::InsufficientFreeSpace`] if an imported object needs more
     ///   space than the free-space budget of the transaction holds.
     /// - [`Error::LockTimeout`] if the wait for the repository lock or the
@@ -1484,8 +1525,9 @@ impl Repo {
     ///   parse.
     /// - [`Error::InvalidFormat`] if the `summary` or `summary.sig` of `src` is
     ///   larger than 64 MiB or is not a regular file. Also if a static delta of
-    ///   `src` is malformed. Also if a filter gets detached metadata that is
-    ///   not a dict of `{sv}` entries.
+    ///   `src` is malformed, or if `src` does not hold a superblock of a chain
+    ///   when the pull applies its step. Also if a filter gets detached
+    ///   metadata that is not a dict of `{sv}` entries.
     /// - [`Error::Io`] for an I/O failure of the file system. Also for a held
     ///   dirtree that the pull cannot read, that is not a regular file, or that
     ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
@@ -1500,7 +1542,6 @@ impl Repo {
         check_static_deltas(&opts)?;
         let collection_relpaths = check_local_collection(&opts)?;
         let edges = take_static_deltas(&mut opts).await?;
-        refuse_static_delta_list(edges.as_ref())?;
         // The pull builds the signature policy before it reads the source. So
         // a check that the options ask for with no remote to take keys from
         // fails here, before the walk of a chain.
@@ -1513,9 +1554,11 @@ impl Repo {
         .await?;
         let verification = verify::Verification::from_trust(trust);
         // A pull that requires static deltas reads the source as a fetch
-        // reads a remote: the summary, then the deltas that it advertises. Its
-        // counts are those of a fetch. These steps come before the walk of the
-        // commit chains, in the order of the refusals of the `ostree` command:
+        // reads a remote: the summary, then the deltas that it advertises. A
+        // pull with a list of static deltas reads the deltas of the list and
+        // needs no summary. The counts of both pulls are those of a fetch.
+        // These steps come before the walk of the commit chains, in the order
+        // of the refusals of the `ostree` command:
         //
         // - the summary verification.
         // - the refusal of a source with no summary or outside archive mode.
@@ -1525,7 +1568,11 @@ impl Repo {
         // the summary and its signature under the size cap of a summary. It
         // refuses a file there that is not a regular file.
         let fetching = opts.require_static_deltas && !opts.disable_static_deltas;
-        let summary = if verification.checks_summary() || fetching {
+        // A commit-only pull ignores the list.
+        let list_applies = edges.is_some() && !opts.flags.contains(PullFlags::COMMIT_ONLY);
+        let reads_deltas = fetching || list_applies;
+        let needs_summary = fetching && edges.is_none();
+        let summary = if verification.checks_summary() || needs_summary {
             delta::read_local(
                 src,
                 crate::summary::SUMMARY_FILE,
@@ -1546,20 +1593,20 @@ impl Repo {
                 .check_summary(summary.as_deref(), signature.as_deref())
                 .await?;
         }
+        if needs_summary && summary.is_none() {
+            return Err(delta::no_summary_error());
+        }
+        if reads_deltas && !src.mode().is_archive() {
+            return Err(Error::Unsupported(format!(
+                "can't pull from a repository in mode {}: a local pull that reads static \
+                 deltas reads an archive repository",
+                src.mode().as_mode_str()
+            )));
+        }
         // The pull drops the bytes here: discovery reads the parsed summary
         // alone.
         let summary = match summary {
-            Some(bytes) if fetching => {
-                if !src.mode().is_archive() {
-                    return Err(Error::Unsupported(format!(
-                        "can't pull from a repository in mode {}: a local pull that requires \
-                         static deltas reads an archive repository",
-                        src.mode().as_mode_str()
-                    )));
-                }
-                Some(crate::summary::Summary::parse(&bytes)?)
-            }
-            None if fetching => return Err(delta::no_summary_error()),
+            Some(bytes) if needs_summary => Some(crate::summary::Summary::parse(&bytes)?),
             _ => None,
         };
 
@@ -1568,27 +1615,30 @@ impl Repo {
         let verify_bindings = !flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS);
 
         // The pull finds the deltas before the transaction opens, so a refusal
-        // writes no object, no ref, and no marker.
+        // writes no object, no ref, and no marker. With a list, discovery also
+        // checks the signatures of each intermediate commit.
         let counters = PullCounters::new(None);
-        let deltas = match &summary {
-            Some(summary) => {
-                delta::discover(
-                    self,
-                    &delta::DeltaSource::Local(src),
-                    Some(summary),
-                    &targets,
-                    &opts,
-                    opts.remote.as_deref(),
-                    edges,
-                    &verification,
-                    &counters,
-                )
-                .await?
-            }
-            None => delta::DeltaPlan::default(),
+        let deltas = if summary.is_some() || edges.is_some() {
+            delta::discover(
+                self,
+                &delta::DeltaSource::Local(src),
+                summary.as_ref(),
+                &targets,
+                &opts,
+                opts.remote.as_deref(),
+                edges,
+                &verification,
+                &counters,
+            )
+            .await?
+        } else {
+            delta::DeltaPlan::default()
         };
         drop(summary);
         let mut deltas = deltas;
+        // The intermediate commits of the chains. The run of the levels
+        // imports each of them, and the commit loop skips them.
+        let done: HashSet<Checksum> = deltas.levels().iter().flatten().copied().collect();
 
         let sources: Vec<&Repo> = std::iter::once(src)
             .chain(opts.localcache_repos.iter())
@@ -1610,10 +1660,14 @@ impl Repo {
         // import needs one entry for each commit of the chain. A `depth=-1`
         // pull puts no bound on that count, so the pull reads the metadata
         // twice.
+        //
+        // Discovery checked each intermediate commit of a chain, so the walk
+        // does not check it again.
         let mut check = verification.checks_commits().then(|| ChainCheck {
             repo: self,
             sources: &sources,
             verification: &verification,
+            plan: &deltas,
             failed: None,
         });
 
@@ -1656,7 +1710,22 @@ impl Repo {
             // commit that this repository already holds complete: an unrelated
             // failure must not demote a complete commit. The plan of the tree
             // reads the same answer and plans nothing for a complete commit.
+            // The intermediate commits of the chains come first, with one
+            // batched check.
+            let level_commits: Vec<Checksum> = deltas.levels().iter().flatten().copied().collect();
+            let mut held_levels: HashSet<Checksum> = HashSet::new();
+            for (commit, held) in chain::check_complete(self, &level_commits).await? {
+                if held {
+                    held_levels.insert(commit);
+                } else {
+                    self.write_partial_marker(&commit).await?;
+                    marked.push(commit);
+                }
+            }
             for commit in &mut commits {
+                if done.contains(&commit.checksum) {
+                    continue;
+                }
                 commit.held = delta::complete_here(self, &commit.checksum).await?;
                 if !commit.held {
                     self.write_partial_marker(&commit.checksum).await?;
@@ -1664,61 +1733,128 @@ impl Repo {
                 }
             }
 
-            // Apply each delta whole, one part at a time, and then stage its
-            // commit from the superblock. The import then walks each commit and
-            // imports what no part produced.
             let checks = ModeChecks::new(flags, self.mode());
-            for (_, tip) in &targets {
-                let Some(job) = deltas.jobs.get(tip) else {
-                    continue;
-                };
-                if txn.is_staged(tip, ObjectType::Commit) {
-                    continue;
-                }
-                for index in 0..job.parts() {
-                    delta::apply_job_part(
-                        &txn,
-                        &delta::DeltaSource::Local(src),
-                        job,
-                        index,
-                        checks,
-                        &counters,
-                    )
-                    .await?;
-                }
-                txn.write_metadata(ObjectType::Commit, Some(tip), &job.commit_bytes)
-                    .await?;
-            }
-            // The pull is done with the jobs, the inline part bodies included.
-            drop(std::mem::take(&mut deltas));
-
+            let delta_source = delta::DeltaSource::Local(src);
+            // A fetch counts each object that the pull reads from the source.
+            let count = reads_deltas.then_some(&counters);
             let mut plan = PlanState::default();
             // The read buffer of an untrusted verification. The pull uses it
             // again for each object and sizes it on its first use, so a pull
             // that verifies nothing allocates nothing.
             let mut verify_buf: Vec<u8> = Vec::new();
+
+            // A part of a later step of a chain can patch against an object
+            // that an earlier step wrote. So the parts, the loose objects, and
+            // the walk of each level of intermediate commits end before the
+            // next level starts. The pull parses the job of one step at a
+            // time, and drops it after its parts.
+            for level in deltas.levels() {
+                let mut made: Vec<ChainCommit> = Vec::with_capacity(level.len());
+                for commit in level {
+                    let job = deltas
+                        .parse_record(self, &delta_source, commit)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::InvalidFormat(format!(
+                                "static delta to {commit}: the plan holds no step for the commit"
+                            ))
+                        })?;
+                    let held = held_levels.contains(commit);
+                    if !held {
+                        for index in 0..job.parts() {
+                            delta::apply_job_part(
+                                &txn,
+                                &delta_source,
+                                &job,
+                                index,
+                                checks,
+                                &counters,
+                            )
+                            .await?;
+                        }
+                        txn.write_metadata(ObjectType::Commit, Some(commit), &job.commit_bytes)
+                            .await?;
+                    }
+                    let parsed = Commit::parse(&job.commit_bytes)?;
+                    made.push(ChainCommit {
+                        checksum: *commit,
+                        root_dirtree: parsed.root_dirtree,
+                        root_dirmeta: parsed.root_dirmeta,
+                        held,
+                    });
+                }
+                // Discovery counted the `.commitmeta` of each intermediate
+                // commit.
+                for chain_commit in &made {
+                    self.import_planned(
+                        &txn,
+                        &sources,
+                        chain_commit,
+                        flags,
+                        &mut plan,
+                        &mut verify_buf,
+                        count,
+                    )
+                    .await?;
+                    self.import_detached_metadata(
+                        &txn,
+                        &sources,
+                        &chain_commit.checksum,
+                        &opts.detached_metadata_filter,
+                        None,
+                    )
+                    .await?;
+                }
+            }
+
+            // Apply each delta to a target whole, one part at a time, and then
+            // stage its commit from the superblock. The import then walks each
+            // commit and imports what no part produced. The pull takes or
+            // parses the job of one target at a time, and drops it after its
+            // parts. A target that a level made has its commit already.
+            for (_, tip) in &targets {
+                if done.contains(tip) || txn.is_staged(tip, ObjectType::Commit) {
+                    continue;
+                }
+                let job = match deltas.jobs.remove(tip) {
+                    Some(job) => job,
+                    None => match deltas.parse_record(self, &delta_source, tip).await? {
+                        Some(job) => job,
+                        None => continue,
+                    },
+                };
+                for index in 0..job.parts() {
+                    delta::apply_job_part(&txn, &delta_source, &job, index, checks, &counters)
+                        .await?;
+                }
+                txn.write_metadata(ObjectType::Commit, Some(tip), &job.commit_bytes)
+                    .await?;
+            }
+            // The pull is done with the deltas, the inline part bodies of the
+            // jobs that no target took included.
+            drop(std::mem::take(&mut deltas));
+
             for chain_commit in &commits {
                 let commit = &chain_commit.checksum;
-                for name in plan_commit(&txn, &sources, chain_commit, flags, &mut plan).await? {
-                    let imported = self
-                        .import_object(&txn, &sources, name, flags, &mut verify_buf)
-                        .await?;
-                    // A fetch counts an object read from the source. It does
-                    // not count an object from a localcache repository.
-                    if fetching && let Some((0, size)) = imported {
-                        count_fetched(&counters, name.ty, size);
-                    }
+                if done.contains(commit) {
+                    continue;
                 }
-                if fetching
-                    && let Some(size) = source_size(src, ObjectType::CommitMeta, commit).await?
-                {
-                    count_fetched(&counters, ObjectType::CommitMeta, size);
-                }
+                self.import_planned(
+                    &txn,
+                    &sources,
+                    chain_commit,
+                    flags,
+                    &mut plan,
+                    &mut verify_buf,
+                    count,
+                )
+                .await?;
                 self.import_detached_metadata(
                     &txn,
                     &sources,
                     commit,
                     &opts.detached_metadata_filter,
+                    count,
                 )
                 .await?;
             }
@@ -1757,6 +1893,37 @@ impl Repo {
             bytes_transferred: counters.bytes(),
             elapsed: started.elapsed(),
         })
+    }
+
+    /// Plans the objects of `commit` with [`plan_commit`] and imports each
+    /// one with [`import_object`](Repo::import_object).
+    ///
+    /// If `count` is set, the call counts each object that it read from the
+    /// source, the first of `sources`, as a fetch counts it. An object from a
+    /// localcache repository does not count. An object that a delta part
+    /// staged is not planned, so it does not count either.
+    #[allow(clippy::too_many_arguments)]
+    async fn import_planned(
+        &self,
+        txn: &Transaction,
+        sources: &[&Repo],
+        commit: &ChainCommit,
+        flags: PullFlags,
+        plan: &mut PlanState,
+        verify_buf: &mut Vec<u8>,
+        count: Option<&PullCounters>,
+    ) -> Result<()> {
+        for name in plan_commit(txn, sources, commit, flags, plan).await? {
+            let imported = self
+                .import_object(txn, sources, name, flags, verify_buf)
+                .await?;
+            if let Some(counters) = count
+                && let Some((0, size)) = imported
+            {
+                count_fetched(counters, name.ty, size);
+            }
+        }
+        Ok(())
     }
 
     /// Imports one object from the first source repository that holds it.
@@ -1895,16 +2062,28 @@ impl Repo {
     /// source unchanged. They get to `objects/` when `txn` commits. A source
     /// with no `.commitmeta`, and a filter that allows no property, each leave
     /// the copy of the destination unchanged.
+    ///
+    /// If `count` is set, the call counts the `.commitmeta` as a fetch counts
+    /// it when the bytes come from the source, the first of `sources`. The
+    /// count is the length of the bytes that the call read, before the
+    /// filter.
     async fn import_detached_metadata(
         &self,
         txn: &Transaction,
         sources: &[&Repo],
         commit: &Checksum,
         filter: &DetachedMetadataFilter,
+        count: Option<&PullCounters>,
     ) -> Result<()> {
-        if let Some(bytes) = detached_bytes_from(sources, commit).await?
-            && let Some(bytes) = filter.apply(commit, bytes)?
+        let Some((at, bytes)) = detached_bytes_from(sources, commit).await? else {
+            return Ok(());
+        };
+        if at == 0
+            && let Some(counters) = count
         {
+            count_fetched(counters, ObjectType::CommitMeta, bytes.len() as u64);
+        }
+        if let Some(bytes) = filter.apply(commit, bytes)? {
             txn.stage_commit_detached_bytes(commit, bytes).await?;
         }
         Ok(())
@@ -2154,6 +2333,9 @@ struct ChainCheck<'a> {
     /// The source and the localcache repositories, in the order of the reads.
     sources: &'a [&'a Repo],
     verification: &'a verify::Verification,
+    /// The deltas that discovery found. The check skips each commit whose
+    /// signatures discovery checked.
+    plan: &'a delta::DeltaPlan,
     /// The first check that failed.
     ///
     /// The commits after it get no check, and the walk continues, so the pull
@@ -2173,13 +2355,20 @@ impl ChainCheck<'_> {
     }
 
     /// Checks `commit`, whose object holds `bytes`, against the commit policy.
+    ///
+    /// A commit that discovery checked passes with no read.
     async fn check_one(&self, commit: &Checksum, bytes: &[u8]) -> Result<()> {
+        if let delta::CommitCheck::Checked(_) = self.plan.commit_check(commit).await? {
+            return Ok(());
+        }
         // The verification reads the detached metadata as the source holds
         // it. That is the `.commitmeta` of the first source that holds one,
         // else that of this repository. A filter makes the stored metadata
         // smaller, so a later verification of the stored commit reads what the
         // filter kept.
-        let detached = detached_bytes_from(self.sources, commit).await?;
+        let detached = detached_bytes_from(self.sources, commit)
+            .await?
+            .map(|(_, bytes)| bytes);
         check_commit_signatures(
             self.repo,
             self.verification,
@@ -2395,16 +2584,21 @@ async fn try_load_commit(repo: &Repo, checksum: &Checksum) -> Result<Option<(Vec
 /// Reads the `.commitmeta` bytes of a commit from the first source that holds
 /// that object, or returns `None` if no source holds one.
 ///
+/// The result holds the position of that source in `sources` and the bytes.
+///
 /// This function alone selects the detached metadata of a local pull. The
 /// signature verification reads these bytes, and
 /// [`Repo::import_detached_metadata`] writes them, so the verified metadata
 /// and the stored metadata agree. A
 /// zero-length file counts as a source that holds one. It is the "no metadata"
 /// marker, and it replaces the copy of the destination.
-async fn detached_bytes_from(sources: &[&Repo], commit: &Checksum) -> Result<Option<Vec<u8>>> {
-    for src in sources {
+async fn detached_bytes_from(
+    sources: &[&Repo],
+    commit: &Checksum,
+) -> Result<Option<(usize, Vec<u8>)>> {
+    for (at, src) in sources.iter().enumerate() {
         match src.load_object_bytes(ObjectType::CommitMeta, commit).await {
-            Ok(bytes) => return Ok(Some(bytes)),
+            Ok(bytes) => return Ok(Some((at, bytes))),
             Err(Error::ObjectNotFound { .. }) => continue,
             Err(e) => return Err(e),
         }
@@ -2536,18 +2730,6 @@ async fn take_static_deltas(opts: &mut PullOptions) -> Result<Option<chain::Edge
     ostrya_rt::unblock(move || chain::Edges::new(list))
         .await
         .map(Some)
-}
-
-/// Refuses a local pull with a list of static deltas, because a local pull
-/// does not apply a list yet. `edges` is the index that
-/// [`take_static_deltas`] gives.
-fn refuse_static_delta_list(edges: Option<&chain::Edges>) -> Result<()> {
-    if edges.is_some() {
-        return Err(Error::Unsupported(
-            "a pull does not apply a static_deltas list".into(),
-        ));
-    }
-    Ok(())
 }
 
 /// Checks that the `ostree.ref-binding` of a commit names the ref that the pull

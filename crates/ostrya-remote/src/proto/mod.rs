@@ -157,6 +157,8 @@
 //! the marker, an object of the push takes `Abort`, and a body of the pull
 //! takes an `Error` message.
 //!
+//! [`MAX_REF_LISTING`] is the size cap of a ref listing.
+//!
 //! # Codec
 //!
 //! [`FrameReader`] and [`FrameWriter`] implement the frames, the object
@@ -229,6 +231,13 @@ pub const MIN_FRAME_LIMIT: u32 = 1 << 20;
 /// The decoder checks a dict value under an unknown key through a value tree,
 /// and then drops the tree. The peak grows in proportion to the limit.
 pub const MAX_FRAME: u32 = 1 << 20;
+
+/// The largest ref listing: 128 MiB.
+///
+/// A ref listing is a summary of the refs under a set of prefixes, which a
+/// server builds for each request. The builder refuses a larger listing with
+/// [`Error::LimitExceeded`].
+pub const MAX_REF_LISTING: u64 = 128 * 1024 * 1024;
 
 /// The `max-have` value that an ostrya server announces: 16,384 entries.
 ///

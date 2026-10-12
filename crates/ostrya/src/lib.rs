@@ -166,6 +166,7 @@ pub use ostrya_core::{
     TextError, Type, Value, Xattrs, from_bytes, from_text, is_checksum_shaped, loose_path, to_text,
     to_text_unannotated,
 };
+pub use ostrya_remote::proto::MAX_REF_LISTING;
 #[doc(hidden)]
 pub use prune::{PruneOptions, PruneStats, WeakRefFilter, WeakRefFilterFn};
 #[doc(hidden)]

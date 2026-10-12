@@ -13,7 +13,7 @@
 //!   gives the ref file format and the durability rules.
 //! - [`Transaction::set_ref`] queues a ref write for the transaction commit.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
@@ -458,9 +458,42 @@ impl Repo {
         let repo = self.clone();
         let mut refs = ostrya_rt::unblock(move || collect_heads(&repo)).await?;
         if let Some(prefix) = prefix {
-            let nested = format!("{prefix}/");
-            refs.retain(|(name, _)| name == prefix || name.starts_with(&nested));
+            refs.retain(|(name, _)| ref_prefixes(name).any(|part| part == prefix));
         }
+        refs.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(refs)
+    }
+
+    /// Returns the local refs that `prefixes` select, as `(name, commit)`
+    /// pairs sorted by name, each ref one time.
+    ///
+    /// Each prefix selects the refs that [`list_refs`](Repo::list_refs) gives
+    /// for it, and the result is the union of these sets. An empty slice
+    /// selects each ref under `refs/heads`. The call drops each prefix that a
+    /// shorter prefix of the slice selects, and reads only the subtree of each
+    /// other prefix, so its cost follows the number of selected refs.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRefspec`] if a prefix is not a valid ref name. The
+    ///   check comes before each read.
+    /// - The errors of [`list_refs`](Repo::list_refs), for a selected ref.
+    pub(crate) async fn list_refs_under(
+        &self,
+        prefixes: &[&str],
+    ) -> Result<Vec<(String, Checksum)>> {
+        for prefix in prefixes {
+            check_ref_path(prefix)?;
+        }
+        if prefixes.is_empty() {
+            return self.list_refs(None).await;
+        }
+        let prefixes: Vec<String> = uncovered_prefixes(prefixes)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let repo = self.clone();
+        let mut refs = ostrya_rt::unblock(move || collect_heads_under(&repo, &prefixes)).await?;
         refs.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(refs)
     }
@@ -911,13 +944,33 @@ fn collect_heads(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    walk_ref_dir(heads.as_fd(), "", &mut |entry| {
-        if let Some(bytes) = read_ref_file(entry.dir, entry.name)? {
-            out.push((entry.path.to_owned(), parse_ref_content(&bytes)?));
-        }
-        Ok(())
-    })?;
+    walk_ref_dir(heads.as_fd(), "", &mut |entry| push_head(&mut out, &entry))?;
     Ok(out)
+}
+
+/// Collects each ref under `refs/heads` that one of `prefixes` selects. No
+/// prefix of `prefixes` selects another, so no ref is collected two times.
+fn collect_heads_under(repo: &Repo, prefixes: &[String]) -> Result<Vec<(String, Checksum)>> {
+    let Some(heads) = open_refs_dir(repo, "refs/heads")? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for prefix in prefixes {
+        walk_ref_prefix(heads.as_fd(), prefix, &mut |entry| {
+            push_head(&mut out, &entry)
+        })?;
+    }
+    Ok(out)
+}
+
+/// Reads the ref entry `entry` of a walk of `refs/heads` and adds it to
+/// `out`. An alias resolves to the commit of its target, and a dangling alias
+/// adds nothing.
+fn push_head(out: &mut Vec<(String, Checksum)>, entry: &RefEntry<'_>) -> Result<()> {
+    if let Some(bytes) = read_ref_file(entry.dir, entry.name)? {
+        out.push((entry.path.to_owned(), parse_ref_content(&bytes)?));
+    }
+    Ok(())
 }
 
 /// Collects each ref under `refs/remotes`, named by its `remote:name`
@@ -1041,25 +1094,18 @@ pub(crate) fn walk_ref_dir(
     visit: &mut impl FnMut(RefEntry<'_>) -> Result<()>,
 ) -> Result<()> {
     for name in read_dir_names(dir)? {
-        let stat = match rustix::fs::statat(dir, name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) => stat,
-            Err(Errno::NOENT) => continue, // removed between readdir and stat
-            Err(e) => return Err(Error::Io(e.into())),
+        // A name removed between the directory read and the classification
+        // has no type.
+        let Some(file_type) = ref_entry_type(dir, &name)? else {
+            continue;
         };
         let path = if prefix.is_empty() {
             name.clone()
         } else {
             format!("{prefix}/{name}")
         };
-        let file_type = FileType::from_raw_mode(stat.st_mode);
         if file_type == FileType::Directory {
-            let sub = rustix::fs::openat(
-                dir,
-                name.as_str(),
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|e| Error::Io(e.into()))?;
+            let sub = open_ref_subdir(dir, &name)?;
             walk_ref_dir(sub.as_fd(), &path, visit)?;
         } else {
             visit(RefEntry {
@@ -1071,6 +1117,77 @@ pub(crate) fn walk_ref_dir(
         }
     }
     Ok(())
+}
+
+/// Walks the part of a ref tree that the ref name `prefix` selects by the
+/// rule of [`ref_prefixes`]. `visit` gets each entry that [`walk_ref_dir`]
+/// gives from `top` with a path that `prefix` selects, and no other entry.
+///
+/// The call goes down `prefix` one path part at a time, and classifies each
+/// part with `SYMLINK_NOFOLLOW`, as `walk_ref_dir` does:
+///
+/// - Each part before the last part must be a real directory. If such a part
+///   is missing, or is a file, a symlink, or another entry that is not a
+///   directory, the prefix selects nothing. `walk_ref_dir` does not descend
+///   into such an entry, so it reports no path below it.
+/// - If the last part is missing, the prefix selects nothing.
+/// - If the last part is a real directory, the call walks it with
+///   `walk_ref_dir`.
+/// - Each other last part goes to `visit` as one entry, as `walk_ref_dir`
+///   reports it. A symlink that names a directory is such an entry.
+fn walk_ref_prefix(
+    top: BorrowedFd<'_>,
+    prefix: &str,
+    visit: &mut impl FnMut(RefEntry<'_>) -> Result<()>,
+) -> Result<()> {
+    let (parents, last) = match prefix.rsplit_once('/') {
+        Some((parents, last)) => (Some(parents), last),
+        None => (None, prefix),
+    };
+    let mut parent: Option<OwnedFd> = None;
+    for part in parents.into_iter().flat_map(|parents| parents.split('/')) {
+        let dir = parent.as_ref().map_or(top, AsFd::as_fd);
+        if ref_entry_type(dir, part)? != Some(FileType::Directory) {
+            return Ok(());
+        }
+        let sub = open_ref_subdir(dir, part)?;
+        parent = Some(sub);
+    }
+    let dir = parent.as_ref().map_or(top, AsFd::as_fd);
+    match ref_entry_type(dir, last)? {
+        None => Ok(()),
+        Some(FileType::Directory) => {
+            let sub = open_ref_subdir(dir, last)?;
+            walk_ref_dir(sub.as_fd(), prefix, visit)
+        }
+        Some(file_type) => visit(RefEntry {
+            dir,
+            name: last,
+            path: prefix,
+            file_type,
+        }),
+    }
+}
+
+/// Returns the type of the entry `name` of `dir`, read with no symlink
+/// followed, or `None` if the entry does not exist.
+fn ref_entry_type(dir: BorrowedFd<'_>, name: &str) -> Result<Option<FileType>> {
+    match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(Some(FileType::from_raw_mode(stat.st_mode))),
+        Err(Errno::NOENT) => Ok(None),
+        Err(e) => Err(Error::Io(e.into())),
+    }
+}
+
+/// Opens the subdirectory `name` of `dir` in a ref-tree walk.
+fn open_ref_subdir(dir: BorrowedFd<'_>, name: &str) -> Result<OwnedFd> {
+    rustix::fs::openat(
+        dir,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| Error::Io(e.into()))
 }
 
 /// Returns the symlink target of an alias entry, as stored. Returns `None`
@@ -1100,7 +1217,9 @@ fn read_ref_file(
         Err(Errno::NOENT) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let mut buf = Vec::new();
+    // The buffer holds the whole cap before the read, so a ref file takes
+    // one read and the read that finds its end.
+    let mut buf = Vec::with_capacity(REF_READ_CAP as usize);
     std::fs::File::from(fd)
         .take(REF_READ_CAP)
         .read_to_end(&mut buf)?;
@@ -1134,7 +1253,7 @@ fn ref_file_state(dir: BorrowedFd<'_>, relpath: &str) -> Result<RefFileState> {
         Err(Errno::LOOP) => return Ok(RefFileState::Alias),
         Err(e) => return Err(e.into()),
     };
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(REF_READ_CAP as usize);
     std::fs::File::from(fd)
         .take(REF_READ_CAP)
         .read_to_end(&mut buf)?;
@@ -1228,6 +1347,32 @@ pub(crate) fn check_ref_path(name: &str) -> Result<()> {
     } else {
         Err(Error::InvalidRefspec(name.to_owned()))
     }
+}
+
+/// Returns each prefix that selects the ref `name`: each leading part of
+/// `name` that ends before a `/`, and then `name` itself.
+///
+/// The prefix `a/b` selects the ref `a/b` and each ref below `a/b/`. It does
+/// not select `a/bc`. [`Repo::list_refs`] and
+/// [`Repo::build_ref_listing`] apply this rule.
+pub(crate) fn ref_prefixes(name: &str) -> impl Iterator<Item = &str> {
+    name.match_indices('/')
+        .map(|(end, _)| &name[..end])
+        .chain(std::iter::once(name))
+}
+
+/// Returns the prefixes of `prefixes` that no other prefix of the slice
+/// selects by the rule of [`ref_prefixes`], sorted, each one time.
+///
+/// The prefix `a` selects `a/c`, so `["a", "a/c"]` gives `["a"]`. It does not
+/// select `ab`. Each ref that the slice selects is below exactly one prefix
+/// of the result.
+fn uncovered_prefixes<'a>(prefixes: &[&'a str]) -> Vec<&'a str> {
+    let all: BTreeSet<&str> = prefixes.iter().copied().collect();
+    all.iter()
+        .copied()
+        .filter(|prefix| ref_prefixes(prefix).find(|part| all.contains(part)) == Some(*prefix))
+        .collect()
 }
 
 // A ref name can contain `/`. It has no empty, `.`, or `..` component, and
@@ -1708,6 +1853,17 @@ mod tests {
         }
         assert!(validate_refspec("test/main").is_ok());
         assert!(validate_refspec("origin:test/main").is_ok());
+    }
+
+    /// A prefix that a shorter prefix selects is dropped, and a duplicate
+    /// is kept one time. The prefix `a` does not select `ab`.
+    #[test]
+    fn a_covered_prefix_is_dropped() {
+        assert_eq!(
+            uncovered_prefixes(&["a/c", "ab", "a", "x/y", "a/c/d", "ab", "x/yz"]),
+            ["a", "ab", "x/y", "x/yz"]
+        );
+        assert_eq!(uncovered_prefixes(&["b/c", "b/c"]), ["b/c"]);
     }
 
     #[test]

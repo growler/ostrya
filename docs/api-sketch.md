@@ -482,7 +482,38 @@ impl Repo {
     /// lock, a caller that holds one itself included. A caller value the dict cannot hold is refused before
     /// any lock.
     pub async fn regenerate_summary(&self, opts: &SummaryOptions) -> Result<()>;
+    /// A ref listing for one request: a `(a(s(taya{sv}))a{sv})` summary of
+    /// the refs under `refs/heads` that `prefixes` select. The prefix `a/b`
+    /// selects `a/b` and each ref below `a/b/`, and not `a/bc`, as
+    /// `list_refs` with a prefix does. An empty slice selects each ref. The
+    /// refs are sorted byte-wise, each one time. An alias is listed under its
+    /// own name with the commit of its target. No mirror ref is listed, and
+    /// each entry has the bytes of the entry of the same ref in a summary of
+    /// the same repository state. A prefix that a shorter prefix selects is
+    /// dropped, and the call reads only the subtree of `refs/heads` under
+    /// each other prefix and each distinct commit one time, so its cost
+    /// follows the number of selected refs. The global metadata holds
+    /// `ostree.summary.mode`, then `ostree.static-deltas` if a delta is
+    /// found, then `ostree.summary.collection-id` if `[core] collection-id`
+    /// is set, with the encodings of the summary. The deltas come from
+    /// `delta-indexes/` alone: the index of each listed commit, then the
+    /// index of each source commit an index names, until no new commit
+    /// appears. A prefix that is not a ref name is InvalidRefspec before any
+    /// read. A listing over `MAX_REF_LISTING` is
+    /// `Error::Remote(LimitExceeded)`, never cut short. The call refuses it
+    /// at the first lower bound of its size over the cap: from the ref
+    /// names, then the number of deltas, then the serialized metadata (all
+    /// before a commit is read), then the commit versions, then the bytes
+    /// written. The call writes nothing and takes no lock. A bad selected
+    /// ref, a missing commit, or a bad index fails the whole listing. A ref
+    /// that no prefix selects is not read. One state of the repository
+    /// gives the same bytes.
+    pub async fn build_ref_listing(&self, prefixes: &[&str]) -> Result<Vec<u8>>;
 }
+
+/// The cap of a ref listing: 128 MiB. `ostrya_remote::proto::MAX_REF_LISTING`,
+/// also at `ostrya::MAX_REF_LISTING`.
+pub const MAX_REF_LISTING: u64 = 128 * 1024 * 1024;
 
 /// Held by one caller at a time, across processes and inside the process.
 /// `Send + Sync`. While you hold it, write through it: the receive commit and
@@ -2609,7 +2640,8 @@ pub struct PullStats {
 }
 
 /// The read side of a `summary` file: the ref list a pull resolves against, and
-/// the global metadata dict verbatim.
+/// the global metadata dict verbatim. `parse` and `static_deltas` also read a
+/// ref listing of `Repo::build_ref_listing`.
 pub struct Summary { pub refs: Vec<SummaryRef>, pub metadata: Value }
 /// One field-0 entry: a ref, the commit it names, and what the summary records
 /// about that commit. `commit_size` is stored in host order; the numbers in

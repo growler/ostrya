@@ -765,3 +765,312 @@ fn a_refusal_comes_before_the_locks() {
         guard.finish().await.unwrap();
     });
 }
+
+/// Returns the names of the refs that a ref listing holds, in stored order.
+fn listed_names(listing: &[u8]) -> Vec<String> {
+    Summary::parse(listing)
+        .unwrap()
+        .refs
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect()
+}
+
+/// Asserts that `bytes` are in normal form, so two equal values in such
+/// bytes have equal bytes.
+fn assert_normal_form(bytes: &[u8]) {
+    let ty = ostrya::Type::parse("(a(s(taya{sv}))a{sv})").unwrap();
+    let value = ostrya::from_bytes(&ty, bytes).unwrap();
+    assert_eq!(ostrya_core::to_bytes(&ty, &value).unwrap(), bytes);
+}
+
+/// Adds the refs `a/b`, `a/bc`, `a/c/d`, `ab`, `x/y`, and the alias `x/al` of
+/// `a/b` to the `summary` fixture. Returns the commits of `main` and `other`.
+async fn add_prefix_refs(repo: &Repo) -> (Checksum, Checksum) {
+    let refs = repo.list_refs(None).await.unwrap();
+    let (main, other) = (refs[0].1, refs[1].1);
+    assert_eq!((refs[0].0.as_str(), refs[1].0.as_str()), ("main", "other"));
+    for (name, commit) in [
+        ("a/b", main),
+        ("a/bc", main),
+        ("a/c/d", other),
+        ("ab", other),
+        ("x/y", other),
+    ] {
+        repo.set_ref_immediate(name, Some(&commit)).await.unwrap();
+    }
+    repo.set_ref_alias_immediate("x/al", "a/b").await.unwrap();
+    (main, other)
+}
+
+/// Returns the names that `list_refs` gives for each prefix of `prefixes`,
+/// merged, sorted, and each one time. An empty slice gives each ref.
+async fn merged_list_refs(repo: &Repo, prefixes: &[&str]) -> Vec<String> {
+    let mut union: Vec<String> = Vec::new();
+    if prefixes.is_empty() {
+        let refs = repo.list_refs(None).await.unwrap();
+        union.extend(refs.into_iter().map(|(name, _)| name));
+    }
+    for prefix in prefixes {
+        let refs = repo.list_refs(Some(prefix)).await.unwrap();
+        union.extend(refs.into_iter().map(|(name, _)| name));
+    }
+    union.sort();
+    union.dedup();
+    union
+}
+
+/// A prefix selects the ref of its name and the refs below it. The prefix
+/// `a` does not select `ab`. Each set of prefixes lists the sorted union of
+/// the `list_refs` results of its prefixes, each ref one time. An empty set
+/// lists every ref.
+///
+/// The cases cover a prefix that is a ref file, a directory, an alias, a
+/// dangling alias, or missing, and a prefix below a ref file, below an alias,
+/// and below a missing directory. A prefix below a symlink to a directory
+/// selects nothing, because a walk of the refs does not descend into a
+/// symlink.
+#[test]
+fn a_ref_listing_selects_refs_by_prefix() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-prefixes");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let (main, _) = add_prefix_refs(&repo).await;
+        let heads = repo_dir.join("refs/heads");
+        std::os::unix::fs::symlink("absent", heads.join("x/dangling")).unwrap();
+        let all = merged_list_refs(&repo, &[]).await;
+        let cases: [(&[&str], Vec<&str>); 13] = [
+            (&["a/b"], vec!["a/b"]),
+            (&["main"], vec!["main"]),
+            (&["a"], vec!["a/b", "a/bc", "a/c/d"]),
+            (&["ab"], vec!["ab"]),
+            (&["a", "ab"], vec!["a/b", "a/bc", "a/c/d", "ab"]),
+            (&["a/c"], vec!["a/c/d"]),
+            (&["a", "a/c"], vec!["a/b", "a/bc", "a/c/d"]),
+            (
+                &["a/c/d", "a", "a/b", "a/c/d"],
+                vec!["a/b", "a/bc", "a/c/d"],
+            ),
+            (&["x", "main"], vec!["main", "x/al", "x/y"]),
+            (&["x/al"], vec!["x/al"]),
+            (&["x/dangling"], vec![]),
+            (&[], all.iter().map(String::as_str).collect()),
+            (&["absent", "a/b/c", "main/x", "x/al/q", "absent/q"], vec![]),
+        ];
+        for (prefixes, want) in cases {
+            let listing = repo.build_ref_listing(prefixes).await.unwrap();
+            let names = listed_names(&listing);
+            assert_eq!(names, want, "{prefixes:?}");
+            assert_eq!(
+                names,
+                merged_list_refs(&repo, prefixes).await,
+                "{prefixes:?}"
+            );
+        }
+
+        // The alias is listed under its own name, with the commit of its
+        // target.
+        let listing = repo.build_ref_listing(&["x/al"]).await.unwrap();
+        assert_eq!(Summary::parse(&listing).unwrap().lookup("x/al"), Some(main));
+
+        // A walk reports a symlink to a directory as one entry. A listing
+        // that selects it reads it as a ref and fails, as `list_refs` does. A
+        // prefix below it selects nothing.
+        std::os::unix::fs::symlink("a", heads.join("ln")).unwrap();
+        assert!(matches!(
+            repo.list_refs(Some("ln")).await,
+            Err(ostrya::Error::Io(_))
+        ));
+        for prefixes in [&["ln"][..], &["a", "ln"][..], &[][..]] {
+            let outcome = repo.build_ref_listing(prefixes).await;
+            assert!(
+                matches!(outcome, Err(ostrya::Error::Io(_))),
+                "{prefixes:?}: {outcome:?}"
+            );
+        }
+        let listing = repo
+            .build_ref_listing(&["ln/b", "ln/c", "a/c"])
+            .await
+            .unwrap();
+        assert_eq!(listed_names(&listing), ["a/c/d"]);
+    });
+}
+
+/// Each entry of a listing has the bytes of the entry of the same ref in the
+/// summary. The listing is in normal form, so equal values are equal bytes.
+#[test]
+fn a_ref_listing_entry_has_the_bytes_of_the_summary_entry() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-entries");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        add_prefix_refs(&repo).await;
+        let summary = regenerate_with(&repo, Vec::new()).await;
+        for prefixes in [&[][..], &["a"][..], &["x", "other"][..]] {
+            let listing = repo.build_ref_listing(prefixes).await.unwrap();
+            assert_normal_form(&listing);
+            let parsed = Summary::parse(&listing).unwrap();
+            assert!(!parsed.refs.is_empty(), "{prefixes:?}");
+            for entry in &parsed.refs {
+                let stored = summary
+                    .refs
+                    .iter()
+                    .find(|stored| stored.name == entry.name)
+                    .expect("the summary lists each listed ref");
+                assert_eq!(entry, stored);
+            }
+        }
+    });
+}
+
+/// The metadata of a listing holds the mode and, after an index pass, the
+/// deltas that the index files advertise on the paths back from the listed
+/// commits. A prefix that leaves a ref out leaves its deltas out. Two builds
+/// of one state give the same bytes.
+#[test]
+fn a_ref_listing_advertises_the_indexed_deltas_of_its_commits() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-deltas");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let listing = repo.build_ref_listing(&[]).await.unwrap();
+        let parsed = Summary::parse(&listing).unwrap();
+        assert_eq!(metadata_keys(&parsed), ["ostree.summary.mode"]);
+        assert_eq!(
+            parsed.metadata_value("ostree.summary.mode"),
+            Some(&Value::Str("archive-z2".into()))
+        );
+
+        let refs = repo.list_refs(None).await.unwrap();
+        let (main, other) = (refs[0].1, refs[1].1);
+        let opts = DeltaOptions {
+            timestamp: Some(FIXED_EPOCH),
+            ..DeltaOptions::default()
+        };
+        for (from, to) in [(None, &main), (Some(&other), &main), (None, &other)] {
+            repo.generate_static_delta(from, to, &opts).await.unwrap();
+        }
+        // The deltas have no index file yet, so the listing names none.
+        let listing = repo.build_ref_listing(&[]).await.unwrap();
+        assert_eq!(
+            metadata_keys(&Summary::parse(&listing).unwrap()),
+            ["ostree.summary.mode"]
+        );
+
+        repo.reindex_static_deltas().await.unwrap();
+        let summary = regenerate_with(&repo, Vec::new()).await;
+        let listing = repo.build_ref_listing(&[]).await.unwrap();
+        assert_eq!(listing, repo.build_ref_listing(&[]).await.unwrap());
+        assert_normal_form(&listing);
+        let parsed = Summary::parse(&listing).unwrap();
+        assert_eq!(
+            metadata_keys(&parsed),
+            ["ostree.summary.mode", "ostree.static-deltas"]
+        );
+        // The map has the value of the summary map, so the same bytes.
+        assert_eq!(
+            parsed.metadata_value("ostree.static-deltas"),
+            summary.metadata_value("ostree.static-deltas")
+        );
+        assert_eq!(parsed.static_deltas().unwrap().len(), 3);
+
+        // `main` reaches the delta to `other` through its delta from `other`.
+        let listing = repo.build_ref_listing(&["main"]).await.unwrap();
+        assert_eq!(
+            Summary::parse(&listing).unwrap().static_deltas().unwrap(),
+            summary.static_deltas().unwrap()
+        );
+
+        // `other` reaches its own delta alone.
+        let listing = repo.build_ref_listing(&["other"]).await.unwrap();
+        let deltas = Summary::parse(&listing).unwrap().static_deltas().unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!((deltas[0].from, deltas[0].to), (None, other));
+
+        // No listed commit gives no delta map.
+        let listing = repo.build_ref_listing(&["absent"]).await.unwrap();
+        assert_eq!(
+            metadata_keys(&Summary::parse(&listing).unwrap()),
+            ["ostree.summary.mode"]
+        );
+    });
+}
+
+/// A repository with a collection id names it in the listing metadata after
+/// the mode. The listing holds no mirror ref and no collection map. The build
+/// takes no lock, so a held guard does not delay it.
+#[test]
+fn a_ref_listing_names_the_collection_and_no_mirror_ref() {
+    let (_tmp, repo_dir) = collection_fixture_with_no_wait("listing-collection");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let (_, commit) = repo.list_refs(None).await.unwrap()[0].clone();
+        repo.set_collection_ref_immediate(
+            &ostrya::CollectionRef::new("org.ostrya.Other", "mirrored"),
+            Some(&commit),
+        )
+        .await
+        .unwrap();
+        let summary = regenerate_with(&repo, Vec::new()).await;
+        assert_eq!(summary.collection_map().unwrap().len(), 1);
+
+        let guard = repo.begin_update().await.unwrap();
+        let listing = repo.build_ref_listing(&[]).await.unwrap();
+        guard.finish().await.unwrap();
+        let parsed = Summary::parse(&listing).unwrap();
+        assert_eq!(
+            metadata_keys(&parsed),
+            ["ostree.summary.mode", "ostree.summary.collection-id"]
+        );
+        assert_eq!(
+            parsed.metadata_value("ostree.summary.collection-id"),
+            Some(&Value::Str(COLLECTION_ID.into()))
+        );
+        assert_eq!(listed_names(&listing), ["main", "ostree-metadata"]);
+    });
+}
+
+/// A prefix that is not a ref name is refused, alone and next to a valid
+/// prefix. The refusal comes before each read: a repository with a ref file
+/// that holds no checksum and a ref that names a missing commit gives the
+/// same refusal.
+#[test]
+fn a_ref_listing_refuses_a_bad_prefix() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-bad-prefix");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let bad_prefixes = [
+            "", "/", "/a", "a/", "a//b", ".", "..", "a/./b", "a/../b", "a\0b",
+        ];
+        for bad in bad_prefixes {
+            for prefixes in [&[bad][..], &["main", bad][..]] {
+                let outcome = repo.build_ref_listing(prefixes).await;
+                assert!(
+                    matches!(outcome, Err(ostrya::Error::InvalidRefspec(_))),
+                    "{prefixes:?}: {outcome:?}"
+                );
+            }
+        }
+
+        let missing = Checksum::from_bytes([7; 32]);
+        repo.set_ref_immediate("broken", Some(&missing))
+            .await
+            .unwrap();
+        std::fs::write(repo_dir.join("refs/heads/garbage"), "no checksum\n").unwrap();
+        assert!(matches!(
+            repo.build_ref_listing(&[]).await,
+            Err(ostrya::Error::Core(_))
+        ));
+        assert!(matches!(
+            repo.build_ref_listing(&["broken"]).await,
+            Err(ostrya::Error::ObjectNotFound { .. })
+        ));
+        for bad in bad_prefixes {
+            for prefixes in [&[bad][..], &["broken", bad][..], &[bad, "garbage"][..]] {
+                let outcome = repo.build_ref_listing(prefixes).await;
+                assert!(
+                    matches!(outcome, Err(ostrya::Error::InvalidRefspec(_))),
+                    "{prefixes:?}: {outcome:?}"
+                );
+            }
+        }
+    });
+}

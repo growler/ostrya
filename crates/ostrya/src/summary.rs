@@ -10,6 +10,8 @@
 //!   `summary.sig`. [`Repo::verify_summary`] verifies them.
 //! - [`Repo::read_summary`] and [`Repo::read_summary_signature`] read the two
 //!   files.
+//! - [`Repo::build_ref_listing`] builds a ref listing for one request: a
+//!   summary of the refs under a set of prefixes, with a size cap.
 //! - [`Summary`] is the parsed form of a `summary` file.
 //!   [`Summary::static_deltas`] reads its delta map as [`AdvertisedDelta`]
 //!   values.
@@ -19,17 +21,18 @@ use std::collections::hash_map::Entry;
 use std::os::fd::{AsFd, BorrowedFd};
 
 use ostrya_core::{
-    Checksum, Commit, DirMeta, ObjectType, Type, Value, from_bytes, loose_path, to_bytes,
-    tuple_field_from_bytes,
+    Checksum, Commit, DirMeta, ObjectType, Type, Value, choose_offset_size, from_bytes, loose_path,
+    to_bytes, tuple_field_from_bytes, write_offset,
 };
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::commit::{CommitOptions, append_dict_entry};
-use crate::deltagen::{STATIC_DELTAS_KEY, parse_delta_name};
+use crate::deltagen::{STATIC_DELTAS_KEY, advertised_delta_map, parse_delta_name};
 use crate::error::{Error, Result};
 use crate::lock::{LockKind, UpdateLockHeld};
 use crate::mtree::MutableTree;
+use crate::remote::proto::MAX_REF_LISTING;
 use crate::repo::Repo;
 use crate::sign::{Signer, Verifier, VerifyOutcome, append_signature, signatures_for};
 
@@ -37,6 +40,24 @@ use crate::sign::{Signer, Verifier, VerifyOutcome, append_signature, signatures_
 const SUMMARY_SIGNATURE: &str = "(a(s(taya{sv}))a{sv})";
 /// The `a{sv}` type of the global metadata of the summary and of `summary.sig`.
 const METADATA_SIGNATURE: &str = "a{sv}";
+/// The type of one entry of the ref list of the summary.
+const REF_ENTRY_SIGNATURE: &str = "(s(taya{sv}))";
+/// The alignment of a ref entry and of the global metadata dict, in bytes.
+const LISTING_ALIGNMENT: usize = 8;
+/// The fewest bytes of a ref entry other than its name.
+///
+/// The count is the NUL after the name, the 8-byte commit size, the 32-byte
+/// commit checksum, the `ostree.commit.timestamp` entry of the ref metadata,
+/// and 2 framing offsets of the entry: the end of the name and the end of the
+/// checksum. The timestamp entry is the key and its NUL, the variant of type
+/// `t` (8 bytes, a zero byte, and the type `t`), the framing offset of the
+/// entry, and the framing offset of the dict array. The padding after the
+/// name is not in the count, so the count is a lower bound for each name.
+const REF_ENTRY_FLOOR: u64 = 1 + 8 + 32 + (COMMIT_TIMESTAMP_KEY.len() as u64 + 1 + 10 + 2) + 2;
+/// The fewest bytes of one entry of the delta map: a key of 64 hex characters
+/// and its NUL, the variant of type `ay` (32 bytes, a zero byte, and the type
+/// `ay`), and the framing offset of the entry.
+const DELTA_ENTRY_FLOOR: u64 = 64 + 1 + (32 + 1 + 2) + 1;
 /// The type of the `ostree.summary.collection-map` value: a map from a
 /// collection id to a ref array with the shape of the ref list of the summary.
 const COLLECTION_MAP_SIGNATURE: &str = "a{sa(s(taya{sv}))}";
@@ -675,6 +696,145 @@ impl Repo {
         Ok(to_bytes(&ty, &summary).map_err(ostrya_core::Error::from)?)
     }
 
+    /// Returns a ref listing: a summary of the local refs under `prefixes`,
+    /// built for one request.
+    ///
+    /// The listing has the type of a `summary` file, `(a(s(taya{sv}))a{sv})`,
+    /// and [`Summary::parse`] reads it. The call writes nothing and takes no
+    /// lock. One state of the repository gives the same bytes.
+    ///
+    /// # Refs
+    ///
+    /// A prefix is a ref name. It selects the ref of the same name and each
+    /// ref below `<prefix>/`. The prefix `a/b` selects `a/b` and `a/b/c`. It
+    /// does not select `a/bc`. This is the rule of
+    /// [`list_refs`](Repo::list_refs) with a prefix. An empty slice selects
+    /// each ref under `refs/heads`.
+    ///
+    /// The listing holds each selected ref one time, sorted byte-wise by name.
+    /// An alias is in the listing under its own name, with the commit of its
+    /// target. The listing holds no mirror ref. Each entry has the bytes of
+    /// the entry of the same ref in a summary of the same repository state.
+    ///
+    /// The call drops each prefix that a shorter prefix of the slice selects.
+    /// It reads only the subtree of `refs/heads` under each other prefix, and
+    /// it reads each commit one time, also when more than one ref names it.
+    /// So the cost of the call follows the number of selected refs. An empty
+    /// slice reads all of `refs/heads`.
+    ///
+    /// # Global metadata
+    ///
+    /// The global metadata dict holds these entries, in this order:
+    ///
+    /// 1. `ostree.summary.mode`, the mode of the repository.
+    /// 2. `ostree.static-deltas`, if the index files advertise a delta.
+    /// 3. `ostree.summary.collection-id`, if `[core] collection-id` is set.
+    ///
+    /// The values have the encoding of the same keys in a summary. The dict
+    /// holds no `ostree.summary.last-modified` and no
+    /// `ostree.summary.collection-map`.
+    ///
+    /// The deltas come from the index files under `delta-indexes/` alone,
+    /// which [`reindex_static_deltas`](Repo::reindex_static_deltas) writes.
+    /// The call reads the index file of each listed commit. Then it reads the
+    /// index file of each source commit that an index file names, until it
+    /// finds no new commit. A commit with no index file adds no delta. The map
+    /// is sorted by delta name.
+    ///
+    /// # Size
+    ///
+    /// The listing is at most [`MAX_REF_LISTING`] bytes. The call refuses a
+    /// larger listing before the whole listing is in memory. It never cuts
+    /// the listing short. Each check below compares a lower bound of the
+    /// size of the listing with the cap, so a listing that fits passes each
+    /// check. The call refuses the listing at the first check that fails:
+    ///
+    /// 1. After the read of the refs: the size of each entry, from the length
+    ///    of the ref name. No commit and no index file is read before this
+    ///    check.
+    /// 2. After the delta walk: the same sum and the size of the delta map,
+    ///    from the number of deltas.
+    /// 3. After the serialization of the global metadata: the same sum and
+    ///    the length of the metadata. No commit is read before this check.
+    /// 4. During the read of the commits: the same sum and, for each ref, the
+    ///    size of the version of its commit.
+    /// 5. During the write of the entries: the length of the listing.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRefspec`] if a prefix is not a valid ref name. The
+    ///   check comes before each read.
+    /// - [`Error::Remote`] with
+    ///   [`LimitExceeded`](crate::remote::Error::LimitExceeded) if the
+    ///   listing is larger than [`MAX_REF_LISTING`] bytes.
+    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8, or if an index
+    ///   file is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE),
+    ///   does not decode as a delta index, or names a delta to another commit.
+    /// - [`Error::Core`] if a ref file holds no checksum, or if a commit
+    ///   object does not parse.
+    /// - [`Error::ObjectNotFound`] if a listed ref names a commit that is not
+    ///   in the object store.
+    /// - [`Error::Io`] if a read fails, for example for an alias that names a
+    ///   directory, or if `delta-indexes/` is not a directory.
+    ///
+    /// A failure of one selected ref or of one index file fails the whole
+    /// listing. The call does not read a ref that no prefix selects.
+    pub async fn build_ref_listing(&self, prefixes: &[&str]) -> Result<Vec<u8>> {
+        self.build_ref_listing_capped(prefixes, MAX_REF_LISTING)
+            .await
+    }
+
+    /// Builds the listing of [`build_ref_listing`](Repo::build_ref_listing)
+    /// with a size cap of `cap` bytes. A listing of exactly `cap` bytes fits.
+    pub(crate) async fn build_ref_listing_capped(
+        &self,
+        prefixes: &[&str],
+        cap: u64,
+    ) -> Result<Vec<u8>> {
+        // The refs come sorted byte-wise by name, each one time, which is the
+        // order of `build_summary`.
+        let refs = self.list_refs_under(prefixes).await?;
+
+        // Each entry is at least its name and the fixed fields. If the sum of
+        // these sizes is over the cap, the listing is too.
+        let mut floor: u64 = refs
+            .iter()
+            .map(|(name, _)| name.len() as u64 + REF_ENTRY_FLOOR)
+            .sum();
+        check_floor(floor, cap)?;
+
+        // The global metadata comes before the commit reads, so its length
+        // is in the floor before a commit is in memory.
+        let deltas = self
+            .walk_delta_indexes(refs.iter().map(|(_, commit)| *commit))
+            .await?;
+        check_floor(floor + deltas.len() as u64 * DELTA_ENTRY_FLOOR, cap)?;
+        let mut dict = Value::Array(Vec::new());
+        append_dict_entry(
+            &mut dict,
+            MODE_KEY,
+            variant("s", Value::Str(self.mode().as_mode_str().to_owned()))?,
+        )?;
+        if !deltas.is_empty() {
+            append_dict_entry(&mut dict, STATIC_DELTAS_KEY, advertised_delta_map(&deltas)?)?;
+        }
+        drop(deltas);
+        if let Some(cid) = self.config().collection_id() {
+            append_dict_entry(
+                &mut dict,
+                COLLECTION_ID_KEY,
+                variant("s", Value::Str(cid.to_owned()))?,
+            )?;
+        }
+        let metadata = serialize_signature_dict(&dict)?;
+        drop(dict);
+        floor += metadata.len() as u64;
+        check_floor(floor, cap)?;
+
+        let repo = self.clone();
+        ostrya_rt::unblock(move || write_ref_listing(&repo, &refs, &metadata, floor, cap)).await
+    }
+
     /// Returns the bytes of `summary`, or `None` if the file does not exist.
     ///
     /// The read stops at 64 MiB. If the file is longer, the call returns the
@@ -846,34 +1006,10 @@ impl Repo {
     /// one commit in memory at a time.
     async fn summary_commit_facts(&self, commits: Vec<Checksum>) -> Result<Vec<CommitFacts>> {
         let repo = self.clone();
-        let mode = self.mode();
         ostrya_rt::unblock(move || {
             commits
                 .iter()
-                .map(|commit| {
-                    let path = loose_path(commit, ObjectType::Commit, mode);
-                    let bytes = crate::object::read_meta_object(
-                        repo.objects_fd(),
-                        &path,
-                        crate::object::MAX_METADATA_SIZE,
-                    )
-                    .map_err(|e| match e.kind() {
-                        std::io::ErrorKind::NotFound => Error::ObjectNotFound {
-                            checksum: *commit,
-                            ty: ObjectType::Commit,
-                        },
-                        _ => Error::Io(e),
-                    })?;
-                    let parsed = Commit::parse(&bytes)?;
-                    Ok(CommitFacts {
-                        // Commit objects are stored uncompressed, so the
-                        // size on disk is the serialized length that the
-                        // `ostree` command reports.
-                        size: bytes.len() as u64,
-                        version: parsed.version().map(str::to_owned),
-                        timestamp: parsed.timestamp,
-                    })
-                })
+                .map(|commit| read_commit_facts(&repo, commit))
                 .collect()
         })
         .await
@@ -1045,6 +1181,113 @@ struct CommitFacts {
     timestamp: u64,
 }
 
+/// Reads the size, the version, and the timestamp of the commit `commit`.
+///
+/// The call reads the commit object under the size cap of a metadata object,
+/// on the calling thread.
+fn read_commit_facts(repo: &Repo, commit: &Checksum) -> Result<CommitFacts> {
+    let path = loose_path(commit, ObjectType::Commit, repo.mode());
+    let bytes =
+        crate::object::read_meta_object(repo.objects_fd(), &path, crate::object::MAX_METADATA_SIZE)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => Error::ObjectNotFound {
+                    checksum: *commit,
+                    ty: ObjectType::Commit,
+                },
+                _ => Error::Io(e),
+            })?;
+    // Commit objects are stored uncompressed, so the size on disk is the
+    // serialized length that the `ostree` command reports.
+    let size = bytes.len() as u64;
+    let parsed = Commit::parse(&bytes)?;
+    drop(bytes);
+    Ok(CommitFacts {
+        size,
+        version: parsed.version().map(str::to_owned),
+        timestamp: parsed.timestamp,
+    })
+}
+
+/// Writes the ref listing of `refs`, with the serialized global metadata
+/// `metadata`, on the calling thread.
+///
+/// `floor` is a lower bound of the size of the listing from the names of
+/// `refs` and from `metadata`. The call reads each distinct commit one time.
+/// It adds the size of the version of each commit to the floor, one time for
+/// each ref that names the commit, and refuses the listing when the floor
+/// passes `cap`. Then it writes the entries one at a time.
+fn write_ref_listing(
+    repo: &Repo,
+    refs: &[(String, Checksum)],
+    metadata: &[u8],
+    mut floor: u64,
+    cap: u64,
+) -> Result<Vec<u8>> {
+    // `slots[i]` is the index in `commits` of the commit of `refs[i]`. Each
+    // item of `commits` is a distinct commit and the number of refs that
+    // name it.
+    let mut index: HashMap<Checksum, usize> = HashMap::new();
+    let mut commits: Vec<(Checksum, u64)> = Vec::new();
+    let slots: Vec<usize> = refs
+        .iter()
+        .map(|(_, commit)| match index.entry(*commit) {
+            Entry::Occupied(slot) => {
+                commits[*slot.get()].1 += 1;
+                *slot.get()
+            }
+            Entry::Vacant(slot) => {
+                commits.push((*commit, 1));
+                *slot.insert(commits.len() - 1)
+            }
+        })
+        .collect();
+    drop(index);
+
+    let mut facts = Vec::with_capacity(commits.len());
+    for (commit, uses) in &commits {
+        let fact = read_commit_facts(repo, commit)?;
+        if let Some(version) = &fact.version {
+            floor += uses * version_floor(version);
+            check_floor(floor, cap)?;
+        }
+        facts.push(fact);
+    }
+    drop(commits);
+
+    let entry_ty = Type::parse(REF_ENTRY_SIGNATURE).map_err(ostrya_core::Error::from)?;
+    let mut listing = ListingWriter::new(cap, floor, refs.len());
+    for ((name, commit), slot) in refs.iter().zip(slots) {
+        let fact = &facts[slot];
+        let entry = ref_entry(
+            name,
+            fact.size,
+            commit,
+            fact.version.as_deref(),
+            fact.timestamp,
+        )?;
+        listing.push_entry(&to_bytes(&entry_ty, &entry).map_err(ostrya_core::Error::from)?)?;
+    }
+    drop(facts);
+    listing.finish(metadata)
+}
+
+/// Returns the fewest bytes that the `ostree.commit.version` entry with the
+/// value `version` adds to a ref entry: the key and its NUL, the variant of
+/// type `s` (the value, its NUL, a zero byte, and the type `s`), the framing
+/// offset of the entry, and the framing offset of the dict array.
+fn version_floor(version: &str) -> u64 {
+    (COMMIT_VERSION_KEY.len() + 1 + version.len() + 3 + 2) as u64
+}
+
+/// Fails with the cap error if `floor`, a lower bound of the size of a ref
+/// listing, is over `cap`.
+fn check_floor(floor: u64, cap: u64) -> Result<()> {
+    if floor > cap {
+        return Err(listing_too_large(cap));
+    }
+    Ok(())
+}
+
 /// Builds one entry `(s, (t, ay, a{sv}))` of the ref list.
 ///
 /// The entry holds the ref name, the size of the commit object in host order,
@@ -1080,6 +1323,98 @@ fn ref_entry(
         refmeta,
     ]);
     Ok(Value::Tuple(vec![Value::Str(name.to_owned()), inner]))
+}
+
+/// The writer of a ref listing, a `(a(s(taya{sv}))a{sv})` GVariant, one ref
+/// entry at a time.
+///
+/// The writer gives the bytes that `to_bytes` gives for the whole value. It
+/// checks the length against the cap before each append, so a listing over
+/// the cap fails before it is whole in memory.
+struct ListingWriter {
+    out: Vec<u8>,
+    /// The end of each entry, counted from the start of the ref array.
+    ends: Vec<usize>,
+    cap: u64,
+}
+
+impl ListingWriter {
+    /// Returns a writer of a listing of `entries` ref entries, with a size cap
+    /// of `cap` bytes. The buffer starts with a capacity of `floor` bytes, a
+    /// lower bound of the size of the listing, and no more than the cap.
+    fn new(cap: u64, floor: u64, entries: usize) -> ListingWriter {
+        ListingWriter {
+            out: Vec::with_capacity(usize::try_from(floor.min(cap)).unwrap_or(usize::MAX)),
+            ends: Vec::with_capacity(entries),
+            cap,
+        }
+    }
+
+    /// Fails with the cap error if `extra` more bytes do not fit in the cap.
+    /// Otherwise it makes the buffer large enough for them. The buffer grows
+    /// to two times its capacity at most, and never past the cap.
+    fn make_room(&mut self, extra: usize) -> Result<()> {
+        let need = self.out.len() + extra;
+        if need as u64 > self.cap {
+            return Err(listing_too_large(self.cap));
+        }
+        if need > self.out.capacity() {
+            let cap = usize::try_from(self.cap).unwrap_or(usize::MAX);
+            let target = need.max(self.out.capacity().saturating_mul(2)).min(cap);
+            self.out.reserve_exact(target - self.out.len());
+        }
+        Ok(())
+    }
+
+    /// Appends zero bytes up to the alignment of an entry and of the
+    /// metadata dict, then `bytes`.
+    fn append_aligned(&mut self, bytes: &[u8]) -> Result<()> {
+        let aligned = self.out.len().next_multiple_of(LISTING_ALIGNMENT);
+        self.make_room(aligned - self.out.len() + bytes.len())?;
+        self.out.resize(aligned, 0);
+        self.out.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Appends the serialized ref entry `entry` to the ref array.
+    ///
+    /// An entry has an alignment of 8, so its bytes at an aligned position
+    /// equal its bytes alone.
+    fn push_entry(&mut self, entry: &[u8]) -> Result<()> {
+        self.append_aligned(entry)?;
+        self.ends.push(self.out.len());
+        Ok(())
+    }
+
+    /// Closes the ref array, appends the serialized metadata dict `metadata`,
+    /// and returns the listing.
+    ///
+    /// The ref array starts at offset 0. Its framing offsets follow its
+    /// entries, in entry order. An empty array has no offsets. The tuple then
+    /// holds the dict, aligned to 8, and one framing offset: the end of the
+    /// array.
+    fn finish(mut self, metadata: &[u8]) -> Result<Vec<u8>> {
+        if !self.ends.is_empty() {
+            let width = choose_offset_size(self.out.len(), self.ends.len());
+            self.make_room(self.ends.len() * width)?;
+            for &end in &self.ends {
+                write_offset(&mut self.out, end, width);
+            }
+        }
+        let array_end = self.out.len();
+        self.append_aligned(metadata)?;
+        let width = choose_offset_size(self.out.len(), 1);
+        self.make_room(width)?;
+        write_offset(&mut self.out, array_end, width);
+        Ok(self.out)
+    }
+}
+
+/// Returns the error for a ref listing over `cap` bytes.
+fn listing_too_large(cap: u64) -> Error {
+    Error::Remote(crate::remote::Error::LimitExceeded(format!(
+        "the ref listing is larger than its cap of {cap} bytes"
+    )))
 }
 
 /// Returns the caller keys to append after the standard entries of
@@ -1242,11 +1577,14 @@ pub(crate) fn put_root_file_blocking(
     })
 }
 
-/// `SummaryOptions` and the parsed summary move across tasks and threads.
+/// `SummaryOptions` and the parsed summary move across tasks and threads, and
+/// so does the future of a ref listing.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<SummaryOptions>();
     assert_send_sync::<Summary>();
+    fn assert_send<T: Send>(_: &T) {}
+    let _ = |repo: &Repo| assert_send(&repo.build_ref_listing(&[]));
 };
 
 #[cfg(test)]
@@ -1506,6 +1844,327 @@ mod tests {
                 "the build refreshes no anchor"
             );
             assert_eq!(repo.read_summary().await.unwrap().unwrap(), written);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writes a listing of `entries` and `metadata` with [`ListingWriter`]
+    /// and with `to_bytes` of the whole value, checks that the two agree, and
+    /// returns the bytes.
+    fn listing_both_ways(entries: Vec<Value>, metadata: Value) -> Vec<u8> {
+        let entry_ty = Type::parse(REF_ENTRY_SIGNATURE).unwrap();
+        let mut writer = ListingWriter::new(u64::MAX, 0, entries.len());
+        for entry in &entries {
+            writer
+                .push_entry(&to_bytes(&entry_ty, entry).unwrap())
+                .unwrap();
+        }
+        let streamed = writer
+            .finish(&serialize_signature_dict(&metadata).unwrap())
+            .unwrap();
+        let whole = Value::Tuple(vec![Value::Array(entries), metadata]);
+        let ty = Type::parse(SUMMARY_SIGNATURE).unwrap();
+        assert_eq!(streamed, to_bytes(&ty, &whole).unwrap());
+        streamed
+    }
+
+    /// Returns `count` ref entries whose names are `len` bytes long.
+    fn entries_of(count: usize, len: usize) -> Vec<Value> {
+        (0..count)
+            .map(|i| {
+                let name = format!("{i:0>len$}");
+                ref_entry(&name, 100, &checksum(i as u8), Some("1.0"), 7).unwrap()
+            })
+            .collect()
+    }
+
+    /// Returns the value that `build` gives for the first length `n` at which
+    /// the serialized form of the value under `ty` is `size` bytes long.
+    ///
+    /// The serialized length of `build(n)` grows by one byte for each step of
+    /// `n`, with a few bytes more where a framing offset gets wider.
+    fn value_of_size(ty: &str, size: usize, build: impl Fn(usize) -> Value) -> Value {
+        let ty = Type::parse(ty).unwrap();
+        let len = |n: usize| to_bytes(&ty, &build(n)).unwrap().len();
+        let mut n = size.saturating_sub(len(0));
+        for _ in 0..16 {
+            let got = len(n);
+            if got == size {
+                return build(n);
+            }
+            n = (n + size).saturating_sub(got);
+        }
+        panic!("no value of {size} bytes");
+    }
+
+    /// Returns an `a{sv}` dict whose last bytes are a string of `n` bytes.
+    fn dict_ending_in(n: usize) -> Value {
+        let mut dict = Value::Array(Vec::new());
+        append_dict_entry(
+            &mut dict,
+            "k",
+            variant("s", Value::Str("x".repeat(n))).unwrap(),
+        )
+        .unwrap();
+        dict
+    }
+
+    /// Returns a ref entry of `size` bytes.
+    fn entry_of_size(size: usize) -> Value {
+        value_of_size(REF_ENTRY_SIGNATURE, size, |n| {
+            Value::Tuple(vec![
+                Value::Str("r".into()),
+                Value::Tuple(vec![
+                    Value::U64(0),
+                    Value::Bytes(vec![0; 32]),
+                    dict_ending_in(n),
+                ]),
+            ])
+        })
+    }
+
+    /// Returns the end of the ref array of `listing`: the framing offset at
+    /// the end of the listing.
+    fn array_end(listing: &[u8]) -> usize {
+        let width = ostrya_core::offset_size_for(listing.len());
+        let mut end = [0u8; 8];
+        end[..width].copy_from_slice(&listing[listing.len() - width..]);
+        usize::try_from(u64::from_le_bytes(end)).unwrap()
+    }
+
+    /// The listing writer gives the bytes of `to_bytes` for no entries, and
+    /// for framing offsets of 1, 2, and 4 bytes. One case has offsets of 1
+    /// byte in the ref array and of 2 bytes in the outer tuple.
+    ///
+    /// The boundary cases put the data of the ref array, or of the outer
+    /// tuple, and its framing offsets at 255 and 256 bytes for offsets of 1
+    /// byte, and at 65,535 and 65,536 bytes for offsets of 2 bytes. At the
+    /// first size of each pair, the offsets keep their width. At the second,
+    /// they get wider.
+    #[test]
+    fn the_listing_writer_frames_as_to_bytes_does() {
+        let mode = || {
+            let mut metadata = Value::Array(Vec::new());
+            append_dict_entry(
+                &mut metadata,
+                MODE_KEY,
+                variant("s", Value::Str("archive-z2".into())).unwrap(),
+            )
+            .unwrap();
+            metadata
+        };
+        let long_metadata = {
+            let mut metadata = mode();
+            append_dict_entry(
+                &mut metadata,
+                COLLECTION_ID_KEY,
+                variant("s", Value::Str("c".repeat(200))).unwrap(),
+            )
+            .unwrap();
+            metadata
+        };
+        let cases = [
+            (Vec::new(), Value::Array(Vec::new()), 1),
+            (Vec::new(), mode(), 1),
+            (entries_of(1, 4), mode(), 1),
+            (entries_of(1, 4), long_metadata, 2),
+            (entries_of(8, 40), mode(), 2),
+            (entries_of(3, 30_000), mode(), 4),
+        ];
+        for (entries, metadata, width) in cases {
+            let bytes = listing_both_ways(entries, metadata);
+            assert_eq!(ostrya_core::offset_size_for(bytes.len()), width);
+        }
+
+        // The ref array holds one entry, so its data and its offsets at the
+        // narrow width are the entry and one offset.
+        for (data_and_offset, narrow, array_len) in [
+            (255, 1, 255),
+            (256, 1, 257),
+            (65_535, 2, 65_535),
+            (65_536, 2, 65_538),
+        ] {
+            let entry = entry_of_size(data_and_offset - narrow);
+            let listing = listing_both_ways(vec![entry], Value::Array(Vec::new()));
+            assert_eq!(array_end(&listing), array_len, "{data_and_offset}");
+        }
+
+        // With no entry, the outer tuple holds the metadata dict and one
+        // offset.
+        for (data_and_offset, narrow, listing_len) in [
+            (255, 1, 255),
+            (256, 1, 257),
+            (65_535, 2, 65_535),
+            (65_536, 2, 65_538),
+        ] {
+            let metadata = value_of_size(METADATA_SIGNATURE, data_and_offset - narrow, |n| {
+                dict_ending_in(n)
+            });
+            let listing = listing_both_ways(Vec::new(), metadata);
+            assert_eq!(listing.len(), listing_len, "{data_and_offset}");
+        }
+    }
+
+    /// The floor of a ref entry is at most the size of each entry, and is the
+    /// size of the smallest entry: a name whose NUL ends at a multiple of 8
+    /// bytes, and no version. A version adds at least its floor.
+    #[test]
+    fn the_ref_entry_floor_is_the_size_of_the_smallest_entry() {
+        let entry_ty = Type::parse(REF_ENTRY_SIGNATURE).unwrap();
+        let size = |name: &str, version: Option<&str>| {
+            let entry = ref_entry(name, 0, &checksum(0), version, 0).unwrap();
+            to_bytes(&entry_ty, &entry).unwrap().len() as u64
+        };
+        let long = "v".repeat(300);
+        for len in 1..=40 {
+            let name = "n".repeat(len);
+            let bare = size(&name, None);
+            assert!(bare >= len as u64 + REF_ENTRY_FLOOR, "{len}");
+            if (len + 1) % 8 == 0 {
+                assert_eq!(bare, len as u64 + REF_ENTRY_FLOOR, "{len}");
+            }
+            for version in ["", "1", "1.0.0", long.as_str()] {
+                let with = size(&name, Some(version));
+                assert!(with >= bare + version_floor(version), "{len} {version}");
+            }
+        }
+    }
+
+    /// The floor of a delta map entry is at most the size of each entry.
+    #[test]
+    fn the_delta_entry_floor_is_a_lower_bound() {
+        let ty = Type::parse("v").unwrap();
+        for count in 1..=3u8 {
+            let deltas: Vec<AdvertisedDelta> = (0..count)
+                .map(|i| AdvertisedDelta {
+                    from: None,
+                    to: checksum(i),
+                    superblock: checksum(100 + i),
+                })
+                .collect();
+            let map = advertised_delta_map(&deltas).unwrap();
+            let len = to_bytes(&ty, &map).unwrap().len() as u64;
+            assert!(len >= u64::from(count) * DELTA_ENTRY_FLOOR, "{count}");
+        }
+    }
+
+    /// Returns a new archive repository in `dir` with one commit that has a
+    /// version, a delta from scratch to it with an index file, and each ref of
+    /// `names` on that commit.
+    async fn repo_with_refs(dir: &std::path::Path, names: &[&str]) -> Repo {
+        let create = crate::CreateOptions::new(ostrya_core::RepoMode::Archive);
+        let repo = Repo::create(dir, create).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let dirmeta = DirMeta {
+            uid: 0,
+            gid: 0,
+            mode: ANCHOR_DIR_MODE,
+            xattrs: Default::default(),
+        };
+        let dirmeta = txn
+            .write_metadata(ObjectType::DirMeta, None, &dirmeta.serialize().unwrap())
+            .await
+            .unwrap();
+        let mut mtree = MutableTree::new();
+        mtree.set_metadata_checksum(dirmeta);
+        let root = txn.write_mtree(&mut mtree).await.unwrap();
+        let mut metadata = Value::Array(Vec::new());
+        append_dict_entry(
+            &mut metadata,
+            "version",
+            variant("s", Value::Str("1.0.0".into())).unwrap(),
+        )
+        .unwrap();
+        let options = CommitOptions {
+            parent: None,
+            subject: None,
+            body: None,
+            timestamp: Some(1_700_000_000),
+            metadata: Some(metadata),
+        };
+        let commit = txn.write_commit(options, &root).await.unwrap();
+        txn.commit().await.unwrap();
+        for name in names {
+            repo.set_ref_immediate(name, Some(&commit)).await.unwrap();
+        }
+        let options = crate::DeltaOptions {
+            timestamp: Some(1_700_000_000),
+            ..crate::DeltaOptions::default()
+        };
+        repo.generate_static_delta(None, &commit, &options)
+            .await
+            .unwrap();
+        repo.reindex_static_deltas().await.unwrap();
+        repo
+    }
+
+    /// Returns `true` if `outcome` is the cap error.
+    fn is_cap_error(outcome: &Result<Vec<u8>>) -> bool {
+        matches!(
+            outcome,
+            Err(Error::Remote(crate::remote::Error::LimitExceeded(_)))
+        )
+    }
+
+    /// A listing fits in a cap of its own length, in a buffer no larger than
+    /// the cap, and each lower cap refuses it with the cap error. The listing
+    /// has a version in each entry and a delta map, so each floor check is
+    /// on the path. The checks of the names and of the metadata come before
+    /// the commit reads.
+    #[test]
+    fn a_ref_listing_fits_its_cap_to_the_byte() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-ref-listing-cap-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ostrya_rt::block_on(async {
+            let names = ["a/b", "a/c", "z"];
+            let repo = repo_with_refs(&dir, &names).await;
+            let full = repo.build_ref_listing(&[]).await.unwrap();
+            let parsed = Summary::parse(&full).unwrap();
+            assert_eq!(parsed.refs.len(), 3);
+            assert_eq!(parsed.static_deltas().unwrap().len(), 1);
+            assert!(
+                parsed.refs[0]
+                    .metadata
+                    .dict_get(COMMIT_VERSION_KEY)
+                    .is_some()
+            );
+            let len = full.len() as u64;
+            let capped = repo.build_ref_listing_capped(&[], len).await.unwrap();
+            assert_eq!(capped, full);
+            assert!(capped.capacity() as u64 <= len);
+            for cap in 0..len {
+                let outcome = repo.build_ref_listing_capped(&[], cap).await;
+                assert!(is_cap_error(&outcome), "cap {cap}: {outcome:?}");
+            }
+
+            // With no commit object, a cap below the floor of the names and
+            // the metadata still gives the cap error, so these checks come
+            // before the commit reads. A cap of that floor passes them, and
+            // the commit read fails.
+            let names_floor: u64 = names
+                .iter()
+                .map(|name| name.len() as u64 + REF_ENTRY_FLOOR)
+                .sum();
+            let floor =
+                names_floor + serialize_signature_dict(&parsed.metadata).unwrap().len() as u64;
+            let commit = parsed.refs[0].commit;
+            let path = loose_path(&commit, ObjectType::Commit, repo.mode());
+            std::fs::remove_file(dir.join("objects").join(path)).unwrap();
+            for cap in [names_floor - 1, floor - 1] {
+                let outcome = repo.build_ref_listing_capped(&[], cap).await;
+                assert!(is_cap_error(&outcome), "cap {cap}: {outcome:?}");
+            }
+            for cap in [floor, MAX_REF_LISTING] {
+                let outcome = repo.build_ref_listing_capped(&[], cap).await;
+                assert!(
+                    matches!(outcome, Err(Error::ObjectNotFound { .. })),
+                    "cap {cap}: {outcome:?}"
+                );
+            }
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

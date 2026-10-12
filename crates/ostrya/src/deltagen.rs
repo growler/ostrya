@@ -16,6 +16,8 @@
 //!   blocking pool. [`PART_XZ_LEVEL`] sets the memory of the xz encoder.
 //! - [`Repo::walk_delta_indexes`] reads the `delta-indexes/` cache back from a
 //!   set of commits, through the source commit of each delta that it finds.
+//!   [`advertised_delta_map`] encodes the deltas that it finds as the
+//!   `ostree.static-deltas` value of a summary.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::SeekFrom;
@@ -748,13 +750,12 @@ impl Repo {
         if entries.is_empty() {
             return Ok(None);
         }
-        let map = delta_map_value(
+        let map = summary_delta_map(
             entries
                 .iter()
                 .map(|entry| (entry.name.as_str(), &entry.digest)),
         )?;
-        let map_ty = Type::parse("a{sv}").map_err(ostrya_core::Error::from)?;
-        Ok(Some(Value::variant(map_ty, map)))
+        Ok(Some(map))
     }
 
     /// Returns the target commits of the index files in `delta-indexes/`, sorted.
@@ -805,7 +806,6 @@ impl Repo {
     ///   or a read fails.
     ///
     /// [`Summary::static_deltas`]: crate::Summary::static_deltas
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn walk_delta_indexes(
         &self,
         commits: impl IntoIterator<Item = Checksum>,
@@ -2003,6 +2003,32 @@ fn delta_map_value<'a>(deltas: impl Iterator<Item = (&'a str, &'a Checksum)>) ->
         )?;
     }
     Ok(map)
+}
+
+/// Returns the `ostree.static-deltas` value of a summary: the map of
+/// [`delta_map_value`] in a variant of type `a{sv}`.
+fn summary_delta_map<'a>(deltas: impl Iterator<Item = (&'a str, &'a Checksum)>) -> Result<Value> {
+    let map_ty = Type::parse("a{sv}").map_err(ostrya_core::Error::from)?;
+    Ok(Value::variant(map_ty, delta_map_value(deltas)?))
+}
+
+/// Returns the `ostree.static-deltas` value of a summary that advertises
+/// `deltas`, in the order of the slice.
+///
+/// The value has the bytes of the value that
+/// [`Repo::static_deltas_summary_value`] gives for the same deltas in the
+/// same order.
+pub(crate) fn advertised_delta_map(deltas: &[AdvertisedDelta]) -> Result<Value> {
+    let names: Vec<String> = deltas
+        .iter()
+        .map(|delta| delta_name(delta.from.as_ref(), &delta.to))
+        .collect();
+    summary_delta_map(
+        names
+            .iter()
+            .map(String::as_str)
+            .zip(deltas.iter().map(|delta| &delta.superblock)),
+    )
 }
 
 /// Builds the `a{sv}` of an index file: the delta map under the shared

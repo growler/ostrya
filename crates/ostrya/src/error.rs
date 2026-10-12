@@ -350,6 +350,8 @@ pub enum Error {
     /// - a content object whose mode the destination repository cannot store
     /// - a required static delta that is absent, or a delta whose superblock
     ///   does not produce its target
+    /// - a list of static deltas whose superblocks and detached metadata pass
+    ///   the 1 GiB limit of one discovery from a remote
     /// - a subpath that is not an absolute path, or too many subpaths
     /// - a signature verification with no remote to take the keys from
     /// - a client certificate with no client key, or a client key with no

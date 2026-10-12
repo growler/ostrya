@@ -22,7 +22,7 @@ use ostrya::{
     CommitState, CreateOptions, DeltaOptions, DeltaSuperblock, DetachedMetadataFilter,
     DetachedMetadataFilterFn, Ed25519Signer, Error, FilterResult, FsckOptions, MutableTree,
     ObjectName, ObjectType, PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode,
-    SummaryOptions, Type, Value,
+    SummaryOptions, TimestampCheck, Type, Value,
 };
 use ostrya_rt::{block_on, spawn};
 
@@ -5345,8 +5345,8 @@ fn a_failure_inside_a_local_level_clears_the_markers() {
 }
 
 /// The intermediate commits B and C are signed, and the target D is not. The
-/// pull refuses D in the walk of the commit chains, before its transaction
-/// opens. It writes no marker and no object, so it applies no part.
+/// pull refuses D in discovery, before its transaction opens. It writes no
+/// marker and no object, so it applies no part.
 #[test]
 fn an_unsigned_local_target_fails_before_the_transaction() {
     let tmp = TmpDir::new("pull-chain-unsigned-target");
@@ -5369,6 +5369,139 @@ fn an_unsigned_local_target_fails_before_the_transaction() {
         assert!(matches!(err, Error::Signature(_)), "{err:?}");
         assert!(dst.list_refs(None).await.unwrap().is_empty());
         assert_eq!(dst.list_objects().await.unwrap(), held);
+        assert_no_markers(&dst_dir);
+    });
+}
+
+/// The requested ref names the target of a chain, and the ref binding of the
+/// target lists another ref. The pull refuses the target in discovery, before
+/// its transaction opens. It writes no ref, no marker, and no object, so it
+/// applies no part.
+#[test]
+fn a_local_target_refused_by_its_ref_binding_applies_no_part() {
+    let tmp = TmpDir::new("pull-chain-target-binding");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, commits) = chain_source(base, &["a", "b", "c", "d"]).await;
+        let [a, b, c, d] = commits[..] else {
+            unreachable!()
+        };
+        let txn = src.transaction().await.unwrap();
+        txn.set_ref("alias", Some(&d));
+        txn.commit().await.unwrap();
+        let (list, _dirs) = chain_list(&src, &[(a, b), (b, c), (c, d)]).await;
+        let (dst_dir, dst) = dst_holding(base, "dst", &src, &a).await;
+        let held = dst.list_objects().await.unwrap();
+
+        let opts = PullOptions {
+            refs: vec!["alias".to_owned()],
+            ..chain_pull(list)
+        };
+        let err = dst.pull_local(&src, opts).await.unwrap_err();
+
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("'alias'")),
+            "{err:?}"
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(dst.list_objects().await.unwrap(), held);
+        assert_no_markers(&dst_dir);
+    });
+}
+
+/// The source holds no commit object of the target of a chain, and the ref
+/// binding of the target lists another ref. Discovery reads the target from
+/// its superblock and refuses the ref binding. The walk of the chain, which
+/// reads the commit object, does not start, so the refusal reports and the
+/// missing object does not.
+#[test]
+fn a_local_target_refused_by_its_ref_binding_reports_before_the_walk() {
+    let tmp = TmpDir::new("pull-chain-target-binding-first");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, commits) = chain_source(base, &["a", "b", "c", "d"]).await;
+        let [a, b, c, d] = commits[..] else {
+            unreachable!()
+        };
+        let txn = src.transaction().await.unwrap();
+        txn.set_ref("alias", Some(&d));
+        txn.commit().await.unwrap();
+        let (list, _dirs) = chain_list(&src, &[(a, b), (b, c), (c, d)]).await;
+        let name = ostrya::ObjectName::new(d, ostrya::ObjectType::Commit);
+        std::fs::remove_file(object_path(&src_dir, &name, RepoMode::Archive)).unwrap();
+        let (dst_dir, dst) = dst_holding(base, "dst", &src, &a).await;
+        let held = dst.list_objects().await.unwrap();
+
+        let opts = PullOptions {
+            refs: vec!["alias".to_owned()],
+            ..chain_pull(list)
+        };
+        let err = dst.pull_local(&src, opts).await.unwrap_err();
+
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("'alias'")),
+            "{err:?}"
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(dst.list_objects().await.unwrap(), held);
+        assert_no_markers(&dst_dir);
+    });
+}
+
+/// A local pull makes no timestamp check, also for the target of a chain
+/// that discovery checks. The destination holds a commit newer than the
+/// target, and the pull with that commit as the timestamp check passes.
+#[test]
+fn a_local_chain_pull_makes_no_timestamp_check() {
+    let tmp = TmpDir::new("pull-chain-no-timestamp");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, commits) = chain_source(base, &["a", "b", "c"]).await;
+        let [a, b, c] = commits[..] else {
+            unreachable!()
+        };
+        let (list, _dirs) = chain_list(&src, &[(a, b), (b, c)]).await;
+        let (dst_dir, dst) = dst_holding(base, "dst", &src, &a).await;
+        build_tree(&base.join("newer"), b"newer\n");
+        let newer = {
+            let txn = dst.transaction().await.unwrap();
+            let mut mtree = MutableTree::new();
+            let mut modifier = CommitModifier::new(CommitModifierFlags::SKIP_XATTRS);
+            let dfd = std::fs::File::open(base).unwrap();
+            txn.write_dfd_to_mtree(
+                dfd.as_fd(),
+                Path::new("newer"),
+                &mut mtree,
+                Some(&mut modifier),
+            )
+            .await
+            .unwrap();
+            let root = txn.write_mtree(&mut mtree).await.unwrap();
+            let commit = txn
+                .write_commit(
+                    CommitOptions {
+                        timestamp: Some(FIXED_TS + 100),
+                        ..CommitOptions::default()
+                    },
+                    &root,
+                )
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            commit
+        };
+
+        let opts = PullOptions {
+            timestamp_check: TimestampCheck::Rev(newer),
+            ..chain_pull(list)
+        };
+        let stats = dst.pull_local(&src, opts).await.unwrap();
+
+        assert_eq!(dst.resolve_rev("main", false).await.unwrap(), Some(c));
+        assert!(stats.delta_parts > 0, "{stats:?}");
+        for commit in [b, c] {
+            assert_complete(&src, &dst, &dst_dir, &commit).await;
+        }
         assert_no_markers(&dst_dir);
     });
 }

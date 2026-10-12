@@ -4090,7 +4090,11 @@ neither is refused by name. A commit is checked in the step that fetched it,
 after its detached metadata is here and before its bytes are staged or its tree
 is asked for. That holds for whichever source supplied the bytes: a loose fetch,
 a localcache repository the step imports the object from, and a delta superblock
-each hand the bytes to the check first and stage them after it. Every commit a
+each hand the bytes to the check first and stage them after it. A commit of a
+chain of a `static_deltas` list is checked in discovery instead, before the
+transaction opens: its signatures over the bytes of its superblock, and the
+ref-binding and timestamp checks of each requested ref that names it. The step
+that stages it does not check it again. Every commit a
 pull carries is checked, the parents a depth pull follows included, and so is a
 commit this repository already holds, since the pull's policy is what decides
 rather than what an earlier pull accepted. The tool makes the same three

@@ -57,9 +57,9 @@ use super::subpath::{Scope, Subpaths};
 use super::verify::Verification;
 use super::{
     DetachedMetadataFilter, ModeChecks, PullCounters, PullFlags, PullOptions, PullStats,
-    PullVerify, READ_CHUNK, TimestampCheck, apply_durability, check_commit_signatures, check_depth,
-    check_ref_binding, check_remote_option, check_static_deltas, refspec, refuse_remote_collection,
-    take_static_deltas,
+    PullVerify, READ_CHUNK, TimestampCheck, TipChecks, apply_durability, check_commit_signatures,
+    check_depth, check_remote_option, check_static_deltas, check_tip_refs, refspec,
+    refuse_remote_collection, take_static_deltas,
 };
 
 /// The number of fetched content objects that stream into the object store at
@@ -165,7 +165,11 @@ impl Repo {
     /// - The stream source keeps the requests of `summary.sig`, `summary`, and
     ///   `config` in flight together, in the order of the HTTP source. It does
     ///   the same for a `.commitmeta` and its commit, so a parent commit costs
-    ///   one round trip. The HTTP source sends these requests one at a time.
+    ///   one round trip. It also does the same for the superblock of a step of
+    ///   a [`static_deltas`](PullOptions::static_deltas) chain and the
+    ///   `.commitmeta` of the commit of the step, the superblock first, as
+    ///   `# Static deltas` states. The HTTP source sends these requests one at
+    ///   a time.
     /// - The stream source ends its session before the transaction commits.
     ///   It closes the input of the server and, over ssh, waits for the ssh
     ///   client.
@@ -200,7 +204,10 @@ impl Repo {
     /// The pull fetches each object once, also if several commits reach it.
     /// The step that fetches a commit makes the ref-binding check and the
     /// timestamp check of each requested ref that names the commit. So two
-    /// refs at one commit get both checks.
+    /// refs at one commit get both checks. For a commit of a chain of a
+    /// [`static_deltas`](PullOptions::static_deltas) list, discovery makes
+    /// these checks before the transaction opens, as `# Static deltas`
+    /// states.
     ///
     /// The pull queues no object of the tree of a commit that this repository
     /// holds complete. It follows the parent of that commit all the same, so a
@@ -334,8 +341,37 @@ impl Repo {
     ///
     /// Before the transaction opens, the pull fetches the superblock of each
     /// step and compares its SHA-256 with the digest in the list. For each
-    /// intermediate commit, it also fetches the `.commitmeta` and checks the
-    /// signatures of the commit. The pull does not request these files again.
+    /// commit of a chain, the target included, it also fetches the
+    /// `.commitmeta` and checks the signatures of the commit. For each
+    /// requested ref that names a commit of a chain, it makes the ref-binding
+    /// check and the timestamp check, in the order of the refs. So a target
+    /// that the policy, its ref binding, or the timestamp check refuses costs
+    /// the superblocks that discovery fetched, and the pull requests no part.
+    /// The pull does not request these files again, and does not check these
+    /// commits again. A commit that has no record in the last plan gets its
+    /// checks when the pull fetches it, and the pull requests its
+    /// `.commitmeta` again. This is a target whose chain the pull drops, or a
+    /// dropped intermediate commit that a depth walk reaches as a parent.
+    ///
+    /// Over a stream session, if no localcache repository holds the
+    /// `.commitmeta` of the commit of a step, the pull sends the request of
+    /// the superblock and the request of the `.commitmeta` as one pair. The
+    /// reply of the `.commitmeta` arrives while the pull parses and verifies
+    /// the superblock. So discovery then holds one superblock and one
+    /// `.commitmeta` on the heap, up to 128 MiB each, and the parse of the
+    /// superblock. A superblock that the remote does not hold costs its paired
+    /// `.commitmeta` request. If a later plan reaches the same commit through
+    /// another delta, the pull requests the `.commitmeta` again and counts it
+    /// again. So for the same pull, the metadata count over a stream session
+    /// can be higher than over HTTP: one more for each superblock that the
+    /// remote does not hold, if the remote holds the `.commitmeta` of its
+    /// commit.
+    ///
+    /// The pull keeps the verified superblocks and `.commitmeta` files of
+    /// discovery in one temp file in `tmp/` of this repository until it ends.
+    /// The file holds at most 1 GiB, the bytes of the steps that discovery
+    /// drops included. A list whose steps pass this limit fails the pull with
+    /// [`Error::Pull`], and the pull does not fetch loose.
     ///
     /// The pull applies a chain one level at a time, in its one transaction. A
     /// part of a later step can patch against an object that an earlier step
@@ -347,7 +383,7 @@ impl Repo {
     ///
     /// The pull makes no ref-binding check and no timestamp check on an
     /// intermediate commit. If a requested ref names an intermediate commit,
-    /// the pull makes both checks for that ref.
+    /// discovery makes both checks for that ref.
     ///
     /// If the remote does not hold a superblock of a chain, the pull plans
     /// again without that delta. If no chain reaches a target, the pull
@@ -428,6 +464,12 @@ impl Repo {
     ///   that target loose.
     /// - [`Error::Pull`] if a superblock names other commits than its delta
     ///   name.
+    /// - [`Error::Pull`] if the superblocks and the `.commitmeta` files of the
+    ///   chains of a list pass the limit of 1 GiB.
+    /// - [`Error::Signature`] if the policy refuses a commit of a chain of a
+    ///   list.
+    /// - [`Error::Pull`] if a requested ref that names a commit of a chain of
+    ///   a list fails the ref-binding check or the timestamp check.
     ///
     /// These errors stop the pull while it fetches:
     ///
@@ -1208,9 +1250,9 @@ impl Repo {
         if ctx.done.contains(&checksum) {
             return self.done_commit(ctx, checksum).await;
         }
-        // Discovery checked the signatures of each intermediate commit of a
-        // chain, and kept the verified `.commitmeta`. The step stages these
-        // bytes and does not request them again.
+        // Discovery checked the signatures of each commit of a chain, and kept
+        // the verified `.commitmeta`. The step stages these bytes and does not
+        // request them again.
         let (prechecked, mut known) = match ctx.delta_plan.commit_check(&checksum).await? {
             CommitCheck::NotChecked => (false, None),
             CommitCheck::Checked(detached) => (true, Some(detached)),
@@ -1291,24 +1333,22 @@ impl Repo {
         let commit = Commit::parse(&bytes)?;
         // The signature verification runs before the pull stages the commit
         // and requests its tree, so a commit that the policy refuses costs no
-        // fetch of its own objects. A target at the end of a chain comes after
-        // the runs of the levels of its chain, so a refused target still costs
-        // the objects of those levels. Discovery checked each intermediate
-        // commit before the transaction opened. The verification reads the
-        // detached metadata that this pull puts in place. That is the copy of
-        // the remote if it served one, else the copy of this repository. A
-        // later verification of the stored commit reads the same metadata.
-        if !prechecked {
-            check_commit_signatures(
-                self,
-                ctx.verification,
-                &checksum,
-                &bytes,
-                detached.as_deref(),
-            )
-            .await?;
-        }
-        self.check_tips(ctx, &checksum, &commit).await?;
+        // fetch of its own objects. Discovery checked each commit of a chain
+        // before the transaction opened: its signatures, and the checks of
+        // each requested ref that names it. The step does not check that
+        // commit again. The verification reads the detached metadata that
+        // this pull puts in place. That is the copy of the remote if it served
+        // one, else the copy of this repository. A later verification of the
+        // stored commit reads the same metadata.
+        let detached = if prechecked {
+            detached
+        } else {
+            let detached =
+                check_commit_signatures(self, ctx.verification, &checksum, &bytes, detached)
+                    .await?;
+            self.check_tips(ctx, &checksum, &commit).await?;
+            detached
+        };
 
         // The pull writes no partial marker for a commit that this repository
         // holds complete: a pull that fails elsewhere must not demote it.
@@ -1401,27 +1441,34 @@ impl Repo {
         checksum: &Checksum,
         commit: &Commit,
     ) -> Result<()> {
-        for ref_name in ctx.tips.get(checksum).into_iter().flatten() {
-            if !ctx.flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS) {
-                check_ref_binding(checksum, commit, ref_name)?;
-            }
-            self.check_timestamp(ctx, ref_name, checksum, commit)
-                .await?;
-        }
-        Ok(())
+        let refs: Vec<&str> = ctx
+            .tips
+            .get(checksum)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let checks = TipChecks {
+            bindings: !ctx.flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS),
+            timestamp: ctx.timestamp_check,
+            ref_prefix: ctx.ref_prefix,
+        };
+        check_tip_refs(self, checks, checksum, commit, &refs).await
     }
 
     /// Runs the step of a commit that an earlier run of this pull made
     /// complete in the transaction.
     ///
     /// The step reads the commit from the transaction, and makes the checks
-    /// of each requested ref that names it. It checks no signature, requests
-    /// nothing, and stages nothing. The plan follows the parent of the commit
-    /// under `depth`.
+    /// of each requested ref that names it, unless discovery made them. It
+    /// checks no signature, requests nothing, and stages nothing. The plan
+    /// follows the parent of the commit under `depth`.
     async fn done_commit(&self, ctx: &StepCtx<'_>, checksum: Checksum) -> Result<Step> {
         let bytes = ctx.txn.load_commit_bytes_staged_first(&checksum).await?;
         let commit = Commit::parse(&bytes)?;
-        self.check_tips(ctx, &checksum, &commit).await?;
+        if !ctx.delta_plan.checked(&checksum) {
+            self.check_tips(ctx, &checksum, &commit).await?;
+        }
         Ok(Step::Commit(CommitOutcome {
             checksum,
             next: CommitNext::Nothing,
@@ -1662,41 +1709,6 @@ impl Repo {
             read_buf,
         )
         .await
-    }
-
-    /// Refuses a fetched tip that is older than the commit of the check.
-    async fn check_timestamp(
-        &self,
-        ctx: &StepCtx<'_>,
-        ref_name: &str,
-        tip: &Checksum,
-        fetched: &Commit,
-    ) -> Result<()> {
-        let against = match ctx.timestamp_check {
-            TimestampCheck::Off => return Ok(()),
-            TimestampCheck::CurrentRef => {
-                let current = self
-                    .resolve_ref_tip(&refspec(ctx.ref_prefix, ref_name))
-                    .await?;
-                // A ref that this repository does not hold has nothing to be
-                // older than.
-                let Some(current) = current else {
-                    return Ok(());
-                };
-                current
-            }
-            TimestampCheck::Rev(rev) => *rev,
-        };
-        let bytes = self.load_object_bytes(ObjectType::Commit, &against).await?;
-        let current = Commit::parse(&bytes)?;
-        if fetched.timestamp >= current.timestamp {
-            return Ok(());
-        }
-        Err(Error::Pull(format!(
-            "commit {tip} (timestamp {}) is chronologically older than \
-             {against} (timestamp {})",
-            fetched.timestamp, current.timestamp
-        )))
     }
 }
 
@@ -2263,7 +2275,7 @@ pub(super) async fn fetch_detached_metadata(
 /// Fetches the `.commitmeta` of a commit from the remote, or `None` if the
 /// remote serves none. A file that the remote serves adds one to the metadata
 /// count in `progress`.
-async fn fetch_remote_detached(
+pub(super) async fn fetch_remote_detached(
     source: &RemoteSource,
     progress: &PullCounters,
     commit: &Checksum,
@@ -2292,7 +2304,7 @@ async fn cached_detached_metadata(sources: &[Repo], commit: &Checksum) -> Result
 }
 
 /// Returns the first localcache repository that holds `name`.
-async fn cached_source(sources: &[Repo], name: ObjectName) -> Result<Option<&Repo>> {
+pub(super) async fn cached_source(sources: &[Repo], name: ObjectName) -> Result<Option<&Repo>> {
     for src in sources {
         if src.has_object(name.ty, &name.checksum).await? {
             return Ok(Some(src));

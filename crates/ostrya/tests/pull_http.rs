@@ -5889,9 +5889,9 @@ fn a_missing_superblock_in_the_middle_of_a_chain() {
 }
 
 /// A pull of depth 1 through a chain under a signature policy passes.
-/// Discovery checks each intermediate commit with its `.commitmeta`, and the
-/// pull requests neither file again: the step of the parent under depth reads
-/// the commit that an earlier run made complete.
+/// Discovery checks each commit of the chain with its `.commitmeta`, the
+/// target included, and the pull requests neither file again: the step of the
+/// parent under depth reads the commit that an earlier run made complete.
 #[test]
 fn depth_one_through_a_chain_under_verification() {
     block_on(async {
@@ -5915,7 +5915,7 @@ fn depth_one_through_a_chain_under_verification() {
         dest.pull("origin", opts).await.unwrap();
 
         let seen = server.seen();
-        for commit in [b, c] {
+        for commit in [b, c, d] {
             assert_eq!(server.requests_for(&meta_path(&commit, "commit")), 0);
             assert_eq!(
                 server.requests_for(&meta_path(&commit, "commitmeta")),
@@ -5924,7 +5924,6 @@ fn depth_one_through_a_chain_under_verification() {
             );
             assert_complete(&remote, &dest, &dest_dir, &commit).await;
         }
-        assert_complete(&remote, &dest, &dest_dir, &d).await;
         assert_no_markers(&dest_dir);
         assert_eq!(
             dest.read_commit_detached_metadata(&c).await.unwrap(),
@@ -5947,7 +5946,8 @@ fn depth_one_through_a_chain_under_verification() {
 /// target. The pull passes under a signature policy, makes both refs, and
 /// requests the `.commitmeta` of each intermediate commit once. The binding
 /// check applies to the ref that names the intermediate commit: a ref that
-/// the binding of that commit does not list fails the pull.
+/// the binding of that commit does not list fails the pull in discovery,
+/// before the request of a part.
 #[test]
 fn a_target_that_is_an_intermediate_commit_of_another_target() {
     block_on(async {
@@ -5981,6 +5981,8 @@ fn a_target_that_is_an_intermediate_commit_of_another_target() {
             matches!(&err, Error::Pull(m) if m.contains("'test/alias'")),
             "{err:?}"
         );
+        let seen = server.seen();
+        assert!(part_requests(&seen).is_empty(), "{seen:?}");
         assert_nothing_published(&dest).await;
         assert_no_markers(&dest_dir);
         assert_eq!(dest.list_objects().await.unwrap(), held);
@@ -6182,9 +6184,9 @@ fn a_list_with_an_entry_twice_applies_the_chain() {
 
 /// A requested ref names an intermediate commit of the chain of another
 /// target. The ref in the destination names a newer commit, so the timestamp
-/// check refuses the intermediate commit in the run of the targets. The pull
-/// fails, keeps the refs and the objects of the destination, and leaves no
-/// marker.
+/// check refuses the intermediate commit in discovery. The pull fails before
+/// it requests a part or the superblock of the next step, keeps the refs and
+/// the objects of the destination, and leaves no marker.
 #[test]
 fn the_timestamp_check_refuses_an_older_intermediate_commit() {
     block_on(async {
@@ -6225,20 +6227,178 @@ fn the_timestamp_check_refuses_an_older_intermediate_commit() {
         let message = err.to_string();
         assert!(message.contains(&c.to_hex()), "{message}");
         assert!(message.contains(&newer.to_hex()), "{message}");
-        // The runs of the levels applied the steps to B and to C before the
-        // check failed.
         let seen = server.seen();
-        let bc_parts = part_paths(&remote, &b, &c);
-        assert_eq!(
-            positions(&seen, &bc_parts).len(),
-            bc_parts.len(),
-            "{seen:?}"
-        );
+        assert!(part_requests(&seen).is_empty(), "{seen:?}");
+        assert_eq!(server.requests_for(&superblock_path(&c, &d)), 0);
         assert!(!seen.contains(&meta_path(&c, "commit")), "{seen:?}");
         assert_eq!(
             dest.resolve_rev("origin:test/mid", true).await.unwrap(),
             Some(newer)
         );
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            None
+        );
+        assert_eq!(dest.list_objects().await.unwrap(), held);
+        assert_no_markers(&dest_dir);
+    });
+}
+
+/// The intermediate commits of a chain are signed, and the target is not.
+/// The pull refuses the target in discovery, before the transaction opens. It
+/// requests no part and no `.commit`, publishes no ref, writes no object, and
+/// leaves no marker.
+#[test]
+fn a_target_refused_by_its_signature_requests_no_part() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-unsigned-target");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        sign_commits(&remote, &[a, b, c]).await;
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        drop(dest_holding(dir.path(), &server.url(), &a).await);
+        let dest = reconfigure_dest(dir.path(), &server.url(), &signed_policy()).await;
+        let dest_dir = dir.path().join("dest");
+        let held = dest.list_objects().await.unwrap();
+        server.forget();
+
+        let err = dest.pull("origin", chain_opts(list)).await.unwrap_err();
+
+        assert!(matches!(err, Error::Signature(_)), "{err:?}");
+        let seen = server.seen();
+        assert!(part_requests(&seen).is_empty(), "{seen:?}");
+        assert!(
+            !seen.iter().any(|path| path.ends_with(".commit")),
+            "{seen:?}"
+        );
+        assert_eq!(server.requests_for(&meta_path(&d, "commitmeta")), 1);
+        assert_nothing_published(&dest).await;
+        assert_no_markers(&dest_dir);
+        assert_eq!(dest.list_objects().await.unwrap(), held);
+    });
+}
+
+/// The requested ref names the target of a chain, and the ref binding of the
+/// target lists another ref. The pull refuses the target in discovery, after
+/// the superblock of its step and before the request of a part. It publishes
+/// no ref, writes no object, and leaves no marker.
+#[test]
+fn a_target_refused_by_its_ref_binding_requests_no_part() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-target-binding");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        let txn = remote.transaction().await.unwrap();
+        txn.set_ref("test/alias", Some(&d));
+        txn.commit().await.unwrap();
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &a).await;
+        let dest_dir = dir.path().join("dest");
+        let held = dest.list_objects().await.unwrap();
+        server.forget();
+
+        let opts = PullOptions {
+            refs: vec!["test/alias".to_owned()],
+            ..chain_opts(list)
+        };
+        let err = dest.pull("origin", opts).await.unwrap_err();
+
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("'test/alias'")),
+            "{err:?}"
+        );
+        let seen = server.seen();
+        assert_eq!(server.requests_for(&superblock_path(&c, &d)), 1);
+        assert!(part_requests(&seen).is_empty(), "{seen:?}");
+        assert_nothing_published(&dest).await;
+        assert_no_markers(&dest_dir);
+        assert_eq!(dest.list_objects().await.unwrap(), held);
+    });
+}
+
+/// The ref binding of the target of a chain lists another ref, and the pull
+/// sets `DISABLE_VERIFY_BINDINGS`. Discovery makes no ref-binding check, so
+/// the pull requests the parts and writes the ref.
+#[test]
+fn a_target_with_another_ref_binding_pulls_with_the_check_disabled() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-target-binding-off");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        let txn = remote.transaction().await.unwrap();
+        txn.set_ref("test/alias", Some(&d));
+        txn.commit().await.unwrap();
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &a).await;
+        server.forget();
+
+        let opts = PullOptions {
+            refs: vec!["test/alias".to_owned()],
+            flags: PullFlags::DISABLE_VERIFY_BINDINGS,
+            ..chain_opts(list)
+        };
+        dest.pull("origin", opts).await.unwrap();
+
+        let seen = server.seen();
+        assert!(!part_requests(&seen).is_empty(), "{seen:?}");
+        assert_eq!(
+            dest.resolve_rev("origin:test/alias", false).await.unwrap(),
+            Some(d)
+        );
+    });
+}
+
+/// The timestamp check compares the target of a chain with a newer commit of
+/// the destination. The pull refuses the target in discovery, before the
+/// request of a part and of the `.commit`. It writes no ref, keeps the
+/// objects of the destination, and leaves no marker.
+#[test]
+fn a_target_refused_by_the_timestamp_check_requests_no_part() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-target-timestamp");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &a).await;
+        let dest_dir = dir.path().join("dest");
+        build_tree(&dir.path().join("newer"), b"newer\n");
+        let newer = commit_tree(
+            &dest,
+            dir.path(),
+            "newer",
+            "local/newer",
+            None,
+            FIXED_TS + 100,
+        )
+        .await;
+        let held = dest.list_objects().await.unwrap();
+        server.forget();
+
+        let opts = PullOptions {
+            timestamp_check: TimestampCheck::Rev(newer),
+            ..chain_opts(list)
+        };
+        let err = dest.pull("origin", opts).await.unwrap_err();
+
+        assert!(matches!(err, Error::Pull(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains(&d.to_hex()), "{message}");
+        assert!(message.contains(&newer.to_hex()), "{message}");
+        let seen = server.seen();
+        assert!(part_requests(&seen).is_empty(), "{seen:?}");
+        assert!(!seen.contains(&meta_path(&d, "commit")), "{seen:?}");
         assert_eq!(
             dest.resolve_rev("origin:test/main", true).await.unwrap(),
             None

@@ -2491,20 +2491,31 @@ this repository holds complete, or with a delta from scratch if the ref names
 neither a complete commit nor the target in this repository. Of two chains with
 the same number of steps, the chain from a complete commit wins. Before the
 transaction opens, it fetches the superblock of each step and checks it against
-its listed digest, and it fetches the `.commitmeta` of each intermediate commit
-and checks the signatures of that commit. It applies the chains one level at a
-time: the parts, the loose objects, and the tree walk of one level end before
-the next level starts. Each intermediate commit ends complete with no
-`.commitpartial` marker. The ref-binding check and the timestamp check apply to
-an intermediate commit only for a requested ref that names it. A `COMMIT_ONLY`
-pull ignores the list. `pull_local` reads the superblocks and the parts of a
-list from the source directory, which must be an archive repository, and the
-counters of `PullStats` count these reads as fetches. It applies one step at
-a time, in each level and in the run of the targets. Before it applies a step,
-it reads the superblock of the step again and checks it against its listed
-digest again. A superblock that is gone at that point fails the pull with
-`InvalidFormat`. `pull_local` checks the signatures and the ref binding of
-each target commit before its transaction opens.
+its listed digest, and it fetches the `.commitmeta` of each commit of a chain,
+the target included, and checks the signatures of that commit. For each
+requested ref that names a commit of a chain, it also makes the ref-binding
+check and the timestamp check before the transaction opens, so a refused
+target costs the superblocks and no part. The pull checks no commit of the
+last plan a second time. A commit with no record in the last plan gets its
+checks when the pull fetches it, and the pull requests its `.commitmeta` again:
+a target whose chain a later plan drops, or a dropped intermediate commit that
+a depth walk reaches as a parent. A pull from a remote keeps the verified
+superblocks and `.commitmeta` files in one temp file of at most 1 GiB, and a
+list whose steps pass that limit fails the pull with `Error::Pull`. It applies the chains one
+level at a time: the parts, the loose objects, and the tree walk of one level
+end before the next level starts. Each intermediate commit ends complete with
+no `.commitpartial` marker. The ref-binding check and the timestamp check apply
+to an intermediate commit only for a requested ref that names it. A
+`COMMIT_ONLY` pull ignores the list. `pull_local` reads the superblocks and the
+parts of a list from the source directory, which must be an archive
+repository, and the counters of `PullStats` count these reads as fetches. It
+applies one step at a time, in each level and in the run of the targets.
+Before it applies a step, it reads the superblock of the step again and checks
+it against its listed digest again. A superblock that is gone at that point
+fails the pull with `InvalidFormat`. `pull_local` checks the signatures and
+the ref binding of each target commit before its transaction opens, and makes
+no timestamp check. It reads the `.commitmeta` of a commit of a chain in
+discovery only if the policy checks commits.
 
 A pull checks the signatures on the commits it carries and on the remote's
 summary. `verify` holds four switches, each overriding the remote configuration
@@ -5253,8 +5264,13 @@ The pull through the stream source:
   and no whole read for a `.filez`.
 - The source sends the `Get` of `summary.sig`, `summary`, and `config` as
   three calls in flight together, and the `Get` of a `.commitmeta` and of its
-  commit as two, in the order of the HTTP pull. The HTTP pull keeps its
-  requests one after another.
+  commit as two, in the order of the HTTP pull. It sends the `Get` of the
+  superblock of a step of a `static_deltas` chain and of the `.commitmeta` of
+  its commit as two, the superblock first, if no localcache repository holds
+  the `.commitmeta`. The pull then holds one superblock and one `.commitmeta`,
+  up to 128 MiB each. A superblock that the remote does not hold costs its
+  paired `.commitmeta` request, so the metadata count can be higher than over
+  HTTP. The HTTP pull keeps its requests one after another.
 - A content object of the stream source takes no write permit. The session
   streams one body at a time, and the stores that finish after the end of
   their body are bounded by the request limit of the session,

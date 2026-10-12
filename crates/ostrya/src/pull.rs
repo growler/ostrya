@@ -1449,8 +1449,15 @@ impl Repo {
     ///
     /// Before the transaction opens, the pull reads the superblock of each
     /// step and compares its SHA-256 with the digest in the list. For each
-    /// intermediate commit, it also checks the signatures of the commit. The
-    /// walk of the commit chains does not check that commit again.
+    /// commit of a chain, the target included, it also checks the signatures
+    /// of the commit, and the ref binding of each requested ref that names
+    /// the commit. The walk of the commit chains does not check that commit
+    /// again. A local pull makes no timestamp check. So a target that the
+    /// policy or its ref binding refuses costs the reads of the superblocks,
+    /// and the pull applies no part. The pull reports this refusal before a
+    /// defect that the walk of the commit chains finds. A target with no chain
+    /// gets its checks in the walk of the commit chains, also before the
+    /// transaction opens.
     ///
     /// The pull applies a chain one level at a time, in its one transaction.
     /// The parts, the loose objects, and the tree walk of one level end before
@@ -1465,11 +1472,6 @@ impl Repo {
     /// it before the transaction, the pull plans again without that delta. If
     /// no chain reaches a target, the pull imports its objects loose, or fails
     /// under `require_static_deltas`.
-    ///
-    /// The pull checks the signatures and the ref binding of a target commit
-    /// in the walk of the commit chains, after discovery and before the
-    /// transaction opens. So a target that the policy refuses costs the reads
-    /// of discovery, and the pull applies no part.
     ///
     /// # Errors
     ///
@@ -1505,7 +1507,7 @@ impl Repo {
     ///   [`BAREUSERONLY_FILES`](PullFlags::BAREUSERONLY_FILES) check or the
     ///   check of a `bare-user-only` destination.
     /// - [`Error::Signature`] if a commit or the summary fails the signature
-    ///   policy, an intermediate commit of a chain included. Also if the
+    ///   policy, each commit of a chain included. Also if the
     ///   policy covers the summary and `src` has no `summary` or no
     ///   `summary.sig`.
     /// - [`Error::RefNotFound`] if `src` does not hold a requested ref or
@@ -1616,7 +1618,8 @@ impl Repo {
 
         // The pull finds the deltas before the transaction opens, so a refusal
         // writes no object, no ref, and no marker. With a list, discovery also
-        // checks the signatures of each intermediate commit.
+        // checks each commit of a chain: the signatures, and the ref binding of
+        // each requested ref that names it.
         let counters = PullCounters::new(None);
         let deltas = if summary.is_some() || edges.is_some() {
             delta::discover(
@@ -1661,8 +1664,8 @@ impl Repo {
         // pull puts no bound on that count, so the pull reads the metadata
         // twice.
         //
-        // Discovery checked each intermediate commit of a chain, so the walk
-        // does not check it again.
+        // Discovery checked each commit of a chain, so the walk does not check
+        // it again.
         let mut check = verification.checks_commits().then(|| ChainCheck {
             repo: self,
             sources: &sources,
@@ -1676,7 +1679,9 @@ impl Repo {
         let mut seen: HashMap<Checksum, i32> = HashMap::new();
         for (ref_name, tip) in &targets {
             let (bytes, commit) = load_commit(src, tip).await?;
-            if verify_bindings {
+            // Discovery made the binding check of each ref that names a
+            // commit of a chain.
+            if verify_bindings && !deltas.checked(tip) {
                 check_ref_binding(tip, &commit, ref_name)?;
             }
             collect_chain(
@@ -2358,7 +2363,7 @@ impl ChainCheck<'_> {
     ///
     /// A commit that discovery checked passes with no read.
     async fn check_one(&self, commit: &Checksum, bytes: &[u8]) -> Result<()> {
-        if let delta::CommitCheck::Checked(_) = self.plan.commit_check(commit).await? {
+        if self.plan.checked(commit) {
             return Ok(());
         }
         // The verification reads the detached metadata as the source holds
@@ -2369,40 +2374,60 @@ impl ChainCheck<'_> {
         let detached = detached_bytes_from(self.sources, commit)
             .await?
             .map(|(_, bytes)| bytes);
-        check_commit_signatures(
-            self.repo,
-            self.verification,
-            commit,
-            bytes,
-            detached.as_deref(),
-        )
-        .await
+        check_commit_signatures(self.repo, self.verification, commit, bytes, detached)
+            .await
+            .map(drop)
     }
 }
 
 /// Checks the signatures of `commit`, whose object holds `bytes`, against the
-/// commit policy of `verification`.
+/// commit policy of `verification`, and gives back `detached`.
 ///
 /// `detached` is the `.commitmeta` that the pull puts in place. If it is
 /// `None`, the check reads the detached metadata of `repo`. A policy that does
 /// not apply to commits passes each commit and reads nothing.
+///
+/// The parse of the detached metadata runs on the blocking pool, because the
+/// bytes can be as large as
+/// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
 async fn check_commit_signatures(
     repo: &Repo,
     verification: &verify::Verification,
     commit: &Checksum,
     bytes: &[u8],
-    detached: Option<&[u8]>,
-) -> Result<()> {
+    detached: Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
     if !verification.checks_commits() {
-        return Ok(());
+        return Ok(detached);
     }
-    let dict = match detached {
-        Some(detached) => crate::summary::parse_signature_dict(detached)?,
-        None => repo.read_commit_detached_metadata(commit).await?,
+    let (dict, detached) = match detached {
+        Some(detached) => {
+            let (dict, detached) = parse_detached(detached).await;
+            (dict?, Some(detached))
+        }
+        None => match repo.load_object_bytes(ObjectType::CommitMeta, commit).await {
+            Ok(held) => (parse_detached(held).await.0?, None),
+            Err(Error::ObjectNotFound { .. }) => (None, None),
+            Err(e) => return Err(e),
+        },
     };
     verification
         .check_commit(commit, bytes, dict.as_ref())
-        .await
+        .await?;
+    Ok(detached)
+}
+
+/// Parses the `.commitmeta` bytes `bytes` on the blocking pool, and gives
+/// back the bytes with the result.
+///
+/// A zero-length file reads as `None`, as
+/// [`Repo::read_commit_detached_metadata`] states.
+async fn parse_detached(bytes: Vec<u8>) -> (Result<Option<Value>>, Vec<u8>) {
+    ostrya_rt::unblock(move || {
+        let dict = crate::summary::parse_signature_dict(&bytes);
+        (dict, bytes)
+    })
+    .await
 }
 
 /// The object names that the plans of a pull met so far, planned or found
@@ -2752,6 +2777,81 @@ fn check_ref_binding(checksum: &Checksum, commit: &Commit, ref_name: &str) -> Re
     };
     Err(Error::Pull(format!(
         "commit {checksum}: no requested ref '{ref_name}' in ref binding metadata ({listed})"
+    )))
+}
+
+/// The checks that a pull makes for each requested ref that names a tip
+/// commit.
+#[derive(Clone, Copy)]
+struct TipChecks<'a> {
+    /// `true` if the pull makes the ref-binding check.
+    bindings: bool,
+    /// The timestamp check of the pull.
+    timestamp: &'a TimestampCheck,
+    /// The prefix of the pulled refs. The timestamp check resolves the current
+    /// tip of a ref through it. `None` is a local ref.
+    ref_prefix: Option<&'a str>,
+}
+
+/// Makes the ref-binding check and the timestamp check of each ref of `refs`,
+/// in order, for the tip commit `tip`, which parses to `commit`.
+///
+/// The first check that fails stops the call.
+async fn check_tip_refs(
+    repo: &Repo,
+    checks: TipChecks<'_>,
+    tip: &Checksum,
+    commit: &Commit,
+    refs: &[&str],
+) -> Result<()> {
+    for ref_name in refs {
+        if checks.bindings {
+            check_ref_binding(tip, commit, ref_name)?;
+        }
+        check_timestamp(
+            repo,
+            checks.timestamp,
+            checks.ref_prefix,
+            ref_name,
+            tip,
+            commit,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Refuses a fetched tip that is older than the commit of the check.
+async fn check_timestamp(
+    repo: &Repo,
+    check: &TimestampCheck,
+    ref_prefix: Option<&str>,
+    ref_name: &str,
+    tip: &Checksum,
+    fetched: &Commit,
+) -> Result<()> {
+    let against = match check {
+        TimestampCheck::Off => return Ok(()),
+        TimestampCheck::CurrentRef => {
+            let current = repo.resolve_ref_tip(&refspec(ref_prefix, ref_name)).await?;
+            // A ref that this repository does not hold has nothing to be
+            // older than.
+            let Some(current) = current else {
+                return Ok(());
+            };
+            current
+        }
+        TimestampCheck::Rev(rev) => *rev,
+    };
+    let bytes = repo.load_object_bytes(ObjectType::Commit, &against).await?;
+    let current = Commit::parse(&bytes)?;
+    if fetched.timestamp >= current.timestamp {
+        return Ok(());
+    }
+    Err(Error::Pull(format!(
+        "commit {tip} (timestamp {}) is chronologically older than \
+         {against} (timestamp {})",
+        fetched.timestamp, current.timestamp
     )))
 }
 

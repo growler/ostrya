@@ -155,6 +155,21 @@ fn an_invalid_ref_name_is_invalid_ref() {
     assert!(staging_entries(repo.path()).is_empty());
 }
 
+/// A ref name that fails the ref-name rule, here a name with a space, is
+/// `invalid-ref` at `Hello`.
+#[test]
+fn a_ref_name_outside_the_rule_is_invalid_ref() {
+    let tmp = TmpDir::new("recv-badref-rule");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let (result, error) = session(&repo, &policy(), |mut c| async move {
+        c.hello(&["a b"]).await.unwrap();
+        c.error().await
+    });
+    assert_eq!(error.code, ErrorCode::InvalidRef);
+    assert_eq!(returned_code(&result), Some(ErrorCode::InvalidRef));
+    assert!(staging_entries(repo.path()).is_empty());
+}
+
 /// A ref path that names a directory, or passes through a file, holds no
 /// ref, so the reply states the ref as absent.
 #[test]

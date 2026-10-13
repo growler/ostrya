@@ -691,6 +691,9 @@ fn the_ref_listing_refuses_bad_queries() {
             "?prefix=a%2F%2Fb",
             "?prefix=..",
             "?prefix=a/",
+            "?prefix=a%20b",
+            "?prefix=-a",
+            "?prefix=a*",
         ] {
             let target = format!("/_ostrya/refs/v1{query}");
             let (head, body) = exchange(addrs[0], &ask("GET", &target)).await;
@@ -737,10 +740,9 @@ fn the_view_still_serves_refs_heads() {
     });
 }
 
-/// Ref names that hold bytes that the query of the listing escapes.
-const ESCAPED_REFS: [&str; 8] = [
-    "odd/a b", "odd/a+b", "odd/a?b", "odd/a#b", "odd/a&b", "odd/a=b", "odd/a%b", "odd/é",
-];
+/// Ref names that hold bytes that the query of the listing escapes. The
+/// ref-name rule refuses each other name with such a byte.
+const ESCAPED_REFS: [&str; 1] = ["odd/é"];
 
 /// Returns the names of the refs of a listing, in the order of the listing.
 fn listed_names(listing: &[u8]) -> Vec<String> {

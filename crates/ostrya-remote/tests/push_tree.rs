@@ -259,6 +259,11 @@ fn options_refused_before_the_scan_start_no_ssh_client() {
             "not a valid ref name",
         ),
         (
+            "a name outside the rule",
+            Box::new(|| options(&["a b"])),
+            "not a valid ref name",
+        ),
+        (
             "a remote ref",
             Box::new(|| options(&["origin:main"])),
             "':'",

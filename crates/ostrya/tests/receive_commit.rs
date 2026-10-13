@@ -773,6 +773,29 @@ fn an_invalid_name_at_commit_is_invalid_ref() {
     assert_unchanged(&repo, &before);
 }
 
+/// A ref name that fails the ref-name rule, here a name with a space, is
+/// `invalid-ref` at `Commit`, also if `Hello` did not name it.
+#[test]
+fn a_name_outside_the_ref_name_rule_at_commit_is_invalid_ref() {
+    let tmp = TmpDir::new("recv-invalid-rule");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let before = snapshot(&repo);
+    let names = vec!["test/main".to_string()];
+    refused(
+        push_named(
+            &repo,
+            &policy(),
+            &names,
+            &fixture_objects(Encoding::Raw),
+            &[],
+            vec![update("a b", Expected::Absent, Some(fixture_commit()))],
+            false,
+        ),
+        ErrorCode::InvalidRef,
+    );
+    assert_unchanged(&repo, &before);
+}
+
 /// A ref name of 64 lowercase hex characters passes `Hello`. A revision reads
 /// such a name as a commit checksum. An update that writes a commit to it is
 /// `invalid-ref` at `Commit`, also if `Hello` did not name it. If the name has

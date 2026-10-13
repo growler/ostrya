@@ -596,8 +596,7 @@ note: the target of `-A --create` is answered by an existence check that stands
  name no ref holds and no `Invalid refspec` line reaches this site. The name is
  read as given and names no ref in any repository, so the setup binds everything
  the invocation reads. `refs-bytes` states that neither wrote a link. The other
- refused shapes, and the target the tool's own character class refuses, are in
- `refs/invalid-refspec-forms` below.
+ refused shapes are in `refs/invalid-refspec-forms` below.
 
 family: M10
 subcommand: refs
@@ -960,10 +959,11 @@ note: the refused-name cases the single-branch setup does not bind: every shape
  an alias target takes, which both report as `Cannot create alias to non-existent
  ref: <target>` -- the existence check standing ahead of the name rule there --
  with the tool answering a target naming a directory the same way where the port
- reports its `Is a directory` line, and a target the tool's own character class
- refuses parting the two over a ref `ostrya commit -b` wrote; and a remote half
- holding a `/`, which is one
- component in both. The cited test also pins the two divergences
+ reports its `Is a directory` line, and the same line for each target the
+ ref-name rule refuses, such as `tes~t` and `a:b:c`; a remote half holding a
+ `/`, which is one component in both; and `commit -b` of a name the rule
+ refuses, which both refuse with exit 1 and no ref written. The cited test
+ also pins the two divergences
  `cli-surface.md`, "P1" records -- the empty refspec as the zero-length case of
  the tool's abbreviated-checksum scan, which the repository's four commits
  make not unique, and what a ref name that names a directory draws: the
@@ -1312,9 +1312,8 @@ note: `REV^` walking one generation, `REV^^` walking two, and the root
  builds one by committing three times onto one branch, each commit taking the
  tip the one before it left (Phase 17b1 of `../port-plan.md`). The cited
  test also covers `-S` reporting more than one commit, and the `~N` and `^N`
- non-syntaxes, where the tool reports `error: Invalid refspec <rev>` and the
- port reports `error: Refspec '<rev>' not found` (`cli-surface.md`, "P1"); the
- same repository serves all three.
+ non-syntaxes, where both report `error: Invalid refspec <rev>`; the same
+ repository serves all three.
 
 family: M10
 subcommand: rev-parse
@@ -10122,7 +10121,8 @@ cell: prune/refs-only-deletes-a-shadowed-ref-commit
 setup: repo-with-commit
 outcome: lossy
 severity: interop
-loss: a ref name outside the character class the tool validates against. The
+loss: a ref name outside the ref-name rule. Such a name arises by an
+ out-of-band write alone, and the port refuses it on every write path. The
  tool's ref enumeration skips such a name without a word, so its
  `prune --refs-only` reads the commit that ref holds as unreachable and deletes
  it, leaving the ref file over an absent object. The port enumerates the name
@@ -10131,9 +10131,7 @@ evidence: ostrya_cli::cli::prune_refs_only_parts_on_a_shadowed_ref_name
 spec: cli-surface.md#p1----reading-and-resolution
 note: a name of that shape reaches a repository by an out-of-band write alone,
  which the cited test performs, so no `run:` line states the case. The test
- states the pair over `odd~1` and `main^`, the two spellings of the one class.
- The character class itself is deferred; adopting it tightens `resolve_rev`,
- `commit -b`, and every pull path at once.
+ states the pair over `odd~1` and `main^`, the two spellings of the one rule.
 
 # ---------------------------------------------------------------------------
 # fsck -- the option set, the output format, and the two verification

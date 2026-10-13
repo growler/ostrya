@@ -3260,6 +3260,36 @@ fn a_local_pull_refuses_a_static_delta_list_it_cannot_take() {
     });
 }
 
+/// A local pull of a requested ref name that fails the ref-name rule gives
+/// `InvalidRefspec`, and writes no object, no ref, and no state.
+#[test]
+fn a_local_pull_refuses_a_requested_name_outside_the_ref_name_rule() {
+    let tmp = TmpDir::new("pull-name-rule");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, _c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let inventory = |dir: &Path| {
+            let mut out = file_inventory(dir, "objects");
+            out.extend(file_inventory(dir, "refs"));
+            out.extend(file_inventory(dir, "state"));
+            out
+        };
+        let before = inventory(&dst_dir);
+        for name in ["a b", "a*", "-a", "a/.b", "a:b:c"] {
+            let opts = PullOptions {
+                refs: vec![name.to_owned()],
+                ..PullOptions::default()
+            };
+            match dst.pull_local(&src, opts).await {
+                Err(Error::InvalidRefspec(got)) => assert_eq!(got, name),
+                other => panic!("{name:?}: {other:?}"),
+            }
+            assert_eq!(inventory(&dst_dir), before, "{name:?}");
+        }
+    });
+}
+
 // --- static deltas -------------------------------------------------------
 
 /// Generates a delta in `repo` with a fixed timestamp under `opts`, and
@@ -4296,10 +4326,11 @@ fn a_collection_ref_path_through_a_directory_or_a_file_is_not_found() {
     });
 }
 
-/// With a collection id, an abbreviated checksum and an ancestry suffix are
-/// part of the ref name. The source holds `main` under `refs/heads` and as a
-/// collection ref. If the pull reads either name as a revision, it finds a
-/// commit.
+/// With a collection id, an abbreviated checksum is part of the ref name, and
+/// an ancestry suffix makes the name invalid. The source holds `main` under
+/// `refs/heads` and as a collection ref. If the pull reads the checksum as a
+/// revision, it finds a commit. If it reads `main^` as a revision, it pulls
+/// the parent of `main`.
 #[test]
 fn a_collection_ref_name_takes_no_revision_syntax() {
     let tmp = TmpDir::new("pull-collection-revision");
@@ -4310,27 +4341,37 @@ fn a_collection_ref_name_takes_no_revision_syntax() {
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
         let hex = c2.to_hex();
 
-        for name in [&hex[..10], "main^"] {
-            let err = dst
-                .pull_local(&src, collection_pull(&[name]))
-                .await
-                .unwrap_err();
-            match err {
-                Error::RefNotFound(path) => {
-                    assert_eq!(path, format!("refs/mirrors/{COLLECTION}/{name}"))
-                }
-                other => panic!("{name}: {other:?}"),
+        let name = &hex[..10];
+        let err = dst
+            .pull_local(&src, collection_pull(&[name]))
+            .await
+            .unwrap_err();
+        match err {
+            Error::RefNotFound(path) => {
+                assert_eq!(path, format!("refs/mirrors/{COLLECTION}/{name}"))
             }
-            assert_nothing_left(&dst_dir, &dst, &c2).await;
+            other => panic!("{name}: {other:?}"),
         }
+        assert_nothing_left(&dst_dir, &dst, &c2).await;
+
+        let name = "main^";
+        let err = dst
+            .pull_local(&src, collection_pull(&[name]))
+            .await
+            .unwrap_err();
+        match err {
+            Error::InvalidRefspec(pair) => assert_eq!(pair, format!("{COLLECTION}:{name}")),
+            other => panic!("{name}: {other:?}"),
+        }
+        assert_nothing_left(&dst_dir, &dst, &c2).await;
     });
 }
 
-/// The pull refuses an invalid collection id, and a name that holds `:`,
-/// before it reads the source. The error holds the pair. The pull requires
-/// static deltas and the source holds no summary. If the check comes after the
-/// first read of the source, the error is that of the absent summary, as for
-/// the valid pair.
+/// The pull refuses an invalid collection id, and a name that fails the
+/// ref-name rule, before it reads the source. The error holds the pair. The
+/// pull requires static deltas and the source holds no summary. If the check
+/// comes after the first read of the source, the error is that of the absent
+/// summary, as for the valid pair.
 #[test]
 fn an_invalid_collection_id_or_name_is_refused_before_the_source_is_read() {
     let tmp = TmpDir::new("pull-collection-invalid");
@@ -4363,6 +4404,9 @@ fn an_invalid_collection_id_or_name_is_refused_before_the_source_is_read() {
             (COLLECTION, "a:b"),
             (COLLECTION, "x:"),
             (COLLECTION, ":y"),
+            (COLLECTION, "main^"),
+            (COLLECTION, "a b"),
+            (COLLECTION, "-a"),
         ] {
             match dst.pull_local(&src, opts(id, name)).await {
                 Err(Error::InvalidRefspec(pair)) => {

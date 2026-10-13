@@ -999,23 +999,29 @@ fn a_dangling_alias_is_never_classified_and_never_deleted() {
     });
 }
 
-/// Two ref files under `refs/remotes` can list under one name, and the refspec
-/// rule addresses only one of them. The run classifies the file that the name
-/// addresses. The other file stays strong, and the run does not change it.
+/// A ref file under `refs/remotes` that an out-of-band write placed under a
+/// name outside the ref-name rule is never classified. The run does not change
+/// it, and its commit stands. A ref with a valid remote name is classified one
+/// time.
 ///
 /// `refs/remotes/a:b/pool/x` and `refs/remotes/a/b:pool/x` both list as
-/// `a:b:pool/x`. That name maps to the second file. The same is true one level
-/// up. A file directly under `refs/remotes` lists under a name that maps below
-/// `refs/heads`.
+/// `a:b:pool/x`, a name that holds a `:` in its name part. The rule refuses
+/// that name, so neither file is addressable. The refspec `a:pool/x` is valid
+/// and maps to `refs/remotes/a/pool/x`. A file directly under `refs/remotes`
+/// lists under a name that maps below `refs/heads`.
 #[test]
-fn a_colon_bearing_remote_directory_is_never_classified() {
+fn a_remote_ref_outside_the_name_rule_is_never_classified() {
     let tmp = TmpDir::new("weak-refs-colon-remote");
     block_on(async {
-        let repo = repo_with_trees(tmp.path(), &["head", "shadowed", "addressed", "stray"]).await;
+        let repo = repo_with_trees(
+            tmp.path(),
+            &["head", "shadowed", "second", "addressed", "stray"],
+        )
+        .await;
         commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
 
-        // No refspec addresses this file, so the test writes it with blocking
-        // `std::fs`.
+        // No write path of the library accepts these names, so the test writes
+        // the files with blocking `std::fs`.
         let shadowed = commit(&repo, tmp.path(), "shadowed", None, None, None).await;
         let shadowed_root = commit_root(&repo, &shadowed).await;
         let shadowed_path = tmp.path().join("repo/refs/remotes/a:b/pool/x");
@@ -1023,13 +1029,20 @@ fn a_colon_bearing_remote_directory_is_never_classified() {
         std::fs::create_dir_all(shadowed_path.parent().unwrap()).unwrap();
         std::fs::write(&shadowed_path, &shadowed_body).unwrap();
 
-        // The refspec `a:b:pool/x` addresses `refs/remotes/a/b:pool/x`.
+        let second = commit(&repo, tmp.path(), "second", None, None, None).await;
+        let second_root = commit_root(&repo, &second).await;
+        let second_path = tmp.path().join("repo/refs/remotes/a/b:pool/x");
+        let second_body = format!("{}\n", second.to_hex());
+        std::fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+        std::fs::write(&second_path, &second_body).unwrap();
+
+        // The refspec `a:pool/x` is valid and addresses its own file.
         let addressed = commit(&repo, tmp.path(), "addressed", None, None, None).await;
         let addressed_root = commit_root(&repo, &addressed).await;
-        repo.set_ref_immediate("a:b:pool/x", Some(&addressed))
+        repo.set_ref_immediate("a:pool/x", Some(&addressed))
             .await
             .unwrap();
-        let addressed_path = tmp.path().join("repo/refs/remotes/a/b:pool/x");
+        let addressed_path = tmp.path().join("repo/refs/remotes/a/pool/x");
         assert!(
             addressed_path.exists(),
             "the refspec wrote the file it maps to"
@@ -1048,14 +1061,18 @@ fn a_colon_bearing_remote_directory_is_never_classified() {
         let stats = repo.prune(&weak_options(filter)).await.unwrap();
 
         let names = recorded(&seen);
+        assert!(
+            !names.iter().any(|n| n == "a:b:pool/x"),
+            "no file that lists as a name outside the rule reached the classifier: {names:?}"
+        );
         assert_eq!(
-            names.iter().filter(|n| *n == "a:b:pool/x").count(),
+            names.iter().filter(|n| *n == "a:pool/x").count(),
             1,
-            "the name reached the classifier once, for the file it addresses: {names:?}"
+            "the valid name reached the classifier once: {names:?}"
         );
         assert_eq!(
             stats.deleted_refs,
-            vec!["a:b:pool/x".to_owned()],
+            vec!["a:pool/x".to_owned()],
             "the run deleted the addressed ref alone"
         );
         assert!(!addressed_path.exists(), "the addressed file is gone");
@@ -1064,19 +1081,24 @@ fn a_colon_bearing_remote_directory_is_never_classified() {
             !holds_tree(&repo, &addressed_root).await,
             "with the tree only it reached"
         );
-        assert_eq!(
-            std::fs::read_to_string(&shadowed_path).unwrap(),
-            shadowed_body,
-            "the shadowed file stands with the content it was written with"
-        );
-        assert!(
-            holds(&repo, &shadowed).await,
-            "so it rooted the walk and its commit survives"
-        );
-        assert!(
-            holds_tree(&repo, &shadowed_root).await,
-            "and so does the tree it reaches"
-        );
+        for (path, body, commit_id, root) in [
+            (&shadowed_path, &shadowed_body, &shadowed, &shadowed_root),
+            (&second_path, &second_body, &second, &second_root),
+        ] {
+            assert_eq!(
+                &std::fs::read_to_string(path).unwrap(),
+                body,
+                "the file stands with the content it was written with"
+            );
+            assert!(
+                holds(&repo, commit_id).await,
+                "so it rooted the walk and its commit survives"
+            );
+            assert!(
+                holds_tree(&repo, root).await,
+                "and so does the tree it reaches"
+            );
+        }
         assert!(stray_path.exists(), "the stray remote file stands");
         assert!(
             tmp.path().join("repo/refs/heads/poolstray").exists(),

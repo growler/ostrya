@@ -511,6 +511,18 @@ mod tests {
                 names(),
             ),
             (
+                "a ref name outside the ref-name rule",
+                vec![update("a b", Expected::Any, Some(commit()))],
+                Compression::None,
+                names(),
+            ),
+            (
+                "a refspec with a second colon",
+                vec![update("o:a:b", Expected::Any, Some(commit()))],
+                Compression::None,
+                names(),
+            ),
+            (
                 "a ref name of 64 lowercase hex characters",
                 vec![update(&"ab".repeat(32), Expected::Any, Some(commit()))],
                 Compression::None,

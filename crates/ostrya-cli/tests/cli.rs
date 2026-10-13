@@ -8132,29 +8132,15 @@ fn refs_alias_matches_the_tool() {
             vec!["refs", "-A", "--create=origin:bad/", "test/main"],
             "error: Invalid refspec origin:bad/",
         ),
+        // A NEWREF holding a second `:` fails the ref-name rule at the same
+        // step in both implementations, ahead of the remote refusal.
+        (
+            vec!["refs", "-A", "--create=a:b:c", "test/main"],
+            "error: Invalid refspec a:b:c",
+        ),
     ] {
         assert_agrees_on_error(&port, &tool, &args, message);
     }
-    // A NEWREF holding a second `:` is one the port's own ref rule accepts and
-    // the tool's refuses, so the two refuse it at different steps: the port
-    // reaches the remote refusal and reports the first half, and the tool reports
-    // the whole name (`docs/conformance/cli-surface.md`, "P1"). Both exit 1 and
-    // write nothing, which is what the refs tree below states.
-    let (port_run, tool_run) =
-        run_both(&port, &tool, &["refs", "-A", "--create=a:b:c", "test/main"]);
-    for (who, run) in [("port", &port_run), ("tool", &tool_run)] {
-        assert_eq!(
-            run.status.code(),
-            Some(1),
-            "the {who} did not refuse `-A --create=a:b:c`"
-        );
-    }
-    assert!(
-        String::from_utf8_lossy(&port_run.stderr)
-            .contains("error: Cannot create alias to remote ref: a"),
-    );
-    assert!(String::from_utf8_lossy(&tool_run.stderr).contains("error: Invalid refspec a:b:c"));
-
     assert_eq!(
         describe_refs(&port),
         before,
@@ -9532,9 +9518,8 @@ fn invalid_refspec_matches_the_tool() {
     // name rule, so every name the rule refuses is reported as a name no ref
     // holds, in both implementations, and no `Invalid refspec` line reaches this
     // site: a traversal component, an empty component, `.`, `..`, the empty
-    // name, an empty ref half, a second `:`, a `/` in the remote half, a name
-    // the tool's character class refuses and the port's rule accepts, and an
-    // ancestry suffix, which names a commit.
+    // name, an empty ref half, a second `:`, a `/` in the remote half, a `~` in
+    // a component, and an ancestry suffix, which names a commit.
     for target in [
         "a/../b",
         "a//b",
@@ -9586,34 +9571,41 @@ fn invalid_refspec_matches_the_tool() {
         "a refused name wrote a ref",
     );
 
-    // A target the tool's character class refuses and the port's rule accepts
-    // parts the two at this site: with the ref written by `ostrya commit -b`,
-    // the port writes the alias and the tool reports the target as non-existent
-    // (`docs/conformance/cli-surface.md`, "P1"). The two trees part company, so
-    // this pair of clones is its own.
-    let odd_port = clone_repo(base, &repo, "refspec-odd-port");
-    let odd_tool = clone_repo(base, &repo, "refspec-odd-tool");
-    for side in [&odd_port, &odd_tool] {
-        commit_tree(side, "tes~t", &base.join("src"), None);
+    // A branch name the ref-name rule refuses is refused by `commit -b` in both
+    // implementations: exit 1, and no ref written.
+    let src = base.join("src");
+    let before = describe_refs(&port);
+    for branch in ["tes~t", "te st", "a^b"] {
+        let (refused, tool_refused) = run_both(
+            &port,
+            &tool,
+            &[
+                "commit",
+                "-b",
+                branch,
+                "-s",
+                "x",
+                "--canonical-permissions",
+                src.to_str().unwrap(),
+            ],
+        );
+        for (who, run) in [("port", &refused), ("tool", &tool_refused)] {
+            assert_eq!(
+                run.status.code(),
+                Some(1),
+                "the {who} did not refuse the branch `{branch}`"
+            );
+        }
     }
-    let (written, missing) = run_both(
-        &odd_port,
-        &odd_tool,
-        &["refs", "-A", "--create=al", "tes~t"],
-    );
-    written.ok();
     assert_eq!(
-        std::fs::read_link(odd_port.join("refs/heads/al")).unwrap(),
-        Path::new("tes~t"),
+        describe_refs(&port),
+        before,
+        "the port wrote a refused name"
     );
-    assert_eq!(missing.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&missing.stderr)
-            .contains("error: Cannot create alias to non-existent ref: tes~t"),
-    );
-    assert!(
-        odd_tool.join("refs/heads/al").symlink_metadata().is_err(),
-        "the tool wrote an alias to a name its class refuses",
+    assert_eq!(
+        describe_refs(&tool),
+        before,
+        "the tool wrote a refused name"
     );
 
     // Two divergences the same surface carries, recorded in
@@ -9764,6 +9756,89 @@ fn invalid_refspec_matches_the_tool() {
     );
 }
 
+/// A refspec whose remote or name fails the ref-name rule is refused by `refs
+/// --create`: exit 1, nothing on standard output, and no ref written. The
+/// test needs no `ostree` tool.
+#[test]
+fn a_refspec_outside_the_ref_name_rule_is_refused_on_write() {
+    let tmp = TmpDir::new("refspec-rule-write");
+    let base = tmp.path();
+    let repo = build_multi_ref_repo(base);
+    let before = describe_refs(&repo);
+    let repo_arg = format!("--repo={}", repo.display());
+    for name in [
+        "o r:main",
+        "o*:main",
+        "-o:main",
+        ".o:main",
+        "o~:main",
+        "o:a b",
+        "a\u{a0}b",
+        "a\u{200b}b",
+        "a\u{1f600}b",
+    ] {
+        let run = Command::new(env!("CARGO_BIN_EXE_ostrya"))
+            .args(["refs", &repo_arg, &format!("--create={name}"), "plain"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(run.status.code(), Some(1), "{name:?}");
+        assert!(run.stdout.is_empty(), "{name:?}");
+        assert_eq!(describe_refs(&repo), before, "{name:?} wrote a ref");
+    }
+}
+
+/// A ref name that is not valid UTF-8 is refused at the decoding of the
+/// arguments: exit 1, nothing on standard output, and no ref written. The
+/// test needs no `ostree` tool.
+#[test]
+fn a_non_utf8_ref_name_is_refused() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = TmpDir::new("refspec-non-utf8");
+    let base = tmp.path();
+    let repo = build_multi_ref_repo(base);
+    let before = describe_refs(&repo);
+    let name = OsStr::from_bytes(b"a\x80b");
+    let src = base.join("src");
+    let repo_arg = format!("--repo={}", repo.display());
+    let create_name = create_arg(b"--create=", name);
+    let branch_name = create_arg(b"--branch=", name);
+    let create = [
+        OsStr::new("refs"),
+        OsStr::new(&repo_arg),
+        create_name.as_os_str(),
+        OsStr::new("plain"),
+    ];
+    let commit = [
+        OsStr::new("commit"),
+        OsStr::new(&repo_arg),
+        branch_name.as_os_str(),
+        OsStr::new("-s"),
+        OsStr::new("x"),
+        OsStr::new("--canonical-permissions"),
+        src.as_os_str(),
+    ];
+    for args in [&create[..], &commit[..]] {
+        let run = Command::new(env!("CARGO_BIN_EXE_ostrya"))
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(run.status.code(), Some(1), "{args:?}");
+        assert!(run.stdout.is_empty(), "{args:?}");
+        assert_eq!(describe_refs(&repo), before, "{args:?} wrote a ref");
+    }
+
+    /// Joins an option and a value of raw bytes into one argument.
+    fn create_arg(option: &[u8], value: &OsStr) -> std::ffi::OsString {
+        let mut bytes = option.to_vec();
+        bytes.extend_from_slice(value.as_bytes());
+        OsStr::from_bytes(&bytes).to_owned()
+    }
+}
+
 #[test]
 fn rev_parse_ancestry_matches_the_tool() {
     if !ostree_available() {
@@ -9809,26 +9884,17 @@ fn rev_parse_ancestry_matches_the_tool() {
         "error: Multiple commit objects found",
     );
 
-    // `~N` and `^N` are not revision syntax. The tool refuses both names at its
-    // own ref-name character class, and the port's rule accepts them, so the port
-    // reads the whole revision as a refspec and reports the not-found line both
-    // give a name that resolves to nothing. A checksum carrying either suffix
-    // takes the same path (`docs/conformance/cli-surface.md`, "P1").
+    // `~N` and `^N` are not revision syntax. The ref-name rule refuses both
+    // names in both implementations, so each reports the whole revision as an
+    // invalid refspec. A checksum carrying either suffix takes the same path.
     let suffixed = format!("{tip}~1");
     for rev in ["chain~1", "chain^2", suffixed.as_str()] {
-        let (absent, refused) = run_both(&repo, &repo, &["rev-parse", rev]);
-        for (who, run, message) in [
-            (
-                "port",
-                &absent,
-                format!("error: Refspec '{rev}' not found\n"),
-            ),
-            ("tool", &refused, format!("error: Invalid refspec {rev}\n")),
-        ] {
-            assert_eq!(run.status.code(), Some(1), "the {who} did not exit 1");
-            assert_eq!(String::from_utf8_lossy(&run.stderr), message);
-            assert_eq!(String::from_utf8_lossy(&run.stdout), "");
-        }
+        assert_agrees_on_error(
+            &repo,
+            &repo,
+            &["rev-parse", rev],
+            &format!("error: Invalid refspec {rev}"),
+        );
     }
 }
 
@@ -10650,36 +10716,27 @@ fn commit_ancestry_branch_name_matches_the_tool() {
         ],
     );
 
-    // The boundary the guard does not cross: a `^` inside the name is a ref name
-    // to the port and a refused one to the tool, which is the ref-name character
-    // class `cli-surface.md` "P1" records as deferred.
+    // A `^` inside the name fails the ref-name rule, so both refuse it with the
+    // same line and write nothing.
     let port_repo = clone_repo(base, &empty, "interior-port");
     let tool_repo = clone_repo(base, &empty, "interior-tool");
     let (port, tool) = run(&commit_args("a^b", src), &port_repo, &tool_repo);
-    assert_eq!(
-        port.status.code(),
-        Some(0),
-        "the port refused an interior `^`: {}",
-        String::from_utf8_lossy(&port.stderr),
-    );
-    let written = String::from_utf8_lossy(&port.stdout).trim().to_owned();
-    assert!(
-        describe_refs(&port_repo).contains(&format!("heads/a^b = {written}")),
-        "the port wrote no ref for an interior `^`",
-    );
+    refused("port", &port, "error: Invalid refspec a^b\n");
     refused("tool", &tool, "error: Invalid refspec a^b\n");
-    assert_eq!(
-        describe_refs(&tool_repo),
-        untouched,
-        "the tool wrote a ref for an interior `^`",
-    );
+    for (who, repo) in [("port", &port_repo), ("tool", &tool_repo)] {
+        assert_eq!(
+            describe_refs(repo),
+            untouched,
+            "the {who} wrote a ref for an interior `^`",
+        );
+    }
 
     // What the guard stands for. A ref of the refused shape now arrives by an
     // out-of-band write alone, and where one stands the tool's enumeration skips
     // it without a word, so its `prune --refs-only` reads the commit that ref
     // holds as unreachable and deletes it, leaving the ref file over an absent
-    // object. This is the class the `odd~1` item of `cli-surface.md` "P1"
-    // records for a name the tool's character class refuses.
+    // object. The same holds for a name such as `odd~1` that the ref-name rule
+    // refuses.
     let shadowed = clone_repo(base, &rooted, "shadowed");
     std::fs::remove_file(shadowed.join("refs/heads/main")).unwrap();
     write_ref_file(&shadowed, "heads/main^", &root);

@@ -35,7 +35,9 @@ pub type WeakRefFilterFn = Arc<dyn Fn(&str, &Checksum) -> bool + Send + Sync>;
 /// The ref classifier of a prune, unset by default.
 ///
 /// An unset filter marks every ref strong, so a prune with no filter deletes no
-/// ref. [`PruneOptions::weak_ref_filter`] states how a run uses the verdicts.
+/// ref. A ref whose name fails the ref-name rule is never offered to the
+/// filter and is always strong. [`PruneOptions::weak_ref_filter`] states how a
+/// run uses the verdicts.
 ///
 /// The callback is in an [`Arc`], so a caller can share one classifier across
 /// more than one [`PruneOptions`]. A classifier that keeps state must supply
@@ -275,6 +277,10 @@ pub struct PruneOptions {
     /// name. A prefix that is a bare segment also matches a remote refspec, and
     /// so does a substring test. For example, the prefix `pool` matches
     /// `poolcache:main`, the refspec of a ref of the remote `poolcache`.
+    ///
+    /// A ref whose name fails the ref-name rule is never offered to the filter
+    /// and is always strong. Only an out-of-band write can put such a name on
+    /// disk, because each write path of the library refuses it.
     ///
     /// A strong ref roots the walk under the bound that
     /// [`retain_branch_depth`](PruneOptions::retain_branch_depth),

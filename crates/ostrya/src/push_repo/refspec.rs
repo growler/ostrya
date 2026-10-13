@@ -265,6 +265,17 @@ mod tests {
     }
 
     #[test]
+    fn a_destination_outside_the_ref_name_rule_is_an_invalid_refspec() {
+        for dst in ["a b", "a*", "-a", "a/.b", "a~b"] {
+            assert_invalid_refspec(split(&format!("main:{dst}")), dst);
+            assert_invalid_refspec(split(&format!(":{dst}")), dst);
+        }
+        for dst in ["a.", "_a", "1a", "é"] {
+            assert_eq!(split(&format!("main:{dst}")).unwrap().dst, Some(dst));
+        }
+    }
+
+    #[test]
     fn a_destination_of_64_lowercase_hex_characters_is_an_invalid_refspec() {
         let hex = "ab".repeat(32);
         assert_invalid_refspec(split(&format!("main:{hex}")), &hex);

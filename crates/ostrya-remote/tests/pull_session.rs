@@ -1170,7 +1170,8 @@ fn fetch_refs_gives_the_limit_exceeded_of_the_server() {
     );
 }
 
-/// A prefix that is not a ref name is `InvalidInput`. The call writes
+/// A prefix that is not a ref name, such as a prefix with a space, a leading
+/// `-`, or a wildcard, is `InvalidInput`. The call writes
 /// nothing, and the session stays usable: the next frame that the server
 /// reads is the `Get` of a later call.
 #[test]
@@ -1182,7 +1183,15 @@ fn fetch_refs_refuses_a_bad_prefix_and_writes_nothing() {
             let session = PullSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
-            for bad in [&[""][..], &["a/../b"], &["a/"], &["main", "/main"]] {
+            for bad in [
+                &[""][..],
+                &["a/../b"],
+                &["a/"],
+                &["main", "/main"],
+                &["a b"],
+                &["-a"],
+                &["a*"],
+            ] {
                 let e = session.fetch_refs(bad).await.unwrap_err();
                 assert!(matches!(e, Error::InvalidInput(_)), "{bad:?}: {e:?}");
             }
@@ -1307,14 +1316,14 @@ fn fetch_refs_over_http_refuses_bad_input_before_a_request() {
         .map(|n| format!("{n:0>64}"))
         .collect::<Vec<String>>();
     let long: Vec<&str> = long.iter().map(String::as_str).collect();
-    // One prefix of 5,500 spaces is 16,500 bytes encoded.
-    let spaces = " ".repeat(5_500);
+    // One prefix of 2,750 `é` is 16,500 bytes encoded.
+    let accents = "é".repeat(2_750);
     ostrya_rt::block_on(async {
         for (case, prefixes) in [
             ("bad prefix", &["main", "a/../b"][..]),
             ("257 prefixes", &many),
             ("long target", &long),
-            ("escaped target", &[spaces.as_str()][..]),
+            ("escaped target", &[accents.as_str()][..]),
         ] {
             let e = session.fetch_refs(prefixes).await.unwrap_err();
             assert!(matches!(e, Error::InvalidInput(_)), "{case}: {e:?}");

@@ -535,7 +535,9 @@ mod tests {
                 "{caret}"
             );
         }
-        for bad in ["", "/a", "a/", "a//b", ".", "..", "a/../b", "a\0b"] {
+        for bad in [
+            "", "/a", "a/", "a//b", ".", "..", "a/../b", "a\0b", "a b", "a*", "-a", "a/.b",
+        ] {
             assert!(
                 refused(with_refs(&[bad])).contains("not a valid ref name"),
                 "{bad:?}"

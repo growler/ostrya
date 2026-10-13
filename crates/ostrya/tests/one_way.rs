@@ -1272,6 +1272,15 @@ mod export {
         );
         assert!(matches!(error, Error::InvalidRefspec(_)), "{error:?}");
         assert_eq!(calls, 0);
+        for name in ["a b", "a*", "-a", "a/.b", "o:a:b"] {
+            let (error, calls) =
+                refused(repo, with(vec![update(name, Expected::Any, Some(commit))]));
+            assert!(
+                matches!(&error, Error::InvalidRefspec(n) if n == name),
+                "{name}: {error:?}"
+            );
+            assert_eq!(calls, 0, "{name}");
+        }
         let hex = "a".repeat(64);
         let (error, calls) = refused(repo, with(vec![update(&hex, Expected::Any, Some(commit))]));
         assert!(

@@ -116,6 +116,7 @@ pub(crate) struct ListedRef {
     pub(crate) name: String,
     /// `true` if that name addresses the file that the listing read, by the
     /// rule of [`listed_name_addresses_it`](crate::refs::listed_name_addresses_it).
+    /// A name that fails the ref-name rule gives `false`.
     pub(crate) addressable: bool,
     /// The commit that the ref resolves to.
     pub(crate) checksum: Checksum,

@@ -509,19 +509,42 @@ an individual loose file; there is no packed-refs mechanism.
 
 Ref name validation. A ref name is one or more `/`-separated components. Each
 component is non-empty, does not begin with `-` or `.`, and holds only
-alphanumerics, `-`, `.`, `_`, and bytes at or above `0x80`. One optional `:`
+ASCII alphanumerics, `-`, `.`, `_`, and the non-ASCII characters that this
+paragraph states. One optional `:`
 separates a remote name from the ref name, and a second `:` is invalid.
 Recovered by feeding `ostree rev-parse` one candidate name per ASCII
 punctuation character: the tool accepts `a-b`, `a.b`, `a_b`, `a..b`, `a.`,
 `0ab`, and `té`, and rejects each of `! " # $ % & ' ( ) * + , ; < = > ? @ [ \ ]
 ^ ` { | } ~` and space in a component, `-a` and `.a` and `~a` and `+a` at the
 start of one, an empty component (`a//b`, `/a`, `a/`), and `a:b:c`, each with
-`error: Invalid refspec <name>` and exit 1. The remote is one component, so
-`a/b:x` is refused too. The port's own check is narrower -- it rejects an empty
-name, an empty, `.`, or `..` component, a `/` in the remote name or in the
-collection id, and an interior NUL, and accepts the rest -- so `ostrya refs
---create` writes some names the tool then refuses to resolve
-(`conformance/cli-surface.md`, "P1 -- reading and resolution").
+`error: Invalid refspec <name>` and exit 1. The remote follows the rule of a
+component: `o r:main`, `o*:main`, `-o:main`, `.o:main`, and `o~:main` are
+refused, and `é:main`, `o.:main`, and `_o:main` are accepted. The remote is one
+component, so `a/b:x` is refused too. The port applies the same rule to the
+remote and to the name part of every ref name and refspec, and refuses an empty
+name and a name part with a `:`. The collection id is one component that is
+not empty, is not `.` or `..`, and holds no `/` and no NUL.
+
+The non-ASCII part of the rule was recovered by feeding `ostree refs
+--create=NAME` a name with one character, for each non-ASCII character for
+which Rust `char::is_alphanumeric` is true. The tool accepts letters, numbers,
+and nonspacing combining marks (Unicode category Mn), and non-ASCII connector
+punctuation (category Pc). It refuses controls, spaces, format characters,
+symbols, other punctuation, private use characters, `U+FFFD`, emoji, spacing
+combining marks (category Mc), enclosing marks (category Me), circled and
+enclosed letters, and characters that its Unicode tables do not hold.
+`U+00E9`, `U+00B5`, `U+02D0`, `U+4E2D`, `U+00B2`, `U+2160`, `U+0660`, `U+00AA`,
+`U+00BA`, and `U+00BC` are accepted. `U+0080`, `U+0085`, `U+00A0`, `U+00AD`,
+`U+00D7`, `U+2013`, `U+200B`, `U+20AC`, `U+FEFF`, `U+E000`, `U+1F600`, and
+`U+FFFD` are refused. The port accepts a non-ASCII character if
+`char::is_alphanumeric` is true for it and it is not one of the 571 such
+characters that the tool refuses, which are spacing combining marks, circled
+and enclosed letters, and letters that the tool does not know. The port
+refuses each other non-ASCII character, so it also refuses the characters of
+category Mn and category Pc that the tool accepts. Every name that the port
+accepts is a name that the tool accepts. The port reads a name as UTF-8. The
+tool refuses an argument that is not valid UTF-8 with exit 1 and writes no ref.
+The port refuses it at the decoding of the arguments, with exit 1 and no ref.
 
 Both implementations report a name they refuse as `error: Invalid refspec
 <refspec>` and exit 1, wherever the name is taken: a revision, a NEWREF, or the
@@ -596,14 +619,12 @@ hex checksum, an abbreviated checksum, a refspec, or any of those followed by
 one or more `^` characters, each stepping one generation back along the
 commit's `parent` field. `~N` and `^N` are not revision syntax: `ostree
 rev-parse test/main~1` and `test/main^2` each report `error: Invalid refspec
-<rev>`. The port's ref rule accepts both names, so it reads the whole revision
-as a refspec and reports `error: Refspec '<rev>' not found`, the message the
-two implementations share for a name that resolves to nothing, wherever a
+<rev>`. The ref-name rule refuses `~` and `^` inside a name, so the port
+reads the whole revision as a refspec and reports the same line, wherever a
 revision is taken: `rev-parse`, `cat`, and the positional of `refs --create`. A
 checksum carrying either suffix takes that same path, the name holding more
-than 64 characters. Both implementations exit 1 and write nothing, and the
-wording follows from the ref-name character class the port does not validate
-(`conformance/cli-surface.md`, "P1"). Walking past a root commit reports
+than 64 characters. Both implementations exit 1 and write nothing. Walking past
+a root commit reports
 `error: Commit <checksum> has no parent` and exits 1.
 
 An abbreviated checksum is a run of one to 63 lowercase hex characters, and it
@@ -712,9 +733,8 @@ the name before the tree, a tree path that does not open is reported by the
 port and reached by the tool only after the name it already refused, and
 neither implementation publishes an object for the refusal, where the checksum
 guard leaves the tool's tree and commit objects in `objects/`.
-A `^` inside the name is a separate rule: the tool refuses `a^b` as a ref name
-whatever the store holds, and the port writes it, which is the ref-name
-character class `conformance/cli-surface.md`, "P1" records.
+A `^` inside the name is a separate rule: both implementations refuse `a^b` as
+a ref name whatever the store holds, and report `error: Invalid refspec a^b`.
 
 A push guards the checksum shape at each site where it writes a commit to a
 target ref. `push` refuses a `DST` of that shape after a `SRC` with `error:
@@ -748,7 +768,7 @@ file or directory`, where the port copies the ref. Where an ancestry-shaped one
 stands, the tool's ref enumeration skips it without a word, so `refs` prints
 nothing and `prune --refs-only` reads the commit as unreachable and deletes it,
 leaving the ref file over an absent object; the port enumerates the name. That
-is the same destructive class the ref-name character class carries
+is the same destructive class that a name outside the ref-name rule carries
 (`conformance/cli-surface.md`, "P1").
 
 Ref file content is read by a parser that takes either case. Both
@@ -5108,11 +5128,9 @@ The step as a whole stands after the tree is written and after the branch-name
 guard, and before the ref write and the publication. So a tree path that does
 not open, a refused timestamp, and a branch name the guard refuses each win over
 a key that cannot sign, and a key that cannot sign wins over a ref write that
-cannot happen. The branch-name term is observable over a name both ref-name
-grammars refuse, `bad//name` among them; the port's guard covers path safety
-alone, so a name only the tool's wider grammar refuses -- one holding a space or
-a caret -- reaches the signing step in the port
-(`../conformance/cli-surface.md`, "P2").
+cannot happen. The branch-name term is observable over a name the ref-name rule
+refuses, `bad//name`, a name with a space, and a name with a caret among them;
+both implementations apply the same rule.
 
 ### `refs`
 
@@ -5147,9 +5165,8 @@ reports `error: Invalid refspec <PREFIX>`, the one message it gives that rule
 wherever a name reaches it. The refusals observed are `test/`, `/test`, `a//b`,
 `.`, `..`, `test/main/`, `test/../main`, an empty argument, `:`, `:rr`,
 `origin:rr/`, `origin:..`, and a remote half holding a `/` such as `or/igin:rr`.
-The tool applies the narrower ref-name class "Ref name validation" above records,
-so it also refuses `tes~t`, `te st`, `.test`, and `origin::rr`, which the port's
-rule accepts.
+Both apply the ref-name rule "Ref name validation" above records, so both also
+refuse `tes~t`, `te st`, `.test`, `a*`, `-a`, and `origin::rr`.
 
 The check runs where each prefix is taken, so a valid prefix ahead of a refused
 one keeps its effect: `refs test 'bad/'` prints the rows `test` matched and then
@@ -5281,9 +5298,7 @@ are given. The errors, each exit 1:
   rule refuses: `a/../b`, `a//b`, `.`, `..`, the empty argument, `origin:`,
   `a:b:c`, `a/b:x`, `te st`, `.test`, `origin::rr`, and `tes~t` each report the
   target as given. The tool answers the two i/o conditions with that same line,
-  where the port reports the message it gives each of them, and a target the
-  tool's narrower character class refuses parts the two where the ref exists
-  (`conformance/cli-surface.md`, "P1").
+  where the port reports the message it gives each of them.
 
 A NEWREF whose path under `refs/` runs through a ref file, or names a directory,
 and a positional revision of either shape, are refused before anything is
@@ -5319,14 +5334,10 @@ where the existence check `--force` suppressed would have named the ref, while
 `-A --create=origin:bad/ test/main` stops one step earlier with `error: Invalid
 refspec origin:bad/`. With `-c` the fourth step is absent, `-c` winning over `-A`,
 so `-c -A --create=<id>:<ref>` writes a collection ref in either flag order. A
-NEWREF holding a second `:` reaches the fourth step in the port and the third in
-the tool, the port's ref rule being the wider one, so `-A --create=a:b:c` reports
-`error: Cannot create alias to remote ref: a` from the port and `error: Invalid
-refspec a:b:c` from the tool; both exit 1 and write nothing
-(`conformance/cli-surface.md`, "P1"). The port refuses a
-NEWREF ending in `^` with that message; a `^` elsewhere in a ref name belongs to
-the character class the port does not validate
-(`conformance/cli-surface.md`, "P1").
+NEWREF holding a second `:` stops at the third step in both implementations, so
+`-A --create=a:b:c` reports `error: Invalid refspec a:b:c` from each; both exit
+1 and write nothing. The port refuses a NEWREF ending in `^` with that message,
+and a `^` elsewhere in a ref name is refused by the ref-name rule.
 
 Under `-A` the target is checked in a fifth step, after the remote refusal: the
 existence check that reports `error: Cannot create alias to non-existent ref:

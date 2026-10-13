@@ -196,9 +196,7 @@ reproduced:
   standard output, and leave the same refs tree, so the two lines differ by the
   tool's `Listing refs: ` context prefix, which the port carries nowhere: one
   condition has one message wherever a name reaches the library
-  (`../format-reference.md`, "refs"). A prefix the tool's narrower ref-name class
-  refuses and the port's rule accepts, such as `tes~t` or `origin::rr`, belongs
-  to the character-class divergence below;
+  (`../format-reference.md`, "refs");
 - a `PREFIX` whose path under `refs/` runs through a ref file -- `plain/x` over
   the ref `plain`, `origin:rr/x/y` over the ref `origin:rr/x`, `al/x` through an
   alias symlink -- is refused by both, in every listing form and in `--delete`,
@@ -309,40 +307,41 @@ syntax".
 One resolution behavior the tool has and the port does not, recorded in
 `../format-reference.md` with the observation that recovered it:
 
-- the tool validates a ref name against a character class the port's own check
-  does not, so `ostrya refs --create` writes some names the tool then refuses
-  to resolve. Adopting the rule tightens `Repo::resolve_rev`, `commit -b`, and
-  every pull path at once, so it belongs with a phase that reviews those. Four
-  consequences the surface carries today. A name of that shape draws `error:
-  Invalid refspec <name>` from the tool wherever it is taken as a revision or a
-  NEWREF, and `error: Refspec '<name>' not found` from the port at a resolution
-  site, the message both give a name that resolves to nothing, so `rev-parse
-  <name>~1` and `rev-parse <name>^2` -- the two non-syntaxes of
-  `../format-reference.md`, "Revision syntax" -- differ in words while both exit
-  1 and write nothing. As a `PREFIX` the same name ends the tool's listing with
-  `error: Listing refs: Invalid refspec <PREFIX>` at exit 1, and matches nothing
-  in the port, which prints nothing and exits 0. And the tool's
-  ref enumeration skips such a name without a word: `refs`, `refs --list`, `refs
-  -r`, a `PREFIX` above it, `fsck`, and `summary -u` each print the other refs
-  and exit 0. The port's `fsck` enumerates the name and loads the commit it
+- the tool's ref enumeration skips a ref whose name fails the ref-name rule
+  without a word, and the port enumerates it. Only an out-of-band write puts
+  such a name in a repository, because both implementations refuse it on every
+  write path. Over a ref of that shape, `refs`, `refs --list`, `refs -r`, a
+  `PREFIX` above it, `fsck`, and `summary -u` each print the other refs and exit
+  0 in the tool. The port's `fsck` enumerates the name and loads the commit it
   holds, so a ref of that shape over an absent commit ends the port's run at
   exit 1 where the tool's run passes, which is one of the divergences the
-  `fsck` entry under "P2" records. And `prune --refs-only` reads the commit
-  that ref holds as
-  unreachable and deletes it, so after `ostrya commit -b 'odd~1'` and `ostree
-  prune --refs-only` the ref file stands over an absent commit object and
-  `ostrya cat 'odd~1' PATH` reports `error: object not found`. The port
-  enumerates the name everywhere, so its own `prune --refs-only` over the same
-  repository keeps the commit and leaves the ref file standing over it, which is
-  the pair `ostrya_cli::cli::prune_refs_only_parts_on_a_shadowed_ref_name`
-  states over the names `odd~1` and `main^`. A branch name ending in `^` carries
-  the same consequence and is recorded under "P2", where the write-side guard
-  that keeps it out of a port-written repository stands; the two are one class.
-  And the tool holds such a name to name no ref as
-  an `-A --create` target, so over the ref `tes~t` written by
-  `ostrya commit -b 'tes~t'` the port writes `refs -A --create=al 'tes~t'` and the
-  tool reports `error: Cannot create alias to non-existent ref: tes~t` at exit 1,
-  the one case at that site where the two leave different refs trees.
+  `fsck` entry under "P2" records. And `prune --refs-only` in the tool reads the
+  commit that ref holds as unreachable and deletes it, so after an out-of-band
+  write of the ref `odd~1` and `ostree prune --refs-only` the ref file stands
+  over an absent commit object and `ostrya cat 'odd~1' PATH` reports `error:
+  object not found`. The port enumerates the name, so its own `prune
+  --refs-only` over the same repository keeps the commit and leaves the ref file
+  standing over it, which is the pair
+  `ostrya_cli::cli::prune_refs_only_parts_on_a_shadowed_ref_name` states over the
+  names `odd~1` and `main^`. A ref name ending in `^` carries the same
+  consequence and is recorded under "P2"; the two are one class.
+
+One class of non-ASCII characters in a ref name parts the two implementations,
+recorded in `../format-reference.md`, "Ref name validation", with the
+observation that recovered it:
+
+- the tool accepts a nonspacing combining mark (Unicode category Mn), such as
+  `U+0301`, and a non-ASCII connector punctuation character (category Pc), such
+  as `U+203F`, in a component of a ref name. The port refuses them with `error:
+  Invalid refspec <name>` at exit 1 and writes no ref. The port accepts a
+  non-ASCII character only if `char::is_alphanumeric` is true for it, and it
+  also refuses the characters of that kind that the tool refuses (spacing
+  combining marks, circled and enclosed letters, and characters that the Unicode
+  tables of the tool do not hold). So the port never writes a name that the
+  tool might skip, and the difference is a refusal alone. The set of characters
+  that the port refuses over `char::is_alphanumeric` stands in a table in
+  `ostrya-core`, taken from a probe of the tool 2026.1 against the Unicode
+  version of Rust 1.92.
 
 Done, Phase 17d:
 
@@ -1148,12 +1147,11 @@ Where one stands, the tool's ref enumeration skips it without a word and its
 `prune --refs-only` reads the commit that ref holds as unreachable and deletes
 it, leaving the ref file over an absent object, where the port enumerates the
 name and keeps the commit. That is the destructive class the `odd~1` item of
-"P1" records for the ref-name character class, and the two read as one class:
+"P1" records for a name outside the ref-name rule, and the two read as one class:
 an out-of-band write is the only arrival for either name.
 `ostrya_cli::cli::prune_refs_only_parts_on_a_shadowed_ref_name` states the pair
-over both names. The character class
-itself stays deferred, so a `^` inside the name parts the two -- the port writes
-`a^b` and the tool refuses it with `Invalid refspec a^b`.
+over both names. A `^` inside the name is refused by both implementations, with
+`Invalid refspec a^b`.
 
 Four `commit` divergences sit at the three options that derive a metadata key
 from the committed tree, `--generate-sizes`, `--bootable`, and
@@ -1299,12 +1297,9 @@ stand.
   carry the same reason, exit 1, and write no object and no ref; an absolute
   path reaches one line from both.
 - The branch-name term of the signing step's fault order is observable only over
-  a name both ref-name grammars refuse. `-b 'bad//name' --sign=zzz` reports
-  `error: Invalid refspec bad//name` in both. The port's `validate_refspec`
-  covers path safety alone -- an empty name, a `.` or `..` component, a NUL --
-  where the tool's grammar is wider, so `-b 'bad name' --sign=zzz` and
-  `-b 'a^b' --sign=zzz` report the refspec in the tool and the key in the port.
-  The ref-name grammar is the item deferred in Phase 17b.
+  a name the ref-name rule refuses. `-b 'bad//name' --sign=zzz` reports
+  `error: Invalid refspec bad//name` in both, and so do `-b 'bad name'
+  --sign=zzz` and `-b 'a^b' --sign=zzz`.
 - The order the `.commitmeta` dict stores its keys in parts over some key sets.
   The port stores insertion order always. The tool stores that same order over
   most sets and a name-dependent order over some of them: with
@@ -1923,7 +1918,7 @@ Two corners at `prune` are not settled by an observation this host can make:
 
 A ref name the tool's ref enumeration skips is read by the tool's
 `prune --refs-only` as unreachable, so the tool deletes a commit the port keeps.
-That is the ref-name character class of "P1", and the pair is stated there.
+That is the out-of-band ref name of "P1", and the pair is stated there.
 
 Two repository config keys in the `[ex-ostrya]` group are port extensions with
 no option and no counterpart in the tool. They part `ostrya` from `ostree` on a
@@ -2039,8 +2034,8 @@ Eight divergences stand at `fsck`:
   either way;
 - a dangling ref whose name the tool's ref enumeration skips. The tool never
   reads the name, so its run passes; the port enumerates it, loads the commit
-  the ref names, and ends the run at exit 1. This is the ref-name character
-  class of "P1" reaching a second command. A ref of that shape whose commit is
+  the ref names, and ends the run at exit 1. This is the out-of-band ref name of
+  "P1" reaching a second command. A ref of that shape whose commit is
   present parts the two in neither direction;
 - a positional argument. The tool accepts one and ignores it; `clap` refuses it
   with `error: unexpected argument '<value>' found` at exit 1. This is the

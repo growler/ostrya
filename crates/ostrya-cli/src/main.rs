@@ -4175,13 +4175,10 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // A branch name the revision syntax shadows, and one the refspec grammar
     // refuses, are both reported after the commit is written and ahead of the
     // signing step, which is the order the tool reports each of them against a
-    // key it cannot use. The order is observable only over a name both
-    // grammars refuse: `validate_refspec` covers path safety alone, so a name
-    // the tool's wider ref-name grammar refuses and this one accepts -- one
-    // holding a space or a caret -- reaches the signing step here and the
-    // refspec refusal there (`docs/conformance/cli-surface.md`, "P2").
-    // `exit_error` runs no destructor, so the staging directory is reaped ahead
-    // of it.
+    // key it cannot use. The refspec grammar is the ref-name rule of the tool,
+    // so a name with a space or a caret is refused here, as the tool refuses
+    // it. `exit_error` runs no destructor, so the staging directory is reaped
+    // ahead of it.
     if let Some(branch) = args.branch.as_deref() {
         if let Some(message) = shadowed_branch_name(branch) {
             txn.abort().await?;
@@ -6622,9 +6619,10 @@ async fn check_prefix(repo: &Repo, prefix: Option<&str>) -> Result<()> {
 /// refusal, so [`whole_remote`] hands it the remote name alone -- one component,
 /// which the rule reads as a name holding no `/`.
 ///
-/// The tool's ref-name character class is narrower than the port's rule, so a
-/// prefix such as `tes~t` passes here and the tool refuses it
-/// (`docs/conformance/cli-surface.md`, "P1").
+/// A component of a prefix, and the remote of a prefix, is under the ref-name
+/// rule: it is not empty, does not start with `-` or `.`, and holds ASCII
+/// alphanumerics, `-`, `.`, `_`, and alphanumeric characters that are not
+/// ASCII.
 fn check_prefix_name(prefix: &str) -> Result<()> {
     let checked = whole_remote(prefix).unwrap_or(prefix);
     validate_refspec(checked).map_err(|_| Error::InvalidRefspec(prefix.to_owned()))
@@ -10480,23 +10478,17 @@ mod tests {
             "or/igin:rr",
             "or/igin:",
             ".:",
+            "origin::rr",
+            "tes~t",
+            "te st",
+            ".test",
         ] {
             match check_prefix_name(prefix) {
                 Err(Error::InvalidRefspec(name)) if name == prefix => {}
                 other => panic!("`{prefix}` was not refused as given: {other:?}"),
             }
         }
-        for prefix in [
-            "test",
-            "test/main",
-            "origin:rr",
-            "origin:",
-            "origin:.",
-            // The port's ref rule reads a second `:` as part of the ref name and
-            // the tool refuses it, which is the character-class divergence
-            // `docs/conformance/cli-surface.md`, "P1" records.
-            "origin::rr",
-        ] {
+        for prefix in ["test", "test/main", "origin:rr", "origin:", "origin:."] {
             check_prefix_name(prefix).expect("the prefix was refused");
         }
     }

@@ -1040,14 +1040,13 @@ fn a_ref_name_reaches_the_wire_percent_encoded() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
-        // Without encoding, `test%2fmain` asks a server that decodes its
-        // request target for `refs/heads/test/main`. That ref exists under a
-        // name that the test did not request.
+        // Without encoding, the bytes of `é` reach the wire as raw bytes in the
+        // request target. The name is absent on the remote.
         let err = dest
             .pull(
                 "origin",
                 PullOptions {
-                    refs: vec!["test%2fmain".to_owned()],
+                    refs: vec!["é".to_owned()],
                     ..PullOptions::default()
                 },
             )
@@ -1056,9 +1055,45 @@ fn a_ref_name_reaches_the_wire_percent_encoded() {
         assert!(matches!(err, Error::RefNotFound(_)), "{err}");
         let seen = server.seen();
         assert!(
-            seen.contains(&"refs/heads/test%252fmain".to_owned()),
+            seen.contains(&"refs/heads/%C3%A9".to_owned()),
             "the name reached the wire unencoded: {seen:?}"
         );
+    });
+}
+
+/// A requested ref name that fails the ref-name rule gives `InvalidRefspec`
+/// before the pull sends a request for a ref.
+#[test]
+fn a_requested_name_outside_the_ref_name_rule_is_refused_before_a_request() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-name-rule");
+        build_remote(dir.path()).await;
+        std::fs::remove_file(dir.path().join("remote/summary")).unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        for name in ["a b", "a*", "-a", "a/.b", "a:b:c"] {
+            let err = dest
+                .pull(
+                    "origin",
+                    PullOptions {
+                        refs: vec![name.to_owned()],
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidRefspec(got) if got == name),
+                "{name:?}: {err}"
+            );
+        }
+        let seen = server.seen();
+        assert!(
+            !seen.iter().any(|path| path.starts_with("refs/")),
+            "a ref was requested: {seen:?}"
+        );
+        assert_nothing_published(&dest).await;
     });
 }
 
@@ -1209,14 +1244,26 @@ fn a_mirror_pull_from_an_unsigned_summary_keeps_the_signature_here() {
 /// the refspec at publication.
 #[test]
 fn a_mirror_pull_rejects_a_malformed_summary_ref_name_before_fetching() {
+    // The length stays the same, so the frame offsets of the summary stay
+    // valid. The name gets a traversal component, which the ref store
+    // refuses.
+    mirror_pull_refuses_summary_name("pull-http-mirror-bad-ref", b"test/../m");
+}
+
+/// A mirror pull refuses a summary name that fails the ref-name rule, here a
+/// name with a space, at the same point.
+#[test]
+fn a_mirror_pull_rejects_a_summary_ref_name_outside_the_rule_before_fetching() {
+    mirror_pull_refuses_summary_name("pull-http-mirror-space-ref", b"test/m an");
+}
+
+/// Replaces the ref name `test/main` of the published summary with
+/// `replacement`, which has the same length, and checks that a mirror pull
+/// refuses the name before it fetches an object.
+fn mirror_pull_refuses_summary_name(tag: &str, replacement: &'static [u8]) {
     block_on(async {
         const NAME: &[u8] = b"test/main";
-        // The length stays the same, so the frame offsets of the summary stay
-        // valid. The name gets a traversal component, which the ref store
-        // refuses.
-        const TRAVERSAL: &[u8] = b"test/../m";
-
-        let dir = TmpDir::new("pull-http-mirror-bad-ref");
+        let dir = TmpDir::new(tag);
         build_remote(dir.path()).await;
         let published = std::fs::read(dir.path().join("remote/summary")).unwrap();
         let at = published
@@ -1224,7 +1271,7 @@ fn a_mirror_pull_rejects_a_malformed_summary_ref_name_before_fetching() {
             .position(|window| window == NAME)
             .expect("the summary names the ref");
         let mut tampered = published.clone();
-        tampered[at..at + NAME.len()].copy_from_slice(TRAVERSAL);
+        tampered[at..at + NAME.len()].copy_from_slice(replacement);
 
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         server.tamper("summary", tampered);
@@ -1241,7 +1288,7 @@ fn a_mirror_pull_rejects_a_malformed_summary_ref_name_before_fetching() {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, Error::InvalidRefspec(name) if name.as_bytes() == TRAVERSAL),
+            matches!(&err, Error::InvalidRefspec(name) if name.as_bytes() == replacement),
             "{err}"
         );
         assert_nothing_published(&dest).await;
@@ -2813,7 +2860,7 @@ fn a_pull_session_fetches_no_ref_listing_from_a_static_server() {
 #[test]
 fn a_pull_session_refuses_a_ref_listing_over_the_cap_over_http() {
     block_on(async {
-        let target = "_ostrya/refs/v1?prefix=a%2Fb&prefix=x%20y%2Bz&prefix=%C3%A9%3F%23%26%3D%25";
+        let target = "_ostrya/refs/v1?prefix=a%2Fb&prefix=x-y&prefix=%C3%A9%2F%C3%BC";
         let (addr, seen) = oversized_file_server(target, ostrya::MAX_REF_LISTING + 1).await;
         let mut http = FetcherOptions::new(format!("http://{addr}"));
         http.proxy = Proxy::None;
@@ -2821,7 +2868,7 @@ fn a_pull_session_refuses_a_ref_listing_over_the_cap_over_http() {
             .await
             .unwrap();
         let err = session
-            .fetch_refs(&["a/b", "x y+z", "a/b/c", "é?#&=%", "x y+z"])
+            .fetch_refs(&["a/b", "x-y", "a/b/c", "é/ü", "x-y"])
             .await
             .unwrap_err();
         assert!(

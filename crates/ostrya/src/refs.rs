@@ -482,8 +482,9 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] if a prefix is not a valid ref name. The
-    ///   check comes before each read.
+    /// - [`Error::InvalidRefspec`] if a prefix is not a valid ref name, so a
+    ///   prefix with a space, a wildcard, or a leading `-` or `.` in a
+    ///   component fails. The check comes before each read.
     /// - The errors of [`list_refs`](Repo::list_refs), for a selected ref.
     pub(crate) async fn list_refs_under(
         &self,
@@ -665,8 +666,8 @@ impl Repo {
     ///
     /// A ref can also be an alias: a relative symlink to the file of another
     /// ref. A read follows the link and reads the checksum of the target ref.
-    /// [`validate_refspec`] checks each component, so a ref path stays inside
-    /// `refs/`.
+    /// [`validate_refspec`] checks each component of the name against the
+    /// ref-name rule, so a ref path stays inside `refs/`.
     ///
     /// The call creates the missing parent directories of a name with `/` in
     /// it. It requests mode `0777` for them, which the umask reduces. In a
@@ -1282,13 +1283,17 @@ fn parse_ref_content(bytes: &[u8]) -> Result<Checksum> {
 /// Checks that a refspec names a path under `refs/`.
 ///
 /// A refspec is a ref name, with an optional `<remote>:` prefix.
-/// [`ostrya_core::is_refspec`] holds the rule.
+/// [`ostrya_core::is_refspec`] holds the rule. Each component of the name, and
+/// the remote, is not empty, does not start with `-` or `.`, and holds only
+/// ASCII alphanumerics, `-`, `.`, `_`, and alphanumeric characters that are
+/// not ASCII. So the name holds no `:`, no space, and no wildcard, and the
+/// remote holds no `/`, no space, and no wildcard.
 ///
 /// # Errors
 ///
 /// - [`Error::InvalidRefspec`] if `refspec` does not obey the rule, for
-///   example if it names a path outside `refs/`. The error holds the refspec
-///   as given.
+///   example if it names a path outside `refs/` or holds a character that
+///   the rule refuses. The error holds the refspec as given.
 pub fn validate_refspec(refspec: &str) -> Result<()> {
     if ostrya_core::is_refspec(refspec) {
         Ok(())
@@ -1297,8 +1302,8 @@ pub fn validate_refspec(refspec: &str) -> Result<()> {
     }
 }
 
-/// Maps a refspec to its path under `refs/`. Refuses a refspec that leaves
-/// the tree.
+/// Maps a refspec to its path under `refs/`. Refuses a refspec that
+/// [`validate_refspec`] refuses.
 pub(crate) fn refspec_to_relpath(refspec: &str) -> Result<String> {
     validate_refspec(refspec)?;
     Ok(match refspec.split_once(':') {
@@ -1319,13 +1324,14 @@ pub(crate) fn refspec_to_relpath(refspec: &str) -> Result<String> {
 /// The name alone decides this for a ref below `refs/heads`. There, a `:` in
 /// the name sends the mapping to `refs/remotes` and so to a different file.
 ///
-/// The name alone cannot decide it for a ref below `refs/remotes`. A listing
-/// names such a ref with a `:` in place of the first `/` of its path. The
-/// mapping splits at the first `:`, so two files give one name.
+/// For a ref below `refs/remotes`, the path must be `<remote>/<rest>`, where
+/// the name is `<remote>:<rest>`. A listing names such a ref with a `:` in
+/// place of the first `/` of its path.
 ///
-/// Both `refs/remotes/a:b/main` and `refs/remotes/a/b:main` list as
-/// `a:b:main`, and the mapping sends that name to the second of the two. For
-/// this reason the signature takes the path.
+/// A name that the ref-name rule refuses is not addressable, so prune never
+/// classifies it as weak. Only an out-of-band write can put such a name on
+/// disk. The rule refuses a `:` in the name part, so a name that a listing
+/// gives for a file below `refs/remotes` addresses that file alone.
 ///
 /// No refspec maps to a path below `refs/mirrors`, so a mirror ref always
 /// gives `false`.
@@ -1336,7 +1342,7 @@ pub(crate) fn listed_name_addresses_it(name: &str, top: &str, path: &str) -> boo
     match name.split_once(':') {
         Some((remote, rest)) => {
             top == "refs/remotes"
-                && is_component(remote)
+                && ostrya_core::is_ref_name_component(remote)
                 && is_ref_path(rest)
                 && path
                     .split_once('/')
@@ -1350,8 +1356,9 @@ pub(crate) fn listed_name_addresses_it(name: &str, top: &str, path: &str) -> boo
 /// fails with [`Error::InvalidRefspec`].
 ///
 /// An HTTP pull applies it before a ref name becomes a request path. A
-/// traversal component in a request path asks the server for a different
-/// resource, as it names a different file in the repository.
+/// component that the rule refuses, such as a traversal component, asks the
+/// server for a different resource, as it names a different file in the
+/// repository.
 pub(crate) fn check_ref_path(name: &str) -> Result<()> {
     if is_ref_path(name) {
         Ok(())
@@ -1386,9 +1393,11 @@ fn uncovered_prefixes<'a>(prefixes: &[&'a str]) -> Vec<&'a str> {
         .collect()
 }
 
-// A ref name can contain `/`. It has no empty, `.`, or `..` component, and
-// no NUL. A single path component is not empty, not a traversal, and holds no
-// slash or NUL. `ostrya-core` holds the rule.
+// A ref name can contain `/`. A component of a ref name, and a remote, is not
+// empty, does not start with `-` or `.`, and holds ASCII alphanumerics, `-`,
+// `.`, `_`, and alphanumeric characters that are not ASCII. The collection id
+// uses the wider `is_ref_component`: not empty, not `.` or `..`, no slash, no
+// NUL. `ostrya-core` holds the rule.
 pub(crate) use ostrya_core::{is_ref_component as is_component, is_ref_name as is_ref_path};
 
 /// Maps a collection ref to its path under `refs/`. A collection id puts the
@@ -1851,6 +1860,21 @@ mod tests {
             "a//b",
             "a/..",
             "origin:../escape",
+            // A name outside the ref-name rule.
+            "a b",
+            "a*",
+            "-a",
+            "a/.b",
+            "a^b",
+            "a~b",
+            "origin:a:b",
+            "origin:a b",
+            // A remote outside the ref-name rule.
+            "o r:main",
+            "o*:main",
+            "-o:main",
+            ".o:main",
+            "o~:main",
             // A remote is one component, so a `/` in it names no remote.
             "a/b:x",
             ":x",
@@ -1864,6 +1888,19 @@ mod tests {
         }
         assert!(validate_refspec("test/main").is_ok());
         assert!(validate_refspec("origin:test/main").is_ok());
+        for good in [
+            "a.",
+            "a..b",
+            "_a",
+            "a_b",
+            "1a",
+            "A",
+            "\u{e9}",
+            "a/\u{e9}b",
+            "\u{e9}:main",
+        ] {
+            assert!(validate_refspec(good).is_ok(), "should accept {good:?}");
+        }
     }
 
     /// A prefix that a shorter prefix selects is dropped, and a duplicate
@@ -1937,10 +1974,24 @@ mod tests {
         // A remote name addresses its own file where the first `/` of the path
         // is the `:` of the name.
         ("origin:main", "refs/remotes", "origin/main", true),
-        ("origin:foo:bar", "refs/remotes", "origin/foo:bar", true),
-        // One name, two files. The name addresses the second of the two.
+        ("a:pool/x", "refs/remotes", "a:pool/x", false),
+        ("a:pool/x", "refs/remotes", "a/pool/x", true),
+        // A `:` in the name part is outside the ref-name rule, so neither of
+        // the two files that list as this name is addressable.
+        ("origin:foo:bar", "refs/remotes", "origin/foo:bar", false),
         ("a:b:main", "refs/remotes", "a:b/main", false),
-        ("a:b:main", "refs/remotes", "a/b:main", true),
+        ("a:b:main", "refs/remotes", "a/b:main", false),
+        // A name outside the rule is not addressable, wherever its file is.
+        ("a b", "refs/heads", "a b", false),
+        ("-a", "refs/heads", "-a", false),
+        ("a/.b", "refs/heads", "a/.b", false),
+        ("a*", "refs/heads", "a*", false),
+        ("origin:a b", "refs/remotes", "origin/a b", false),
+        ("o r:main", "refs/remotes", "o r/main", false),
+        ("-o:main", "refs/remotes", "-o/main", false),
+        (".o:main", "refs/remotes", ".o/main", false),
+        ("o~:main", "refs/remotes", "o~/main", false),
+        ("\u{e9}:main", "refs/remotes", "\u{e9}/main", true),
         // A file directly under `refs/remotes` names no remote, so its name
         // maps under `refs/heads`.
         ("stray", "refs/remotes", "stray", false),

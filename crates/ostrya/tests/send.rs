@@ -727,7 +727,7 @@ fn list_refs_answers_with_the_built_listing() {
 fn list_refs_with_a_bad_prefix_is_protocol() {
     let tmp = TmpDir::new("send-list-refs-bad");
     let repo = listing_repo(&tmp);
-    for bad in ["", "a/../b", "a/", "/a"] {
+    for bad in ["", "a/../b", "a/", "/a", "a b", "-a", "a*", "a/.b"] {
         let (result, error) = session(&repo, PIPE_CAP, |mut c| async move {
             c.open().await;
             c.send(&Message::ListRefs(vec!["z".to_owned(), bad.to_owned()]))

@@ -1059,7 +1059,8 @@ fn a_ref_listing_refuses_a_bad_prefix() {
     block_on(async {
         let repo = Repo::open(&repo_dir).await.unwrap();
         let bad_prefixes = [
-            "", "/", "/a", "a/", "a//b", ".", "..", "a/./b", "a/../b", "a\0b",
+            "", "/", "/a", "a/", "a//b", ".", "..", "a/./b", "a/../b", "a\0b", "a b", "-a", "a*",
+            "a/.b", "a!",
         ];
         for bad in bad_prefixes {
             for prefixes in [&[bad][..], &["main", bad][..]] {

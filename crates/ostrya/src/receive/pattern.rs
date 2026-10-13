@@ -15,14 +15,17 @@ use crate::refs::{is_component, is_ref_path};
 /// - `*:NAME`, `*:PREFIX/*`, and `*:*` -- the same, for the remote refs of
 ///   every remote.
 ///
-/// `NAME` and `PREFIX` are ref names. `REMOTE` is one component of a ref
-/// path. [`RefPattern::parse`] refuses each other form:
+/// `NAME` and `PREFIX` are ref names under the ref-name rule. `REMOTE` is one
+/// component of a ref path, under the wider rule of `is_ref_component`.
+/// [`RefPattern::parse`] refuses each other form:
 ///
 /// - A `*` in another place. This includes `*` alone, with no remote part.
 /// - A second `*`.
 /// - An empty part.
 /// - A `.` or `..` component.
 /// - A control character.
+/// - A name or prefix that fails the ref-name rule, for example one with a
+///   space or a component that starts with `-`.
 ///
 /// If more than one pattern matches a ref,
 /// [`ReceivePolicy::rule_for`](super::ReceivePolicy::rule_for) states which
@@ -185,7 +188,6 @@ mod tests {
             "*:main",
             "*:apps/*",
             "*:*",
-            "r:a:b",
         ] {
             let parsed = RefPattern::parse(pattern).unwrap();
             assert_eq!(parsed.as_str(), pattern);
@@ -225,6 +227,11 @@ mod tests {
             "a/*b",
             "*:**",
             "*:a*",
+            "r:a:b",
+            "a b/*",
+            "a b",
+            "-a",
+            "a/.b/*",
         ] {
             let err = RefPattern::parse(pattern).unwrap_err();
             assert!(

@@ -455,7 +455,9 @@ impl Repo {
     /// - [`Error::Core`] if the `config` of the remote does not parse as a key
     ///   file, or if a `refs/heads/<ref>` file holds no checksum.
     /// - [`Error::InvalidRefspec`] if a requested ref, or a ref of the summary
-    ///   under `MIRROR`, is not a valid ref name.
+    ///   under `MIRROR`, is not a valid ref name. A `MIRROR` pull of every ref
+    ///   fails with this error if the summary lists one name that the ref-name
+    ///   rule refuses. The pull does not skip the name.
     /// - [`Error::RefNotFound`] if neither the summary nor `refs/heads/<ref>`
     ///   names a requested ref.
     /// - [`Error::Pull`] if [`refs`](PullOptions::refs) is empty and the remote
@@ -1146,8 +1148,9 @@ impl Repo {
         let mut out = Vec::with_capacity(names.len());
         for name in names {
             // The name goes on the wire as a request path, so the pull checks
-            // it against the rule of the ref store. A traversal component can
-            // ask the server for a resource that the ref does not name.
+            // it against the rule of the ref store. A component that the rule
+            // refuses, such as a traversal, can ask the server for a resource
+            // that the ref does not name.
             crate::refs::check_ref_path(&name)?;
             let checksum = match summary.and_then(|summary| summary.lookup(&name)) {
                 Some(checksum) => checksum,

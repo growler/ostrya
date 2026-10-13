@@ -100,10 +100,19 @@ pub fn ref_binding(refs: &[&str]) -> Value;
 /// explicit, else SOURCE_DATE_EPOCH, else now.
 pub fn commit_timestamp(explicit: Option<u64>) -> Result<u64, TimestampError>;
 impl DirTree { pub fn check_name(name: &str) -> Result<()>; }
-/// The ref-name rule. A component is not empty, is not `.` or `..`, and holds
-/// no `/` and no NUL. A ref name is one or more components joined with `/`.
-/// A refspec is a ref name, or REMOTE:NAME split at the first `:`, with
-/// REMOTE one component. `ostrya::validate_refspec` applies `is_refspec`.
+/// The ref-name rule. A component of a ref name is not empty, does not start
+/// with `-` or `.`, and holds only ASCII alphanumerics, `-`, `.`, `_`, and
+/// non-ASCII characters for which `char::is_alphanumeric` is true, less the
+/// characters that the `ostree` tool refuses (spacing combining marks, circled
+/// and enclosed letters). The port refuses each other non-ASCII character,
+/// including the nonspacing combining marks that the tool accepts. A ref name
+/// is one or more such components joined with `/`. A refspec is a ref name, or
+/// REMOTE:NAME split at the first `:`, with REMOTE one component under
+/// `is_ref_name_component`. So NAME holds no `:`. `ostrya::validate_refspec`
+/// applies `is_refspec`.
+pub fn is_ref_name_component(component: &str) -> bool;
+/// A wider check for a part that is not a ref name, such as a collection id:
+/// not empty, not `.` or `..`, no `/`, no NUL.
 pub fn is_ref_component(component: &str) -> bool;
 pub fn is_ref_name(name: &str) -> bool;
 pub fn is_refspec(refspec: &str) -> bool;
@@ -651,11 +660,9 @@ pub struct PruneOptions {
     ///
     /// A ref is addressable where the name the listing gave it maps back to
     /// the file it was listed from. A non-addressable ref is strong and never
-    /// reaches the filter either. The mapping splits a name at its first `:`,
-    /// and the listing builds a remote name by replacing the first `/` of the
-    /// path below `refs/remotes` with a `:`, so `refs/remotes/a:b/main` and
-    /// `refs/remotes/a/b:main` share the listed name `a:b:main` and only the
-    /// second addresses its own file.
+    /// reaches the filter either. A ref whose name fails the ref-name rule is
+    /// not addressable, so it is never weak. Only an out-of-band write can put
+    /// such a name on disk, because each write path of the library refuses it.
     ///
     /// A strong ref roots the walk under the bound `retain_branch_depth`,
     /// `only_branch`, and `depth` give its name. A weak ref roots nothing, so
@@ -869,10 +876,13 @@ pub struct CollectionRefEntry {
 }
 
 /// Whether a refspec names a path under `refs/`: a ref name, optionally
-/// preceded by a `<remote>:` prefix. A refspec that would leave the tree is
-/// `Error::InvalidRefspec`, holding the refspec as given, which is the one
-/// error a caller reporting a refused name needs the name from. Every ref
-/// write and every resolution applies the same rule, which is
+/// preceded by a `<remote>:` prefix. Each component of the name, and the
+/// remote, is not empty, does not start with `-` or `.`, and holds only ASCII
+/// alphanumerics, `-`, `.`, `_`, and alphanumeric characters that are not
+/// ASCII (`is_ref_name_component` states the exact set). A refspec that fails
+/// the rule is `Error::InvalidRefspec`, holding the refspec as given, which is
+/// the one error a caller reporting a refused name needs the name from. Every
+/// ref write and every resolution applies the same rule, which is
 /// `ostrya_core::is_refspec`.
 pub fn validate_refspec(refspec: &str) -> Result<()>;
 

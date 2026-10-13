@@ -14,7 +14,7 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use ostrya_core::{Checksum, ObjectType, RepoMode, Value};
+use ostrya_core::{Checksum, Commit, ObjectType, RepoMode, Value};
 
 use crate::config::Tristate;
 use crate::error::{Error, Result};
@@ -849,6 +849,38 @@ impl Transaction {
         })
         .await
         .map_err(Error::Io)
+    }
+
+    /// Loads a commit object as
+    /// [`load_commit_bytes_staged_first`](Transaction::load_commit_bytes_staged_first)
+    /// does, and parses it.
+    ///
+    /// A commit object can be as large as
+    /// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), so the read and the
+    /// parse run in one call on the blocking pool. The errors are those of the
+    /// read, then [`Error::Core`] if the bytes do not parse as a commit.
+    pub(crate) async fn load_commit_staged_first(&self, checksum: &Checksum) -> Result<Commit> {
+        if !self.is_staged(checksum, ObjectType::Commit) {
+            let repo = self.repo.clone();
+            let checksum = *checksum;
+            return ostrya_rt::unblock(move || {
+                let bytes = repo.load_object_bytes_blocking(ObjectType::Commit, &checksum)?;
+                Ok(Commit::parse(&bytes)?)
+            })
+            .await;
+        }
+        let name = crate::write::flat_name(checksum, ObjectType::Commit, self.repo.mode());
+        let staging = self.staging_fd().try_clone_to_owned()?;
+        ostrya_rt::unblock(move || {
+            let bytes = crate::object::read_meta_object(
+                staging.as_fd(),
+                &name,
+                crate::object::MAX_METADATA_SIZE,
+            )
+            .map_err(Error::Io)?;
+            Ok(Commit::parse(&bytes)?)
+        })
+        .await
     }
 
     /// Takes the queued detached-metadata edits for [`DetachedJob::run`].

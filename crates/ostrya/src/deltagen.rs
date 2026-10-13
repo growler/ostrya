@@ -441,9 +441,9 @@ impl Repo {
         // The superblock embeds the whole target commit, so the commit loads,
         // and must be present, before any write. Its detached metadata goes
         // into the superblock beside it, because a verifying pull of the
-        // `ostree` command checks the delivered commit against that copy.
-        let commit_bytes = self.load_object_bytes(ObjectType::Commit, to).await?;
-        let detached = self.read_commit_detached_metadata(to).await?;
+        // `ostree` command checks the delivered commit against that copy. The
+        // two reads run in one call on the blocking pool, the commit first.
+        let (commit_bytes, detached) = self.load_commit_and_detached(to).await?;
         let commit = Target {
             bytes: &commit_bytes,
             detached: detached.as_ref(),

@@ -6744,6 +6744,177 @@ fn the_detached_filter_applies_to_an_intermediate_commit() {
     });
 }
 
+/// A verified pull of a chain calls the detached-metadata filter one time for
+/// each property of the `.commitmeta` of each commit of the chain. Discovery
+/// runs the filter, and the commit step stores its result with no second
+/// call. A filter that keeps each property stores the bytes of the remote
+/// unchanged. A filter that drops a property stores the other properties.
+/// The pull requests each `.commitmeta` once.
+#[test]
+fn a_verified_chain_pull_filters_each_commitmeta_one_time() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-filter-count");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        sign_commits(&remote, &[a, b, c, d]).await;
+        let mut properties = 0;
+        for commit in [b, c, d] {
+            let Some(Value::Array(mut entries)) =
+                remote.read_commit_detached_metadata(&commit).await.unwrap()
+            else {
+                panic!("{commit} has no signed .commitmeta");
+            };
+            entries.push(Value::Tuple(vec![
+                Value::Str("test.private".to_owned()),
+                Value::Variant(Box::new((
+                    Type::parse("s").unwrap(),
+                    Value::Str("repository-local".to_owned()),
+                ))),
+            ]));
+            properties += entries.len();
+            remote
+                .write_commit_detached_metadata(&commit, Some(&Value::Array(entries)))
+                .await
+                .unwrap();
+        }
+        assert_eq!(properties, 6, "a signature and a private key for each");
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest_dir = dir.path().join("dest");
+
+        for dropped in [None, Some("test.private")] {
+            let _ = std::fs::remove_dir_all(&dest_dir);
+            drop(dest_holding(dir.path(), &server.url(), &a).await);
+            let dest = reconfigure_dest(dir.path(), &server.url(), &signed_policy()).await;
+            server.forget();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = calls.clone();
+            let opts = PullOptions {
+                detached_metadata_filter: DetachedMetadataFilter::new(move |_, key, _| {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    if Some(key) == dropped {
+                        FilterResult::Skip
+                    } else {
+                        FilterResult::Allow
+                    }
+                }),
+                ..chain_opts(list.clone())
+            };
+            dest.pull("origin", opts).await.unwrap();
+
+            assert_eq!(calls.load(Ordering::Relaxed), properties, "{dropped:?}");
+            let seen = server.seen();
+            for commit in [b, c, d] {
+                let path = meta_path(&commit, "commitmeta");
+                assert_eq!(server.requests_for(&path), 1, "{dropped:?}: {seen:?}");
+                match dropped {
+                    None => assert_eq!(
+                        std::fs::read(dest_dir.join(&path)).unwrap(),
+                        std::fs::read(remote.path().join(&path)).unwrap(),
+                        "{commit}"
+                    ),
+                    Some(key) => {
+                        let Some(Value::Array(entries)) =
+                            remote.read_commit_detached_metadata(&commit).await.unwrap()
+                        else {
+                            panic!("{commit} has no .commitmeta");
+                        };
+                        let kept: Vec<Value> = entries
+                            .into_iter()
+                            .filter(|entry| {
+                                entry.as_tuple().and_then(|fields| fields[0].as_str()) != Some(key)
+                            })
+                            .collect();
+                        assert_eq!(kept.len(), 1, "{commit}");
+                        assert_eq!(
+                            dest.read_commit_detached_metadata(&commit).await.unwrap(),
+                            Some(Value::Array(kept)),
+                            "{commit}"
+                        );
+                    }
+                }
+                assert_complete(&remote, &dest, &dest_dir, &commit).await;
+            }
+            assert_no_markers(&dest_dir);
+        }
+    });
+}
+
+/// With commit verification off, discovery does not parse the `.commitmeta`
+/// of a commit of a chain. A filter set on the pull, and a `.commitmeta` of an
+/// intermediate commit that does not parse, do not change the error of the
+/// pull: the timestamp check of the target in discovery refuses the pull
+/// first.
+#[test]
+fn an_unverified_chain_pull_does_not_filter_in_discovery() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-filter-unverified-order");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let path = meta_path(&c, "commitmeta");
+        std::fs::write(remote.path().join(&path), b"\x01\x02\x03\x04\x05").unwrap();
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &a).await;
+        build_tree(&dir.path().join("newer"), b"newer\n");
+        let newer = commit_tree(
+            &dest,
+            dir.path(),
+            "newer",
+            "local/newer",
+            None,
+            FIXED_TS + 100,
+        )
+        .await;
+        let opts = PullOptions {
+            timestamp_check: TimestampCheck::Rev(newer),
+            detached_metadata_filter: DetachedMetadataFilter::excluding(["absent.key"]),
+            ..chain_opts(list)
+        };
+        match dest.pull("origin", opts).await {
+            Err(Error::Pull(msg)) => {
+                assert!(msg.contains("chronologically older"), "{msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+}
+
+/// With commit verification off, a `.commitmeta` that does not parse fails no
+/// pull for a commit that discovery checks and a later plan drops. The list
+/// gives a->c and c->d, and the remote lacks the superblock c->d, so the pull
+/// fetches d loose and never fetches c.
+#[test]
+fn an_unverified_chain_pull_skips_the_commitmeta_of_a_dropped_commit() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-filter-unverified-dropped");
+        let (remote, [a, _b, c, d]) = build_chain_remote(dir.path()).await;
+        let mut list = Vec::new();
+        for (from, to) in [(a, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        std::fs::remove_file(remote.path().join(superblock_path(&c, &d))).unwrap();
+        let path = meta_path(&c, "commitmeta");
+        std::fs::write(remote.path().join(&path), b"\x01\x02\x03\x04\x05").unwrap();
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest_dir = dir.path().join("dest");
+        let dest = dest_holding(dir.path(), &server.url(), &a).await;
+        server.forget();
+        let opts = PullOptions {
+            detached_metadata_filter: DetachedMetadataFilter::excluding(["absent.key"]),
+            ..chain_opts(list)
+        };
+        dest.pull("origin", opts).await.unwrap();
+        assert_eq!(server.requests_for(&path), 1, "{:?}", server.seen());
+        assert_complete(&remote, &dest, &dest_dir, &d).await;
+        assert_no_markers(&dest_dir);
+    });
+}
+
 // --- writing no ref --------------------------------------------------------
 
 /// Builds a remote archive repository under `dir/remote` with two commits on

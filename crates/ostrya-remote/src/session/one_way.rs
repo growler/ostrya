@@ -83,6 +83,10 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Direct<W> {
 /// does not close it. The caller closes `output`, and this close gives the end
 /// of file that ends the stream. A caller that keeps its writer gives `&mut W`.
 ///
+/// Under the `tokio` backend, the call needs a tokio runtime context: it
+/// serializes a [`DetachedMetadata::Dict`](super::DetachedMetadata::Dict) on
+/// the blocking pool of the runtime.
+///
 /// # Progress
 ///
 /// - `opts.agent` is the `agent` of `Hello`.

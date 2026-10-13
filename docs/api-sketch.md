@@ -2560,7 +2560,19 @@ because an HTTP pull carries several commits at once and calls it from each, so
 several threads can call it at the same time. If a pull fails while a filter
 call runs, that call runs to its end, so the callback can run after the pull
 returns the error. A call does not mean that the pull stores the commit: a later
-check of the pull can refuse it.
+check of the pull can refuse it. A pull from a remote with a `static_deltas` list
+checks the signatures of each commit of a chain in discovery, before the
+transaction opens. If the pull verifies the signatures of commits, discovery
+calls the filter for each such commit right after its signature check, over the
+parse of that check; the record file of discovery keeps the filtered bytes, and
+the commit step stores them with no second call. So such a pull parses each
+`.commitmeta` of a chain one time, and it can also call the filter for a commit
+that a later plan of discovery drops, or for a commit of a pull that fails later
+in discovery. If the pull does not verify the signatures of commits, the record
+file keeps the `.commitmeta` as the remote holds it, and the commit step calls
+the filter when the pull fetches the commit. Discovery then parses no
+`.commitmeta`, so a `.commitmeta` that does not parse fails the pull only for a
+commit that the pull fetches.
 
 `DetachedMetadataFilter::excluding` builds the deny-list form: the names are
 matched whole against the key of each detached-metadata property, and every
@@ -3348,7 +3360,9 @@ impl HookRefusal {
 
 `ostrya-remote` holds the client side of a push, re-exported as
 `ostrya::remote`. A `PushSession` runs one session over a pair of byte
-streams. `over_stream` needs no runtime. `connect` opens a session over
+streams. `over_stream` needs no runtime under the `smol` backend. Under the
+`tokio` backend, `send` needs a tokio runtime context, because it serializes
+a `DetachedMetadata::Dict` on the blocking pool of the runtime. `connect` opens a session over
 ssh or HTTP, on the runtime backend that the `smol` or the `tokio` feature
 selects.
 
@@ -3361,8 +3375,14 @@ selects.
   session stays usable.
 - `send` sends objects from an `ObjectSource`, then one `CommitMeta` for
   each commit of `commits` with detached metadata that the session has not
-  sent yet. The session builds the wire bytes of `ObjectData::Content`, raw
-  or through its own `DeflateReader`, and copies `ObjectData::Encoded`. It
+  sent yet. It reads that metadata through
+  `ObjectSource::detached_metadata_encoded`: it serializes a
+  `DetachedMetadata::Dict` on the blocking pool, and sends the bytes of
+  `DetachedMetadata::Encoded` as they are. The repository source of the
+  `ostrya` crate gives `Encoded`, so an unset filter and a filter that keeps
+  each property send the stored `.commitmeta` bytes unchanged. The session builds the wire bytes
+  of `ObjectData::Content`, raw or through its own `DeflateReader`, and copies
+  `ObjectData::Encoded`. It
   does not hash or measure an object, because the server verifies each one.
   A source that fails ends the session with the abandon marker and `Abort`,
   and the call returns `Error::Source`.
@@ -3449,6 +3469,11 @@ pub enum ObjectData {
     Encoded { encoding: Encoding, reader: Box<dyn ObjectReader> },
 }
 
+pub enum DetachedMetadata {
+    Dict(Value),       // the session serializes it on the blocking pool
+    Encoded(Vec<u8>),  // the `a{sv}` bytes in normal form, sent as they are
+}
+
 pub trait ObjectSource: Send + Sync {
     fn objects<'a>(&'a self, commit: &'a Checksum)
         -> BoxFuture<'a, Result<Vec<ObjectName>>>;
@@ -3456,6 +3481,9 @@ pub trait ObjectSource: Send + Sync {
         -> BoxFuture<'a, Result<ObjectData>>;
     fn detached_metadata<'a>(&'a self, commit: &'a Checksum)
         -> BoxFuture<'a, Result<Option<Value>>>;
+    // Provided: `detached_metadata` as `DetachedMetadata::Dict`.
+    fn detached_metadata_encoded<'a>(&'a self, commit: &'a Checksum)
+        -> BoxFuture<'a, Result<Option<DetachedMetadata>>>;
     // Provided: `None`.
     fn content_size<'a>(&'a self, names: &'a [ObjectName], encoding: Encoding)
         -> BoxFuture<'a, Result<Option<u64>>>;
@@ -4392,6 +4420,17 @@ blocking pool, and no payload byte:
   `bare-user` object, which is a regular file also for a symlink, a
   symlink as 0;
 - one `statat` of an object of the other modes, a symlink as 0.
+
+The source gives the detached metadata of a commit as
+`DetachedMetadata::Encoded`. With an unset `detached_metadata_filter`, it reads
+the `.commitmeta` on the blocking pool and gives the stored bytes unchanged with
+no parse; a zero-length file gives no metadata. So a `.commitmeta` that is not
+an `a{sv}` dict goes to the server, and the server refuses it with the code
+`protocol`. With a set filter, the
+source reads the `.commitmeta`, parses it, and runs the filter in one pass on
+the blocking pool. A filter that keeps each property gives the stored bytes
+unchanged; a filter that keeps some properties gives their normal form,
+serialized in the same pass; a file that does not parse gives `Error::Source`.
 
 `ostrya push`, under the `push` feature of `ostrya-cli`, is the command
 form of `Repo::push`:

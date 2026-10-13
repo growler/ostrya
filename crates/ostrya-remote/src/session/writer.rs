@@ -2,6 +2,10 @@
 //! frames and chunks of the objects of one `send` call, and the detached
 //! metadata of their commits.
 //!
+//! The writer serializes a detached metadata dict of a source on the blocking
+//! pool. It sends the bytes that a source gives as
+//! [`DetachedMetadata::Encoded`] as they are.
+//!
 //! `ObjectWriter` is generic over its output. A stream transport gives it a
 //! buffered pipe, and the HTTP transport gives it the body of one upload
 //! request. One `send` call can run several writers over one `Upload`, and
@@ -21,7 +25,7 @@ use ostrya_core::{Checksum, DeflateReader, MAX_METADATA_SIZE, ObjectName, Object
 use ostrya_gvariant::Type;
 
 use super::progress::Counters;
-use super::{ObjectData, ObjectReader, ObjectSource, invalid};
+use super::{DetachedMetadata, ObjectData, ObjectReader, ObjectSource, invalid};
 use crate::error::{Error, Result};
 use crate::proto::{Encoding, FrameWriter, Message, ObjectHeader};
 
@@ -584,21 +588,28 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
                 name: ObjectName::new(*commit, ObjectType::CommitMeta),
                 encoding: Encoding::Raw,
             };
-            let dict = up
+            let detached = up
                 .source
-                .detached_metadata(commit)
+                .detached_metadata_encoded(commit)
                 .await
                 .map_err(|e| refuse(source_error(e), next.clone()))?;
-            let Some(dict) = dict else {
-                continue;
+            let bytes = match detached {
+                None => continue,
+                Some(DetachedMetadata::Encoded(bytes)) => bytes,
+                // The dict can be as large as `MAX_METADATA_SIZE`, so the
+                // serialization runs on the blocking pool.
+                Some(DetachedMetadata::Dict(dict)) => ostrya_rt::unblock(move || {
+                    let a_sv = Type::parse("a{sv}").expect("valid signature");
+                    ostrya_gvariant::to_bytes(&a_sv, &dict)
+                })
+                .await
+                .map_err(|e| {
+                    refuse(
+                        invalid(format!("the detached metadata of commit {commit}: {e}")),
+                        next.clone(),
+                    )
+                })?,
             };
-            let a_sv = Type::parse("a{sv}").expect("valid signature");
-            let bytes = ostrya_gvariant::to_bytes(&a_sv, &dict).map_err(|e| {
-                refuse(
-                    invalid(format!("the detached metadata of commit {commit}: {e}")),
-                    next.clone(),
-                )
-            })?;
             if bytes.len() as u64 > MAX_METADATA_SIZE {
                 return Err(refuse(
                     invalid(format!(

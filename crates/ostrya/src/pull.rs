@@ -183,7 +183,7 @@ use crate::error::{Error, Result};
 use crate::file::FileKind;
 use crate::modifier::FilterResult;
 use crate::perm;
-use crate::refs::{CollectionRef, collection_ref_to_relpath};
+use crate::refs::{CollectionRef, collection_ref_to_relpath, refspec_to_relpath};
 use crate::repo::Repo;
 use crate::summary::AdvertisedDelta;
 use crate::transaction::Transaction;
@@ -420,6 +420,17 @@ pub type DetachedMetadataFilterFn =
 /// callback can run after the pull returns the error.
 /// The pull can call the filter for a commit that a later check of the pull
 /// refuses, so a call does not mean that the pull stores the commit.
+///
+/// A pull from a remote with a list of static deltas
+/// ([`PullOptions::static_deltas`]) checks the signatures of each commit of a
+/// chain in discovery, before the transaction opens. If the pull verifies the
+/// signatures of commits, discovery calls the filter for each such commit
+/// right after its signature check, over the parse of that check. Discovery
+/// keeps the result, and the pull stores it with no second call. So the pull
+/// can also call the filter for a commit that a later plan of discovery drops,
+/// and for a commit of a pull that fails later in discovery. If the pull does
+/// not verify the signatures of commits, it calls the filter for a commit of a
+/// chain when it fetches the commit, as for each other commit.
 #[derive(Clone, Default)]
 pub struct DetachedMetadataFilter(Option<DetachedMetadataFilterFn>);
 
@@ -528,6 +539,9 @@ impl DetachedMetadataFilter {
             Kept::All(_) => Ok(Some(bytes)),
             Kept::Nothing => Ok(None),
             Kept::Part(kept) => {
+                // The source bytes are not part of the result, so they drop
+                // before the serialization.
+                drop(bytes);
                 crate::summary::serialize_signature_dict(&Value::Array(kept)).map(Some)
             }
         }
@@ -907,6 +921,14 @@ pub struct PullOptions {
     /// filter call runs, that call runs to its end, so the callback can run
     /// after the pull returns the error. A call does not mean that the pull
     /// stores the commit: a later check of the pull can refuse it.
+    ///
+    /// If the pull verifies the signatures of commits, a pull from a remote
+    /// calls the filter for each commit of a chain of
+    /// [`static_deltas`](PullOptions::static_deltas) in discovery, right after
+    /// the signature check of the commit, before the transaction opens. So the
+    /// pull can call it for a commit that a later plan of discovery drops, or
+    /// for a commit of a pull that fails later in discovery. Else the pull
+    /// calls it when it fetches the commit.
     pub detached_metadata_filter: DetachedMetadataFilter,
     /// The handle to which a pull from a remote adds its live counters.
     ///
@@ -1644,7 +1666,7 @@ impl Repo {
             )
             .await?;
             verification
-                .check_summary(summary.as_deref(), signature.as_deref())
+                .check_summary(summary.as_deref(), signature)
                 .await?;
         }
         if needs_summary && summary.is_none() {
@@ -1658,9 +1680,12 @@ impl Repo {
             )));
         }
         // The pull drops the bytes here: discovery reads the parsed summary
-        // alone.
+        // alone. A summary can be as large as `SUMMARY_READ_CAP`, so the parse
+        // runs on the blocking pool, and the bytes drop there.
         let summary = match summary {
-            Some(bytes) if needs_summary => Some(crate::summary::Summary::parse(&bytes)?),
+            Some(bytes) if needs_summary => {
+                Some(ostrya_rt::unblock(move || crate::summary::Summary::parse(&bytes)).await?)
+            }
             _ => None,
         };
 
@@ -1834,7 +1859,10 @@ impl Repo {
                         txn.write_metadata(ObjectType::Commit, Some(commit), &job.commit_bytes)
                             .await?;
                     }
-                    let parsed = Commit::parse(&job.commit_bytes)?;
+                    // A commit object can be as large as `MAX_METADATA_SIZE`,
+                    // so the parse runs on the blocking pool.
+                    let bytes = Arc::clone(&job.commit_bytes);
+                    let parsed = ostrya_rt::unblock(move || Commit::parse(&bytes)).await?;
                     made.push(ChainCommit {
                         checksum: *commit,
                         root_dirtree: parsed.root_dirtree,
@@ -2125,7 +2153,9 @@ impl Repo {
     /// If `count` is set, the call counts the `.commitmeta` as a fetch counts
     /// it when the bytes come from the source, the first of `sources`. The
     /// count is the length of the bytes that the call read, before the
-    /// filter.
+    /// filter. A filter that fails counts the bytes first.
+    ///
+    /// The read and the filter run in one call on the blocking pool.
     async fn import_detached_metadata(
         &self,
         txn: &Transaction,
@@ -2134,15 +2164,26 @@ impl Repo {
         filter: &DetachedMetadataFilter,
         count: Option<&PullCounters>,
     ) -> Result<()> {
-        let Some((at, bytes)) = detached_bytes_from(sources, commit).await? else {
+        let owned: Vec<Repo> = sources.iter().map(|src| (*src).clone()).collect();
+        let filter = filter.clone();
+        let key = *commit;
+        let read = ostrya_rt::unblock(move || -> Result<_> {
+            let Some((at, bytes)) = detached_bytes_from_blocking(&owned, &key)? else {
+                return Ok(None);
+            };
+            let len = bytes.len() as u64;
+            Ok(Some((at, len, filter.apply(&key, bytes))))
+        })
+        .await?;
+        let Some((at, len, kept)) = read else {
             return Ok(());
         };
         if at == 0
             && let Some(counters) = count
         {
-            count_fetched(counters, ObjectType::CommitMeta, bytes.len() as u64);
+            count_fetched(counters, ObjectType::CommitMeta, len);
         }
-        if let Some(bytes) = filter.apply_on_pool(commit, bytes).await? {
+        if let Some(bytes) = kept? {
             txn.stage_commit_detached_bytes(commit, bytes).await?;
         }
         Ok(())
@@ -2425,10 +2466,8 @@ impl ChainCheck<'_> {
         // else that of this repository. A filter makes the stored metadata
         // smaller, so a later verification of the stored commit reads what the
         // filter kept.
-        let detached = detached_bytes_from(self.sources, commit)
-            .await?
-            .map(|(_, bytes)| bytes);
-        check_commit_signatures(self.repo, self.verification, commit, bytes, detached)
+        let sources: Vec<Repo> = self.sources.iter().map(|src| (*src).clone()).collect();
+        check_local_commit_signatures(self.repo, self.verification, sources, commit, bytes)
             .await
             .map(drop)
     }
@@ -2469,6 +2508,47 @@ async fn check_commit_signatures(
         .check_commit(commit, bytes, dict.as_ref())
         .await?;
     Ok(detached)
+}
+
+/// Checks the signatures of `commit`, whose object holds `bytes`, against the
+/// commit policy of `verification`, for a pull from local sources.
+///
+/// The check reads the `.commitmeta` of the first repository of `sources` that
+/// holds one, as [`detached_bytes_from_blocking`] does. If no source holds
+/// one, it reads the `.commitmeta` of `repo`, this repository. The reads and
+/// the parse run in one call on the blocking pool, because the bytes can be as
+/// large as [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE). The errors are
+/// the errors of [`check_commit_signatures`] over the bytes of the sources, in
+/// the same order.
+///
+/// Returns the position in `sources` and the length of the `.commitmeta` that
+/// the check read from a source, or `None` if no source holds one. The caller
+/// makes sure that the policy checks commits.
+async fn check_local_commit_signatures(
+    repo: &Repo,
+    verification: &verify::Verification,
+    sources: Vec<Repo>,
+    commit: &Checksum,
+    bytes: &[u8],
+) -> Result<Option<(usize, u64)>> {
+    let repo = repo.clone();
+    let key = *commit;
+    let (read, dict) = ostrya_rt::unblock(move || -> Result<_> {
+        if let Some((at, held)) = detached_bytes_from_blocking(&sources, &key)? {
+            let dict = crate::summary::parse_signature_dict(&held)?;
+            return Ok((Some((at, held.len() as u64)), dict));
+        }
+        match repo.load_object_bytes_blocking(ObjectType::CommitMeta, &key) {
+            Ok(held) => Ok((None, crate::summary::parse_signature_dict(&held)?)),
+            Err(Error::ObjectNotFound { .. }) => Ok((None, None)),
+            Err(e) => Err(e),
+        }
+    })
+    .await?;
+    verification
+        .check_commit(commit, bytes, dict.as_ref())
+        .await?;
+    Ok(read)
 }
 
 /// The `.commitmeta` that the pull puts in place for a commit, after the
@@ -2714,10 +2794,18 @@ async fn source_size(repo: &Repo, ty: ObjectType, checksum: &Checksum) -> Result
 }
 
 /// Loads a commit from a repository: its bytes and the commit parsed from them.
+///
+/// A commit object can be as large as [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE),
+/// so the read and the parse run in one call on the blocking pool.
 async fn load_commit(repo: &Repo, checksum: &Checksum) -> Result<(Vec<u8>, Commit)> {
-    let bytes = repo.load_object_bytes(ObjectType::Commit, checksum).await?;
-    let commit = Commit::parse(&bytes)?;
-    Ok((bytes, commit))
+    let repo = repo.clone();
+    let checksum = *checksum;
+    ostrya_rt::unblock(move || {
+        let bytes = repo.load_object_bytes_blocking(ObjectType::Commit, &checksum)?;
+        let commit = Commit::parse(&bytes)?;
+        Ok((bytes, commit))
+    })
+    .await
 }
 
 /// Loads a commit, or returns `None` for an absent object.
@@ -2740,12 +2828,15 @@ async fn try_load_commit(repo: &Repo, checksum: &Checksum) -> Result<Option<(Vec
 /// and the stored metadata agree. A
 /// zero-length file counts as a source that holds one. It is the "no metadata"
 /// marker, and it replaces the copy of the destination.
-async fn detached_bytes_from(
-    sources: &[&Repo],
+///
+/// The function reads on the calling thread. A caller on the executor calls
+/// it in one call on the blocking pool for all sources.
+fn detached_bytes_from_blocking(
+    sources: &[Repo],
     commit: &Checksum,
 ) -> Result<Option<(usize, Vec<u8>)>> {
     for (at, src) in sources.iter().enumerate() {
-        match src.load_object_bytes(ObjectType::CommitMeta, commit).await {
+        match src.load_object_bytes_blocking(ObjectType::CommitMeta, commit) {
             Ok(bytes) => return Ok(Some((at, bytes))),
             Err(Error::ObjectNotFound { .. }) => continue,
             Err(e) => return Err(e),
@@ -2953,6 +3044,27 @@ async fn commit_timestamp(repo: &Repo, commit: &Checksum) -> Result<u64> {
     .await
 }
 
+/// Reads the commit that the ref `refspec` of this repository names, and the
+/// timestamp of that commit. Returns `None` if this repository holds no such
+/// ref.
+///
+/// The ref, the read of the commit, and the decode run in one call on the
+/// blocking pool. The errors come in this order: the refspec, the read and
+/// the parse of the ref, then the read and the decode of the commit, as
+/// [`commit_timestamp`] states.
+async fn current_ref_timestamp(repo: &Repo, refspec: &str) -> Result<Option<(Checksum, u64)>> {
+    let relpath = refspec_to_relpath(refspec)?;
+    let repo = repo.clone();
+    ostrya_rt::unblock(move || {
+        let Some(current) = repo.resolve_relpath_tip_blocking(&relpath)? else {
+            return Ok(None);
+        };
+        let bytes = repo.load_object_bytes_blocking(ObjectType::Commit, &current)?;
+        Ok(Some((current, Commit::parse_timestamp(&bytes)?)))
+    })
+    .await
+}
+
 /// The checks that a pull makes for each requested ref that names a tip
 /// commit.
 #[derive(Clone, Copy)]
@@ -2995,6 +3107,10 @@ async fn check_tip_refs(
 }
 
 /// Refuses a fetched tip that is older than the commit of the check.
+///
+/// Under [`TimestampBase::CurrentRef`], the call reads the ref and the
+/// timestamp of its commit in one call on the blocking pool, through
+/// [`current_ref_timestamp`].
 async fn check_timestamp(
     repo: &Repo,
     check: TimestampBase,
@@ -3006,13 +3122,13 @@ async fn check_timestamp(
     let (against, timestamp) = match check {
         TimestampBase::Off => return Ok(()),
         TimestampBase::CurrentRef => {
-            let current = repo.resolve_ref_tip(&refspec(ref_prefix, ref_name)).await?;
             // A ref that this repository does not hold has nothing to be
             // older than.
-            let Some(current) = current else {
+            let Some(current) = current_ref_timestamp(repo, &refspec(ref_prefix, ref_name)).await?
+            else {
                 return Ok(());
             };
-            (current, commit_timestamp(repo, &current).await?)
+            current
         }
         TimestampBase::Rev { commit, timestamp } => (commit, timestamp),
     };

@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::file::FileKind;
 use crate::object;
 use crate::pull::DetachedMetadataFilter;
-use crate::remote::{BoxFuture, Encoding, ObjectData, ObjectSource};
+use crate::remote::{BoxFuture, DetachedMetadata, Encoding, ObjectData, ObjectSource};
 use crate::repo::Repo;
 
 /// The [`ObjectSource`] over a local repository.
@@ -26,7 +26,12 @@ use crate::repo::Repo;
 /// calls. [`content_size`](ObjectSource::content_size) reads the metadata of
 /// each file object in one pass on the blocking pool. It reads no payload byte.
 ///
-/// The source applies the filter to the detached metadata of a commit.
+/// The source applies the filter to the detached metadata of a commit. It
+/// gives the detached metadata as [`DetachedMetadata::Encoded`]. If the filter
+/// is unset or keeps each property, these are the bytes of the stored
+/// `.commitmeta` unchanged, so the session sends them with no parse or
+/// serialization of its own. With an unset filter, the source does not parse
+/// the `.commitmeta`, and the server checks it.
 pub(crate) struct RepoSource {
     repo: Repo,
     filter: DetachedMetadataFilter,
@@ -131,6 +136,40 @@ impl RepoSource {
         )
         .await
     }
+
+    /// Returns the bytes of the detached metadata of `commit` that the filter
+    /// allows. If the commit has none or the filter allows no property,
+    /// returns `None`.
+    ///
+    /// An unset filter gives the bytes of the stored `.commitmeta` unchanged,
+    /// and the call does not parse them. So a `.commitmeta` that is not an
+    /// `a{sv}` dict goes to the server as it is, and the server refuses it
+    /// with the code `protocol`. A set filter parses the file: a filter that
+    /// keeps each property gives the bytes unchanged, and a filter that keeps
+    /// some of the properties gives their normal form. With a set filter, a
+    /// `.commitmeta` that is not an `a{sv}` dict gives [`Error::Core`], as
+    /// [`detached`](RepoSource::detached) does. The read, the parse, the
+    /// filter, and the serialization of a partial result run in one call on
+    /// the blocking pool.
+    async fn detached_bytes(&self, commit: &Checksum) -> Result<Option<Vec<u8>>> {
+        let repo = self.repo.clone();
+        let filter = self.filter.clone();
+        let commit = *commit;
+        ostrya_rt::unblock(move || {
+            let bytes = match repo.load_object_bytes_blocking(ObjectType::CommitMeta, &commit) {
+                Ok(bytes) => bytes,
+                Err(Error::ObjectNotFound { .. }) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            // A zero-length file marks no metadata, so the session sends
+            // nothing for it.
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            filter.apply(&commit, bytes)
+        })
+        .await
+    }
 }
 
 fn source_error(e: Error) -> crate::remote::Error {
@@ -165,6 +204,18 @@ impl ObjectSource for RepoSource {
         commit: &'a Checksum,
     ) -> BoxFuture<'a, crate::remote::Result<Option<Value>>> {
         Box::pin(async move { self.detached(commit).await.map_err(source_error) })
+    }
+
+    fn detached_metadata_encoded<'a>(
+        &'a self,
+        commit: &'a Checksum,
+    ) -> BoxFuture<'a, crate::remote::Result<Option<DetachedMetadata>>> {
+        Box::pin(async move {
+            self.detached_bytes(commit)
+                .await
+                .map(|bytes| bytes.map(DetachedMetadata::Encoded))
+                .map_err(source_error)
+        })
     }
 
     fn content_size<'a>(
@@ -586,6 +637,87 @@ mod tests {
                 DetachedMetadataFilter::excluding(["xa.keep", "xa.drop", "xa.other"]),
             );
             assert!(none.detached_metadata(&commit).await.unwrap().is_none());
+        });
+    }
+
+    /// Returns the bytes of an `Encoded` result, `None` for `None`, and fails
+    /// for a `Dict`.
+    async fn encoded(src: &RepoSource, commit: &Checksum) -> Option<Vec<u8>> {
+        match src.detached_metadata_encoded(commit).await.unwrap() {
+            Some(DetachedMetadata::Encoded(bytes)) => Some(bytes),
+            Some(DetachedMetadata::Dict(dict)) => panic!("a dict: {dict:?}"),
+            None => None,
+        }
+    }
+
+    /// The source gives the bytes of the stored `.commitmeta` unchanged for an
+    /// unset filter and for a filter that keeps each property. A partial
+    /// filter gives the normal form of the kept properties. An absent file,
+    /// the zero-length marker, and a filter that allows no property give
+    /// `None`. An unset filter does not parse the file, so a file that is not
+    /// an `a{sv}` dict goes as it is. A set filter refuses that file.
+    #[test]
+    fn encoded_detached_metadata_is_the_stored_file_if_the_filter_keeps_each_property() {
+        ostrya_rt::block_on(async {
+            let (scratch, repo, commit) = fixture("detached-encoded", RepoMode::Archive).await;
+            let name = ObjectName::new(commit, ObjectType::CommitMeta);
+            assert_eq!(encoded(&source(&repo), &commit).await, None);
+
+            repo.write_commit_detached_metadata(&commit, None)
+                .await
+                .unwrap();
+            assert!(stored(&scratch, &repo, &name).is_empty());
+            assert_eq!(encoded(&source(&repo), &commit).await, None);
+
+            let mut dict = DictBuilder::new();
+            dict.insert_str("xa.keep", "kept");
+            dict.insert_str("xa.drop", "dropped");
+            let dict = dict.build();
+            repo.write_commit_detached_metadata(&commit, Some(&dict))
+                .await
+                .unwrap();
+            let file = stored(&scratch, &repo, &name);
+
+            assert_eq!(encoded(&source(&repo), &commit).await.as_ref(), Some(&file));
+            let keep_all = RepoSource::new(
+                repo.clone(),
+                DetachedMetadataFilter::excluding(["xa.absent"]),
+            );
+            assert_eq!(encoded(&keep_all, &commit).await.as_ref(), Some(&file));
+
+            let partial =
+                RepoSource::new(repo.clone(), DetachedMetadataFilter::excluding(["xa.drop"]));
+            let kept: Vec<Value> = dict
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.as_tuple().unwrap()[0].as_str() != Some("xa.drop"))
+                .cloned()
+                .collect();
+            assert_eq!(
+                encoded(&partial, &commit).await,
+                Some(crate::summary::serialize_signature_dict(&Value::Array(kept)).unwrap())
+            );
+
+            let none = RepoSource::new(
+                repo.clone(),
+                DetachedMetadataFilter::excluding(["xa.keep", "xa.drop"]),
+            );
+            assert_eq!(encoded(&none, &commit).await, None);
+
+            let corrupt = b"\x01\x02\x03\x04\x05".to_vec();
+            let path = loose_path(&commit, ObjectType::CommitMeta, repo.mode());
+            std::fs::write(scratch.path().join("repo/objects").join(path), &corrupt).unwrap();
+            assert_eq!(encoded(&source(&repo), &commit).await, Some(corrupt));
+            let Err(crate::remote::Error::Source(inner)) =
+                keep_all.detached_metadata_encoded(&commit).await
+            else {
+                panic!("a set filter passed a corrupt .commitmeta");
+            };
+            assert!(
+                matches!(inner.downcast_ref::<Error>(), Some(Error::Core(_))),
+                "{inner:?}"
+            );
         });
     }
 }

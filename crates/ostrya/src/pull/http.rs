@@ -899,15 +899,32 @@ impl Repo {
         marked: &mut Vec<Checksum>,
     ) -> Result<FetchedPull> {
         let mut root = source.root_files().await?;
+        // A mirror pull of every ref that writes refs copies the `summary` and
+        // the `summary.sig` of the remote. Each other pull drops the bytes
+        // after their checks.
+        let copies_summary =
+            opts.flags.contains(PullFlags::MIRROR) && opts.refs.is_empty() && !opts.no_ref_writes;
         // The pull checks the summary before it reads it. The pull acts on the
         // refs that the summary resolves and the deltas that it advertises.
         // As a result, a summary that the policy refuses stops the pull before
         // its first object request.
-        verification
-            .check_summary(root.summary.as_deref(), root.signature.as_deref())
-            .await?;
-        let summary = match root.summary.as_deref() {
-            Some(bytes) => Some(Summary::parse(bytes)?),
+        root.signature = verification
+            .check_summary(root.summary.as_deref(), root.signature.take())
+            .await?
+            .filter(|_| copies_summary);
+        // A summary can be as large as its read cap, so the parse runs on the
+        // blocking pool. The bytes come back only for the write of a mirror
+        // pull, and else drop there.
+        let summary = match root.summary.take() {
+            Some(bytes) => {
+                let (parsed, bytes) = ostrya_rt::unblock(move || {
+                    let parsed = Summary::parse(&bytes);
+                    (parsed, copies_summary.then_some(bytes))
+                })
+                .await;
+                root.summary = bytes;
+                Some(parsed?)
+            }
             None => None,
         };
         check_remote_mode(root.config(source).await?)?;
@@ -946,6 +963,8 @@ impl Repo {
             counters,
         )
         .await?;
+        // Discovery is the last reader of the parsed summary.
+        drop(summary);
         deltas.plan_parts(counters);
 
         let mut txn = self.transaction().await?;
@@ -1279,11 +1298,13 @@ impl Repo {
             return self.done_commit(ctx, checksum).await;
         }
         // Discovery checked the signatures of each commit of a chain, and kept
-        // the verified `.commitmeta`. The step stages these bytes and does not
-        // request them again.
-        let (prechecked, mut known) = match ctx.delta_plan.commit_check(&checksum).await? {
-            CommitCheck::NotChecked => (false, None),
-            CommitCheck::Checked(detached) => (true, Some(detached)),
+        // the verified `.commitmeta`: the result of the filter if the check
+        // parsed it, else the bytes of the source. The step stages these bytes
+        // and does not request them again.
+        let (prechecked, filtered, mut known) = match ctx.delta_plan.commit_check(&checksum).await?
+        {
+            CommitCheck::NotChecked => (false, false, None),
+            CommitCheck::Checked { detached, filtered } => (true, filtered, Some(detached)),
         };
 
         let present = self.has_object(ObjectType::Commit, &checksum).await?;
@@ -1295,6 +1316,9 @@ impl Repo {
         // before the commit. The `ostree` command was observed to request the
         // pair in this order. The pull holds the bytes until the commit object
         // is here, so a commit that the remote does not hold leaves none.
+        //
+        // The commit bytes are shared, so the bytes of a delta job need no
+        // copy.
         let (detached, bytes) = if present {
             let detached = match known.take() {
                 Some(detached) => detached,
@@ -1306,7 +1330,7 @@ impl Repo {
             let bytes = self
                 .load_object_bytes(ObjectType::Commit, &checksum)
                 .await?;
-            (detached, bytes)
+            (detached, Arc::new(bytes))
         } else if let Some(src) = cached_source(ctx.sources, name).await? {
             // A localcache source holds the object. The pull reads the bytes
             // from there, and the import runs after the checks, in the order of
@@ -1321,14 +1345,14 @@ impl Repo {
             };
             (
                 detached,
-                src.load_object_bytes(ObjectType::Commit, &checksum).await?,
+                Arc::new(src.load_object_bytes(ObjectType::Commit, &checksum).await?),
             )
         } else if let Some(job) = ctx.deltas.get(&checksum) {
             // A delta carries the target commit in its superblock, and these
             // bytes come from there. The parse of the superblock verified that
             // they hash to this checksum. The write at staging verifies it
             // again.
-            staging = CommitStaging::Write;
+            staging = CommitStaging::Write(Arc::clone(&job.commit_bytes));
             let detached = match known.take() {
                 Some(detached) => detached,
                 None => {
@@ -1336,12 +1360,13 @@ impl Repo {
                         .await?
                 }
             };
-            (detached, job.commit_bytes.clone())
+            (detached, Arc::clone(&job.commit_bytes))
         } else {
             match self.fetch_remote_commit(ctx, &checksum).await? {
                 (detached, Some(bytes)) => {
                     ctx.progress.metadata_fetched();
-                    staging = CommitStaging::Write;
+                    let bytes = Arc::new(bytes);
+                    staging = CommitStaging::Write(Arc::clone(&bytes));
                     (detached, bytes)
                 }
                 // A parent that the remote does not hold ends that chain, as a
@@ -1358,7 +1383,10 @@ impl Repo {
             }
         };
 
-        let commit = Commit::parse(&bytes)?;
+        // A commit object can be as large as `MAX_METADATA_SIZE`, so the parse
+        // runs on the blocking pool.
+        let shared = Arc::clone(&bytes);
+        let commit = ostrya_rt::unblock(move || Commit::parse(&shared)).await?;
         // The signature verification runs before the pull stages the commit
         // and requests its tree, so a commit that the policy refuses costs no
         // fetch of its own objects. Discovery checked each commit of a chain
@@ -1370,8 +1398,14 @@ impl Repo {
         // stored commit reads the same metadata.
         // If the verification parses the metadata, the filter reads that parse
         // right after the verification, and the step keeps only its result.
+        // The bytes that discovery filtered pass as they are. The step filters
+        // the other bytes that discovery kept, and a `.commitmeta` that it
+        // fetched itself.
         let detached = if prechecked {
-            detached.map(CheckedMeta::Source)
+            match known {
+                None if filtered => Some(CheckedMeta::Filtered(detached)),
+                _ => detached.map(CheckedMeta::Source),
+            }
         } else {
             let detached = check_commit_signatures_filtered(
                 self,
@@ -1385,6 +1419,10 @@ impl Repo {
             self.check_tips(ctx, &checksum, &commit).await?;
             detached
         };
+        // The checks are the last readers of these bytes. A write keeps its
+        // own reference in `staging`, so the other stagings drop the bytes
+        // here.
+        drop(bytes);
 
         // The pull writes no partial marker for a commit that this repository
         // holds complete: a pull that fails elsewhere must not demote it.
@@ -1411,7 +1449,7 @@ impl Repo {
                 )
                 .await?;
             }
-            CommitStaging::Write => {
+            CommitStaging::Write(bytes) => {
                 ctx.txn
                     .write_metadata(ObjectType::Commit, Some(&checksum), &bytes)
                     .await?;
@@ -1425,10 +1463,12 @@ impl Repo {
         // new read of a mutable file on each pull.
         //
         // The filter runs after the checks read the metadata as the remote
-        // holds it: here, or after the verification that parsed it. So a
-        // filter drops a property from what the pull stores, and the verified
-        // metadata stays whole. A filter that allows no property stages
-        // nothing, and the copy of this repository stays as it is.
+        // holds it: here, after the verification that parsed it, or in
+        // discovery after the verification of a commit of a chain that parsed
+        // it. So a filter drops a property from
+        // what the pull stores, and the verified metadata stays whole. A
+        // filter that allows no property stages nothing, and the copy of this
+        // repository stays as it is.
         if let Some(meta) = detached
             && let Some(meta) = meta.filtered(ctx.detached_filter, &checksum).await?
         {
@@ -1495,13 +1535,13 @@ impl Repo {
     /// Runs the step of a commit that an earlier run of this pull made
     /// complete in the transaction.
     ///
-    /// The step reads the commit from the transaction, and makes the checks
-    /// of each requested ref that names it, unless discovery made them. It
-    /// checks no signature, requests nothing, and stages nothing. The plan
-    /// follows the parent of the commit under `depth`.
+    /// The step reads and parses the commit from the transaction in one call
+    /// on the blocking pool. It then makes the checks of each requested ref
+    /// that names the commit, unless discovery made them. It checks no
+    /// signature, requests nothing, and stages nothing. The plan follows the
+    /// parent of the commit under `depth`.
     async fn done_commit(&self, ctx: &StepCtx<'_>, checksum: Checksum) -> Result<Step> {
-        let bytes = ctx.txn.load_commit_bytes_staged_first(&checksum).await?;
-        let commit = Commit::parse(&bytes)?;
+        let commit = ctx.txn.load_commit_staged_first(&checksum).await?;
         if !ctx.delta_plan.checked(&checksum) {
             self.check_tips(ctx, &checksum, &commit).await?;
         }
@@ -1754,7 +1794,7 @@ struct FetchedPull {
     /// The refs to write, and the commit each names.
     targets: Vec<(String, Checksum)>,
     /// The `summary` and `summary.sig` of the remote, which a mirror pull of
-    /// every ref copies.
+    /// every ref copies. Each other pull keeps neither.
     summary: Option<Vec<u8>>,
     signature: Option<Vec<u8>>,
 }
@@ -1962,7 +2002,7 @@ enum CommitStaging<'a> {
     /// A localcache repository holds it, and the pull imports it from there.
     Import(&'a Repo),
     /// Its bytes are in memory, and the pull writes them into the transaction.
-    Write,
+    Write(Arc<Vec<u8>>),
 }
 
 /// How the objects of a commit reach this repository.

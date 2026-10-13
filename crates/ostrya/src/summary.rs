@@ -855,7 +855,7 @@ impl Repo {
     ///
     /// The dict is an `a{sv}` with one entry for each signing engine. The read
     /// stops at 64 MiB. If the file is longer, the call parses the first
-    /// 64 MiB.
+    /// 64 MiB. The read and the parse run in one call on the blocking pool.
     ///
     /// # Errors
     ///
@@ -863,10 +863,14 @@ impl Repo {
     /// - [`Error::Io`] if the read fails, for example if `summary.sig` is a
     ///   symlink.
     pub async fn read_summary_signature(&self) -> Result<Option<Value>> {
-        let Some(bytes) = self.read_root_file(SUMMARY_SIG_FILE).await? else {
-            return Ok(None);
-        };
-        parse_signature_dict(&bytes)
+        let repo = self.clone();
+        ostrya_rt::unblock(move || {
+            let Some(bytes) = read_root_file_blocking(repo.repo_fd(), SUMMARY_SIG_FILE)? else {
+                return Ok(None);
+            };
+            parse_signature_dict(&bytes)
+        })
+        .await
     }
 
     /// Signs the summary with `signer` and adds the signature to `summary.sig`.

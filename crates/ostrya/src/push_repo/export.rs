@@ -32,7 +32,11 @@ pub struct ExportStreamOptions {
     pub compression: Compression,
     /// The filter for the detached metadata of each commit in the stream.
     ///
-    /// If the filter is unset, the stream carries every key.
+    /// If the filter is unset, the stream carries every key. The stream then
+    /// carries the stored `.commitmeta` bytes with no parse, so the receiver
+    /// refuses a `.commitmeta` that is not an `a{sv}` dict. A set filter
+    /// parses the file, and such a file gives
+    /// [`Source`](crate::remote::Error::Source).
     pub detached_metadata_filter: DetachedMetadataFilter,
 }
 

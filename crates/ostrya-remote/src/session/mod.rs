@@ -133,6 +133,19 @@ impl fmt::Debug for ObjectData {
     }
 }
 
+/// The detached metadata of a commit, as an [`ObjectSource`] gives it.
+pub enum DetachedMetadata {
+    /// An `a{sv}` dict. The session serializes it on the blocking pool.
+    Dict(Value),
+    /// The bytes of an `a{sv}` dict in normal form. The session sends the
+    /// bytes as they are.
+    ///
+    /// A source that holds the serialized dict gives it in this form, so the
+    /// session does not serialize it again. The session does not check the
+    /// bytes. The server checks them.
+    Encoded(Vec<u8>),
+}
+
 /// A source of the objects that a session sends.
 pub trait ObjectSource: Send + Sync {
     /// Returns the name of each object that `commit` reaches, and of the commit.
@@ -177,6 +190,10 @@ pub trait ObjectSource: Send + Sync {
     /// value, or if its bytes are more than 128 MiB, the object stream stops
     /// with [`Error::InvalidInput`].
     ///
+    /// The session calls
+    /// [`detached_metadata_encoded`](ObjectSource::detached_metadata_encoded),
+    /// whose default implementation calls this method.
+    ///
     /// # Errors
     ///
     /// An error of the source stops the object stream.
@@ -186,6 +203,37 @@ pub trait ObjectSource: Send + Sync {
         &'a self,
         commit: &'a Checksum,
     ) -> BoxFuture<'a, Result<Option<Value>>>;
+
+    /// Returns the detached metadata for `commit`, as a dict or as its bytes.
+    ///
+    /// The session sends the detached metadata of each commit through this
+    /// method. The default implementation calls
+    /// [`detached_metadata`](ObjectSource::detached_metadata) and gives its
+    /// dict as [`DetachedMetadata::Dict`]. A source that holds the bytes of
+    /// the dict can give them as [`DetachedMetadata::Encoded`].
+    ///
+    /// For `None`, the session sends no detached metadata for `commit`. The
+    /// session serializes a [`DetachedMetadata::Dict`] on the blocking pool.
+    /// If the dict is not a valid `a{sv}` value, or if the bytes of either
+    /// form are more than 128 MiB, the object stream stops with
+    /// [`Error::InvalidInput`].
+    ///
+    /// # Errors
+    ///
+    /// An error of the source stops the object stream.
+    /// [`send`](PushSession::send) and [`export_stream`] return it as
+    /// [`Error::Source`].
+    fn detached_metadata_encoded<'a>(
+        &'a self,
+        commit: &'a Checksum,
+    ) -> BoxFuture<'a, Result<Option<DetachedMetadata>>> {
+        Box::pin(async move {
+            Ok(self
+                .detached_metadata(commit)
+                .await?
+                .map(DetachedMetadata::Dict))
+        })
+    }
 
     /// Returns the content bytes of the file objects of `names` in `encoding`.
     ///
@@ -498,8 +546,11 @@ impl PushSession {
     /// time limit on a read. A peer that stays silent keeps a call waiting
     /// until the caller drops its future or closes the streams.
     ///
-    /// A session over a stream uses the `futures-io` traits alone, so it needs
-    /// no async runtime.
+    /// A session over a stream uses the `futures-io` traits for its I/O. Under
+    /// the `smol` backend, it needs no async runtime. Under the `tokio`
+    /// backend, [`send`](PushSession::send) needs a tokio runtime context: it
+    /// serializes a [`DetachedMetadata::Dict`] on the blocking pool of the
+    /// runtime. The other calls need no async runtime.
     ///
     /// # Errors
     ///

@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures_io::{AsyncRead, AsyncWrite};
-use futures_lite::future::block_on;
 use futures_lite::io::{AsyncWriteExt, Cursor};
 use ostrya_core::filehdr::frame;
 use ostrya_core::{Checksum, DeflateSink, FileHeader, ObjectName, ObjectType, Xattrs};
@@ -19,10 +18,11 @@ use ostrya_remote::proto::{
     ObjectHeader, ObjectRead, ObjectsReply,
 };
 use ostrya_remote::{
-    BoxFuture, Compression, Encoding, Error, ErrorCode, Expected, ObjectData, ObjectSource,
-    PushPhase, PushProgress, PushProgressSnapshot, PushSession, RefOutcome, RefState, RefUpdate,
-    SessionOptions,
+    BoxFuture, Compression, DetachedMetadata, Encoding, Error, ErrorCode, Expected, ObjectData,
+    ObjectSource, PushPhase, PushProgress, PushProgressSnapshot, PushSession, RefOutcome, RefState,
+    RefUpdate, SessionOptions,
 };
+use ostrya_rt::block_on;
 
 fn ck(n: u8) -> Checksum {
     Checksum::from_bytes([n; 32])
@@ -315,6 +315,8 @@ enum Item {
 struct Source {
     items: HashMap<ObjectName, Item>,
     meta: HashMap<Checksum, Value>,
+    /// The detached metadata that the source gives as bytes.
+    encoded: HashMap<Checksum, Vec<u8>>,
     /// Each open, with the encoding the session named.
     opened: Mutex<Vec<(ObjectName, Encoding)>>,
     /// Each detached metadata request.
@@ -383,6 +385,24 @@ impl ObjectSource for Source {
     ) -> BoxFuture<'a, ostrya_remote::Result<Option<Value>>> {
         self.asked.lock().unwrap().push(*commit);
         Box::pin(async move { Ok(self.meta.get(commit).cloned()) })
+    }
+
+    fn detached_metadata_encoded<'a>(
+        &'a self,
+        commit: &'a Checksum,
+    ) -> BoxFuture<'a, ostrya_remote::Result<Option<DetachedMetadata>>> {
+        match self.encoded.get(commit) {
+            Some(bytes) => {
+                let bytes = bytes.clone();
+                Box::pin(async move { Ok(Some(DetachedMetadata::Encoded(bytes))) })
+            }
+            None => Box::pin(async move {
+                Ok(self
+                    .detached_metadata(commit)
+                    .await?
+                    .map(DetachedMetadata::Dict))
+            }),
+        }
     }
 
     fn content_size<'a>(
@@ -972,6 +992,37 @@ fn detached_metadata_goes_once_per_commit() {
                 meta_name(ObjectType::CommitMeta, 2),
                 Encoding::Raw,
                 a_sv_bytes(&Value::Array(Vec::new()))
+            ),
+        ]
+    );
+}
+
+/// A source that gives its detached metadata as bytes gets them sent as they
+/// are, and the session does not ask for the dict. A source with a dict gets
+/// it sent in normal form.
+#[test]
+fn encoded_detached_metadata_goes_as_it_is() {
+    let mut dict = DictBuilder::new();
+    dict.insert_str("key", "value");
+    let dict = dict.build();
+    let mut source = Source::default();
+    source.meta.insert(ck(1), dict.clone());
+    source.encoded.insert(ck(2), b"encoded bytes".to_vec());
+    let (session, out) = open(&["a"], BOTH, &[objects_reply()]);
+    block_on(session.send(&source, &[], &[ck(1), ck(2)], Compression::None)).unwrap();
+    assert_eq!(*source.asked.lock().unwrap(), vec![ck(1)]);
+    assert_eq!(
+        objects(&after_hello(&out)),
+        vec![
+            (
+                meta_name(ObjectType::CommitMeta, 1),
+                Encoding::Raw,
+                a_sv_bytes(&dict)
+            ),
+            (
+                meta_name(ObjectType::CommitMeta, 2),
+                Encoding::Raw,
+                b"encoded bytes".to_vec()
             ),
         ]
     );

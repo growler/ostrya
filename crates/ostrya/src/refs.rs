@@ -355,10 +355,17 @@ impl Repo {
     /// Returns the commit that the ref file at `relpath` names, read as
     /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads a refspec. The call
     /// follows an alias. The result is `None` if no file is at the path.
+    ///
+    /// The read and the parse run in one call on the blocking pool.
     pub(crate) async fn resolve_relpath_tip(&self, relpath: String) -> Result<Option<Checksum>> {
         let repo = self.clone();
-        let bytes = ostrya_rt::unblock(move || read_ref_file(repo.repo_fd(), &relpath)).await?;
-        match bytes {
+        ostrya_rt::unblock(move || repo.resolve_relpath_tip_blocking(&relpath)).await
+    }
+
+    /// Runs [`resolve_relpath_tip`](Repo::resolve_relpath_tip) on the calling
+    /// thread.
+    pub(crate) fn resolve_relpath_tip_blocking(&self, relpath: &str) -> Result<Option<Checksum>> {
+        match read_ref_file(self.repo_fd(), relpath)? {
             Some(bytes) => Ok(Some(parse_ref_content(&bytes)?)),
             None => Ok(None),
         }

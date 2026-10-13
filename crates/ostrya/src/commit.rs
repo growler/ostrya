@@ -344,6 +344,29 @@ impl Repo {
         crate::summary::parse_signature_dict(&bytes)
     }
 
+    /// Loads the bytes of the commit object `checksum` and its detached
+    /// metadata, as
+    /// [`read_commit_detached_metadata`](Repo::read_commit_detached_metadata)
+    /// reads it.
+    ///
+    /// The two reads and the parse run in one call on the blocking pool. The
+    /// read of the commit comes first, so a commit that this repository does
+    /// not hold gives [`Error::ObjectNotFound`] before an error of the
+    /// `.commitmeta`.
+    pub(crate) async fn load_commit_and_detached(
+        &self,
+        checksum: &Checksum,
+    ) -> Result<(Vec<u8>, Option<Value>)> {
+        let repo = self.clone();
+        let key = *checksum;
+        ostrya_rt::unblock(move || {
+            let bytes = repo.load_object_bytes_blocking(ObjectType::Commit, &key)?;
+            let detached = repo.read_commit_detached_metadata_blocking(&key)?;
+            Ok((bytes, detached))
+        })
+        .await
+    }
+
     /// Writes or clears the detached metadata of a commit.
     ///
     /// If `meta` is `Some`, the call writes the `a{sv}` dict at the

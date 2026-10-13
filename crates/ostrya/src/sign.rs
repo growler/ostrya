@@ -137,6 +137,10 @@ impl Repo {
     /// valid. The outcome holds the [`SignatureInfo`] records of all
     /// verifiers, in the order of `verifiers`.
     ///
+    /// The read of the commit object, the read of the `.commitmeta` file, and
+    /// the parse of the file run in one call on the blocking pool. The read of
+    /// the commit object comes first.
+    ///
     /// # Errors
     ///
     /// - [`Error::ObjectNotFound`] if the commit object is not in the object
@@ -166,8 +170,7 @@ impl Repo {
         checksum: &Checksum,
         verifiers: &[&dyn Verifier],
     ) -> crate::Result<VerifyOutcome> {
-        let data = self.load_object_bytes(ObjectType::Commit, checksum).await?;
-        let dict = self.read_commit_detached_metadata(checksum).await?;
+        let (data, dict) = self.load_commit_and_detached(checksum).await?;
         let mut outcome = VerifyOutcome::default();
         for verifier in verifiers {
             let signatures = match &dict {

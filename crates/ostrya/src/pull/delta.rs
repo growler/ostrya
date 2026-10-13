@@ -33,7 +33,10 @@
 //! For the commit of each step, discovery fetches the `.commitmeta` from a
 //! remote. From a local source it reads the `.commitmeta` only if the policy
 //! checks commits. Then it checks the signatures of the commit that the
-//! superblock carries. For a target, it also makes the ref-binding check of
+//! superblock carries. For a remote source, if the check parsed the
+//! `.commitmeta` and the pull has a filter, discovery then runs the detached
+//! metadata filter of the pull over that parse, and the record file keeps the
+//! result. For a target, it also makes the ref-binding check of
 //! each requested ref that names it. For a remote source it also makes the
 //! timestamp check of each of these refs, and for a local source it makes
 //! none, because a local pull has none. So a refused target costs no part.
@@ -99,8 +102,9 @@ use super::chain::{
 use super::http::{cached_source, fetch_remote_detached};
 use super::source::{RemoteSource, Transfer, session_error};
 use super::{
-    TimestampBase, TipChecks, check_commit_signatures, check_tip_refs, count_fetched,
-    detached_bytes_from, source_size,
+    CheckedMeta, DetachedMetadataFilter, TimestampBase, TipChecks,
+    check_commit_signatures_filtered, check_local_commit_signatures, check_tip_refs, count_fetched,
+    source_size,
 };
 
 /// The number of delta parts that one pull fetches at a time.
@@ -147,7 +151,11 @@ pub(crate) struct DeltaJob {
     name: String,
     /// The normal-form bytes of the target commit. The superblock carries them,
     /// and the pull stages the commit from them.
-    pub(crate) commit_bytes: Vec<u8>,
+    ///
+    /// The jobs of a pull from a remote are in a map that the concurrent steps
+    /// share. The step of the commit takes a shared reference to the bytes,
+    /// and does not copy them.
+    pub(crate) commit_bytes: Arc<Vec<u8>>,
     /// The meta-entries of the parts, in part order: the checksum of each part,
     /// the size that caps its fetch, and the objects that it produces.
     meta_entries: Vec<DeltaPart>,
@@ -324,10 +332,11 @@ impl DeltaPlan {
     /// Returns the check that discovery made of `commit`.
     ///
     /// For a checked commit, the result holds the verified `.commitmeta` from
-    /// the record file, or `None` if no repository holds one. A record from a
-    /// local source keeps no bytes, so for a plan from a local source the
-    /// result holds `None` and states only whether discovery checked the
-    /// commit. The call then reads nothing.
+    /// the record file, and states whether the filter of the pull ran over it.
+    /// It holds `None` if no repository holds a `.commitmeta`, or if the
+    /// filter allows no property. A record from a local source keeps no bytes,
+    /// so for a plan from a local source the result holds `None` and states
+    /// only whether discovery checked the commit. The call then reads nothing.
     ///
     /// # Errors
     ///
@@ -339,13 +348,29 @@ impl DeltaPlan {
         };
         match (&record.detached, self.store.as_ref()) {
             (Detached::NotChecked, _) => Ok(CommitCheck::NotChecked),
-            (Detached::Checked { kept: Some(range) }, Some(store)) => {
-                Ok(CommitCheck::Checked(Some(store.read(range.clone()).await?)))
-            }
-            (Detached::Checked { kept: Some(_) }, None) => Err(Error::InvalidFormat(
+            (
+                Detached::Checked {
+                    kept: Some(range),
+                    filtered,
+                },
+                Some(store),
+            ) => Ok(CommitCheck::Checked {
+                detached: Some(store.read(range.clone()).await?),
+                filtered: *filtered,
+            }),
+            (Detached::Checked { kept: Some(_), .. }, None) => Err(Error::InvalidFormat(
                 "the record file holds no record".into(),
             )),
-            (Detached::Checked { kept: None }, _) => Ok(CommitCheck::Checked(None)),
+            (
+                Detached::Checked {
+                    kept: None,
+                    filtered,
+                },
+                _,
+            ) => Ok(CommitCheck::Checked {
+                detached: None,
+                filtered: *filtered,
+            }),
         }
     }
 
@@ -365,9 +390,15 @@ pub(crate) enum CommitCheck {
     /// Discovery checked the signatures of the commit, and made the
     /// ref-binding check of each requested ref that names it. For a remote
     /// source, discovery also made the timestamp check of each of these refs.
-    /// The value is the verified `.commitmeta`, or `None` if no repository
-    /// holds one.
-    Checked(Option<Vec<u8>>),
+    Checked {
+        /// The verified `.commitmeta`. It is `None` if no repository holds a
+        /// `.commitmeta`, or if the filter allows no property.
+        detached: Option<Vec<u8>>,
+        /// `true` if `detached` is the result of the filter of the pull.
+        /// `false` if `detached` holds the bytes as the source holds them, and
+        /// the commit step runs the filter over them.
+        filtered: bool,
+    },
 }
 
 /// A step of a chain whose superblock discovery fetched and verified.
@@ -392,9 +423,13 @@ enum Detached {
     /// Discovery checked the commit, as [`CommitCheck::Checked`] states.
     Checked {
         /// The range of the verified `.commitmeta` in the record file. `None`
-        /// if the remote and the localcache repositories hold none, and for a
-        /// local source, which keeps no bytes.
+        /// if the remote and the localcache repositories hold none, if the
+        /// filter allows no property, and for a local source, which keeps no
+        /// bytes.
         kept: Option<Range<u64>>,
+        /// `true` if `kept` holds the result of the filter of the pull, as
+        /// [`CommitCheck::Checked`] states.
+        filtered: bool,
     },
 }
 
@@ -403,6 +438,9 @@ struct Checked {
     /// The range of the verified `.commitmeta` in the record file, from a
     /// remote.
     kept: Option<Range<u64>>,
+    /// `true` if `kept` holds the result of the filter of the pull, as
+    /// [`CommitCheck::Checked`] states.
+    filtered: bool,
     /// What the check read of the `.commitmeta` in a local source.
     local: LocalRead,
 }
@@ -420,7 +458,9 @@ enum LocalRead {
 }
 
 /// The file that keeps the raw superblocks and the verified `.commitmeta`
-/// files of a discovery from a remote.
+/// files of a discovery from a remote. If the check of the signatures parsed a
+/// `.commitmeta` and the pull has a filter, the file keeps the result of the
+/// filter. Else it keeps the `.commitmeta` as the source holds it.
 ///
 /// The file is one unlinked temp file in `tmp/` of the repository, open for
 /// reads and writes and not mapped. It opens at the first write. Discovery
@@ -567,7 +607,7 @@ impl FetchedDelta {
         Ok(DeltaJob {
             dir,
             name,
-            commit_bytes,
+            commit_bytes: Arc::new(commit_bytes),
             meta_entries,
             fallbacks,
             inline,
@@ -847,6 +887,7 @@ async fn discover_chain(
         source,
         localcache: &opts.localcache_repos,
         verification,
+        filter: &opts.detached_metadata_filter,
         progress,
         tips: TipChecks {
             bindings: !opts.flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS),
@@ -933,7 +974,10 @@ async fn discover_chain(
             continue;
         };
         if let Some(check) = checked.remove(commit) {
-            record.detached = Detached::Checked { kept: check.kept };
+            record.detached = Detached::Checked {
+                kept: check.kept,
+                filtered: check.filtered,
+            };
         }
         kept_records.insert(*commit, record);
     }
@@ -1052,6 +1096,10 @@ struct CheckCtx<'a> {
     /// The localcache repositories of the pull, in the order of the reads.
     localcache: &'a [Repo],
     verification: &'a Verification,
+    /// The detached metadata filter of the pull. Discovery runs it over the
+    /// `.commitmeta` of a commit that it checks from a remote, if the check of
+    /// the signatures parses the `.commitmeta`.
+    filter: &'a DetachedMetadataFilter,
     progress: &'a PullCounters,
     /// The checks of each requested ref that names a commit.
     tips: TipChecks<'a>,
@@ -1156,14 +1204,20 @@ async fn fetch_step(
 /// - From a remote, `detached` is the `.commitmeta` that [`fetch_step`] got
 ///   with the superblock. If it is `None`, the `.commitmeta` comes from the
 ///   first localcache repository that holds it, else from the remote. A file
-///   that the remote serves adds one to the metadata count. The record file
-///   keeps the verified bytes, and the result holds their range.
+///   that the remote serves adds one to the metadata count. If the policy
+///   checks commits and the pull has a filter, the check parses the bytes,
+///   and the detached metadata filter of the pull reads that parse right
+///   after the check, on the blocking pool. The record file keeps the result
+///   of the filter. A filter that allows no property keeps no range. Else
+///   the record file keeps the verified bytes, and the commit step runs the
+///   filter over them. The result holds the range in the record file.
 /// - From a local source, the `.commitmeta` comes from the source, else from
-///   the first localcache repository that holds it. The record keeps no
-///   bytes. If the policy checks no commit, discovery reads no
-///   `.commitmeta`. The result holds the size of the file that the source
-///   holds. [`discover_chain`] counts the file at its end, for each
-///   intermediate commit of the last plan alone.
+///   the first localcache repository that holds it. The reads and the parse
+///   run in one call on the blocking pool. The record keeps no bytes. If the
+///   policy checks no commit, discovery reads no `.commitmeta`. The result
+///   holds the size of the file that the source holds. [`discover_chain`]
+///   counts the file at its end, for each intermediate commit of the last
+///   plan alone.
 ///
 /// If no repository holds a `.commitmeta`, the check reads the detached
 /// metadata of this repository.
@@ -1197,14 +1251,25 @@ async fn check_step_commit(
                     .await?
                 }
             };
-            let detached = check_commit_signatures(
+            // If the check parses the `.commitmeta`, the filter reads that
+            // parse right after the check, and the record file keeps its
+            // result. Else the record file keeps the bytes of the source, and
+            // the commit step filters them. A parse error of the filter then
+            // comes only for a commit that the pull fetches.
+            let checked = check_commit_signatures_filtered(
                 ctx.repo,
                 ctx.verification,
+                ctx.filter,
                 commit,
                 &commit_bytes,
                 detached,
             )
             .await?;
+            let (detached, filtered) = match checked {
+                Some(CheckedMeta::Filtered(kept)) => (kept, true),
+                Some(CheckedMeta::Source(bytes)) => (Some(bytes), false),
+                None => (None, false),
+            };
             let kept = match (detached, store) {
                 (Some(bytes), Some(store)) => Some(
                     store
@@ -1215,34 +1280,38 @@ async fn check_step_commit(
             };
             Checked {
                 kept,
+                filtered,
                 local: LocalRead::Nothing,
             }
         }
         DeltaSource::Local(_) if !ctx.verification.checks_commits() => Checked {
             kept: None,
+            filtered: false,
             local: LocalRead::Nothing,
         },
         DeltaSource::Local(src) => {
-            let (detached, local) =
-                match src.load_object_bytes(ObjectType::CommitMeta, commit).await {
-                    Ok(bytes) => {
-                        let size = bytes.len() as u64;
-                        (Some(bytes), LocalRead::Size(size))
-                    }
-                    Err(Error::ObjectNotFound { .. }) => {
-                        let sources: Vec<&Repo> = ctx.localcache.iter().collect();
-                        (
-                            detached_bytes_from(&sources, commit)
-                                .await?
-                                .map(|(_, bytes)| bytes),
-                            LocalRead::Absent,
-                        )
-                    }
-                    Err(e) => return Err(e),
-                };
-            check_commit_signatures(ctx.repo, ctx.verification, commit, &commit_bytes, detached)
-                .await?;
-            Checked { kept: None, local }
+            // The source comes first, then the localcache repositories, then
+            // this repository. One call on the blocking pool reads and parses.
+            let sources: Vec<Repo> = std::iter::once((*src).clone())
+                .chain(ctx.localcache.iter().cloned())
+                .collect();
+            let read = check_local_commit_signatures(
+                ctx.repo,
+                ctx.verification,
+                sources,
+                commit,
+                &commit_bytes,
+            )
+            .await?;
+            let local = match read {
+                Some((0, size)) => LocalRead::Size(size),
+                _ => LocalRead::Absent,
+            };
+            Checked {
+                kept: None,
+                filtered: false,
+                local,
+            }
         }
     };
     if !refs.is_empty() {
@@ -2339,7 +2408,7 @@ mod tests {
             for commit in [f.b, f.c, f.d] {
                 assert!(matches!(
                     plan.records[&commit].detached,
-                    Detached::Checked { kept: None }
+                    Detached::Checked { kept: None, .. }
                 ));
             }
             assert_eq!(counters.metadata(), 3);
@@ -2650,7 +2719,7 @@ mod tests {
             assert!(!plan.checked(&f.a));
             assert!(matches!(
                 plan.commit_check(&f.d).await.unwrap(),
-                CommitCheck::Checked(None)
+                CommitCheck::Checked { detached: None, .. }
             ));
         });
     }
@@ -2784,7 +2853,7 @@ mod tests {
             for commit in [f.c, f.x, f.d] {
                 assert!(matches!(
                     plan.records[&commit].detached,
-                    Detached::Checked { kept: None }
+                    Detached::Checked { kept: None, .. }
                 ));
             }
             // Four superblock requests and the `.commitmeta` of `X`.
@@ -3072,7 +3141,10 @@ mod tests {
                 assert_eq!(plan.levels, [vec![f.b]]);
                 let store = plan.store.as_ref().unwrap();
                 let b = &plan.records[&f.b];
-                let Detached::Checked { kept: Some(kept) } = &b.detached else {
+                let Detached::Checked {
+                    kept: Some(kept), ..
+                } = &b.detached
+                else {
                     panic!("no kept .commitmeta");
                 };
                 assert_eq!(store.read(kept.clone()).await.unwrap(), meta);
@@ -3082,12 +3154,18 @@ mod tests {
                 }
                 let jobs = plan.parse_level(&f.dst, &source, &[f.b]).await.unwrap();
                 assert_eq!(Checksum::sha256(&jobs[&f.b].commit_bytes), f.b);
-                let CommitCheck::Checked(Some(read)) = plan.commit_check(&f.b).await.unwrap()
+                let CommitCheck::Checked {
+                    detached: Some(read),
+                    ..
+                } = plan.commit_check(&f.b).await.unwrap()
                 else {
                     panic!("no checked .commitmeta");
                 };
                 assert_eq!(read, meta);
-                let CommitCheck::Checked(Some(read)) = plan.commit_check(&f.d).await.unwrap()
+                let CommitCheck::Checked {
+                    detached: Some(read),
+                    ..
+                } = plan.commit_check(&f.d).await.unwrap()
                 else {
                     panic!("no checked .commitmeta of the target");
                 };
@@ -3333,7 +3411,9 @@ mod tests {
                 }
                 let store = plan.store.as_ref().unwrap();
                 for (commit, meta) in [(f.b, &meta_b), (f.d, &meta_d)] {
-                    let Detached::Checked { kept: Some(kept) } = &plan.records[&commit].detached
+                    let Detached::Checked {
+                        kept: Some(kept), ..
+                    } = &plan.records[&commit].detached
                     else {
                         panic!("no kept .commitmeta of {commit}");
                     };
@@ -3442,7 +3522,11 @@ mod tests {
             assert_eq!(written.matches(&commitmeta(&f.d)).count(), 2);
             assert_eq!(plan.levels, [vec![f.c]]);
             assert!(plan.checked(&f.c) && plan.checked(&f.d));
-            let CommitCheck::Checked(Some(read)) = plan.commit_check(&f.d).await.unwrap() else {
+            let CommitCheck::Checked {
+                detached: Some(read),
+                ..
+            } = plan.commit_check(&f.d).await.unwrap()
+            else {
                 panic!("no checked .commitmeta of the target");
             };
             assert_eq!(read, meta_d);

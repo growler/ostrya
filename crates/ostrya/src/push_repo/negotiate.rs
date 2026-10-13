@@ -65,7 +65,10 @@ pub struct RepoPushOptions {
     pub force: bool,
     /// The filter of the detached metadata of each commit that the push sends.
     ///
-    /// If the filter is unset, the push sends every key.
+    /// If the filter is unset, the push sends every key. The push then sends
+    /// the stored `.commitmeta` bytes with no parse, so the server refuses a
+    /// `.commitmeta` that is not an `a{sv}` dict. A set filter parses the
+    /// file, and such a file gives [`Source`](crate::remote::Error::Source).
     pub detached_metadata_filter: DetachedMetadataFilter,
     /// A progress handle that receives the counters of the session.
     pub progress: Option<PushProgress>,

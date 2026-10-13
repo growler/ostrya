@@ -59,19 +59,24 @@ impl Verification {
             .await
     }
 
-    /// Verifies the summary of the remote against the summary policy.
+    /// Verifies the summary of the remote against the summary policy, and
+    /// gives back the `summary.sig` bytes `signature`.
     ///
     /// A policy that applies needs both files. If the source publishes no
     /// summary, or a summary with no `summary.sig`, this function fails with
     /// [`Error::Signature`]. The message names the missing file. The `ostree`
-    /// command reports the same two cases.
+    /// command reports the same two cases. A policy that does not apply reads
+    /// nothing.
+    ///
+    /// The parse of `summary.sig` runs on the blocking pool, because the file
+    /// can be as large as the read cap of a summary.
     pub(crate) async fn check_summary(
         &self,
         summary: Option<&[u8]>,
-        signature: Option<&[u8]>,
-    ) -> Result<()> {
+        signature: Option<Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>> {
         if !self.summary.applies() {
-            return Ok(());
+            return Ok(signature);
         }
         let Some(summary) = summary else {
             return Err(Error::Signature(
@@ -83,10 +88,11 @@ impl Verification {
                 "summary verification is enabled, but no summary.sig is published".into(),
             ));
         };
-        let dict = crate::summary::parse_signature_dict(signature)?;
+        let (dict, signature) = super::parse_detached(signature).await;
         self.summary
-            .check("the summary", summary, dict.as_ref())
-            .await
+            .check("the summary", summary, dict?.as_ref())
+            .await?;
+        Ok(Some(signature))
     }
 
     /// Verifies a fetched static delta against the sign-api axis of the commit
@@ -202,7 +208,7 @@ mod tests {
                     .check_commit(&checksum(), PAYLOAD, Some(&other))
                     .await,
                 verification.check_commit(&checksum(), PAYLOAD, None).await,
-                verification.check_summary(None, None).await,
+                verification.check_summary(None, None).await.map(drop),
             )
         });
         own.expect("a commit signed with the trusted key passes");
@@ -247,18 +253,22 @@ mod tests {
         other.expect("a commit signed with another key passes");
         delta.expect("a delta signed with another key passes");
 
-        let own = summary_sig(SECRET_B64);
+        let own_sig = summary_sig(SECRET_B64);
         let other = summary_sig(OTHER_SECRET_B64);
         let (own, other, missing) = ostrya_rt::block_on(async {
             (
-                verification.check_summary(Some(PAYLOAD), Some(&own)).await,
                 verification
-                    .check_summary(Some(PAYLOAD), Some(&other))
+                    .check_summary(Some(PAYLOAD), Some(own_sig.clone()))
                     .await,
+                verification.check_summary(Some(PAYLOAD), Some(other)).await,
                 verification.check_summary(Some(PAYLOAD), None).await,
             )
         });
-        own.expect("a summary signed with the last summary key passes");
+        assert_eq!(
+            own.expect("a summary signed with the last summary key passes"),
+            Some(own_sig),
+            "the check gives back the summary.sig bytes"
+        );
         let err = other.expect_err("a summary signed with a replaced key fails");
         assert!(
             matches!(&err, Error::Signature(m)
@@ -339,7 +349,7 @@ mod tests {
         assert!(verification.checks_commits());
         assert!(verification.checks_summary());
         let own = summary_sig(SECRET_B64);
-        ostrya_rt::block_on(verification.check_summary(Some(PAYLOAD), Some(&own)))
+        ostrya_rt::block_on(verification.check_summary(Some(PAYLOAD), Some(own)))
             .expect("a summary signed with the key of the section passes");
     }
 

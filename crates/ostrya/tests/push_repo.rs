@@ -663,6 +663,37 @@ fn the_filter_drops_the_excluded_keys_from_the_detached_metadata() {
     assert!(stored.dict_get("xa.drop").is_none());
 }
 
+/// A push whose filter keeps each property stores the `.commitmeta` bytes of
+/// the client unchanged on the server.
+#[test]
+fn a_filter_that_keeps_each_property_sends_the_source_bytes() {
+    let pair = Pair::new("filter-keep", RepoMode::Archive, RepoMode::Archive, "");
+    let c1 = commit(&pair.client, "main", None, "c1", None);
+    let mut detached = DictBuilder::new();
+    detached
+        .insert_str("xa.keep", "kept")
+        .insert_str("xa.other", "kept too");
+    block_on(
+        pair.client
+            .write_commit_detached_metadata(&c1, Some(&detached.build())),
+    )
+    .unwrap();
+    let (report, outcome) = push(
+        &pair,
+        RepoPushOptions {
+            detached_metadata_filter: DetachedMetadataFilter::excluding(["absent.key"]),
+            ..opts(&["main"])
+        },
+    );
+    report.unwrap();
+    outcome.unwrap();
+    let path = ostrya::loose_path(&c1, ObjectType::CommitMeta, RepoMode::Archive);
+    let sent = std::fs::read(pair.client.path().join("objects").join(&path)).unwrap();
+    let stored = std::fs::read(pair.server.path().join("objects").join(&path)).unwrap();
+    assert!(!sent.is_empty());
+    assert_eq!(sent, stored);
+}
+
 #[test]
 fn deflate_objects_of_an_archive_source_equal_the_stored_filez() {
     // The server deflates a `raw` object at level 1, and the client stored

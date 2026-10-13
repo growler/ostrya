@@ -64,9 +64,9 @@ pub use push_tree::{
 };
 #[doc(hidden)]
 pub use session::{
-    BoxFuture, Compression, ObjectData, ObjectReader, ObjectSource, PullBody, PullSession,
-    PushOutcome, PushPhase, PushProgress, PushProgressFn, PushProgressSnapshot, PushSession,
-    PushStats, ServerInfo, SessionOptions, StreamSession, StreamSessionOptions,
+    BoxFuture, Compression, DetachedMetadata, ObjectData, ObjectReader, ObjectSource, PullBody,
+    PullSession, PushOutcome, PushPhase, PushProgress, PushProgressFn, PushProgressSnapshot,
+    PushSession, PushStats, ServerInfo, SessionOptions, StreamSession, StreamSessionOptions,
 };
 #[doc(hidden)]
 pub use transport::{Endpoint, PreparedSession, SshAddress, SshOptions, without_userinfo};
@@ -88,6 +88,7 @@ const _: fn() = || {
     assert_send_sync::<PushOutcome>();
     assert_send_sync::<ServerInfo>();
     assert_send_sync::<ObjectData>();
+    assert_send_sync::<DetachedMetadata>();
     assert_send_sync::<Box<dyn ObjectReader>>();
     assert_send_sync::<PreparedSession>();
     assert_send_sync::<tree::TreeModel>();

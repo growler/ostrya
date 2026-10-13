@@ -6444,6 +6444,175 @@ fn a_target_refused_by_its_signature_requests_no_part() {
     });
 }
 
+/// The commits of a chain are signed, except the intermediate commit B. Under
+/// sign-api verification, discovery refuses B after the superblock of its
+/// step. The pull requests no later superblock, no part, and no `.commit`,
+/// publishes no ref, writes no object, and leaves no marker. With
+/// verification off, the same list passes.
+#[test]
+fn an_unsigned_intermediate_commit_fails_discovery_over_http() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-unsigned-intermediate");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        sign_commits(&remote, &[a, c, d]).await;
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        drop(dest_holding(dir.path(), &server.url(), &a).await);
+        let dest = reconfigure_dest(dir.path(), &server.url(), &signed_policy()).await;
+        let dest_dir = dir.path().join("dest");
+        let held = dest.list_objects().await.unwrap();
+        server.forget();
+
+        let err = dest
+            .pull("origin", chain_opts(list.clone()))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, Error::Signature(m) if m.starts_with(&format!("commit {b}: "))
+                && !m.contains("static delta")),
+            "{err:?}"
+        );
+        let seen = server.seen();
+        assert_eq!(server.requests_for(&superblock_path(&a, &b)), 1);
+        assert_eq!(server.requests_for(&meta_path(&b, "commitmeta")), 1);
+        assert_eq!(server.requests_for(&superblock_path(&b, &c)), 0);
+        assert_eq!(server.requests_for(&superblock_path(&c, &d)), 0);
+        assert!(part_requests(&seen).is_empty(), "{seen:?}");
+        assert!(
+            !seen.iter().any(|path| path.ends_with(".commit")),
+            "{seen:?}"
+        );
+        assert_nothing_published(&dest).await;
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            None
+        );
+        assert_no_markers(&dest_dir);
+        assert_eq!(dest.list_objects().await.unwrap(), held);
+        drop(dest);
+
+        let dest = reconfigure_dest(dir.path(), &server.url(), "").await;
+        server.forget();
+        dest.pull("origin", chain_opts(list)).await.unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(d)
+        );
+        for commit in [b, c, d] {
+            assert_complete(&remote, &dest, &dest_dir, &commit).await;
+        }
+        assert_no_markers(&dest_dir);
+        let seen = server.seen();
+        assert!(!part_requests(&seen).is_empty(), "{seen:?}");
+    });
+}
+
+/// The intermediate commit C has the ref binding `test/mid`, and the pull
+/// requests `test/main` alone. Discovery checks only the signatures of C, so
+/// the pull passes under sign-api verification. It writes no ref for C, and
+/// requests no `.commit`.
+#[test]
+fn an_intermediate_commit_bound_to_another_ref_passes() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-intermediate-binding");
+        let remote = create_remote(dir.path()).await;
+        let a = chain_commit(&remote, dir.path(), "a", "test/main", None, 0).await;
+        let b = chain_commit(&remote, dir.path(), "b", "test/main", Some(a), 1).await;
+        let c = chain_commit(&remote, dir.path(), "c", "test/mid", Some(b), 2).await;
+        let d = chain_commit(&remote, dir.path(), "d", "test/main", Some(c), 3).await;
+        sign_commits(&remote, &[a, b, c, d]).await;
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        drop(dest_holding(dir.path(), &server.url(), &a).await);
+        let dest = reconfigure_dest(dir.path(), &server.url(), &signed_policy()).await;
+        let dest_dir = dir.path().join("dest");
+        server.forget();
+
+        dest.pull("origin", chain_opts(list)).await.unwrap();
+
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(d)
+        );
+        assert_eq!(
+            dest.resolve_rev("origin:test/mid", true).await.unwrap(),
+            None
+        );
+        for commit in [b, c, d] {
+            assert_complete(&remote, &dest, &dest_dir, &commit).await;
+        }
+        assert_no_markers(&dest_dir);
+        let seen = server.seen();
+        assert!(!part_requests(&seen).is_empty(), "{seen:?}");
+        assert!(
+            !seen.iter().any(|path| path.ends_with(".commit")),
+            "{seen:?}"
+        );
+    });
+}
+
+/// Each commit of a chain is signed with the trusted key. The superblock of
+/// the step B->C carries a signature of another key alone. Discovery refuses
+/// the superblock before it checks C. The pull requests no later superblock,
+/// no `.commitmeta` of C, and no part, publishes no ref, writes no object, and
+/// leaves no marker.
+#[test]
+fn a_step_superblock_signed_by_an_untrusted_key_fails_discovery() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-chain-untrusted-superblock");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        sign_commits(&remote, &[a, b, c, d]).await;
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let other = Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap();
+        remote
+            .sign_static_delta(
+                &remote.path().join(static_delta_relative_dir(Some(&b), &c)),
+                &other,
+            )
+            .await
+            .unwrap();
+        let bytes = std::fs::read(remote.path().join(superblock_path(&b, &c))).unwrap();
+        list[1].superblock = Checksum::sha256(&bytes);
+        let server = RepoServer::start(remote.path(), false).await;
+        drop(dest_holding(dir.path(), &server.url(), &a).await);
+        let dest = reconfigure_dest(dir.path(), &server.url(), &signed_policy()).await;
+        let dest_dir = dir.path().join("dest");
+        let held = dest.list_objects().await.unwrap();
+        server.forget();
+
+        let err = dest.pull("origin", chain_opts(list)).await.unwrap_err();
+
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("static delta")
+                && m.contains("trusted key")),
+            "{err:?}"
+        );
+        let seen = server.seen();
+        assert_eq!(server.requests_for(&superblock_path(&b, &c)), 1);
+        assert_eq!(server.requests_for(&superblock_path(&c, &d)), 0);
+        assert_eq!(server.requests_for(&meta_path(&b, "commitmeta")), 1);
+        assert_eq!(server.requests_for(&meta_path(&c, "commitmeta")), 0);
+        assert!(part_requests(&seen).is_empty(), "{seen:?}");
+        assert_nothing_published(&dest).await;
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            None
+        );
+        assert_no_markers(&dest_dir);
+        assert_eq!(dest.list_objects().await.unwrap(), held);
+    });
+}
+
 /// The requested ref names the target of a chain, and the ref binding of the
 /// target lists another ref. The pull refuses the target in discovery, after
 /// the superblock of its step and before the request of a part. It publishes

@@ -340,13 +340,15 @@ impl Repo {
     /// wins.
     ///
     /// Before the transaction opens, the pull fetches the superblock of each
-    /// step and compares its SHA-256 with the digest in the list. For each
-    /// commit of a chain, the target included, it also fetches the
-    /// `.commitmeta` and checks the signatures of the commit. For each
-    /// requested ref that names a commit of a chain, it makes the ref-binding
-    /// check and the timestamp check, in the order of the refs. So a target
-    /// that the policy, its ref binding, or the timestamp check refuses costs
-    /// the superblocks that discovery fetched, and the pull requests no part.
+    /// step and compares its SHA-256 with the digest in the list. It verifies
+    /// the signatures and the inline parts of each superblock, as stated
+    /// above, before it checks the commit of the step. For each commit of a
+    /// chain, the target included, it also fetches the `.commitmeta` and
+    /// checks the signatures of the commit. For each requested ref that names
+    /// a commit of a chain, it makes the ref-binding check and the timestamp
+    /// check, in the order of the refs. So a target that the policy, its ref
+    /// binding, or the timestamp check refuses costs the superblocks that
+    /// discovery fetched, and the pull requests no part.
     /// The pull does not request these files again, and does not check these
     /// commits again. A commit that has no record in the last plan gets its
     /// checks when the pull fetches it, and the pull requests its
@@ -381,8 +383,10 @@ impl Repo {
     /// `.commitpartial` marker. The pull writes a ref for an intermediate
     /// commit only if a requested ref names it.
     ///
-    /// The pull makes no ref-binding check and no timestamp check on an
-    /// intermediate commit. If a requested ref names an intermediate commit,
+    /// Discovery checks only the signatures of an intermediate commit that
+    /// no requested ref names. It makes no ref-binding check and no timestamp
+    /// check on it, so a chain can go through a commit whose ref binding
+    /// names another ref. If a requested ref names an intermediate commit,
     /// discovery makes both checks for that ref.
     ///
     /// If the remote does not hold a superblock of a chain, the pull plans
@@ -480,7 +484,7 @@ impl Repo {
     /// - [`Error::Pull`] if the superblocks and the `.commitmeta` files of the
     ///   chains of a list pass the limit of 1 GiB.
     /// - [`Error::Signature`] if the policy refuses a commit of a chain of a
-    ///   list.
+    ///   list, or the superblock of a step.
     /// - [`Error::Pull`] if a requested ref that names a commit of a chain of
     ///   a list fails the ref-binding check or the timestamp check.
     ///

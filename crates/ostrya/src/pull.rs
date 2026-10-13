@@ -366,12 +366,45 @@ pub enum TimestampCheck {
 /// the summary. If the policy covers the summary and the source has no
 /// `summary` or no `summary.sig`, the pull fails with [`Error::Signature`].
 ///
-/// The pull verifies a commit in the step that fetched it, before it stages
-/// the bytes and before it requests the tree. The policy belongs to the pull,
-/// so the pull verifies each commit that it carries. This includes the
-/// parents that a depth pull follows and a commit that this repository
-/// already holds. A commit that fails the policy fails the pull with
-/// [`Error::Signature`].
+/// The policy belongs to the pull, so the pull verifies each commit that it
+/// carries. This includes the parents that a depth pull follows and a commit
+/// that this repository already holds. A commit that fails the policy fails
+/// the pull with [`Error::Signature`].
+///
+/// A pull from a remote verifies a commit outside a chain of static deltas in
+/// the step that fetched it. The verification comes before the pull stages
+/// the bytes and before it requests the tree.
+///
+/// With a [`static_deltas`](PullOptions::static_deltas) list, discovery
+/// verifies each commit of a chain before the transaction opens. It reads the
+/// commit from the superblock of its step, so it fetches no `.commit` object.
+///
+/// - An intermediate commit that no requested ref names gets the signature
+///   checks alone. Discovery makes no ref-binding check and no timestamp
+///   check on it. So a chain can go through a commit whose ref binding names
+///   another ref.
+/// - A target commit gets the signature checks. Then it gets the ref-binding
+///   check and the timestamp check of each requested ref that names it, in
+///   the order of the refs.
+/// - If a requested ref names an intermediate commit, discovery also makes
+///   the ref-binding check and the timestamp check of that ref.
+///
+/// A local pull makes no timestamp check.
+///
+/// A commit that discovery refuses costs the superblocks and the
+/// `.commitmeta` files that discovery fetched, and the pull fetches no part.
+/// The pull does not verify a commit of a chain a second time. If the last
+/// plan of discovery drops a commit, the commit gets its checks when the pull
+/// fetches it.
+///
+/// The pull verifies the superblock of a static delta before it fetches a
+/// part of the delta. For a chain, discovery verifies the superblock of each
+/// step before it verifies the commit of the step. Only the sign-api axis
+/// applies to a superblock, because a static delta carries sign-api
+/// signatures alone. A superblock with no signature of an engine of the
+/// policy passes, and the commit that the delta gives still gets its checks.
+/// If each such signature of a superblock is from a key that is not trusted,
+/// the pull fails with [`Error::Signature`].
 ///
 /// A local pull verifies the commits and the summary before the transaction
 /// opens, so a source that the policy refuses imports nothing.
@@ -1522,16 +1555,17 @@ impl Repo {
     /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull ignores the list.
     ///
     /// Before the transaction opens, the pull reads the superblock of each
-    /// step and compares its SHA-256 with the digest in the list. For each
-    /// commit of a chain, the target included, it also checks the signatures
-    /// of the commit, and the ref binding of each requested ref that names
-    /// the commit. The walk of the commit chains does not check that commit
-    /// again. A local pull makes no timestamp check. So a target that the
-    /// policy or its ref binding refuses costs the reads of the superblocks,
-    /// and the pull applies no part. The pull reports this refusal before a
-    /// defect that the walk of the commit chains finds. A target with no chain
-    /// gets its checks in the walk of the commit chains, also before the
-    /// transaction opens.
+    /// step and compares its SHA-256 with the digest in the list. It checks
+    /// the signatures of the superblock, by the rules of [`PullVerify`], and
+    /// its inline parts. For each commit of a chain, the target included, it
+    /// also checks the signatures of the commit, and the ref binding of each
+    /// requested ref that names the commit. The walk of the commit chains
+    /// does not check that commit again. A local pull makes no timestamp
+    /// check. So a target that the policy or its ref binding refuses costs the
+    /// reads of the superblocks, and the pull applies no part. The pull
+    /// reports this refusal before a defect that the walk of the commit chains
+    /// finds. A target with no chain gets its checks in the walk of the commit
+    /// chains, also before the transaction opens.
     ///
     /// The pull applies a chain one level at a time, in its one transaction.
     /// The parts, the loose objects, and the tree walk of one level end before
@@ -1581,9 +1615,9 @@ impl Repo {
     ///   [`BAREUSERONLY_FILES`](PullFlags::BAREUSERONLY_FILES) check or the
     ///   check of a `bare-user-only` destination.
     /// - [`Error::Signature`] if a commit or the summary fails the signature
-    ///   policy, each commit of a chain included. Also if the
-    ///   policy covers the summary and `src` has no `summary` or no
-    ///   `summary.sig`.
+    ///   policy, each commit of a chain included. Also if the signatures of
+    ///   a superblock fail the policy, or if the policy covers the summary and
+    ///   `src` has no `summary` or no `summary.sig`.
     /// - [`Error::RefNotFound`] if `src` does not hold a requested ref or
     ///   collection ref.
     /// - [`Error::ObjectNotFound`] if neither this repository nor a source

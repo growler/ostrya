@@ -20,8 +20,9 @@ use std::process::Command;
 
 use common::TmpDir;
 use ostrya::{
-    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Error, GpgSigner,
-    MutableTree, PullOptions, PullVerify, Repo, RepoMode,
+    AdvertisedDelta, Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitState,
+    CreateOptions, DeltaOptions, Error, GpgSigner, MutableTree, PullOptions, PullVerify, Repo,
+    RepoMode,
 };
 use ostrya_rt::block_on;
 
@@ -182,6 +183,181 @@ async fn gpg_pull(dst: &Repo, src: &Repo) -> Result<(), Error> {
     )
     .await
     .map(|_| ())
+}
+
+/// Commits the tree under `base/<name>` into `repo` on `main`, with `parent`.
+/// The tree holds one file with the marker `<name>`.
+async fn commit_marker(repo: &Repo, base: &Path, name: &str, parent: Option<Checksum>) -> Checksum {
+    let tree = base.join(name);
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("marker.txt"), format!("{name}\n")).unwrap();
+    let txn = repo.transaction().await.unwrap();
+    let mut mtree = MutableTree::new();
+    let mut modifier = CommitModifier::new(CommitModifierFlags::SKIP_XATTRS);
+    let dfd = std::fs::File::open(base).unwrap();
+    txn.write_dfd_to_mtree(
+        dfd.as_fd(),
+        Path::new(name),
+        &mut mtree,
+        Some(&mut modifier),
+    )
+    .await
+    .unwrap();
+    let root = txn.write_mtree(&mut mtree).await.unwrap();
+    let commit = txn
+        .write_commit(
+            CommitOptions {
+                parent,
+                subject: Some(name.to_owned()),
+                timestamp: Some(FIXED_TS),
+                ..CommitOptions::default()
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+    txn.set_ref("main", Some(&commit));
+    txn.commit().await.unwrap();
+    commit
+}
+
+/// Creates an archive source under `base/src` with the commit B and its
+/// child C on `main`, and the deltas from scratch to B and from B to C.
+///
+/// Returns the source, B, C, and the list of the two deltas, each with the
+/// SHA-256 of its superblock.
+async fn chain_source(base: &Path) -> (Repo, Checksum, Checksum, Vec<AdvertisedDelta>) {
+    let repo = Repo::create(&base.join("src"), CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap();
+    let b = commit_marker(&repo, base, "b", None).await;
+    let c = commit_marker(&repo, base, "c", Some(b)).await;
+    let mut list = Vec::new();
+    for (from, to) in [(None, b), (Some(b), c)] {
+        let dir = repo
+            .generate_static_delta(from.as_ref(), &to, &DeltaOptions::default())
+            .await
+            .unwrap();
+        let bytes = std::fs::read(repo.path().join(dir).join("superblock")).unwrap();
+        list.push(AdvertisedDelta {
+            from,
+            to,
+            superblock: Checksum::sha256(&bytes),
+        });
+    }
+    (repo, b, c, list)
+}
+
+/// Pulls `main` from `src` into `dst` under the remote `origin`, with the
+/// list `list`. GPG verification is on if `gpg` is `true`.
+async fn gpg_chain_pull(
+    dst: &Repo,
+    src: &Repo,
+    list: Vec<AdvertisedDelta>,
+    gpg: bool,
+) -> Result<(), Error> {
+    dst.pull_local(
+        src,
+        PullOptions {
+            refs: vec!["main".to_owned()],
+            remote: Some("origin".to_owned()),
+            static_deltas: Some(list),
+            verify: PullVerify {
+                gpg: Some(gpg),
+                ..PullVerify::default()
+            },
+            ..PullOptions::default()
+        },
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Asserts that the repository at `dir` keeps no `.commitpartial` marker and
+/// no staging directory.
+fn assert_no_markers(dir: &Path) {
+    let markers: Vec<String> = std::fs::read_dir(dir.join("state"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".commitpartial"))
+        .collect();
+    assert!(markers.is_empty(), "{markers:?}");
+    let staging: Vec<String> = std::fs::read_dir(dir.join("tmp"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("staging-"))
+        .collect();
+    assert!(staging.is_empty(), "{staging:?}");
+}
+
+/// Asserts that `dst` holds `commit` complete: the commit has no
+/// `.commitpartial` marker, and `dst` holds each object that `src` reaches
+/// from it.
+async fn assert_complete(src: &Repo, dst: &Repo, commit: &Checksum) {
+    assert_eq!(dst.commit_state(commit).await.unwrap(), CommitState::Normal);
+    for name in &src.traverse_commit(commit, 0).await.unwrap() {
+        assert!(
+            dst.has_object(name.ty, &name.checksum).await.unwrap(),
+            "{name} missing from the destination"
+        );
+    }
+}
+
+/// GPG verification applies to the intermediate commit of a chain of static
+/// deltas.
+///
+/// - The chain is the delta from scratch to B, then the delta from B to C.
+///   The key signs C alone. The pull refuses B before the transaction opens:
+///   it writes no ref, no object, no marker, and no staging directory.
+/// - With GPG verification off, the same list passes into another
+///   destination.
+/// - After the key signs B, the list passes under GPG verification into the
+///   first destination.
+#[test]
+fn an_unsigned_intermediate_commit_fails_gpg_verification() {
+    if !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-verify-gpg-chain");
+    let base = tmp.path();
+    let signer_home = GpgHome::create(base, "gnupg", "Ostrya Pull <pull@example.invalid>");
+
+    block_on(async {
+        let (src, b, c, list) = chain_source(base).await;
+        let signer = signer_home.signer();
+        src.sign_commit(&c, &signer).await.unwrap();
+
+        let (path, dst) = dest_with_remote(base, "dst-gpg", "").await;
+        signer_home.export_to(&path.join("origin.trustedkeys.gpg"));
+        let err = gpg_chain_pull(&dst, &src, list.clone(), true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.starts_with(&format!("commit {b}: GPG "))),
+            "{err}"
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert!(dst.list_objects().await.unwrap().is_empty());
+        assert_no_markers(&path);
+
+        let (off_path, off) = dest_with_remote(base, "dst-off", "").await;
+        gpg_chain_pull(&off, &src, list.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(off.resolve_rev("origin:main", true).await.unwrap(), Some(c));
+        for commit in [b, c] {
+            assert_complete(&src, &off, &commit).await;
+        }
+        assert_no_markers(&off_path);
+
+        src.sign_commit(&b, &signer).await.unwrap();
+        gpg_chain_pull(&dst, &src, list, true).await.unwrap();
+        assert_eq!(dst.resolve_rev("origin:main", true).await.unwrap(), Some(c));
+        for commit in [b, c] {
+            assert_complete(&src, &dst, &commit).await;
+        }
+        assert_no_markers(&path);
+    });
 }
 
 /// The trusted set of a remote starts with `<remote>.trustedkeys.gpg` in the

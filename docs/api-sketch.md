@@ -2542,8 +2542,16 @@ store. Each axis that applies has to find a valid signature, and within the
 sign-api axis one engine is enough. The summary is checked before it is read and
 a commit before its bytes are staged, so a refusal costs no object fetch. A
 fetched static delta is held to the sign-api axis over its raw superblock bytes
-before any part is requested. `PullTrust::from_remote` gives this trust as a
-value (see "Trusted keys and the pull trust").
+before any part is requested. A superblock with no signature of an engine of
+the policy passes, and the commit that it delivers still gets its checks. A
+superblock whose signatures of these engines all come from keys that are not
+trusted fails the pull with `Error::Signature`. For a chain of a
+`static_deltas` list, discovery checks the superblock of each step before the
+commit of that step. Discovery reads that commit from the superblock, so it
+fetches no `.commit`. It checks only the signatures of an intermediate
+commit that no requested ref names, so a chain can go through a commit whose
+ref binding names another ref. `PullTrust::from_remote` gives this trust as a value (see "Trusted keys
+and the pull trust").
 
 `detached_metadata_filter` decides, property by property, which of a commit's
 detached metadata reaches this repository. The pull calls it once per property of

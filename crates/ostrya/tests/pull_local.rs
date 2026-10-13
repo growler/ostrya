@@ -5014,8 +5014,10 @@ fn a_wrong_listed_digest_fails_a_local_pull() {
 }
 
 /// An intermediate commit with no valid signature fails the pull before the
-/// transaction opens: the pull publishes nothing and leaves no marker and no
-/// staging directory. After the source signs that commit, the pull passes.
+/// transaction opens: the pull publishes nothing, writes no object, and leaves
+/// no marker and no staging directory. With verification off, the same list
+/// passes into another destination. After the source signs that commit, the
+/// pull under verification passes.
 #[test]
 fn an_unsigned_intermediate_commit_fails_a_local_pull() {
     let tmp = TmpDir::new("pull-chain-unsigned-intermediate");
@@ -5034,10 +5036,24 @@ fn an_unsigned_intermediate_commit_fails_a_local_pull() {
             .pull_local(&src, signed_chain_pull(list.clone()))
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Signature(_)), "{err:?}");
+        assert!(
+            matches!(&err, Error::Signature(m) if m.starts_with(&format!("commit {b}: "))
+                && !m.contains("static delta")),
+            "{err:?}"
+        );
         assert!(dst.list_refs(None).await.unwrap().is_empty());
         assert_eq!(dst.list_objects().await.unwrap(), held);
         assert_no_markers(&dst_dir);
+
+        let (off_dir, off) = dst_holding(base, "dst-off", &src, &a).await;
+        off.pull_local(&src, chain_pull(list.clone()))
+            .await
+            .unwrap();
+        assert_eq!(off.resolve_rev("main", false).await.unwrap(), Some(d));
+        for commit in [b, c, d] {
+            assert_complete(&src, &off, &off_dir, &commit).await;
+        }
+        assert_no_markers(&off_dir);
 
         sign_commits(&src, &[b]).await;
         dst.pull_local(&src, signed_chain_pull(list)).await.unwrap();
@@ -5140,6 +5156,37 @@ fn a_local_target_that_is_an_intermediate_commit_of_another_target() {
         assert_eq!(dst.resolve_rev("origin:main", true).await.unwrap(), Some(d));
         assert_eq!(dst.resolve_rev("origin:mid", true).await.unwrap(), Some(c));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        for commit in [b, c, d] {
+            assert_complete(&src, &dst, &dst_dir, &commit).await;
+        }
+        assert_no_markers(&dst_dir);
+    });
+}
+
+/// The intermediate commit C has the ref binding `mid`, and the pull requests
+/// `main` alone. The pull checks only the signatures of C, so it passes under
+/// verification. It writes no ref for C.
+#[test]
+fn a_local_intermediate_commit_bound_to_another_ref_passes() {
+    let tmp = TmpDir::new("pull-chain-intermediate-binding");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        for name in ["a", "b", "c", "d"] {
+            build_tree(&base.join(name), format!("{name}\n").as_bytes());
+        }
+        let a = commit_tree(&src, base, "a", "main", None).await;
+        let b = commit_tree(&src, base, "b", "main", Some(a)).await;
+        let c = commit_tree(&src, base, "c", "mid", Some(b)).await;
+        let d = commit_tree(&src, base, "d", "main", Some(c)).await;
+        sign_commits(&src, &[a, b, c, d]).await;
+        let (list, _dirs) = chain_list(&src, &[(a, b), (b, c), (c, d)]).await;
+        let (dst_dir, dst) = signed_dst_holding(base, &src, &a).await;
+
+        dst.pull_local(&src, signed_chain_pull(list)).await.unwrap();
+
+        assert_eq!(dst.resolve_rev("origin:main", true).await.unwrap(), Some(d));
+        assert_eq!(dst.resolve_rev("origin:mid", true).await.unwrap(), None);
         for commit in [b, c, d] {
             assert_complete(&src, &dst, &dst_dir, &commit).await;
         }

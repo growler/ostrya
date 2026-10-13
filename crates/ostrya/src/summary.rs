@@ -11,7 +11,7 @@
 //! - [`Repo::read_summary`] and [`Repo::read_summary_signature`] read the two
 //!   files.
 //! - [`Repo::build_ref_listing`] builds a ref listing for one request: a
-//!   summary of the refs under a set of prefixes, with a size cap.
+//!   summary of the refs that a [`RefSelector`] selects, with a size cap.
 //! - [`Summary`] is the parsed form of a `summary` file.
 //!   [`Summary::static_deltas`] reads its delta map as [`AdvertisedDelta`]
 //!   values.
@@ -21,8 +21,8 @@ use std::collections::hash_map::Entry;
 use std::os::fd::{AsFd, BorrowedFd};
 
 use ostrya_core::{
-    Checksum, Commit, DirMeta, ObjectType, Type, Value, choose_offset_size, from_bytes, loose_path,
-    to_bytes, tuple_field_from_bytes, write_offset,
+    Checksum, Commit, DirMeta, ObjectType, RefSelector, Type, Value, choose_offset_size,
+    from_bytes, loose_path, to_bytes, tuple_field_from_bytes, write_offset,
 };
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
@@ -696,8 +696,8 @@ impl Repo {
         Ok(to_bytes(&ty, &summary).map_err(ostrya_core::Error::from)?)
     }
 
-    /// Returns a ref listing: a summary of the local refs under `prefixes`,
-    /// built for one request.
+    /// Returns a ref listing: a summary of the local refs that `selector`
+    /// selects, built for one request.
     ///
     /// The listing has the type of a `summary` file, `(a(s(taya{sv}))a{sv})`,
     /// and [`Summary::parse`] reads it. The call writes nothing and takes no
@@ -705,24 +705,28 @@ impl Repo {
     ///
     /// # Refs
     ///
-    /// A prefix is a ref name. It selects the ref of the same name and each
-    /// ref below `<prefix>/`. The prefix `a/b` selects `a/b` and `a/b/c`. It
-    /// does not select `a/bc`. This is the rule of
-    /// [`list_refs`](Repo::list_refs) with a prefix. An empty slice selects
-    /// each ref under `refs/heads`. A prefix with a part longer than the file
-    /// system permits for a file name selects no ref, as a missing prefix
-    /// does.
+    /// A ref is selected when the selector has no positive pattern or a
+    /// positive pattern matches its name, and no negative pattern matches it.
+    /// The pattern `a/*` selects `a/b` and the pattern `a/**` selects `a/b`
+    /// and `a/b/c`. An empty selector selects each ref under `refs/heads`.
+    /// A selector of negative patterns alone selects each ref that they do
+    /// not match. The order of the entries has no effect.
     ///
     /// The listing holds each selected ref one time, sorted byte-wise by name.
     /// An alias is in the listing under its own name, with the commit of its
     /// target. The listing holds no mirror ref. Each entry has the bytes of
     /// the entry of the same ref in a summary of the same repository state.
     ///
-    /// The call drops each prefix that a shorter prefix of the slice selects.
-    /// It reads only the subtree of `refs/heads` under each other prefix, and
-    /// it reads each commit one time, also when more than one ref names it.
-    /// So the cost of the call follows the number of selected refs. An empty
-    /// slice reads all of `refs/heads`.
+    /// The call reads only the directories of `refs/heads` that a positive
+    /// pattern can match, and it reads no ref file outside the literal
+    /// leading parts of a positive pattern and its matches. A leading
+    /// wildcard lists the directories at its level. It skips a directory that
+    /// a negative pattern covers, and it applies the negative patterns to a
+    /// name before it reads the ref file, so it reads no ref that the
+    /// selector does not select. It reads each commit one time, also when
+    /// more than one ref names it. An empty selector, and a selector of
+    /// negative patterns alone, read all of `refs/heads`. A name that the
+    /// ref-name rule refuses is in the walk, and a wildcard selects it.
     ///
     /// # Global metadata
     ///
@@ -764,8 +768,6 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] if a prefix is not a valid ref name. The
-    ///   check comes before each read.
     /// - [`Error::Remote`] with
     ///   [`LimitExceeded`](crate::remote::Error::LimitExceeded) if the
     ///   listing is larger than [`MAX_REF_LISTING`] bytes.
@@ -780,9 +782,9 @@ impl Repo {
     ///   directory, or if `delta-indexes/` is not a directory.
     ///
     /// A failure of one selected ref or of one index file fails the whole
-    /// listing. The call does not read a ref that no prefix selects.
-    pub async fn build_ref_listing(&self, prefixes: &[&str]) -> Result<Vec<u8>> {
-        self.build_ref_listing_capped(prefixes, MAX_REF_LISTING)
+    /// listing. The call does not read a ref that the selector does not select.
+    pub async fn build_ref_listing(&self, selector: &RefSelector) -> Result<Vec<u8>> {
+        self.build_ref_listing_capped(selector, MAX_REF_LISTING)
             .await
     }
 
@@ -790,12 +792,12 @@ impl Repo {
     /// with a size cap of `cap` bytes. A listing of exactly `cap` bytes fits.
     pub(crate) async fn build_ref_listing_capped(
         &self,
-        prefixes: &[&str],
+        selector: &RefSelector,
         cap: u64,
     ) -> Result<Vec<u8>> {
         // The refs come sorted byte-wise by name, each one time, which is the
         // order of `build_summary`.
-        let refs = self.list_refs_under(prefixes).await?;
+        let refs = self.list_refs_selected(selector).await?;
 
         // Each entry is at least its name and the fixed fields. If the sum of
         // these sizes is over the cap, the listing is too.
@@ -1593,12 +1595,17 @@ const _: fn() = || {
     assert_send_sync::<Summary>();
     assert_send_sync::<AdvertisedDelta>();
     fn assert_send<T: Send>(_: &T) {}
-    let _ = |repo: &Repo| assert_send(&repo.build_ref_listing(&[]));
+    let _ = |repo: &Repo, selector: &RefSelector| assert_send(&repo.build_ref_listing(selector));
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The selector with no entry, which selects each ref.
+    fn all_refs() -> RefSelector {
+        RefSelector::parse([]).unwrap()
+    }
 
     fn checksum(byte: u8) -> Checksum {
         Checksum::from_bytes([byte; 32])
@@ -2140,7 +2147,7 @@ mod tests {
         ostrya_rt::block_on(async {
             let names = ["a/b", "a/c", "z"];
             let repo = repo_with_refs(&dir, &names).await;
-            let full = repo.build_ref_listing(&[]).await.unwrap();
+            let full = repo.build_ref_listing(&all_refs()).await.unwrap();
             let parsed = Summary::parse(&full).unwrap();
             assert_eq!(parsed.refs.len(), 3);
             assert_eq!(parsed.static_deltas().unwrap().len(), 1);
@@ -2151,11 +2158,14 @@ mod tests {
                     .is_some()
             );
             let len = full.len() as u64;
-            let capped = repo.build_ref_listing_capped(&[], len).await.unwrap();
+            let capped = repo
+                .build_ref_listing_capped(&all_refs(), len)
+                .await
+                .unwrap();
             assert_eq!(capped, full);
             assert!(capped.capacity() as u64 <= len);
             for cap in 0..len {
-                let outcome = repo.build_ref_listing_capped(&[], cap).await;
+                let outcome = repo.build_ref_listing_capped(&all_refs(), cap).await;
                 assert!(is_cap_error(&outcome), "cap {cap}: {outcome:?}");
             }
 
@@ -2173,11 +2183,11 @@ mod tests {
             let path = loose_path(&commit, ObjectType::Commit, repo.mode());
             std::fs::remove_file(dir.join("objects").join(path)).unwrap();
             for cap in [names_floor - 1, floor - 1] {
-                let outcome = repo.build_ref_listing_capped(&[], cap).await;
+                let outcome = repo.build_ref_listing_capped(&all_refs(), cap).await;
                 assert!(is_cap_error(&outcome), "cap {cap}: {outcome:?}");
             }
             for cap in [floor, MAX_REF_LISTING] {
-                let outcome = repo.build_ref_listing_capped(&[], cap).await;
+                let outcome = repo.build_ref_listing_capped(&all_refs(), cap).await;
                 assert!(
                     matches!(outcome, Err(Error::ObjectNotFound { .. })),
                     "cap {cap}: {outcome:?}"

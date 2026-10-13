@@ -166,7 +166,9 @@ pub use ostrya_core::{
     RefSelector, RepoMode, Span, TextError, Type, Value, Xattrs, from_bytes, from_text,
     is_checksum_shaped, loose_path, to_text, to_text_unannotated,
 };
-pub use ostrya_remote::proto::{MAX_REF_LISTING, MAX_REF_PREFIXES};
+pub use ostrya_remote::proto::{
+    MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_LISTING, MAX_REF_PREFIXES,
+};
 #[doc(hidden)]
 pub use prune::{PruneOptions, PruneStats, WeakRefFilter, WeakRefFilterFn};
 #[doc(hidden)]

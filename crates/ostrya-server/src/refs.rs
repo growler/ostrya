@@ -1,14 +1,20 @@
-//! The ref listing: the refs of the repository under a set of prefixes.
+//! The ref listing: the refs of the repository that a list of ref patterns
+//! selects.
 //!
 //! A `GET` of [`PATH`] gets the bytes of [`Repo::build_ref_listing`], built
 //! for each request. Each pair of the query is `prefix=VALUE`. The value is
-//! percent-decoded, and [`Repo::build_ref_listing`] checks that it is a ref
-//! name. No query is an empty prefix list, which takes all refs.
+//! percent-decoded, and it is one entry of a [`RefSelector`]: a ref pattern
+//! with an optional leading `!`. An entry has at most
+//! [`MAX_REF_ENTRY_PARTS`] parts and [`MAX_REF_ENTRY_LEN`] bytes. The server
+//! parses the entries before it takes a slot, so a bad entry gets 400 also
+//! when the slots are busy. No query is an empty list, which selects all
+//! refs.
 //!
 //! A listing is whole in memory from its build until its body drops. The
 //! server holds at most [`MAX_LISTINGS`] listings at the same time, over all
 //! connections.
 
+use std::collections::HashSet;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,7 +25,7 @@ use futures_io::AsyncRead;
 use futures_lite::io::Cursor;
 use hyper::header::{ALLOW, HeaderValue, RETRY_AFTER};
 use hyper::{Method, Response, StatusCode};
-use ostrya::{MAX_REF_PREFIXES, Repo};
+use ostrya::{MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_PREFIXES, RefSelector, Repo};
 
 use crate::body::ServeBody;
 use crate::router::{empty, percent_decode, with_length};
@@ -43,8 +49,8 @@ const MAX_LISTINGS: usize = 4;
 /// A method other than `GET` gets 405 with `Allow: GET`. A bad query gets
 /// 400. If [`MAX_LISTINGS`] listings are in flight, the request gets 503 with
 /// `Retry-After: 1`. These checks come in this order, before the build. A
-/// prefix that is not a ref name gets 400. The listing is built in the
-/// request task.
+/// query entry that is not a ref pattern, or that is over the limits of one
+/// entry, is a bad query. The listing is built in the request task.
 pub(crate) async fn handle(
     repo: &Repo,
     listings: &Arc<AtomicUsize>,
@@ -52,12 +58,11 @@ pub(crate) async fn handle(
     query: Option<&str>,
     stall: &Arc<Stall>,
 ) -> Response<ServeBody> {
-    let (prefixes, slot) = match admit(method, query, listings) {
+    let (selector, slot) = match admit(method, query, listings) {
         Ok(admitted) => admitted,
         Err(status) => return refusal(status),
     };
-    let prefixes: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-    match repo.build_ref_listing(&prefixes).await {
+    match repo.build_ref_listing(&selector).await {
         Ok(bytes) => {
             let len = bytes.len() as u64;
             let reader = Box::new(Listing {
@@ -67,26 +72,27 @@ pub(crate) async fn handle(
             let body = ServeBody::stream(reader, Some(len), stall.track());
             with_length(Response::new(body), Some(len))
         }
-        Err(e) => empty(status_of(&e)),
+        Err(_) => empty(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
-/// Returns the prefixes of the request and a slot of `listings`, or the
+/// Returns the selector of the request and a slot of `listings`, or the
 /// status that refuses the request.
 ///
-/// A method other than `GET` gets 405. Then a bad query gets 400. Then, if
-/// no slot is free, the request gets 503.
+/// A method other than `GET` gets 405. Then a bad query gets 400, also for
+/// an entry that is not a ref pattern. Then, if no slot is free, the request
+/// gets 503.
 fn admit(
     method: &Method,
     query: Option<&str>,
     listings: &Arc<AtomicUsize>,
-) -> Result<(Vec<String>, Slot), StatusCode> {
+) -> Result<(RefSelector, Slot), StatusCode> {
     if method != Method::GET {
         return Err(StatusCode::METHOD_NOT_ALLOWED);
     }
-    let prefixes = parse_query(query).ok_or(StatusCode::BAD_REQUEST)?;
+    let selector = parse_query(query).ok_or(StatusCode::BAD_REQUEST)?;
     let slot = Slot::take(listings).ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    Ok((prefixes, slot))
+    Ok((selector, slot))
 }
 
 /// Returns the response of a refusal of [`admit`] with `status`, with an
@@ -151,73 +157,115 @@ impl AsyncRead for Listing {
     }
 }
 
-/// Returns the status of an error of the build. A bad prefix is 400, and
-/// each other error is 500.
-fn status_of(error: &ostrya::Error) -> StatusCode {
-    match error {
-        ostrya::Error::InvalidRefspec(_) => StatusCode::BAD_REQUEST,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
-
-/// Returns the prefixes of the raw `query`, in the order of the query. No
-/// query and an empty query give an empty list.
+/// Returns the selector of the raw `query`. No query and an empty query give
+/// the selector with no entry.
 ///
 /// Each pair of the query is `prefix=VALUE`, and `&` separates two pairs.
 /// The key must be the raw bytes `prefix`. The value is percent-decoded with
-/// [`percent_decode`], so `+` stays `+`. A prefix given two times stays two
-/// times. If a pair is empty, has no `=`, has another key, or has a value
-/// that does not decode, the function returns `None`. If the query has more
-/// than [`MAX_REF_PREFIXES`] pairs, the function returns `None` before it
-/// decodes the pair after the limit. The function does not check the ref
-/// name: [`Repo::build_ref_listing`] checks each prefix before it reads the
-/// repository.
-fn parse_query(query: Option<&str>) -> Option<Vec<String>> {
+/// [`percent_decode`], so `+` stays `+`, and it is one entry of
+/// [`RefSelector::parse`]. If a pair is empty, has no `=`, has another key,
+/// has a value that does not decode, or has an entry over
+/// [`MAX_REF_ENTRY_PARTS`] parts or [`MAX_REF_ENTRY_LEN`] bytes, the function
+/// returns `None`. The limits of an entry come before the parse. If the
+/// query has more than [`MAX_REF_PREFIXES`] pairs, the function returns
+/// `None` before it decodes the pair after the limit. If the parse refuses
+/// an entry, the function returns `None`. A server keeps each entry and
+/// drops an entry that a pair repeats exactly.
+fn parse_query(query: Option<&str>) -> Option<RefSelector> {
     let query = match query {
-        None | Some("") => return Some(Vec::new()),
+        None | Some("") => return RefSelector::parse([]).ok(),
         Some(query) => query,
     };
-    let mut prefixes = Vec::new();
-    for pair in query.split('&') {
-        if prefixes.len() == MAX_REF_PREFIXES {
+    let mut entries: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (index, pair) in query.split('&').enumerate() {
+        if index == MAX_REF_PREFIXES {
             return None;
         }
         let (key, value) = pair.split_once('=')?;
         if key != PREFIX_KEY {
             return None;
         }
-        prefixes.push(percent_decode(value)?);
+        let entry = percent_decode(value)?;
+        if entry.len() > MAX_REF_ENTRY_LEN || entry.split('/').count() > MAX_REF_ENTRY_PARTS {
+            return None;
+        }
+        if seen.insert(entry.clone()) {
+            entries.push(entry);
+        }
     }
-    Some(prefixes)
+    RefSelector::parse(entries.iter().map(String::as_str)).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn prefixes(query: &str) -> Option<Vec<String>> {
+    fn selector(query: &str) -> Option<RefSelector> {
         parse_query(Some(query))
     }
 
-    #[test]
-    fn no_query_is_an_empty_prefix_list() {
-        assert_eq!(parse_query(None), Some(Vec::new()));
-        assert_eq!(prefixes(""), Some(Vec::new()));
+    fn parsed(entries: &[&str]) -> RefSelector {
+        RefSelector::parse(entries.iter().copied()).unwrap()
     }
 
     #[test]
-    fn each_pair_gives_one_decoded_prefix() {
+    fn no_query_is_an_empty_selector() {
+        assert_eq!(parse_query(None), Some(parsed(&[])));
+        assert_eq!(selector(""), Some(parsed(&[])));
+    }
+
+    #[test]
+    fn each_pair_gives_one_decoded_entry() {
         assert_eq!(
-            prefixes("prefix=a%2Fb&prefix=main"),
-            Some(vec!["a/b".to_owned(), "main".to_owned()])
+            selector("prefix=a%2Fb&prefix=main"),
+            Some(parsed(&["a/b", "main"]))
         );
-        assert_eq!(prefixes("prefix=a/b%2fc").unwrap(), ["a/b/c"]);
-        assert_eq!(prefixes("prefix=a%2Bb").unwrap(), ["a+b"]);
-        assert_eq!(prefixes("prefix=a+b").unwrap(), ["a+b"]);
-        assert_eq!(prefixes("prefix=a=b").unwrap(), ["a=b"]);
-        assert_eq!(prefixes("prefix=").unwrap(), [""]);
-        assert_eq!(prefixes("prefix=a%2F%2Fb").unwrap(), ["a//b"]);
-        assert_eq!(prefixes("prefix=x&prefix=x").unwrap(), ["x", "x"]);
+        assert_eq!(selector("prefix=a/b%2fc"), Some(parsed(&["a/b/c"])));
+        assert_eq!(selector("prefix=a%2F%2A"), Some(parsed(&["a/*"])));
+        assert_eq!(selector("prefix=a%2f**"), Some(parsed(&["a/**"])));
+        assert_eq!(selector("prefix=%21a%2Fb"), Some(parsed(&["!a/b"])));
+        assert_eq!(
+            selector("prefix=a%2F%2A%2Fc&prefix=%21a%2Fx%2F%2A%2A"),
+            Some(parsed(&["a/*/c", "!a/x/**"]))
+        );
+    }
+
+    /// An entry that an exact repeat gives is dropped. Entries that overlap
+    /// stay.
+    #[test]
+    fn an_exact_repeat_is_dropped() {
+        assert_eq!(
+            selector("prefix=x&prefix=x&prefix=x%2F%2A"),
+            Some(parsed(&["x", "x/*"]))
+        );
+        assert_eq!(selector("prefix=%21x&prefix=%21x"), Some(parsed(&["!x"])));
+    }
+
+    /// An entry that `RefSelector::parse` refuses makes the query bad.
+    #[test]
+    fn a_bad_entry_is_refused() {
+        for bad in [
+            "prefix=",
+            "prefix=%2F",
+            "prefix=a%2F%2Fb",
+            "prefix=a%2F",
+            "prefix=%2Fa",
+            "prefix=a%2A",
+            "prefix=%2A%2Ax",
+            "prefix=%2A%2A%2A",
+            "prefix=%21%21a",
+            "prefix=%21",
+            "prefix=a%21",
+            "prefix=a+b",
+            "prefix=a=b",
+            "prefix=a%2B",
+            "prefix=main&prefix=a%2F%2Fb",
+            "prefix=..",
+            "prefix=-a",
+        ] {
+            assert_eq!(selector(bad), None, "{bad}");
+        }
     }
 
     #[test]
@@ -239,16 +287,51 @@ mod tests {
             "prefix=a%00",
             "prefix=%ff",
         ] {
-            assert_eq!(prefixes(bad), None, "{bad}");
+            assert_eq!(selector(bad), None, "{bad}");
         }
     }
 
-    /// A query takes at most 256 prefixes, duplicates counted.
+    /// A query takes at most 256 pairs, duplicates counted. The limit comes
+    /// before the decode and the parse of the pair after it.
     #[test]
-    fn a_query_takes_at_most_256_prefixes() {
+    fn a_query_takes_at_most_256_pairs() {
         let query = |count: usize| vec!["prefix=a"; count].join("&");
-        assert_eq!(prefixes(&query(MAX_REF_PREFIXES)).unwrap().len(), 256);
-        assert_eq!(prefixes(&query(MAX_REF_PREFIXES + 1)), None);
+        assert_eq!(selector(&query(MAX_REF_PREFIXES)), Some(parsed(&["a"])));
+        assert_eq!(selector(&query(MAX_REF_PREFIXES + 1)), None);
+        let distinct: Vec<String> = (0..MAX_REF_PREFIXES)
+            .map(|n| format!("prefix=r{n}"))
+            .collect();
+        let distinct = distinct.join("&");
+        assert_eq!(
+            selector(&distinct).unwrap().positive().len(),
+            MAX_REF_PREFIXES
+        );
+        assert_eq!(selector(&format!("{distinct}&prefix=%zz")), None);
+    }
+
+    /// An entry has at most 256 parts and 4096 bytes. The limit comes before
+    /// the parse, so an entry over it is refused whatever its text.
+    #[test]
+    fn an_entry_takes_at_most_256_parts_and_4096_bytes() {
+        let parts = |count: usize| vec!["a"; count].join("%2F");
+        assert!(selector(&format!("prefix={}", parts(MAX_REF_ENTRY_PARTS))).is_some());
+        assert_eq!(
+            selector(&format!("prefix={}", parts(MAX_REF_ENTRY_PARTS + 1))),
+            None
+        );
+        let len = |count: usize| "a".repeat(count);
+        assert!(selector(&format!("prefix={}", len(MAX_REF_ENTRY_LEN))).is_some());
+        assert_eq!(
+            selector(&format!("prefix={}", len(MAX_REF_ENTRY_LEN + 1))),
+            None
+        );
+        // The bytes of a `!` count.
+        assert_eq!(
+            selector(&format!("prefix=%21{}", len(MAX_REF_ENTRY_LEN))),
+            None
+        );
+        // An entry over the limit with a bad text gets the same refusal.
+        assert_eq!(selector(&format!("prefix={}", "%2F".repeat(300))), None);
     }
 
     /// A slot counts while it lives, and leaves the count when it drops. No
@@ -297,6 +380,12 @@ mod tests {
         };
         assert_eq!(refused(Method::HEAD, "x"), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(refused(Method::GET, "x"), StatusCode::BAD_REQUEST);
+        // A bad entry gets 400 also when no slot is free.
+        assert_eq!(
+            refused(Method::GET, "prefix=a%2F%2Fb"),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(refused(Method::GET, "prefix=a%2A"), StatusCode::BAD_REQUEST);
         assert_eq!(
             refused(Method::GET, "prefix=a"),
             StatusCode::SERVICE_UNAVAILABLE
@@ -318,29 +407,12 @@ mod tests {
         );
 
         listings.store(MAX_LISTINGS - 1, Ordering::Release);
-        let Ok((prefixes, slot)) = admit(&Method::GET, Some("prefix=a"), &listings) else {
+        let Ok((selector, slot)) = admit(&Method::GET, Some("prefix=a"), &listings) else {
             panic!("a free slot is refused");
         };
-        assert_eq!(prefixes, ["a"]);
+        assert_eq!(selector, parsed(&["a"]));
         assert_eq!(listings.load(Ordering::Acquire), MAX_LISTINGS);
         drop(slot);
         assert_eq!(listings.load(Ordering::Acquire), MAX_LISTINGS - 1);
-    }
-
-    #[test]
-    fn a_bad_prefix_is_400_and_other_errors_are_500() {
-        assert_eq!(
-            status_of(&ostrya::Error::InvalidRefspec("a/".into())),
-            StatusCode::BAD_REQUEST
-        );
-        let limit = ostrya::remote::Error::LimitExceeded("listing".into());
-        assert_eq!(
-            status_of(&ostrya::Error::Remote(limit)),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        assert_eq!(
-            status_of(&ostrya::Error::InvalidFormat("x".into())),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
     }
 }

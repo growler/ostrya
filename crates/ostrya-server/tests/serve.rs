@@ -25,8 +25,8 @@ use ostrya::remote::PullSession;
 use ostrya::verify::PullTrust;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
-    MutableTree, ObjectType, PullOptions, PullProgress, Repo, RepoMode, Summary, Type, Value,
-    loose_path,
+    MutableTree, ObjectType, PullOptions, PullProgress, RefSelector, Repo, RepoMode, Summary, Type,
+    Value, loose_path,
 };
 use ostrya_rt::block_on;
 use ostrya_server::{ServeOptions, ServerTls};
@@ -595,12 +595,18 @@ async fn add_refs(repo: &Repo, commit: &Checksum) {
     txn.commit().await.unwrap();
 }
 
+/// Parses `entries` as a selector.
+fn selector(entries: &[&str]) -> RefSelector {
+    RefSelector::parse(entries.iter().copied()).unwrap()
+}
+
 /// A `GET` of the ref listing gives the bytes of `build_ref_listing` for the
-/// prefixes of its query, with their length. No query takes all refs, and a
-/// prefix given two times gives the bytes of one time. The server does not
-/// see a `#` fragment. The requests go one
-/// after the other, more of them than the listings that the server holds at
-/// the same time, so each listing frees its place when its body ends.
+/// entries of its query, with their length. The entries are ref patterns
+/// with an optional `!`. No query takes all refs, and an entry given two
+/// times gives the bytes of one time. The server does not see a `#`
+/// fragment. The requests go one after the other, more of them than the
+/// listings that the server holds at the same time, so each listing frees
+/// its place when its body ends.
 #[test]
 fn the_ref_listing_is_served() {
     let tmp = TmpDir::new("listing");
@@ -613,11 +619,13 @@ fn the_ref_listing_is_served() {
             async move { exchange(addr, &request).await }
         };
 
-        let (head, body) = get("?prefix=a%2Fb&prefix=main").await;
+        let (head, body) = get("?prefix=a%2Fb%2F%2A%2A&prefix=main").await;
         assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
         assert_eq!(
             body,
-            repo.build_ref_listing(&["a/b", "main"]).await.unwrap()
+            repo.build_ref_listing(&selector(&["a/b/**", "main"]))
+                .await
+                .unwrap()
         );
         assert_eq!(
             header(&head, "content-length"),
@@ -632,17 +640,45 @@ fn the_ref_listing_is_served() {
             .collect();
         assert_eq!(names, ["a/b/c", "a/b/d", "main"]);
 
-        let all = repo.build_ref_listing(&[]).await.unwrap();
+        let all = repo.build_ref_listing(&selector(&[])).await.unwrap();
         for query in ["", "?", "#prefix=main"] {
             let (head, body) = get(query).await;
             assert!(head.starts_with("HTTP/1.1 200 "), "{query}: {head}");
             assert_eq!(body, all, "{query}");
         }
-        let main = repo.build_ref_listing(&["main"]).await.unwrap();
+        let main = repo.build_ref_listing(&selector(&["main"])).await.unwrap();
         for query in ["?prefix=main&prefix=main", "?prefix=main", "?prefix=main#x"] {
             let (head, body) = get(query).await;
             assert!(head.starts_with("HTTP/1.1 200 "), "{query}: {head}");
             assert_eq!(body, main, "{query}");
+        }
+
+        // A wildcard, a negative entry, a mixed list, and an overlap give
+        // the listing of their selector. `a%2F%2A` is `a/*`, `%21` is `!`.
+        let cases: [(&str, &[&str], &[&str]); 5] = [
+            ("?prefix=a%2F%2A", &["a/*"], &["a/bc"]),
+            ("?prefix=a%2F%2A%2A", &["a/**"], &["a/b/c", "a/b/d", "a/bc"]),
+            ("?prefix=%21a%2F%2A%2A", &["!a/**"], &["main"]),
+            (
+                "?prefix=a%2F%2A%2A&prefix=%21a%2Fb%2F%2A",
+                &["a/**", "!a/b/*"],
+                &["a/bc"],
+            ),
+            (
+                "?prefix=a%2F%2A&prefix=a%2F%2A%2A&prefix=a%2F%2A",
+                &["a/*", "a/**"],
+                &["a/b/c", "a/b/d", "a/bc"],
+            ),
+        ];
+        for (query, entries, names) in cases {
+            let (head, body) = get(query).await;
+            assert!(head.starts_with("HTTP/1.1 200 "), "{query}: {head}");
+            assert_eq!(
+                body,
+                repo.build_ref_listing(&selector(entries)).await.unwrap(),
+                "{query}"
+            );
+            assert_eq!(listed_names(&body), names, "{query}");
         }
     });
 }
@@ -669,12 +705,17 @@ fn a_failed_listing_gets_500() {
         }
         let (head, body) = exchange(addrs[0], &ask("GET", "/_ostrya/refs/v1?prefix=main")).await;
         assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
-        assert_eq!(body, repo.build_ref_listing(&["main"]).await.unwrap());
+        assert_eq!(
+            body,
+            repo.build_ref_listing(&selector(&["main"])).await.unwrap()
+        );
     });
 }
 
-/// A bad pair of the query and a prefix that is not a ref name get 400 with
-/// an empty body.
+/// A bad pair of the query and an entry that is not a ref pattern get 400
+/// with an empty body, and so does an entry of more than 256 parts or 4096
+/// bytes. An entry at a limit gets 200, and so does `a/*` written as
+/// `a%2F%2A`.
 #[test]
 fn the_ref_listing_refuses_bad_queries() {
     let tmp = TmpDir::new("listing-bad");
@@ -694,12 +735,40 @@ fn the_ref_listing_refuses_bad_queries() {
             "?prefix=a%20b",
             "?prefix=-a",
             "?prefix=a*",
+            "?prefix=a%2A",
+            "?prefix=%2A%2Ax",
+            "?prefix=%21%21a",
+            "?prefix=%21",
+            "?prefix=a%21",
+            "?prefix=%2F",
+            "?prefix=main&prefix=a%2F%2Fb",
         ] {
             let target = format!("/_ostrya/refs/v1{query}");
             let (head, body) = exchange(addrs[0], &ask("GET", &target)).await;
             assert!(head.starts_with("HTTP/1.1 400 "), "{query}: {head}");
             assert_eq!(header(&head, "content-length"), Some("0"), "{query}");
             assert!(body.is_empty(), "{query}");
+        }
+
+        let parts = |n: usize| vec!["a"; n].join("%2F");
+        let long = |n: usize| "a".repeat(n);
+        for (query, status) in [
+            (format!("?prefix={}", parts(256)), "200"),
+            (format!("?prefix={}", parts(257)), "400"),
+            (format!("?prefix={}", long(4096)), "200"),
+            (format!("?prefix={}", long(4097)), "400"),
+            (format!("?prefix=%21{}", long(4096)), "400"),
+            ("?prefix=a%2F%2A".to_owned(), "200"),
+            ("?prefix=a%2F%2A%2A&prefix=%21a%2Fx".to_owned(), "200"),
+        ] {
+            let target = format!("/_ostrya/refs/v1{query}");
+            let (head, _) = exchange(addrs[0], &ask("GET", &target)).await;
+            let prefix = format!("HTTP/1.1 {status} ");
+            assert!(
+                head.starts_with(&prefix),
+                "{}: {head}",
+                &query[..query.len().min(40)]
+            );
         }
     });
 }
@@ -755,8 +824,8 @@ fn listed_names(listing: &[u8]) -> Vec<String> {
 }
 
 /// `PullSession::fetch_refs` over HTTP/1.1 and over HTTP/2 gives the bytes of
-/// `build_ref_listing`. The client removes duplicate and covered prefixes,
-/// and a ref name with bytes that the query escapes comes back unchanged.
+/// `build_ref_listing`. The client removes duplicate prefixes, and a ref name
+/// with bytes that the query escapes comes back unchanged.
 #[test]
 fn fetch_refs_over_http_gives_the_built_listing() {
     let tmp = TmpDir::new("fetch-refs");
@@ -775,14 +844,14 @@ fn fetch_refs_over_http_gives_the_built_listing() {
             let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
             let session = PullSession::Http(fetcher(url, http2, None).await);
             let cases: [(&[&str], &[&str]); 4] = [
-                (&["a/b", "main"], &["a/b", "main"]),
+                (&["a/b/c", "main"], &["a/b/c", "main"]),
                 (&[], &[]),
-                (&["main", "a/b/c", "a", "main", "a/b"], &["main", "a"]),
+                (&["main", "a/b/c", "main"], &["main", "a/b/c"]),
                 (&ESCAPED_REFS, &ESCAPED_REFS),
             ];
             for (prefixes, built) in cases {
                 let got = session.fetch_refs(prefixes).await.unwrap().unwrap();
-                let want = repo.build_ref_listing(built).await.unwrap();
+                let want = repo.build_ref_listing(&selector(built)).await.unwrap();
                 assert_eq!(got, want, "{scheme}: {prefixes:?}");
             }
             let got = session.fetch_refs(&ESCAPED_REFS).await.unwrap().unwrap();
@@ -814,24 +883,40 @@ fn prefix_of_encoded_len(len: usize) -> String {
 }
 
 /// A request target of exactly 16 KiB, the client limit, gets the listing over
-/// HTTP/1.1 and over HTTP/2. The target is `_ostrya/refs/v1?prefix=` and the
-/// encoded prefix.
+/// HTTP/1.1 and over HTTP/2. The target is `_ostrya/refs/v1?` and five
+/// pairs `prefix=` and an encoded name, so each name is under the limit of
+/// 4096 bytes of one entry. The first part of each name differs, so no name
+/// covers another.
 #[test]
 fn fetch_refs_takes_a_target_at_the_client_limit() {
     let tmp = TmpDir::new("fetch-refs-target");
     let (_, repo, _, _) = block_on(repo(tmp.path()));
-    let fixed = "_ostrya/refs/v1?prefix=".len();
-    let prefix = prefix_of_encoded_len(16 * 1024 - fixed);
-    let encoded = prefix.len() + 2 * prefix.matches('/').count();
+    let fixed = "_ostrya/refs/v1?".len() + 5 * "prefix=".len() + 4;
+    let mut lens = vec![3900; 4];
+    lens.push(16 * 1024 - fixed - lens.iter().sum::<usize>());
+    let prefixes: Vec<String> = lens
+        .iter()
+        .zip(b'a'..)
+        .map(|(len, first)| {
+            let mut name = prefix_of_encoded_len(*len);
+            name.replace_range(..1, &char::from(first).to_string());
+            name
+        })
+        .collect();
+    let encoded: usize = prefixes
+        .iter()
+        .map(|p| p.len() + 2 * p.matches('/').count())
+        .sum();
     assert_eq!(fixed + encoded, 16 * 1024);
     for (opts, scheme, http2) in [(local(), "http", false), (tls(false), "https", true)] {
         let repo = repo.clone();
-        let prefix = prefix.clone();
+        let prefixes = prefixes.clone();
         with_server(repo.clone(), opts, |addrs| async move {
             let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
             let session = PullSession::Http(fetcher(url, http2, None).await);
-            let got = session.fetch_refs(&[prefix.as_str()]).await;
-            let want = repo.build_ref_listing(&[prefix.as_str()]).await.unwrap();
+            let entries: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+            let got = session.fetch_refs(&entries).await;
+            let want = repo.build_ref_listing(&selector(&entries)).await.unwrap();
             assert_eq!(got.unwrap(), Some(want), "{scheme}");
         });
     }
@@ -851,7 +936,10 @@ fn fetch_refs_of_a_too_long_part_gets_an_empty_listing() {
             let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
             let session = PullSession::Http(fetcher(url, http2, None).await);
             let got = session.fetch_refs(&[long.as_str()]).await;
-            let want = repo.build_ref_listing(&["absent"]).await.unwrap();
+            let want = repo
+                .build_ref_listing(&selector(&["absent"]))
+                .await
+                .unwrap();
             assert_eq!(got.unwrap(), Some(want), "{scheme}");
         });
     }
@@ -974,7 +1062,7 @@ fn a_chain_from_the_ref_listing_is_pulled_over_http() {
         with_server(server.clone(), opts, |addrs| async move {
             let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
             let session = PullSession::Http(fetcher(url, http2, None).await);
-            let listing = session.fetch_refs(&["test"]).await.unwrap().unwrap();
+            let listing = session.fetch_refs(&["test/main"]).await.unwrap().unwrap();
             let deltas = Summary::parse(&listing).unwrap().static_deltas().unwrap();
             assert_eq!(deltas.len(), 3, "{scheme}");
             let progress = PullProgress::new();

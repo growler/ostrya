@@ -13,11 +13,11 @@
 //!   gives the ref file format and the durability rules.
 //! - [`Transaction::set_ref`] queues a ref write for the transaction commit.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
-use ostrya_core::{Checksum, RepoMode};
+use ostrya_core::{Checksum, RefPattern, RefSelector, RepoMode};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
@@ -471,39 +471,39 @@ impl Repo {
         Ok(refs)
     }
 
-    /// Returns the local refs that `prefixes` select, as `(name, commit)`
+    /// Returns the local refs that `selector` selects, as `(name, commit)`
     /// pairs sorted by name, each ref one time.
     ///
-    /// Each prefix selects the refs that [`list_refs`](Repo::list_refs) gives
-    /// for it, and the result is the union of these sets. An empty slice
-    /// selects each ref under `refs/heads`. The call drops each prefix that a
-    /// shorter prefix of the slice selects, and reads only the subtree of each
-    /// other prefix, so its cost follows the number of selected refs.
+    /// A ref is selected when the selector has no positive pattern or a
+    /// positive pattern matches its name, and no negative pattern matches it.
+    /// The walk reads only the directories that the literal leading parts of
+    /// a positive pattern name, and below them only the directories that the
+    /// pattern can match. It applies the negative patterns to a name before
+    /// it reads the ref file, so a ref that no entry selects is never read.
+    /// The walk drops a positive pattern that another positive pattern
+    /// covers: if `q` is literal parts and a final `**`, a pattern that
+    /// starts with the same literal parts and has at least one more part
+    /// selects only names that `q` selects. The walk does not read a
+    /// directory that a negative pattern covers: a negative pattern of
+    /// literal or `*` parts and a final `**` matches each name below a
+    /// directory whose path starts with these parts.
+    /// With no positive pattern the walk covers all of `refs/heads`. The
+    /// walk enumerates a name that the ref-name rule refuses, and a wildcard
+    /// selects it.
+    ///
+    /// The call follows each alias. An alias whose target names no ref is not
+    /// in the result.
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] if a prefix is not a valid ref name, so a
-    ///   prefix with a space, a wildcard, or a leading `-` or `.` in a
-    ///   component fails. The check comes before each read.
-    /// - The errors of [`list_refs`](Repo::list_refs), for a selected ref.
-    pub(crate) async fn list_refs_under(
+    /// The errors of [`list_refs`](Repo::list_refs), for a selected ref.
+    pub(crate) async fn list_refs_selected(
         &self,
-        prefixes: &[&str],
+        selector: &RefSelector,
     ) -> Result<Vec<(String, Checksum)>> {
-        for prefix in prefixes {
-            check_ref_path(prefix)?;
-        }
-        if prefixes.is_empty() {
-            return self.list_refs(None).await;
-        }
-        let prefixes: Vec<String> = uncovered_prefixes(prefixes)
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
         let repo = self.clone();
-        let mut refs = ostrya_rt::unblock(move || collect_heads_under(&repo, &prefixes)).await?;
-        refs.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(refs)
+        let selector = selector.clone();
+        ostrya_rt::unblock(move || collect_heads_selected(&repo, &selector)).await
     }
 
     /// Returns the remote refs as `(refspec, commit)` pairs, sorted by refspec.
@@ -956,19 +956,41 @@ fn collect_heads(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
     Ok(out)
 }
 
-/// Collects each ref under `refs/heads` that one of `prefixes` selects. No
-/// prefix of `prefixes` selects another, so no ref is collected two times.
-fn collect_heads_under(repo: &Repo, prefixes: &[String]) -> Result<Vec<(String, Checksum)>> {
+/// Collects each ref under `refs/heads` that `selector` selects, sorted by
+/// name, each one time. A ref that no entry selects is not read, and a
+/// directory that a negative pattern covers is not read.
+fn collect_heads_selected(repo: &Repo, selector: &RefSelector) -> Result<Vec<(String, Checksum)>> {
     let Some(heads) = open_refs_dir(repo, "refs/heads")? else {
         return Ok(Vec::new());
     };
-    let mut out = Vec::new();
-    for prefix in prefixes {
-        walk_ref_prefix(heads.as_fd(), prefix, &mut |entry| {
-            push_head(&mut out, &entry)
-        })?;
+    let mut out: BTreeMap<String, Checksum> = BTreeMap::new();
+    // Reads the ref of `entry` unless it is in `out` already or a negative
+    // pattern matches it. The positive match is the duty of the walk.
+    let mut take = |entry: RefEntry<'_>| -> Result<()> {
+        if out.contains_key(entry.path) || selector.negative().iter().any(|p| p.matches(entry.path))
+        {
+            return Ok(());
+        }
+        if let Some(bytes) = read_ref_file(entry.dir, entry.name)? {
+            out.insert(entry.path.to_owned(), parse_ref_content(&bytes)?);
+        }
+        Ok(())
+    };
+    let covers: Vec<Vec<&str>> = selector
+        .negative()
+        .iter()
+        .filter_map(|pattern| covering_lead(pattern.as_str()))
+        .collect();
+    let skip = |dir: &str| dir_is_covered(&covers, dir);
+    if selector.positive().is_empty() {
+        walk_ref_dir_skipping(heads.as_fd(), "", &skip, &mut take)?;
+    } else {
+        for pattern in uncovered_patterns(selector.positive()) {
+            let parts: Vec<&str> = pattern.as_str().split('/').collect();
+            walk_ref_pattern(heads.as_fd(), "", &parts, pattern, &skip, &mut take)?;
+        }
     }
-    Ok(out)
+    Ok(out.into_iter().collect())
 }
 
 /// Reads the ref entry `entry` of a walk of `refs/heads` and adds it to
@@ -1101,6 +1123,17 @@ pub(crate) fn walk_ref_dir(
     prefix: &str,
     visit: &mut impl FnMut(RefEntry<'_>) -> Result<()>,
 ) -> Result<()> {
+    walk_ref_dir_skipping(dir, prefix, &|_| false, visit)
+}
+
+/// Walks a directory as [`walk_ref_dir`] does, and does not read a
+/// subdirectory when `skip` returns `true` for its path below the top.
+fn walk_ref_dir_skipping(
+    dir: BorrowedFd<'_>,
+    prefix: &str,
+    skip: &dyn Fn(&str) -> bool,
+    visit: &mut impl FnMut(RefEntry<'_>) -> Result<()>,
+) -> Result<()> {
     for name in read_dir_names(dir)? {
         // A name removed between the directory read and the classification
         // has no type.
@@ -1113,8 +1146,11 @@ pub(crate) fn walk_ref_dir(
             format!("{prefix}/{name}")
         };
         if file_type == FileType::Directory {
+            if skip(&path) {
+                continue;
+            }
             let sub = open_ref_subdir(dir, &name)?;
-            walk_ref_dir(sub.as_fd(), &path, visit)?;
+            walk_ref_dir_skipping(sub.as_fd(), &path, skip, visit)?;
         } else {
             visit(RefEntry {
                 dir,
@@ -1127,55 +1163,151 @@ pub(crate) fn walk_ref_dir(
     Ok(())
 }
 
-/// Walks the part of a ref tree that the ref name `prefix` selects by the
-/// rule of [`ref_prefixes`]. `visit` gets each entry that [`walk_ref_dir`]
-/// gives from `top` with a path that `prefix` selects, and no other entry.
+/// Walks the part of a ref tree that `pattern` can match. `parts` are the
+/// parts of the pattern that remain below `dir`, and `prefix` is the path of
+/// `dir` below the top, or empty for the top. `visit` gets each entry that
+/// [`walk_ref_dir`] gives from the top with a path that `pattern` matches,
+/// and no other entry. The call does not read a subdirectory when `skip`
+/// returns `true` for its path.
 ///
-/// The call goes down `prefix` one path part at a time, and classifies each
-/// part with `SYMLINK_NOFOLLOW`, as `walk_ref_dir` does:
+/// The call classifies each entry with `SYMLINK_NOFOLLOW`, as `walk_ref_dir`
+/// does, so it descends only into a real directory. It reads no ref file
+/// outside the literal leading parts of the pattern and the matches. A
+/// leading wildcard lists the directories at its level. For the first of
+/// `parts`:
 ///
-/// - Each part before the last part must be a real directory. If such a part
-///   is missing, is longer than a file name can be, or is a file, a symlink,
-///   or another entry that is not a directory, the prefix selects nothing. `walk_ref_dir` does not descend
-///   into such an entry, so it reports no path below it.
-/// - If the last part is missing, or is longer than a file name can be, the
-///   prefix selects nothing.
-/// - If the last part is a real directory, the call walks it with
-///   `walk_ref_dir`.
-/// - Each other last part goes to `visit` as one entry, as `walk_ref_dir`
-///   reports it. A symlink that names a directory is such an entry.
-fn walk_ref_prefix(
-    top: BorrowedFd<'_>,
+/// - A literal part names one entry. If the entry is missing, or is longer
+///   than a file name can be, the pattern selects nothing. If more parts
+///   follow, the entry must be a real directory, and the call goes down into
+///   it. If the part is the last, the entry goes to `visit` unless it is a
+///   directory. A symlink that names a directory is such an entry.
+/// - `*` reads `dir` and takes each entry as a literal part does.
+/// - `**` walks `dir` with `walk_ref_dir`. If no part follows it, each entry
+///   goes to `visit`. Otherwise `visit` gets each entry whose whole path the
+///   pattern matches.
+fn walk_ref_pattern(
+    dir: BorrowedFd<'_>,
     prefix: &str,
-    visit: &mut impl FnMut(RefEntry<'_>) -> Result<()>,
+    parts: &[&str],
+    pattern: &RefPattern,
+    skip: &dyn Fn(&str) -> bool,
+    visit: &mut dyn FnMut(RefEntry<'_>) -> Result<()>,
 ) -> Result<()> {
-    let (parents, last) = match prefix.rsplit_once('/') {
-        Some((parents, last)) => (Some(parents), last),
-        None => (None, prefix),
+    let Some((first, rest)) = parts.split_first() else {
+        return Ok(());
     };
-    let mut parent: Option<OwnedFd> = None;
-    for part in parents.into_iter().flat_map(|parents| parents.split('/')) {
-        let dir = parent.as_ref().map_or(top, AsFd::as_fd);
-        if ref_entry_type(dir, part)? != Some(FileType::Directory) {
-            return Ok(());
-        }
-        let sub = open_ref_subdir(dir, part)?;
-        parent = Some(sub);
+    if *first == "**" {
+        return walk_ref_dir_skipping(dir, prefix, skip, &mut |entry| {
+            if rest.is_empty() || pattern.matches(entry.path) {
+                visit(entry)
+            } else {
+                Ok(())
+            }
+        });
     }
-    let dir = parent.as_ref().map_or(top, AsFd::as_fd);
-    match ref_entry_type(dir, last)? {
-        None => Ok(()),
-        Some(FileType::Directory) => {
-            let sub = open_ref_subdir(dir, last)?;
-            walk_ref_dir(sub.as_fd(), prefix, visit)
+    let names = if *first == "*" {
+        read_dir_names(dir)?
+    } else {
+        vec![(*first).to_owned()]
+    };
+    for name in names {
+        // A name removed after the directory read has no type.
+        let Some(file_type) = ref_entry_type(dir, &name)? else {
+            continue;
+        };
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        match (file_type == FileType::Directory, rest.is_empty()) {
+            (true, false) if !skip(&path) => {
+                let sub = open_ref_subdir(dir, &name)?;
+                walk_ref_pattern(sub.as_fd(), &path, rest, pattern, skip, visit)?;
+            }
+            (false, true) => visit(RefEntry {
+                dir,
+                name: &name,
+                path: &path,
+                file_type,
+            })?,
+            _ => {}
         }
-        Some(file_type) => visit(RefEntry {
-            dir,
-            name: last,
-            path: prefix,
-            file_type,
-        }),
     }
+    Ok(())
+}
+
+/// Returns the leading parts of the negative pattern `text` when the
+/// pattern is these parts, each a literal or `*`, followed by a final `**`.
+/// Such a pattern matches each name below a directory whose path starts with
+/// the parts. `**` alone has no leading part.
+fn covering_lead(text: &str) -> Option<Vec<&str>> {
+    let lead = if text == "**" {
+        ""
+    } else {
+        text.strip_suffix("/**")?
+    };
+    let parts: Vec<&str> = if lead.is_empty() {
+        Vec::new()
+    } else {
+        lead.split('/').collect()
+    };
+    if parts.contains(&"**") {
+        return None;
+    }
+    Some(parts)
+}
+
+/// Returns `true` if a negative pattern with one of the leading parts
+/// `covers` matches each name below the directory `dir`. That holds when
+/// `dir` has at least as many parts as the lead, and each lead part is `*` or
+/// equals the part of `dir` at its place.
+fn dir_is_covered(covers: &[Vec<&str>], dir: &str) -> bool {
+    covers.iter().any(|lead| {
+        let mut parts = dir.split('/');
+        lead.iter()
+            .all(|l| parts.next().is_some_and(|part| *l == "*" || *l == part))
+    })
+}
+
+/// Returns the patterns of `patterns` that no other pattern of the slice
+/// covers, in order. A pattern `q` covers a pattern `p` when `q` is literal
+/// parts followed by a final `**`, and `p` starts with the same literal
+/// parts and has at least one more part: each name that `p` matches is below
+/// the literal parts, and `q` matches it. Of two patterns with the same text
+/// the first stays. A pattern that only a combination of patterns covers
+/// stays.
+fn uncovered_patterns(patterns: &[RefPattern]) -> Vec<&RefPattern> {
+    // The text of each pattern that has the shape of `q`, up to its `**`.
+    let leads: Vec<(usize, &str)> = patterns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, q)| {
+            let text = q.as_str();
+            let lead = if text == "**" {
+                ""
+            } else {
+                &text[..text.strip_suffix("/**")?.len() + 1]
+            };
+            let literal = lead.split('/').all(|part| part != "*" && part != "**");
+            literal.then_some((i, lead))
+        })
+        .collect();
+    patterns
+        .iter()
+        .enumerate()
+        .filter(|(i, p)| {
+            let text = p.as_str();
+            let repeat = patterns[..*i].iter().any(|q| q.as_str() == text);
+            !repeat
+                && !leads.iter().any(|(j, lead)| {
+                    patterns[*j].as_str() != text
+                        && text.len() > lead.len()
+                        && text.starts_with(lead)
+                })
+        })
+        .map(|(_, p)| p)
+        .collect()
 }
 
 /// Returns the type of the entry `name` of `dir`, read with no symlink
@@ -1371,26 +1503,11 @@ pub(crate) fn check_ref_path(name: &str) -> Result<()> {
 /// `name` that ends before a `/`, and then `name` itself.
 ///
 /// The prefix `a/b` selects the ref `a/b` and each ref below `a/b/`. It does
-/// not select `a/bc`. [`Repo::list_refs`] and
-/// [`Repo::build_ref_listing`] apply this rule.
+/// not select `a/bc`. [`Repo::list_refs`] applies this rule.
 pub(crate) fn ref_prefixes(name: &str) -> impl Iterator<Item = &str> {
     name.match_indices('/')
         .map(|(end, _)| &name[..end])
         .chain(std::iter::once(name))
-}
-
-/// Returns the prefixes of `prefixes` that no other prefix of the slice
-/// selects by the rule of [`ref_prefixes`], sorted, each one time.
-///
-/// The prefix `a` selects `a/c`, so `["a", "a/c"]` gives `["a"]`. It does not
-/// select `ab`. Each ref that the slice selects is below exactly one prefix
-/// of the result.
-fn uncovered_prefixes<'a>(prefixes: &[&'a str]) -> Vec<&'a str> {
-    let all: BTreeSet<&str> = prefixes.iter().copied().collect();
-    all.iter()
-        .copied()
-        .filter(|prefix| ref_prefixes(prefix).find(|part| all.contains(part)) == Some(*prefix))
-        .collect()
 }
 
 // A ref name can contain `/`. A component of a ref name, and a remote, is not
@@ -1903,15 +2020,57 @@ mod tests {
         }
     }
 
-    /// A prefix that a shorter prefix selects is dropped, and a duplicate
-    /// is kept one time. The prefix `a` does not select `ab`.
+    fn patterns(texts: &[&str]) -> Vec<RefPattern> {
+        texts
+            .iter()
+            .map(|text| RefPattern::parse(text).unwrap())
+            .collect()
+    }
+
+    /// A pattern below the literal parts of a `lit/**` pattern is dropped,
+    /// and a duplicate stays one time. A pattern that is not below the
+    /// literal parts, one with a wildcard before the `**`, and `a/**` against
+    /// `a` stay.
     #[test]
-    fn a_covered_prefix_is_dropped() {
+    fn a_covered_pattern_is_dropped() {
+        let kept = |texts: &[&str]| -> Vec<String> {
+            let all = patterns(texts);
+            uncovered_patterns(&all)
+                .iter()
+                .map(|p| p.as_str().to_owned())
+                .collect()
+        };
         assert_eq!(
-            uncovered_prefixes(&["a/c", "ab", "a", "x/y", "a/c/d", "ab", "x/yz"]),
-            ["a", "ab", "x/y", "x/yz"]
+            kept(&["a/b", "a/**", "a/*/c", "ab", "a"]),
+            ["a/**", "ab", "a"]
         );
-        assert_eq!(uncovered_prefixes(&["b/c", "b/c"]), ["b/c"]);
+        assert_eq!(kept(&["a/b", "a/b", "a/**", "a/**"]), ["a/**"]);
+        assert_eq!(kept(&["x/y", "x/y"]), ["x/y"]);
+        assert_eq!(kept(&["a/b/**", "a/**", "a/b/c"]), ["a/**"]);
+        assert_eq!(kept(&["a/*/**", "a/b/c"]), ["a/*/**", "a/b/c"]);
+        assert_eq!(kept(&["a/**/c", "a/**", "a/**/c"]), ["a/**"]);
+        assert_eq!(kept(&["a/**/c", "b/**/c"]), ["a/**/c", "b/**/c"]);
+        assert_eq!(kept(&["**", "a", "b/*"]), ["**"]);
+        assert_eq!(kept(&["*", "a/b"]), ["*", "a/b"]);
+    }
+
+    /// A negative pattern covers a directory when it is `lead/**` and the
+    /// directory path starts with the lead parts, where `*` stands for any
+    /// part.
+    #[test]
+    fn a_negative_pattern_covers_a_directory() {
+        let covers: Vec<Vec<&str>> = ["a/c/**", "*/x/**", "**/q", "a/**/**", "k/**"]
+            .iter()
+            .filter_map(|text| covering_lead(text))
+            .collect();
+        assert_eq!(covers, [vec!["a", "c"], vec!["*", "x"], vec!["k"]]);
+        for dir in ["a/c", "a/c/d", "z/x", "k", "k/j/i"] {
+            assert!(dir_is_covered(&covers, dir), "{dir}");
+        }
+        for dir in ["a", "a/b", "b/c", "z", "kk", "z/y"] {
+            assert!(!dir_is_covered(&covers, dir), "{dir}");
+        }
+        assert!(dir_is_covered(&[Vec::new()], "any"));
     }
 
     #[test]

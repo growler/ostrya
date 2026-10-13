@@ -5,13 +5,14 @@ use std::io;
 
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::io::{AsyncReadExt, BufReader, BufWriter};
+use ostrya_core::RefSelector;
 
 use crate::archive::{ArchiveAnswer, ArchiveView};
 use crate::error::{Error, Result};
 use crate::remote;
 use crate::remote::proto::{
-    FrameReader, FrameWriter, GetReply, MAX_REF_LISTING, MAX_REF_PREFIXES, Message,
-    PULL_PROTOCOL_VERSION, PullHello, PullHelloReply,
+    FrameReader, FrameWriter, GetReply, MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_LISTING,
+    MAX_REF_PREFIXES, Message, PULL_PROTOCOL_VERSION, PullHello, PullHelloReply,
 };
 use crate::repo::Repo;
 
@@ -107,8 +108,11 @@ impl Repo {
     ///   body follows as chunks.
     ///
     /// The session answers each `ListRefs` with the listing that
-    /// [`build_ref_listing`](Repo::build_ref_listing) builds for its prefixes.
-    /// A `ListRefs` holds at most [`MAX_REF_PREFIXES`] prefixes.
+    /// [`build_ref_listing`](Repo::build_ref_listing) builds for its entries.
+    /// The entries are ref patterns with an optional leading `!`, which
+    /// [`RefSelector::parse`] reads. A `ListRefs` holds at most
+    /// [`MAX_REF_PREFIXES`] entries, and each entry holds at most
+    /// [`MAX_REF_ENTRY_PARTS`] parts and [`MAX_REF_ENTRY_LEN`] bytes.
     /// The reply is a `GetReply` with `found` set to `true` and the length of
     /// the listing. The listing follows as chunks.
     ///
@@ -165,8 +169,10 @@ impl Repo {
     /// - [`Error::Remote`] with the code `protocol` if a frame is malformed, or
     ///   if `input` ends inside a frame.
     /// - [`Error::Remote`] with the code `protocol` if a `ListRefs` holds more
-    ///   than [`MAX_REF_PREFIXES`] prefixes, or a prefix that is not a ref
-    ///   name. A prefix given two times counts two times.
+    ///   than [`MAX_REF_PREFIXES`] entries, an entry over the limits of one
+    ///   entry, or an entry that [`RefSelector::parse`] refuses. An entry
+    ///   given two times counts two times. The check of the limits of an entry
+    ///   comes before the parse.
     /// - [`Error::Remote`] with the code `limit-exceeded` if a ref listing is
     ///   larger than [`MAX_REF_LISTING`].
     /// - [`Error::Remote`] with the code `limit-exceeded` if a frame is larger
@@ -335,26 +341,32 @@ where
         }
     }
 
-    /// Answers one `ListRefs` with the listing of `prefixes`.
+    /// Answers one `ListRefs` with the listing of `entries`.
     ///
     /// Each failure comes before the reply, so the session sends an `Error`
     /// message in place of the reply.
-    async fn list_refs(&mut self, prefixes: &[String]) -> std::result::Result<(), Failure> {
-        if prefixes.len() > MAX_REF_PREFIXES {
-            return Err(Failure::Wire(remote::Error::Protocol(format!(
-                "ListRefs: {} prefixes, over the limit of {MAX_REF_PREFIXES}",
-                prefixes.len()
-            ))));
+    async fn list_refs(&mut self, entries: &[String]) -> std::result::Result<(), Failure> {
+        let protocol = |why: String| Failure::Wire(remote::Error::Protocol(why));
+        if entries.len() > MAX_REF_PREFIXES {
+            return Err(protocol(format!(
+                "ListRefs: {} entries, over the limit of {MAX_REF_PREFIXES}",
+                entries.len()
+            )));
         }
-        if let Some(bad) = prefixes.iter().find(|p| !ostrya_core::is_ref_name(p)) {
-            return Err(Failure::Wire(remote::Error::Protocol(format!(
-                "ListRefs: prefix '{bad}' is not a ref name"
-            ))));
+        for entry in entries {
+            if entry.len() > MAX_REF_ENTRY_LEN || entry.split('/').count() > MAX_REF_ENTRY_PARTS {
+                return Err(protocol(format!(
+                    "ListRefs: an entry of {} bytes is over the limit of \
+                     {MAX_REF_ENTRY_PARTS} parts or {MAX_REF_ENTRY_LEN} bytes",
+                    entry.len()
+                )));
+            }
         }
-        let prefixes: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        let selector = RefSelector::parse(entries.iter().map(String::as_str))
+            .map_err(|e| protocol(format!("ListRefs: {e}")))?;
         let listing = self
             .repo
-            .build_ref_listing_capped(&prefixes, self.listing_cap)
+            .build_ref_listing_capped(&selector, self.listing_cap)
             .await
             .map_err(|e| match e {
                 Error::Remote(e @ remote::Error::LimitExceeded(_)) => Failure::Wire(e),
@@ -692,7 +704,10 @@ mod tests {
             let repo = Repo::create(&dir, crate::CreateOptions::new(crate::RepoMode::BareUser))
                 .await
                 .unwrap();
-            let listing = repo.build_ref_listing(&[]).await.unwrap();
+            let listing = repo
+                .build_ref_listing(&crate::RefSelector::parse([]).unwrap())
+                .await
+                .unwrap();
             let mut input = FrameWriter::new(Vec::new());
             for msg in [
                 Message::PullHello(PullHello {

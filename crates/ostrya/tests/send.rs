@@ -35,6 +35,7 @@ use common::pipe::{PipeReader, PipeWriter, pipe};
 use futures_io::AsyncWrite;
 use futures_lite::future;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt, Cursor};
+use ostrya::RefSelector;
 use ostrya::remote::ErrorCode;
 use ostrya::remote::proto::{
     ErrorMessage, FrameReader, FrameWriter, GetReply, Hello, MIN_FRAME_LIMIT, Message, ObjectRead,
@@ -709,11 +710,12 @@ fn list_refs_answers_with_the_built_listing() {
         replies
     });
     result.unwrap();
-    for (reply, prefixes) in [(&replies[0], &["a/b"][..]), (&replies[2], &[])] {
-        let listing = block_on(repo.build_ref_listing(prefixes)).unwrap();
-        assert!(reply.found, "{prefixes:?}");
-        assert_eq!(reply.len, Some(listing.len() as u64), "{prefixes:?}");
-        assert_eq!(reply.body, listing, "{prefixes:?}");
+    for (reply, entries) in [(&replies[0], &["a/b"][..]), (&replies[2], &[])] {
+        let selector = RefSelector::parse(entries.iter().copied()).unwrap();
+        let listing = block_on(repo.build_ref_listing(&selector)).unwrap();
+        assert!(reply.found, "{entries:?}");
+        assert_eq!(reply.len, Some(listing.len() as u64), "{entries:?}");
+        assert_eq!(reply.body, listing, "{entries:?}");
     }
     assert_eq!(replies[1].body, BASE_CONFIG);
     let one = ostrya::Summary::parse(&replies[0].body).unwrap();
@@ -721,13 +723,51 @@ fn list_refs_answers_with_the_built_listing() {
     assert_eq!(names, ["a/b"]);
 }
 
-/// A prefix that is not a ref name is `protocol`. The session sends no
-/// reply before the `Error` message.
+/// Each entry of a `ListRefs` is a ref pattern with an optional `!`. The
+/// listing holds the refs that the selector of the entries selects: a
+/// wildcard, a negative entry, and a mixed list.
+#[test]
+fn list_refs_selects_refs_by_pattern() {
+    let tmp = TmpDir::new("send-list-refs-patterns");
+    let repo = listing_repo(&tmp);
+    let cases: [(&[&str], &[&str]); 6] = [
+        (&["a/*"], &["a/b", "a/bc"]),
+        (&["a/**"], &["a/b", "a/bc"]),
+        (&["*"], &["main", "z"]),
+        (&["!a/**"], &["main", "z"]),
+        (&["a/**", "!a/bc"], &["a/b"]),
+        (&["a/b", "a/b", "z"], &["a/b", "z"]),
+    ];
+    for (entries, want) in cases {
+        let entries: Vec<String> = entries.iter().map(|e| (*e).to_owned()).collect();
+        let sent = entries.clone();
+        let (result, reply) = session(&repo, PIPE_CAP, |mut c| async move {
+            c.open().await;
+            c.send(&Message::ListRefs(sent)).await;
+            read_reply(&mut c.reader).await
+        });
+        result.unwrap();
+        let selector = RefSelector::parse(entries.iter().map(String::as_str)).unwrap();
+        assert_eq!(
+            reply.body,
+            block_on(repo.build_ref_listing(&selector)).unwrap()
+        );
+        let parsed = ostrya::Summary::parse(&reply.body).unwrap();
+        let names: Vec<&str> = parsed.refs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, want, "{entries:?}");
+    }
+}
+
+/// An entry that is not a ref pattern is `protocol`, and the error names the
+/// entry. The session sends no reply before the `Error` message.
 #[test]
 fn list_refs_with_a_bad_prefix_is_protocol() {
     let tmp = TmpDir::new("send-list-refs-bad");
     let repo = listing_repo(&tmp);
-    for bad in ["", "a/../b", "a/", "/a", "a b", "-a", "a*", "a/.b"] {
+    for bad in [
+        "", "/", "a/../b", "a/", "/a", "a b", "-a", "a*", "a/.b", "!!a", "!", "**x", "a//b",
+        "a/***", "a!", "a/!b",
+    ] {
         let (result, error) = session(&repo, PIPE_CAP, |mut c| async move {
             c.open().await;
             c.send(&Message::ListRefs(vec!["z".to_owned(), bad.to_owned()]))
@@ -735,7 +775,47 @@ fn list_refs_with_a_bad_prefix_is_protocol() {
             c.error().await
         });
         assert_eq!(error.code, ErrorCode::Protocol, "{bad:?}");
+        assert!(error.message.contains(&format!("{bad:?}")), "{error:?}");
         assert_eq!(returned_code(&result), Some(ErrorCode::Protocol), "{bad:?}");
+    }
+}
+
+/// An entry of more than 256 parts or 4096 bytes is `protocol`, and the
+/// limits pass. The check comes before the parse: an entry over a limit with
+/// a bad text gets the same refusal, and its message holds no parse reason.
+#[test]
+fn list_refs_over_the_entry_limits_is_protocol() {
+    let tmp = TmpDir::new("send-list-refs-entry");
+    let repo = listing_repo(&tmp);
+    let parts = |n: usize| vec!["a"; n].join("/");
+    for ok in [
+        parts(ostrya::MAX_REF_ENTRY_PARTS),
+        "a".repeat(ostrya::MAX_REF_ENTRY_LEN),
+        format!("!{}", "a".repeat(ostrya::MAX_REF_ENTRY_LEN - 1)),
+    ] {
+        let (result, reply) = session(&repo, PIPE_CAP, |mut c| async move {
+            c.open().await;
+            c.send(&Message::ListRefs(vec![ok])).await;
+            read_reply(&mut c.reader).await
+        });
+        result.unwrap();
+        assert!(reply.found);
+    }
+    for bad in [
+        parts(ostrya::MAX_REF_ENTRY_PARTS + 1),
+        "a".repeat(ostrya::MAX_REF_ENTRY_LEN + 1),
+        format!("!{}", "a".repeat(ostrya::MAX_REF_ENTRY_LEN)),
+        "/".repeat(300),
+        "*".repeat(5000),
+    ] {
+        let (result, error) = session(&repo, PIPE_CAP, |mut c| async move {
+            c.open().await;
+            c.send(&Message::ListRefs(vec!["z".to_owned(), bad])).await;
+            c.error().await
+        });
+        assert_eq!(error.code, ErrorCode::Protocol);
+        assert!(error.message.contains("over the limit"), "{error:?}");
+        assert_eq!(returned_code(&result), Some(ErrorCode::Protocol));
     }
 }
 

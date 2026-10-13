@@ -533,34 +533,39 @@ impl Repo {
     /// any lock.
     pub async fn regenerate_summary(&self, opts: &SummaryOptions) -> Result<()>;
     /// A ref listing for one request: a `(a(s(taya{sv}))a{sv})` summary of
-    /// the refs under `refs/heads` that `prefixes` select. The prefix `a/b`
-    /// selects `a/b` and each ref below `a/b/`, and not `a/bc`, as
-    /// `list_refs` with a prefix does. An empty slice selects each ref. A
-    /// prefix with a part longer than the file system permits for a file name
-    /// selects no ref, as a missing prefix does. The refs are sorted
-    /// byte-wise, each one time. An alias is listed under its
-    /// own name with the commit of its target. No mirror ref is listed, and
-    /// each entry has the bytes of the entry of the same ref in a summary of
-    /// the same repository state. A prefix that a shorter prefix selects is
-    /// dropped, and the call reads only the subtree of `refs/heads` under
-    /// each other prefix and each distinct commit one time, so its cost
-    /// follows the number of selected refs. The global metadata holds
-    /// `ostree.summary.mode`, then `ostree.static-deltas` if a delta is
-    /// found, then `ostree.summary.collection-id` if `[core] collection-id`
-    /// is set, with the encodings of the summary. The deltas come from
-    /// `delta-indexes/` alone: the index of each listed commit, then the
-    /// index of each source commit an index names, until no new commit
-    /// appears. A prefix that is not a ref name is InvalidRefspec before any
-    /// read. A listing over `MAX_REF_LISTING` is
+    /// the refs under `refs/heads` that `selector` selects. A ref is
+    /// selected when the selector has no positive pattern or a positive
+    /// pattern matches its name, and no negative pattern matches it. The
+    /// pattern `a/*` selects `a/b`, and `a/**` selects `a/b` and `a/b/c`.
+    /// An empty selector selects each ref. A pattern with a part longer than
+    /// the file system permits for a file name selects no ref, as a missing
+    /// name does. The refs are sorted byte-wise, each one time. An alias is
+    /// listed under its own name with the commit of its target. No mirror
+    /// ref is listed, and each entry has the bytes of the entry of the same
+    /// ref in a summary of the same repository state. The call reads only the
+    /// directories of `refs/heads` that a positive pattern can match, and no
+    /// ref file outside the literal leading parts of a positive pattern and
+    /// its matches. A leading wildcard lists the directories at its level. It
+    /// applies the negative patterns to a name before it reads the ref file,
+    /// and it skips a directory that a negative pattern covers.
+    /// It reads each distinct commit one time. A selector with no positive
+    /// pattern reads all of `refs/heads`. A name that the ref-name rule
+    /// refuses is in the walk, and a wildcard selects it. The global
+    /// metadata holds `ostree.summary.mode`, then `ostree.static-deltas` if a
+    /// delta is found, then `ostree.summary.collection-id` if `[core]
+    /// collection-id` is set, with the encodings of the summary. The deltas
+    /// come from `delta-indexes/` alone: the index of each listed commit,
+    /// then the index of each source commit an index names, until no new
+    /// commit appears. A listing over `MAX_REF_LISTING` is
     /// `Error::Remote(LimitExceeded)`, never cut short. The call refuses it
     /// at the first lower bound of its size over the cap: from the ref
     /// names, then the number of deltas, then the serialized metadata (all
     /// before a commit is read), then the commit versions, then the bytes
     /// written. The call writes nothing and takes no lock. A bad selected
     /// ref, a missing commit, or a bad index fails the whole listing. A ref
-    /// that no prefix selects is not read. One state of the repository
-    /// gives the same bytes.
-    pub async fn build_ref_listing(&self, prefixes: &[&str]) -> Result<Vec<u8>>;
+    /// that the selector does not select is not read. One state of the
+    /// repository gives the same bytes.
+    pub async fn build_ref_listing(&self, selector: &RefSelector) -> Result<Vec<u8>>;
 }
 
 /// The cap of a ref listing: 128 MiB. `ostrya_remote::proto::MAX_REF_LISTING`,
@@ -572,6 +577,18 @@ pub const MAX_REF_LISTING: u64 = 128 * 1024 * 1024;
 /// `ostrya::MAX_REF_PREFIXES`. A server counts a duplicate; a client removes
 /// duplicates and covered prefixes before it counts.
 pub const MAX_REF_PREFIXES: usize = 256;
+
+/// The most parts in one entry of a ref listing request: 256.
+/// `ostrya_remote::proto::MAX_REF_ENTRY_PARTS`, also at
+/// `ostrya::MAX_REF_ENTRY_PARTS`. A server refuses a longer entry before it
+/// parses the entry.
+pub const MAX_REF_ENTRY_PARTS: usize = 256;
+
+/// The most bytes in one entry of a ref listing request: 4,096.
+/// `ostrya_remote::proto::MAX_REF_ENTRY_LEN`, also at
+/// `ostrya::MAX_REF_ENTRY_LEN`. A server refuses a longer entry before it
+/// parses the entry.
+pub const MAX_REF_ENTRY_LEN: usize = 4096;
 
 /// Held by one caller at a time, across processes and inside the process.
 /// `Send + Sync`. While you hold it, write through it: the receive commit and
@@ -5034,8 +5051,8 @@ ends as aborted, and `on_report` is not called. The host has the report in
 `after_update`.
 
 The ref listing. The server answers `GET /_ostrya/refs/v1?prefix=P&prefix=Q`
-with the bytes of `Repo::build_ref_listing` for the prefixes of the query.
-It builds the listing for each request, from a clone of the `Repo` that
+with the bytes of `Repo::build_ref_listing` for the ref patterns of the
+query. It builds the listing for each request, from a clone of the `Repo` that
 `bind` takes. The listing is served with and without `receive`.
 
 - The server compares the raw request path with `/_ostrya/refs/v1`, and
@@ -5046,10 +5063,14 @@ It builds the listing for each request, from a clone of the `Repo` that
 - Each pair of the query is `prefix=VALUE`, and `&` separates two pairs.
   The server compares the key with the raw bytes `prefix`. It decodes the
   value with the percent-decoding of a request path, in which `+` stays
-  `+`. The decoded value must be a ref name. A prefix given two times is
-  accepted.
-- No query, or a `?` alone, is an empty prefix list, which takes all refs.
-- A query holds at most `MAX_REF_PREFIXES`, 256, pairs. A prefix given two
+  `+`. The decoded value is one entry of a `RefSelector`: a ref pattern with
+  an optional leading `!`. The server parses the entries with
+  `RefSelector::parse` before it takes a slot. An entry has at most
+  `MAX_REF_ENTRY_PARTS`, 256, parts and `MAX_REF_ENTRY_LEN`, 4096, bytes,
+  and the server checks both limits before the parse. An entry given two
+  times is accepted, and the server keeps it one time.
+- No query, or a `?` alone, is an empty list, which takes all refs.
+- A query holds at most `MAX_REF_PREFIXES`, 256, pairs. An entry given two
   times counts two times.
 - An HTTP/2 connection takes a header list of at most 32 KiB for one
   request, and a larger list gets 431. The list counts, for each header
@@ -5061,8 +5082,9 @@ It builds the listing for each request, from a clone of the `Repo` that
   query, then the count of listings in flight.
 - A method other than `GET`, `HEAD` included, gets 405 with `Allow: GET`.
 - An empty pair, a pair with no `=`, another key, a bad escape, a NUL, a
-  value that is not UTF-8, a query of more than 256 pairs, and a prefix that
-  is not a ref name get 400 with no body.
+  value that is not UTF-8, a query of more than 256 pairs, an entry over the
+  limits of one entry, and an entry that `RefSelector::parse` refuses get
+  400 with no body. A bad entry gets 400 also when 4 listings are in flight.
 - The server holds at most 4 listings at the same time, over all
   connections. A listing is in flight from the start of its build until its
   response body drops, so a client that does not read its body keeps its
@@ -5109,8 +5131,8 @@ The session:
    `version-unsupported`.
 2. The client sends `Get` frames, each with the path of one file relative to
    the repository root, and `ListRefs` frames, each with a list of ref
-   prefixes. The server answers each frame with one `GetReply`, in the order
-   of the frames. A body of chunks follows each reply with found true.
+   pattern entries. The server answers each frame with one `GetReply`, in
+   the order of the frames. A body of chunks follows each reply with found true.
 3. The client closes the input of the server at a frame boundary. `send`
    returns `Ok`.
 
@@ -5127,11 +5149,12 @@ Rules:
   reads the next request. It drops each body before the next request, so a
   built `.filez` gives its compressor back first.
 - The session answers a `ListRefs` with the bytes of
-  `Repo::build_ref_listing` for its prefixes: `GetReply` with found true
+  `Repo::build_ref_listing` for its entries: `GetReply` with found true
   and the length of the listing, then the listing as a body of chunks. The
-  session checks the count of the prefixes against `MAX_REF_PREFIXES`, 256,
-  and each prefix with `ostrya_core::is_ref_name` before the build. A
-  prefix given two times counts two times. An empty list is all refs under
+  session checks the count of the entries against `MAX_REF_PREFIXES`, 256,
+  the limits of each entry (`MAX_REF_ENTRY_PARTS` and `MAX_REF_ENTRY_LEN`),
+  and then the entries with `RefSelector::parse` before the build. An entry
+  given two times counts two times. An empty list is all refs under
   `refs/heads`. The listing is whole
   in memory, up to `MAX_REF_LISTING`, 128 MiB.
 - The session opens no transaction and takes no lock, neither the
@@ -5166,9 +5189,10 @@ Failures:
   `PullHello`, a `ListRefs` before `PullHello`, a kind of the push,
   `PullHelloReply`, `GetReply`, or `Error` from the client, a malformed
   frame, an end of input inside a frame, a `ListRefs` with more than
-  `MAX_REF_PREFIXES` prefixes, and a `ListRefs` prefix that is not a ref
-  name; `limit-exceeded` for a frame over 1 MiB and for a ref
-  listing over `MAX_REF_LISTING`.
+  `MAX_REF_PREFIXES` entries, a `ListRefs` entry over the limits of one
+  entry, and a `ListRefs` entry that `RefSelector::parse` refuses;
+  `limit-exceeded` for a frame over 1 MiB and for a ref listing over
+  `MAX_REF_LISTING`.
 - Each other error of `build_ref_listing` goes to the client as `Error`
   with `internal` in place of the reply, and returns as the error it is.
 - A failure of the view before the reply, for example a file that the

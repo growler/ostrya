@@ -28,7 +28,8 @@ use ostrya::remote::proto::{
 use ostrya::remote::{Encoding, ErrorCode, Expected, RefUpdate};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree,
-    ObjectName, ObjectType, PruneOptions, ReceivePolicy, ReceiveReport, Repo, RepoMode, loose_path,
+    ObjectName, ObjectType, PruneOptions, ReceivePolicy, ReceiveReport, RefSelector, Repo,
+    RepoMode, loose_path,
 };
 use ostrya_rt::{Timer, block_on};
 use ostrya_server::{ServeOptions, ServerTls};
@@ -680,7 +681,12 @@ fn the_ref_listing_is_served_beside_the_endpoint() {
         stream.read_to_end(&mut out).await.unwrap();
         let end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         assert!(out.starts_with(b"HTTP/1.1 200 "));
-        assert_eq!(out[end..], repo.build_ref_listing(&[]).await.unwrap());
+        assert_eq!(
+            out[end..],
+            repo.build_ref_listing(&RefSelector::parse([]).unwrap())
+                .await
+                .unwrap()
+        );
 
         for request in [
             "HEAD /_ostrya/refs/v1 HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n",

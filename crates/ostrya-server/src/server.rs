@@ -70,22 +70,25 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 ///   receive endpoint, with the bytes of [`Repo::build_ref_listing`]. The
 ///   path must match exactly, and the server reads its query. Each pair of
 ///   the query is `prefix=VALUE`, with the raw key `prefix` and a
-///   percent-decoded value in which `+` stays `+`. No query is an empty
-///   prefix list. The checks come in this order:
+///   percent-decoded value in which `+` stays `+`. The value is one entry of
+///   a [`ostrya::RefSelector`]: a ref pattern with an optional leading `!`.
+///   An entry has at most [`ostrya::MAX_REF_ENTRY_PARTS`] parts and
+///   [`ostrya::MAX_REF_ENTRY_LEN`] bytes. No query is an empty list, which
+///   selects all refs. The checks come in this order:
 ///   1. A method other than `GET`, `HEAD` included, gets 405 with
 ///      `Allow: GET`.
-///   2. A bad pair, and a query of more than 256 pairs
-///      ([`ostrya::MAX_REF_PREFIXES`]), get 400. A prefix given two times
-///      counts two times.
+///   2. A bad pair, an entry over the limits of one entry, an entry that
+///      [`ostrya::RefSelector::parse`] refuses, and a query of more than 256
+///      pairs ([`ostrya::MAX_REF_PREFIXES`]), get 400. An entry given two
+///      times counts two times, and the server keeps it one time.
 ///   3. If 4 listings are in flight over all connections, the request gets
 ///      503 with `Retry-After: 1`. A listing is in flight from the start of
 ///      its build until its response body drops.
 ///
-///   Then the server builds the listing. A value that is not a ref name gets
-///   400, and each other error of the build gets 500. A 400, a 405, a 500,
-///   and a 503 have an empty body. A 200 carries `Content-Length`, and the
-///   server sends the body in frames of at most 64 KiB under the body
-///   timeout.
+///   Then the server builds the listing. Each error of the build gets 500.
+///   A 400, a 405, a 500, and a 503 have an empty body. A 200 carries
+///   `Content-Length`, and the server sends the body in frames of at most
+///   64 KiB under the body timeout.
 /// - A path that the view does not find gets 404 with an empty body. A path
 ///   that the view refuses gets the same response, so a client cannot tell
 ///   a private path from an absent one.

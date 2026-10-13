@@ -3625,10 +3625,12 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   not served. A path the server refuses and a path it does not find both get
   404. `../format-reference.md`, "The archive view", states the rules.
 - The command also answers `GET /_ostrya/refs/v1?prefix=P&prefix=Q`, with
-  and without `--read-only`. The body is the ref listing of the refs under
-  the prefixes, a summary GVariant built for each request. No query takes
-  all refs. A bad pair of the query, a query of more than 256 pairs, and a
-  prefix that is not a ref name get 400, and a method other than `GET` gets
+  and without `--read-only`. The body is the ref listing, a summary
+  GVariant built for each request, of the refs that the entries of the query
+  select. Each entry is a ref pattern with an optional leading `!`. No
+  query takes all refs. A bad pair of the query, a query of more than 256
+  pairs, an entry of more than 256 parts or 4096 bytes, and an entry that is not a ref
+  pattern get 400, and a method other than `GET` gets
   405 with `Allow: GET`. The command holds at most 4 listings at the same
   time. A request over this limit gets 503 with `Retry-After: 1`.
 - `--read-only` serves the files of a pull alone. Without it the command

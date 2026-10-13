@@ -20,8 +20,8 @@ use std::process::Command;
 use common::{TmpDir, fixture_root, ostree_available, ostree_supports_ed25519};
 use ostrya::base64;
 use ostrya::{
-    AdvertisedDelta, Checksum, DeltaOptions, Ed25519Signer, Ed25519Verifier, Repo, Summary,
-    SummaryOptions, Value,
+    AdvertisedDelta, Checksum, DeltaOptions, Ed25519Signer, Ed25519Verifier, RefSelector, Repo,
+    Summary, SummaryOptions, Value,
 };
 use ostrya_rt::block_on;
 
@@ -803,102 +803,158 @@ async fn add_prefix_refs(repo: &Repo) -> (Checksum, Checksum) {
     (main, other)
 }
 
-/// Returns the names that `list_refs` gives for each prefix of `prefixes`,
-/// merged, sorted, and each one time. An empty slice gives each ref.
-async fn merged_list_refs(repo: &Repo, prefixes: &[&str]) -> Vec<String> {
-    let mut union: Vec<String> = Vec::new();
-    if prefixes.is_empty() {
-        let refs = repo.list_refs(None).await.unwrap();
-        union.extend(refs.into_iter().map(|(name, _)| name));
-    }
-    for prefix in prefixes {
-        let refs = repo.list_refs(Some(prefix)).await.unwrap();
-        union.extend(refs.into_iter().map(|(name, _)| name));
-    }
-    union.sort();
-    union.dedup();
-    union
+/// Parses `entries` as a selector.
+fn selector(entries: &[&str]) -> RefSelector {
+    RefSelector::parse(entries.iter().copied()).unwrap()
 }
 
-/// A prefix selects the ref of its name and the refs below it. The prefix
-/// `a` does not select `ab`. Each set of prefixes lists the sorted union of
-/// the `list_refs` results of its prefixes, each ref one time. An empty set
-/// lists every ref.
+/// Builds the ref listing of the selector that `entries` give.
+async fn list(repo: &Repo, entries: &[&str]) -> Result<Vec<u8>, ostrya::Error> {
+    repo.build_ref_listing(&selector(entries)).await
+}
+
+/// Returns the names of `list_refs(None)` that the selector of `entries`
+/// selects, sorted. This is the oracle of a listing. It holds in a
+/// repository where each ref reads.
+async fn oracle(repo: &Repo, entries: &[&str]) -> Vec<String> {
+    let selector = selector(entries);
+    let refs = repo.list_refs(None).await.unwrap();
+    refs.into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| selector.matches(name))
+        .collect()
+}
+
+/// Copies the ref file `from` to `to`, below `refs/heads`, so the new ref
+/// names the same commit. The call can create a name that no ref write
+/// accepts.
+fn copy_ref_file(repo_dir: &Path, from: &str, to: &str) {
+    let heads = repo_dir.join("refs/heads");
+    let target = heads.join(to);
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::copy(heads.join(from), target).unwrap();
+}
+
+/// A selector selects the refs that its patterns match. `a/*` takes one name
+/// part and `a/**` takes one or more. A negative entry removes refs, and a
+/// selector with no positive entry starts from each ref. The order of the
+/// entries has no effect, so a positive `a/b` does not bring back a ref that
+/// `!a/**` removes. Each set of entries lists the same names as the
+/// matcher gives over `list_refs`, each ref one time.
 ///
-/// The cases cover a prefix that is a ref file, a directory, an alias, a
-/// dangling alias, or missing, and a prefix below a ref file, below an alias,
-/// and below a missing directory. A prefix below a symlink to a directory
-/// selects nothing, because a walk of the refs does not descend into a
-/// symlink.
+/// The cases cover a pattern that is a ref file, a directory, an alias, a
+/// dangling alias, or missing, and a pattern below a ref file, below an
+/// alias, and below a missing directory. A pattern below a symlink to a
+/// directory selects nothing, because a walk of the refs does not descend
+/// into a symlink.
 #[test]
-fn a_ref_listing_selects_refs_by_prefix() {
-    let (_tmp, repo_dir) = writable_fixture("summary", "listing-prefixes");
+fn a_ref_listing_selects_refs_by_pattern() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-patterns");
     block_on(async {
         let repo = Repo::open(&repo_dir).await.unwrap();
         let (main, _) = add_prefix_refs(&repo).await;
         let heads = repo_dir.join("refs/heads");
         std::os::unix::fs::symlink("absent", heads.join("x/dangling")).unwrap();
-        let all = merged_list_refs(&repo, &[]).await;
-        let cases: [(&[&str], Vec<&str>); 13] = [
+        let all = ["a/b", "a/bc", "a/c/d", "ab", "main", "other", "x/al", "x/y"];
+        let cases: [(&[&str], Vec<&str>); 31] = [
             (&["a/b"], vec!["a/b"]),
             (&["main"], vec!["main"]),
-            (&["a"], vec!["a/b", "a/bc", "a/c/d"]),
+            (&["a"], vec![]),
+            (&["a/*"], vec!["a/b", "a/bc"]),
+            (&["a/**"], vec!["a/b", "a/bc", "a/c/d"]),
             (&["ab"], vec!["ab"]),
-            (&["a", "ab"], vec!["a/b", "a/bc", "a/c/d", "ab"]),
-            (&["a/c"], vec!["a/c/d"]),
-            (&["a", "a/c"], vec!["a/b", "a/bc", "a/c/d"]),
+            (&["a/**", "ab"], vec!["a/b", "a/bc", "a/c/d", "ab"]),
+            (&["a/c/*"], vec!["a/c/d"]),
+            (&["a/c"], vec![]),
+            (&["a/*/d"], vec!["a/c/d"]),
+            (&["a/**/d"], vec!["a/c/d"]),
+            (&["a/*/c"], vec![]),
+            (&["**/d"], vec!["a/c/d"]),
+            (&["*/*"], vec!["a/b", "a/bc", "x/al", "x/y"]),
+            (&["*"], vec!["ab", "main", "other"]),
+            (&["**"], all.to_vec()),
+            (&["*/y"], vec!["x/y"]),
+            (&["x/**", "main"], vec!["main", "x/al", "x/y"]),
+            (&["x/al"], vec!["x/al"]),
+            (&["x/*"], vec!["x/al", "x/y"]),
+            (&["x/dangling"], vec![]),
+            (&[], all.to_vec()),
+            (&["!a/**"], vec!["ab", "main", "other", "x/al", "x/y"]),
+            (&["!a/**", "a/b"], vec![]),
+            (&["a/b", "!a/**"], vec![]),
+            (&["a/**", "!a/c/**"], vec!["a/b", "a/bc"]),
+            (&["!*"], vec!["a/b", "a/bc", "a/c/d", "x/al", "x/y"]),
+            (&["!**"], vec![]),
             (
-                &["a/c/d", "a", "a/b", "a/c/d"],
+                &["**", "!a/*", "!x/y"],
+                vec!["a/c/d", "ab", "main", "other", "x/al"],
+            ),
+            (
+                &["a/b", "a/b", "a/*", "a/**", "a/b"],
                 vec!["a/b", "a/bc", "a/c/d"],
             ),
-            (&["x", "main"], vec!["main", "x/al", "x/y"]),
-            (&["x/al"], vec!["x/al"]),
-            (&["x/dangling"], vec![]),
-            (&[], all.iter().map(String::as_str).collect()),
-            (&["absent", "a/b/c", "main/x", "x/al/q", "absent/q"], vec![]),
+            (
+                &[
+                    "absent", "a/b/c", "main/x", "x/al/q", "absent/q", "*/*/*/*", "absent/*",
+                ],
+                vec![],
+            ),
         ];
-        for (prefixes, want) in cases {
-            let listing = repo.build_ref_listing(prefixes).await.unwrap();
+        for (entries, want) in cases {
+            let listing = list(&repo, entries).await.unwrap();
             let names = listed_names(&listing);
-            assert_eq!(names, want, "{prefixes:?}");
-            assert_eq!(
-                names,
-                merged_list_refs(&repo, prefixes).await,
-                "{prefixes:?}"
-            );
+            assert_eq!(names, want, "{entries:?}");
+            assert_eq!(names, oracle(&repo, entries).await, "{entries:?}");
         }
 
         // The alias is listed under its own name, with the commit of its
         // target.
-        let listing = repo.build_ref_listing(&["x/al"]).await.unwrap();
+        let listing = list(&repo, &["x/al"]).await.unwrap();
         assert_eq!(Summary::parse(&listing).unwrap().lookup("x/al"), Some(main));
 
         // A walk reports a symlink to a directory as one entry. A listing
         // that selects it reads it as a ref and fails, as `list_refs` does. A
-        // prefix below it selects nothing.
+        // pattern below it selects nothing. A negative entry for it comes
+        // before the read, so the listing does not fail.
         std::os::unix::fs::symlink("a", heads.join("ln")).unwrap();
         assert!(matches!(
             repo.list_refs(Some("ln")).await,
             Err(ostrya::Error::Io(_))
         ));
-        for prefixes in [&["ln"][..], &["a", "ln"][..], &[][..]] {
-            let outcome = repo.build_ref_listing(prefixes).await;
+        for entries in [
+            &["ln"][..],
+            &["a/**", "ln"][..],
+            &["*"][..],
+            &["**"][..],
+            &[][..],
+            &["!a/**"][..],
+        ] {
+            let outcome = list(&repo, entries).await;
             assert!(
                 matches!(outcome, Err(ostrya::Error::Io(_))),
-                "{prefixes:?}: {outcome:?}"
+                "{entries:?}: {outcome:?}"
             );
         }
-        let listing = repo
-            .build_ref_listing(&["ln/b", "ln/c", "a/c"])
-            .await
-            .unwrap();
+        for entries in [
+            &["ln/*"][..],
+            &["ln/**"][..],
+            &["ln/b"][..],
+            &["ln/*/d"][..],
+        ] {
+            let listing = list(&repo, entries).await.unwrap();
+            assert_eq!(listed_names(&listing), Vec::<String>::new(), "{entries:?}");
+        }
+        let listing = list(&repo, &["ln/b", "ln/c", "a/c/**"]).await.unwrap();
         assert_eq!(listed_names(&listing), ["a/c/d"]);
+        let listing = list(&repo, &["!ln"]).await.unwrap();
+        assert_eq!(listed_names(&listing), all);
     });
 }
 
-/// A prefix with a part longer than 255 bytes, which no file name can have,
-/// selects no ref, as an absent prefix does. This holds for a long first
-/// part, a long last part, and a long part under a ref directory.
+/// A pattern with a part longer than 255 bytes, which no file name can have,
+/// selects no ref, as an absent name does. This holds for a long first part,
+/// a long last part, and a long part under a ref directory, with a literal
+/// or with a wildcard before and after it.
 #[test]
 fn a_ref_listing_of_a_too_long_part_selects_nothing() {
     let (_tmp, repo_dir) = writable_fixture("summary", "listing-long-part");
@@ -906,14 +962,73 @@ fn a_ref_listing_of_a_too_long_part_selects_nothing() {
         let repo = Repo::open(&repo_dir).await.unwrap();
         add_prefix_refs(&repo).await;
         let long = "l".repeat(256);
-        let absent = repo.build_ref_listing(&["absent"]).await.unwrap();
-        let only_a = repo.build_ref_listing(&["a"]).await.unwrap();
-        for prefix in [long.clone(), format!("a/{long}"), format!("{long}/b")] {
-            let listing = repo.build_ref_listing(&[prefix.as_str()]).await;
-            assert_eq!(listing.unwrap(), absent, "{prefix}");
-            let listing = repo.build_ref_listing(&["a", prefix.as_str()]).await;
-            assert_eq!(listing.unwrap(), only_a, "{prefix}");
+        let absent = list(&repo, &["absent"]).await.unwrap();
+        let only_a = list(&repo, &["a/**"]).await.unwrap();
+        for pattern in [
+            long.clone(),
+            format!("a/{long}"),
+            format!("{long}/b"),
+            format!("*/{long}"),
+            format!("{long}/*"),
+            format!("a/*/{long}"),
+        ] {
+            let listing = list(&repo, &[pattern.as_str()]).await;
+            assert_eq!(listing.unwrap(), absent, "{pattern}");
+            let listing = list(&repo, &["a/**", pattern.as_str()]).await;
+            assert_eq!(listing.unwrap(), only_a, "{pattern}");
         }
+    });
+}
+
+/// A name that the ref-name rule refuses is still on disk. A wildcard
+/// selects it, as `list_refs` lists it. No literal pattern can name it.
+#[test]
+fn a_ref_listing_enumerates_names_that_the_name_rule_refuses() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-refused-names");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        for odd in ["odd~1", "q/a b", "q/main^", ".hidden", "q/-dash"] {
+            copy_ref_file(&repo_dir, "main", odd);
+        }
+        let odd = [".hidden", "odd~1", "q/-dash", "q/a b", "q/main^"];
+        let listing = list(&repo, &["**", "!main", "!other"]).await.unwrap();
+        assert_eq!(listed_names(&listing), odd);
+        let listing = list(&repo, &["*", "!main", "!other"]).await.unwrap();
+        assert_eq!(listed_names(&listing), [".hidden", "odd~1"]);
+        let listing = list(&repo, &["q/*"]).await.unwrap();
+        assert_eq!(listed_names(&listing), ["q/-dash", "q/a b", "q/main^"]);
+        let listing = list(&repo, &["q/**", "!q/*"]).await.unwrap();
+        assert_eq!(listed_names(&listing), Vec::<String>::new());
+        assert_eq!(
+            listed_names(&list(&repo, &[]).await.unwrap()),
+            oracle(&repo, &[]).await
+        );
+        assert!(RefSelector::parse(["odd~1"]).is_err());
+    });
+}
+
+/// Entries that overlap, repeat, or come in another order give one entry for
+/// each ref and the same bytes. Two builds of one state give the same bytes.
+#[test]
+fn a_ref_listing_of_overlapping_patterns_is_deterministic() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-overlap");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        add_prefix_refs(&repo).await;
+        let one = list(&repo, &["a/**"]).await.unwrap();
+        for entries in [
+            &["a/**", "a/*", "a/b", "a/c/d", "a/**"][..],
+            &["a/c/d", "a/b", "a/bc", "a/**", "a/*/d"][..],
+            &["**", "!ab", "!main", "!other", "!x/**"][..],
+            &["!ab", "!x/**", "!main", "!other"][..],
+        ] {
+            let listing = list(&repo, entries).await.unwrap();
+            assert_eq!(listing, one, "{entries:?}");
+            assert_eq!(list(&repo, entries).await.unwrap(), listing);
+        }
+        let parsed = Summary::parse(&one).unwrap();
+        let names: Vec<&str> = parsed.refs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["a/b", "a/bc", "a/c/d"]);
     });
 }
 
@@ -926,8 +1041,8 @@ fn a_ref_listing_entry_has_the_bytes_of_the_summary_entry() {
         let repo = Repo::open(&repo_dir).await.unwrap();
         add_prefix_refs(&repo).await;
         let summary = regenerate_with(&repo, Vec::new()).await;
-        for prefixes in [&[][..], &["a"][..], &["x", "other"][..]] {
-            let listing = repo.build_ref_listing(prefixes).await.unwrap();
+        for prefixes in [&[][..], &["a/**"][..], &["x/**", "other"][..]] {
+            let listing = list(&repo, prefixes).await.unwrap();
             assert_normal_form(&listing);
             let parsed = Summary::parse(&listing).unwrap();
             assert!(!parsed.refs.is_empty(), "{prefixes:?}");
@@ -952,7 +1067,7 @@ fn a_ref_listing_advertises_the_indexed_deltas_of_its_commits() {
     let (_tmp, repo_dir) = writable_fixture("summary", "listing-deltas");
     block_on(async {
         let repo = Repo::open(&repo_dir).await.unwrap();
-        let listing = repo.build_ref_listing(&[]).await.unwrap();
+        let listing = list(&repo, &[]).await.unwrap();
         let parsed = Summary::parse(&listing).unwrap();
         assert_eq!(metadata_keys(&parsed), ["ostree.summary.mode"]);
         assert_eq!(
@@ -970,7 +1085,7 @@ fn a_ref_listing_advertises_the_indexed_deltas_of_its_commits() {
             repo.generate_static_delta(from, to, &opts).await.unwrap();
         }
         // The deltas have no index file yet, so the listing names none.
-        let listing = repo.build_ref_listing(&[]).await.unwrap();
+        let listing = list(&repo, &[]).await.unwrap();
         assert_eq!(
             metadata_keys(&Summary::parse(&listing).unwrap()),
             ["ostree.summary.mode"]
@@ -978,8 +1093,8 @@ fn a_ref_listing_advertises_the_indexed_deltas_of_its_commits() {
 
         repo.reindex_static_deltas().await.unwrap();
         let summary = regenerate_with(&repo, Vec::new()).await;
-        let listing = repo.build_ref_listing(&[]).await.unwrap();
-        assert_eq!(listing, repo.build_ref_listing(&[]).await.unwrap());
+        let listing = list(&repo, &[]).await.unwrap();
+        assert_eq!(listing, list(&repo, &[]).await.unwrap());
         assert_normal_form(&listing);
         let parsed = Summary::parse(&listing).unwrap();
         assert_eq!(
@@ -994,20 +1109,20 @@ fn a_ref_listing_advertises_the_indexed_deltas_of_its_commits() {
         assert_eq!(parsed.static_deltas().unwrap().len(), 3);
 
         // `main` reaches the delta to `other` through its delta from `other`.
-        let listing = repo.build_ref_listing(&["main"]).await.unwrap();
+        let listing = list(&repo, &["main"]).await.unwrap();
         assert_eq!(
             Summary::parse(&listing).unwrap().static_deltas().unwrap(),
             summary.static_deltas().unwrap()
         );
 
         // `other` reaches its own delta alone.
-        let listing = repo.build_ref_listing(&["other"]).await.unwrap();
+        let listing = list(&repo, &["other"]).await.unwrap();
         let deltas = Summary::parse(&listing).unwrap().static_deltas().unwrap();
         assert_eq!(deltas.len(), 1);
         assert_eq!((deltas[0].from, deltas[0].to), (None, other));
 
         // No listed commit gives no delta map.
-        let listing = repo.build_ref_listing(&["absent"]).await.unwrap();
+        let listing = list(&repo, &["absent"]).await.unwrap();
         assert_eq!(
             metadata_keys(&Summary::parse(&listing).unwrap()),
             ["ostree.summary.mode"]
@@ -1034,7 +1149,7 @@ fn a_ref_listing_names_the_collection_and_no_mirror_ref() {
         assert_eq!(summary.collection_map().unwrap().len(), 1);
 
         let guard = repo.begin_update().await.unwrap();
-        let listing = repo.build_ref_listing(&[]).await.unwrap();
+        let listing = list(&repo, &[]).await.unwrap();
         guard.finish().await.unwrap();
         let parsed = Summary::parse(&listing).unwrap();
         assert_eq!(
@@ -1049,50 +1164,136 @@ fn a_ref_listing_names_the_collection_and_no_mirror_ref() {
     });
 }
 
-/// A prefix that is not a ref name is refused, alone and next to a valid
-/// prefix. The refusal comes before each read: a repository with a ref file
-/// that holds no checksum and a ref that names a missing commit gives the
-/// same refusal.
+/// The walk reads no ref outside the subtrees that the patterns can match,
+/// and no ref that a negative entry removes. A ref file with no checksum, and
+/// a ref that names a missing commit, fail only a listing that selects them.
 #[test]
-fn a_ref_listing_refuses_a_bad_prefix() {
-    let (_tmp, repo_dir) = writable_fixture("summary", "listing-bad-prefix");
+fn a_ref_listing_reads_only_the_refs_that_it_selects() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-bad-refs");
     block_on(async {
         let repo = Repo::open(&repo_dir).await.unwrap();
-        let bad_prefixes = [
-            "", "/", "/a", "a/", "a//b", ".", "..", "a/./b", "a/../b", "a\0b", "a b", "-a", "a*",
-            "a/.b", "a!",
-        ];
-        for bad in bad_prefixes {
-            for prefixes in [&[bad][..], &["main", bad][..]] {
-                let outcome = repo.build_ref_listing(prefixes).await;
-                assert!(
-                    matches!(outcome, Err(ostrya::Error::InvalidRefspec(_))),
-                    "{prefixes:?}: {outcome:?}"
-                );
-            }
-        }
-
+        add_prefix_refs(&repo).await;
         let missing = Checksum::from_bytes([7; 32]);
         repo.set_ref_immediate("broken", Some(&missing))
             .await
             .unwrap();
-        std::fs::write(repo_dir.join("refs/heads/garbage"), "no checksum\n").unwrap();
-        assert!(matches!(
-            repo.build_ref_listing(&[]).await,
-            Err(ostrya::Error::Core(_))
-        ));
-        assert!(matches!(
-            repo.build_ref_listing(&["broken"]).await,
-            Err(ostrya::Error::ObjectNotFound { .. })
-        ));
-        for bad in bad_prefixes {
-            for prefixes in [&[bad][..], &["broken", bad][..], &[bad, "garbage"][..]] {
-                let outcome = repo.build_ref_listing(prefixes).await;
-                assert!(
-                    matches!(outcome, Err(ostrya::Error::InvalidRefspec(_))),
-                    "{prefixes:?}: {outcome:?}"
-                );
-            }
+        let heads = repo_dir.join("refs/heads");
+        std::fs::write(heads.join("garbage"), "no checksum\n").unwrap();
+        std::fs::write(heads.join("a/c/bad"), "no checksum\n").unwrap();
+
+        // A listing that selects a bad ref fails. A ref file with no
+        // checksum is `Core`, and a ref with a missing commit fails later.
+        for entries in [
+            &[][..],
+            &["*"][..],
+            &["**"][..],
+            &["garbage"][..],
+            &["garbage", "main"][..],
+            &["a/**"][..],
+            &["a/c/*"][..],
+            &["a/c/bad"][..],
+            &["a/**/bad"][..],
+            &["!main"][..],
+            &["**", "!a/b"][..],
+        ] {
+            let outcome = list(&repo, entries).await;
+            assert!(
+                matches!(outcome, Err(ostrya::Error::Core(_))),
+                "{entries:?}: {outcome:?}"
+            );
+        }
+        let outcome = list(&repo, &["broken"]).await;
+        assert!(
+            matches!(outcome, Err(ostrya::Error::ObjectNotFound { .. })),
+            "{outcome:?}"
+        );
+
+        // A listing that selects no bad ref succeeds. The bad file at the
+        // top is not read by a pattern with a literal or wildcard first
+        // part and more parts after it, and the bad file below `a/c` is not
+        // read by a pattern that stops above it or names another ref.
+        for (entries, want) in [
+            (&["*/y"][..], vec!["x/y"]),
+            (&["*/*"][..], vec!["a/b", "a/bc", "x/al", "x/y"]),
+            (&["a/*"][..], vec!["a/b", "a/bc"]),
+            (&["a/b", "a/c/d"][..], vec!["a/b", "a/c/d"]),
+            (&["a/*/d"][..], vec!["a/c/d"]),
+            (&["x/**", "main"][..], vec!["main", "x/al", "x/y"]),
+            (&["main"][..], vec!["main"]),
+            (
+                &["!garbage", "!broken", "!a/c/bad"][..],
+                vec!["a/b", "a/bc", "a/c/d", "ab", "main", "other", "x/al", "x/y"],
+            ),
+            (
+                &["**", "!garbage", "!broken", "!a/c/bad"][..],
+                vec!["a/b", "a/bc", "a/c/d", "ab", "main", "other", "x/al", "x/y"],
+            ),
+            (&["a/**", "!a/c/*"][..], vec!["a/b", "a/bc"]),
+            (&["a/**", "!a/**/bad"][..], vec!["a/b", "a/bc", "a/c/d"]),
+        ] {
+            let listing = list(&repo, entries).await.unwrap();
+            assert_eq!(listed_names(&listing), want, "{entries:?}");
         }
     });
+}
+
+/// The walk does not read a directory that a negative entry covers. A
+/// directory with mode 0 fails a listing that reads it and not a listing
+/// that skips it. The test returns at once for a user that ignores the mode.
+#[test]
+fn a_ref_listing_skips_a_directory_that_a_negative_entry_covers() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-skip-dir");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        add_prefix_refs(&repo).await;
+        let locked = repo_dir.join("refs/heads/a/c");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let restore = || {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        if std::fs::read_dir(&locked).is_ok() {
+            restore();
+            return;
+        }
+        for entries in [&["a/**"][..], &["**"][..], &["a/*/d"][..], &[][..]] {
+            assert!(list(&repo, entries).await.is_err(), "{entries:?}");
+        }
+        for (entries, want) in [
+            (&["a/**", "!a/c/**"][..], vec!["a/b", "a/bc"]),
+            (&["a/**", "!a/*/**"][..], vec!["a/b", "a/bc"]),
+            (&["a/**", "!**"][..], vec![]),
+            (
+                &["**", "!a/c/**"][..],
+                vec!["a/b", "a/bc", "ab", "main", "other", "x/al", "x/y"],
+            ),
+            (
+                &["!a/c/**"][..],
+                vec!["a/b", "a/bc", "ab", "main", "other", "x/al", "x/y"],
+            ),
+        ] {
+            let listing = list(&repo, entries).await.unwrap();
+            assert_eq!(listed_names(&listing), want, "{entries:?}");
+        }
+        restore();
+    });
+}
+
+/// An entry that `RefSelector::parse` refuses never reaches a listing. The
+/// parse comes before each read, so a repository with a bad ref gives the
+/// same refusal.
+#[test]
+fn a_bad_entry_is_refused_by_the_parser() {
+    for bad in [
+        "", "/", "/a", "a/", "a//b", ".", "..", "a/./b", "a/../b", "a\0b", "a b", "-a", "a*",
+        "a/.b", "a!", "!!a", "!", "!/a", "**x", "x**", "***", "a/b*c", "~a",
+    ] {
+        for entries in [&[bad][..], &["main", bad][..], &["!main", bad][..]] {
+            let outcome = RefSelector::parse(entries.iter().copied());
+            assert!(
+                matches!(outcome, Err(ostrya_core::Error::InvalidRefPattern(_))),
+                "{entries:?}: {outcome:?}"
+            );
+        }
+    }
 }

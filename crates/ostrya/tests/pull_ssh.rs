@@ -24,6 +24,7 @@ use common::TmpDir;
 use common::pipe::{PipeReader, pipe};
 use futures_lite::future;
 use futures_lite::io::AsyncRead;
+use ostrya::RefSelector;
 use ostrya::endpoint::{EndpointOverrides, resolve_pull};
 use ostrya::remote::proto::{FrameReader, Message};
 use ostrya::remote::{PullSession, StreamSessionOptions};
@@ -744,7 +745,7 @@ fn a_pull_session_fetches_the_summary_over_a_stream() {
 }
 
 /// `PullSession::fetch_refs` over a stream returns the listing that
-/// `Repo::build_ref_listing` builds on the server, for a prefix and for an
+/// `Repo::build_ref_listing` builds on the server, for a name and for an
 /// empty list. The session ends with `Ok`.
 #[test]
 fn a_pull_session_fetches_the_ref_listing_over_a_stream() {
@@ -752,8 +753,14 @@ fn a_pull_session_fetches_the_ref_listing_over_a_stream() {
         let dir = TmpDir::new("pull-ssh-session-fetch-refs");
         let (remote, _commit) = build_remote(dir.path()).await;
         let expected = [
-            remote.build_ref_listing(&["test"]).await.unwrap(),
-            remote.build_ref_listing(&[]).await.unwrap(),
+            remote
+                .build_ref_listing(&RefSelector::parse(["test/main"]).unwrap())
+                .await
+                .unwrap(),
+            remote
+                .build_ref_listing(&RefSelector::parse([]).unwrap())
+                .await
+                .unwrap(),
         ];
         let (to_server, server_in) = pipe(PIPE_CAP);
         let (server_out, from_server) = pipe(PIPE_CAP);
@@ -769,7 +776,7 @@ fn a_pull_session_fetches_the_ref_listing_over_a_stream() {
                     .await
                     .unwrap();
                     let fetched = [
-                        session.fetch_refs(&["test"]).await.unwrap(),
+                        session.fetch_refs(&["test/main"]).await.unwrap(),
                         session.fetch_refs(&[]).await.unwrap(),
                     ];
                     session.finish().await.unwrap();
@@ -862,7 +869,7 @@ fn a_chain_from_the_ref_listing_is_pulled_over_a_stream() {
                     )
                     .await
                     .unwrap();
-                    let listing = session.fetch_refs(&["test"]).await.unwrap().unwrap();
+                    let listing = session.fetch_refs(&["test/main"]).await.unwrap().unwrap();
                     let deltas = ostrya::Summary::parse(&listing)
                         .unwrap()
                         .static_deltas()

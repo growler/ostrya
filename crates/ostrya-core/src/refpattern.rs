@@ -119,8 +119,12 @@ impl RefPattern {
     ///
     /// The name is not checked against the ref-name rule.
     pub fn matches(&self, name: &str) -> bool {
-        let name: Vec<&str> = name.split('/').collect();
-        match_parts(&self.parts, &name, &mut 0)
+        if self.parts.contains(&Part::Many) {
+            let name: Vec<&str> = name.split('/').collect();
+            match_parts(&self.parts, &name, &mut 0)
+        } else {
+            match_flat(&self.parts, name)
+        }
     }
 }
 
@@ -179,6 +183,29 @@ fn match_parts(parts: &[Part], name: &[&str], steps: &mut usize) -> bool {
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[n]
+}
+
+/// Matches `name` against `parts`, which hold no `**`. Each part covers
+/// exactly one name part, so the match compares the parts in order and needs
+/// no table.
+fn match_flat(parts: &[Part], name: &str) -> bool {
+    let mut name = name.split('/');
+    for part in parts {
+        let Some(piece) = name.next() else {
+            return false;
+        };
+        let ok = match part {
+            Part::Literal(literal) => piece == literal,
+            Part::One => true,
+            // The caller passes no `**`. The part would need more than one
+            // name part.
+            Part::Many => return false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    name.next().is_none()
 }
 
 /// A list of positive and negative [`RefPattern`]s.
@@ -245,6 +272,29 @@ mod tests {
 
     fn pat(p: &str) -> RefPattern {
         RefPattern::parse(p).unwrap()
+    }
+
+    /// The match with no table agrees with the table on patterns with no
+    /// `**`.
+    #[test]
+    fn the_flat_match_agrees_with_the_table() {
+        let patterns = ["a", "a/b", "*", "*/*", "a/*", "*/b", "a/*/c", "a/b/c"];
+        let names = [
+            "a", "b", "a/b", "a/c", "b/b", "a/b/c", "a/x/c", "a/b/c/d", "x/a/b", "a/b/d",
+        ];
+        for p in patterns {
+            let pattern = pat(p);
+            let parts: Vec<Part> = pattern.parts.clone();
+            for n in names {
+                let split: Vec<&str> = n.split('/').collect();
+                assert_eq!(
+                    match_flat(&parts, n),
+                    match_parts(&parts, &split, &mut 0),
+                    "{p} {n}"
+                );
+                assert_eq!(pattern.matches(n), match_flat(&parts, n), "{p} {n}");
+            }
+        }
     }
 
     #[test]

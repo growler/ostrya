@@ -671,14 +671,14 @@ fn the_filter_removes_its_keys_from_the_incoming_dict() {
     assert_eq!(keys, vec!["kept"]);
 }
 
-/// Under a rule for `origin:*`, an update of `origin:test/main` writes
+/// Under a rule for `origin:**`, an update of `origin:test/main` writes
 /// `refs/remotes/origin/test/main`, and the binding check compares
 /// `test/main`.
 #[test]
 fn a_remote_rule_writes_refs_remotes_and_binds_the_name() {
     let tmp = TmpDir::new("recv-remote");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let policy = policy_with("origin:*", ReceiveRule::default());
+    let policy = policy_with("origin:**", ReceiveRule::default());
     let before = snapshot(&repo);
     let error = refused(
         push(
@@ -828,7 +828,7 @@ fn a_write_to_a_checksum_shaped_name_is_invalid_ref_at_commit() {
     refused(
         push(
             &repo,
-            &policy_with("origin:*", ReceiveRule::default()),
+            &policy_with("origin:**", ReceiveRule::default()),
             &fixture_objects(Encoding::Raw),
             &[],
             vec![update(&remote, Expected::Absent, Some(fixture_commit()))],
@@ -1106,7 +1106,7 @@ fn ref_denied_covers_each_refused_ref() {
         ..ReceiveRule::default()
     };
     let cases: Vec<(&str, ReceivePolicy, &str, &str)> = vec![
-        ("", policy_with("test/*", denied), "test/main", "refuses"),
+        ("", policy_with("test/**", denied), "test/main", "refuses"),
         ("", policy(), "origin:test/main", "no rule"),
         (
             "collection-id=org.example.C\n",

@@ -154,7 +154,7 @@ fn each_rule_boolean_reaches_its_own_field() {
                 continue;
             }
             let groups =
-                format!("[ex-ostrya receive]\n{key}={value}\n[ex-ostrya receive \"apps/*\"]\n");
+                format!("[ex-ostrya receive]\n{key}={value}\n[ex-ostrya receive \"apps/**\"]\n");
             let policy = policy(&groups).unwrap();
             let (_, pattern_rule) = &policy.rules[0];
             for (other, default, read) in &fields {
@@ -254,15 +254,16 @@ fn detached_metadata_exclude_gives_the_filter() {
 fn the_pattern_groups_become_rules() {
     let policy = policy(
         "[ex-ostrya receive]\naccept=false\n\
-         [ex-ostrya receive \"apps/*\"]\nallow-delete=true\n\
-         [ex-ostrya receive \"central:*\"]\n\
+         [ex-ostrya receive \"apps/**\"]\nallow-delete=true\n\
+         [ex-ostrya receive \"central:**\"]\n\
          [ex-ostrya receive \"*:apps/x\"]\n",
     )
     .unwrap();
     let patterns: Vec<&str> = policy.rules.iter().map(|(p, _)| p.as_str()).collect();
-    assert_eq!(patterns, ["apps/*", "central:*", "*:apps/x"]);
+    assert_eq!(patterns, ["apps/**", "central:**", "*:apps/x"]);
     assert!(!policy.rule_for("main").unwrap().accept);
     assert!(policy.rule_for("apps/a").unwrap().allow_delete);
+    assert!(policy.rule_for("apps/a/b").unwrap().allow_delete);
     let central = policy.rule_for("central:apps/x").unwrap();
     assert!(std::ptr::eq(central, &policy.rules[1].1));
     let other = policy.rule_for("other:apps/x").unwrap();
@@ -275,7 +276,7 @@ fn the_pattern_groups_become_rules() {
 fn a_hand_built_policy_selects_its_rules() {
     let policy = ReceivePolicy {
         rules: vec![(
-            ReceivePattern::parse("*:*").unwrap(),
+            ReceivePattern::parse("*:**").unwrap(),
             ReceiveRule {
                 allow_delete: true,
                 ..ReceiveRule::default()
@@ -284,6 +285,7 @@ fn a_hand_built_policy_selects_its_rules() {
         ..ReceivePolicy::default()
     };
     assert!(policy.rule_for("origin:x").unwrap().allow_delete);
+    assert!(policy.rule_for("origin:a/b").unwrap().allow_delete);
     assert!(!policy.rule_for("x").unwrap().allow_delete);
 }
 
@@ -291,7 +293,8 @@ fn a_hand_built_policy_selects_its_rules() {
 #[test]
 fn a_malformed_pattern_is_refused() {
     for pattern in [
-        "*", "**", "a*", "*/x", "a/*/b", "/*", "a//*", ":x", "r:", "r/x:y", "..", "a/./b",
+        "a*", "/*", "a//*", ":x", "r:", "r/x:y", "..", "a/./b", "!a", "!*:x", "r:!a", "a/b*",
+        "a/**x", "***", "a/*b", "*:a*", "r:a:b", "**:x", "*/", "a//**",
     ] {
         assert_malformed(
             &format!("[ex-ostrya receive \"{pattern}\"]\n"),
@@ -856,7 +859,7 @@ fn the_rules_share_what_the_groups_build() {
         "",
         &format!(
             "[ex-ostrya receive]\nsign=k;k\nsign-summary=k\nverify=trust:t\n\
-             [ex-ostrya receive \"apps/*\"]\nsign=k\nverify=trust:t\n{}{}",
+             [ex-ostrya receive \"apps/**\"]\nsign=k\nverify=trust:t\n{}{}",
             key_group("k", &file),
             trust_t()
         ),
@@ -900,7 +903,7 @@ fn a_policy_file_resolves_remotes_in_itself() {
         "[remote \"central\"]\nurl=http://localhost/\ngpg-verify=false\n\
          sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"
     );
-    let rule = "[ex-ostrya receive \"central:*\"]\nverify=remote:central\n";
+    let rule = "[ex-ostrya receive \"central:**\"]\nverify=remote:central\n";
     let dir = TmpDir::new("receive-file-remote");
     let policy = file_policy(dir.path(), "", &format!("{rule}{remote}")).unwrap();
     assert!(keys(&policy.rules[0].1).is_some());
@@ -987,8 +990,8 @@ fn the_tool_tolerates_the_receive_groups() {
     let mut config = std::fs::read_to_string(repo.join("config")).unwrap();
     config.push_str(&format!(
         "\n[ex-ostrya receive]\naccept=false\nsign-summary=central-ed\n\
-         [ex-ostrya receive \"apps/*\"]\nverify=trust:release\nsign=central-ed\n\
-         [ex-ostrya receive \"central:*\"]\nverify=remote:central\n\
+         [ex-ostrya receive \"apps/**\"]\nverify=trust:release\nsign=central-ed\n\
+         [ex-ostrya receive \"central:**\"]\nverify=remote:central\n\
          [ex-ostrya receive \"*:apps/x.y\"]\nallow-delete=true\n\
          [ex-ostrya trust \"release\"]\nsign-verify=ed25519\n\
          verification-ed25519-key={PUBLIC_B64}\n\
@@ -1009,6 +1012,47 @@ fn the_tool_tolerates_the_receive_groups() {
         );
     }
     assert!(repo.join("summary").exists());
+}
+
+/// The tool keeps a receive group with a `**` name verbatim in the config and
+/// still runs its commands. The policy reads the group as the pattern.
+#[test]
+fn the_tool_keeps_a_double_star_group_verbatim() {
+    if !common::ostree_available() {
+        eprintln!("skipping: ostree not available");
+        return;
+    }
+    let dir = TmpDir::new("receive-tool-verbatim");
+    let repo = dir.path().join("repo");
+    let ostree = |args: &[&str]| {
+        std::process::Command::new("ostree")
+            .arg(format!("--repo={}", repo.display()))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let out = ostree(&["init", "--mode=archive"]);
+    assert!(out.status.success(), "{out:?}");
+    let out = ostree(&[
+        "config",
+        "set",
+        "ex-ostrya receive \"apps/**\".allow-delete",
+        "true",
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let config = std::fs::read_to_string(repo.join("config")).unwrap();
+    assert!(
+        config.contains("[ex-ostrya receive \"apps/**\"]\nallow-delete=true\n"),
+        "{config}"
+    );
+    for args in [&["refs"][..], &["fsck"], &["summary", "-u"]] {
+        let out = ostree(args);
+        assert!(out.status.success(), "ostree {args:?}: {out:?}");
+    }
+    let repo = block_on(Repo::open(&repo)).unwrap();
+    let policy = block_on(ReceivePolicy::from_config(&repo)).unwrap();
+    assert_eq!(policy.rules[0].0.as_str(), "apps/**");
+    assert!(policy.rule_for("apps/a/b").unwrap().allow_delete);
 }
 
 /// The policy moves across tasks and threads.

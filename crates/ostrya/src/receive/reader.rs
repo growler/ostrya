@@ -730,8 +730,8 @@ mod tests {
             Some(Group::Default)
         ));
         assert!(matches!(
-            classify("ex-ostrya receive \"a/*\"").unwrap(),
-            Some(Group::Rule("a/*"))
+            classify("ex-ostrya receive \"a/**\"").unwrap(),
+            Some(Group::Rule("a/**"))
         ));
         assert!(matches!(
             classify("ex-ostrya trust \"t\"").unwrap(),

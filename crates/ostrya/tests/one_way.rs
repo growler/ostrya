@@ -85,7 +85,7 @@ fn policy() -> ReceivePolicy {
     };
     ReceivePolicy {
         default_rule: rule.clone(),
-        rules: vec![(ReceivePattern::parse("*:*").unwrap(), rule)],
+        rules: vec![(ReceivePattern::parse("*:**").unwrap(), rule)],
         summary_signers: vec![signer],
         update_summary: true,
         ..ReceivePolicy::default()
@@ -904,7 +904,7 @@ mod export {
     fn export_policy() -> ReceivePolicy {
         ReceivePolicy {
             rules: vec![(
-                ReceivePattern::parse("*:*").unwrap(),
+                ReceivePattern::parse("*:**").unwrap(),
                 ReceiveRule::default(),
             )],
             allow_privileged: true,

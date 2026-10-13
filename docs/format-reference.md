@@ -1821,25 +1821,33 @@ itself. `ex-ostrya receive`, `ex-ostrya trust "`, and `ex-ostrya key "` are
 literal prefixes with one space between the words. The quoted part ends the
 name, is not empty, and holds no `"` and no control character.
 
-`PATTERN` is one of these forms:
+`PATTERN` has an optional remote part and a name part. The name part is a
+path of parts split at `/`. Each part is a literal, `*`, or `**`. `*` selects
+exactly one part of a name, and `**` selects one or more parts. `*` and `**`
+are valid only as a whole part. `PATTERN` has one of these forms:
 
-- `NAME` -- the plain ref `NAME`.
-- `PREFIX/*` -- every plain ref under `PREFIX/`, at any depth. It does not
-  match `PREFIX`.
-- `REMOTE:NAME`, `REMOTE:PREFIX/*`, and `REMOTE:*` -- the same, and every
-  ref, for the remote refs of the remote `REMOTE`.
-- `*:NAME`, `*:PREFIX/*`, and `*:*` -- the same, for the remote refs of every
-  remote.
+- `NAME` -- the plain refs that the name part `NAME` matches.
+- `REMOTE:NAME` -- the remote refs of the remote `REMOTE` that `NAME`
+  matches.
+- `*:NAME` -- the remote refs of every remote that `NAME` matches.
 
-`NAME` and `PREFIX` are ref names, and `REMOTE` is one component of a ref
-path. Another `*`, and a `*` in another place, are refused. The server selects
-one rule for each ref update:
+For example, `apps/*` selects `apps/web` and does not select `apps` or
+`apps/web/db`. `apps/**` selects `apps/web` and `apps/web/db`, and does not
+select `apps`. `central:**` selects every ref of the remote `central`.
+
+A literal part is a component of a ref name, and `REMOTE` is one component of
+a ref path with no `*`. A `!` at the start of a pattern or in the name part,
+a `*` in another place, an empty part, and a `:` in the name part are
+refused. The server selects one rule for
+each ref update:
 
 1. A remote ref matches only a pattern with a remote part, and a plain ref
    only a pattern without one.
 2. A literal remote part wins over `*:`.
-3. An exact name wins over a prefix, and a longer prefix wins over a shorter
-   one. `REMOTE:*` and `*:*` are prefixes of length zero.
+3. The parts of the name part compare from the left. At the first part where
+   two patterns differ in kind, a literal wins over `*`, and `*` wins over
+   `**`. If one pattern is a leading run of the other, the longer pattern
+   wins. If the kinds of all parts are equal, the first rule in the file wins.
 4. A plain ref that no pattern matches gets the default rule. A remote ref
    that no pattern matches is refused.
 
@@ -1947,18 +1955,18 @@ gc-root-metadata-keys=app.roots;app.other;
 
 Observed with `ostree` 2026.1 against an archive repository with one commit
 on `x` whose `config` holds a group of each receive shape, with patterns that
-hold `/`, `*`, `:`, and `.`. The paths the keys name do not exist:
+hold `/`, `*`, `**`, `:`, and `.`. The paths the keys name do not exist:
 
 ```
 [ex-ostrya receive]
 accept=false
 sign-summary=central-ed
 
-[ex-ostrya receive "apps/*"]
+[ex-ostrya receive "apps/**"]
 verify=trust:release
 sign=central-ed
 
-[ex-ostrya receive "central:*"]
+[ex-ostrya receive "central:**"]
 verify=remote:central
 
 [ex-ostrya receive "*:apps/x.y"]

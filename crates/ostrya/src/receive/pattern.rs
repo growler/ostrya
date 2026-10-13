@@ -1,31 +1,39 @@
 //! The ref patterns of the receive rules.
 
+use ostrya_core::RefPattern;
+
 use crate::error::{Error, Result};
-use crate::refs::{is_component, is_ref_path};
+use crate::refs::is_component;
 
 /// A pattern that names the refs of one receive rule.
 ///
-/// A pattern has one of these forms:
+/// A pattern has an optional remote part and a name part. The name part is a
+/// [`RefPattern`]: a path of parts, split at `/`. Each part is a literal, `*`,
+/// or `**`. `*` selects exactly one part of a name. `**` selects one or more
+/// parts. A pattern has one of these forms:
 ///
-/// - `NAME` -- the plain ref `NAME`.
-/// - `PREFIX/*` -- every plain ref under `PREFIX/`, at any depth. The pattern
-///   does not match `PREFIX` itself.
-/// - `REMOTE:NAME`, `REMOTE:PREFIX/*`, and `REMOTE:*` -- the same, and every
-///   ref, for the remote refs of the remote `REMOTE`.
-/// - `*:NAME`, `*:PREFIX/*`, and `*:*` -- the same, for the remote refs of
-///   every remote.
+/// - `NAME` -- the plain refs that the name pattern `NAME` matches.
+/// - `REMOTE:NAME` -- the remote refs of the remote `REMOTE` that `NAME`
+///   matches.
+/// - `*:NAME` -- the remote refs of every remote that `NAME` matches.
 ///
-/// `NAME` and `PREFIX` are ref names under the ref-name rule. `REMOTE` is one
-/// component of a ref path, under the wider rule of `is_ref_component`.
-/// [`ReceivePattern::parse`] refuses each other form:
+/// For example, `apps/*` selects `apps/web` and does not select `apps` or
+/// `apps/web/db`. `apps/**` selects `apps/web` and `apps/web/db`, and does not
+/// select `apps`. `central:**` selects every ref of the remote `central`.
 ///
-/// - A `*` in another place. This includes `*` alone, with no remote part.
-/// - A second `*`.
-/// - An empty part.
-/// - A `.` or `..` component.
+/// `REMOTE` is one component of a ref path, under the wider rule of
+/// `is_ref_component`, and holds no `*`. [`ReceivePattern::parse`] refuses
+/// each other form:
+///
+/// - A `!` at the start of the pattern or in the name part. A receive pattern
+///   has no negative form. A `!` in a remote part follows the component rule
+///   of the remote part.
+/// - A `*` in a remote part other than the whole part `*`.
+/// - A `*` in a name part other than the whole part `*` or `**`.
+/// - An empty pattern, an empty part, or a `:` in the name part.
 /// - A control character.
-/// - A name or prefix that fails the ref-name rule, for example one with a
-///   space or a component that starts with `-`.
+/// - A literal part that fails the ref-name rule, for example one with a space
+///   or one that starts with `-`.
 ///
 /// If more than one pattern matches a ref,
 /// [`ReceivePolicy::rule_for`](super::ReceivePolicy::rule_for) states which
@@ -37,7 +45,9 @@ pub struct ReceivePattern {
     /// The remote part. It is `None` for a pattern of plain refs.
     remote: Option<RemotePart>,
     /// The name part.
-    name: NamePart,
+    name: RefPattern,
+    /// The kind of each part of the name part, in order.
+    kinds: Vec<Kind>,
 }
 
 /// The remote part of a pattern.
@@ -49,27 +59,27 @@ enum RemotePart {
     Literal(String),
 }
 
-/// The name part of a pattern.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum NamePart {
-    /// One ref name.
-    Exact(String),
-    /// Every ref under a prefix, held with its trailing `/`.
-    Prefix(String),
-    /// `*` after a remote part: every ref.
-    All,
+/// The kind of one part of a name part. A larger value is more specific.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Kind {
+    /// `**`.
+    Many,
+    /// `*`.
+    One,
+    /// A literal.
+    Literal,
 }
 
 /// The strength of the match of a pattern on a ref. A larger value wins.
 ///
-/// The fields compare in order. A literal remote part wins over `*:`. Then an
-/// exact name wins over a prefix. Then a longer prefix wins over a shorter
-/// one. `REMOTE:*` and `*:*` are prefixes of length zero.
+/// The fields compare in order. A literal remote part wins over `*:`. Then the
+/// kinds of the parts of the name part compare from the left: a literal wins
+/// over `*`, and `*` wins over `**`. If one list of kinds is the start of the
+/// other, the longer one wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Specificity {
+pub(crate) struct Specificity<'a> {
     literal_remote: bool,
-    exact: bool,
-    prefix_len: usize,
+    kinds: &'a [Kind],
 }
 
 impl ReceivePattern {
@@ -89,6 +99,9 @@ impl ReceivePattern {
         if pattern.chars().any(char::is_control) {
             return Err(malformed("the pattern holds a control character"));
         }
+        if pattern.starts_with('!') {
+            return Err(malformed("a receive pattern has no '!'"));
+        }
         let (remote, name) = match pattern.split_once(':') {
             Some((remote, name)) => (Some(remote), name),
             None => (None, pattern),
@@ -104,28 +117,28 @@ impl ReceivePattern {
             }
             Some(remote) => Some(RemotePart::Literal(remote.to_owned())),
         };
-        let name = if name == "*" {
-            if remote.is_none() {
-                return Err(malformed(
-                    "'*' alone matches remote refs only; write '*:*' or 'PREFIX/*'",
-                ));
+        let name_text = name;
+        let name = RefPattern::parse(name_text).map_err(|err| match err {
+            ostrya_core::Error::InvalidRefPattern(reason) => {
+                let quoted = format!("{name_text:?}: ");
+                malformed(reason.strip_prefix(&quoted).unwrap_or(&reason))
             }
-            NamePart::All
-        } else if let Some(prefix) = name.strip_suffix("/*") {
-            if prefix.contains('*') || !is_ref_path(prefix) {
-                return Err(malformed("the prefix is not a ref name"));
-            }
-            NamePart::Prefix(format!("{prefix}/"))
-        } else {
-            if name.contains('*') || !is_ref_path(name) {
-                return Err(malformed("the name is not a ref name"));
-            }
-            NamePart::Exact(name.to_owned())
-        };
+            other => malformed(&other.to_string()),
+        })?;
+        let kinds = name
+            .as_str()
+            .split('/')
+            .map(|part| match part {
+                "**" => Kind::Many,
+                "*" => Kind::One,
+                _ => Kind::Literal,
+            })
+            .collect();
         Ok(ReceivePattern {
             text: pattern.to_owned(),
             remote,
             name,
+            kinds,
         })
     }
 
@@ -140,25 +153,19 @@ impl ReceivePattern {
     /// `remote` is `None` for a plain ref. The result is `None` if the pattern
     /// does not match. A pattern with a remote part matches only remote refs.
     /// A pattern with no remote part matches only plain refs.
-    pub(crate) fn specificity(&self, remote: Option<&str>, name: &str) -> Option<Specificity> {
+    pub(crate) fn specificity(&self, remote: Option<&str>, name: &str) -> Option<Specificity<'_>> {
         let literal_remote = match (&self.remote, remote) {
             (None, None) => false,
             (Some(RemotePart::Any), Some(_)) => false,
             (Some(RemotePart::Literal(want)), Some(remote)) if want == remote => true,
             _ => return None,
         };
-        let (exact, prefix_len) = match &self.name {
-            NamePart::Exact(want) if want == name => (true, 0),
-            NamePart::Prefix(prefix) if name.len() > prefix.len() && name.starts_with(prefix) => {
-                (false, prefix.len())
-            }
-            NamePart::All => (false, 0),
-            _ => return None,
-        };
+        if !self.name.matches(name) {
+            return None;
+        }
         Some(Specificity {
             literal_remote,
-            exact,
-            prefix_len,
+            kinds: &self.kinds,
         })
     }
 }
@@ -181,13 +188,22 @@ mod tests {
             "main",
             "apps/x",
             "apps/*",
-            "a/b/*",
+            "apps/**",
+            "a/b/**",
+            "a/*/b",
+            "*/x",
+            "a/**/b",
+            "*",
+            "**",
             "origin:main",
-            "origin:apps/*",
+            "origin:apps/**",
             "origin:*",
+            "origin:**",
             "*:main",
             "*:apps/*",
             "*:*",
+            "*:**",
+            "r!:a",
         ] {
             let parsed = ReceivePattern::parse(pattern).unwrap();
             assert_eq!(parsed.as_str(), pattern);
@@ -199,13 +215,15 @@ mod tests {
     fn the_other_forms_are_refused() {
         for pattern in [
             "",
-            "*",
-            "**",
+            "!a",
+            "!*:x",
+            "r:!a",
             "a*",
             "*a",
-            "*/x",
-            "a/*/b",
-            "a/**",
+            "***",
+            "*/",
+            "a//**",
+            "a/**x",
             "/*",
             "a//*",
             "a/",
@@ -225,7 +243,6 @@ mod tests {
             "a\nb",
             "r:a\u{7f}",
             "a/*b",
-            "*:**",
             "*:a*",
             "r:a:b",
             "a b/*",
@@ -241,17 +258,24 @@ mod tests {
         }
     }
 
-    /// A prefix matches the refs under it at any depth. It does not match the
-    /// prefix itself or a name whose component is longer.
+    /// `*` selects one part and `**` selects one or more parts.
     #[test]
-    fn a_prefix_matches_below_it() {
+    fn the_wildcards_select_parts() {
         assert!(matches("a/*", None, "a/b"));
-        assert!(matches("a/*", None, "a/b/c"));
+        assert!(!matches("a/*", None, "a/b/c"));
         assert!(!matches("a/*", None, "a"));
-        assert!(!matches("a/*", None, "ab/c"));
-        assert!(!matches("a/*", None, "b/a/c"));
+        assert!(matches("a/**", None, "a/b"));
+        assert!(matches("a/**", None, "a/b/c"));
+        assert!(!matches("a/**", None, "a"));
+        assert!(!matches("a/**", None, "ab/c"));
+        assert!(!matches("a/**", None, "b/a/c"));
+        assert!(matches("a/*/c", None, "a/b/c"));
+        assert!(!matches("a/*/c", None, "a/b/d/c"));
         assert!(matches("main", None, "main"));
         assert!(!matches("main", None, "main2"));
+        assert!(matches("**", None, "a/b"));
+        assert!(matches("*", None, "a"));
+        assert!(!matches("*", None, "a/b"));
     }
 
     /// A plain pattern never matches a remote ref, and a remote pattern never
@@ -259,12 +283,13 @@ mod tests {
     #[test]
     fn the_remote_part_separates_the_two_kinds() {
         assert!(!matches("main", Some("origin"), "main"));
-        assert!(!matches("a/*", Some("origin"), "a/b"));
+        assert!(!matches("a/**", Some("origin"), "a/b"));
         assert!(!matches("origin:main", None, "main"));
-        assert!(!matches("*:*", None, "main"));
-        assert!(matches("*:*", Some("origin"), "main"));
-        assert!(matches("origin:*", Some("origin"), "a/b"));
-        assert!(!matches("origin:*", Some("other"), "a/b"));
-        assert!(!matches("origin:*", Some("origin2"), "a"));
+        assert!(!matches("*:**", None, "main"));
+        assert!(matches("*:**", Some("origin"), "main"));
+        assert!(matches("origin:**", Some("origin"), "a/b"));
+        assert!(!matches("origin:**", Some("other"), "a/b"));
+        assert!(!matches("origin:**", Some("origin2"), "a"));
+        assert!(!matches("origin:*", Some("origin"), "a/b"));
     }
 }

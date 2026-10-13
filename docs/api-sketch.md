@@ -2986,8 +2986,9 @@ pub struct ReceiveRule {
     pub signers: Vec<Arc<ServerSigner>>,
 }
 
-/// `NAME`, `PREFIX/*`, and either one after `REMOTE:` or `*:`, and
-/// `REMOTE:*` and `*:*`.
+/// A name pattern, with an optional `REMOTE:` or `*:` first. Each part of
+/// the name pattern is a literal, `*` for one part, or `**` for one or more
+/// parts. `PREFIX/*` selects one part, and `PREFIX/**` selects any depth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceivePattern { /* private */ }
 impl ReceivePattern {
@@ -3005,7 +3006,10 @@ pub enum ReceiveVerify {
 impl ReceivePolicy {
     pub async fn from_config(repo: &Repo) -> Result<ReceivePolicy>;
     pub async fn from_file(repo: &Repo, path: &Path) -> Result<ReceivePolicy>;
-    /// The rule of `NAME` or `REMOTE:NAME`; `None` refuses the update.
+    /// The rule of `NAME` or `REMOTE:NAME`; `None` refuses the update. The
+    /// most specific matching pattern wins: a literal remote, then the
+    /// leftmost part by kind (literal, `*`, `**`), then the longer pattern.
+    /// On a tie, the first rule wins.
     pub fn rule_for(&self, refspec: &str) -> Option<&ReceiveRule>;
 }
 

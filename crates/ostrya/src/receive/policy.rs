@@ -255,13 +255,22 @@ impl ReceivePolicy {
     /// call selects in this order:
     ///
     /// 1. A literal remote part wins over `*:`.
-    /// 2. An exact name wins over a prefix.
-    /// 3. A longer prefix wins over a shorter one.
+    /// 2. The parts of the name pattern compare from the left. At the first
+    ///    part where the two patterns differ in kind, a literal wins over `*`,
+    ///    and `*` wins over `**`.
+    /// 3. If one pattern is a leading run of the other, the longer pattern
+    ///    wins.
+    ///
+    /// For example, `a/b` wins over `a/*`, `a/*` wins over `a/**`, and
+    /// `a/b/**` wins over `a/**`. For the ref `a/b/c`, `a/*/c` wins over
+    /// `*/b/c`, because the first part decides.
     ///
     /// If two entries of [`rules`](ReceivePolicy::rules) tie, the first one
-    /// wins. Only a repeated pattern can cause a tie. A plain ref that no
-    /// pattern matches gets [`default_rule`](ReceivePolicy::default_rule). A
-    /// remote ref that no pattern matches gets `None`.
+    /// wins. Two patterns tie if they differ only in the text of their
+    /// literal parts, for example `**/x/**` and `**/y/**` on the ref
+    /// `p/x/y/q`. A plain ref that no pattern matches gets
+    /// [`default_rule`](ReceivePolicy::default_rule). A remote ref that no
+    /// pattern matches gets `None`.
     pub fn rule_for(&self, refspec: &str) -> Option<&ReceiveRule> {
         let (remote, name) = match refspec.split_once(':') {
             Some((remote, name)) => (Some(remote), name),
@@ -321,39 +330,69 @@ mod tests {
     /// plain one.
     #[test]
     fn the_remote_part_decides_first() {
-        let policy = policy(&["main", "*:*"]);
+        let policy = policy(&["main", "*:**"]);
         assert_eq!(selected(&policy, "main"), Some("main"));
-        assert_eq!(selected(&policy, "origin:main"), Some("*:*"));
+        assert_eq!(selected(&policy, "origin:main"), Some("*:**"));
         assert_eq!(selected(&policy, "other"), Some(""));
     }
 
     /// A literal remote part wins over `*:`, before the name is compared.
     #[test]
     fn a_literal_remote_wins_over_any_remote() {
-        let policy = policy(&["*:apps/x", "origin:*"]);
-        assert_eq!(selected(&policy, "origin:apps/x"), Some("origin:*"));
+        let policy = policy(&["*:apps/x", "origin:**"]);
+        assert_eq!(selected(&policy, "origin:apps/x"), Some("origin:**"));
         assert_eq!(selected(&policy, "other:apps/x"), Some("*:apps/x"));
         assert_eq!(selected(&policy, "other:apps/y"), None);
+        let policy = self::policy(&["*:a/b", "origin:**"]);
+        assert_eq!(selected(&policy, "origin:a/b"), Some("origin:**"));
+        let policy = self::policy(&["origin:**", "*:a/b"]);
+        assert_eq!(selected(&policy, "origin:a/b"), Some("origin:**"));
     }
 
-    /// An exact name wins over a prefix, and a longer prefix wins over a
-    /// shorter one. The test gives the rules in both orders.
+    /// A literal wins over `*`, and `*` wins over `**`. The test gives the
+    /// rules in both orders.
     #[test]
-    fn an_exact_name_and_a_longer_prefix_win() {
-        for patterns in [
-            ["apps/*", "apps/x/*", "apps/x/main"],
-            ["apps/x/main", "apps/x/*", "apps/*"],
-        ] {
+    fn a_literal_wins_over_one_and_one_over_many() {
+        for patterns in [["a/b", "a/*", "a/**"], ["a/**", "a/*", "a/b"]] {
             let policy = policy(&patterns);
-            assert_eq!(selected(&policy, "apps/x/main"), Some("apps/x/main"));
-            assert_eq!(selected(&policy, "apps/x/other"), Some("apps/x/*"));
-            assert_eq!(selected(&policy, "apps/y"), Some("apps/*"));
-            assert_eq!(selected(&policy, "apps"), Some(""));
+            assert_eq!(selected(&policy, "a/b"), Some("a/b"));
+            assert_eq!(selected(&policy, "a/c"), Some("a/*"));
+            assert_eq!(selected(&policy, "a/c/d"), Some("a/**"));
+            assert_eq!(selected(&policy, "a"), Some(""));
         }
-        let policy = policy(&["origin:*", "origin:a/*", "origin:a/b"]);
+        let policy = policy(&["origin:**", "origin:a/**", "origin:a/b"]);
         assert_eq!(selected(&policy, "origin:a/b"), Some("origin:a/b"));
-        assert_eq!(selected(&policy, "origin:a/c"), Some("origin:a/*"));
-        assert_eq!(selected(&policy, "origin:b"), Some("origin:*"));
+        assert_eq!(selected(&policy, "origin:a/c"), Some("origin:a/**"));
+        assert_eq!(selected(&policy, "origin:b"), Some("origin:**"));
+    }
+
+    /// A longer pattern wins when the shorter one is its leading run, and the
+    /// leftmost differing part decides otherwise.
+    #[test]
+    fn the_leftmost_part_and_the_length_decide() {
+        for patterns in [["a/**", "a/b/**"], ["a/b/**", "a/**"]] {
+            let policy = policy(&patterns);
+            assert_eq!(selected(&policy, "a/b/c"), Some("a/b/**"));
+            assert_eq!(selected(&policy, "a/x/c"), Some("a/**"));
+        }
+        for patterns in [["a/*/c", "*/b/c"], ["*/b/c", "a/*/c"]] {
+            let policy = policy(&patterns);
+            assert_eq!(selected(&policy, "a/b/c"), Some("a/*/c"));
+        }
+        for patterns in [["a/**", "a/**/c"], ["a/**/c", "a/**"]] {
+            let policy = policy(&patterns);
+            assert_eq!(selected(&policy, "a/x/c"), Some("a/**/c"));
+            assert_eq!(selected(&policy, "a/x/d"), Some("a/**"));
+        }
+    }
+
+    /// Two patterns of equal kinds tie, and the first entry wins.
+    #[test]
+    fn a_tie_goes_to_the_first_entry() {
+        for patterns in [["**/x/**", "**/y/**"], ["**/y/**", "**/x/**"]] {
+            let policy = policy(&patterns);
+            assert_eq!(selected(&policy, "p/x/y/q"), Some(patterns[0]));
+        }
     }
 
     /// A plain ref that no pattern matches gets the default rule, and a remote
@@ -363,7 +402,7 @@ mod tests {
         let policy = ReceivePolicy::default();
         assert_eq!(selected(&policy, "main"), Some(""));
         assert_eq!(selected(&policy, "origin:main"), None);
-        let policy = self::policy(&["other:*"]);
+        let policy = self::policy(&["other:**"]);
         assert_eq!(selected(&policy, "origin:main"), None);
     }
 

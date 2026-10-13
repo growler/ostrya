@@ -514,8 +514,8 @@ paragraph states. One optional `:`
 separates a remote name from the ref name, and a second `:` is invalid.
 Recovered by feeding `ostree rev-parse` one candidate name per ASCII
 punctuation character: the tool accepts `a-b`, `a.b`, `a_b`, `a..b`, `a.`,
-`0ab`, and `té`, and rejects each of `! " # $ % & ' ( ) * + , ; < = > ? @ [ \ ]
-^ ` { | } ~` and space in a component, `-a` and `.a` and `~a` and `+a` at the
+`0ab`, and `té`, and rejects each of ``! " # $ % & ' ( ) * + , ; < = > ? @ [ \ ]
+^ ` { | } ~`` and space in a component, `-a` and `.a` and `~a` and `+a` at the
 start of one, an empty component (`a//b`, `/a`, `a/`), and `a:b:c`, each with
 `error: Invalid refspec <name>` and exit 1. The remote follows the rule of a
 component: `o r:main`, `o*:main`, `-o:main`, `.o:main`, and `o~:main` are

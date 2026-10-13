@@ -1671,7 +1671,7 @@ mod cli {
                 ),
                 (vec!["--compress=0"], "--compress"),
                 (vec!["-b", "main"], "named twice"),
-                (vec!["-b", "main^"], "Invalid refspec main^"),
+                (vec!["-b", "main^"], "is not a valid ref name"),
                 (vec!["-b", "origin:main"], "holds ':'"),
                 (vec!["-b", hex.as_str()], "looks like a checksum"),
                 (vec!["--owner-uid=abc"], "Cannot parse integer value"),

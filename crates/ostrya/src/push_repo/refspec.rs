@@ -42,7 +42,6 @@ struct Refspec<'a> {
 /// These forms of `DST` give [`Error::InvalidRefspec`] with the `DST`:
 ///
 /// - A `DST` that [`validate_refspec`] refuses.
-/// - A `DST` that holds a `^`.
 /// - A `DST` that [`is_checksum_shaped`](ostrya_core::is_checksum_shaped)
 ///   marks, after a non-empty `SRC`.
 ///
@@ -68,7 +67,7 @@ fn split(spec: &str) -> Result<Refspec<'_>> {
     validate_refspec(dst)?;
     // A revision reads 64 lowercase hex characters as a checksum, so a push
     // writes no commit to such a ref. A delete of it passes.
-    if dst.contains('^') || (!src.is_empty() && ostrya_core::is_checksum_shaped(dst)) {
+    if !src.is_empty() && ostrya_core::is_checksum_shaped(dst) {
         return Err(Error::InvalidRefspec(dst.to_owned()));
     }
     Ok(Refspec {

@@ -1123,11 +1123,13 @@ ref of that shape as a checksum and refuses it at exit 1, and copies the ref
 when every ref is pulled. Such a source arrives by an out-of-band write alone
 once the guard is in place.
 
-A third `commit` divergence sits at that guard's second arm, the branch name
-ending in `^` which resolution reads as ancestry (`../format-reference.md`,
+A third `commit` divergence sits at the branch name ending in `^`, which
+resolution reads as ancestry (`../format-reference.md`,
 "Revision syntax"). Both implementations refuse it, neither writes a ref, and
-neither publishes an object; the words and the step part. The port refuses at the
-ref write with `Invalid refspec <name>`, one message for every base. The tool
+neither publishes an object; the words and the step part. The ref-name rule
+refuses the name, so the port refuses at the ref write, after the tree is
+read, with `Invalid refspec <name>`, one message for every base. A tree error
+such as a path that does not open can come first. The tool
 reads the branch name as a revision ahead of the tree and reports that walk:
 `Invalid refspec <name>` where the base resolves to a commit holding a parent,
 `Commit <checksum> has no parent` where it resolves to a root commit, and a
@@ -3376,10 +3378,10 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
 - Each refspec is `SRC[:DST]`. `SRC` is a revision of the local repository.
   `DST` is the ref of the server, and it defaults to `SRC` when `SRC` is a
   ref. `:DST` deletes the ref `DST` of the server.
-- A `DST` that the ref-name rule refuses, a `DST` that holds `^`, and a
-  `DST` of 64 lowercase hex characters after a `SRC`, which a revision reads
-  as a commit checksum, are refused with `error: Invalid refspec DST` at exit
-  1. The refusal comes after `REMOTE` resolves and before the ssh client
+- A `DST` that the ref-name rule refuses, which includes a `DST` that holds
+  `^`, and a `DST` of 64 lowercase hex characters after a `SRC`, which a
+  revision reads as a commit checksum, are refused with `error: Invalid
+  refspec DST` at exit 1. The refusal comes after `REMOTE` resolves and before the ssh client
   starts or the first HTTP request. A delete `:DST` of a `DST` of 64
   lowercase hex characters passes, and the server removes the ref where its
   rule allows the delete.
@@ -3555,12 +3557,13 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
 - `--parent` takes a full commit checksum of 64 lowercase hex characters,
   or `none`. Without it, the parent is the commit of the first `-b` ref on
   the server, or no parent when the server does not hold that ref.
-- The command refuses a `-b` name that holds `:` or `^`, a name that the
-  ref-name rule refuses, and a name given twice. It refuses a name of 64
-  lowercase hex characters with the wording of `commit`. A name that ends
-  in `^` and a name of 64 lowercase hex characters are refused before
+- The command refuses a `-b` name that holds `:`, a name that the ref-name
+  rule refuses, which includes a name that holds `^`, and a name given twice.
+  It refuses a name of 64 lowercase hex characters with the wording of
+  `commit`. A name of 64 lowercase hex characters is refused before
   `--parent` is read. The other names are refused after `--body-file` is
-  read, and before the walk.
+  read, and before the walk. A name that holds `^` is refused with `ref
+  'NAME' is not a valid ref name`.
 - The metadata dict holds every `--add-metadata-string` entry, then every
   `--add-metadata` entry, then the binding keys. `ostree.ref-binding`
   holds the `-b` names sorted. `ostree.collection-binding` holds the

@@ -2255,9 +2255,9 @@ async fn push_tree(
     if let Some(message) = canonical_owner_conflict(args.canonical_permissions, owner) {
         exit_error(&message);
     }
-    // The ref rule of the push refuses `:`, `^`, a bad name, and a name given
-    // twice. A name that a revision reads as a checksum is refused here, with
-    // the wording of `commit`.
+    // The ref rule of the push refuses `:`, a name with `^`, a bad name, and a
+    // name given twice. A name that a revision reads as a checksum is refused
+    // here, with the wording of `commit`.
     for branch in &args.branch {
         if let Some(message) = shadowed_branch_name(branch) {
             exit_error(&message);
@@ -2289,7 +2289,7 @@ async fn push_tree(
     };
     // The transport is made ready before a signer can start gpg and before
     // the body file is read, so a refusal of the remote or of its options
-    // costs neither.
+    // costs neither. A name with `^` is refused later, in the library.
     let overrides = push_overrides(args.connect);
     let endpoint = if ostrya::is_push_address(remote) {
         ostrya::endpoint::resolve_push(None, remote, overrides).await?
@@ -3919,10 +3919,13 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         // The branch's current tip is the implicit parent. The tip is read from
         // the ref file and not loaded, so a branch that names no ref gives a
         // root commit and a ref over an absent object is inherited unread. A
-        // name the guard below refuses is not read at all, which leaves that
-        // refusal the message and the position it already has.
+        // name the guard below refuses is not read at all. A name the checksum
+        // guard refuses and a name the ref-name rule refuses are both refused
+        // after the commit is written.
         None => match args.branch.as_deref() {
-            Some(branch) if shadowed_branch_name(branch).is_none() => {
+            Some(branch)
+                if shadowed_branch_name(branch).is_none() && validate_refspec(branch).is_ok() =>
+            {
                 match repo.resolve_rev(branch, true).await {
                     Ok(found) => found,
                     Err(err) => return Err(report_resolution_failure(err)),
@@ -4176,9 +4179,10 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // refuses, are both reported after the commit is written and ahead of the
     // signing step, which is the order the tool reports each of them against a
     // key it cannot use. The refspec grammar is the ref-name rule of the tool,
-    // so a name with a space or a caret is refused here, as the tool refuses
-    // it. `exit_error` runs no destructor, so the staging directory is reaped
-    // ahead of it.
+    // so a name with a space or a caret is refused here with `Invalid refspec
+    // <name>`. The refusal comes at the ref write, after the tree is read, so
+    // an error of the tree can come first. `exit_error` runs no destructor, so
+    // the staging directory is reaped ahead of it.
     if let Some(branch) = args.branch.as_deref() {
         if let Some(message) = shadowed_branch_name(branch) {
             txn.abort().await?;
@@ -6203,11 +6207,10 @@ async fn refs_create(repo: &Repo, newref: &str, args: &RefsArgs) -> Result<()> {
         ));
     }
     // NEWREF is validated as a ref name here: after the existence check and
-    // before the positional resolves, which is the order the tool takes it in
-    // (`format-reference.md`, "refs"). A trailing `^` fails this step, since a
-    // ref name carries no ancestry suffix -- it names a commit, and a ref written
-    // under that name is one the existence check reads as a revision.
-    if validate_refspec(newref).is_err() || newref.ends_with('^') {
+    // before the positional resolves, which is the order the tool takes it in.
+    // A `^` fails the ref-name rule, so a name with an ancestry suffix is
+    // refused at this step.
+    if validate_refspec(newref).is_err() {
         exit_error(&format!("Invalid refspec {newref}"));
     }
     if args.collections {
@@ -6246,10 +6249,9 @@ async fn refs_create(repo: &Repo, newref: &str, args: &RefsArgs) -> Result<()> {
 /// id and the missing name is reported once that id holds.
 async fn refs_create_collection(repo: &Repo, newref: &str, existing: &str) -> Result<()> {
     let pair = match newref.split_once(':') {
-        // A `^` is refused with the pair's own message here, and a trailing one
-        // is the case the tool crashes on under `-c`
-        // (`docs/conformance/cli-surface.md`, "P1").
-        Some((_, ref_name)) if ref_name.contains(':') || newref.contains('^') => {
+        // A second `:` is refused with the pair's own message here. A `^` never
+        // reaches this step, because the ref-name rule refuses it earlier.
+        Some((_, ref_name)) if ref_name.contains(':') => {
             exit_error(&format!("Invalid refspec {newref}"))
         }
         pair => pair,
@@ -10161,17 +10163,11 @@ fn parse_commit_message(text: &str) -> (String, String) {
 }
 
 /// The message a branch name the revision syntax shadows is refused with, and
-/// `None` for a name a ref can carry. Resolution reads a trailing run of `^` as
-/// ancestry and a name of 64 lowercase hex characters as a checksum, so a ref
-/// carrying either is reachable by no revision
-/// (`docs/format-reference.md`, "Revision syntax"). Each message is the wording
-/// the port already gives that shape -- the ancestry name at `refs --create`, the
-/// checksum name at the tool's own guard -- and the two shapes are disjoint, a
-/// 64-character hex name holding no `^`.
+/// `None` for any other name. Resolution reads a name of 64 lowercase hex
+/// characters as a checksum, so a ref with such a name is reachable by no
+/// revision. The message is the wording of the tool's own guard. A name that
+/// holds `^` is not covered here: the ref-name rule refuses it.
 fn shadowed_branch_name(branch: &str) -> Option<String> {
-    if branch.ends_with('^') {
-        return Some(format!("Invalid refspec {branch}"));
-    }
     if ostrya::is_checksum_shaped(branch) {
         return Some(format!("Rev name '{branch}' looks like a checksum"));
     }

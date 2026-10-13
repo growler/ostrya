@@ -187,7 +187,7 @@ pub async fn push_tree_prepared(
 /// Before the scan, the push refuses these values of `opts`:
 ///
 /// - empty `refs`, and a ref named twice
-/// - a ref that holds `:` or `^`, a ref of 64 lowercase hex characters, and a
+/// - a ref that holds `:`, a ref of 64 lowercase hex characters, and a
 ///   ref that fails the ref-name rule of [`ostrya_core::is_ref_name`]
 /// - a DEFLATE level outside 1 through 9
 /// - a malformed `SOURCE_DATE_EPOCH` if `timestamp` is not set, and a system
@@ -199,9 +199,9 @@ pub async fn push_tree_prepared(
 ///   `MAX_METADATA_SIZE` without the bindings and without a parent of
 ///   [`ParentPolicy::CurrentTip`]
 ///
-/// A revision cannot name a ref that holds `^`, because it reads `^` as the
-/// parent of a commit. It also cannot name a ref of 64 lowercase hex
-/// characters, because it reads that name as a commit checksum.
+/// The ref-name rule refuses a ref that holds `^`, because a revision reads
+/// `^` as the parent of a commit. A revision also cannot name a ref of 64
+/// lowercase hex characters, because it reads that name as a commit checksum.
 ///
 /// The bindings and a parent from the server only add bytes to the commit
 /// object. As a result, the size check before the scan never refuses a commit
@@ -468,9 +468,9 @@ impl Prepared {
     }
 }
 
-/// Refuses empty `refs`, a ref that holds `:`, a ref that holds `^`, a ref
-/// that fails the ref-name rule, a ref of 64 lowercase hex characters, and a
-/// ref named twice.
+/// Refuses empty `refs`, a ref that holds `:`, a ref that fails the ref-name
+/// rule (which includes a ref that holds `^`), a ref of 64 lowercase hex
+/// characters, and a ref named twice.
 fn check_refs(refs: &[String]) -> Result<()> {
     if refs.is_empty() {
         return Err(invalid("a tree push needs at least one target ref"));
@@ -480,11 +480,6 @@ fn check_refs(refs: &[String]) -> Result<()> {
         if name.contains(':') {
             return Err(invalid(format!(
                 "ref '{name}' holds ':'; a tree push sets refs below refs/heads"
-            )));
-        }
-        if name.contains('^') {
-            return Err(invalid(format!(
-                "ref '{name}' holds '^', which a revision reads as the parent of a commit"
             )));
         }
         if !ostrya_core::is_ref_name(name) {
@@ -529,14 +524,9 @@ mod tests {
         assert!(refused(with_refs(&["a", "b", "a"])).contains("twice"));
         assert!(refused(with_refs(&["origin:main"])).contains("':'"));
         assert!(refused(with_refs(&["main", "o:a:b"])).contains("':'"));
-        for caret in ["main^", "a^b", "^", "x/y^"] {
-            assert!(
-                refused(with_refs(&["main", caret])).contains("'^'"),
-                "{caret}"
-            );
-        }
         for bad in [
-            "", "/a", "a/", "a//b", ".", "..", "a/../b", "a\0b", "a b", "a*", "-a", "a/.b",
+            "", "main^", "a^b", "^", "x/y^", "/a", "a/", "a//b", ".", "..", "a/../b", "a\0b",
+            "a b", "a*", "-a", "a/.b",
         ] {
             assert!(
                 refused(with_refs(&[bad])).contains("not a valid ref name"),

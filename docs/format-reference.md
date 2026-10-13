@@ -706,15 +706,18 @@ wherever a 64-character name is taken:
   (`conformance/cli-surface.md`, "P2"). `--orphan` leaves the refusal standing in
   both implementations, since `-b` writes the ref under it too.
 
-The revision syntax shadows two branch-name shapes, and `commit -b` guards both.
-Beside the checksum shape above stands a name ending in `^`, which resolution
-reads as ancestry, so no revision reaches the commit a ref of that name holds.
-The port refuses it with `error: Invalid refspec <name>`, the message it gives
-that same shape at `refs --create`, at the step the checksum guard runs at: the
-ref write, after `--parent` resolves and after the tree is read. The tool refuses
-it a step earlier, reading the branch name as a revision before it commits the
-tree, and reports what that walk found. Three outcomes follow from the base the
-suffix names:
+The revision syntax shadows two branch-name shapes. Beside the checksum shape
+above stands a name ending in `^`, which resolution reads as ancestry, so no
+revision reaches the commit a ref of that name holds. The ref-name rule refuses
+every name that holds a `^`. The port refuses the name with `error: Invalid
+refspec <name>`, the message it gives that same shape at `refs --create`, at
+the step the checksum guard runs at: the ref write, after the tree is read, so
+an error of the tree, such as a path that does not open, can come first. A
+branch name the ref-name rule refuses is not read as the implicit parent, so
+the refusal comes after the commit is written, and the port aborts the
+transaction. The tool refuses it a step earlier, reading the branch name as a
+revision before it commits the tree, and reports what that walk found. Three
+outcomes follow from the base the suffix names:
 
 - a base resolving to a commit that has a parent: `error: Invalid refspec
   <name>`, exit 1, which is the port's own line;
@@ -733,8 +736,8 @@ the name before the tree, a tree path that does not open is reported by the
 port and reached by the tool only after the name it already refused, and
 neither implementation publishes an object for the refusal, where the checksum
 guard leaves the tool's tree and commit objects in `objects/`.
-A `^` inside the name is a separate rule: both implementations refuse `a^b` as
-a ref name whatever the store holds, and report `error: Invalid refspec a^b`.
+Both implementations refuse `a^b` as a ref name whatever the store holds, and
+report `error: Invalid refspec a^b`.
 
 A push guards the checksum shape at each site where it writes a commit to a
 target ref. `push` refuses a `DST` of that shape after a `SRC` with `error:
@@ -756,8 +759,6 @@ A ref of either refused shape can arrive in these ways:
   `Repo::set_ref_immediate` write both shapes;
 - a pull of every ref of a source that holds a ref of the checksum shape: the
   port copies the ref, as the next paragraph records;
-- a push of a name that ends in `^`: the receiver takes it, and
-  `Repo::export_stream` sends it, where `Repo::push` and `push_tree` refuse it;
 - an out-of-band write into `refs/`.
 
 Where a checksum-shaped one stands, the tool's listings enumerate it, its `fsck`
@@ -5318,8 +5319,8 @@ specified but ref NAME^ already exists` where the base resolves to a commit
 holding a parent, and `error: Commit <checksum> has no parent` where the base is
 a root commit; `--create=NAME^ --force` reports that same `has no parent` line
 where the base is a root commit. The third step validates NEWREF as a ref name,
-by the rule "Ref name validation" above states, and refuses a `^` in it:
-`--create=NAME^ --force` reports `error: Invalid refspec NAME^` where the
+by the rule "Ref name validation" above states, and the rule refuses a `^` in
+it: `--create=NAME^ --force` reports `error: Invalid refspec NAME^` where the
 ancestry resolves, and `--create=a/../b --force nosuch` reports `error: Invalid
 refspec a/../b` rather than the unresolvable positional -- a name a traversal
 component makes invalid draws those same words from the second step, so which of
@@ -5336,8 +5337,8 @@ refspec origin:bad/`. With `-c` the fourth step is absent, `-c` winning over `-A
 so `-c -A --create=<id>:<ref>` writes a collection ref in either flag order. A
 NEWREF holding a second `:` stops at the third step in both implementations, so
 `-A --create=a:b:c` reports `error: Invalid refspec a:b:c` from each; both exit
-1 and write nothing. The port refuses a NEWREF ending in `^` with that message,
-and a `^` elsewhere in a ref name is refused by the ref-name rule.
+1 and write nothing. The port refuses a NEWREF that holds a `^` with that
+message, by the ref-name rule.
 
 Under `-A` the target is checked in a fifth step, after the remote refusal: the
 existence check that reports `error: Cannot create alias to non-existent ref:

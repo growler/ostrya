@@ -271,7 +271,7 @@ fn options_refused_before_the_scan_start_no_ssh_client() {
         (
             "a parent revision",
             Box::new(|| options(&["main", "main^"])),
-            "'^'",
+            "not a valid ref name",
         ),
         (
             "a level out of range",

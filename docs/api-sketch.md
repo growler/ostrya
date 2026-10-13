@@ -2980,8 +2980,8 @@ messages through `ostrya`. `Error::Remote` carries them in every build too.
   `bare-split-xattrs` repository refuses it with `mode-refused`, and so does
   a `bare` repository when the process does not run as root. A ref name of
   `Hello` that `validate_refspec` refuses is `invalid-ref` with the text
-  `invalid ref name 'NAME'`. A ref name with a trailing `^` passes, and so
-  does a ref name of 64 lowercase hex characters: `Hello` does not tell a
+  `invalid ref name 'NAME'`, which includes a ref name that holds `^`. A ref
+  name of 64 lowercase hex characters passes: `Hello` does not tell a
   write from a delete, and `Commit` checks that shape. A `Hello` whose
   `HelloReply` needs a frame over `MAX_FRAME` when each ref has a commit is
   `limit-exceeded`. These checks are those of `ReceiveService::check_hello`,
@@ -3706,10 +3706,10 @@ push over a pair of byte streams. `ostrya` re-exports the three as
 `ostrya::remote`.
 
 - Before the scan, the push refuses with `Error::InvalidInput`: empty
-  `refs`, a ref named twice, a ref that holds `:`, a ref that holds `^`, a
-  ref that fails `ostrya_core::is_ref_name`, a ref of 64 lowercase hex
-  characters, a DEFLATE level outside 1 through 9, a malformed
-  `SOURCE_DATE_EPOCH` when `timestamp` is not set, an
+  `refs`, a ref named twice, a ref that holds `:`, a ref that fails
+  `ostrya_core::is_ref_name` (which includes a ref that holds `^`), a ref of
+  64 lowercase hex characters, a DEFLATE level outside 1 through 9, a
+  malformed `SOURCE_DATE_EPOCH` when `timestamp` is not set, an
   empty key in `metadata` or in `detached_metadata`, entries that do not
   serialize as an `a{sv}` dict, entries whose serialized dict is over
   `MAX_METADATA_SIZE`, and a subject, a body, and `metadata` whose commit
@@ -4358,10 +4358,10 @@ Before it writes a byte, the push refuses:
   `DST` that two refspecs name, as `Error::Remote` with `InvalidInput`;
 - a checksum `SRC` and a `SRC` with a `^` suffix, each with no `DST`, as
   `Error::Remote` with `InvalidInput`;
-- a `DST` that `validate_refspec` refuses, a `DST` that holds a `^`, and a
-  `DST` of 64 lowercase hex characters that takes a commit, as
-  `Error::InvalidRefspec` with the `DST`. A revision reads a `DST` of 64
-  lowercase hex characters as a commit checksum. A delete (`:DST`) of a
+- a `DST` that `validate_refspec` refuses, which includes a `DST` that
+  holds a `^`, and a `DST` of 64 lowercase hex characters that takes a
+  commit, as `Error::InvalidRefspec` with the `DST`. A revision reads a
+  `DST` of 64 lowercase hex characters as a commit checksum. A delete (`:DST`) of a
   `DST` of 64 lowercase hex characters passes;
 - a `SRC` that does not resolve, with the error of `Repo::resolve_rev`;
 - a source commit that the local repository marks partial, as `Error::Remote`

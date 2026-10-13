@@ -745,23 +745,26 @@ fn a_pull_session_fetches_the_summary_over_a_stream() {
 }
 
 /// `PullSession::fetch_refs` over a stream returns the listing that
-/// `Repo::build_ref_listing` builds on the server, for a name and for an
-/// empty list. The session ends with `Ok`.
+/// `Repo::build_ref_listing` builds on the server, for a name, for a pattern
+/// with `*`, for a list with a negative entry, and for an empty list. The
+/// session ends with `Ok`.
 #[test]
 fn a_pull_session_fetches_the_ref_listing_over_a_stream() {
     block_on(async {
         let dir = TmpDir::new("pull-ssh-session-fetch-refs");
         let (remote, _commit) = build_remote(dir.path()).await;
-        let expected = [
-            remote
-                .build_ref_listing(&RefSelector::parse(["test/main"]).unwrap())
-                .await
-                .unwrap(),
-            remote
-                .build_ref_listing(&RefSelector::parse([]).unwrap())
-                .await
-                .unwrap(),
+        let selectors: [&[&str]; 5] = [
+            &["test/main"],
+            &[],
+            &["test/*"],
+            &["**", "!test/*"],
+            &["!test/**", "test/main", "!test/main"],
         ];
+        let mut expected = Vec::new();
+        for entries in selectors {
+            let selector = RefSelector::parse(entries.iter().copied()).unwrap();
+            expected.push(remote.build_ref_listing(&selector).await.unwrap());
+        }
         let (to_server, server_in) = pipe(PIPE_CAP);
         let (server_out, from_server) = pipe(PIPE_CAP);
         let (fetched, served) = within(
@@ -775,10 +778,11 @@ fn a_pull_session_fetches_the_ref_listing_over_a_stream() {
                     )
                     .await
                     .unwrap();
-                    let fetched = [
-                        session.fetch_refs(&["test/main"]).await.unwrap(),
-                        session.fetch_refs(&[]).await.unwrap(),
-                    ];
+                    let mut fetched = Vec::new();
+                    for entries in selectors {
+                        let selector = RefSelector::parse(entries.iter().copied()).unwrap();
+                        fetched.push(session.fetch_refs(&selector).await.unwrap());
+                    }
                     session.finish().await.unwrap();
                     fetched
                 },
@@ -788,7 +792,7 @@ fn a_pull_session_fetches_the_ref_listing_over_a_stream() {
         .await;
         served.unwrap();
         let listing = ostrya::Summary::parse(&expected[0]).unwrap();
-        assert_eq!(fetched, expected.map(Some));
+        assert_eq!(fetched, expected.into_iter().map(Some).collect::<Vec<_>>());
         assert_eq!(listing.refs.len(), 1);
         assert_eq!(listing.refs[0].name, "test/main");
     });
@@ -869,7 +873,8 @@ fn a_chain_from_the_ref_listing_is_pulled_over_a_stream() {
                     )
                     .await
                     .unwrap();
-                    let listing = session.fetch_refs(&["test/main"]).await.unwrap().unwrap();
+                    let selector = RefSelector::parse(["test/main"]).unwrap();
+                    let listing = session.fetch_refs(&selector).await.unwrap().unwrap();
                     let deltas = ostrya::Summary::parse(&listing)
                         .unwrap()
                         .static_deltas()

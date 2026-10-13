@@ -35,6 +35,7 @@ use common::{
 };
 use futures_lite::future::poll_once;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+use ostrya::RefSelector;
 use ostrya::endpoint::EndpointOverrides;
 use ostrya::fetch::{BearerToken, ClientIdentity, Fetcher, FetcherOptions, Proxy};
 use ostrya::remote::{Endpoint, PullSession, StreamSessionOptions};
@@ -2842,8 +2843,20 @@ fn a_pull_session_fetches_no_ref_listing_from_a_static_server() {
         )
         .await
         .unwrap();
-        assert_eq!(session.fetch_refs(&["main"]).await.unwrap(), None);
-        assert_eq!(session.fetch_refs(&[]).await.unwrap(), None);
+        assert_eq!(
+            session
+                .fetch_refs(&RefSelector::parse(["main"]).unwrap())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            session
+                .fetch_refs(&RefSelector::parse([]).unwrap())
+                .await
+                .unwrap(),
+            None
+        );
         assert_eq!(server.seen(), ["_ostrya/refs/v1", "_ostrya/refs/v1"]);
 
         let summary = std::fs::read(dir.path().join("remote/summary")).unwrap();
@@ -2855,22 +2868,21 @@ fn a_pull_session_fetches_no_ref_listing_from_a_static_server() {
 
 /// `PullSession::fetch_refs` over HTTP refuses a listing whose stated length
 /// is over the cap of 128 MiB, from the head of the answer. The request
-/// target holds each prefix that stays, percent-encoded, and the call does
-/// not ask again.
+/// target holds each entry that stays, percent-encoded, the positive entries
+/// first, and the call does not ask again.
 #[test]
 fn a_pull_session_refuses_a_ref_listing_over_the_cap_over_http() {
     block_on(async {
-        let target = "_ostrya/refs/v1?prefix=a%2Fb&prefix=x-y&prefix=%C3%A9%2F%C3%BC";
+        let target = "_ostrya/refs/v1?pattern=a%2Fb&pattern=x-y&pattern=a%2Fb%2Fc&pattern=%C3%A9%2F%C3%BC\
+                      &pattern=%21a%2F%2A";
         let (addr, seen) = oversized_file_server(target, ostrya::MAX_REF_LISTING + 1).await;
         let mut http = FetcherOptions::new(format!("http://{addr}"));
         http.proxy = Proxy::None;
         let session = PullSession::connect(Endpoint::Http(http), StreamSessionOptions::default())
             .await
             .unwrap();
-        let err = session
-            .fetch_refs(&["a/b", "x-y", "a/b/c", "é/ü", "x-y"])
-            .await
-            .unwrap_err();
+        let selector = RefSelector::parse(["a/b", "!a/*", "x-y", "a/b/c", "é/ü", "x-y"]).unwrap();
+        let err = session.fetch_refs(&selector).await.unwrap_err();
         assert!(
             matches!(
                 err,

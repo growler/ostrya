@@ -69,7 +69,7 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// - The server answers the raw path `/_ostrya/refs/v1`, with and without a
 ///   receive endpoint, with the bytes of [`Repo::build_ref_listing`]. The
 ///   path must match exactly, and the server reads its query. Each pair of
-///   the query is `prefix=VALUE`, with the raw key `prefix` and a
+///   the query is `pattern=VALUE`, with the raw key `pattern` and a
 ///   percent-decoded value in which `+` stays `+`. The value is one entry of
 ///   a [`ostrya::RefSelector`]: a ref pattern with an optional leading `!`.
 ///   An entry has at most [`ostrya::MAX_REF_ENTRY_PARTS`] parts and
@@ -79,7 +79,7 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 ///      `Allow: GET`.
 ///   2. A bad pair, an entry over the limits of one entry, an entry that
 ///      [`ostrya::RefSelector::parse`] refuses, and a query of more than 256
-///      pairs ([`ostrya::MAX_REF_PREFIXES`]), get 400. An entry given two
+///      pairs ([`ostrya::MAX_REF_PATTERNS`]), get 400. An entry given two
 ///      times counts two times, and the server keeps it one time.
 ///   3. If 4 listings are in flight over all connections, the request gets
 ///      503 with `Retry-After: 1`. A listing is in flight from the start of

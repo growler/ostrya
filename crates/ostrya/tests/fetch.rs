@@ -1024,7 +1024,7 @@ fn a_path_query_goes_to_each_mirror_as_written() {
         })
         .await
         .unwrap();
-        let query = "prefix=a%2Fb&prefix=x%20y%2Bz";
+        let query = "pattern=a%2Fb&pattern=x%20y%2Bz";
         let fetched = fetcher
             .fetch(FetchRequest::path_query("_ostrya/refs/v1", query))
             .await

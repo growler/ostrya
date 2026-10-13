@@ -572,11 +572,12 @@ impl Repo {
 /// also at `ostrya::MAX_REF_LISTING`.
 pub const MAX_REF_LISTING: u64 = 128 * 1024 * 1024;
 
-/// The most prefixes in one request of a ref listing: 256.
-/// `ostrya_remote::proto::MAX_REF_PREFIXES`, also at
-/// `ostrya::MAX_REF_PREFIXES`. A server counts a duplicate; a client removes
-/// duplicates and covered prefixes before it counts.
-pub const MAX_REF_PREFIXES: usize = 256;
+/// The most entries in one request of a ref listing: 256.
+/// `ostrya_remote::proto::MAX_REF_PATTERNS`, also at
+/// `ostrya::MAX_REF_PATTERNS`. Positive and negative entries count together.
+/// A server counts a duplicate; a client removes exact duplicates before it
+/// counts.
+pub const MAX_REF_PATTERNS: usize = 256;
 
 /// The most parts in one entry of a ref listing request: 256.
 /// `ostrya_remote::proto::MAX_REF_ENTRY_PARTS`, also at
@@ -5050,7 +5051,7 @@ succeeds. When `after_update` returns an error, the client gets 500 with
 ends as aborted, and `on_report` is not called. The host has the report in
 `after_update`.
 
-The ref listing. The server answers `GET /_ostrya/refs/v1?prefix=P&prefix=Q`
+The ref listing. The server answers `GET /_ostrya/refs/v1?pattern=P&pattern=Q`
 with the bytes of `Repo::build_ref_listing` for the ref patterns of the
 query. It builds the listing for each request, from a clone of the `Repo` that
 `bind` takes. The listing is served with and without `receive`.
@@ -5060,8 +5061,9 @@ query. It builds the listing for each request, from a clone of the `Repo` that
   gives 404 under `/_ostrya/`.
 - The HTTP layer removes a `#` fragment before the routing, so the server
   does not see a fragment.
-- Each pair of the query is `prefix=VALUE`, and `&` separates two pairs.
-  The server compares the key with the raw bytes `prefix`. It decodes the
+- Each pair of the query is `pattern=VALUE`, and `&` separates two pairs.
+  The server compares the key with the raw bytes `pattern`. Another key,
+  `prefix` included, gets 400. It decodes the
   value with the percent-decoding of a request path, in which `+` stays
   `+`. The decoded value is one entry of a `RefSelector`: a ref pattern with
   an optional leading `!`. The server parses the entries with
@@ -5070,7 +5072,8 @@ query. It builds the listing for each request, from a clone of the `Repo` that
   and the server checks both limits before the parse. An entry given two
   times is accepted, and the server keeps it one time.
 - No query, or a `?` alone, is an empty list, which takes all refs.
-- A query holds at most `MAX_REF_PREFIXES`, 256, pairs. An entry given two
+- A query holds at most `MAX_REF_PATTERNS`, 256, pairs, positive and
+  negative together. An entry given two
   times counts two times.
 - An HTTP/2 connection takes a header list of at most 32 KiB for one
   request, and a larger list gets 431. The list counts, for each header
@@ -5151,7 +5154,7 @@ Rules:
 - The session answers a `ListRefs` with the bytes of
   `Repo::build_ref_listing` for its entries: `GetReply` with found true
   and the length of the listing, then the listing as a body of chunks. The
-  session checks the count of the entries against `MAX_REF_PREFIXES`, 256,
+  session checks the count of the entries against `MAX_REF_PATTERNS`, 256,
   the limits of each entry (`MAX_REF_ENTRY_PARTS` and `MAX_REF_ENTRY_LEN`),
   and then the entries with `RefSelector::parse` before the build. An entry
   given two times counts two times. An empty list is all refs under
@@ -5189,7 +5192,7 @@ Failures:
   `PullHello`, a `ListRefs` before `PullHello`, a kind of the push,
   `PullHelloReply`, `GetReply`, or `Error` from the client, a malformed
   frame, an end of input inside a frame, a `ListRefs` with more than
-  `MAX_REF_PREFIXES` entries, a `ListRefs` entry over the limits of one
+  `MAX_REF_PATTERNS` entries, a `ListRefs` entry over the limits of one
   entry, and a `ListRefs` entry that `RefSelector::parse` refuses;
   `limit-exceeded` for a frame over 1 MiB and for a ref listing over
   `MAX_REF_LISTING`.
@@ -5238,7 +5241,7 @@ impl StreamSession {
         -> Result<StreamSession>;
     pub async fn get(&self, path: &str, max_len: u64)
         -> Result<Option<PullBody>>;
-    pub async fn list_refs(&self, prefixes: &[&str], max_len: u64)
+    pub async fn list_refs(&self, selector: &RefSelector, max_len: u64)
         -> Result<PullBody>;
     pub async fn finish(self) -> Result<()>;
 }
@@ -5264,7 +5267,7 @@ impl PullSession {
         W: AsyncWrite + Unpin + Send + 'static;
     pub async fn fetch_summary(&self)
         -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)>; // (summary, summary.sig)
-    pub async fn fetch_refs(&self, prefixes: &[&str])
+    pub async fn fetch_refs(&self, selector: &RefSelector)
         -> Result<Option<Vec<u8>>>;             // a ref listing
     pub fn max_outstanding(&self) -> usize;
     pub async fn finish(self) -> Result<()>;
@@ -5292,32 +5295,38 @@ The pull session:
   call asks for `summary.sig` and then for `summary` at `Priority::High`. A
   404 is an absent file, and a body that fails in transit is fetched again.
   Over a stream session, the two `Get` calls are in flight together.
-- `fetch_refs` takes `&self` and returns the ref listing of a set of
-  prefixes: a summary GVariant that the server builds for the request, with
-  the refs under `refs/heads` that the prefixes select. An empty list
-  selects all refs. The listing has a cap of `MAX_REF_LISTING`, 128 MiB.
-  No signature covers the listing.
-- On both transports, `fetch_refs` first checks each prefix with
-  `ostrya_core::is_ref_name`. It then removes duplicate prefixes and each
-  prefix that another prefix covers (`a` covers `a/b`, and does not cover
-  `ab`), and keeps the order of the first appearance. More than
-  `MAX_REF_PREFIXES`, 256, prefixes that stay is `Error::InvalidInput`. A
+- `fetch_refs` takes `&self` and returns the ref listing of a
+  `RefSelector`: a summary GVariant that the server builds for the request,
+  with the refs under `refs/heads` that the selector selects. A selector
+  with no entry selects all refs. The listing has a cap of
+  `MAX_REF_LISTING`, 128 MiB. No signature covers the listing.
+- On both transports, `fetch_refs` sends the positive entries first, then
+  the negative entries, each with its `!`. It removes an exact duplicate
+  within one kind and keeps the first appearance. A positive `x` and a
+  negative `!x` both stay, and `a` and `a/b` both stay, because no entry is
+  removed for the cover of another entry. An entry has at
+  most `MAX_REF_ENTRY_LEN`, 4096, bytes, with its `!` counted as one byte,
+  and `MAX_REF_ENTRY_PARTS`, 256, parts, counted as
+  `entry.split('/').count()` on the text after the `!`. More than
+  `MAX_REF_PATTERNS`, 256, entries that stay, positive and negative
+  together, is `Error::InvalidInput`, and so is an entry over a limit. A
   refusal sends no request.
 - Over a stream session the call is `StreamSession::list_refs`, and it
   returns `Some` with the bytes. The buffer of the listing gets the stated
   length, within the cap.
 - Over HTTP the call sends `GET _ostrya/refs/v1` under the base URL of each
-  mirror, at `Priority::High`, with the cap on `max_size`. Each prefix that
-  stays is one `prefix=VALUE` pair of the query, joined with `&`. The value
+  mirror, at `Priority::High`, with the cap on `max_size`. Each entry that
+  stays is one `pattern=VALUE` pair of the query, joined with `&`. The value
   keeps `A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, and `~`, and writes each other
-  byte as `%XX` in upper case, `/` included. An empty list sends no query.
+  byte as `%XX` in upper case, so `/` is `%2F`, `!` is `%21`, and `*` is
+  `%2A`. A selector with no entry sends no query.
   The client refuses with `Error::InvalidInput`, before any request, a
   target from `_ostrya/refs/v1` to the end of the query of more than
   16 KiB. The base path of the mirror adds to the target on the wire.
 - Over HTTP, a 404 is `None`, so a static server of the repository files
   gives `None`. A body that fails in transit is fetched again, as for
   `fetch_summary`. Each other status is `Error::Fetch` with
-  `HttpStatus`: 400 for a prefix that the server refuses, 414 or 431 for a
+  `HttpStatus`: 400 for a pattern that the server refuses, 414 or 431 for a
   target too long for the server, and 503 when the server builds too many
   listings. The fetcher retries a 503 with its backoff and does not read
   `Retry-After`. Of a static mirror beside a busy server, the fetcher
@@ -5352,14 +5361,13 @@ The session:
   frame under one lock, so the frames go on the wire in the order of the
   places. The places and the writes are each served in the order the calls
   arrive.
-- `list_refs` checks each prefix with `ostrya_core::is_ref_name` before it
-  takes a place. It then removes duplicate prefixes and covered prefixes,
-  as `PullSession::fetch_refs` states, and counts the prefixes that stay. A
-  prefix that is not a ref name, and more than `MAX_REF_PREFIXES` prefixes
-  that stay, are `Error::InvalidInput`, the call writes nothing, and the
-  session stays usable. A `GetReply` with
-  found false, or with no length, in reply to `ListRefs` is
-  `Error::Protocol` and ends the session.
+- `list_refs` removes exact duplicate entries, orders the entries, and
+  counts the entries that stay, as `PullSession::fetch_refs` states, before
+  it takes a place. An entry over the limits of one entry, and more than
+  `MAX_REF_PATTERNS` entries that stay, are `Error::InvalidInput`, the call
+  writes nothing, and the session stays usable. A `GetReply` with found
+  false, or with no length, in reply to `ListRefs` is `Error::Protocol` and
+  ends the session.
 - The call returns at the head of its reply. `None` is a path that the
   server does not serve. The session moves to the next reply when it reads
   the chunk that ends a body, also while the caller still holds that body.

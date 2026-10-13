@@ -20,7 +20,7 @@
 //!   a file, and [`StreamSession::list_refs`] reads a ref listing.
 //! - [`PullSession::connect`] opens the session of a pull to an [`Endpoint`], over HTTP or ssh,
 //!   [`PullSession::fetch_summary`] reads the summary of the remote, and
-//!   [`PullSession::fetch_refs`] reads the ref listing of a set of prefixes, over HTTP from
+//!   [`PullSession::fetch_refs`] reads the ref listing of a `RefSelector`, over HTTP from
 //!   `_ostrya/refs/v1` or over a stream session.
 //! - [`Error`] is the error of each fallible operation, and [`ErrorCode`] names its wire codes.
 //!
@@ -113,6 +113,7 @@ fn stream_session_futures_are_send(
     options: &SshOptions,
     session: &StreamSession,
     owned: StreamSession,
+    selector: &ostrya_core::RefSelector,
 ) {
     fn assert_send<T: Send>(_: &T) {}
     assert_send(&StreamSession::connect(
@@ -126,13 +127,18 @@ fn stream_session_futures_are_send(
         StreamSessionOptions::default(),
     ));
     assert_send(&session.get("config", 1));
-    assert_send(&session.list_refs(&["main"], 1));
+    assert_send(&session.list_refs(selector, 1));
     assert_send(&owned.finish());
 }
 
 /// The futures of a pull session can run on a multi-threaded executor.
 #[allow(dead_code)]
-fn pull_session_futures_are_send(endpoint: &Endpoint, session: &PullSession, owned: PullSession) {
+fn pull_session_futures_are_send(
+    endpoint: &Endpoint,
+    session: &PullSession,
+    owned: PullSession,
+    selector: &ostrya_core::RefSelector,
+) {
     fn assert_send<T: Send>(_: &T) {}
     assert_send(&PullSession::connect(
         endpoint.clone(),
@@ -144,7 +150,7 @@ fn pull_session_futures_are_send(endpoint: &Endpoint, session: &PullSession, own
         StreamSessionOptions::default(),
     ));
     assert_send(&session.fetch_summary());
-    assert_send(&session.fetch_refs(&["main"]));
+    assert_send(&session.fetch_refs(selector));
     assert_send(&owned.finish());
 }
 

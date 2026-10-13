@@ -5,9 +5,10 @@ use std::io;
 
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::io::AsyncReadExt;
+use ostrya_core::RefSelector;
 use ostrya_fetch::{FetchRequest, Fetched, Fetcher, Priority};
 
-use super::pull::{PullBody, StreamSession, StreamSessionOptions, reduce_prefixes};
+use super::pull::{PullBody, StreamSession, StreamSessionOptions, wire_entries};
 use crate::error::{Error, Result};
 use crate::proto::MAX_REF_LISTING;
 
@@ -40,7 +41,7 @@ const REFS_PATH: &str = "_ostrya/refs/v1";
 const MAX_REFS_TARGET: usize = 16 * 1024;
 
 /// The key of each pair of the query of a ref listing.
-const PREFIX_KEY: &str = "prefix=";
+const PATTERN_KEY: &str = "pattern=";
 
 /// The session of a pull: the HTTP fetcher of a remote, or a stream session.
 ///
@@ -142,28 +143,34 @@ impl PullSession {
         }
     }
 
-    /// Reads the ref listing of `prefixes` from the remote.
+    /// Reads the ref listing of `selector` from the remote.
     ///
     /// The listing is a summary of the refs under `refs/heads` that the
-    /// prefixes select, built by the server for this request. Each prefix is
-    /// a ref name. A prefix selects the ref of that name and each ref below
-    /// it. An empty list selects all refs. The listing has a cap of
-    /// [`MAX_REF_LISTING`] bytes.
+    /// selector selects, built by the server for this request. A selector
+    /// with no entry selects all refs.
+    /// The listing has a cap of [`MAX_REF_LISTING`] bytes.
     ///
-    /// Before it sends a request, the call removes duplicate prefixes and each
-    /// prefix that another prefix covers, so `a` removes `a/b` and keeps `ab`.
-    /// The prefixes that stay keep the order of their first appearance. At
-    /// most [`MAX_REF_PREFIXES`](crate::proto::MAX_REF_PREFIXES) prefixes can
-    /// stay. These rules apply to both transports.
+    /// The request lists the positive entries first, then the negative
+    /// entries, each with its `!`. Before it sends a request, the call
+    /// removes exact duplicate entries of one kind and keeps the first
+    /// appearance. A positive `a` and a negative `!a` both stay, and `a` and
+    /// `a/b` both stay. At most
+    /// [`MAX_REF_PATTERNS`](crate::proto::MAX_REF_PATTERNS) entries can stay,
+    /// positive and negative together. An entry has at most
+    /// [`MAX_REF_ENTRY_LEN`](crate::proto::MAX_REF_ENTRY_LEN) bytes, with its
+    /// `!` counted as one byte, and at most
+    /// [`MAX_REF_ENTRY_PARTS`](crate::proto::MAX_REF_ENTRY_PARTS) parts. The
+    /// `!` adds no part. These rules apply to both transports.
     ///
     /// Over HTTP, the call sends a `GET` of `_ostrya/refs/v1` under the base
-    /// URL of each mirror, at [`Priority::High`]. Each prefix that stays goes
-    /// into the query as one `prefix=VALUE` pair, and `&` separates the
-    /// pairs. The value is the prefix with each byte outside `A-Z`, `a-z`,
-    /// `0-9`, `-`, `.`, `_`, and `~` written as `%XX`, `/` included. An empty
-    /// list sends no query. The request target that the call builds, from
-    /// `_ostrya/refs/v1` to the end of the query, is at most 16 KiB. The base
-    /// path of the mirror comes before it on the wire.
+    /// URL of each mirror, at [`Priority::High`]. Each entry that stays goes
+    /// into the query as one `pattern=VALUE` pair, and `&` separates the
+    /// pairs. The value is the entry with each byte outside `A-Z`, `a-z`,
+    /// `0-9`, `-`, `.`, `_`, and `~` written as `%XX`, so `/` is `%2F`, `!` is
+    /// `%21`, and `*` is `%2A`. A selector with no entry sends no query. The
+    /// request target that the call builds, from `_ostrya/refs/v1` to the end
+    /// of the query, is at most 16 KiB. The base path of the mirror comes
+    /// before it on the wire.
     ///
     /// A 404 is a remote that serves no ref listing, for example a static
     /// file server, and the call returns `None`. If a body fails in transit,
@@ -190,9 +197,10 @@ impl PullSession {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidInput`] if a prefix is not a ref name, or if more
-    ///   than [`MAX_REF_PREFIXES`](crate::proto::MAX_REF_PREFIXES) prefixes
-    ///   stay. The call sends no request.
+    /// - [`Error::InvalidInput`] if an entry is over the limits of bytes or
+    ///   parts, or if more than
+    ///   [`MAX_REF_PATTERNS`](crate::proto::MAX_REF_PATTERNS) entries stay.
+    ///   The call sends no request.
     /// - [`Error::InvalidInput`] over HTTP if the request target is longer
     ///   than 16 KiB. The call sends no request.
     /// - [`Error::Fetch`] over HTTP if a request fails after its retries, or
@@ -201,7 +209,7 @@ impl PullSession {
     ///   [`FetchTooLarge`](ostrya_fetch::Error::FetchTooLarge). A server that
     ///   refuses the request gives
     ///   [`HttpStatus`](ostrya_fetch::Error::HttpStatus), for example 400 for
-    ///   a prefix that it refuses, 414 or 431 for a target that is too long
+    ///   a pattern that it refuses, 414 or 431 for a target that is too long
     ///   for it, and 503 for a server that stays busy.
     /// - [`Error::Io`] over HTTP if the read of the body fails. A body that
     ///   grows past the cap has the kind
@@ -211,11 +219,11 @@ impl PullSession {
     ///   that the server refuses for its cap is also [`Error::LimitExceeded`].
     /// - The error of the session that a failed read of a stream body
     ///   carries.
-    pub async fn fetch_refs(&self, prefixes: &[&str]) -> Result<Option<Vec<u8>>> {
+    pub async fn fetch_refs(&self, selector: &RefSelector) -> Result<Option<Vec<u8>>> {
         match self {
             PullSession::Http(fetcher) => {
-                let prefixes = reduce_prefixes(prefixes)?;
-                let query = refs_query(&prefixes)?;
+                let entries = wire_entries(selector)?;
+                let query = refs_query(&entries)?;
                 let request = match &query {
                     Some(query) => FetchRequest::path_query(REFS_PATH, query),
                     None => FetchRequest::path(REFS_PATH),
@@ -223,7 +231,7 @@ impl PullSession {
                 fetch_optional(fetcher, request, MAX_REF_LISTING).await
             }
             PullSession::Stream(session) => {
-                let body = session.list_refs(prefixes, MAX_REF_LISTING).await?;
+                let body = session.list_refs(selector, MAX_REF_LISTING).await?;
                 read_body(body, MAX_REF_LISTING).await.map(Some)
             }
         }
@@ -258,11 +266,11 @@ impl PullSession {
     }
 }
 
-/// Returns the query of a ref listing of `prefixes`, or `None` for an empty
+/// Returns the query of a ref listing of `entries`, or `None` for an empty
 /// list.
 ///
-/// Each prefix is one `prefix=VALUE` pair, and `&` separates the pairs. The
-/// value is the prefix with each byte outside the unreserved set of URIs
+/// Each entry is one `pattern=VALUE` pair, and `&` separates the pairs. The
+/// value is the entry with each byte outside the unreserved set of URIs
 /// written as `%XX`, in upper case.
 ///
 /// # Errors
@@ -270,30 +278,30 @@ impl PullSession {
 /// [`Error::InvalidInput`] if the request target, [`REFS_PATH`] with `?` and
 /// the query, is longer than [`MAX_REFS_TARGET`]. The function measures the
 /// target before it builds the query.
-fn refs_query(prefixes: &[&str]) -> Result<Option<String>> {
-    if prefixes.is_empty() {
+fn refs_query(entries: &[String]) -> Result<Option<String>> {
+    if entries.is_empty() {
         return Ok(None);
     }
-    let len = prefixes
+    let len = entries
         .iter()
-        .map(|prefix| PREFIX_KEY.len() + encoded_len(prefix))
+        .map(|entry| PATTERN_KEY.len() + encoded_len(entry))
         .sum::<usize>()
-        + prefixes.len()
+        + entries.len()
         - 1;
     let target = REFS_PATH.len() + 1 + len;
     if target > MAX_REFS_TARGET {
         return Err(Error::InvalidInput(format!(
             "the request target of the ref listing is {target} bytes, over the limit of \
-             {MAX_REFS_TARGET}: ask for fewer or shorter prefixes"
+             {MAX_REFS_TARGET}: ask for fewer or shorter patterns"
         )));
     }
     let mut query = String::with_capacity(len);
-    for (n, prefix) in prefixes.iter().enumerate() {
+    for (n, entry) in entries.iter().enumerate() {
         if n > 0 {
             query.push('&');
         }
-        query.push_str(PREFIX_KEY);
-        encode(prefix, &mut query);
+        query.push_str(PATTERN_KEY);
+        encode(entry, &mut query);
     }
     Ok(Some(query))
 }
@@ -444,13 +452,15 @@ mod tests {
     /// Each byte outside the unreserved set is `%XX` in upper case, and the
     /// measured length is the length of the result.
     #[test]
-    fn a_prefix_is_percent_encoded() {
+    fn an_entry_is_percent_encoded() {
         let cases = [
             ("a/b", "a%2Fb"),
             ("A-z.0_9~", "A-z.0_9~"),
             ("x y+z", "x%20y%2Bz"),
             ("?#&=%", "%3F%23%26%3D%25"),
             ("é", "%C3%A9"),
+            ("!a/*", "%21a%2F%2A"),
+            ("a/**", "a%2F%2A%2A"),
         ];
         for (value, encoded) in cases {
             let mut out = String::new();
@@ -459,9 +469,17 @@ mod tests {
             assert_eq!(encoded_len(value), encoded.len());
         }
         assert_eq!(refs_query(&[]).unwrap(), None);
+        let entries =
+            |list: &[&str]| -> Vec<String> { list.iter().map(|e| (*e).to_owned()).collect() };
         assert_eq!(
-            refs_query(&["a/b", "main"]).unwrap().as_deref(),
-            Some("prefix=a%2Fb&prefix=main")
+            refs_query(&entries(&["a/b", "main"])).unwrap().as_deref(),
+            Some("pattern=a%2Fb&pattern=main")
+        );
+        assert_eq!(
+            refs_query(&entries(&["a/**", "x/*", "!a/b/*", "!z"]))
+                .unwrap()
+                .as_deref(),
+            Some("pattern=a%2F%2A%2A&pattern=x%2F%2A&pattern=%21a%2Fb%2F%2A&pattern=%21z")
         );
     }
 
@@ -469,13 +487,26 @@ mod tests {
     /// target of exactly the limit passes.
     #[test]
     fn the_target_limit_is_inclusive() {
-        let fixed = REFS_PATH.len() + 1 + PREFIX_KEY.len();
+        let fixed = REFS_PATH.len() + 1 + PATTERN_KEY.len();
         let fits = "a".repeat(MAX_REFS_TARGET - fixed);
-        let query = refs_query(&[fits.as_str()]).unwrap().unwrap();
+        let query = refs_query(&[fits]).unwrap().unwrap();
         assert_eq!(REFS_PATH.len() + 1 + query.len(), MAX_REFS_TARGET);
         assert_eq!(query.capacity(), query.len());
         let over = "a".repeat(MAX_REFS_TARGET - fixed + 1);
-        let err = refs_query(&[over.as_str()]).unwrap_err();
+        let err = refs_query(&[over]).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+    }
+
+    /// A `!` counts in the length of the target. A negative entry one byte
+    /// over the limit is refused, and a negative entry at the limit passes.
+    #[test]
+    fn the_target_limit_counts_the_bang() {
+        let fixed = REFS_PATH.len() + 1 + PATTERN_KEY.len();
+        let fits = format!("!{}", "a".repeat(MAX_REFS_TARGET - fixed - 3));
+        let query = refs_query(&[fits]).unwrap().unwrap();
+        assert_eq!(REFS_PATH.len() + 1 + query.len(), MAX_REFS_TARGET);
+        let over = format!("!{}", "a".repeat(MAX_REFS_TARGET - fixed - 2));
+        let err = refs_query(&[over]).unwrap_err();
         assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
     }
 }

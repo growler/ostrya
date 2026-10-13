@@ -12,14 +12,16 @@ use std::time::Duration;
 
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::io::{AsyncWriteExt, BufReader};
+use ostrya_core::RefSelector;
 use ostrya_fetch::Priority;
 use ostrya_fetch::gate::{Gate, Permit};
 
 use super::stream::{Input, Output};
 use crate::error::{Error, Result};
 use crate::proto::{
-    FrameReader, FrameWriter, GetReply, Kind, MAX_REF_PREFIXES, MIN_FRAME_LIMIT, Message,
-    PULL_PROTOCOL_VERSION, PullHello, Step, encode_frame, protocol,
+    FrameReader, FrameWriter, GetReply, Kind, MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS,
+    MAX_REF_PATTERNS, MIN_FRAME_LIMIT, Message, PULL_PROTOCOL_VERSION, PullHello, Step,
+    encode_frame, protocol,
 };
 use crate::transport::Transport;
 
@@ -182,47 +184,47 @@ fn body_error(e: Error) -> io::Error {
     io::Error::new(kind, e)
 }
 
-/// Returns the prefixes of a ref listing that a request sends.
+/// Returns the entries of a ref listing that a request sends.
 ///
-/// The function checks that each prefix is a ref name. Then it removes each
-/// duplicate and each prefix that another prefix covers. A prefix covers the
-/// ref of its name and each ref below it, so `a` covers `a/b` and does not
-/// cover `ab`. The result keeps the order of the first appearance of each
-/// prefix that stays. It selects the same refs as `prefixes`.
+/// The positive entries come first, then the negative entries, each with its
+/// `!`. An exact duplicate within one kind is removed, and the first
+/// appearance stays. A positive `x` and a negative `!x` both stay, and no
+/// entry is removed because another entry covers it.
 ///
 /// # Errors
 ///
-/// [`Error::InvalidInput`] if a prefix is not a ref name, or if more than
-/// [`MAX_REF_PREFIXES`] prefixes stay.
-pub(super) fn reduce_prefixes<'a>(prefixes: &[&'a str]) -> Result<Vec<&'a str>> {
-    if let Some(bad) = prefixes.iter().find(|p| !ostrya_core::is_ref_name(p)) {
-        return Err(Error::InvalidInput(format!(
-            "the ref prefix '{bad}' is not a ref name"
-        )));
-    }
-    let given: HashSet<&str> = prefixes.iter().copied().collect();
-    let lens: HashSet<usize> = prefixes.iter().map(|p| p.len()).collect();
-    let mut kept = Vec::new();
+/// [`Error::InvalidInput`] if an entry is over [`MAX_REF_ENTRY_LEN`] bytes,
+/// with its `!` counted as one byte, or over [`MAX_REF_ENTRY_PARTS`] parts,
+/// or if more than [`MAX_REF_PATTERNS`] entries stay.
+pub(super) fn wire_entries(selector: &RefSelector) -> Result<Vec<String>> {
     let mut seen = HashSet::new();
-    for &prefix in prefixes {
-        // The prefixes that cover `prefix` are the parts of it before each
-        // `/`. A part is hashed only if a given prefix has the same length.
-        // So the hashed parts of one prefix have distinct lengths, and their
-        // sum is at most the total length of the given prefixes.
-        let covered = prefix
-            .match_indices('/')
-            .any(|(at, _)| lens.contains(&at) && given.contains(&prefix[..at]));
-        if !covered && seen.insert(prefix) {
-            kept.push(prefix);
+    let mut entries = Vec::new();
+    let positive = selector.positive().iter().map(|p| (false, p.as_str()));
+    let negative = selector.negative().iter().map(|p| (true, p.as_str()));
+    for (is_negative, text) in positive.chain(negative) {
+        if !seen.insert((is_negative, text)) {
+            continue;
         }
+        let len = text.len() + usize::from(is_negative);
+        let parts = text.split('/').count();
+        if len > MAX_REF_ENTRY_LEN || parts > MAX_REF_ENTRY_PARTS {
+            return Err(Error::InvalidInput(format!(
+                "a ref pattern entry has {len} bytes and {parts} parts, over the limits of \
+                 {MAX_REF_ENTRY_LEN} bytes and {MAX_REF_ENTRY_PARTS} parts"
+            )));
+        }
+        if entries.len() == MAX_REF_PATTERNS {
+            return Err(Error::InvalidInput(format!(
+                "the ref listing names more than {MAX_REF_PATTERNS} distinct entries"
+            )));
+        }
+        entries.push(if is_negative {
+            format!("!{text}")
+        } else {
+            text.to_owned()
+        });
     }
-    if kept.len() > MAX_REF_PREFIXES {
-        return Err(Error::InvalidInput(format!(
-            "the ref listing names {} distinct prefixes, over the limit of {MAX_REF_PREFIXES}",
-            kept.len()
-        )));
-    }
-    Ok(kept)
+    Ok(entries)
 }
 
 fn eof(what: &str) -> Error {
@@ -571,18 +573,19 @@ impl StreamSession {
         self.request(Kind::Get, frame, path, max_len).await
     }
 
-    /// Asks for the ref listing of `prefixes` and waits for the head of its
+    /// Asks for the ref listing of `selector` and waits for the head of its
     /// reply.
     ///
-    /// Each prefix is a ref name. A prefix selects the ref of that name and
-    /// each ref below it, under `refs/heads`. An empty list selects all refs
-    /// under `refs/heads`. The [`PullBody`] holds the listing to `max_len`
-    /// bytes and to its stated length.
+    /// The selector selects refs under `refs/heads`. A selector with no
+    /// entry selects all refs under `refs/heads`. The [`PullBody`] holds the
+    /// listing to `max_len` bytes and to its stated length.
     ///
-    /// Before it sends the request, the call removes duplicate prefixes and
-    /// each prefix that another prefix covers. So `["a", "a/b", "a"]` sends
-    /// `["a"]`. The prefixes that stay keep the order of their first
-    /// appearance. At most [`MAX_REF_PREFIXES`] prefixes can stay.
+    /// The request lists the positive entries first, then the negative
+    /// entries, each with its `!`. Before it sends the request, the call
+    /// removes exact duplicate entries of one kind and keeps the first
+    /// appearance. So `["a", "!b", "a"]` sends `["a", "!b"]`. A positive `a`
+    /// and a negative `!a` both stay, and `a` and `a/b` both stay. At most
+    /// [`MAX_REF_PATTERNS`] entries can stay, positive and negative together.
     ///
     /// The call takes its place in the [pipeline](StreamSession#pipeline) as
     /// [`get`](StreamSession::get) does, and it has the same rules for the
@@ -594,22 +597,21 @@ impl StreamSession {
     /// nothing. Each other error is a failure of the session, as
     /// [Failures](StreamSession#failures) states.
     ///
-    /// - [`Error::InvalidInput`] if a prefix is not a ref name, or if more
-    ///   than [`MAX_REF_PREFIXES`] prefixes stay after the removal.
+    /// - [`Error::InvalidInput`] if an entry has more than
+    ///   [`MAX_REF_ENTRY_LEN`] bytes, with its `!` counted as one byte, or
+    ///   more than [`MAX_REF_ENTRY_PARTS`] parts, or if more than
+    ///   [`MAX_REF_PATTERNS`] entries stay after the removal.
     /// - [`Error::LimitExceeded`] if the `ListRefs` frame is longer than
     ///   [`MIN_FRAME_LIMIT`].
     /// - [`Error::Protocol`] if the reply is a `GetReply` whose `found` is
     ///   `false`, or that states no length.
     /// - Each failure of the session that [`get`](StreamSession::get) lists.
-    ///   The server sends `protocol` for a prefix that it refuses, and
+    ///   The server sends `protocol` for an entry that it refuses, and
     ///   `limit-exceeded` for a listing over its cap.
-    pub async fn list_refs(&self, prefixes: &[&str], max_len: u64) -> Result<PullBody> {
+    pub async fn list_refs(&self, selector: &RefSelector, max_len: u64) -> Result<PullBody> {
         self.inner.shared.check()?;
-        let prefixes = reduce_prefixes(prefixes)?;
-        let frame = {
-            let list = Message::ListRefs(prefixes.iter().map(|p| (*p).to_owned()).collect());
-            encode_frame(&list, MIN_FRAME_LIMIT)?
-        };
+        let entries = wire_entries(selector)?;
+        let frame = encode_frame(&Message::ListRefs(entries), MIN_FRAME_LIMIT)?;
         let body = self
             .request(Kind::ListRefs, frame, "ListRefs".to_owned(), max_len)
             .await?;
@@ -1004,25 +1006,74 @@ impl Drop for PullBody {
 mod tests {
     use super::*;
 
-    /// The removal keeps the first appearance of each prefix that no other
-    /// prefix covers, in the given order.
-    #[test]
-    fn duplicates_and_covered_prefixes_are_removed() {
-        let reduced = reduce_prefixes(&["a/b", "x", "a/b/c", "ab", "a", "x", "a/bc"]).unwrap();
-        assert_eq!(reduced, ["x", "ab", "a"]);
-        let reduced = reduce_prefixes(&["a/b", "a/bc", "a/b"]).unwrap();
-        assert_eq!(reduced, ["a/b", "a/bc"]);
-        assert!(reduce_prefixes(&[]).unwrap().is_empty());
+    fn selector(entries: &[&str]) -> RefSelector {
+        RefSelector::parse(entries.iter().copied()).unwrap()
     }
 
-    /// The limit counts the prefixes that stay after the removal.
+    fn wire(entries: &[&str]) -> Vec<String> {
+        wire_entries(&selector(entries)).unwrap()
+    }
+
+    /// An exact duplicate of one kind is removed, the first appearance stays,
+    /// and an entry that another entry covers stays.
     #[test]
-    fn the_limit_counts_the_prefixes_that_stay() {
-        let many: Vec<String> = (0..=MAX_REF_PREFIXES).map(|n| format!("r{n}")).collect();
-        let many: Vec<&str> = many.iter().map(String::as_str).collect();
-        let err = reduce_prefixes(&many).unwrap_err();
+    fn exact_duplicates_are_removed_in_order() {
+        assert_eq!(wire(&["x", "a", "x", "b", "a"]), ["x", "a", "b"]);
+        assert_eq!(wire(&["a", "a/b", "a"]), ["a", "a/b"]);
+        assert!(wire(&[]).is_empty());
+        assert_eq!(wire(&["main"; 300]), ["main"]);
+    }
+
+    /// The positive entries come first, then the negative entries with their
+    /// `!`. A positive and a negative entry of the same text both stay.
+    #[test]
+    fn negative_entries_follow_positive_entries() {
+        assert_eq!(
+            wire(&["!x", "a/**", "!a/b/*", "x", "!x", "a/*"]),
+            ["a/**", "x", "a/*", "!x", "!a/b/*"]
+        );
+    }
+
+    /// The limit counts positive and negative entries together.
+    #[test]
+    fn the_limit_counts_both_kinds() {
+        let entries: Vec<String> = (0..=MAX_REF_PATTERNS)
+            .map(|n| {
+                if n % 2 == 0 {
+                    format!("r{n}")
+                } else {
+                    format!("!r{n}")
+                }
+            })
+            .collect();
+        let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
+        let err = wire_entries(&selector(&entries)).unwrap_err();
         assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
-        assert_eq!(reduce_prefixes(&many[1..]).unwrap().len(), MAX_REF_PREFIXES);
-        assert_eq!(reduce_prefixes(&["main"; 300]).unwrap(), ["main"]);
+        assert_eq!(wire(&entries[1..]).len(), MAX_REF_PATTERNS);
+    }
+
+    /// An entry over the limit of bytes or parts is refused, and an entry at
+    /// the limit passes. The `!` counts as one byte and adds no part.
+    #[test]
+    fn an_entry_over_a_limit_is_refused() {
+        let parts = |n: usize| vec!["a"; n].join("/");
+        let long = |n: usize| "a".repeat(n);
+        for ok in [
+            parts(MAX_REF_ENTRY_PARTS),
+            long(MAX_REF_ENTRY_LEN),
+            format!("!{}", long(MAX_REF_ENTRY_LEN - 1)),
+            format!("!{}", parts(MAX_REF_ENTRY_PARTS)),
+        ] {
+            assert_eq!(wire(&[&ok]), [ok]);
+        }
+        for bad in [
+            parts(MAX_REF_ENTRY_PARTS + 1),
+            long(MAX_REF_ENTRY_LEN + 1),
+            format!("!{}", long(MAX_REF_ENTRY_LEN)),
+            format!("!{}", parts(MAX_REF_ENTRY_PARTS + 1)),
+        ] {
+            let err = wire_entries(&selector(&[&bad])).unwrap_err();
+            assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        }
     }
 }

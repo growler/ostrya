@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::remote;
 use crate::remote::proto::{
     FrameReader, FrameWriter, GetReply, MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_LISTING,
-    MAX_REF_PREFIXES, Message, PULL_PROTOCOL_VERSION, PullHello, PullHelloReply,
+    MAX_REF_PATTERNS, Message, PULL_PROTOCOL_VERSION, PullHello, PullHelloReply,
 };
 use crate::repo::Repo;
 
@@ -111,7 +111,7 @@ impl Repo {
     /// [`build_ref_listing`](Repo::build_ref_listing) builds for its entries.
     /// The entries are ref patterns with an optional leading `!`, which
     /// [`RefSelector::parse`] reads. A `ListRefs` holds at most
-    /// [`MAX_REF_PREFIXES`] entries, and each entry holds at most
+    /// [`MAX_REF_PATTERNS`] entries, and each entry holds at most
     /// [`MAX_REF_ENTRY_PARTS`] parts and [`MAX_REF_ENTRY_LEN`] bytes.
     /// The reply is a `GetReply` with `found` set to `true` and the length of
     /// the listing. The listing follows as chunks.
@@ -169,7 +169,7 @@ impl Repo {
     /// - [`Error::Remote`] with the code `protocol` if a frame is malformed, or
     ///   if `input` ends inside a frame.
     /// - [`Error::Remote`] with the code `protocol` if a `ListRefs` holds more
-    ///   than [`MAX_REF_PREFIXES`] entries, an entry over the limits of one
+    ///   than [`MAX_REF_PATTERNS`] entries, an entry over the limits of one
     ///   entry, or an entry that [`RefSelector::parse`] refuses. An entry
     ///   given two times counts two times. The check of the limits of an entry
     ///   comes before the parse.
@@ -273,7 +273,7 @@ where
             }
             match self.next().await? {
                 Some(Message::Get(path)) => self.get(&path).await?,
-                Some(Message::ListRefs(prefixes)) => self.list_refs(&prefixes).await?,
+                Some(Message::ListRefs(entries)) => self.list_refs(&entries).await?,
                 Some(other) => return Err(out_of_order(&other)),
                 None => return Ok(()),
             }
@@ -347,9 +347,9 @@ where
     /// message in place of the reply.
     async fn list_refs(&mut self, entries: &[String]) -> std::result::Result<(), Failure> {
         let protocol = |why: String| Failure::Wire(remote::Error::Protocol(why));
-        if entries.len() > MAX_REF_PREFIXES {
+        if entries.len() > MAX_REF_PATTERNS {
             return Err(protocol(format!(
-                "ListRefs: {} entries, over the limit of {MAX_REF_PREFIXES}",
+                "ListRefs: {} entries, over the limit of {MAX_REF_PATTERNS}",
                 entries.len()
             )));
         }

@@ -15,6 +15,7 @@ use std::time::Duration;
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::future;
 use futures_lite::io::AsyncReadExt;
+use ostrya_core::RefSelector;
 use ostrya_fetch::{FetcherOptions, Proxy};
 use ostrya_remote::proto::{
     ErrorMessage, FrameReader, FrameWriter, GetReply, MAX_REF_LISTING, Message,
@@ -28,6 +29,11 @@ use ostrya_remote::{
 /// The capacity of each pipe. It is smaller than a large body, so the server
 /// waits for the client to read.
 const PIPE_CAP: usize = 16 * 1024;
+
+/// Returns the selector of `entries`, each a pattern with an optional `!`.
+fn selector<S: AsRef<str>>(entries: &[S]) -> RefSelector {
+    RefSelector::parse(entries.iter().map(AsRef::as_ref)).unwrap()
+}
 
 /// The time bound of each test.
 const LIMIT: Duration = Duration::from_secs(30);
@@ -190,10 +196,10 @@ impl Server {
         self.writer.flush().await.unwrap();
     }
 
-    /// Reads one `ListRefs` and returns its prefixes.
+    /// Reads one `ListRefs` and returns its entries.
     async fn list_refs(&mut self) -> Vec<String> {
         match self.recv().await {
-            Some(Message::ListRefs(prefixes)) => prefixes,
+            Some(Message::ListRefs(entries)) => entries,
             other => panic!("{other:?}"),
         }
     }
@@ -1046,7 +1052,7 @@ fn fetch_refs_and_get_keep_their_order() {
                     let body = stream.get("config", u64::MAX).await.unwrap().unwrap();
                     read_all(body).await.unwrap()
                 };
-                let refs = async { session.fetch_refs(&["a", "b/c"]).await.unwrap() };
+                let refs = async { session.fetch_refs(&selector(&["a", "b/c"])).await.unwrap() };
                 let out = if refs_first {
                     future::zip(refs, get).await
                 } else {
@@ -1082,7 +1088,7 @@ fn fetch_refs_and_get_keep_their_order() {
     }
 }
 
-/// `fetch_refs` sends an empty prefix list as it is, and reads the listing in
+/// `fetch_refs` sends an empty entry list as it is, and reads the listing in
 /// chunks.
 #[test]
 fn fetch_refs_sends_an_empty_list_and_reads_the_listing() {
@@ -1093,7 +1099,7 @@ fn fetch_refs_sends_an_empty_list_and_reads_the_listing() {
             let session = PullSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
-            let got = session.fetch_refs(&[]).await.unwrap();
+            let got = session.fetch_refs(&selector::<&str>(&[])).await.unwrap();
             session.finish().await.unwrap();
             got
         },
@@ -1118,7 +1124,7 @@ fn fetch_refs_refuses_a_stated_length_over_the_cap() {
             let session = PullSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
-            let e = session.fetch_refs(&["main"]).await.unwrap_err();
+            let e = session.fetch_refs(&selector(&["main"])).await.unwrap_err();
             assert!(
                 matches!(&e, Error::LimitExceeded(m)
                     if m.contains(&format!("over the limit {MAX_REF_LISTING}"))),
@@ -1150,12 +1156,18 @@ fn fetch_refs_gives_the_limit_exceeded_of_the_server() {
             let session = PullSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
-            let e = session.fetch_refs(&[]).await.unwrap_err();
+            let e = session
+                .fetch_refs(&selector::<&str>(&[]))
+                .await
+                .unwrap_err();
             assert!(
                 matches!(&e, Error::LimitExceeded(m) if m == "too large"),
                 "{e:?}"
             );
-            let e = session.fetch_refs(&[]).await.unwrap_err();
+            let e = session
+                .fetch_refs(&selector::<&str>(&[]))
+                .await
+                .unwrap_err();
             assert!(
                 matches!(&e, Error::LimitExceeded(m) if m == "too large"),
                 "{e:?}"
@@ -1170,12 +1182,11 @@ fn fetch_refs_gives_the_limit_exceeded_of_the_server() {
     );
 }
 
-/// A prefix that is not a ref name, such as a prefix with a space, a leading
-/// `-`, or a wildcard, is `InvalidInput`. The call writes
+/// An entry over the limit of 4,096 bytes or 256 parts is `InvalidInput`. The call writes
 /// nothing, and the session stays usable: the next frame that the server
 /// reads is the `Get` of a later call.
 #[test]
-fn fetch_refs_refuses_a_bad_prefix_and_writes_nothing() {
+fn fetch_refs_refuses_an_entry_over_a_limit_and_writes_nothing() {
     let ((input, output), mut server) = ends();
     let config = body_of("config");
     let got = run(
@@ -1183,17 +1194,17 @@ fn fetch_refs_refuses_a_bad_prefix_and_writes_nothing() {
             let session = PullSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
+            let parts = |n: usize| vec!["a"; n].join("/");
             for bad in [
-                &[""][..],
-                &["a/../b"],
-                &["a/"],
-                &["main", "/main"],
-                &["a b"],
-                &["-a"],
-                &["a*"],
+                parts(256 + 1),
+                "a".repeat(4096 + 1),
+                format!("!{}", "a".repeat(4096)),
             ] {
-                let e = session.fetch_refs(bad).await.unwrap_err();
-                assert!(matches!(e, Error::InvalidInput(_)), "{bad:?}: {e:?}");
+                let e = session
+                    .fetch_refs(&selector(&["main", bad.as_str()]))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(e, Error::InvalidInput(_)), "{e:?}");
             }
             let PullSession::Stream(stream) = &session else {
                 unreachable!("over_stream gives a stream session");
@@ -1223,7 +1234,7 @@ fn a_not_found_reply_to_list_refs_is_protocol() {
             let session = PullSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
-            let e = session.fetch_refs(&["main"]).await.unwrap_err();
+            let e = session.fetch_refs(&selector(&["main"])).await.unwrap_err();
             assert!(
                 matches!(&e, Error::Protocol(m) if m.contains("ListRefs")),
                 "{e:?}"
@@ -1254,7 +1265,7 @@ fn a_reply_to_list_refs_with_no_length_is_protocol() {
             let session = PullSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
-            let e = session.fetch_refs(&["main"]).await.unwrap_err();
+            let e = session.fetch_refs(&selector(&["main"])).await.unwrap_err();
             assert!(
                 matches!(&e, Error::Protocol(m) if m.contains("no length")),
                 "{e:?}"
@@ -1296,54 +1307,74 @@ fn dead_http_session() -> PullSession {
     .unwrap()
 }
 
-/// Returns `count` distinct prefixes, of which none covers another.
-fn distinct_prefixes(count: usize) -> Vec<String> {
-    (0..count).map(|n| format!("r{n}")).collect()
+/// Returns `count` distinct entries, which alternate between a positive
+/// pattern and a negative pattern.
+fn mixed_entries(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|n| {
+            if n % 2 == 0 {
+                format!("r{n}")
+            } else {
+                format!("!r{n}")
+            }
+        })
+        .collect()
 }
 
-/// Over HTTP, a bad prefix, more than 256 prefixes after the removal of
-/// duplicates and covered prefixes, and a request target over 16 KiB are
-/// `InvalidInput`. The call sends no request: no server listens on the
-/// address, and a request would fail with `Fetch`.
+/// Over HTTP, an entry over a limit, more than 256 entries after the removal
+/// of exact duplicates, and a request target over 16 KiB are `InvalidInput`.
+/// The call sends no request: no server listens on the address, and a request
+/// would fail with `Fetch`.
 #[test]
 fn fetch_refs_over_http_refuses_bad_input_before_a_request() {
     let session = dead_http_session();
-    let many = distinct_prefixes(257);
-    let many: Vec<&str> = many.iter().map(String::as_str).collect();
-    // 256 prefixes of 64 bytes take 256 * 72 bytes of query, with the key
+    let many = mixed_entries(257);
+    // 256 entries of 64 bytes take 256 * 73 bytes of query, with the key
     // and the separator, which is more than 16 KiB.
     let long = (0..256)
         .map(|n| format!("{n:0>64}"))
         .collect::<Vec<String>>();
-    let long: Vec<&str> = long.iter().map(String::as_str).collect();
-    // One prefix of 2,750 `é` is 16,500 bytes encoded.
-    let accents = "é".repeat(2_750);
+    // Four entries of 700 `é` are 4,200 bytes each when encoded, which is
+    // more than 16 KiB, and each entry is under 4,096 bytes.
+    let accents: Vec<String> = (0..4).map(|n| format!("{}{n}", "é".repeat(700))).collect();
+    let parts = "a/".repeat(256) + "a";
+    let bytes = "a".repeat(4096 + 1);
+    let negative_bytes = format!("!{}", "a".repeat(4096));
     ostrya_rt::block_on(async {
-        for (case, prefixes) in [
-            ("bad prefix", &["main", "a/../b"][..]),
-            ("257 prefixes", &many),
+        for (case, entries) in [
+            ("257 entries", &many),
             ("long target", &long),
-            ("escaped target", &[accents.as_str()][..]),
+            ("escaped target", &accents),
+            ("257 parts", &vec![parts]),
+            ("4097 bytes", &vec![bytes]),
+            ("negative 4097 bytes", &vec![negative_bytes]),
         ] {
-            let e = session.fetch_refs(prefixes).await.unwrap_err();
+            let e = session.fetch_refs(&selector(entries)).await.unwrap_err();
             assert!(matches!(e, Error::InvalidInput(_)), "{case}: {e:?}");
         }
-        // 300 copies of one prefix are one prefix, and the client sends the
+        // 300 copies of one entry are one entry, and the client sends the
         // request.
-        let e = session.fetch_refs(&["main"; 300]).await.unwrap_err();
+        let e = session
+            .fetch_refs(&selector(&["main"; 300]))
+            .await
+            .unwrap_err();
         assert!(matches!(e, Error::Fetch(_)), "{e:?}");
-        // 256 distinct prefixes pass the client checks.
-        let e = session.fetch_refs(&many[..256]).await.unwrap_err();
+        // 256 distinct entries, of both kinds, pass the client checks.
+        let e = session
+            .fetch_refs(&selector(&many[..256]))
+            .await
+            .unwrap_err();
         assert!(matches!(e, Error::Fetch(_)), "{e:?}");
     });
     ostrya_rt::block_on(session.finish()).unwrap();
 }
 
-/// Over a stream session, more than 256 prefixes after the removal is
-/// `InvalidInput`, and the call writes nothing. The client removes
-/// duplicates and covered prefixes before it sends `ListRefs`.
+/// Over a stream session, more than 256 entries after the removal, positive
+/// and negative together, is `InvalidInput`, and the call writes nothing. The
+/// client removes exact duplicates before it sends `ListRefs`, puts the
+/// positive entries first, and keeps an entry that another entry covers.
 #[test]
-fn fetch_refs_over_a_stream_counts_the_prefixes_that_stay() {
+fn fetch_refs_over_a_stream_counts_the_entries_that_stay() {
     let ((input, output), mut server) = ends();
     let listing = body_of("listing");
     let got = run(
@@ -1351,19 +1382,21 @@ fn fetch_refs_over_a_stream_counts_the_prefixes_that_stay() {
             let session = PullSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
-            let many = distinct_prefixes(257);
-            let many: Vec<&str> = many.iter().map(String::as_str).collect();
-            let e = session.fetch_refs(&many).await.unwrap_err();
+            let many = mixed_entries(257);
+            let e = session.fetch_refs(&selector(&many)).await.unwrap_err();
             assert!(matches!(e, Error::InvalidInput(_)), "{e:?}");
-            let mut prefixes = vec!["a/b", "main", "a"];
-            prefixes.extend(["main"; 300]);
-            let got = session.fetch_refs(&prefixes).await.unwrap();
+            let mut entries = vec!["!a/*", "a/b", "main", "a", "!main"];
+            entries.extend(["main"; 300]);
+            let got = session.fetch_refs(&selector(&entries)).await.unwrap();
             session.finish().await.unwrap();
             got
         },
         async {
             server.hello(1).await;
-            assert_eq!(server.list_refs().await, ["main", "a"]);
+            assert_eq!(
+                server.list_refs().await,
+                ["a/b", "main", "a", "!a/*", "!main"]
+            );
             server.body(Some(listing.len() as u64), &listing, 700).await;
             assert!(server.recv().await.is_none());
         },

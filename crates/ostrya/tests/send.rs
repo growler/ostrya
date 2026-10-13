@@ -819,30 +819,30 @@ fn list_refs_over_the_entry_limits_is_protocol() {
     }
 }
 
-/// A `ListRefs` with more than `MAX_REF_PREFIXES` prefixes is `protocol`.
-/// A prefix given two times counts two times, and the limit itself passes.
+/// A `ListRefs` with more than `MAX_REF_PATTERNS` entries is `protocol`.
+/// Positive and negative entries count together, an entry given two times
+/// counts two times, and the limit itself passes.
 #[test]
-fn list_refs_over_the_prefix_limit_is_protocol() {
+fn list_refs_over_the_entry_count_limit_is_protocol() {
     let tmp = TmpDir::new("send-list-refs-many");
     let repo = listing_repo(&tmp);
+    let mixed = |count: usize| -> Vec<String> {
+        (0..count)
+            .map(|n| if n % 2 == 0 { "a/b" } else { "!a/b" }.to_owned())
+            .collect()
+    };
     let (result, reply) = session(&repo, PIPE_CAP, |mut c| async move {
         c.open().await;
-        c.send(&Message::ListRefs(vec![
-            "a/b".to_owned();
-            ostrya::MAX_REF_PREFIXES
-        ]))
-        .await;
+        c.send(&Message::ListRefs(mixed(ostrya::MAX_REF_PATTERNS)))
+            .await;
         read_reply(&mut c.reader).await
     });
     result.unwrap();
     assert!(reply.found);
     let (result, error) = session(&repo, PIPE_CAP, |mut c| async move {
         c.open().await;
-        c.send(&Message::ListRefs(vec![
-            "a/b".to_owned();
-            ostrya::MAX_REF_PREFIXES + 1
-        ]))
-        .await;
+        c.send(&Message::ListRefs(mixed(ostrya::MAX_REF_PATTERNS + 1)))
+            .await;
         c.error().await
     });
     assert_eq!(error.code, ErrorCode::Protocol);

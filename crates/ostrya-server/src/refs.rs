@@ -2,7 +2,7 @@
 //! selects.
 //!
 //! A `GET` of [`PATH`] gets the bytes of [`Repo::build_ref_listing`], built
-//! for each request. Each pair of the query is `prefix=VALUE`. The value is
+//! for each request. Each pair of the query is `pattern=VALUE`. The value is
 //! percent-decoded, and it is one entry of a [`RefSelector`]: a ref pattern
 //! with an optional leading `!`. An entry has at most
 //! [`MAX_REF_ENTRY_PARTS`] parts and [`MAX_REF_ENTRY_LEN`] bytes. The server
@@ -14,7 +14,6 @@
 //! server holds at most [`MAX_LISTINGS`] listings at the same time, over all
 //! connections.
 
-use std::collections::HashSet;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -25,7 +24,7 @@ use futures_io::AsyncRead;
 use futures_lite::io::Cursor;
 use hyper::header::{ALLOW, HeaderValue, RETRY_AFTER};
 use hyper::{Method, Response, StatusCode};
-use ostrya::{MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_PREFIXES, RefSelector, Repo};
+use ostrya::{MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_PATTERNS, RefSelector, Repo};
 
 use crate::body::ServeBody;
 use crate::router::{empty, percent_decode, with_length};
@@ -35,7 +34,7 @@ use crate::stall::Stall;
 pub(crate) const PATH: &str = "/_ostrya/refs/v1";
 
 /// The key of each pair of the query.
-const PREFIX_KEY: &str = "prefix";
+const PATTERN_KEY: &str = "pattern";
 
 /// The most listings that the server holds at the same time, over all
 /// connections. A listing holds its slot from the start of its build until
@@ -160,14 +159,16 @@ impl AsyncRead for Listing {
 /// Returns the selector of the raw `query`. No query and an empty query give
 /// the selector with no entry.
 ///
-/// Each pair of the query is `prefix=VALUE`, and `&` separates two pairs.
-/// The key must be the raw bytes `prefix`. The value is percent-decoded with
+/// Each pair of the query is `pattern=VALUE`, and `&` separates two pairs.
+/// The key must be the raw bytes `pattern`. The value is percent-decoded with
 /// [`percent_decode`], so `+` stays `+`, and it is one entry of
 /// [`RefSelector::parse`]. If a pair is empty, has no `=`, has another key,
-/// has a value that does not decode, or has an entry over
+/// has a value over three times [`MAX_REF_ENTRY_LEN`] bytes, which the
+/// function refuses before it decodes, has a value that does not decode, or
+/// has an entry over
 /// [`MAX_REF_ENTRY_PARTS`] parts or [`MAX_REF_ENTRY_LEN`] bytes, the function
 /// returns `None`. The limits of an entry come before the parse. If the
-/// query has more than [`MAX_REF_PREFIXES`] pairs, the function returns
+/// query has more than [`MAX_REF_PATTERNS`] pairs, the function returns
 /// `None` before it decodes the pair after the limit. If the parse refuses
 /// an entry, the function returns `None`. A server keeps each entry and
 /// drops an entry that a pair repeats exactly.
@@ -177,20 +178,22 @@ fn parse_query(query: Option<&str>) -> Option<RefSelector> {
         Some(query) => query,
     };
     let mut entries: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
     for (index, pair) in query.split('&').enumerate() {
-        if index == MAX_REF_PREFIXES {
+        if index == MAX_REF_PATTERNS {
             return None;
         }
         let (key, value) = pair.split_once('=')?;
-        if key != PREFIX_KEY {
+        if key != PATTERN_KEY {
+            return None;
+        }
+        if value.len() > 3 * MAX_REF_ENTRY_LEN {
             return None;
         }
         let entry = percent_decode(value)?;
         if entry.len() > MAX_REF_ENTRY_LEN || entry.split('/').count() > MAX_REF_ENTRY_PARTS {
             return None;
         }
-        if seen.insert(entry.clone()) {
+        if !entries.contains(&entry) {
             entries.push(entry);
         }
     }
@@ -218,15 +221,15 @@ mod tests {
     #[test]
     fn each_pair_gives_one_decoded_entry() {
         assert_eq!(
-            selector("prefix=a%2Fb&prefix=main"),
+            selector("pattern=a%2Fb&pattern=main"),
             Some(parsed(&["a/b", "main"]))
         );
-        assert_eq!(selector("prefix=a/b%2fc"), Some(parsed(&["a/b/c"])));
-        assert_eq!(selector("prefix=a%2F%2A"), Some(parsed(&["a/*"])));
-        assert_eq!(selector("prefix=a%2f**"), Some(parsed(&["a/**"])));
-        assert_eq!(selector("prefix=%21a%2Fb"), Some(parsed(&["!a/b"])));
+        assert_eq!(selector("pattern=a/b%2fc"), Some(parsed(&["a/b/c"])));
+        assert_eq!(selector("pattern=a%2F%2A"), Some(parsed(&["a/*"])));
+        assert_eq!(selector("pattern=a%2f**"), Some(parsed(&["a/**"])));
+        assert_eq!(selector("pattern=%21a%2Fb"), Some(parsed(&["!a/b"])));
         assert_eq!(
-            selector("prefix=a%2F%2A%2Fc&prefix=%21a%2Fx%2F%2A%2A"),
+            selector("pattern=a%2F%2A%2Fc&pattern=%21a%2Fx%2F%2A%2A"),
             Some(parsed(&["a/*/c", "!a/x/**"]))
         );
     }
@@ -236,33 +239,33 @@ mod tests {
     #[test]
     fn an_exact_repeat_is_dropped() {
         assert_eq!(
-            selector("prefix=x&prefix=x&prefix=x%2F%2A"),
+            selector("pattern=x&pattern=x&pattern=x%2F%2A"),
             Some(parsed(&["x", "x/*"]))
         );
-        assert_eq!(selector("prefix=%21x&prefix=%21x"), Some(parsed(&["!x"])));
+        assert_eq!(selector("pattern=%21x&pattern=%21x"), Some(parsed(&["!x"])));
     }
 
     /// An entry that `RefSelector::parse` refuses makes the query bad.
     #[test]
     fn a_bad_entry_is_refused() {
         for bad in [
-            "prefix=",
-            "prefix=%2F",
-            "prefix=a%2F%2Fb",
-            "prefix=a%2F",
-            "prefix=%2Fa",
-            "prefix=a%2A",
-            "prefix=%2A%2Ax",
-            "prefix=%2A%2A%2A",
-            "prefix=%21%21a",
-            "prefix=%21",
-            "prefix=a%21",
-            "prefix=a+b",
-            "prefix=a=b",
-            "prefix=a%2B",
-            "prefix=main&prefix=a%2F%2Fb",
-            "prefix=..",
-            "prefix=-a",
+            "pattern=",
+            "pattern=%2F",
+            "pattern=a%2F%2Fb",
+            "pattern=a%2F",
+            "pattern=%2Fa",
+            "pattern=a%2A",
+            "pattern=%2A%2Ax",
+            "pattern=%2A%2A%2A",
+            "pattern=%21%21a",
+            "pattern=%21",
+            "pattern=a%21",
+            "pattern=a+b",
+            "pattern=a=b",
+            "pattern=a%2B",
+            "pattern=main&pattern=a%2F%2Fb",
+            "pattern=..",
+            "pattern=-a",
         ] {
             assert_eq!(selector(bad), None, "{bad}");
         }
@@ -272,20 +275,22 @@ mod tests {
     fn bad_pairs_are_refused() {
         for bad in [
             "&",
-            "prefix=a&",
-            "&prefix=a",
-            "prefix=a&&prefix=b",
-            "prefix",
-            "prefix=a&prefix",
+            "pattern=a&",
+            "&pattern=a",
+            "pattern=a&&pattern=b",
+            "pattern",
+            "pattern=a&pattern",
             "x=1",
-            "Prefix=a",
-            "prefix%3Da",
-            "pre%66ix=a",
-            "prefix =a",
-            "prefix=a%zz",
-            "prefix=a%2",
-            "prefix=a%00",
-            "prefix=%ff",
+            "prefix=a",
+            "pattern=a&prefix=b",
+            "Pattern=a",
+            "pattern%3Da",
+            "pat%74ern=a",
+            "pattern =a",
+            "pattern=a%zz",
+            "pattern=a%2",
+            "pattern=a%00",
+            "pattern=%ff",
         ] {
             assert_eq!(selector(bad), None, "{bad}");
         }
@@ -295,18 +300,27 @@ mod tests {
     /// before the decode and the parse of the pair after it.
     #[test]
     fn a_query_takes_at_most_256_pairs() {
-        let query = |count: usize| vec!["prefix=a"; count].join("&");
-        assert_eq!(selector(&query(MAX_REF_PREFIXES)), Some(parsed(&["a"])));
-        assert_eq!(selector(&query(MAX_REF_PREFIXES + 1)), None);
-        let distinct: Vec<String> = (0..MAX_REF_PREFIXES)
-            .map(|n| format!("prefix=r{n}"))
+        let query = |count: usize| vec!["pattern=a"; count].join("&");
+        assert_eq!(selector(&query(MAX_REF_PATTERNS)), Some(parsed(&["a"])));
+        assert_eq!(selector(&query(MAX_REF_PATTERNS + 1)), None);
+        let distinct: Vec<String> = (0..MAX_REF_PATTERNS)
+            .map(|n| {
+                if n % 2 == 0 {
+                    format!("pattern=r{n}")
+                } else {
+                    format!("pattern=%21r{n}")
+                }
+            })
             .collect();
         let distinct = distinct.join("&");
+        let both = selector(&distinct).unwrap();
         assert_eq!(
-            selector(&distinct).unwrap().positive().len(),
-            MAX_REF_PREFIXES
+            both.positive().len() + both.negative().len(),
+            MAX_REF_PATTERNS
         );
-        assert_eq!(selector(&format!("{distinct}&prefix=%zz")), None);
+        assert_eq!(both.negative().len(), MAX_REF_PATTERNS / 2);
+        assert_eq!(selector(&format!("{distinct}&pattern=%21z")), None);
+        assert_eq!(selector(&format!("{distinct}&pattern=%zz")), None);
     }
 
     /// An entry has at most 256 parts and 4096 bytes. The limit comes before
@@ -314,24 +328,41 @@ mod tests {
     #[test]
     fn an_entry_takes_at_most_256_parts_and_4096_bytes() {
         let parts = |count: usize| vec!["a"; count].join("%2F");
-        assert!(selector(&format!("prefix={}", parts(MAX_REF_ENTRY_PARTS))).is_some());
+        assert!(selector(&format!("pattern={}", parts(MAX_REF_ENTRY_PARTS))).is_some());
         assert_eq!(
-            selector(&format!("prefix={}", parts(MAX_REF_ENTRY_PARTS + 1))),
+            selector(&format!("pattern={}", parts(MAX_REF_ENTRY_PARTS + 1))),
             None
         );
         let len = |count: usize| "a".repeat(count);
-        assert!(selector(&format!("prefix={}", len(MAX_REF_ENTRY_LEN))).is_some());
+        assert!(selector(&format!("pattern={}", len(MAX_REF_ENTRY_LEN))).is_some());
         assert_eq!(
-            selector(&format!("prefix={}", len(MAX_REF_ENTRY_LEN + 1))),
+            selector(&format!("pattern={}", len(MAX_REF_ENTRY_LEN + 1))),
             None
         );
         // The bytes of a `!` count.
         assert_eq!(
-            selector(&format!("prefix=%21{}", len(MAX_REF_ENTRY_LEN))),
+            selector(&format!("pattern=%21{}", len(MAX_REF_ENTRY_LEN))),
+            None
+        );
+        // The `!` adds no part: 256 parts pass, 257 do not.
+        assert!(selector(&format!("pattern=%21{}", parts(MAX_REF_ENTRY_PARTS))).is_some());
+        assert_eq!(
+            selector(&format!("pattern=%21{}", parts(MAX_REF_ENTRY_PARTS + 1))),
             None
         );
         // An entry over the limit with a bad text gets the same refusal.
-        assert_eq!(selector(&format!("prefix={}", "%2F".repeat(300))), None);
+        assert_eq!(selector(&format!("pattern={}", "%2F".repeat(300))), None);
+    }
+
+    /// A raw value over three times the byte limit of an entry is refused
+    /// before the decode. A raw value at the limit is decoded.
+    #[test]
+    fn a_raw_value_over_the_limit_is_refused() {
+        let limit = 3 * MAX_REF_ENTRY_LEN;
+        let value = |len: usize| "%61".repeat(len / 3);
+        assert_eq!(value(limit).len(), limit);
+        assert!(selector(&format!("pattern={}", value(limit))).is_some());
+        assert_eq!(selector(&format!("pattern={}a", value(limit))), None);
     }
 
     /// A slot counts while it lives, and leaves the count when it drops. No
@@ -382,12 +413,15 @@ mod tests {
         assert_eq!(refused(Method::GET, "x"), StatusCode::BAD_REQUEST);
         // A bad entry gets 400 also when no slot is free.
         assert_eq!(
-            refused(Method::GET, "prefix=a%2F%2Fb"),
+            refused(Method::GET, "pattern=a%2F%2Fb"),
             StatusCode::BAD_REQUEST
         );
-        assert_eq!(refused(Method::GET, "prefix=a%2A"), StatusCode::BAD_REQUEST);
         assert_eq!(
-            refused(Method::GET, "prefix=a"),
+            refused(Method::GET, "pattern=a%2A"),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            refused(Method::GET, "pattern=a"),
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(listings.load(Ordering::Acquire), MAX_LISTINGS);
@@ -407,7 +441,7 @@ mod tests {
         );
 
         listings.store(MAX_LISTINGS - 1, Ordering::Release);
-        let Ok((selector, slot)) = admit(&Method::GET, Some("prefix=a"), &listings) else {
+        let Ok((selector, slot)) = admit(&Method::GET, Some("pattern=a"), &listings) else {
             panic!("a free slot is refused");
         };
         assert_eq!(selector, parsed(&["a"]));

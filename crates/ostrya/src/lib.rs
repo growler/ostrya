@@ -167,7 +167,7 @@ pub use ostrya_core::{
     is_checksum_shaped, loose_path, to_text, to_text_unannotated,
 };
 pub use ostrya_remote::proto::{
-    MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_LISTING, MAX_REF_PREFIXES,
+    MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_LISTING, MAX_REF_PATTERNS,
 };
 #[doc(hidden)]
 pub use prune::{PruneOptions, PruneStats, WeakRefFilter, WeakRefFilterFn};

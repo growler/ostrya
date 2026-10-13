@@ -619,7 +619,7 @@ fn the_ref_listing_is_served() {
             async move { exchange(addr, &request).await }
         };
 
-        let (head, body) = get("?prefix=a%2Fb%2F%2A%2A&prefix=main").await;
+        let (head, body) = get("?pattern=a%2Fb%2F%2A%2A&pattern=main").await;
         assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
         assert_eq!(
             body,
@@ -641,13 +641,17 @@ fn the_ref_listing_is_served() {
         assert_eq!(names, ["a/b/c", "a/b/d", "main"]);
 
         let all = repo.build_ref_listing(&selector(&[])).await.unwrap();
-        for query in ["", "?", "#prefix=main"] {
+        for query in ["", "?", "#pattern=main"] {
             let (head, body) = get(query).await;
             assert!(head.starts_with("HTTP/1.1 200 "), "{query}: {head}");
             assert_eq!(body, all, "{query}");
         }
         let main = repo.build_ref_listing(&selector(&["main"])).await.unwrap();
-        for query in ["?prefix=main&prefix=main", "?prefix=main", "?prefix=main#x"] {
+        for query in [
+            "?pattern=main&pattern=main",
+            "?pattern=main",
+            "?pattern=main#x",
+        ] {
             let (head, body) = get(query).await;
             assert!(head.starts_with("HTTP/1.1 200 "), "{query}: {head}");
             assert_eq!(body, main, "{query}");
@@ -656,16 +660,20 @@ fn the_ref_listing_is_served() {
         // A wildcard, a negative entry, a mixed list, and an overlap give
         // the listing of their selector. `a%2F%2A` is `a/*`, `%21` is `!`.
         let cases: [(&str, &[&str], &[&str]); 5] = [
-            ("?prefix=a%2F%2A", &["a/*"], &["a/bc"]),
-            ("?prefix=a%2F%2A%2A", &["a/**"], &["a/b/c", "a/b/d", "a/bc"]),
-            ("?prefix=%21a%2F%2A%2A", &["!a/**"], &["main"]),
+            ("?pattern=a%2F%2A", &["a/*"], &["a/bc"]),
             (
-                "?prefix=a%2F%2A%2A&prefix=%21a%2Fb%2F%2A",
+                "?pattern=a%2F%2A%2A",
+                &["a/**"],
+                &["a/b/c", "a/b/d", "a/bc"],
+            ),
+            ("?pattern=%21a%2F%2A%2A", &["!a/**"], &["main"]),
+            (
+                "?pattern=a%2F%2A%2A&pattern=%21a%2Fb%2F%2A",
                 &["a/**", "!a/b/*"],
                 &["a/bc"],
             ),
             (
-                "?prefix=a%2F%2A&prefix=a%2F%2A%2A&prefix=a%2F%2A",
+                "?pattern=a%2F%2A&pattern=a%2F%2A%2A&pattern=a%2F%2A",
                 &["a/*", "a/**"],
                 &["a/b/c", "a/b/d", "a/bc"],
             ),
@@ -696,14 +704,14 @@ fn a_failed_listing_gets_500() {
     )
     .unwrap();
     with_server(repo.clone(), local(), |addrs| async move {
-        let target = "/_ostrya/refs/v1?prefix=absent";
+        let target = "/_ostrya/refs/v1?pattern=absent";
         for _ in 0..6 {
             let (head, body) = exchange(addrs[0], &ask("GET", target)).await;
             assert!(head.starts_with("HTTP/1.1 500 "), "{head}");
             assert_eq!(header(&head, "content-length"), Some("0"));
             assert!(body.is_empty());
         }
-        let (head, body) = exchange(addrs[0], &ask("GET", "/_ostrya/refs/v1?prefix=main")).await;
+        let (head, body) = exchange(addrs[0], &ask("GET", "/_ostrya/refs/v1?pattern=main")).await;
         assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
         assert_eq!(
             body,
@@ -723,25 +731,28 @@ fn the_ref_listing_refuses_bad_queries() {
     with_server(repo, local(), |addrs| async move {
         for query in [
             "?x=1",
-            "?prefix",
-            "?prefix=",
-            "?prefix=a&&prefix=b",
-            "?prefix=a%zz",
-            "?prefix=a%00",
-            "?prefix=%ff",
-            "?prefix=a%2F%2Fb",
-            "?prefix=..",
-            "?prefix=a/",
-            "?prefix=a%20b",
-            "?prefix=-a",
-            "?prefix=a*",
-            "?prefix=a%2A",
-            "?prefix=%2A%2Ax",
-            "?prefix=%21%21a",
-            "?prefix=%21",
-            "?prefix=a%21",
-            "?prefix=%2F",
-            "?prefix=main&prefix=a%2F%2Fb",
+            "?pattern",
+            "?prefix=main",
+            "?prefix=a&pattern=b",
+            "?pattern=main&prefix=a",
+            "?pattern=",
+            "?pattern=a&&pattern=b",
+            "?pattern=a%zz",
+            "?pattern=a%00",
+            "?pattern=%ff",
+            "?pattern=a%2F%2Fb",
+            "?pattern=..",
+            "?pattern=a/",
+            "?pattern=a%20b",
+            "?pattern=-a",
+            "?pattern=a*",
+            "?pattern=a%2A",
+            "?pattern=%2A%2Ax",
+            "?pattern=%21%21a",
+            "?pattern=%21",
+            "?pattern=a%21",
+            "?pattern=%2F",
+            "?pattern=main&pattern=a%2F%2Fb",
         ] {
             let target = format!("/_ostrya/refs/v1{query}");
             let (head, body) = exchange(addrs[0], &ask("GET", &target)).await;
@@ -753,13 +764,13 @@ fn the_ref_listing_refuses_bad_queries() {
         let parts = |n: usize| vec!["a"; n].join("%2F");
         let long = |n: usize| "a".repeat(n);
         for (query, status) in [
-            (format!("?prefix={}", parts(256)), "200"),
-            (format!("?prefix={}", parts(257)), "400"),
-            (format!("?prefix={}", long(4096)), "200"),
-            (format!("?prefix={}", long(4097)), "400"),
-            (format!("?prefix=%21{}", long(4096)), "400"),
-            ("?prefix=a%2F%2A".to_owned(), "200"),
-            ("?prefix=a%2F%2A%2A&prefix=%21a%2Fx".to_owned(), "200"),
+            (format!("?pattern={}", parts(256)), "200"),
+            (format!("?pattern={}", parts(257)), "400"),
+            (format!("?pattern={}", long(4096)), "200"),
+            (format!("?pattern={}", long(4097)), "400"),
+            (format!("?pattern=%21{}", long(4096)), "400"),
+            ("?pattern=a%2F%2A".to_owned(), "200"),
+            ("?pattern=a%2F%2A%2A&pattern=%21a%2Fx".to_owned(), "200"),
         ] {
             let target = format!("/_ostrya/refs/v1{query}");
             let (head, _) = exchange(addrs[0], &ask("GET", &target)).await;
@@ -803,7 +814,7 @@ fn the_view_still_serves_refs_heads() {
             let (head, _) = exchange(addr, &ask("GET", target)).await;
             assert!(head.starts_with("HTTP/1.1 404 "), "{target}: {head}");
         }
-        let (head, body) = exchange(addr, &ask("GET", "/config?prefix=x")).await;
+        let (head, body) = exchange(addr, &ask("GET", "/config?pattern=x")).await;
         assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
         assert!(body.starts_with(b"[core]\n"));
     });
@@ -824,7 +835,7 @@ fn listed_names(listing: &[u8]) -> Vec<String> {
 }
 
 /// `PullSession::fetch_refs` over HTTP/1.1 and over HTTP/2 gives the bytes of
-/// `build_ref_listing`. The client removes duplicate prefixes, and a ref name
+/// `build_ref_listing`. The client removes exact duplicate entries, and a ref name
 /// with bytes that the query escapes comes back unchanged.
 #[test]
 fn fetch_refs_over_http_gives_the_built_listing() {
@@ -843,23 +854,51 @@ fn fetch_refs_over_http_gives_the_built_listing() {
         with_server(repo.clone(), opts, |addrs| async move {
             let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
             let session = PullSession::Http(fetcher(url, http2, None).await);
-            let cases: [(&[&str], &[&str]); 4] = [
-                (&["a/b/c", "main"], &["a/b/c", "main"]),
-                (&[], &[]),
-                (&["main", "a/b/c", "main"], &["main", "a/b/c"]),
-                (&ESCAPED_REFS, &ESCAPED_REFS),
+            // The client sends the positive entries first, then the negative
+            // entries, and drops an exact duplicate. The listing is the
+            // listing of the same selector in the repository.
+            let cases: [&[&str]; 11] = [
+                &["a/b/c", "main"],
+                &[],
+                &["main", "a/b/c", "main"],
+                &ESCAPED_REFS,
+                &["a/*"],
+                &["a/**"],
+                &["**"],
+                &["!a/**"],
+                &["a/**", "!a/b/*"],
+                &["!a/b/*", "a/**", "!a/b/*", "a/*"],
+                &["a/*", "a/**", "!main", "!a/bc", "a/*"],
             ];
-            for (prefixes, built) in cases {
-                let got = session.fetch_refs(prefixes).await.unwrap().unwrap();
-                let want = repo.build_ref_listing(&selector(built)).await.unwrap();
-                assert_eq!(got, want, "{scheme}: {prefixes:?}");
+            for entries in cases {
+                let got = session
+                    .fetch_refs(&selector(entries))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let want = repo.build_ref_listing(&selector(entries)).await.unwrap();
+                assert_eq!(got, want, "{scheme}: {entries:?}");
             }
-            let got = session.fetch_refs(&ESCAPED_REFS).await.unwrap().unwrap();
+            let got = session
+                .fetch_refs(&selector(&["a/**", "!a/b/*"]))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(listed_names(&got), ["a/bc"], "{scheme}");
+            let got = session
+                .fetch_refs(&selector(&ESCAPED_REFS))
+                .await
+                .unwrap()
+                .unwrap();
             let mut names = ESCAPED_REFS.map(str::to_owned).to_vec();
             names.sort();
             assert_eq!(listed_names(&got), names, "{scheme}");
             for name in ESCAPED_REFS {
-                let got = session.fetch_refs(&[name]).await.unwrap().unwrap();
+                let got = session
+                    .fetch_refs(&selector(&[name]))
+                    .await
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(listed_names(&got), [name], "{scheme}: {name}");
             }
         });
@@ -884,14 +923,13 @@ fn prefix_of_encoded_len(len: usize) -> String {
 
 /// A request target of exactly 16 KiB, the client limit, gets the listing over
 /// HTTP/1.1 and over HTTP/2. The target is `_ostrya/refs/v1?` and five
-/// pairs `prefix=` and an encoded name, so each name is under the limit of
-/// 4096 bytes of one entry. The first part of each name differs, so no name
-/// covers another.
+/// pairs `pattern=` and an encoded name, so each name is under the limit of
+/// 4096 bytes of one entry. The first part of each name differs.
 #[test]
 fn fetch_refs_takes_a_target_at_the_client_limit() {
     let tmp = TmpDir::new("fetch-refs-target");
     let (_, repo, _, _) = block_on(repo(tmp.path()));
-    let fixed = "_ostrya/refs/v1?".len() + 5 * "prefix=".len() + 4;
+    let fixed = "_ostrya/refs/v1?".len() + 5 * "pattern=".len() + 4;
     let mut lens = vec![3900; 4];
     lens.push(16 * 1024 - fixed - lens.iter().sum::<usize>());
     let prefixes: Vec<String> = lens
@@ -915,15 +953,61 @@ fn fetch_refs_takes_a_target_at_the_client_limit() {
             let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
             let session = PullSession::Http(fetcher(url, http2, None).await);
             let entries: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-            let got = session.fetch_refs(&entries).await;
+            let got = session.fetch_refs(&selector(&entries)).await;
             let want = repo.build_ref_listing(&selector(&entries)).await.unwrap();
             assert_eq!(got.unwrap(), Some(want), "{scheme}");
         });
     }
 }
 
-/// A prefix with a part longer than 255 bytes gets the listing of an absent
-/// prefix over HTTP/1.1 and over HTTP/2.
+/// A list of 200 positive and negative entries passes the client and the
+/// server over HTTP/1.1 and over HTTP/2, and gives the listing of the same
+/// selector in the repository. A list of 257 entries is refused by the
+/// client with `InvalidInput`, and the same session then reads a listing.
+#[test]
+fn fetch_refs_takes_a_mixed_list_up_to_the_limit() {
+    let tmp = TmpDir::new("fetch-refs-mixed");
+    let (_, repo, commit, _) = block_on(repo(tmp.path()));
+    block_on(add_refs(&repo, &commit));
+    let mixed = |count: usize| -> Vec<String> {
+        let mut entries: Vec<String> = (0..count)
+            .map(|n| {
+                if n % 2 == 0 {
+                    format!("p{n}/**")
+                } else {
+                    format!("!n{n}/*")
+                }
+            })
+            .collect();
+        entries[0] = "a/**".to_owned();
+        entries[1] = "!a/b/*".to_owned();
+        entries
+    };
+    for (opts, scheme, http2) in [(local(), "http", false), (tls(false), "https", true)] {
+        let repo = repo.clone();
+        with_server(repo.clone(), opts, |addrs| async move {
+            let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
+            let session = PullSession::Http(fetcher(url, http2, None).await);
+            let entries = mixed(200);
+            let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
+            let got = session.fetch_refs(&selector(&entries)).await;
+            let want = repo.build_ref_listing(&selector(&entries)).await.unwrap();
+            assert_eq!(got.unwrap(), Some(want), "{scheme}");
+            let entries = mixed(257);
+            let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
+            let err = session.fetch_refs(&selector(&entries)).await.unwrap_err();
+            assert!(
+                matches!(err, ostrya::remote::Error::InvalidInput(_)),
+                "{err:?}"
+            );
+            let got = session.fetch_refs(&selector(&["main"])).await.unwrap();
+            assert!(got.is_some(), "{scheme}");
+        });
+    }
+}
+
+/// A pattern with a part longer than 255 bytes gets the listing of an absent
+/// name over HTTP/1.1 and over HTTP/2.
 #[test]
 fn fetch_refs_of_a_too_long_part_gets_an_empty_listing() {
     let tmp = TmpDir::new("fetch-refs-long-part");
@@ -935,7 +1019,7 @@ fn fetch_refs_of_a_too_long_part_gets_an_empty_listing() {
         with_server(repo.clone(), opts, |addrs| async move {
             let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
             let session = PullSession::Http(fetcher(url, http2, None).await);
-            let got = session.fetch_refs(&[long.as_str()]).await;
+            let got = session.fetch_refs(&selector(&[long.as_str()])).await;
             let want = repo
                 .build_ref_listing(&selector(&["absent"]))
                 .await
@@ -1062,7 +1146,11 @@ fn a_chain_from_the_ref_listing_is_pulled_over_http() {
         with_server(server.clone(), opts, |addrs| async move {
             let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
             let session = PullSession::Http(fetcher(url, http2, None).await);
-            let listing = session.fetch_refs(&["test/main"]).await.unwrap().unwrap();
+            let listing = session
+                .fetch_refs(&selector(&["test/main"]))
+                .await
+                .unwrap()
+                .unwrap();
             let deltas = Summary::parse(&listing).unwrap().static_deltas().unwrap();
             assert_eq!(deltas.len(), 3, "{scheme}");
             let progress = PullProgress::new();

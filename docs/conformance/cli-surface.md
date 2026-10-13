@@ -3624,7 +3624,7 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   request at `[archive] zlib-level`, and `deltas/` and `delta-indexes/` are
   not served. A path the server refuses and a path it does not find both get
   404. `../format-reference.md`, "The archive view", states the rules.
-- The command also answers `GET /_ostrya/refs/v1?prefix=P&prefix=Q`, with
+- The command also answers `GET /_ostrya/refs/v1?pattern=P&pattern=Q`, with
   and without `--read-only`. The body is the ref listing, a summary
   GVariant built for each request, of the refs that the entries of the query
   select. Each entry is a ref pattern with an optional leading `!`. No

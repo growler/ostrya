@@ -161,7 +161,7 @@
 //! A `ListRefs` names a set of ref patterns. Each entry is a ref pattern with
 //! an optional leading `!`, which selects the refs under `refs/heads` that
 //! the list of entries selects. An empty list selects all refs under
-//! `refs/heads`. A `ListRefs` holds at most [`MAX_REF_PREFIXES`] entries, and
+//! `refs/heads`. A `ListRefs` holds at most [`MAX_REF_PATTERNS`] entries, and
 //! each entry has at most [`MAX_REF_ENTRY_PARTS`] parts and
 //! [`MAX_REF_ENTRY_LEN`] bytes. The server
 //! answers with a `GetReply` whose `found` is `true` and that holds the length
@@ -172,7 +172,7 @@
 //! conditions:
 //!
 //! - `protocol` for an entry that is not a ref pattern, for an entry over
-//!   the limits of one entry, and for more than [`MAX_REF_PREFIXES`] entries
+//!   the limits of one entry, and for more than [`MAX_REF_PATTERNS`] entries
 //! - `limit-exceeded` for a listing larger than [`MAX_REF_LISTING`]
 //! - `internal` for any other failure of the build of the listing
 //!
@@ -256,12 +256,13 @@ pub const MAX_FRAME: u32 = 1 << 20;
 /// larger listing with [`Error::LimitExceeded`].
 pub const MAX_REF_LISTING: u64 = 128 * 1024 * 1024;
 
-/// The most prefixes in one request of a ref listing: 256.
+/// The most entries in one request of a ref listing: 256.
 ///
-/// A server refuses a request with more entries than this limit, and it
-/// counts each pair of the query. A client removes duplicate prefixes, and
-/// each prefix that another prefix covers, before it counts.
-pub const MAX_REF_PREFIXES: usize = 256;
+/// An entry is a ref pattern with an optional `!`. Positive and negative
+/// entries count together. A server refuses a request with more entries than
+/// this limit, and it counts each pair of the query. A client removes exact
+/// duplicate entries before it counts.
+pub const MAX_REF_PATTERNS: usize = 256;
 
 /// The most parts in one entry of a ref listing request: 256.
 ///

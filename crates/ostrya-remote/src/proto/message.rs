@@ -287,9 +287,10 @@ pub enum Message {
     Get(String),
     /// The `GetReply` message.
     GetReply(GetReply),
-    /// The `ListRefs` message, with the ref prefixes of a ref listing.
+    /// The `ListRefs` message, with the entries of a ref listing.
     ///
-    /// Each prefix is a ref name. The codec does not check the names.
+    /// Each entry is a ref pattern with an optional leading `!`. The codec
+    /// does not check the entries.
     ListRefs(Vec<String>),
 }
 
@@ -479,9 +480,9 @@ impl Message {
                 let len = Value::Maybe(r.len.map(|n| Box::new(Value::U64(n))));
                 (&GET_REPLY, Value::Tuple(vec![Value::Bool(r.found), len]))
             }
-            Message::ListRefs(prefixes) => {
-                let prefixes = prefixes.iter().cloned().map(Value::Str).collect();
-                (&STRV, Value::Array(prefixes))
+            Message::ListRefs(entries) => {
+                let entries = entries.iter().cloned().map(Value::Str).collect();
+                (&STRV, Value::Array(entries))
             }
         };
         ostrya_gvariant::to_bytes(ty, &value).map_err(|e| protocol(format!("encode: {e}")))
@@ -603,8 +604,8 @@ impl Message {
                 Message::GetReply(r)
             }
             Kind::ListRefs => {
-                let prefixes: ArrayIter<&str> = parse_body(body)?;
-                Message::ListRefs(collect(prefixes, |p| Ok(p.to_owned()))?)
+                let entries: ArrayIter<&str> = parse_body(body)?;
+                Message::ListRefs(collect(entries, |e| Ok(e.to_owned()))?)
             }
         })
     }

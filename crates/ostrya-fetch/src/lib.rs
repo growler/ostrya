@@ -6207,14 +6207,14 @@ mod tests {
     #[test]
     fn mirror_urls_join_base_path_and_query() {
         let mirror = parse_mirror("http://127.0.0.1:8080/base/").unwrap();
-        let destination = mirror.destination("_ostrya/refs/v1", Some("prefix=a%2Fb&prefix=c"));
+        let destination = mirror.destination("_ostrya/refs/v1", Some("pattern=a%2Fb&pattern=c"));
         assert_eq!(
             destination.url(),
-            "http://127.0.0.1:8080/base/_ostrya/refs/v1?prefix=a%2Fb&prefix=c"
+            "http://127.0.0.1:8080/base/_ostrya/refs/v1?pattern=a%2Fb&pattern=c"
         );
         assert_eq!(
             destination.target(),
-            "/base/_ostrya/refs/v1?prefix=a%2Fb&prefix=c"
+            "/base/_ostrya/refs/v1?pattern=a%2Fb&pattern=c"
         );
         // An empty query keeps its `?`.
         let root = parse_mirror("https://example.com").unwrap();
@@ -6486,13 +6486,13 @@ mod tests {
             let route = fetcher
                 .route(Target::PathQuery {
                     path: "_ostrya/refs/v1",
-                    query: "prefix=a",
+                    query: "pattern=a",
                 })
                 .unwrap();
             let Route::Mirrors { path, query } = route else {
                 panic!("a path query target goes to the mirrors");
             };
-            assert_eq!((path, query), ("_ostrya/refs/v1", Some("prefix=a")));
+            assert_eq!((path, query), ("_ostrya/refs/v1", Some("pattern=a")));
 
             let refused = [
                 ("p?x", "q", "no query and no fragment"),
@@ -8869,13 +8869,13 @@ mod tests {
         );
         let path_query = Target::PathQuery {
             path: "p?QXZ",
-            query: "prefix=QXZ",
+            query: "pattern=QXZ",
         };
         assert_eq!(
             format!("{path_query:?}"),
             r#"PathQuery { path: "p?<redacted>", query: "<redacted>" }"#
         );
-        let rendered = format!("{:?}", FetchRequest::path_query("refs/v1", "prefix=QXZ"));
+        let rendered = format!("{:?}", FetchRequest::path_query("refs/v1", "pattern=QXZ"));
         assert!(!rendered.contains("QXZ"), "{rendered}");
         assert!(
             rendered.contains(r#"target: PathQuery { path: "refs/v1", query: "<redacted>" }"#),

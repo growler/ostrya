@@ -116,20 +116,20 @@ impl RepoSource {
 
     /// Returns the detached metadata of `commit` that the filter allows. If the
     /// commit has none or the filter allows no property, returns `None`.
+    ///
+    /// The read, the parse, and the filter run in one call on the blocking
+    /// pool.
     async fn detached(&self, commit: &Checksum) -> Result<Option<Value>> {
-        let bytes = match self
-            .repo
-            .load_object_bytes(ObjectType::CommitMeta, commit)
-            .await
-        {
-            Ok(bytes) => bytes,
-            Err(Error::ObjectNotFound { .. }) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        match crate::summary::parse_signature_dict(&bytes)? {
-            Some(dict) => self.filter.apply_value(commit, dict),
-            None => Ok(None),
-        }
+        let repo = self.repo.clone();
+        let filter = self.filter.clone();
+        let commit = *commit;
+        ostrya_rt::unblock(
+            move || match repo.read_commit_detached_metadata_blocking(&commit)? {
+                Some(dict) => filter.apply_value(&commit, dict),
+                None => Ok(None),
+            },
+        )
+        .await
     }
 }
 

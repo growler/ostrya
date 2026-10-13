@@ -87,7 +87,7 @@ use crate::error::{Error, Result};
 use crate::fetch::{FetchRequest, Fetched, Fetcher, Priority};
 use crate::object::MAX_METADATA_SIZE;
 use crate::pull::verify::Verification;
-use crate::pull::{ModeChecks, PullCounters, PullFlags, PullOptions, TimestampCheck, refspec};
+use crate::pull::{ModeChecks, PullCounters, PullFlags, PullOptions, refspec};
 use crate::read::CommitState;
 use crate::repo::Repo;
 use crate::summary::{AdvertisedDelta, INDEXED_DELTAS_KEY, Summary, delta_digest};
@@ -99,8 +99,8 @@ use super::chain::{
 use super::http::{cached_source, fetch_remote_detached};
 use super::source::{RemoteSource, Transfer, session_error};
 use super::{
-    TipChecks, check_commit_signatures, check_tip_refs, count_fetched, detached_bytes_from,
-    source_size,
+    TimestampBase, TipChecks, check_commit_signatures, check_tip_refs, count_fetched,
+    detached_bytes_from, source_size,
 };
 
 /// The number of delta parts that one pull fetches at a time.
@@ -682,7 +682,9 @@ impl ParsedDelta {
 /// `edges` is the index of a list of static deltas. With a list, discovery
 /// reads no summary and no delta index, and [`discover_chain`] plans and
 /// fetches the chains. It also checks the commit of each step, a target
-/// included, before the pull opens its transaction. A
+/// included, before the pull opens its transaction. `timestamp` is the
+/// timestamp check of these checks, which the caller resolved. A local pull
+/// passes [`TimestampBase::Off`]. A
 /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull ignores the list. A pull that
 /// requires static deltas needs no summary for the list.
 #[allow(clippy::too_many_arguments)]
@@ -694,6 +696,7 @@ pub(crate) async fn discover(
     opts: &PullOptions,
     ref_prefix: Option<&str>,
     edges: Option<Edges>,
+    timestamp: TimestampBase,
     verification: &Verification,
     progress: &PullCounters,
 ) -> Result<DeltaPlan> {
@@ -711,6 +714,7 @@ pub(crate) async fn discover(
             opts,
             ref_prefix,
             edges,
+            timestamp,
             verification,
             progress,
         )
@@ -811,6 +815,7 @@ async fn discover_chain(
     opts: &PullOptions,
     ref_prefix: Option<&str>,
     edges: Edges,
+    timestamp: TimestampBase,
     verification: &Verification,
     progress: &PullCounters,
 ) -> Result<DeltaPlan> {
@@ -845,11 +850,7 @@ async fn discover_chain(
         progress,
         tips: TipChecks {
             bindings: !opts.flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS),
-            timestamp: match source {
-                DeltaSource::Remote(_) => &opts.timestamp_check,
-                // A local pull makes no timestamp check.
-                DeltaSource::Local(_) => &TimestampCheck::Off,
-            },
+            timestamp,
             ref_prefix,
         },
     };
@@ -1146,9 +1147,11 @@ async fn fetch_step(
 ///
 /// `commit_bytes` are the bytes of the commit that its superblock carries.
 /// The parse of the superblock verified that they hash to `commit`. The
-/// checks of the refs parse them on the blocking pool. The check reads the
-/// `.commitmeta` that the pull puts in place, as the check of a fetched
-/// commit does.
+/// checks of the refs parse them on the blocking pool. Under
+/// [`TimestampCheck::CurrentRef`](crate::pull::TimestampCheck::CurrentRef),
+/// the timestamp check reads the commit of each ref on the blocking pool too.
+/// The check reads the `.commitmeta` that the pull puts in place, as the
+/// check of a fetched commit does.
 ///
 /// - From a remote, `detached` is the `.commitmeta` that [`fetch_step`] got
 ///   with the superblock. If it is `None`, the `.commitmeta` comes from the
@@ -2276,6 +2279,7 @@ mod tests {
                 opts,
                 None,
                 Some(Edges::new(list)?),
+                TimestampBase::Off,
                 verification,
                 counters,
             )
@@ -3058,6 +3062,7 @@ mod tests {
                     &opts,
                     None,
                     Some(Edges::new(list.clone()).unwrap()),
+                    TimestampBase::Off,
                     &ed25519_verification(),
                     &counters,
                 )
@@ -3301,6 +3306,7 @@ mod tests {
                     &opts,
                     None,
                     Some(Edges::new(list.clone()).unwrap()),
+                    TimestampBase::Off,
                     &verification,
                     &counters,
                 );
@@ -3417,6 +3423,7 @@ mod tests {
                 &opts,
                 None,
                 Some(Edges::new(list).unwrap()),
+                TimestampBase::Off,
                 &verification,
                 &counters,
             );

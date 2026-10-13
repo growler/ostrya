@@ -8,7 +8,8 @@
 //!   bare-user-shared (the commit object is the same in each mode)
 //! - the archive commit of `--generate-sizes`
 //! - the ref files that the `ostree` command resolves
-//! - round trips of detached metadata
+//! - round trips of detached metadata, and the error of a corrupt
+//!   `.commitmeta`
 //! - immediate ref writes
 //! - concurrent commits
 //! - a repository that ostrya writes and the `ostree` command accepts
@@ -353,6 +354,35 @@ fn detached_metadata_round_trips() {
             None,
             "a zero-length file reads as None, not an empty dict"
         );
+    });
+}
+
+#[test]
+fn corrupt_detached_metadata_is_a_core_error() {
+    // A `.commitmeta` that is not an a{sv} in normal form does not parse.
+    let tmp = TmpDir::new("commit-detached-corrupt");
+    let root_dir = tmp.path().join("repo");
+    let commit = csum(COMMIT);
+
+    block_on(async {
+        let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        repo.write_commit_detached_metadata(&commit, None)
+            .await
+            .unwrap();
+        let path = root_dir.join("objects").join(loose_path(
+            &commit,
+            ObjectType::CommitMeta,
+            RepoMode::Archive,
+        ));
+        std::fs::write(&path, [0xff]).unwrap();
+
+        let err = repo
+            .read_commit_detached_metadata(&commit)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ostrya::Error::Core(_)), "{err:?}");
     });
 }
 

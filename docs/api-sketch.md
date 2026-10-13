@@ -814,8 +814,12 @@ impl Commit {
     pub fn collection_binding(&self) -> Option<&str>;
     pub fn content_checksum(&self) -> Checksum;   // sha256(dirtree||dirmeta)
     /// The parent and the root checksums alone, with the checks of `parse`
-    /// for those fields. The metadata, subject, and body are not parsed.
+    /// for those fields. The metadata dict and the related objects are not
+    /// decoded; the tuple frame, the subject, and the body are checked.
     pub fn parse_link(data: &[u8]) -> Result<CommitLink>;
+    /// The timestamp alone, in host byte order, with the checks of
+    /// `parse_link`.
+    pub fn parse_timestamp(data: &[u8]) -> Result<u64>;
 }
 
 pub struct CommitLink {
@@ -2517,6 +2521,17 @@ the ref binding of each target commit before its transaction opens, and makes
 no timestamp check. It reads the `.commitmeta` of a commit of a chain in
 discovery only if the policy checks commits.
 
+`TimestampCheck::Rev` names a commit. A pull from a remote that has at least
+one target reads that commit one time, so this repository must hold it. The
+pull reads it after the summary, the configuration, and the ref files of the
+remote, and before it fetches a delta index, a superblock, a `.commitmeta`, or
+an object. If this repository does not hold the commit, the pull fails with
+`ObjectNotFound` at that point. A pull with no target, such as a `MIRROR` pull
+of a summary that lists no ref, reads no commit. `pull_local` makes no
+timestamp check and reads no commit.
+`TimestampCheck::CurrentRef` reads the commit of each ref when it checks that
+ref. Each read decodes the timestamp alone, on the blocking pool.
+
 A pull checks the signatures on the commits it carries and on the remote's
 summary. `verify` holds four switches, each overriding the remote configuration
 key of the same name; a switch left `None` reads that configuration for `pull`
@@ -2539,9 +2554,13 @@ signature leaves the pull's own verification intact and stores a commit that
 carries none. A filter that allows everything stores the source's bytes
 verbatim. One that drops every property writes nothing, which leaves the
 detached metadata the destination already holds where it stands, so a re-pull
-into a destination holding an earlier copy does not remove it. The callback is
-shared rather than exclusive, because an HTTP pull carries several commits at
-once and calls it from each.
+into a destination holding an earlier copy does not remove it. The pull calls
+the filter on the blocking pool. The callback is shared rather than exclusive,
+because an HTTP pull carries several commits at once and calls it from each, so
+several threads can call it at the same time. If a pull fails while a filter
+call runs, that call runs to its end, so the callback can run after the pull
+returns the error. A call does not mean that the pull stores the commit: a later
+check of the pull can refuse it.
 
 `DetachedMetadataFilter::excluding` builds the deny-list form: the names are
 matched whole against the key of each detached-metadata property, and every
@@ -2587,7 +2606,8 @@ impl PullFlags {
 pub enum TimestampCheck {
     #[default] Off,
     CurrentRef,                           // the commit the ref names here
-    Rev(Checksum),                        // a given commit
+    Rev(Checksum),                        // a given commit; a pull from a
+                                          // remote with a target needs it here
 }
 
 #[derive(Default)]

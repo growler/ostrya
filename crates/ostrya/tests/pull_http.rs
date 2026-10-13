@@ -26,6 +26,7 @@ mod pull;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::{
@@ -2069,6 +2070,91 @@ fn the_timestamp_check_can_name_the_commit_to_compare_against() {
         assert_eq!(
             dest.resolve_rev("origin:test/main", true).await.unwrap(),
             None
+        );
+    });
+}
+
+/// `TimestampCheck::Rev` compares the tip with the timestamp of the named
+/// commit. The timestamps of the current ref commit and of the tip do not take
+/// its place. A named commit that is newer than the tip refuses the pull, also
+/// if the current ref commit is older. A named commit that is older than the
+/// tip lets the pull pass, also if the current ref commit is newer.
+#[test]
+fn the_timestamp_check_reads_the_timestamp_of_the_named_commit() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-timestamp-rev-base");
+        let src = dir.path().join("src");
+        build_tree(&src, b"tip\n");
+        let remote = Repo::create(
+            &dir.path().join("remote"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let tip = commit_tree(&remote, dir.path(), "src", "test/main", None, FIXED_TS).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        let pull = |rev| {
+            dest.pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    timestamp_check: TimestampCheck::Rev(rev),
+                    ..PullOptions::default()
+                },
+            )
+        };
+
+        // The current ref commit is older than the tip, and the named commit
+        // is newer.
+        std::fs::write(src.join("hello.txt"), b"older\n").unwrap();
+        let older = commit_tree(
+            &dest,
+            dir.path(),
+            "src",
+            "origin:test/main",
+            None,
+            FIXED_TS - 100,
+        )
+        .await;
+        std::fs::write(src.join("hello.txt"), b"newer\n").unwrap();
+        let newer = commit_tree(
+            &dest,
+            dir.path(),
+            "src",
+            "local/newer",
+            None,
+            FIXED_TS + 100,
+        )
+        .await;
+        let err = pull(newer).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains(&newer.to_hex()), "{message}");
+        assert!(message.contains(&(FIXED_TS + 100).to_string()), "{message}");
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(older)
+        );
+
+        // The current ref commit is newer than the tip, and the named commit
+        // is older.
+        let current = commit_tree(
+            &dest,
+            dir.path(),
+            "src",
+            "origin:test/main",
+            None,
+            FIXED_TS + 200,
+        )
+        .await;
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(current)
+        );
+        pull(older).await.unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(tip)
         );
     });
 }
@@ -4222,6 +4308,83 @@ fn a_parent_reached_under_depth_is_checked_too() {
             .join("dest/state")
             .join(format!("{}.commitpartial", tip.to_hex()));
         assert!(!marker.exists(), "the tip's marker was left behind");
+    });
+}
+
+/// A pull that verifies the commit signatures and filters the detached
+/// metadata calls the filter one time for each property of the `.commitmeta`.
+/// A filter that keeps each property stores the bytes of the remote unchanged.
+/// A filter that drops a property stores the other properties in normal form,
+/// and the verification reads the whole metadata.
+#[test]
+fn a_verified_pull_filters_the_detached_metadata_one_time() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-verify-filter");
+        let (remote, commit) = build_remote(dir.path()).await;
+        remote
+            .write_commit_detached_metadata(&commit, Some(&detached_dict()))
+            .await
+            .unwrap();
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        remote.sign_commit(&commit, &signer).await.unwrap();
+        let Some(Value::Array(entries)) =
+            remote.read_commit_detached_metadata(&commit).await.unwrap()
+        else {
+            panic!("the remote holds a dict");
+        };
+        assert_eq!(entries.len(), 2, "the property and the signature");
+        let server = RepoServer::start(remote.path(), false).await;
+        let extra = format!("sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n");
+        let commitmeta = |root: &Path| std::fs::read(root.join(meta_path(&commit, "commitmeta")));
+
+        for dropped in [None, Some("test.detached")] {
+            let _ = std::fs::remove_dir_all(dir.path().join("dest"));
+            let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), &extra).await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = calls.clone();
+            let filter = DetachedMetadataFilter::new(move |_, key, _| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                if Some(key) == dropped {
+                    FilterResult::Skip
+                } else {
+                    FilterResult::Allow
+                }
+            });
+
+            pull_main(
+                &dest,
+                PullOptions {
+                    detached_metadata_filter: filter,
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(calls.load(Ordering::Relaxed), entries.len(), "{dropped:?}");
+            match dropped {
+                None => assert_eq!(
+                    commitmeta(&dir.path().join("dest")).unwrap(),
+                    commitmeta(remote.path()).unwrap()
+                ),
+                Some(key) => {
+                    // The read accepts normal form alone, so the stored bytes
+                    // are the normal form of the kept properties.
+                    let kept: Vec<Value> = entries
+                        .iter()
+                        .filter(|entry| {
+                            entry.as_tuple().and_then(|fields| fields[0].as_str()) != Some(key)
+                        })
+                        .cloned()
+                        .collect();
+                    assert_eq!(kept.len(), 1);
+                    assert_eq!(
+                        dest.read_commit_detached_metadata(&commit).await.unwrap(),
+                        Some(Value::Array(kept))
+                    );
+                }
+            }
+        }
     });
 }
 
@@ -6405,6 +6568,96 @@ fn a_target_refused_by_the_timestamp_check_requests_no_part() {
         );
         assert_eq!(dest.list_objects().await.unwrap(), held);
         assert_no_markers(&dest_dir);
+    });
+}
+
+/// `TimestampCheck::Rev` names a commit that the destination does not hold.
+/// The pull fails with `ObjectNotFound` for that commit before discovery: it
+/// requests no superblock, no part, no `.commitmeta`, and no object. It
+/// writes no ref, keeps the objects of the destination, and leaves no
+/// marker.
+#[test]
+fn a_timestamp_commit_that_is_absent_stops_the_pull_before_discovery() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-timestamp-rev-absent");
+        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+        let mut list = Vec::new();
+        for (from, to) in [(a, b), (b, c), (c, d)] {
+            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+        }
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &a).await;
+        let dest_dir = dir.path().join("dest");
+        let absent = Checksum::sha256(b"a commit that no repository holds");
+        let held = dest.list_objects().await.unwrap();
+        server.forget();
+
+        let opts = PullOptions {
+            timestamp_check: TimestampCheck::Rev(absent),
+            ..chain_opts(list)
+        };
+        let err = dest.pull("origin", opts).await.unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                Error::ObjectNotFound {
+                    checksum,
+                    ty: ostrya::ObjectType::Commit,
+                } if checksum == absent
+            ),
+            "{err:?}"
+        );
+        let seen = server.seen();
+        assert!(
+            seen.iter()
+                .all(|path| !path.starts_with("deltas/") && !path.starts_with("objects/")),
+            "{seen:?}"
+        );
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            None
+        );
+        assert_eq!(dest.list_objects().await.unwrap(), held);
+        assert_no_markers(&dest_dir);
+    });
+}
+
+/// A `MIRROR` pull with no named ref, from a summary that lists no ref, has
+/// no target. `TimestampCheck::Rev` then reads no commit, so a commit that the
+/// destination does not hold does not fail the pull. The pull writes no ref.
+#[test]
+fn a_pull_with_no_target_reads_no_timestamp_commit() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-timestamp-rev-no-target");
+        let remote = Repo::create(
+            &dir.path().join("remote"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        remote
+            .regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_TS),
+                ..SummaryOptions::default()
+            })
+            .await
+            .unwrap();
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        let absent = Checksum::sha256(b"a commit that no repository holds");
+
+        dest.pull(
+            "origin",
+            PullOptions {
+                flags: PullFlags::MIRROR,
+                timestamp_check: TimestampCheck::Rev(absent),
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_nothing_published(&dest).await;
     });
 }
 

@@ -310,7 +310,16 @@ pub enum TimestampCheck {
     ///
     /// A ref that this repository does not hold passes.
     CurrentRef,
-    /// A given commit, which this repository must hold.
+    /// A given commit.
+    ///
+    /// A pull from a remote that has at least one target reads the commit one
+    /// time, so this repository must hold it. The pull reads it after the
+    /// `summary`, the `config`, and the ref files of the remote, and before it
+    /// fetches a delta index, a static delta superblock, a `.commitmeta`, or
+    /// an object. If this repository does not hold the commit, the pull fails
+    /// with [`Error::ObjectNotFound`] at that point. A pull with no target
+    /// reads no commit. A local pull makes no timestamp check and reads no
+    /// commit.
     Rev(Checksum),
 }
 
@@ -403,9 +412,14 @@ pub type DetachedMetadataFilterFn =
 /// change the result of that verification. The stored commit then has no
 /// signature for a later verification.
 ///
-/// The callback is shared (an `Arc`), because a pull from a remote carries
-/// several commits at a time and calls the filter from each. A filter that
-/// keeps state supplies its own interior mutability.
+/// The pull calls the filter on the blocking pool. The callback is shared (an
+/// `Arc`), because a pull from a remote carries several commits at a time and
+/// calls the filter from each. So several threads can call the filter at the
+/// same time. A filter that keeps state supplies its own interior mutability.
+/// If a pull fails while a filter call runs, that call runs to its end, so the
+/// callback can run after the pull returns the error.
+/// The pull can call the filter for a commit that a later check of the pull
+/// refuses, so a call does not mean that the pull stores the commit.
 #[derive(Clone, Default)]
 pub struct DetachedMetadataFilter(Option<DetachedMetadataFilterFn>);
 
@@ -470,10 +484,44 @@ impl DetachedMetadataFilter {
     /// filter that allows no property gives `None`, and the destination keeps
     /// the detached metadata that it holds.
     pub(crate) fn apply(&self, commit: &Checksum, bytes: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        let Some(filter) = &self.0 else {
+        if self.0.is_none() {
+            return Ok(Some(bytes));
+        }
+        let Some(dict) = crate::summary::parse_signature_dict(&bytes)? else {
             return Ok(Some(bytes));
         };
-        let Some(dict) = crate::summary::parse_signature_dict(&bytes)? else {
+        self.apply_parsed(commit, bytes, dict)
+    }
+
+    /// Runs [`apply`](DetachedMetadataFilter::apply) on the blocking pool.
+    ///
+    /// An unset filter and the zero-length marker parse nothing, so they give
+    /// the input bytes back on the calling task.
+    pub(crate) async fn apply_on_pool(
+        &self,
+        commit: &Checksum,
+        bytes: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>> {
+        if self.0.is_none() || bytes.is_empty() {
+            return Ok(Some(bytes));
+        }
+        let filter = self.clone();
+        let commit = *commit;
+        ostrya_rt::unblock(move || filter.apply(&commit, bytes)).await
+    }
+
+    /// Runs [`apply`](DetachedMetadataFilter::apply) over the `.commitmeta`
+    /// bytes `bytes`, whose parse is `dict`.
+    ///
+    /// The call parses nothing. It serializes only a dict of which the filter
+    /// keeps some properties. The result is the result of `apply`.
+    pub(crate) fn apply_parsed(
+        &self,
+        commit: &Checksum,
+        bytes: Vec<u8>,
+        dict: Value,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(filter) = &self.0 else {
             return Ok(Some(bytes));
         };
         match kept_entries(filter, commit, dict)? {
@@ -854,7 +902,11 @@ pub struct PullOptions {
     /// stores.
     ///
     /// The default keeps each property, so the pull stores the bytes of the
-    /// source unchanged.
+    /// source unchanged. The pull calls the filter on the blocking pool, and
+    /// several threads can call it at the same time. If a pull fails while a
+    /// filter call runs, that call runs to its end, so the callback can run
+    /// after the pull returns the error. A call does not mean that the pull
+    /// stores the commit: a later check of the pull can refuse it.
     pub detached_metadata_filter: DetachedMetadataFilter,
     /// The handle to which a pull from a remote adds its live counters.
     ///
@@ -1630,6 +1682,8 @@ impl Repo {
                 &opts,
                 opts.remote.as_deref(),
                 edges,
+                // A local pull makes no timestamp check.
+                TimestampBase::Off,
                 &verification,
                 &counters,
             )
@@ -2088,7 +2142,7 @@ impl Repo {
         {
             count_fetched(counters, ObjectType::CommitMeta, bytes.len() as u64);
         }
-        if let Some(bytes) = filter.apply(commit, bytes)? {
+        if let Some(bytes) = filter.apply_on_pool(commit, bytes).await? {
             txn.stage_commit_detached_bytes(commit, bytes).await?;
         }
         Ok(())
@@ -2415,6 +2469,75 @@ async fn check_commit_signatures(
         .check_commit(commit, bytes, dict.as_ref())
         .await?;
     Ok(detached)
+}
+
+/// The `.commitmeta` that the pull puts in place for a commit, after the
+/// signature check of the commit.
+enum CheckedMeta {
+    /// The bytes as the source holds them. The filter did not run.
+    Source(Vec<u8>),
+    /// The result of the filter: the bytes to stage, or `None` if the pull
+    /// stages nothing.
+    Filtered(Option<Vec<u8>>),
+}
+
+impl CheckedMeta {
+    /// Gives the bytes that the pull stages, or `None` if it stages nothing.
+    ///
+    /// [`CheckedMeta::Source`] goes through
+    /// [`apply_on_pool`](DetachedMetadataFilter::apply_on_pool).
+    async fn filtered(
+        self,
+        filter: &DetachedMetadataFilter,
+        commit: &Checksum,
+    ) -> Result<Option<Vec<u8>>> {
+        match self {
+            CheckedMeta::Source(bytes) => filter.apply_on_pool(commit, bytes).await,
+            CheckedMeta::Filtered(kept) => Ok(kept),
+        }
+    }
+}
+
+/// Checks the signatures of `commit` as [`check_commit_signatures`] does, and
+/// runs `filter` over `detached` if the check parses it.
+///
+/// If the policy checks commits, `filter` is set, and `detached` is `Some`,
+/// the filter reads the dict that the check parsed. The filter runs on the
+/// blocking pool after the check, so the call parses `detached` one time and
+/// gives [`CheckedMeta::Filtered`]. Else the call gives the bytes that
+/// [`check_commit_signatures`] gives back, as [`CheckedMeta::Source`].
+async fn check_commit_signatures_filtered(
+    repo: &Repo,
+    verification: &verify::Verification,
+    filter: &DetachedMetadataFilter,
+    commit: &Checksum,
+    bytes: &[u8],
+    detached: Option<Vec<u8>>,
+) -> Result<Option<CheckedMeta>> {
+    match detached {
+        Some(detached) if verification.checks_commits() && filter.0.is_some() => {
+            let (dict, detached) = parse_detached(detached).await;
+            let dict = dict?;
+            verification
+                .check_commit(commit, bytes, dict.as_ref())
+                .await?;
+            // The zero-length marker parses to `None`, and `apply` gives it
+            // back unchanged.
+            let Some(dict) = dict else {
+                return Ok(Some(CheckedMeta::Filtered(Some(detached))));
+            };
+            let filter = filter.clone();
+            let commit = *commit;
+            let kept =
+                ostrya_rt::unblock(move || filter.apply_parsed(&commit, detached, dict)).await?;
+            Ok(Some(CheckedMeta::Filtered(kept)))
+        }
+        detached => Ok(
+            check_commit_signatures(repo, verification, commit, bytes, detached)
+                .await?
+                .map(CheckedMeta::Source),
+        ),
+    }
 }
 
 /// Parses the `.commitmeta` bytes `bytes` on the blocking pool, and gives
@@ -2780,6 +2903,56 @@ fn check_ref_binding(checksum: &Checksum, commit: &Commit, ref_name: &str) -> Re
     )))
 }
 
+/// The commit that the timestamp check of a pull compares against, as the
+/// pull resolves it before discovery.
+#[derive(Debug, Clone, Copy)]
+enum TimestampBase {
+    /// No check.
+    Off,
+    /// The commit that the ref names in this repository, read for each ref.
+    CurrentRef,
+    /// The commit of [`TimestampCheck::Rev`] and its timestamp, read one time
+    /// for each pull.
+    Rev {
+        /// The checksum of the commit.
+        commit: Checksum,
+        /// The timestamp of the commit.
+        timestamp: u64,
+    },
+}
+
+impl TimestampBase {
+    /// Resolves `check` against this repository.
+    ///
+    /// For [`TimestampCheck::Rev`], the call reads the timestamp of the
+    /// commit. If this repository does not hold the commit, the call fails
+    /// with [`Error::ObjectNotFound`].
+    async fn resolve(repo: &Repo, check: &TimestampCheck) -> Result<TimestampBase> {
+        Ok(match check {
+            TimestampCheck::Off => TimestampBase::Off,
+            TimestampCheck::CurrentRef => TimestampBase::CurrentRef,
+            TimestampCheck::Rev(commit) => TimestampBase::Rev {
+                commit: *commit,
+                timestamp: commit_timestamp(repo, commit).await?,
+            },
+        })
+    }
+}
+
+/// Reads the timestamp of the commit `commit` of this repository.
+///
+/// The read and the decode run in one call on the blocking pool. The decode
+/// reads the timestamp alone, with the checks of [`Commit::parse_timestamp`].
+async fn commit_timestamp(repo: &Repo, commit: &Checksum) -> Result<u64> {
+    let repo = repo.clone();
+    let commit = *commit;
+    ostrya_rt::unblock(move || {
+        let bytes = repo.load_object_bytes_blocking(ObjectType::Commit, &commit)?;
+        Ok(Commit::parse_timestamp(&bytes)?)
+    })
+    .await
+}
+
 /// The checks that a pull makes for each requested ref that names a tip
 /// commit.
 #[derive(Clone, Copy)]
@@ -2787,7 +2960,7 @@ struct TipChecks<'a> {
     /// `true` if the pull makes the ref-binding check.
     bindings: bool,
     /// The timestamp check of the pull.
-    timestamp: &'a TimestampCheck,
+    timestamp: TimestampBase,
     /// The prefix of the pulled refs. The timestamp check resolves the current
     /// tip of a ref through it. `None` is a local ref.
     ref_prefix: Option<&'a str>,
@@ -2824,34 +2997,32 @@ async fn check_tip_refs(
 /// Refuses a fetched tip that is older than the commit of the check.
 async fn check_timestamp(
     repo: &Repo,
-    check: &TimestampCheck,
+    check: TimestampBase,
     ref_prefix: Option<&str>,
     ref_name: &str,
     tip: &Checksum,
     fetched: &Commit,
 ) -> Result<()> {
-    let against = match check {
-        TimestampCheck::Off => return Ok(()),
-        TimestampCheck::CurrentRef => {
+    let (against, timestamp) = match check {
+        TimestampBase::Off => return Ok(()),
+        TimestampBase::CurrentRef => {
             let current = repo.resolve_ref_tip(&refspec(ref_prefix, ref_name)).await?;
             // A ref that this repository does not hold has nothing to be
             // older than.
             let Some(current) = current else {
                 return Ok(());
             };
-            current
+            (current, commit_timestamp(repo, &current).await?)
         }
-        TimestampCheck::Rev(rev) => *rev,
+        TimestampBase::Rev { commit, timestamp } => (commit, timestamp),
     };
-    let bytes = repo.load_object_bytes(ObjectType::Commit, &against).await?;
-    let current = Commit::parse(&bytes)?;
-    if fetched.timestamp >= current.timestamp {
+    if fetched.timestamp >= timestamp {
         return Ok(());
     }
     Err(Error::Pull(format!(
         "commit {tip} (timestamp {}) is chronologically older than \
          {against} (timestamp {})",
-        fetched.timestamp, current.timestamp
+        fetched.timestamp, timestamp
     )))
 }
 

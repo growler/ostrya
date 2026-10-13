@@ -307,7 +307,8 @@ impl Repo {
     /// The detached metadata is an `a{sv}` dict at the `.commitmeta` loose
     /// path of the commit. It is outside the commit checksum. The call returns
     /// `None` if the file is absent, or if it is the zero-length file that
-    /// marks no metadata.
+    /// marks no metadata. The call reads and parses the file on the blocking
+    /// pool.
     ///
     /// # Errors
     ///
@@ -319,22 +320,28 @@ impl Repo {
         &self,
         checksum: &Checksum,
     ) -> Result<Option<Value>> {
-        let bytes = match self
-            .load_object_bytes(ObjectType::CommitMeta, checksum)
-            .await
-        {
+        let repo = self.clone();
+        let key = *checksum;
+        ostrya_rt::unblock(move || repo.read_commit_detached_metadata_blocking(&key)).await
+    }
+
+    /// Runs
+    /// [`read_commit_detached_metadata`](Repo::read_commit_detached_metadata)
+    /// on the calling thread.
+    ///
+    /// The read and the parse block the thread, so an async caller runs this
+    /// call on the blocking pool.
+    pub(crate) fn read_commit_detached_metadata_blocking(
+        &self,
+        checksum: &Checksum,
+    ) -> Result<Option<Value>> {
+        let bytes = match self.load_object_bytes_blocking(ObjectType::CommitMeta, checksum) {
             Ok(bytes) => bytes,
             Err(Error::ObjectNotFound { .. }) => return Ok(None),
             Err(e) => return Err(e),
         };
         // A zero-length file marks deleted metadata. It is not an empty dict.
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-        let ty = Type::parse(METADATA_SIGNATURE).map_err(ostrya_core::Error::from)?;
-        Ok(Some(
-            ostrya_core::from_bytes(&ty, &bytes).map_err(ostrya_core::Error::from)?,
-        ))
+        crate::summary::parse_signature_dict(&bytes)
     }
 
     /// Writes or clears the detached metadata of a commit.

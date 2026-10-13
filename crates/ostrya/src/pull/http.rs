@@ -56,10 +56,10 @@ use super::source::{RemoteSource, Transfer, http_error, session_error};
 use super::subpath::{Scope, Subpaths};
 use super::verify::Verification;
 use super::{
-    DetachedMetadataFilter, ModeChecks, PullCounters, PullFlags, PullOptions, PullStats,
-    PullVerify, READ_CHUNK, TimestampCheck, TipChecks, apply_durability, check_commit_signatures,
-    check_depth, check_remote_option, check_static_deltas, check_tip_refs, refspec,
-    refuse_remote_collection, take_static_deltas,
+    CheckedMeta, DetachedMetadataFilter, ModeChecks, PullCounters, PullFlags, PullOptions,
+    PullStats, PullVerify, READ_CHUNK, TimestampBase, TipChecks, apply_durability,
+    check_commit_signatures_filtered, check_depth, check_remote_option, check_static_deltas,
+    check_tip_refs, refspec, refuse_remote_collection, take_static_deltas,
 };
 
 /// The number of fetched content objects that stream into the object store at
@@ -456,6 +456,19 @@ impl Repo {
     ///   names a requested ref.
     /// - [`Error::Pull`] if [`refs`](PullOptions::refs) is empty and the remote
     ///   serves no summary under `MIRROR`, or the remote has no `branches`.
+    /// - These errors of the commit of
+    ///   [`TimestampCheck::Rev`](crate::TimestampCheck::Rev), if
+    ///   [`timestamp_check`](PullOptions::timestamp_check) is that check and
+    ///   the pull has at least one target. The pull reads the commit after the
+    ///   ref files of the remote and before it fetches a delta index or a
+    ///   static delta superblock.
+    ///   - [`Error::ObjectNotFound`] if this repository does not hold the
+    ///     commit.
+    ///   - [`Error::Io`] if the commit object is larger than
+    ///     [`MAX_METADATA_SIZE`], is not a regular file, or a read of it fails.
+    ///   - [`Error::Core`] if the tuple frame, the subject, or the body of the
+    ///     commit is not in normal form, or if its parent, root dirtree, or
+    ///     root dirmeta checksum has a wrong length.
     /// - [`Error::Pull`] if
     ///   [`require_static_deltas`](PullOptions::require_static_deltas) is set
     ///   and the pull finds no delta, or no chain to a target under a list. A
@@ -596,7 +609,8 @@ impl Repo {
     /// The pull does not protect the local refs of this repository. Under
     /// [`no_ref_writes`](PullOptions::no_ref_writes), the pull writes no ref,
     /// and the rules above select the ref that the pull reads for delta
-    /// discovery and for [`TimestampCheck::CurrentRef`].
+    /// discovery and for
+    /// [`TimestampCheck::CurrentRef`](crate::TimestampCheck::CurrentRef).
     ///
     /// A `MIRROR` pull copies no `summary` and no `summary.sig`, because the
     /// pull refuses an empty `refs`.
@@ -905,6 +919,16 @@ impl Repo {
         // `ostree` command reports the same count.
         counters.restart_transferred();
 
+        // The timestamp check reads a commit that it names one time, before
+        // discovery. A commit that this repository does not hold stops the
+        // pull before its first superblock request. A pull with no target
+        // checks no timestamp, so it reads no commit.
+        let timestamp = if targets.is_empty() {
+            TimestampBase::Off
+        } else {
+            TimestampBase::resolve(self, &opts.timestamp_check).await?
+        };
+
         // The deltas that can deliver these commits, found before the first
         // object request. A commit that a delta carries has no `.commit`
         // request of its own.
@@ -917,6 +941,7 @@ impl Repo {
             opts,
             prefix,
             edges,
+            timestamp,
             verification,
             counters,
         )
@@ -948,6 +973,7 @@ impl Repo {
                 source,
                 opts,
                 prefix,
+                timestamp,
                 phase,
                 &deltas,
                 verification,
@@ -983,6 +1009,7 @@ impl Repo {
             source,
             opts,
             prefix,
+            timestamp,
             phase,
             &deltas,
             verification,
@@ -1129,6 +1156,7 @@ impl Repo {
         source: &RemoteSource,
         opts: &PullOptions,
         ref_prefix: Option<&str>,
+        timestamp: TimestampBase,
         phase: Phase<'_>,
         delta_plan: &DeltaPlan,
         verification: &Verification,
@@ -1144,7 +1172,7 @@ impl Repo {
             flags: opts.flags,
             checks: ModeChecks::new(opts.flags, self.mode()),
             ref_prefix,
-            timestamp_check: &opts.timestamp_check,
+            timestamp,
             tips: phase.tips,
             deltas: phase.deltas,
             done: phase.done,
@@ -1340,12 +1368,20 @@ impl Repo {
         // this pull puts in place. That is the copy of the remote if it served
         // one, else the copy of this repository. A later verification of the
         // stored commit reads the same metadata.
+        // If the verification parses the metadata, the filter reads that parse
+        // right after the verification, and the step keeps only its result.
         let detached = if prechecked {
-            detached
+            detached.map(CheckedMeta::Source)
         } else {
-            let detached =
-                check_commit_signatures(self, ctx.verification, &checksum, &bytes, detached)
-                    .await?;
+            let detached = check_commit_signatures_filtered(
+                self,
+                ctx.verification,
+                ctx.detached_filter,
+                &checksum,
+                &bytes,
+                detached,
+            )
+            .await?;
             self.check_tips(ctx, &checksum, &commit).await?;
             detached
         };
@@ -1388,13 +1424,13 @@ impl Repo {
         // copy of the remote replaces the copy here. That is the purpose of a
         // new read of a mutable file on each pull.
         //
-        // The filter runs here, after the checks read the metadata as the
-        // remote holds it. So a filter drops a property from what the pull
-        // stores, and the verified metadata stays whole. A filter that allows
-        // no property stages nothing, and the copy of this repository stays as
-        // it is.
+        // The filter runs after the checks read the metadata as the remote
+        // holds it: here, or after the verification that parsed it. So a
+        // filter drops a property from what the pull stores, and the verified
+        // metadata stays whole. A filter that allows no property stages
+        // nothing, and the copy of this repository stays as it is.
         if let Some(meta) = detached
-            && let Some(meta) = ctx.detached_filter.apply(&checksum, meta)?
+            && let Some(meta) = meta.filtered(ctx.detached_filter, &checksum).await?
         {
             ctx.txn.stage_commit_detached_bytes(&checksum, meta).await?;
         }
@@ -1450,7 +1486,7 @@ impl Repo {
             .collect();
         let checks = TipChecks {
             bindings: !ctx.flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS),
-            timestamp: ctx.timestamp_check,
+            timestamp: ctx.timestamp,
             ref_prefix: ctx.ref_prefix,
         };
         check_tip_refs(self, checks, checksum, commit, &refs).await
@@ -1811,7 +1847,9 @@ struct StepCtx<'a> {
     /// The prefix of the pulled refs. The timestamp check resolves the current
     /// tip of a ref through it. `None` is a local ref.
     ref_prefix: Option<&'a str>,
-    timestamp_check: &'a TimestampCheck,
+    /// The timestamp check of the pull, which the pull resolved before
+    /// discovery.
+    timestamp: TimestampBase,
     /// The requested refs of each tip commit, for the binding check and the
     /// timestamp check. A commit with no entry is a parent under `depth`,
     /// which no ref names. The map is empty in the run of a level of

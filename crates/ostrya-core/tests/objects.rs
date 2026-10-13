@@ -130,6 +130,16 @@ fn commit_links_agree_with_the_full_parse() {
 }
 
 #[test]
+fn commit_timestamps_agree_with_the_full_parse() {
+    for (_, bytes) in objects("commit") {
+        assert_eq!(
+            Commit::parse_timestamp(&bytes).unwrap(),
+            Commit::parse(&bytes).unwrap().timestamp
+        );
+    }
+}
+
+#[test]
 fn dirtree_objects_walk_validate_and_hash_to_their_names() {
     let hash_regular = |payload: &[u8]| {
         let mut hasher = ContentHasher::new(&regular_header()).unwrap();

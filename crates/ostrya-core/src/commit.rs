@@ -40,7 +40,8 @@ static METADATA_TYPE: LazyLock<Type> =
 /// because [`from_bytes`] accepts only normal form and [`to_bytes`] writes
 /// normal form.
 ///
-/// A walk of a long parent chain uses [`Commit::parse_link`].
+/// A walk of a long parent chain uses [`Commit::parse_link`]. A check of the
+/// timestamp alone uses [`Commit::parse_timestamp`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     /// The `a{sv}` metadata dict as a [`Value`] tree.
@@ -150,6 +151,25 @@ impl Commit {
             root_dirtree: parse_root_dirtree(root_dirtree)?,
             root_dirmeta: parse_root_dirmeta(root_dirmeta)?,
         })
+    }
+
+    /// Parses the timestamp of a serialized commit object.
+    ///
+    /// The function does not decode the metadata dict or the entries of the
+    /// related objects. It checks the tuple frame, the subject, the body, and
+    /// the three checksums as [`Commit::parse`] does. The timestamp is in host
+    /// byte order, as [`Commit::timestamp`] holds it.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Commit::parse_link`].
+    pub fn parse_timestamp(data: &[u8]) -> Result<u64> {
+        let (_, parent, _, _, _, timestamp, root_dirtree, root_dirmeta): CommitView =
+            GvDecode::decode(data)?;
+        parse_parent(parent)?;
+        parse_root_dirtree(root_dirtree)?;
+        parse_root_dirmeta(root_dirmeta)?;
+        Ok(timestamp.0)
     }
 
     /// Serializes the commit to normal-form bytes.
@@ -558,6 +578,42 @@ mod tests {
         ] {
             let refused = Commit::parse(&bytes).expect_err("the full parse refuses the object");
             assert_eq!(Commit::parse_link(&bytes), Err(refused));
+        }
+    }
+
+    #[test]
+    fn parse_timestamp_agrees_with_parse() {
+        let root = Commit {
+            parent: None,
+            ..sample()
+        };
+        let wide = Commit {
+            timestamp: 0x0102_0304_0506_0708,
+            ..sample()
+        };
+        for commit in [sample(), root, wide] {
+            let bytes = commit.serialize().unwrap();
+            assert_eq!(
+                Commit::parse_timestamp(&bytes).unwrap(),
+                Commit::parse(&bytes).unwrap().timestamp
+            );
+        }
+    }
+
+    #[test]
+    fn parse_timestamp_refuses_what_parse_refuses_in_its_fields() {
+        let whole = sample().serialize().unwrap();
+        for bytes in [
+            craft_with(&[0xaa; 31], &[1; 32], &[2; 32]),
+            craft_with(&[0xaa; 33], &[1; 32], &[2; 32]),
+            craft_with(&[], &[1; 31], &[2; 32]),
+            craft_with(&[], &[1; 32], &[2; 33]),
+            craft_with(&[], &[1; 32], &[]),
+            whole[..whole.len() - 1].to_vec(),
+            Vec::new(),
+        ] {
+            let refused = Commit::parse(&bytes).expect_err("the full parse refuses the object");
+            assert_eq!(Commit::parse_timestamp(&bytes), Err(refused));
         }
     }
 

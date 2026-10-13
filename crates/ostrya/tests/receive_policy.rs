@@ -17,8 +17,8 @@ use common::TmpDir;
 #[cfg(feature = "verify-gpg")]
 use common::receive::GnupgHome;
 use ostrya::{
-    CreateOptions, Error, ReceivePolicy, ReceiveRule, ReceiveVerify, RefPattern, Repo, RepoMode,
-    ServerSigner, TrustedKeys, base64,
+    CreateOptions, Error, ReceivePattern, ReceivePolicy, ReceiveRule, ReceiveVerify, Repo,
+    RepoMode, ServerSigner, TrustedKeys, base64,
 };
 use ostrya_rt::block_on;
 
@@ -270,12 +270,12 @@ fn the_pattern_groups_become_rules() {
     assert!(policy.rule_for("other:apps/y").is_none());
 }
 
-/// A hand-built rule takes a pattern that `RefPattern::parse` accepts.
+/// A hand-built rule takes a pattern that `ReceivePattern::parse` accepts.
 #[test]
 fn a_hand_built_policy_selects_its_rules() {
     let policy = ReceivePolicy {
         rules: vec![(
-            RefPattern::parse("*:*").unwrap(),
+            ReceivePattern::parse("*:*").unwrap(),
             ReceiveRule {
                 allow_delete: true,
                 ..ReceiveRule::default()
@@ -1018,7 +1018,7 @@ fn the_policy_is_send_and_sync() {
     assert_send_sync::<ReceivePolicy>();
     assert_send_sync::<ReceiveRule>();
     assert_send_sync::<ReceiveVerify>();
-    assert_send_sync::<RefPattern>();
+    assert_send_sync::<ReceivePattern>();
     assert_send_sync::<TrustedKeys>();
     assert_send_sync::<ServerSigner>();
 }

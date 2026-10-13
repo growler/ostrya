@@ -17,7 +17,7 @@ use crate::refs::{is_component, is_ref_path};
 ///
 /// `NAME` and `PREFIX` are ref names under the ref-name rule. `REMOTE` is one
 /// component of a ref path, under the wider rule of `is_ref_component`.
-/// [`RefPattern::parse`] refuses each other form:
+/// [`ReceivePattern::parse`] refuses each other form:
 ///
 /// - A `*` in another place. This includes `*` alone, with no remote part.
 /// - A second `*`.
@@ -31,7 +31,7 @@ use crate::refs::{is_component, is_ref_path};
 /// [`ReceivePolicy::rule_for`](super::ReceivePolicy::rule_for) states which
 /// rule applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RefPattern {
+pub struct ReceivePattern {
     /// The pattern as written.
     text: String,
     /// The remote part. It is `None` for a pattern of plain refs.
@@ -72,14 +72,14 @@ pub(crate) struct Specificity {
     prefix_len: usize,
 }
 
-impl RefPattern {
+impl ReceivePattern {
     /// Parses a ref pattern of a receive rule.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidFormat`] if `pattern` is empty, holds a control
-    /// character, or has a form outside the syntax of [`RefPattern`].
-    pub fn parse(pattern: &str) -> Result<RefPattern> {
+    /// character, or has a form outside the syntax of [`ReceivePattern`].
+    pub fn parse(pattern: &str) -> Result<ReceivePattern> {
         let malformed = |why: &str| {
             Error::InvalidFormat(format!("malformed receive pattern '{pattern}': {why}"))
         };
@@ -122,7 +122,7 @@ impl RefPattern {
             }
             NamePart::Exact(name.to_owned())
         };
-        Ok(RefPattern {
+        Ok(ReceivePattern {
             text: pattern.to_owned(),
             remote,
             name,
@@ -168,7 +168,7 @@ mod tests {
     use super::*;
 
     fn matches(pattern: &str, remote: Option<&str>, name: &str) -> bool {
-        RefPattern::parse(pattern)
+        ReceivePattern::parse(pattern)
             .unwrap()
             .specificity(remote, name)
             .is_some()
@@ -189,7 +189,7 @@ mod tests {
             "*:apps/*",
             "*:*",
         ] {
-            let parsed = RefPattern::parse(pattern).unwrap();
+            let parsed = ReceivePattern::parse(pattern).unwrap();
             assert_eq!(parsed.as_str(), pattern);
         }
     }
@@ -233,7 +233,7 @@ mod tests {
             "-a",
             "a/.b/*",
         ] {
-            let err = RefPattern::parse(pattern).unwrap_err();
+            let err = ReceivePattern::parse(pattern).unwrap_err();
             assert!(
                 matches!(&err, Error::InvalidFormat(m) if m.contains("malformed receive pattern")),
                 "{pattern:?}: {err}"

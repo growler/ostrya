@@ -162,9 +162,9 @@ pub use object::MAX_METADATA_SIZE;
 pub use ostrya_composefs::Image;
 pub use ostrya_core::base64;
 pub use ostrya_core::{
-    Checksum, Commit, DictBuilder, DirMeta, DirTree, ObjectName, ObjectType, RepoMode, Span,
-    TextError, Type, Value, Xattrs, from_bytes, from_text, is_checksum_shaped, loose_path, to_text,
-    to_text_unannotated,
+    Checksum, Commit, DictBuilder, DirMeta, DirTree, ObjectName, ObjectType, RefPattern,
+    RefSelector, RepoMode, Span, TextError, Type, Value, Xattrs, from_bytes, from_text,
+    is_checksum_shaped, loose_path, to_text, to_text_unannotated,
 };
 pub use ostrya_remote::proto::{MAX_REF_LISTING, MAX_REF_PREFIXES};
 #[doc(hidden)]
@@ -181,8 +181,8 @@ pub use read::{CommitSizes, CommitState, MetadataReader};
 #[cfg(feature = "receive")]
 #[doc(hidden)]
 pub use receive::{
-    HookFuture, HookRefusal, HostEntry, ReceiveHooks, ReceivePolicy, ReceiveReport, ReceiveRule,
-    ReceiveService, ReceiveStep, ReceiveVerify, ReceiveWarning, RefPattern, ServerSigner,
+    HookFuture, HookRefusal, HostEntry, ReceiveHooks, ReceivePattern, ReceivePolicy, ReceiveReport,
+    ReceiveRule, ReceiveService, ReceiveStep, ReceiveVerify, ReceiveWarning, ServerSigner,
     UpdatePlan,
 };
 #[doc(hidden)]

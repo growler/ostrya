@@ -18,6 +18,9 @@
 //! - [`ObjectType`] and [`RepoMode`] select the [`loose_path`] of an object.
 //! - [`DeflateSink`] compresses the payload of an archive-mode content object.
 //! - [`KeyFile`] reads and writes the repository `config` file.
+//! - [`RefPattern`] checks and matches one ref pattern with `*` and `**`.
+//! - [`RefSelector`] selects ref names with a list of positive and negative
+//!   patterns.
 //!
 //! # Modules
 //!
@@ -56,6 +59,7 @@ mod mode;
 mod objname;
 mod objtype;
 mod refname;
+mod refpattern;
 pub mod sizes;
 mod valiter;
 pub mod varint;
@@ -79,6 +83,7 @@ pub use objtype::ObjectType;
 pub use refname::{
     is_checksum_shaped, is_ref_component, is_ref_name, is_ref_name_component, is_refspec,
 };
+pub use refpattern::{RefPattern, RefSelector};
 pub use xattr::{Xattrs, XattrsRef};
 
 // The dynamic GVariant value tree and the codec functions. `Commit::metadata`

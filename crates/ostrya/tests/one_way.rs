@@ -28,7 +28,7 @@ use ostrya::remote::proto::{CommitRequest, FrameWriter, Hello, Message, ObjectHe
 use ostrya::remote::{self, Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
 use ostrya::{
     Checksum, DictBuilder, Error, FsckOptions, MAX_METADATA_SIZE, ObjectName, ObjectType,
-    ReceivePolicy, ReceiveReport, ReceiveRule, ReceiveService, RefPattern, Repo, RepoMode,
+    ReceivePattern, ReceivePolicy, ReceiveReport, ReceiveRule, ReceiveService, Repo, RepoMode,
     ServerSigner, Type,
 };
 use ostrya_rt::block_on;
@@ -85,7 +85,7 @@ fn policy() -> ReceivePolicy {
     };
     ReceivePolicy {
         default_rule: rule.clone(),
-        rules: vec![(RefPattern::parse("*:*").unwrap(), rule)],
+        rules: vec![(ReceivePattern::parse("*:*").unwrap(), rule)],
         summary_signers: vec![signer],
         update_summary: true,
         ..ReceivePolicy::default()
@@ -903,7 +903,10 @@ mod export {
     /// A policy that accepts privileged content and every remote ref.
     fn export_policy() -> ReceivePolicy {
         ReceivePolicy {
-            rules: vec![(RefPattern::parse("*:*").unwrap(), ReceiveRule::default())],
+            rules: vec![(
+                ReceivePattern::parse("*:*").unwrap(),
+                ReceiveRule::default(),
+            )],
             allow_privileged: true,
             ..ReceivePolicy::default()
         }

@@ -8,7 +8,7 @@ use crate::pull::DetachedMetadataFilter;
 use crate::repo::Repo;
 
 use super::reader::{self, Origin};
-use super::{RefPattern, ServerSigner, TrustedKeys};
+use super::{ReceivePattern, ServerSigner, TrustedKeys};
 
 /// The rules that decide what a receiving repository accepts.
 ///
@@ -36,7 +36,7 @@ pub struct ReceivePolicy {
     /// The rules of the refs that their patterns match.
     ///
     /// [`rule_for`](ReceivePolicy::rule_for) selects one rule for a ref.
-    pub rules: Vec<(RefPattern, ReceiveRule)>,
+    pub rules: Vec<(ReceivePattern, ReceiveRule)>,
     /// The switch that accepts privileged content in a `bare` repository.
     ///
     /// Privileged content is a setuid or setgid mode bit, or the
@@ -183,7 +183,7 @@ impl ReceivePolicy {
     ///     groups, or its quoted name is malformed
     ///   - a group holds a key that it does not take, or a pattern group holds
     ///     a session key
-    ///   - a pattern is outside the syntax of [`RefPattern`]
+    ///   - a pattern is outside the syntax of [`ReceivePattern`]
     ///   - a `verify` value is malformed
     ///   - a reference names a trust group, a key group, or a remote section
     ///     that does not exist
@@ -291,7 +291,12 @@ mod tests {
         ReceivePolicy {
             rules: patterns
                 .iter()
-                .map(|pattern| (RefPattern::parse(pattern).unwrap(), ReceiveRule::default()))
+                .map(|pattern| {
+                    (
+                        ReceivePattern::parse(pattern).unwrap(),
+                        ReceiveRule::default(),
+                    )
+                })
                 .collect(),
             ..ReceivePolicy::default()
         }

@@ -33,7 +33,7 @@ mod walk;
 
 pub use crate::verify::TrustedKeys;
 pub use hooks::{HookFuture, HookRefusal, HostEntry, ReceiveHooks, UpdatePlan};
-pub use pattern::RefPattern;
+pub use pattern::ReceivePattern;
 pub use policy::{ReceivePolicy, ReceiveRule, ReceiveVerify};
 pub use service::ReceiveService;
 pub use session::{ReceiveReport, ReceiveStep, ReceiveWarning};
@@ -48,7 +48,7 @@ const _: fn() = || {
     assert_send_sync::<ReceivePolicy>();
     assert_send_sync::<ReceiveRule>();
     assert_send_sync::<ReceiveVerify>();
-    assert_send_sync::<RefPattern>();
+    assert_send_sync::<ReceivePattern>();
     assert_send_sync::<TrustedKeys>();
     assert_send_sync::<ServerSigner>();
     assert_send_sync::<ReceiveReport>();

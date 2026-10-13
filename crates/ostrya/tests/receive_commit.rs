@@ -26,9 +26,9 @@ use ostrya::remote::{Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
 use ostrya::sign::append_signature;
 use ostrya::{
     Checksum, Commit, DictBuilder, Ed25519Signer, Ed25519Verifier, Error, FsckOptions, ObjectName,
-    ObjectType, ReceivePolicy, ReceiveReport, ReceiveRule, ReceiveStep, ReceiveVerify, RefPattern,
-    Repo, RepoMode, ServerSigner, Signer, Summary, SummaryOptions, TrustedKeys, Type, Value,
-    Verifier,
+    ObjectType, ReceivePattern, ReceivePolicy, ReceiveReport, ReceiveRule, ReceiveStep,
+    ReceiveVerify, Repo, RepoMode, ServerSigner, Signer, Summary, SummaryOptions, TrustedKeys,
+    Type, Value, Verifier,
 };
 use ostrya_rt::block_on;
 
@@ -291,7 +291,7 @@ fn policy() -> ReceivePolicy {
 /// A policy whose one pattern rule is `rule` under `pattern`.
 fn policy_with(pattern: &str, rule: ReceiveRule) -> ReceivePolicy {
     ReceivePolicy {
-        rules: vec![(RefPattern::parse(pattern).unwrap(), rule)],
+        rules: vec![(ReceivePattern::parse(pattern).unwrap(), rule)],
         ..ReceivePolicy::default()
     }
 }
@@ -1366,7 +1366,7 @@ fn a_commit_under_two_rules_passes_both_and_gets_each_key_once() {
     let policy = ReceivePolicy {
         rules: vec![
             (
-                RefPattern::parse("a").unwrap(),
+                ReceivePattern::parse("a").unwrap(),
                 ReceiveRule {
                     verify: ReceiveVerify::Keys(trust(SECRET_B64)),
                     signers: vec![server_signer(SERVER_SECRET_B64), shared.clone()],
@@ -1374,7 +1374,7 @@ fn a_commit_under_two_rules_passes_both_and_gets_each_key_once() {
                 },
             ),
             (
-                RefPattern::parse("b").unwrap(),
+                ReceivePattern::parse("b").unwrap(),
                 ReceiveRule {
                     verify: ReceiveVerify::Keys(trust(OTHER_SECRET_B64)),
                     signers: vec![shared],

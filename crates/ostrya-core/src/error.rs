@@ -61,6 +61,16 @@ pub enum Error {
     /// A header that is longer than the framing length limit also gives this
     /// error.
     InvalidFileHeader(&'static str),
+    /// A ref pattern that is not valid.
+    ///
+    /// The text names the entry that failed. These are the causes:
+    ///
+    /// - The pattern is empty, or it has an empty part.
+    /// - A part holds `*` but is not `*` or `**`.
+    /// - A literal part is not a valid ref-name component.
+    /// - A pattern holds `!`, or a selector entry holds `!` after its first
+    ///   character.
+    InvalidRefPattern(String),
 }
 
 impl fmt::Display for Error {
@@ -78,6 +88,7 @@ impl fmt::Display for Error {
             Error::InvalidDirTree(reason) => write!(f, "invalid dirtree: {reason}"),
             Error::InvalidDirMeta(reason) => write!(f, "invalid dirmeta: {reason}"),
             Error::InvalidFileHeader(reason) => write!(f, "invalid file header: {reason}"),
+            Error::InvalidRefPattern(reason) => write!(f, "invalid ref pattern: {reason}"),
         }
     }
 }

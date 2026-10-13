@@ -26,7 +26,7 @@ use crate::refs::is_component;
 use crate::repo::Repo;
 use crate::sign::{MAX_KEY_FILE, key_text, read_key_path, read_key_source};
 
-use super::{ReceivePolicy, ReceiveRule, ReceiveVerify, RefPattern, ServerSigner, TrustedKeys};
+use super::{ReceivePattern, ReceivePolicy, ReceiveRule, ReceiveVerify, ServerSigner, TrustedKeys};
 
 /// The name of the default rule group.
 const DEFAULT_GROUP: &str = "ex-ostrya receive";
@@ -122,7 +122,7 @@ enum KeySpec {
 pub(crate) async fn read(repo: &Repo, keyfile: &KeyFile, origin: Origin) -> Result<ReceivePolicy> {
     // The first pass reads each group by its shape, in file order.
     let mut default = None;
-    let mut rule_groups: Vec<(RefPattern, &str)> = Vec::new();
+    let mut rule_groups: Vec<(ReceivePattern, &str)> = Vec::new();
     let mut trust_groups: Vec<(&str, &str)> = Vec::new();
     let mut key_groups: Vec<(&str, &str)> = Vec::new();
     // Trust and key groups with their names, in file order, for the second
@@ -131,7 +131,9 @@ pub(crate) async fn read(repo: &Repo, keyfile: &KeyFile, origin: Origin) -> Resu
     for group in keyfile.groups() {
         match classify(group)? {
             Some(Group::Default) => default = Some(group),
-            Some(Group::Rule(pattern)) => rule_groups.push((RefPattern::parse(pattern)?, group)),
+            Some(Group::Rule(pattern)) => {
+                rule_groups.push((ReceivePattern::parse(pattern)?, group))
+            }
             Some(Group::Trust(name)) => {
                 trust_groups.push((name, group));
                 builds.push((Group::Trust(name), group));

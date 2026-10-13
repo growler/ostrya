@@ -129,6 +129,47 @@ pub fn is_refspec(refspec: &str) -> bool;
 /// can make a ref that no revision reads back.
 /// `ostrya` re-exports it as `ostrya::is_checksum_shaped`.
 pub fn is_checksum_shaped(name: &str) -> bool;
+
+/// One ref pattern. A pattern is split at `/`, and each part is a literal,
+/// `*`, or `**`. A literal passes `is_ref_name_component` and matches an
+/// equal part of a name. `*` matches exactly one part. `**` matches one or
+/// more parts. `*` and `**` are valid only as a whole part. A pattern is not
+/// empty, has no empty part, and has no `!`. `parse` returns
+/// `ostrya_core::Error::InvalidRefPattern` for each other form, and the
+/// message names the pattern. `matches` compares parts, does not check that
+/// the name is a valid ref name, and costs at most the number of pattern
+/// parts times the number of name parts. It does not backtrack. `ostrya`
+/// re-exports it as `ostrya::RefPattern`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefPattern { /* private */ }
+impl RefPattern {
+    pub fn parse(pattern: &str) -> Result<RefPattern>;
+    pub fn as_str(&self) -> &str;
+    pub fn matches(&self, name: &str) -> bool;
+}
+
+/// A list of positive and negative patterns. An entry is a pattern with an
+/// optional first `!`, and the `!` makes it negative. A name is selected if
+/// the list has no positive pattern or a positive pattern matches it, and no
+/// negative pattern matches it. The order of the entries has no effect. An
+/// empty list is valid and selects each name. An entry with a second `!` is
+/// refused with `ostrya_core::Error::InvalidRefPattern`, and the message
+/// names the entry with its `!`. `positive` and `negative` return the
+/// patterns in entry order, and `negative` returns them without the `!`.
+/// `ostrya` re-exports it as `ostrya::RefSelector`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefSelector { /* private */ }
+impl RefSelector {
+    pub fn parse<'a>(entries: impl IntoIterator<Item = &'a str>) -> Result<RefSelector>;
+    pub fn matches(&self, name: &str) -> bool;
+    pub fn positive(&self) -> &[RefPattern];
+    pub fn negative(&self) -> &[RefPattern];
+}
+
+/// The variant of `ostrya_core::Error` for a pattern or an entry that is not
+/// valid. It holds the reason, which names the entry, and its message is
+/// `invalid ref pattern: {reason}`.
+pub enum Error { /* ... */ InvalidRefPattern(String) }
 pub const MAX_METADATA_SIZE: u64;       // also at ostrya::MAX_METADATA_SIZE
 
 pub struct CollectionRef { pub collection_id: Option<String>, pub ref_name: String }
@@ -2909,7 +2950,7 @@ the crate are.
 #[derive(Debug, Default)]
 pub struct ReceivePolicy {
     pub default_rule: ReceiveRule,              // [ex-ostrya receive]
-    pub rules: Vec<(RefPattern, ReceiveRule)>,  // [ex-ostrya receive "P"]
+    pub rules: Vec<(ReceivePattern, ReceiveRule)>,  // [ex-ostrya receive "P"]
     pub allow_privileged: bool,
     pub summary_signers: Vec<Arc<ServerSigner>>,
     pub update_summary: bool,
@@ -2930,9 +2971,9 @@ pub struct ReceiveRule {
 /// `NAME`, `PREFIX/*`, and either one after `REMOTE:` or `*:`, and
 /// `REMOTE:*` and `*:*`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RefPattern { /* private */ }
-impl RefPattern {
-    pub fn parse(pattern: &str) -> Result<RefPattern>;
+pub struct ReceivePattern { /* private */ }
+impl ReceivePattern {
+    pub fn parse(pattern: &str) -> Result<ReceivePattern>;
     pub fn as_str(&self) -> &str;
 }
 

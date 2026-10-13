@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 const REQUIRE_OSTREE: &str = "OSTRYA_REQUIRE_OSTREE";
 
-/// Opts in to the test that pulls over ssh to localhost, with the value `1`
-/// alone.
+/// The variable that turns on the test that pulls over ssh to localhost. Only
+/// the value `1` turns it on.
 const SSH_LOCALHOST: &str = "OSTRYA_TEST_SSH_LOCALHOST";
 
 /// The stand-in ssh client. Its first two arguments are a file that gets the
@@ -54,7 +54,7 @@ impl Drop for TmpDir {
     }
 }
 
-/// Quote `s` for a POSIX shell.
+/// Quotes `s` for a POSIX shell.
 fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
@@ -91,9 +91,9 @@ fn assert_failed(out: &Output, message: &str) {
     assert_eq!(stderr(out), format!("error: {message}\n"));
 }
 
-/// The standard output of `ostree --version`, or `None` when the tool does
-/// not run. The first call runs the tool, and each later call reuses its
-/// answer.
+/// The standard output of `ostree --version`, or `None` if the `ostree`
+/// command does not run. The first call runs `ostree`, and each later call
+/// reuses its answer.
 fn ostree_version() -> Option<&'static str> {
     static VERSION: OnceLock<Option<String>> = OnceLock::new();
     VERSION
@@ -108,8 +108,8 @@ fn ostree_version() -> Option<&'static str> {
         .as_deref()
 }
 
-/// Whether the `ostree` tool can run. With `OSTRYA_REQUIRE_OSTREE` set, a
-/// missing tool fails the test.
+/// Returns `true` if the `ostree` command can run. If `OSTRYA_REQUIRE_OSTREE`
+/// is set and `ostree` is missing, the test fails.
 fn ostree_available() -> bool {
     let found = ostree_version().is_some();
     assert!(
@@ -122,8 +122,9 @@ fn ostree_available() -> bool {
     found
 }
 
-/// `ostree fsck` passes on `repo`, and `ostree rev-parse` resolves
-/// `origin:main` to `commit`, where the tool is installed.
+/// Checks that `ostree fsck` passes on `repo` and that `ostree rev-parse`
+/// resolves `origin:main` to `commit`. The checks run only where the `ostree`
+/// command is installed.
 fn tool_checks(repo: &Path, commit: &str) {
     if !ostree_available() {
         return;
@@ -245,8 +246,9 @@ impl Setup {
         )
     }
 
-    /// Replace the section of `origin` in the client config with `keys`,
-    /// and with no signature check. Remove the status file of the stand-in.
+    /// Replaces the section of `origin` in the client config with `keys` and
+    /// `gpg-verify=false`, so no signature verification occurs. Then it
+    /// removes the status file of the stand-in.
     fn configure(&self, keys: &str) {
         let config = self.client.join("config");
         let text = std::fs::read_to_string(&config).unwrap();
@@ -259,7 +261,7 @@ impl Setup {
         let _ = std::fs::remove_file(&self.status);
     }
 
-    /// Run `ostrya` on the client with `args` and the variables of `envs`.
+    /// Runs `ostrya` on the client with `args` and the variables of `envs`.
     fn client(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
         let repo = format!("--repo={}", self.client.display());
         let mut all = vec![repo.as_str()];
@@ -271,10 +273,10 @@ impl Setup {
         self.status.exists()
     }
 
-    /// The pull of `main` succeeded: the statistics line counts each content
-    /// object of the source, the client resolves `origin:main` to the
-    /// commit, holds the objects of the source, passes `ostrya fsck`, and the
-    /// tool checks.
+    /// Checks that the pull of `main` succeeded. The statistics line counts
+    /// each content object of the source. The client resolves `origin:main`
+    /// to the commit and holds the objects of the source. `ostrya fsck`
+    /// passes on the client, and the checks of `tool_checks` pass.
     fn assert_pulled(&self, out: &Output) {
         assert!(out.status.success(), "{}", stderr(out));
         let objects = object_names(&self.src);
@@ -300,7 +302,8 @@ impl Setup {
 }
 
 /// A remote whose `pull-url` is an ssh address pulls over ssh, with `url`
-/// and without it. A `url` that answers no request is not read.
+/// and without it. The pull does not read `url`, so a `url` that answers no
+/// request does not cause a failure.
 #[test]
 fn a_pull_over_ssh_writes_the_refs_and_the_objects() {
     for (tag, url) in [("no-url", ""), ("dead-url", "url=http://127.0.0.1:1/\n")] {
@@ -316,8 +319,8 @@ fn a_pull_over_ssh_writes_the_refs_and_the_objects() {
     }
 }
 
-/// An ssh address in `url` is refused in the `ssh://` form and in the scp
-/// form, and the ssh client does not start.
+/// ostrya refuses an ssh address in `url`, in the `ssh://` form and in the scp
+/// form. The ssh client does not start.
 #[test]
 fn an_ssh_address_in_url_is_refused() {
     let setup = Setup::new("ssh-url", "archive", "archive");
@@ -338,9 +341,10 @@ fn an_ssh_address_in_url_is_refused() {
     }
 }
 
-/// Each option of HTTP alone is refused with an ssh address before the ssh
-/// client starts. `--disable-retry-on-network-errors` sets a retry count of
-/// 0, which is accepted.
+/// If the address is an ssh address, ostrya refuses each option that applies
+/// to HTTP alone, before the ssh client starts.
+/// `--disable-retry-on-network-errors` sets a retry count of 0, and ostrya
+/// accepts it.
 #[test]
 fn the_options_of_http_alone_are_refused_before_the_ssh_client_starts() {
     let setup = Setup::new("http-options", "archive", "bare-user");
@@ -375,7 +379,8 @@ fn the_options_of_http_alone_are_refused_before_the_ssh_client_starts() {
     setup.assert_pulled(&out);
 }
 
-/// `--url` wins over `pull-url`: a malformed `pull-url` is not read.
+/// `--url` wins over `pull-url`, so ostrya does not read a malformed
+/// `pull-url`.
 #[test]
 fn the_url_option_wins_over_pull_url() {
     let setup = Setup::new("url-option", "archive", "archive");
@@ -450,9 +455,10 @@ fn the_environment_wins_over_the_ssh_command_key() {
     assert!(!setup.ssh_started());
 }
 
-/// Pull over ssh to localhost from an `archive` and a `bare-user` source
-/// into an `archive` and a `bare-user` client, and check each client with
-/// the tool.
+/// Pulls over ssh to localhost from an `archive` and a `bare-user` source
+/// into an `archive` and a `bare-user` client. Then it checks each client
+/// with `assert_pulled`, which also runs the `ostree` command where it is
+/// installed.
 #[test]
 fn a_pull_over_ssh_to_localhost_is_read_by_the_tool() {
     if std::env::var(SSH_LOCALHOST).as_deref() != Ok("1") {

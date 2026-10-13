@@ -1,8 +1,14 @@
-//! `ostrya serve --read-only` against the `ostree` tool: a pull from a
-//! repository of each mode the port reads, over HTTP and HTTPS, a pull of a
-//! ref alias with no summary, and a pull from a repository whose summary
-//! names deltas the server does not serve. The refusals of the command and
-//! the routing of the receive endpoint run without the tool.
+//! Tests of `ostrya serve --read-only` against the `ostree` command. The
+//! tests run these pulls with `ostree`:
+//!
+//! - a pull from a repository of each mode that ostrya reads, over HTTP and
+//!   HTTPS,
+//! - a pull of a ref alias from a repository with no summary,
+//! - a pull from a repository whose summary names deltas that the server
+//!   does not serve.
+//!
+//! The tests of the refusals of `ostrya serve` and of the routing of the
+//! receive endpoint run without `ostree`.
 
 #![cfg(feature = "serve")]
 
@@ -50,8 +56,9 @@ impl Drop for TmpDir {
     }
 }
 
-/// Whether the `ostree` tool is installed. With [`REQUIRE_OSTREE`] set its
-/// absence fails the test; without it the test skips and says so.
+/// Returns `true` if the `ostree` command is installed. If `REQUIRE_OSTREE`
+/// is set and `ostree` is absent, the test fails. If `REQUIRE_OSTREE` is not
+/// set, the test skips and prints a message.
 fn ostree_available() -> bool {
     let found = Command::new("ostree")
         .arg("--version")
@@ -76,8 +83,8 @@ fn run(program: &str, args: &[&str]) -> Output {
         .unwrap()
 }
 
-/// Run `program` with `args` and return its standard output, failing the
-/// test when it fails.
+/// Run `program` with `args` and return its standard output. If the program
+/// fails, the test fails.
 fn ok(program: &str, args: &[&str]) -> String {
     let out = run(program, args);
     assert!(
@@ -93,21 +100,21 @@ fn ostrya() -> &'static str {
     env!("CARGO_BIN_EXE_ostrya")
 }
 
-/// A running `ostrya serve`, killed when it drops.
+/// A running `ostrya serve` process. A drop of this value kills the process.
 struct Serving {
     child: Child,
     url: String,
 }
 
 impl Serving {
-    /// Start the read-only server over `repo` with `extra` options, on a port
-    /// the kernel chooses, and read the URL it writes.
+    /// Start the read-only server over `repo` with the `extra` options, on a
+    /// port that the kernel chooses. Then read the URL that the server writes.
     fn start(repo: &Path, extra: &[&str]) -> Serving {
         Serving::start_with(repo, &[&["--read-only"], extra].concat())
     }
 
-    /// Start the server over `repo` with the options `args`, on a port the
-    /// kernel chooses, and read the URL it writes.
+    /// Start the server over `repo` with the options `args`, on a port that
+    /// the kernel chooses. Then read the URL that the server writes.
     fn start_with(repo: &Path, args: &[&str]) -> Serving {
         let mut child = Command::new(ostrya())
             .arg(format!("--repo={}", repo.display()))
@@ -140,18 +147,18 @@ impl Serving {
     }
 }
 
-/// A CA and a server certificate for `127.0.0.1` that it signed, for the
-/// HTTPS pulls of the tool. The TLS fixtures name one subject for the CA and
-/// the server certificate, which an OpenSSL client reads as a self-signed
-/// leaf, so the tool needs a pair of its own.
+/// A CA and a server certificate for `127.0.0.1` that the CA signed, for the
+/// HTTPS pulls of the `ostree` command. The TLS fixtures name one subject for
+/// the CA and the server certificate. An OpenSSL client reads that server
+/// certificate as a self-signed leaf, so `ostree` needs a pair of its own.
 struct Pki {
     ca: PathBuf,
     cert: PathBuf,
     key: PathBuf,
 }
 
-/// Generate a [`Pki`] under `dir` with `openssl`. Each certificate takes a
-/// config file of its own, and `OPENSSL_CONF` names no file, so no
+/// Generate a `Pki` under `dir` with `openssl`. Each certificate takes a
+/// config file of its own, and `OPENSSL_CONF` names no file. As a result, no
 /// distinguished-name section of a host config replaces the subject.
 fn make_pki(dir: &Path) -> Pki {
     std::fs::create_dir_all(dir).unwrap();
@@ -292,9 +299,12 @@ fn server_repo(path: &Path, mode: &str, src: &Path, extra: &[&str]) -> String {
 }
 
 /// Turn a `bare` repository whose objects carry no extended attributes into
-/// a `bare-split-xattrs` one: the inodes stay, the config names the mode,
-/// and each file object gets a `.file-xattrs-link` to the shared empty
-/// `.file-xattrs` object.
+/// a `bare-split-xattrs` repository:
+///
+/// - the inodes stay,
+/// - the `config` file names the mode `bare-split-xattrs`,
+/// - each file object gets a `.file-xattrs-link` to the shared empty
+///   `.file-xattrs` object.
 fn split_xattrs(path: &Path) {
     let objects = path.join("objects");
     let empty = objects.join(&EMPTY_XATTRS[..2]);
@@ -318,8 +328,8 @@ fn split_xattrs(path: &Path) {
     .unwrap();
 }
 
-/// A client repository of `mode` with the remote `origin` at `url`, which
-/// trusts the CA of `pki` for HTTPS.
+/// A client repository of `mode` with the remote `origin` at `url`. If `pki`
+/// is set, the remote trusts the CA of `pki` for HTTPS.
 fn client(path: &Path, mode: &str, url: &str, pki: Option<&Pki>) -> String {
     let repo = format!("--repo={}", path.display());
     ok("ostree", &[&repo, "init", &format!("--mode={mode}")]);
@@ -342,13 +352,14 @@ fn pull(path: &Path, mode: &str, url: &str, pki: Option<&Pki>, rev: &str) -> Str
         .to_owned()
 }
 
-/// The tool pulls from a repository of each mode the port reads, over HTTP
-/// and over HTTPS, and the pulled repository passes `ostree fsck`.
+/// The `ostree` command pulls from a repository of each mode that ostrya
+/// reads, over HTTP and over HTTPS. Each pulled repository passes
+/// `ostree fsck`.
 ///
 /// The summary of a `bare-user-shared` repository states that mode in
-/// `ostree.summary.mode`, which the tool cannot parse, so the pull from that
-/// repository runs with no summary, and a pull with the summary is checked to
-/// fail with the error of the tool.
+/// `ostree.summary.mode`. `ostree` cannot parse this value, so the pull from
+/// that repository runs with no summary. The test also checks that a pull
+/// with the summary fails with the error of `ostree`.
 #[test]
 fn the_tool_pulls_from_every_mode() {
     if !ostree_available() {
@@ -414,9 +425,11 @@ fn the_tool_pulls_from_every_mode() {
     }
 }
 
-/// With no summary the tool requests `refs/heads/<ref>`, and the view serves
-/// a ref alias as the ref it names. The commit carries no ref binding, which
-/// the tool would hold to the name `main`.
+/// If the repository has no summary, the `ostree` command requests
+/// `refs/heads/<ref>`. The view serves a ref alias as the ref that the alias
+/// names. The commit carries no ref binding, because the test commits with
+/// `--no-bindings`. With a binding, `ostree` holds the commit to the bound
+/// name `main`.
 #[test]
 fn the_tool_pulls_an_alias_with_no_summary() {
     if !ostree_available() {
@@ -441,9 +454,9 @@ fn the_tool_pulls_an_alias_with_no_summary() {
 }
 
 /// The summary of a repository in a mode other than `archive` names a delta
-/// that the view does not serve. A `bare-user` client of the tool fetches
-/// the objects loose, and with `--require-static-deltas` it fails. The
-/// client is `bare-user` because an `archive` client of the tool uses no
+/// that the view does not serve. A `bare-user` client of the `ostree` command
+/// fetches the objects loose. With `--require-static-deltas`, the pull fails.
+/// The client is `bare-user` because an `archive` client of `ostree` uses no
 /// delta.
 #[test]
 fn the_tool_pulls_loose_past_unserved_deltas() {
@@ -504,15 +517,25 @@ fn the_tool_pulls_loose_past_unserved_deltas() {
     );
 }
 
-/// The command refuses to run without `--read-only` and without an
-/// authentication method of push, and with a credential file over plain
-/// HTTP as the one method that takes no credential, before it opens the
-/// repository. It refuses a receive option beside `--read-only`, a policy
-/// file it cannot open, a TLS file it cannot use,
-/// a credential file past the size cap, a credential file with no
-/// credential line as the one method, and a malformed credential line,
-/// which it names by its number alone. Each refusal exits 1 and writes no
-/// URL.
+/// `ostrya serve` refuses to run in these cases, before it opens the
+/// repository:
+///
+/// - with no `--read-only` and no authentication method of push,
+/// - with a credential file as the one method over plain HTTP and no
+///   `--allow-cleartext-credentials`, because the receive endpoint then
+///   takes no credential.
+///
+/// It also refuses these inputs:
+///
+/// - a receive option beside `--read-only`,
+/// - a policy file that it cannot open,
+/// - a TLS file that it cannot use,
+/// - a credential file larger than the size cap,
+/// - a credential file with no credential line, as the one method,
+/// - a malformed credential line. The refusal names the line by its number
+///   alone.
+///
+/// Each refusal exits 1 and writes no URL.
 #[test]
 fn serve_refuses_what_it_cannot_serve() {
     let tmp = TmpDir::new("refusals");
@@ -653,9 +676,9 @@ fn raw(url: &str, request: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// With `--allow-anonymous-push` the receive endpoint answers a `session`
-/// request, and the archive view still serves `config`. With `--read-only`
-/// the server has no endpoint, and the request gets 405.
+/// With `--allow-anonymous-push`, the receive endpoint answers a `session`
+/// request, and the archive view still serves `config`. With `--read-only`,
+/// the server has no receive endpoint, so the request gets 405.
 #[test]
 fn serve_runs_the_receive_endpoint_with_anonymous_push() {
     let tmp = TmpDir::new("receive");
@@ -686,10 +709,11 @@ fn serve_runs_the_receive_endpoint_with_anonymous_push() {
     assert!(response.starts_with("HTTP/1.1 405 "), "{response}");
 }
 
-/// With `--push-credentials` and `--allow-anonymous-push`, a bearer token
-/// over plain HTTP gets 403 with no `--allow-cleartext-credentials`, and
-/// passes the authentication with it. A client CA alone is a method of
-/// push, and the server starts with it.
+/// With `--push-credentials` and `--allow-anonymous-push`, and with no
+/// `--allow-cleartext-credentials`, a bearer token over plain HTTP gets 403.
+/// With `--push-credentials` and `--allow-cleartext-credentials`, the token
+/// passes the authentication. A client CA alone is a method of push, and the
+/// server starts with it.
 #[test]
 fn serve_takes_push_credentials() {
     let tmp = TmpDir::new("credentials");
@@ -711,8 +735,8 @@ fn serve_takes_push_credentials() {
     drop(server);
     let server = Serving::start_with(&path, &[&creds, "--allow-cleartext-credentials"]);
     let response = raw(&server.url, post);
-    // The empty body holds no `Hello`, so the request passed the
-    // authentication and the endpoint refuses it with `protocol`.
+    // A 422 shows that the request passed the authentication. The empty
+    // body holds no `Hello`, so the endpoint refuses it with `protocol`.
     assert!(response.starts_with("HTTP/1.1 422 "), "{response}");
     let unknown = post.replace("Bearer token", "Bearer other");
     let response = raw(&server.url, &unknown);

@@ -289,9 +289,9 @@ fn tip(dest: &Path) -> Option<Checksum> {
     })
 }
 
-/// The standard output of `ostree --version`, or `None` when the tool does
-/// not run. The first call runs the tool, and each later call reuses its
-/// answer.
+/// The standard output of `ostree --version`, or `None` if the `ostree`
+/// command does not run. The first call runs `ostree`, and each later call
+/// reuses its answer.
 fn ostree_version() -> Option<&'static str> {
     static VERSION: OnceLock<Option<String>> = OnceLock::new();
     VERSION
@@ -306,8 +306,8 @@ fn ostree_version() -> Option<&'static str> {
         .as_deref()
 }
 
-/// Whether the `ostree` tool can run. With `OSTRYA_REQUIRE_OSTREE` set, a
-/// missing tool fails the test.
+/// Returns `true` if the `ostree` command can run. If `OSTRYA_REQUIRE_OSTREE`
+/// is set, a missing `ostree` fails the test.
 fn ostree_available() -> bool {
     let found = ostree_version().is_some();
     assert!(
@@ -320,7 +320,8 @@ fn ostree_available() -> bool {
     found
 }
 
-/// `ostree fsck` passes on `repo`, where the tool is installed.
+/// If the `ostree` command is installed, checks that `ostree fsck` passes on
+/// `repo`.
 fn tool_fsck(repo: &Path) {
     if !ostree_available() {
         return;
@@ -737,7 +738,7 @@ mod cli {
 
     /// Push `main` and `other:renamed` over ssh to localhost, into an
     /// `archive` receiver with `--compress` and into a `bare-user` receiver
-    /// raw, and check each receiver with the tool.
+    /// raw, and check each receiver with the `ostree` command.
     #[test]
     fn a_push_over_ssh_to_localhost_is_read_by_the_tool() {
         if std::env::var(SSH_LOCALHOST).as_deref() != Ok("1") {
@@ -789,8 +790,8 @@ mod cli {
         }
     }
 
-    /// `ostree` resolves `refs` in `recv`, checks it, and pulls them into a
-    /// new `archive` repository, which it also checks.
+    /// The `ostree` command resolves `refs` in `recv`, checks it, and pulls
+    /// them into a new `archive` repository, which it also checks.
     fn tool_checks(base: &TmpDir, recv: &Path, refs: &[(&str, Checksum)]) {
         if !ostree_available() {
             return;
@@ -866,10 +867,11 @@ mod cli {
         assert!(last.contains(" bytes sent in "), "{err}");
     }
 
-    /// On a pipe the progress bar writes nothing: standard error carries no
-    /// escape byte, and nothing at all without `--verbose`. With it, the
-    /// statistics line is the last line. Standard output keeps the ref
-    /// line. `TERM` names a terminal, so the pipe alone hides the bar.
+    /// On a pipe, the progress bar writes nothing: standard error carries no
+    /// escape byte. Without `--verbose`, standard error carries nothing at
+    /// all. With it, the statistics line is the last line. Standard output
+    /// keeps the ref line. `TERM` names a terminal, so the pipe alone hides
+    /// the bar.
     #[test]
     fn a_push_to_a_pipe_writes_no_progress() {
         let setup = Setup::new("cli-progress-pipe", "archive");
@@ -984,8 +986,8 @@ mod cli {
         assert!(!setup.ssh_started());
     }
 
-    /// A depth below -1 fails before ssh starts, and `--compress` takes the
-    /// levels 1 to 9 alone.
+    /// A depth less than -1 fails before ssh starts, and `--compress` takes
+    /// the levels 1 to 9 alone.
     #[test]
     fn a_depth_below_minus_one_and_a_bad_level_are_refused() {
         let setup = Setup::new("cli-refused", "archive");
@@ -1006,9 +1008,9 @@ mod cli {
         assert!(setup.ssh_started());
     }
 
-    /// A destination of 64 lowercase hex characters, which a revision reads
-    /// as a commit checksum, is an invalid refspec, refused before ssh
-    /// starts.
+    /// A destination of 64 lowercase hex characters is an invalid refspec,
+    /// because a revision reads it as a commit checksum. The push refuses it
+    /// before ssh starts.
     #[test]
     fn a_destination_of_64_lowercase_hex_characters_is_refused() {
         let setup = Setup::new("cli-hex-dst", "archive");
@@ -1024,7 +1026,8 @@ mod cli {
     }
 
     /// A ref line that standard output cannot take, here on `/dev/full`,
-    /// gives the error line and exit 1. The ref of the server has moved.
+    /// gives the error line and exit 1. The ref of the server moves to the
+    /// pushed commit, although the write of the ref line fails.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_failed_write_of_the_ref_lines_exits_one() {
@@ -1062,7 +1065,8 @@ mod cli {
         let dest = receiver(&setup.base, RepoMode::Archive);
         let env = [("OSTRYA_SSH_COMMAND", "/nonexistent/ssh")];
 
-        // The environment variable reaches the push when no option is given.
+        // If the command line gives no option, the environment variable
+        // reaches the push.
         let receive = receive_command(None);
         let address = address(&dest);
         let out = setup.push(&[&receive, &address, "main"], &env);
@@ -1092,7 +1096,7 @@ mod cli {
         assert_eq!(stdout(&out), format!("main {c} {c2}\n"));
     }
 
-    /// A delete is refused by the default policy, and a policy with
+    /// The default policy refuses a delete, and a policy with
     /// `allow-delete=true` takes it. A delete of an absent ref changes
     /// nothing.
     #[test]
@@ -1154,7 +1158,8 @@ mod cli {
         use super::*;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        /// The timestamp of every commit of the tool and of the port here.
+        /// The timestamp of every commit that the `ostree` command and ostrya
+        /// make in these tests.
         const EPOCH: &str = "1700000000";
 
         /// ed25519 sign fixture: the base64 of the 64-byte secret key and the
@@ -1171,10 +1176,11 @@ mod cli {
         /// into a failure.
         const REQUIRE_OSTREE_ED25519: &str = "OSTRYA_REQUIRE_OSTREE_ED25519";
 
-        /// Whether the `ostree` tool carries its ed25519 signing engine, which
-        /// `ostree --version` reports as the `sign-ed25519` feature. With
-        /// [`REQUIRE_OSTREE_ED25519`] set the absence fails; without it the
-        /// test skips and says so.
+        /// Returns `true` if the `ostree` command carries its ed25519 signing
+        /// engine. `ostree --version` reports this engine as the
+        /// `sign-ed25519` feature. If [`REQUIRE_OSTREE_ED25519`] is set, the
+        /// absence fails the test. If it is not set, the test skips and says
+        /// so.
         fn ostree_supports_ed25519() -> bool {
             let supported = ostree_available()
                 && ostree_version().is_some_and(|text| text.contains("sign-ed25519"));
@@ -1211,7 +1217,7 @@ mod cli {
 
         /// The commit of `ostree commit --no-xattrs` with `args` over `tree`,
         /// in the `archive` repository `tool-ref` under `base`, which the
-        /// first call makes with `ostree init`. `None` when the tool is
+        /// first call makes with `ostree init`. `None` if `ostree` is
         /// absent.
         fn tool_commit(base: &TmpDir, tree: &Path, args: &[&str]) -> Option<Checksum> {
             if !ostree_available() {
@@ -1271,7 +1277,7 @@ mod cli {
             push_tree(setup, &all, &[])
         }
 
-        /// The commit a successful push printed: its one line on standard
+        /// The commit that a successful push prints: its one line on standard
         /// output.
         fn pushed(out: &Output) -> Checksum {
             assert!(out.status.success(), "{}", stderr(out));
@@ -1282,9 +1288,9 @@ mod cli {
         }
 
         /// One `-b` with a subject, a body, and metadata options in mixed
-        /// order gives the commit of the tool, and a second push gives the
-        /// second commit of the tool, whose parent is the first. Under `-v`
-        /// the statistics line goes to standard error.
+        /// order gives the commit of the `ostree` command. A second push gives
+        /// the second commit of `ostree`, whose parent is the first. Under
+        /// `-v`, the statistics line goes to standard error.
         #[test]
         fn a_tree_push_gives_the_commit_of_the_tool() {
             let setup = Setup::without_client("tree-one");
@@ -1328,11 +1334,11 @@ mod cli {
             tool_fsck(&dest);
         }
 
-        /// On a pipe the progress bar of a tree push writes nothing:
-        /// standard error carries no escape byte, and nothing at all
-        /// without `--verbose`. With it, the statistics line is the last
-        /// line. Standard output keeps the commit checksum. `TERM` names a
-        /// terminal, so the pipe alone hides the bar.
+        /// On a pipe, the progress bar of a tree push writes nothing:
+        /// standard error carries no escape byte. Without `--verbose`,
+        /// standard error carries nothing at all. With it, the statistics
+        /// line is the last line. Standard output keeps the commit checksum.
+        /// `TERM` names a terminal, so the pipe alone hides the bar.
         #[test]
         fn a_tree_push_to_a_pipe_writes_no_progress() {
             let setup = Setup::without_client("tree-progress-pipe");
@@ -1395,8 +1401,8 @@ mod cli {
         }
 
         /// `--canonical-permissions` and the owner options give the commit
-        /// of the tool with the same options, over a tree whose modes the
-        /// canonical rule changes.
+        /// of the `ostree` command with the same options, over a tree whose
+        /// modes the canonical rule changes.
         #[test]
         fn the_owner_and_canonical_options_give_the_commit_of_the_tool() {
             let setup = Setup::without_client("tree-owner");
@@ -1422,9 +1428,9 @@ mod cli {
             tool_fsck(&dest);
         }
 
-        /// A push signed with `--sign` verifies with the tool and with the
-        /// port in the receiver, and the signature leaves the commit as an
-        /// unsigned push gives it.
+        /// A push signed with `--sign` verifies with the `ostree` command and
+        /// with ostrya in the receiver. The signature leaves the commit equal
+        /// to the commit of an unsigned push.
         #[test]
         fn a_signed_tree_push_verifies_in_the_receiver() {
             let setup = Setup::without_client("tree-sign");
@@ -1462,8 +1468,9 @@ mod cli {
         }
 
         /// A `bare-user-only` receiver refuses the owner of the walk and a
-        /// mode it does not store. The owner options make a tree of 0644 and
-        /// 0755 modes go in, and `--canonical-permissions` a tree of 0664.
+        /// mode that it does not store. With the owner options, a tree of 0644
+        /// and 0755 modes goes in. With `--canonical-permissions`, a tree of
+        /// 0664 goes in.
         #[test]
         fn the_owner_and_canonical_options_make_a_push_into_bare_user_only_succeed() {
             let setup = Setup::without_client("tree-buo");
@@ -1511,11 +1518,16 @@ mod cli {
             tool_fsck(&dest);
         }
 
-        /// Given an address, the command opens no repository: a `--repo`
-        /// that does not exist, a `--repo` whose config does not parse,
-        /// `OSTREE_REPO` at a missing path, and a current directory that is
-        /// no repository leave the push to succeed. A remote name with a
-        /// `--repo` that does not exist fails on the open.
+        /// If the push names an address, the command opens no repository.
+        /// The push succeeds in each of these cases:
+        ///
+        /// - a `--repo` that does not exist,
+        /// - a `--repo` whose config does not parse,
+        /// - `OSTREE_REPO` at a missing path,
+        /// - a current directory that is no repository.
+        ///
+        /// A remote name with a `--repo` that does not exist fails on the
+        /// open.
         #[test]
         fn an_address_opens_no_repository() {
             let setup = Setup::new("tree-address", "archive");
@@ -1698,8 +1710,8 @@ mod cli {
 
         /// `--body-file` alone and beside `-m`, `--parent=none`,
         /// `--no-bindings`, an explicit `--timestamp`, and `--parent` with
-        /// a commit of the server each give the commit of the tool with the
-        /// same options.
+        /// a commit of the server each give the commit of the `ostree`
+        /// command with the same options.
         #[test]
         fn the_commit_options_give_the_commit_of_the_tool() {
             let setup = Setup::without_client("tree-options");
@@ -1743,9 +1755,11 @@ mod cli {
         }
 
         /// Detached metadata, two `--sign` keys, and a `--sign-from-file`
-        /// key give the detached entry, then the three signatures in the
-        /// order of `commit`, and the `.commitmeta` bytes and the commit of
-        /// the tool with the same options.
+        /// key give the detached entry, then the three signatures. The
+        /// signatures come in the order of `ostree commit`: the `--sign` keys
+        /// in command-line order, then the `--sign-from-file` key. The
+        /// `.commitmeta` bytes and the commit are equal to those of the
+        /// `ostree` command with the same options.
         #[test]
         fn detached_metadata_and_signers_give_the_commitmeta_of_the_tool() {
             let setup = Setup::without_client("tree-detached");
@@ -1791,10 +1805,10 @@ mod cli {
             tool_fsck(&dest);
         }
 
-        /// Under `--sign-type=gpg`, a `--sign` key and a `--sign-from-file`
-        /// key that name no secret key in the GnuPG home directory are
-        /// refused before the scan and before ssh starts, with the words of
-        /// `--gpg-sign`.
+        /// Under `--sign-type=gpg`, the push refuses a `--sign` key and a
+        /// `--sign-from-file` key that name no secret key in the GnuPG home
+        /// directory. It refuses them before the scan and before ssh starts,
+        /// with the words of `--gpg-sign`.
         #[cfg(feature = "gpg")]
         #[test]
         fn a_gpg_key_with_no_secret_key_fails_before_ssh_starts() {
@@ -1823,8 +1837,8 @@ mod cli {
             assert_eq!(server_tip(&dest, "main"), None);
         }
 
-        /// Whether the gpg binary runs. With `OSTRYA_REQUIRE_GNUPG` set, a
-        /// missing binary fails the test.
+        /// Returns `true` if the gpg binary runs. If `OSTRYA_REQUIRE_GNUPG` is
+        /// set, a missing binary fails the test.
         #[cfg(feature = "gpg")]
         fn gpg_available() -> bool {
             const REQUIRE_GNUPG: &str = "OSTRYA_REQUIRE_GNUPG";

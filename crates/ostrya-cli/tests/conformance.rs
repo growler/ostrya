@@ -1,13 +1,13 @@
-//! The conformance matrix, run against the binary this crate builds.
+//! The conformance matrix, run against the binary that this crate builds.
 //!
-//! `docs/conformance/harness.md`, "Cargo and CI wiring": this keeps the
-//! workspace test run as the gate with no workflow change. Every cell that
-//! needs the `ostree` tool reports as `skip: reference-absent` where the tool
-//! is not installed, and never as a pass. A machine that holds the tool runs
-//! `ostrya-conformance run --require tool=ostree` to demand the coverage.
+//! The workspace test run stays the gate, with no change to the CI workflow.
+//! If the `ostree` command is not installed, each cell that needs it reports
+//! as `skip: reference-absent`, and never as a pass. A machine that has
+//! `ostree` runs `ostrya-conformance run --require tool=ostree` to demand the
+//! coverage.
 //!
-//! One setup list also runs directly here, over the port alone, because the
-//! matrix run reaches it only where the `ostree` tool resolves.
+//! One setup list also runs directly here, over ostrya alone, because the
+//! matrix run reaches it only where `ostree` resolves.
 
 use std::path::Path;
 
@@ -23,13 +23,13 @@ fn the_t0_matrix_selection_holds() {
     eprintln!("{}", gate.text);
 }
 
-/// The corpus tree two setups of one record share.
+/// The corpus tree that two setups of one record share.
 ///
-/// `crates/ostrya-conformance/src/setup.rs`: every setup that needs the
-/// corpus names one path for it, so `repo-with-commit` and `tree` in one
-/// record resolve to the tree the first of them wrote. The runner skips a
-/// cell before setup where no `ostree` binary resolves, so the context here
-/// holds no reference handle and names the port for every step.
+/// In `crates/ostrya-conformance/src/setup.rs`, each setup that needs the
+/// corpus names one path for it. `repo-with-commit` and `tree` in one record
+/// then resolve to the tree that the first of them wrote. If no `ostree`
+/// binary resolves, the runner skips the cell before setup. As a result, the
+/// context here holds no reference handle and names ostrya for every step.
 #[test]
 fn two_setups_share_one_corpus_tree() {
     let port = exec::resolve(

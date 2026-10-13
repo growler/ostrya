@@ -1,13 +1,19 @@
-//! The HTTP transport of a push against `ostrya_server` in this process:
-//! each authentication method over HTTPS with an endpoint built in memory, a
-//! trust setting that verifies no certificate chain, a credential over plain
-//! HTTP, the
-//! tree push and its repeat, the push of a repository, the object streams
-//! of a session through a proxy that counts them, a commit whose response is
-//! lost or refused, a source that fails, and an object whose bytes do not
-//! hash to its name. The module `cli` runs `ostrya push` and `ostrya
-//! push-tree` against `ostrya serve`, and checks the receiving repository
-//! with the `ostree` tool.
+//! The HTTP transport of a push against `ostrya_server` in this process.
+//! The tests cover:
+//!
+//! - each authentication method over HTTPS, with an endpoint built in memory
+//! - a trust setting that verifies no certificate chain
+//! - a credential over plain HTTP
+//! - the tree push and its repeat
+//! - the push of a repository
+//! - the object streams of a session, through a proxy that counts them
+//! - a commit whose response is lost or refused
+//! - a source that fails
+//! - an object whose bytes do not hash to its name
+//!
+//! The module `cli` runs `ostrya push` and `ostrya push-tree` against
+//! `ostrya serve`. It checks the receiving repository with the `ostree`
+//! command.
 
 #![cfg(all(feature = "serve", feature = "push"))]
 
@@ -305,7 +311,7 @@ enum CommitResponse {
 struct Seen {
     connections: AtomicUsize,
     requests: AtomicUsize,
-    /// The `objects` requests whose response has not started.
+    /// The `objects` requests whose response did not start yet.
     objects_in_flight: AtomicUsize,
     /// The most `objects` requests in flight at one time.
     max_objects: AtomicUsize,
@@ -315,9 +321,9 @@ struct Seen {
     objects_responses: Mutex<Vec<Vec<u8>>>,
 }
 
-/// A plain TCP proxy to a server that reads the HTTP/1.1 messages on each
-/// connection, so it counts each request also when the client sends several
-/// requests over one connection.
+/// A plain TCP proxy to a server. It reads the HTTP/1.1 messages on each
+/// connection. If the client sends several requests over one connection, the
+/// proxy counts each of them.
 struct CountingProxy {
     url: String,
     seen: Arc<Seen>,
@@ -349,7 +355,7 @@ impl CountingProxy {
 }
 
 /// Read the head of one HTTP/1.1 message: the lines up to the empty line.
-/// `None` at the end of the stream.
+/// Give `None` at the end of the stream.
 fn read_head(input: &mut BufReader<TcpStream>) -> Option<Vec<u8>> {
     let mut head = Vec::new();
     loop {
@@ -377,9 +383,9 @@ fn header(head: &[u8], name: &str) -> Option<String> {
         })
 }
 
-/// Copy the body that `head` frames from `input` to `output`, and give its
-/// bytes when `keep` is set: a `Content-Length` body, a chunked body, or no
-/// body. `None` when the copy failed.
+/// Copy the body that `head` frames from `input` to `output`: a
+/// `Content-Length` body, a chunked body, or no body. If `keep` is set, give
+/// the bytes of the body. If the copy fails, give `None`.
 fn copy_body(
     head: &[u8],
     no_body: bool,
@@ -575,7 +581,7 @@ async fn scan(root: &Path) -> TreeModel {
 // ---------------------------------------------------------------------------
 
 /// Over HTTPS, a push with a bearer token, with Basic, and with a client
-/// certificate sets its ref, and a push with no credential is
+/// certificate sets its ref. A push with no credential is
 /// `unauthorized`. Each credential and each key is in memory. One client key
 /// is an encrypted PKCS#8 key, with its passphrase in memory. A server that
 /// allows anonymous push takes a push with no credential.
@@ -674,8 +680,8 @@ fn a_trust_setting_of_the_caller_that_accepts_any_chain_pushes() {
     });
 }
 
-/// A token to an `http://` address is refused before any request when the
-/// cleartext permission is not set: the resolver refuses a token file, and
+/// If the cleartext permission is not set, a token to an `http://` address
+/// is refused before any request. The resolver refuses a token file, and
 /// the HTTP client refuses a token in memory. With the permission, the push
 /// succeeds against a server that takes cleartext credentials.
 #[test]
@@ -794,9 +800,9 @@ fn a_repository_push_over_http() {
     });
 }
 
-/// The `objects` requests of a session stay within `parallel-uploads`, and
-/// with more than one allowed, several run at the same time. Two `send`
-/// calls of one session at the same time share the limit.
+/// The `objects` requests of a session stay within `parallel-uploads`. If
+/// the limit is more than one, several requests run at the same time. Two
+/// `send` calls of one session at the same time share the limit.
 #[test]
 fn the_object_streams_stay_within_parallel_uploads() {
     let tmp = TmpDir::new("parallel");
@@ -887,9 +893,10 @@ fn a_lost_commit_response_leaves_the_outcome_unknown() {
     });
 }
 
-/// A commit whose response the client refuses after it sent the request,
-/// here for a coding the response declares, gives `CommitOutcomeUnknown`
-/// and not a definite failure: the server applied the commit.
+/// A commit whose response the client refuses after it sent the request
+/// gives `CommitOutcomeUnknown`, and no definite failure. Here the client
+/// refuses a coding that the response declares. The server applied the
+/// commit.
 #[test]
 fn a_refused_commit_response_leaves_the_outcome_unknown() {
     let tmp = TmpDir::new("coded");
@@ -953,9 +960,9 @@ fn a_failed_source_aborts_the_session() {
 }
 
 /// An object whose bytes do not hash to its name gives `checksum-mismatch`
-/// from the server, also when other streams of the call ran at the same time
-/// and failed because the server aborted the session: the call returns the
-/// error that the server gave for its own cause.
+/// from the server. Other streams of the call can run at the same time and
+/// fail because the server aborted the session. In that case too, the call
+/// returns the error that the server gave for the cause of the abort.
 #[test]
 fn a_checksum_mismatch_over_http() {
     let tmp = TmpDir::new("mismatch");
@@ -1011,15 +1018,15 @@ fn a_checksum_mismatch_over_http() {
 }
 
 /// `ostrya push` and `ostrya push-tree` against `ostrya serve`, and the
-/// checks of the `ostree` tool on the receiving repository.
+/// checks of the `ostree` command on the receiving repository.
 mod cli {
     use super::*;
     use std::process::{Child, Command, Output, Stdio};
 
     const REQUIRE_OSTREE: &str = "OSTRYA_REQUIRE_OSTREE";
 
-    /// The variables that name a proxy to the HTTP client of the port or of
-    /// the tool.
+    /// The variables that name a proxy to the HTTP client of ostrya or of
+    /// the `ostree` command.
     const PROXY_VARIABLES: [&str; 8] = [
         "http_proxy",
         "HTTP_PROXY",
@@ -1066,7 +1073,7 @@ mod cli {
     }
 
     /// Run `program` with `args`, with no proxy, and return its standard
-    /// output, failing the test when it fails.
+    /// output. If the program fails, fail the test.
     fn ok(program: &str, args: &[&str]) -> String {
         let out = if program == "ostrya" {
             ostrya(args)
@@ -1185,7 +1192,7 @@ mod cli {
             self.tmp.path().join(name)
         }
 
-        /// A new repository `name` of `mode`, created by the port.
+        /// A new repository `name` of `mode` that `ostrya init` creates.
         fn init(&self, name: &str, mode: &str) -> PathBuf {
             let path = self.path(name);
             ok(
@@ -1252,8 +1259,8 @@ mod cli {
         ostrya(&[&[repo.as_str(), "push"], args].concat())
     }
 
-    /// The `--tls-` options of the fixture CA, and of the fixture client
-    /// certificate when `cert` is set.
+    /// The `--tls-` options of the fixture CA. If `cert` is set, also the
+    /// options of the fixture client certificate.
     fn tls_args(cert: bool) -> Vec<String> {
         let mut args = vec![format!("--tls-ca-path={}", fixture("ca.pem").display())];
         if cert {
@@ -1282,10 +1289,11 @@ mod cli {
     }
 
     /// `ostrya push` to an HTTPS remote of the config takes the address from
-    /// `url`, or from `push-url` when the section has one, and the token
-    /// file, the user, and the CA from the keys of the section. The ssh keys
-    /// of a section with an HTTP address are not read. Each option wins over
-    /// the key of its name, and each key resolves on its own.
+    /// `url`. If the section has a `push-url`, the push takes the address
+    /// from `push-url`. The push takes the token file, the user, and the CA
+    /// from the keys of the section. The push does not read the ssh keys of
+    /// a section with an HTTP address. Each option wins over the key of its
+    /// name, and each key resolves on its own.
     #[test]
     fn push_takes_the_http_keys_of_the_remote_and_the_options_win() {
         let setup = Setup::new("cli-keys");
@@ -1345,7 +1353,7 @@ mod cli {
             &[&ca_arg, &alice, "--push-user=alice", "override", "main:o2"],
         );
         assert!(out.status.success(), "{}", stderr(&out));
-        // A user that does not own the token is refused.
+        // The server refuses a user that does not own the token.
         assert_refused(
             &push_from(
                 &client,
@@ -1399,9 +1407,9 @@ mod cli {
         assert_eq!(refs, "main\n");
     }
 
-    /// A token to an `http://` address is refused before any connection
-    /// without `--allow-cleartext-credentials`. With it, the push succeeds
-    /// against a server that takes credentials over plain HTTP.
+    /// Without `--allow-cleartext-credentials`, the push refuses a token to
+    /// an `http://` address before any connection. With the switch, the push
+    /// succeeds against a server that takes credentials over plain HTTP.
     #[test]
     fn a_cleartext_token_needs_the_switch() {
         let setup = Setup::new("cli-cleartext");
@@ -1439,10 +1447,10 @@ mod cli {
         assert_eq!(rev_parse(&server, "main"), stdout(&out).trim());
     }
 
-    /// `tls-permissive=true` on a remote with an `https://` push address is
-    /// refused before any connection, by `ostrya push` and by `ostrya
-    /// push-tree`. An option of the other transport is refused too, for an
-    /// HTTP address and for an ssh address.
+    /// `ostrya push` and `ostrya push-tree` refuse `tls-permissive=true` on a
+    /// remote with an `https://` push address before any connection. They
+    /// also refuse an option of the other transport, for an HTTP address and
+    /// for an ssh address.
     #[test]
     fn tls_permissive_and_an_option_of_the_other_transport_are_refused() {
         let setup = Setup::new("cli-refusals");
@@ -1484,9 +1492,9 @@ mod cli {
             "error: invalid input: receive-command applies to an ssh address",
         );
         silent.assert_untouched();
-        // The HTTP keys of a remote with an ssh address are not read, so the
-        // push reaches the ssh client, which `OSTRYA_SSH_COMMAND` sets to
-        // `false`.
+        // The push does not read the HTTP keys of a remote with an ssh
+        // address, so the push reaches the ssh client. `OSTRYA_SSH_COMMAND`
+        // sets the ssh client to `false`.
         let out = push_from(&client, &["permissive-ssh", "main"]);
         assert_refused(&out, "transport: 'false'");
         assert!(!stderr(&out).contains("tls-permissive"), "{}", stderr(&out));
@@ -1524,8 +1532,8 @@ mod cli {
         );
     }
 
-    /// An HTTP push reads the `proxy` key of the remote. A value with white
-    /// space at its start is refused before any connection.
+    /// An HTTP push reads the `proxy` key of the remote. If the value starts
+    /// with white space, the push refuses it before any connection.
     #[test]
     fn a_padded_proxy_key_is_refused() {
         let setup = Setup::new("cli-proxy");
@@ -1546,8 +1554,8 @@ mod cli {
         silent.assert_untouched();
     }
 
-    /// `tls-permissive=true` on a remote whose push address is `http://` is
-    /// ignored: the push uses no TLS, and it succeeds.
+    /// The push ignores `tls-permissive=true` on a remote whose push address
+    /// is `http://`. The push uses no TLS, and it succeeds.
     #[test]
     fn tls_permissive_is_ignored_for_an_http_address() {
         let setup = Setup::new("cli-permissive-http");
@@ -1570,10 +1578,10 @@ mod cli {
     }
 
     /// The push checks the remote and makes the transport ready before its
-    /// own local work. `ostrya push` refuses a bad HTTP option before it
-    /// reads a refspec, and `ostrya push-tree` refuses an option of the
-    /// other transport before it checks a signing key and before it reads
-    /// the body file.
+    /// own local work. `ostrya push` refuses an HTTP option that is not
+    /// valid before it reads a refspec. `ostrya push-tree` refuses an option
+    /// of the other transport before it checks a signing key and before it
+    /// reads the body file.
     #[test]
     fn the_transport_checks_come_before_the_local_work() {
         let setup = Setup::new("cli-order");
@@ -1595,7 +1603,7 @@ mod cli {
             &out,
             &format!("error: i/o error: push-token-file '{}': ", absent.display()),
         );
-        // A depth below -1 is a check of the local work too.
+        // A depth of less than -1 is a check of the local work too.
         let out = push_from(&client, &["--push-user=bob", "--depth=-2", &https, "main"]);
         assert_refused(
             &out,
@@ -1619,8 +1627,8 @@ mod cli {
             &out,
             "error: invalid input: tls-ca-path applies to an HTTP address",
         );
-        // Without the option of the other transport, the signing key is
-        // checked first, and then the body file.
+        // Without the option of the other transport, the command checks the
+        // signing key first, and then the body file.
         let out = ostrya(&[
             "push-tree",
             "ssh://localhost/srv/repo",
@@ -1640,7 +1648,8 @@ mod cli {
             &body,
         ]);
         assert_refused(&out, "absent-body");
-        // A refused HTTP option stands ahead of the body file too.
+        // The command also refuses an HTTP option before it reads the body
+        // file.
         let out = ostrya(&[
             "push-tree",
             &https,
@@ -1657,9 +1666,10 @@ mod cli {
         silent.assert_untouched();
     }
 
-    /// Whether the `ostree` tool and `openssl`, which makes the certificates
-    /// of the check, are installed. With [`REQUIRE_OSTREE`] set the absence
-    /// of either fails the test; without it the test skips and says so.
+    /// Returns `true` if the `ostree` command and `openssl` are installed.
+    /// `openssl` makes the certificates of the check. If [`REQUIRE_OSTREE`]
+    /// is set and either program is absent, the test fails. If it is not
+    /// set, the test skips and says so.
     fn tools_available() -> bool {
         let runs = |program: &str, arg: &str| {
             command(program)
@@ -1683,9 +1693,10 @@ mod cli {
     }
 
     /// A CA and a server certificate for `127.0.0.1` that it signed, for the
-    /// HTTPS pull of the tool. The TLS fixtures name one subject for the CA
-    /// and the server certificate, which an OpenSSL client reads as a
-    /// self-signed leaf, so the tool needs a pair of its own.
+    /// HTTPS pull of the `ostree` command. The TLS fixtures name one subject
+    /// for the CA and for the server certificate. An OpenSSL client reads
+    /// that server certificate as a self-signed leaf, so `ostree` needs a
+    /// pair of its own.
     struct Pki {
         ca: PathBuf,
         cert: PathBuf,
@@ -1789,9 +1800,9 @@ mod cli {
     }
 
     /// After `ostrya push` over HTTPS to `ostrya serve`, the receiving
-    /// `bare-user` repository passes `ostree fsck`, and `ostree pull` from
-    /// the archive view of the same server, over HTTPS, gives the pushed
-    /// commit in a new archive repository, which passes `ostree fsck` too.
+    /// `bare-user` repository passes `ostree fsck`. `ostree pull` over
+    /// HTTPS from the archive view of the same server gives the pushed commit
+    /// in a new archive repository. This repository passes `ostree fsck` too.
     #[test]
     fn the_tool_checks_and_pulls_a_push_over_https() {
         if !tools_available() {

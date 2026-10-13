@@ -1,14 +1,14 @@
 //! Integration tests for the `ostrya` binary.
 //!
-//! These tests drive the built binary as a subprocess over repositories the
-//! library creates, checking the three subcommands against the golden fixture
-//! and against the `ostree` tool where it is available.
+//! The tests run the built binary as a subprocess over repositories that the
+//! `ostrya` library creates. They compare its results with the golden fixture,
+//! and with the `ostree` command where that command is installed.
 //!
-//! The deterministic fixture tree is the one `tests/fixtures/generate.sh`
+//! The deterministic fixture tree is the tree that `tests/fixtures/generate.sh`
 //! commits with `--branch=test/main --subject="fixture commit" owner=0:0
-//! --no-xattrs --timestamp=@1700000000`. Committing it through the binary with
-//! `--canonical-permissions` (owner 0:0, `perm & 0755`, no xattrs) and
-//! `SOURCE_DATE_EPOCH=1700000000` reproduces the fixture commit id.
+//! --no-xattrs --timestamp=@1700000000`. A commit of this tree through the
+//! binary with `--canonical-permissions` (owner 0:0, `perm & 0755`, no xattrs)
+//! and `SOURCE_DATE_EPOCH=1700000000` gives the fixture commit id.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -31,17 +31,17 @@ const BRANCH: &str = "test/main";
 const SUBJECT: &str = "fixture commit";
 const SOURCE_DATE_EPOCH: &str = "1700000000";
 
-/// ed25519 sign fixture (shared with the library `sign_ed25519` test): the
-/// base64 of the 64-byte secret key and the matching 32-byte public key.
+/// The ed25519 sign fixture, shared with the library `sign_ed25519` test: the
+/// base64 of the 64-byte secret key and of the matching 32-byte public key.
 const ED25519_SECRET_B64: &str =
     "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
 const ED25519_PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
 
-/// The instant a faked-clock GnuPG home stands at, 2025-01-01T00:00:00Z.
+/// The instant of the faked clock of a GnuPG home: 2025-01-01T00:00:00Z.
 #[cfg(feature = "gpg")]
 const FAKED_CLOCK: &str = "20250101T000000!";
 
-/// Whether the gpg binary is available.
+/// Returns `true` if the `gpg` binary is available.
 #[cfg(feature = "gpg")]
 fn gpg_available() -> bool {
     Command::new("gpg")
@@ -51,9 +51,8 @@ fn gpg_available() -> bool {
 }
 
 /// A private GnuPG home directory. A home that `create` or `expiring` makes
-/// holds one freshly generated, passphrase-free ed25519 signing key. Dropping
-/// the fixture stops the GnuPG daemons of the directory and removes their
-/// socket directory.
+/// holds one new ed25519 signing key with no passphrase. A drop of the fixture
+/// stops the GnuPG daemons of the directory and removes their socket directory.
 #[cfg(feature = "gpg")]
 struct GpgHome {
     dir: PathBuf,
@@ -77,15 +76,15 @@ impl GpgHome {
         home
     }
 
-    /// Generate a signing key for `uid` in a new home directory under `base`
-    /// that was created at the instant [`FAKED_CLOCK`] names and lives for
-    /// `expiry` from it.
+    /// Generate a signing key for `uid` in a new home directory under `base`.
+    /// The key has its creation time at the instant of [`FAKED_CLOCK`], and it
+    /// expires `expiry` after that instant.
     ///
-    /// The instant stands in the home's `gpg.conf`, so every `gpg` run bound to
-    /// it reads that clock, the signing run gpgme drives included. A signature
-    /// this home makes is therefore made while the key is live. Verification
-    /// reads the real clock in each implementation, which is what makes an
-    /// expired key expired.
+    /// The instant is in the `gpg.conf` of the home, so every `gpg` run bound
+    /// to the home reads that clock. This includes the signing run that gpgme
+    /// drives. As a result, this home makes each signature while the key is
+    /// live. Verification in ostrya and in the `ostree` command reads the real
+    /// clock, and against that clock an expired key is expired.
     fn expiring(base: &Path, uid: &str, expiry: &str) -> GpgHome {
         let dir = base.join("gnupghome");
         std::fs::create_dir(&dir).unwrap();
@@ -106,12 +105,12 @@ impl GpgHome {
         home
     }
 
-    /// Set the key's expiry, with `gpg` standing at `when`.
+    /// Set the expiry of the key, with `gpg` at the instant `when`.
     ///
-    /// A fresh self-signature carries a creation time, and `gpg` refuses to
-    /// write one at the instant the self-signature it replaces carries. The
-    /// clock option stated last answers, so a run at a later instant writes the
-    /// signature a run at the home's own instant cannot.
+    /// A new self-signature carries a creation time. `gpg` refuses to write one
+    /// at the instant that the replaced self-signature carries. The clock
+    /// option stated last takes effect. A run at a later instant then writes
+    /// the signature that a run at the instant of the home cannot write.
     fn set_expire_at(&self, when: &str, expiry: &str) {
         let primary = self.fingerprint();
         let status = self
@@ -124,11 +123,10 @@ impl GpgHome {
         assert!(status.success(), "gpg --quick-set-expire failed");
     }
 
-    /// Add a signing subkey to the key this home holds and report its
-    /// fingerprint. `gpg` 2.4.9 signs with a signing subkey where the
-    /// certificate carries one, so a signature made after this call is the
-    /// subkey's and names two keys: the subkey and the primary key that binds
-    /// it.
+    /// Add a signing subkey to the key of this home and report its fingerprint.
+    /// `gpg` 2.4.9 signs with a signing subkey if the certificate carries one.
+    /// As a result, a signature made after this call is a signature of the
+    /// subkey. It names two keys: the subkey and the primary key that binds it.
     fn add_signing_subkey(&self) -> String {
         let status = self
             .gpg()
@@ -159,8 +157,8 @@ impl GpgHome {
         fingerprints[1].to_owned()
     }
 
-    /// Generate a second signing key for `uid` in this home directory, so a
-    /// selector matching both user ids is ambiguous.
+    /// Generate a second signing key for `uid` in this home directory. A
+    /// selector that matches both user ids is then ambiguous.
     fn add_key(&self, uid: &str) {
         let status = self
             .gpg()
@@ -171,7 +169,7 @@ impl GpgHome {
         assert!(status.success(), "gpg --quick-gen-key failed");
     }
 
-    /// A gpg command bound to this home directory, batch mode.
+    /// A `gpg` command in batch mode, bound to this home directory.
     fn gpg(&self) -> Command {
         let mut cmd = Command::new("gpg");
         cmd.arg("--homedir").arg(&self.dir).arg("--batch");
@@ -195,9 +193,9 @@ impl GpgHome {
             .expect("a fpr record in the key listing")
     }
 
-    /// The primary-key fingerprint of the one key `selector` names, as
-    /// uppercase hex. A home holding more than one key is read through this,
-    /// since the listing order of two keys is `gpg`'s to choose.
+    /// The primary-key fingerprint of the one key that `selector` names, as
+    /// uppercase hex. The tests read a home with more than one key through this
+    /// function, because `gpg` selects the listing order of two keys.
     fn fingerprint_of(&self, selector: &str) -> String {
         let out = self
             .gpg()
@@ -216,9 +214,9 @@ impl GpgHome {
         fingerprints[0].to_owned()
     }
 
-    /// Designate the key `revoker` names as a revoker of the key `key` names.
-    /// `gpg` writes a fresh direct-key self-signature carrying signature
-    /// subpacket 12, so this home must hold both certificates.
+    /// Designate the key that `revoker` names as a revoker of the key that
+    /// `key` names. `gpg` writes a new direct-key self-signature that carries
+    /// signature subpacket 12, so this home must hold both certificates.
     fn add_revoker(&self, key: &str, revoker: &str) {
         let mut cmd = self.gpg_interactive();
         cmd.arg("--edit-key").arg(key);
@@ -229,10 +227,11 @@ impl GpgHome {
         );
     }
 
-    /// Write to `path` the key revocation a designated revoker makes over the
-    /// key `key` names: a transferable public key of the revoked key carrying
-    /// the class 0x20 signature. This home must hold the revoker's secret key
-    /// and a certificate of the revoked key that designates it.
+    /// Write to `path` the key revocation that a designated revoker makes for
+    /// the key that `key` names. The output is a transferable public key of
+    /// the revoked key with the class 0x20 signature. This home must hold the
+    /// secret key of the revoker and a certificate of the revoked key that
+    /// designates it.
     fn desig_revoke(&self, key: &str, path: &Path) {
         let mut cmd = self.gpg_interactive();
         cmd.arg("--armor")
@@ -281,15 +280,14 @@ impl GpgHome {
     }
 }
 
-/// The export of the key `key` names out of a fresh GnuPG home holding the
-/// streams `streams` names, imported in the order they stand in, written to
-/// `out`.
+/// Write to `out` the export of the key that `key` names. The export comes from
+/// a new GnuPG home that imports the streams of `streams` in their order.
 ///
-/// The merge runs in a home of its own because `gpg` signs with no key its own
-/// keyring reports revoked: it reports "Unusable secret key". The import of the
-/// stream `gpg --desig-revoke` writes exits 2 and merges the class 0x20
-/// signature into the certificate it holds either way, so the exit status of an
-/// import is not read here.
+/// The merge runs in a separate home, because `gpg` does not sign with a key
+/// that its own keyring reports as revoked. It reports "Unusable secret key".
+/// The import of the stream from `gpg --desig-revoke` exits 2. The import
+/// merges the class 0x20 signature into the certificate in both cases, so this
+/// function does not read the exit status of an import.
 #[cfg(feature = "gpg")]
 fn merged_export(dir: &Path, key: &str, streams: &[&Path], out: &Path) {
     std::fs::create_dir_all(dir).unwrap();
@@ -325,8 +323,8 @@ fn remove_gnupg_sockets(dir: &Path) {
     }
 }
 
-/// Run `cmd`, writing `answers` to its standard input, and assert that it
-/// reported success. `what` names the command in the assertion message.
+/// Run `cmd` with `answers` on its standard input, and assert that it reported
+/// success. `what` names the command in the assertion message.
 #[cfg(feature = "gpg")]
 fn answer(mut cmd: Command, answers: &[u8], what: &str) {
     use std::io::Write;
@@ -376,9 +374,9 @@ impl Drop for TmpDir {
 
 // --- fixtures and process driving --------------------------------------------
 
-/// Build the deterministic fixture source tree under `base/src`, matching
-/// `generate.sh`: a regular file, an empty file, a nested file, and a symlink,
-/// with explicit modes.
+/// Build the deterministic fixture source tree under `base/src`, the same tree
+/// that `generate.sh` builds: a regular file, an empty file, a nested file, and
+/// a symlink, with explicit modes.
 fn build_fixture_source(base: &Path) {
     let set_mode = |p: &Path, m: u32| {
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
@@ -435,8 +433,8 @@ fn ostrya(args: &[&str], stdin: Option<&[u8]>, env: &[(&str, &str)]) -> Run {
     ostrya_in(None, args, stdin, env)
 }
 
-/// Run the `ostrya` binary from `cwd`, for the cases where a relative path
-/// argument makes the working directory part of the behaviour under test.
+/// Run the `ostrya` binary from `cwd`. The tests use it where a relative path
+/// argument makes the working directory part of the behavior under test.
 fn ostrya_in(cwd: Option<&Path>, args: &[&str], stdin: Option<&[u8]>, env: &[(&str, &str)]) -> Run {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ostrya"));
     if let Some(dir) = cwd {
@@ -470,16 +468,17 @@ fn ostrya_in(cwd: Option<&Path>, args: &[&str], stdin: Option<&[u8]>, env: &[(&s
     }
 }
 
-/// The environment variable that turns the reference-absent skip into a
-/// failure. A harness setting it declares that `ostree` is installed, so a run
-/// where it is not is a broken harness rather than a test to pass over.
+/// The environment variable that changes the skip for an absent `ostree`
+/// command into a failure. A harness that sets it declares that `ostree` is
+/// installed. If `ostree` is not installed, the harness is broken, and the
+/// test fails.
 const REQUIRE_OSTREE: &str = "OSTRYA_REQUIRE_OSTREE";
 
-/// Whether the `ostree` tool is available for the cross-check tests. These
-/// tests are the proof a matrix record cites with `evidence:`, so a harness
-/// without the tool would otherwise report the cited cells as covered while no
-/// assertion ran. With [`REQUIRE_OSTREE`] set the absence fails; without it the
-/// test skips and says so.
+/// Returns `true` if the `ostree` command is available for the cross-check
+/// tests. A matrix record cites these tests with `evidence:` as its proof. If
+/// the tests skip in a harness with no `ostree`, the harness reports the cited
+/// cells as covered, and no assertion runs. If [`REQUIRE_OSTREE`] is set, the
+/// absence fails the test. If it is not set, the test skips and says so.
 fn ostree_available() -> bool {
     let found = Command::new("ostree")
         .arg("--version")
@@ -497,18 +496,19 @@ fn ostree_available() -> bool {
     found
 }
 
-/// The environment variable that turns the ed25519-unsupported skip into a
-/// failure. A harness setting it declares that the installed `ostree` carries
-/// the engine, so a run where it does not is a broken harness rather than a
-/// test to pass over.
+/// The environment variable that changes the skip for an `ostree` command with
+/// no ed25519 engine into a failure. A harness that sets it declares that the
+/// installed `ostree` carries the engine. If `ostree` does not carry it, the
+/// harness is broken, and the test fails.
 const REQUIRE_OSTREE_ED25519: &str = "OSTRYA_REQUIRE_OSTREE_ED25519";
 
-/// Whether the `ostree` tool carries its ed25519 signing engine, which
-/// `ostree --version` reports as the `sign-ed25519` feature. The engine is a
-/// build option: a tool built without it refuses every ed25519 invocation with
-/// `Requested signature type is not implemented`, which describes the tool's
-/// build and states nothing about the port. With [`REQUIRE_OSTREE_ED25519`] set
-/// the absence fails; without it the test skips and says so.
+/// Returns `true` if the `ostree` command carries its ed25519 signing engine.
+/// `ostree --version` reports the engine as the `sign-ed25519` feature. The
+/// engine is a build option. An `ostree` build without it refuses every
+/// ed25519 invocation with `Requested signature type is not implemented`. This
+/// refusal is a fact of the `ostree` build and states nothing about ostrya. If
+/// [`REQUIRE_OSTREE_ED25519`] is set, the absence fails the test. If it is not
+/// set, the test skips and says so.
 fn ostree_supports_ed25519() -> bool {
     let supported = ostree_available()
         && Command::new("ostree")
@@ -539,8 +539,9 @@ fn resolve(repo: &Path, refspec: &str) -> Option<String> {
     })
 }
 
-/// A sorted description of a checked-out tree: one `(relpath, kind)` line per
-/// entry, where `kind` captures type, permission bits, and content or target.
+/// A sorted description of a checked-out tree: one `(relpath, kind)` line for
+/// each entry. `kind` holds the type, the permission bits, and the content or
+/// the target.
 fn describe_tree(root: &Path) -> Vec<String> {
     fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
         let mut entries: Vec<_> = std::fs::read_dir(dir)
@@ -609,7 +610,8 @@ fn commit_from_disk_reproduces_fixture_id_and_ref() {
         "--branch points the ref at the new commit",
     );
 
-    // The tool accepts the repository the port created and populated.
+    // The `ostree` command accepts the repository that ostrya created and
+    // filled.
     if ostree_available() {
         let repo_arg = format!("--repo={}", repo.display());
         for sub in [&["fsck"][..], &["show", COMMIT], &["ls", "-R", COMMIT]] {
@@ -640,12 +642,12 @@ fn commit_from_disk_reproduces_fixture_id_and_ref() {
     }
 }
 
-/// The generator's own command line, now that the port accepts every option it
-/// uses: declared ownership, no xattrs, and a fixed timestamp reproduce the
-/// golden fixture commit without `--canonical-permissions` standing in for
-/// them. The ISO form of the same instant, the hexadecimal and octal renderings
-/// of the same ids, and a negative id (which declares nothing, so the tree keeps
-/// the ownership its source carries) are held beside it.
+/// The command line of the fixture generator, with every option that it uses.
+/// Declared ownership, no xattrs, and a fixed timestamp give the golden fixture
+/// commit with no `--canonical-permissions`. The test also runs the ISO form of
+/// the same instant and the hexadecimal and octal forms of the same ids. It
+/// also runs a negative id, which declares nothing, so the tree keeps the
+/// ownership of its source.
 #[test]
 fn commit_flags_reproduce_the_fixture_id() {
     let tmp = TmpDir::new("commit-flags");
@@ -695,10 +697,10 @@ fn commit_flags_reproduce_the_fixture_id() {
         COMMIT,
         "an offset-bearing wall clock and hexadecimal and octal ids agree",
     );
-    // A negative id declares nothing, so the source's ownership stands. Stating
-    // that as equality against the source's own ids holds whoever runs the test;
-    // comparing against the fixture instead would collapse under a root run,
-    // whose source tree already carries the fixture's `0:0`.
+    // A negative id declares nothing, so the ownership of the source stays. The
+    // test compares with the ids of the source, so the claim holds for any
+    // user. A root run has a source tree with the `0:0` of the fixture, so a
+    // compare with the fixture cannot tell the two cases apart.
     let source = std::fs::metadata(src.join("hello.txt")).unwrap();
     let (uid, gid) = (source.uid(), source.gid());
     assert_eq!(
@@ -716,8 +718,8 @@ fn commit_flags_reproduce_the_fixture_id() {
         );
     }
 
-    // `SOURCE_DATE_EPOCH` names the same instant the fixture uses, and
-    // `--timestamp` overrides whatever it holds.
+    // `SOURCE_DATE_EPOCH` names the same instant that the fixture uses, and
+    // `--timestamp` overrides any value that it holds.
     let over_epoch = ostrya(
         &[
             "commit",
@@ -744,11 +746,11 @@ fn commit_flags_reproduce_the_fixture_id() {
     );
 }
 
-/// The four `commit` tree-and-time options against the tool, over a tree
-/// carrying xattrs, a symlink, and a nested directory: each side commits the
-/// same tree with the same options and the printed checksums must agree, which
-/// states that the recorded ownership, mode, xattr set, and timestamp are
-/// byte-identical.
+/// The four `commit` tree-and-time options against the `ostree` command, over
+/// a tree with xattrs, a symlink, and a nested directory. Each command commits
+/// the same tree with the same options, and the printed checksums must agree.
+/// Equal checksums state that the recorded ownership, mode, xattr set, and
+/// timestamp are byte-identical.
 #[test]
 fn commit_ownership_and_timestamp_flags_match_the_tool() {
     if !ostree_available() {
@@ -759,10 +761,10 @@ fn commit_ownership_and_timestamp_flags_match_the_tool() {
     let tree = base.join("tree");
     ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
     ostrya_conformance::corpus::materialize("C4", &tree.join("attrs")).unwrap();
-    // The tool records no xattr whose value is zero bytes long, where the port
-    // records one, so a tree carrying such an entry compares two different
-    // objects whatever the options under test say. The case is corpus `C4`'s own
-    // (`docs/conformance/m0-content.matrix`) and is held out here.
+    // The `ostree` command records no xattr with a value of zero bytes, and
+    // ostrya records one. A tree with such an xattr gives two different objects
+    // for any options under test. This case belongs to corpus `C4`, and this
+    // test leaves it out.
     std::fs::remove_file(tree.join("attrs/empty-value")).unwrap();
 
     let port_repo = base.join("port");
@@ -775,10 +777,10 @@ fn commit_ownership_and_timestamp_flags_match_the_tool() {
         });
     }
 
-    // A case names the branch its commit binds, and two cases that must produce
-    // one commit share it: `ostree.ref-binding` carries the branch name, so a
-    // commit's checksum states the name too. Every commit is a root commit
-    // whatever the branch already holds.
+    // Each case names the branch that its commit binds. Two cases that must
+    // give one commit share a branch. `ostree.ref-binding` carries the branch
+    // name, so the checksum of a commit states the name too. Every commit is a
+    // root commit, for any current tip of the branch.
     let cases: [(&str, &str, Vec<&str>); 7] = [
         ("plain", "plain", vec!["--timestamp=@1234567890"]),
         (
@@ -863,12 +865,12 @@ fn commit_ownership_and_timestamp_flags_match_the_tool() {
     );
 }
 
-/// A declared-ownership commit keeps object identity across the modes that
-/// store ownership: one checksum in `archive`, `bare-user`, and the port
-/// extension `bare-user-shared`. The tool cannot open the third mode, so this is
-/// what corpus `C3`'s `bare-user-shared` cell rests on
-/// (`docs/conformance/m0-content.matrix`); the other two modes are compared
-/// against the tool directly by the cells and the test above.
+/// A declared-ownership commit keeps the object identity across the modes that
+/// store ownership. It has one checksum in `archive`, in `bare-user`, and in
+/// the ostrya extension `bare-user-shared`. The `ostree` command cannot open
+/// the third mode, so the `bare-user-shared` cell of corpus `C3` rests on this
+/// test. The cells and `commit_ownership_and_timestamp_flags_match_the_tool`
+/// compare the other two modes directly with `ostree`.
 #[test]
 fn declared_ownership_is_one_commit_across_modes() {
     let tmp = TmpDir::new("commit-owner-modes");
@@ -915,9 +917,10 @@ fn declared_ownership_is_one_commit_across_modes() {
     }
 }
 
-/// The values `commit` refuses, in the tool's own words and at the tool's own
-/// step: an id no C `int` holds, an id beside `--canonical-permissions`, and a
-/// timestamp neither reader accepts. Every case leaves the repository empty.
+/// The values that `commit` refuses, with the words and at the step of the
+/// `ostree` command: an id that no C `int` holds, an id with
+/// `--canonical-permissions`, and a timestamp that neither reader accepts.
+/// Every case leaves the repository empty.
 #[test]
 fn commit_refuses_the_values_the_tool_refuses() {
     let tmp = TmpDir::new("commit-refuse");
@@ -960,8 +963,8 @@ fn commit_refuses_the_values_the_tool_refuses() {
             vec!["--timestamp=nonsense"],
             "error: Could not parse 'nonsense'",
         ),
-        // The tool's reader takes no bare epoch count, and neither does the
-        // port's; the `@` form is what states one.
+        // The readers of the `ostree` command and of ostrya take no bare epoch
+        // count. The `@` form states an epoch count.
         (
             vec!["--timestamp=1234567890"],
             "error: Could not parse '1234567890'",
@@ -969,10 +972,9 @@ fn commit_refuses_the_values_the_tool_refuses() {
     ];
 
     for (options, message) in &cases {
-        // The invocation both implementations receive, `--repo` apart: the port
-        // takes it as an option in either position, the tool only ahead of the
-        // subcommand name (`docs/conformance/cli-surface.md`, "Global
-        // conventions").
+        // Both commands receive this invocation, apart from `--repo`. ostrya
+        // takes `--repo PATH` before the subcommand name. Before the
+        // subcommand name, the `ostree` command takes only `--repo=PATH`.
         let mut shared = vec!["commit", "-b", "refused", "-s", "x"];
         shared.extend(options.iter().copied());
         shared.push(src.to_str().unwrap());
@@ -1018,16 +1020,21 @@ fn commit_refuses_the_values_the_tool_refuses() {
     }
 }
 
-/// Every `commit` refusal that stands after the transaction opens reaps the
-/// staging directory, whichever way the refusal ends the process. The seven
-/// cases cover the three exit shapes a refusal takes: an abort followed by a
-/// process exit (a `dir=` source that does not open, a `tar=` source that does
-/// not open, a `--consume` removal that fails, a `--tar-pathname-filter` value
-/// the reader refuses, and a `--base` revision that does not resolve), and a
-/// process exit taken from inside the revision reader (`--tree=ref=` over an
-/// unknown ref and over a revision with no parent). Each leaves `tmp/` holding
-/// no `staging-` entry, `objects/` holding the objects it held before, and no
-/// new ref.
+/// Every `commit` refusal after the transaction opens removes the staging
+/// directory, for each way that the refusal ends the process. The seven cases
+/// cover two exit shapes of a refusal:
+///
+/// - an abort and then a process exit:
+///   - a `dir=` source that does not open
+///   - a `tar=` source that does not open
+///   - a `--consume` removal that fails
+///   - a `--tar-pathname-filter` value that the reader refuses
+///   - a `--base` revision that does not resolve
+/// - a process exit from inside the revision reader: `--tree=ref=` over an
+///   unknown ref, and over a revision with no parent
+///
+/// After each case, `tmp/` holds no `staging-` entry, `objects/` holds the
+/// objects that it held before, and no new ref exists.
 #[test]
 fn commit_source_refusals_leave_no_staging_directory() {
     let tmp = TmpDir::new("commit-staging");
@@ -1039,10 +1046,10 @@ fn commit_source_refusals_leave_no_staging_directory() {
     let tar = base.join("src.tar");
     pack_tar(&src, &tar);
     let tar_arg = format!("--tree=tar={}", tar.display());
-    // `--consume` removes the source directory once its contents are ingested,
-    // and `remove_dir` on a path spelled `./` reports EINVAL, so the refusal is
-    // reached without depending on the caller's privileges. The run empties the
-    // directory, so it stands apart from the fixture source.
+    // `--consume` removes the source directory after the commit reads its
+    // contents. `remove_dir` on the path `./` reports EINVAL, so the refusal
+    // occurs for any privileges of the caller. The run empties the directory,
+    // so the directory is separate from the fixture source.
     let consumed = base.join("consumed");
     std::fs::create_dir_all(&consumed).unwrap();
     std::fs::write(consumed.join("f.txt"), b"consume me\n").unwrap();
@@ -1054,10 +1061,10 @@ fn commit_source_refusals_leave_no_staging_directory() {
             .sum::<usize>()
     };
 
-    // A root commit on `held` supplies the revision the two `--tree=ref=` cases
-    // read: one names a ref the repository does not carry, the other asks a root
-    // commit for a parent. Its objects are the baseline every case is measured
-    // against.
+    // A root commit on `held` supplies the revision for the two `--tree=ref=`
+    // cases. One case names a ref that the repository does not carry. The
+    // other asks a root commit for its parent. Every case is measured against
+    // the objects of this commit.
     let src_arg = format!("--tree=dir={}", src.display());
     let seed = ostrya(
         &[repo_arg.as_str(), "commit", "-b", "held", &src_arg],
@@ -1139,17 +1146,17 @@ fn commit_source_refusals_leave_no_staging_directory() {
     }
 }
 
-/// `commit --table-output` prints the tool's seven-line block byte for byte, in
-/// three repository modes and over three commits per mode: the first into an
-/// empty repository, a second of a tree holding one more file, and a third of
-/// the first tree again, whose objects the repository already holds. The three
-/// commits move every counter, so the comparison states the counts and not the
-/// shape of the block alone.
+/// `commit --table-output` prints the seven-line block of the `ostree` command
+/// byte for byte. The test runs three repository modes and three commits in
+/// each mode. The first commit goes into an empty repository. The second
+/// commits a tree with one more file. The third commits the first tree again,
+/// and the repository already holds its objects.
 ///
-/// A `--tree=ref=` source parts the two counter sets, and the last block of the
-/// test pins each side at the value it is measured to print
-/// (`docs/conformance/m10-cli-behavior.matrix`,
-/// `commit/table-output-with-a-ref-source`).
+/// The three commits move every counter, so the comparison states the counts
+/// and not only the shape of the block. With a `--tree=ref=` source alone or
+/// in the second position, the counters of ostrya and `ostree` differ. This is
+/// a recorded divergence. The last part of the test pins each command at the
+/// value that it prints.
 #[test]
 fn commit_table_output_matches_the_tool() {
     if !ostree_available() {
@@ -1196,8 +1203,8 @@ fn commit_table_output_matches_the_tool() {
             );
             blocks.push(String::from_utf8_lossy(&port.stdout).into_owned());
         }
-        // The three steps move the counters apart, so what the comparison above
-        // reads is the counts and not the block's shape: the second step writes
+        // The three steps give different counters, so the comparison reads the
+        // counts and not only the shape of the block. The second step writes
         // one content object more than the first, and the third writes none.
         for (earlier, later) in [(0, 1), (1, 2), (0, 2)] {
             assert_ne!(
@@ -1208,11 +1215,12 @@ fn commit_table_output_matches_the_tool() {
     }
 
     // A `tar=` source of three regular files and a `ref=` source whose tree
-    // holds one, over an archive pair. The tool adds a `ref=` source's content
-    // objects to `Content Total` where that source does not open the source
-    // list, and a `ref=` source standing alone carries one metadata object in
-    // the tool's total against the port's two. Each side is asserted at the
-    // value it prints, so a change on either side fails the run.
+    // holds one file, over a pair of `archive` repositories. If a `ref=`
+    // source is not the first source, the `ostree` command adds its content
+    // objects to `Content Total`. For a `ref=` source alone, the metadata
+    // total is one object in `ostree` and two in ostrya. The test asserts each
+    // command at the value that it prints, so a change in either command fails
+    // the run.
     let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Archive);
     let three = base.join("three");
     std::fs::create_dir_all(three.join("sub")).unwrap();
@@ -1298,8 +1306,8 @@ fn commit_table_output_matches_the_tool() {
         );
     };
 
-    // A `ref=` source second: `Content Total` carries the ref tree's one
-    // content object for the tool and not for the port.
+    // A `ref=` source in the second position. `Content Total` counts the one
+    // content object of the ref tree in the `ostree` command and not in ostrya.
     parts(
         "c1",
         &[&tar_source, "--tree=ref=only1"],
@@ -1324,8 +1332,8 @@ fn commit_table_output_matches_the_tool() {
             &tar_source,
         ],
     );
-    // A `ref=` source alone: no content object is counted on either side, and
-    // `Metadata Total` is the tool's one against the port's two.
+    // A `ref=` source alone. Neither command counts a content object, and
+    // `Metadata Total` is one in the `ostree` command and two in ostrya.
     parts(
         "c3",
         &["--tree=ref=only1"],
@@ -1336,9 +1344,9 @@ fn commit_table_output_matches_the_tool() {
     );
 }
 
-/// `commit --fsync=POLICY` takes the tool's boolean words, refuses every other
-/// value in the tool's words and at the tool's own step, and changes no byte the
-/// repository stores.
+/// `commit --fsync=POLICY` takes the boolean words of the `ostree` command. It
+/// refuses every other value with the words and at the step of `ostree`. It
+/// changes no byte that the repository stores.
 #[test]
 fn commit_fsync_policy_matches_the_tool() {
     let tmp = TmpDir::new("commit-fsync");
@@ -1358,9 +1366,9 @@ fn commit_fsync_policy_matches_the_tool() {
         });
     }
 
-    // Every accepted spelling, in both cases. Each commit is a root commit onto
-    // one branch, so the whole set must print one checksum: the policy decides
-    // durability and no recorded byte.
+    // Every accepted spelling of the true and the false values. Each commit is
+    // a root commit on one branch, so the full set must print one checksum.
+    // The policy controls durability and changes no recorded byte.
     let accepted = [
         "true", "TRUE", "tRuE", "yes", "yEs", "1", "false", "False", "no", "NO", "0",
     ];
@@ -1393,7 +1401,7 @@ fn commit_fsync_policy_matches_the_tool() {
         );
     }
 
-    // The two policies over two fresh repositories leave the same object store.
+    // The two policies over two new repositories leave the same object store.
     let mut stores = Vec::new();
     for (name, value) in [("on", "true"), ("off", "false")] {
         let repo = base.join(format!("policy-{name}"));
@@ -1426,10 +1434,10 @@ fn commit_fsync_policy_matches_the_tool() {
         "the fsync policy changed the object store",
     );
 
-    // A value the reader does not hold, and the fault order around it: the
-    // refusal stands ahead of the missing branch, ahead of the tree, and ahead
-    // of the timestamp. The valueless form takes the next word as its value,
-    // which is what the last case names.
+    // A value that the reader does not know, and the fault order around it.
+    // The refusal comes before the missing branch, before the tree, and before
+    // the timestamp. The form with no value takes the next word as its value,
+    // and the last case names this form.
     let refusals: [(Vec<&str>, &str); 7] = [
         (
             vec!["-b", "f", "--fsync=on", source],
@@ -1485,10 +1493,11 @@ fn commit_fsync_policy_matches_the_tool() {
         }
     }
 
-    // The one ordering the two do not share: with two refusable values on one
-    // command line the tool reports the leftmost and the port reports
-    // `--owner-uid` whatever its position (`docs/conformance/cli-surface.md`,
-    // "P2"). Both orders are run, since "whatever its position" is the claim.
+    // The one fault order that ostrya and the `ostree` command do not share is
+    // a recorded divergence. With two refusable values on one command line,
+    // `ostree` reports the leftmost value. ostrya reports `--owner-uid` in any
+    // position. The test runs both orders, because "in any position" is the
+    // claim.
     if tool {
         for order in [
             ["--fsync=on", "--owner-uid=abc"],
@@ -1517,11 +1526,10 @@ fn commit_fsync_policy_matches_the_tool() {
     }
 }
 
-/// A `[core] fsync` value the reader does not hold is refused under every state
-/// of `--fsync`, the option's own value included. The option narrows the
-/// configured policy, so the configured value is read before the narrowing and
-/// `--fsync=false` conceals nothing (`docs/format-reference.md`, "The fsync
-/// vocabulary").
+/// `commit` refuses a `[core] fsync` value that the reader does not know, for
+/// every state of `--fsync`, the value of the option included. The option
+/// narrows the configured policy. As a result, `commit` reads the configured
+/// value before the narrowing, and `--fsync=false` hides no fault.
 #[test]
 fn commit_refuses_a_bad_configured_fsync_under_every_override() {
     let tmp = TmpDir::new("commit-fsync-bad-config");
@@ -1570,10 +1578,10 @@ fn commit_refuses_a_bad_configured_fsync_under_every_override() {
             "`{option:?}` wrote a ref",
         );
 
-        // The two part on the wording alone: the tool names its key file and
-        // the port names the key (`docs/conformance/cli-surface.md`, "Global
-        // conventions"). The exit status and the empty standard output are the
-        // claim, and so is the ref neither writes.
+        // ostrya and the `ostree` command differ only in the wording. `ostree`
+        // names its key file, and ostrya names the key. The claim is the exit
+        // status, the empty standard output, and the ref that neither command
+        // writes.
         if tool {
             let (_, tool_run) = run_both(&port_repo, &tool_repo, &args);
             assert_eq!(
@@ -1590,10 +1598,10 @@ fn commit_refuses_a_bad_configured_fsync_under_every_override() {
     }
 }
 
-/// Whether `strace` is installed and can trace a child of this process under
-/// the options the two syscall tests use, `-y` among them, since both read the
-/// path behind a descriptor. The syscall claims below are stated only where they
-/// can be measured.
+/// Returns `true` if `strace` is installed and can trace a child of this
+/// process with the options of the two syscall tests. These options include
+/// `-y`, because both tests read the path behind a descriptor. The syscall
+/// tests make their claims only where `strace` can measure them.
 fn strace_available() -> bool {
     std::process::Command::new("strace")
         .args(["-y", "-f", "-e", "trace=fsync", "-o", "/dev/null", "true"])
@@ -1602,15 +1610,15 @@ fn strace_available() -> bool {
         .unwrap_or(false)
 }
 
-/// The `fsync`, `fdatasync`, and `syncfs` calls one `commit` makes, in call
-/// order, each a pair of the call's name and the path `strace -y` prints behind
-/// the descriptor, named relative to the repository and `.` for the repository
-/// itself. The run is returned beside them, so the caller reads the streams and
-/// the exit status of the same invocation.
+/// The `fsync`, `fdatasync`, and `syncfs` calls of one `commit`, in call order.
+/// Each call is a pair of the call name and the path that `strace -y` prints
+/// for the descriptor. The path is relative to the repository, and `.` is the
+/// repository itself. The function also returns the run, so the caller reads
+/// the streams and the exit status of the same invocation.
 ///
-/// A call the tracer splits across an `<unfinished ...>` and a `resumed` line is
-/// read from the entry line, which is the one carrying the descriptor, so each
-/// call is read once.
+/// The tracer can split a call across an `<unfinished ...>` line and a
+/// `resumed` line. The function reads such a call from the entry line, which
+/// carries the descriptor, so it reads each call once.
 fn sync_calls(
     binary: &str,
     repo: &std::path::Path,
@@ -1655,10 +1663,10 @@ fn sync_calls(
     (run, calls)
 }
 
-/// The fanout directories present under `objects/`, named relative to the
-/// repository. On a repository created for one commit these are exactly the
-/// fanouts that commit wrote into, so the caller reads the expected `fsync`
-/// targets out of the tree the run produced instead of naming checksums.
+/// The fanout directories under `objects/`, relative to the repository. In a
+/// repository created for one commit, these are the fanouts that the commit
+/// wrote into. The caller reads the expected `fsync` targets from the tree that
+/// the run made, and does not need to name checksums.
 fn object_fanouts(repo: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(repo.join("objects"))
         .expect("the object store is readable")
@@ -1671,42 +1679,49 @@ fn object_fanouts(repo: &std::path::Path) -> Vec<String> {
     names
 }
 
-/// The `--fsync=POLICY` policy is resolved from the repository config narrowed
-/// by the option, and the resolved value reaches every write the transaction
-/// makes, the ref write among them. Neither half shows in a byte the repository
-/// stores, so the claim is stated in syscalls: the four rows of the table in
-/// `docs/format-reference.md`, "The fsync vocabulary", measured for the port and
-/// for the tool over corpus `C0` under the single-component branch name `main`.
-/// Three of the four rows must issue no sync call at all.
+/// `commit` resolves the `--fsync=POLICY` policy from the repository
+/// configuration, narrowed by the option. The resolved value reaches every
+/// write of the transaction, the ref write included. No stored byte shows
+/// these two facts, so the test states them in syscalls. It measures ostrya
+/// and the `ostree` command over corpus `C0`, with the single-component branch
+/// name `main`, in four rows:
 ///
-/// The syncing row is held to the whole call inventory the table records, so
-/// dropping any one sync fails it. The `fsync` targets are read from the tree
-/// the run produced -- every fanout directory under `objects/`, plus `objects/`
-/// itself, plus, for the port alone, `refs/heads` -- which states the rule the
-/// table states and follows the corpus if the corpus changes. The totals, 11
-/// for the tool and 12 for the port, are asserted beside it, so the table and
-/// this test stay one record.
+/// - `[core] fsync` unset, with `--fsync=true`
+/// - `[core] fsync=true`, with `--fsync=false`
+/// - `[core] fsync=false`, with no option
+/// - `[core] fsync=false`, with `--fsync=true`
 ///
-/// This test reads the single-component ref name, where the ref write creates no
-/// directory. `commit_syncs_every_created_ref_directory` reads the names that
-/// carry `/`, where it does, and holds the created directories and their call
-/// order. Runs where `strace` is installed.
+/// Three of the four rows must issue no sync call.
+///
+/// The test holds the row that syncs to the full call inventory, so the
+/// absence of any one sync fails it. It reads the `fsync` targets from the
+/// tree that the run made: every fanout directory under `objects/`, `objects/`
+/// itself, and `refs/heads` for ostrya only. As a result, the test follows the
+/// corpus if the corpus changes. The test also asserts the totals: 11 for
+/// `ostree` and 12 for ostrya.
+///
+/// This test reads the single-component ref name, where the ref write creates
+/// no directory. `commit_syncs_every_created_ref_directory` reads the names
+/// that carry `/`, where the ref write creates directories. It holds the
+/// created directories and their call order. The test runs where `strace` is
+/// installed.
 #[test]
 fn commit_fsync_policy_controls_the_syscalls() {
     if !strace_available() {
         return;
     }
     let tmp = TmpDir::new("commit-fsync-syscalls");
-    // `strace -y` prints the path a descriptor resolves to, so the repository
-    // path the targets are named against must be resolved too.
+    // `strace -y` prints the resolved path of a descriptor. The targets are
+    // relative to the repository path, so that path must be resolved too.
     let base = &tmp.path().canonicalize().expect("the temp dir resolves");
     let tree = base.join("tree");
     ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
     let source = tree.to_str().unwrap();
     let port = env!("CARGO_BIN_EXE_ostrya");
 
-    // (tag, configured `[core] fsync`, option, whether any sync call is
-    // expected). The tool is measured beside the port wherever it is installed.
+    // (tag, configured `[core] fsync`, option, `true` if a sync call is
+    // expected). The test also measures the `ostree` command where it is
+    // installed.
     let rows: [(&str, Option<&str>, Option<&str>, bool); 4] = [
         ("unset-on", None, Some("--fsync=true"), true),
         ("on-off", Some("true"), Some("--fsync=false"), false),
@@ -1719,9 +1734,9 @@ fn commit_fsync_policy_controls_the_syscalls() {
         binaries.push(("tool", "ostree".to_owned()));
     }
 
-    // Every row of every binary is held against this one: the policy reaches the
-    // sync calls and leaves standard output, standard error, the exit status,
-    // and the object store where they stand.
+    // Every row of each binary must give the same result as the first row. The
+    // policy changes the sync calls, and leaves standard output, standard
+    // error, the exit status, and the object store unchanged.
     let mut answer: Option<(String, String, Option<i32>, Vec<String>)> = None;
     for (who, binary) in &binaries {
         for (tag, configured, option, expect_sync) in rows {
@@ -1740,8 +1755,8 @@ fn commit_fsync_policy_controls_the_syscalls() {
                 )
                 .unwrap();
             }
-            // The global `--repo` takes the `=` form, which is the one spelling
-            // both binaries read ahead of the subcommand.
+            // The global `--repo` uses the `=` form. This is the one form that
+            // both binaries read before the subcommand.
             let repo_arg = format!("--repo={}", repo.display());
             let mut args = vec![
                 repo_arg.as_str(),
@@ -1768,9 +1783,9 @@ fn commit_fsync_policy_controls_the_syscalls() {
                 "`{who}` wrote no ref in the `{tag}` row, so the ref write went unmeasured",
             );
             if expect_sync {
-                // One `fsync` per fanout the commit wrote into, one of
-                // `objects/`, and, for the port, one of the directory holding
-                // the ref, which the tool does not issue.
+                // One `fsync` for each fanout that the commit wrote into, and
+                // one for `objects/`. ostrya also issues one for the directory
+                // that holds the ref, and the `ostree` command does not.
                 let mut expected = object_fanouts(&repo);
                 expected.push("objects".to_owned());
                 if *who == "port" {
@@ -1800,8 +1815,9 @@ fn commit_fsync_policy_controls_the_syscalls() {
                      ref's temp file takes one: {calls:?}",
                     ref_syncs.len(),
                 );
-                // The port creates the ref's temp file in `tmp/`, and the tool
-                // creates it in the directory that holds the ref.
+                // ostrya creates the temp file of the ref in `tmp/`. The
+                // `ostree` command creates it in the directory that holds the
+                // ref.
                 let ref_temp = if *who == "port" {
                     "tmp/.ostrya-ref-"
                 } else {
@@ -1824,9 +1840,8 @@ fn commit_fsync_policy_controls_the_syscalls() {
                     "`{who}` did not `syncfs` the repository once in the `{tag}` row: {calls:?}",
                 );
 
-                // The totals `docs/format-reference.md`, "The fsync
-                // vocabulary", records for corpus `C0`. They follow from the
-                // rules above and the eight objects the corpus commits.
+                // The totals for corpus `C0`. They follow from these rules and
+                // from the eight objects that the corpus commits.
                 let total = if *who == "port" { 12 } else { 11 };
                 assert_eq!(
                     calls.len(),
@@ -1845,9 +1860,9 @@ fn commit_fsync_policy_controls_the_syscalls() {
                 );
             }
 
-            // The sync calls are the whole difference. Every row prints the same
-            // checksum, says nothing on standard error, exits the same way, and
-            // leaves the same object store, across the four policies and across
+            // The sync calls are the only difference. Every row prints the same
+            // checksum and writes nothing to standard error. It exits the same
+            // way and leaves the same object store, for the four policies and
             // the two binaries.
             let observed = (
                 String::from_utf8_lossy(&run.stdout).into_owned(),
@@ -1867,12 +1882,13 @@ fn commit_fsync_policy_controls_the_syscalls() {
 }
 
 /// Under `[core] per-object-fsync=true`, `commit` syncs the file of each
-/// content object stored as a regular file and no metadata object, in the tool
-/// and in the port, over corpus `C0`: four in `archive` and `bare-user`, three
-/// in `bare`, where the symlink object is a symlink inode. The rest of the
-/// inventory is the one `commit_fsync_policy_controls_the_syscalls` holds, so
-/// the totals are tool 15, 15, and 14, and port 16, 16, and 15. Runs where
-/// `strace` is installed.
+/// content object stored as a regular file, and no metadata object. This is
+/// true for ostrya and for the `ostree` command over corpus `C0`. The count is
+/// four in `archive` and `bare-user`, and three in `bare`, where the symlink
+/// object is a symlink inode. The rest of the inventory is the inventory of
+/// `commit_fsync_policy_controls_the_syscalls`. The totals are 15, 15, and 14
+/// for `ostree`, and 16, 16, and 15 for ostrya. The test runs where `strace`
+/// is installed.
 #[test]
 fn commit_per_object_fsync_syncs_content_objects_alone() {
     if !strace_available() {
@@ -1924,9 +1940,9 @@ fn commit_per_object_fsync_syncs_content_objects_alone() {
     }
 }
 
-/// The directories under `refs/` one traced run `fsync`-ed, in call order, each
-/// named relative to the repository. `strace -y` prints the path behind a
-/// descriptor, which is what makes the target of each call readable.
+/// The directories under `refs/` that one traced run passes to `fsync`, in
+/// call order, relative to the repository. `strace -y` prints the path behind
+/// a descriptor, so the target of each call is readable.
 fn ref_dir_fsyncs(
     binary: &str,
     repo: &std::path::Path,
@@ -1958,21 +1974,20 @@ fn ref_dir_fsyncs(
         .collect()
 }
 
-/// A ref name carrying `/` is durable as a whole path. Committing
-/// `deep/nest/branch` into a repository that holds neither directory creates
-/// `refs/heads/deep` and `refs/heads/deep/nest`, and each created name lives in
-/// the directory above it, so that directory is the one an `fsync` records.
-/// The calls run deepest first, the order the object fanout uses: the ref file's
-/// own name, then the name of the directory holding it, then the name above
-/// that. A directory already in place is not synced, and `--fsync=false`
+/// A ref name with `/` is durable as a full path. A commit of
+/// `deep/nest/branch` into a repository with neither directory creates
+/// `refs/heads/deep` and `refs/heads/deep/nest`. Each created name is in the
+/// directory one level up, so an `fsync` of that directory records the name.
+/// The calls run deepest first, in the order of the object fanout: the name of
+/// the ref file, then the name of the directory that holds it, then the next
+/// name up. A directory that already exists gets no sync, and `--fsync=false`
 /// reaches none of them.
 ///
-/// The tool issues no directory `fsync` for a ref at all
-/// (`docs/format-reference.md`, "Ref durability"), so this states the port's own
-/// rule and no interop cell reads it. It reads the `fsync` targets under `refs/`
-/// alone, and the port alone; the whole call inventory of one commit, for both
-/// binaries, is `commit_fsync_policy_controls_the_syscalls`. Runs where `strace`
-/// is installed.
+/// The `ostree` command issues no directory `fsync` for a ref. As a result,
+/// this test states a rule of ostrya alone, and no interop cell reads it. It
+/// reads only the `fsync` targets under `refs/`, and only for ostrya.
+/// `commit_fsync_policy_controls_the_syscalls` holds the full call inventory
+/// of one commit for both binaries. The test runs where `strace` is installed.
 #[test]
 fn commit_syncs_every_created_ref_directory() {
     if !strace_available() {
@@ -2012,8 +2027,8 @@ fn commit_syncs_every_created_ref_directory() {
         "a fresh multi-component ref must sync the holder of every name it created",
     );
 
-    // Every directory of the path is now in place, so the second commit onto it
-    // creates nothing and syncs the directory holding the ref alone.
+    // Every directory of the path exists now. The second commit on the branch
+    // creates no directory and syncs only the directory that holds the ref.
     assert_eq!(
         commit("deep/nest/other", "--fsync=true", "trace-existing"),
         ["refs/heads/deep/nest"],
@@ -2031,11 +2046,12 @@ fn commit_syncs_every_created_ref_directory() {
     );
 }
 
-/// The three tree-shaping options reach the tar stream `commit` reads from
-/// standard input, so a tar of a tree and the tree itself commit alike under
-/// them. The tool takes its tar through `--tree=tar=PATH`, a form the port does
-/// not yet accept (`docs/conformance/cli-surface.md`, "P2"), so this states the
-/// port's own two paths against each other.
+/// The three tree-shaping options reach the tar stream that `commit` reads
+/// from standard input. As a result, a tar of a tree and the tree itself
+/// commit alike under them. The `ostree` command takes its tar through
+/// `--tree=tar=PATH`.
+/// This test compares two input paths of ostrya with each other: the tar
+/// stream on standard input and the tree on disk.
 #[test]
 fn commit_tar_stream_honours_the_tree_options() {
     let tmp = TmpDir::new("commit-tar-flags");
@@ -2164,8 +2180,9 @@ fn tar_roundtrip_via_stdin_reproduces_tree() {
 
 // --- `export` option comparison ----------------------------------------------
 
-/// One member of a tar stream, reduced to the fields the `export` comparison
-/// reads. The payload is held whole: every member of the corpus is small.
+/// One member of a tar stream, with only the fields that the `export`
+/// comparison reads. The struct holds the full payload, because every member
+/// of the corpus is small.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TarMember {
     name: String,
@@ -2180,7 +2197,7 @@ struct TarMember {
     xattrs: Vec<(String, Vec<u8>)>,
 }
 
-/// The `key=value` records a PAX extended header holds. Each record is
+/// The `key=value` records that a PAX extended header holds. Each record is
 /// `LENGTH SPACE key=value NEWLINE`, and `LENGTH` counts the whole record.
 fn pax_records(body: &[u8]) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
@@ -2209,12 +2226,11 @@ fn pax_records(body: &[u8]) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// The members of a tar stream, in stream order. A PAX extended header
-/// (typeflag `x`) is folded into the member that follows it, so a
-/// `SCHILY.xattr.*` record reads as that member's extended attributes. The
-/// stream ends at the first header block whose name field starts with a NUL,
-/// which covers both dialects the two implementations write
-/// (`../docs/format-reference.md`, "tar").
+/// The members of a tar stream, in stream order. The function merges a PAX
+/// extended header (typeflag `x`) into the member after it, so a
+/// `SCHILY.xattr.*` record gives the extended attributes of that member. The
+/// stream ends at the first header block whose name field starts with a NUL.
+/// This rule covers the tar dialects of both ostrya and the `ostree` command.
 fn tar_members(bytes: &[u8]) -> Vec<TarMember> {
     let octal = |field: &[u8]| -> u64 {
         let digits: Vec<u8> = field
@@ -2279,12 +2295,12 @@ fn tar_names(members: &[TarMember]) -> Vec<String> {
     members.iter().map(|member| member.name.clone()).collect()
 }
 
-/// The tree a tar stream extracts to, one line per path, sorted. A hardlink
-/// member reads the metadata and the content of the member it links to, so the
-/// description states the same tree whichever of the two members each
-/// implementation wrote in full. A directory's trailing slash and the root
-/// member's own name are normalized, since the two dialects agree on the
-/// content of a tree and not on how a name spells it.
+/// The tree that a tar stream extracts to, one sorted line for each path. A
+/// hardlink member takes the metadata and the content of its target member.
+/// As a result, the description is the same for each choice of the member
+/// that a command writes in full. The function normalizes the trailing slash
+/// of a directory and the name of the root member. The two dialects agree on
+/// the content of a tree and differ in the spelling of a name.
 fn tar_extracted(members: &[TarMember]) -> Vec<String> {
     let mut out = Vec::new();
     for member in members {
@@ -2321,14 +2337,14 @@ fn tar_extracted(members: &[TarMember]) -> Vec<String> {
     out
 }
 
-/// The member names `--subpath` and `--prefix` map a plain export's names to.
+/// The member names that `--subpath` and `--prefix` make from the names of a
+/// plain export.
 ///
-/// `--subpath` keeps the names under the directory it holds and rebases them on
-/// the archive root. `--prefix` puts its value in front of every name with no
-/// separator, and gives the root member one trailing slash where the value does
-/// not already end in one (`cli-surface.md`, "export"). The order the plain
-/// export set is kept, which is the claim that neither option reorders a
-/// stream.
+/// `--subpath` keeps the names under its directory and rebases them on the
+/// archive root. `--prefix` puts its value in front of every name with no
+/// separator. If the value does not end in a slash, the root member gets one
+/// trailing slash. The function keeps the order of the plain export, because
+/// the claim is that neither option reorders a stream.
 fn transformed_names(base: &[String], subpath: Option<&str>, prefix: Option<&str>) -> Vec<String> {
     let under = subpath
         .map(|path| path.trim_matches('/').to_owned())
@@ -2352,12 +2368,12 @@ fn transformed_names(base: &[String], subpath: Option<&str>, prefix: Option<&str
     names
 }
 
-/// The members of a stream sorted by name, with the hardlink members left out.
-/// A hardlink's own header carries no metadata in the port and carries the
-/// linked-to member's metadata in the tool, and which member of a
-/// content-sharing group becomes the hardlink follows each side's own walk
-/// order (`cli-surface.md`, "export"), so the metadata claim is stated over the
-/// members written in full and the hardlinks are stated by `tar_extracted`.
+/// The members of a stream sorted by name, with no hardlink members. The
+/// header of a hardlink carries no metadata in ostrya. In the `ostree`
+/// command, it carries the metadata of the target member. The walk order of
+/// each command selects which member of a content-sharing group becomes the
+/// hardlink. As a result, the metadata claim covers the members written in
+/// full, and `tar_extracted` covers the hardlinks.
 fn tar_metadata(members: &[TarMember]) -> Vec<String> {
     let mut out: Vec<String> = members
         .iter()
@@ -2381,13 +2397,13 @@ fn tar_metadata(members: &[TarMember]) -> Vec<String> {
     out
 }
 
-/// One `export` case: its name, the options it passes, and the `--subpath` and
-/// `--prefix` values those options carry, which
-/// [`transformed_names`] reads to say what member names the case must produce.
+/// One `export` case: its name, its options, and the `--subpath` and
+/// `--prefix` values of those options. [`transformed_names`] reads these
+/// values to give the member names that the case must produce.
 type ExportCase<'a> = (&'a str, &'a [&'a str], Option<&'a str>, Option<&'a str>);
 
-/// Run `export` under both implementations over one repository and return the
-/// two tar streams.
+/// Run `export` with ostrya and with the `ostree` command over one repository,
+/// and return the two tar streams.
 fn export_both(repo: &Path, options: &[&str], rev: &str) -> (Vec<u8>, Vec<u8>) {
     let mut args = vec!["export", "--repo", repo.to_str().unwrap()];
     args.extend(options.iter().copied());
@@ -2400,13 +2416,12 @@ fn export_both(repo: &Path, options: &[&str], rev: &str) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// `export --no-xattrs`, `--subpath=PATH`, and `--prefix=PATH` against the
-/// tool's export of the same commit.
+/// export of the same commit by the `ostree` command.
 ///
-/// The two write different tar dialects, so the claim is the member list, the
-/// member metadata, and the tree the stream extracts to, and not the bytes
-/// (`../docs/format-reference.md`, "tar"). Each side's own member order is held
-/// to the order its plain export set, which states that no option reorders a
-/// stream.
+/// The two commands write different tar dialects. As a result, the claim is
+/// the member list, the member metadata, and the extracted tree, and not the
+/// bytes. The member order of each command must be the order of its plain
+/// export, so the test states that no option reorders a stream.
 #[test]
 fn export_options_match_the_tool() {
     if !ostree_available() {
@@ -2494,17 +2509,16 @@ fn export_options_match_the_tool() {
             "case `{case}`: the two streams extract to different trees",
         );
 
-        // The tool emits no xattr record at all, and the port emits one per
-        // stored xattr unless `--no-xattrs` drops them
-        // (`../docs/format-reference.md`, "tar").
+        // The `ostree` command writes no xattr record. ostrya writes one record
+        // for each stored xattr, except under `--no-xattrs`.
         assert!(
             tool.iter().all(|member| member.xattrs.is_empty()),
             "case `{case}`: the tool emitted an xattr record",
         );
         let port_xattrs: Vec<&(String, Vec<u8>)> =
             port.iter().flat_map(|member| &member.xattrs).collect();
-        // Only the whole tree carries the `C4` names; the `dir` subtree holds
-        // one file with no extended attribute at all.
+        // Only the full tree carries the `C4` names. The `dir` subtree holds
+        // one file with no extended attribute.
         let carries_xattrs = !options.contains(&"--no-xattrs")
             && subpath.is_none_or(|path| path.trim_matches('/').is_empty());
         if carries_xattrs {
@@ -2523,8 +2537,8 @@ fn export_options_match_the_tool() {
         }
     }
 
-    // A hardlink member states which of the content-sharing paths each side
-    // wrote in full, and the two differ because the walk orders differ.
+    // A hardlink member shows which content-sharing path each command wrote in
+    // full. The two commands differ here, because their walk orders differ.
     let (port, tool) = export_both(&repo, &[], &rev);
     let port_links: Vec<String> = tar_members(&port)
         .iter()
@@ -2548,10 +2562,10 @@ fn export_options_match_the_tool() {
     );
 }
 
-/// `export --no-xattrs` is the form whose stream carries every fact an ostree
-/// tree holds in a dialect the two implementations agree on, so the tool's own
-/// import of each side's archive is a checksum oracle: the commit checksum the
-/// import prints states the tree the archive described.
+/// The stream of `export --no-xattrs` carries every fact of an ostree tree in
+/// a dialect that ostrya and the `ostree` command agree on. As a result, the
+/// import by `ostree` of the archive of each command is a checksum oracle. The
+/// commit checksum that the import prints states the tree of the archive.
 #[test]
 fn export_no_xattrs_imports_to_one_commit() {
     if !ostree_available() {
@@ -2581,9 +2595,9 @@ fn export_no_xattrs_imports_to_one_commit() {
     let rev = rev.ok().stdout_trimmed();
 
     // `--prefix=./` is the one prefix whose names normalize back to the bare
-    // ones on import, so it reaches the same tree as the plain export. Every
-    // other prefix leaves the archive without a root member, which the import
-    // refuses (`cli-surface.md`, "export").
+    // names on import, so it gives the same tree as the plain export. Every
+    // other prefix gives an archive with no root member, and the import
+    // refuses it.
     let cases: [(&str, &[&str]); 3] = [
         ("whole-tree", &["--no-xattrs"]),
         ("subpath", &["--no-xattrs", "--subpath=/dir"]),
@@ -2596,9 +2610,9 @@ fn export_no_xattrs_imports_to_one_commit() {
         std::fs::write(&port_path, &port_tar).unwrap();
         std::fs::write(&tool_path, &tool_tar).unwrap();
 
-        // One destination repository per archive, under one branch name, so the
-        // ref binding the commit carries is the same and the checksum states
-        // the tree alone.
+        // One destination repository for each archive, under one branch name.
+        // The ref binding of each commit is then the same, so the checksum
+        // states only the tree.
         let mut checksums = Vec::new();
         for (importer, archive) in [("port", &port_path), ("tool", &tool_path)] {
             for reader in ["port", "tool"] {
@@ -2642,9 +2656,9 @@ fn export_no_xattrs_imports_to_one_commit() {
     }
 }
 
-/// `export -o PATH` and `export --output=PATH`: the archive the destination
-/// holds, the mode a fresh destination takes, and what an existing destination
-/// keeps.
+/// `export -o PATH` and `export --output=PATH`: the archive in the
+/// destination, the mode of a new destination, and what an existing
+/// destination keeps.
 #[test]
 fn export_output_switch_matches_the_tool() {
     if !ostree_available() {
@@ -2673,9 +2687,9 @@ fn export_output_switch_matches_the_tool() {
     let rev = rev.ok().stdout_trimmed();
     let repo_arg = repo.to_str().unwrap().to_owned();
 
-    // A fresh destination takes the mode an ordinary create takes on this host,
-    // which is `0o666` reduced by the umask; comparing against a plain create
-    // in the same directory states that without setting the umask.
+    // A new destination gets the mode of an ordinary create on this host,
+    // which is `0o666` reduced by the umask. The test compares with a plain
+    // create in the same directory, so it does not set the umask.
     let reference = base.join("umask-probe");
     std::fs::write(&reference, b"").unwrap();
     let expected_mode = std::fs::metadata(&reference).unwrap().permissions().mode() & 0o7777;
@@ -2723,9 +2737,10 @@ fn export_output_switch_matches_the_tool() {
         "the two implementations' `-o` archives hold the same members",
     );
 
-    // The destination is opened for writing in place, so an existing one keeps
-    // its inode and its mode and is truncated. Both write the same archive into
-    // it, and each pads its own stream, so the sizes are read per side.
+    // Each command opens the destination for writing in place. An existing
+    // destination keeps its inode and its mode, and its contents are
+    // truncated. Both commands write the same archive into it. Each command
+    // pads its own stream, so the test reads the size for each command.
     for side in ["port", "tool"] {
         let dest = base.join(format!("{side}-existing.tar"));
         std::fs::write(&dest, b"pre-existing content").unwrap();
@@ -2758,8 +2773,8 @@ fn export_output_switch_matches_the_tool() {
         );
     }
 
-    // A destination that cannot be opened ends the run at exit 1 in both, and
-    // neither creates anything on the way to it.
+    // If the destination cannot be opened, both commands exit 1, and neither
+    // creates anything on the path to it.
     let missing = base.join("nodir").join("out.tar");
     for side in ["port", "tool"] {
         let args = [
@@ -2780,10 +2795,11 @@ fn export_output_switch_matches_the_tool() {
         assert!(!base.join("nodir").exists(), "{side}: no directory created");
     }
 
-    // The destination is opened before the revision resolves, so a revision
-    // naming nothing leaves it truncated at its own mode and inode. Neither
-    // side writes an archive into it; the tool leaves the 1024 bytes its writer
-    // had buffered and the port leaves it empty (`cli-surface.md`, "export").
+    // Each command opens the destination before the revision resolves. A
+    // revision that names nothing leaves the destination truncated, with its
+    // own mode and inode. Neither command writes an archive into it. The
+    // `ostree` command leaves the 1024 bytes that its writer buffered, and
+    // ostrya leaves the destination empty.
     for (side, size) in [("port", 0), ("tool", 1024)] {
         let dest = base.join(format!("{side}-refused.tar"));
         std::fs::write(&dest, b"pre-existing content").unwrap();
@@ -2818,9 +2834,9 @@ fn export_output_switch_matches_the_tool() {
         );
     }
 
-    // Standard output is the same destination under another name: a refusal
-    // that comes after the archive is opened leaves the tool's padding there
-    // and leaves the port's stream empty.
+    // Standard output is the same destination under another name. A refusal
+    // after the archive opens leaves the padding of the `ostree` command on
+    // standard output, and leaves the stream of ostrya empty.
     for (side, size) in [("port", 0), ("tool", 10240)] {
         for revision in ["no-such-ref", &rev] {
             let mut args = vec!["export", "--repo", &repo_arg, revision];
@@ -2846,10 +2862,10 @@ fn export_output_switch_matches_the_tool() {
     }
 }
 
-/// The `--subpath` values the two implementations part on: a trailing slash the
-/// tool reads as part of a name, and a subpath naming a file or a symlink,
-/// which the reference build dies on. A `..` component inside a value is the
-/// case they agree on, and this test states both.
+/// The `--subpath` values where ostrya and the `ostree` command differ.
+/// `ostree` reads a trailing slash as part of a name, and it dies on a subpath
+/// that names a file or a symlink. Both commands agree on a `..` component
+/// inside a value. This test states the differences and the agreement.
 #[test]
 fn export_subpath_refusals_match_the_tool() {
     if !ostree_available() {
@@ -2878,8 +2894,8 @@ fn export_subpath_refusals_match_the_tool() {
     let rev = rev.ok().stdout_trimmed();
     let repo_arg = repo.to_str().unwrap();
 
-    // A subpath naming nothing ends the export at exit 1 in both, in each
-    // side's own words.
+    // If a subpath names nothing, both commands end the export at exit 1, each
+    // in its own words.
     for subpath in ["--subpath=/nope", "--subpath=/dir/nope"] {
         let args = ["export", "--repo", repo_arg, subpath, &rev];
         let port = ostrya(&args, None, &[]);
@@ -2898,10 +2914,9 @@ fn export_subpath_refusals_match_the_tool() {
         );
     }
 
-    // A subpath naming a file or a symlink has no tree to walk. The port
-    // refuses it at exit 1; the reference build dies on SIGABRT and writes no
-    // archive, which states nothing about the port
-    // (`cli-surface.md`, "export").
+    // A subpath that names a file or a symlink has no tree to walk. ostrya
+    // refuses it at exit 1. The `ostree` command dies on SIGABRT and writes no
+    // archive. This crash states nothing about ostrya.
     for subpath in ["--subpath=/file.txt", "--subpath=/link"] {
         let args = ["export", "--repo", repo_arg, subpath, &rev];
         let port = ostrya(&args, None, &[]);
@@ -2923,8 +2938,8 @@ fn export_subpath_refusals_match_the_tool() {
             "the reference build states the assertion it died on: {}",
             String::from_utf8_lossy(&tool.stderr),
         );
-        // The crash puts a `Bail out!` line on standard output, which is what
-        // stands there in place of a tar member (`cli-surface.md`, "export").
+        // The crash puts a `Bail out!` line on standard output, in the place of
+        // a tar member.
         let out = String::from_utf8_lossy(&tool.stdout);
         assert!(
             out.starts_with("Bail out! ")
@@ -2933,11 +2948,12 @@ fn export_subpath_refusals_match_the_tool() {
         );
     }
 
-    // The tool reads each `/`-separated span of the value as a child name, so a
-    // trailing slash and the spans `.` and `..` all name nothing. The port
-    // reads a path: a `..` component names nothing there either, and the two
-    // agree, while a trailing slash names the same directory and a `.`
-    // component falls away, which the port takes and the tool refuses.
+    // The `ostree` command reads each `/`-separated span of the value as a
+    // child name. As a result, a trailing slash and the spans `.` and `..` all
+    // name nothing. ostrya reads a path. A `..` component inside a value also
+    // names nothing in ostrya, so the two commands agree on it. In ostrya, a
+    // trailing slash names the same directory, and a `.` component has no
+    // effect. ostrya accepts these two forms, and `ostree` refuses them.
     for (subpath, named, port_status) in [
         ("--subpath=/dir/", "/dir/", 0),
         ("--subpath=.", "/.", 0),
@@ -2975,10 +2991,10 @@ fn export_subpath_refusals_match_the_tool() {
         }
     }
 
-    // The port's archive under the trailing-slash form is the one it writes
-    // without it, and `.` and `..` name the whole tree. The `..` value reaches
-    // the whole tree through the no-component test the subpath takes first,
-    // ahead of the path walk that refuses a `..` inside a value.
+    // With the trailing slash, ostrya writes the same archive as without it,
+    // and `.` and `..` name the full tree. The value `..` reaches the full tree
+    // through the no-component check, which the subpath takes first. The path
+    // walk that refuses a `..` inside a value comes after that check.
     let dir_args = ["export", "--repo", repo_arg, "--subpath=/dir", &rev];
     let plain_dir = ostrya(&dir_args, None, &[]).ok().stdout.clone();
     let plain_root = ostrya(&["export", "--repo", repo_arg, &rev], None, &[])
@@ -2997,8 +3013,7 @@ fn export_subpath_refusals_match_the_tool() {
 }
 
 /// A repeated `--subpath`, `--prefix`, or `-o` takes the last occurrence in
-/// both implementations (`../docs/format-reference.md`, "The tar export
-/// options").
+/// ostrya and in the `ostree` command.
 #[test]
 fn export_repeated_options_take_the_last_value() {
     if !ostree_available() {
@@ -3026,8 +3041,8 @@ fn export_repeated_options_take_the_last_value() {
     );
     let rev = rev.ok().stdout_trimmed();
 
-    // The last value decides, so the repeated form names the members the last
-    // value alone names, and the value passed first leaves no trace.
+    // The last value decides. The repeated form names the members that the
+    // last value alone names, and the first value has no effect.
     for (repeated, once) in [
         (
             ["--prefix=first/", "--prefix=second/"].as_slice(),
@@ -3082,9 +3097,9 @@ fn export_repeated_options_take_the_last_value() {
     }
 }
 
-/// Which path of a content-sharing group is written in full follows each side's
-/// own walk order, so a group whose paths lie in two directories coalesces in
-/// opposite directions (`../docs/conformance/cli-surface.md`, "export").
+/// The walk order of each command selects the path of a content-sharing group
+/// that the command writes in full. As a result, a group with paths in two
+/// directories coalesces in opposite directions.
 #[test]
 fn export_hardlink_direction_parts_from_the_tool() {
     if !ostree_available() {
@@ -3124,9 +3139,10 @@ fn export_hardlink_direction_parts_from_the_tool() {
             .map(|member| format!("{} -> {}", member.name, member.link))
             .collect()
     };
-    // The tool reaches `z.txt` first, its walk taking a directory's
-    // non-directory entries before its subdirectories; the port reaches
-    // `adir/a.txt` first, its walk taking every entry in one name order.
+    // The `ostree` command reaches `z.txt` first, because its walk takes the
+    // non-directory entries of a directory before its subdirectories. ostrya
+    // reaches `adir/a.txt` first, because its walk takes every entry in one
+    // name order.
     assert_eq!(
         links(&tool),
         vec!["adir/a.txt -> z.txt".to_owned()],
@@ -3150,9 +3166,10 @@ fn checkout_roundtrips_and_matches_tool() {
     let tmp = TmpDir::new("checkout");
     let base = tmp.path();
     build_fixture_source(base);
-    // bare-user-only discards ownership and xattrs and caps the mode, so a
-    // checkout applies no chown (runs unprivileged) and a commit -> checkout ->
-    // commit round-trip is stable regardless of host-applied labels.
+    // `bare-user-only` discards ownership and xattrs and caps the mode. A
+    // checkout then applies no chown and runs unprivileged. A commit ->
+    // checkout -> commit round-trip is stable for any labels that the host
+    // applies.
     let repo = create_repo(base, RepoMode::BareUserOnly);
     let src = base.join("src");
 
@@ -3187,9 +3204,10 @@ fn checkout_roundtrips_and_matches_tool() {
     )
     .ok();
 
-    // Re-committing the checkout with the same options reproduces the commit:
-    // checkout is stable. `--parent=none` keeps the second commit a root commit,
-    // the branch it names already holding a tip the implicit parent would take.
+    // A new commit of the checkout with the same options gives the same
+    // commit, so checkout is stable. `--parent=none` keeps the second commit a
+    // root commit. Without it, the commit takes the current tip of its branch
+    // as its parent.
     let recommit = ostrya(
         &[
             "commit",
@@ -3212,7 +3230,8 @@ fn checkout_roundtrips_and_matches_tool() {
         "commit -> checkout -> commit is stable",
     );
 
-    // The port's checkout matches the tool's checkout of the same commit.
+    // The checkout of ostrya matches the checkout of the same commit by the
+    // `ostree` command.
     if ostree_available() {
         let dest_tool = base.join("co-tool");
         let out = Command::new("ostree")
@@ -3233,11 +3252,11 @@ fn checkout_roundtrips_and_matches_tool() {
     }
 }
 
-/// `checkout -U` and `checkout --subpath=PATH` against the tool's checkout of
-/// the same commit, over a tree carrying a setuid file, a setgid directory, a
-/// nested directory, and a symlink, in the modes whose checkout path differs:
-/// `archive` copies, `bare-user` hardlinks under `-U`, and `bare` copies under
-/// `-U` while it hardlinks without it.
+/// `checkout -U` and `checkout --subpath=PATH` against the checkout of the same
+/// commit by the `ostree` command. The tree carries a setuid file, a setgid
+/// directory, a nested directory, and a symlink. The test runs the modes whose
+/// checkout path differs: `archive` copies, `bare-user` hardlinks under `-U`,
+/// and `bare` copies under `-U` and hardlinks without it.
 #[test]
 fn checkout_user_mode_and_subpath_match_the_tool() {
     if !ostree_available() {
@@ -3312,8 +3331,8 @@ fn checkout_user_mode_and_subpath_match_the_tool() {
             );
         }
 
-        // A file or symlink subpath is placed inside a destination directory the
-        // checkout creates, rather than becoming the destination itself.
+        // The checkout creates a destination directory and puts a file or
+        // symlink subpath inside it.
         let inside = base.join(format!("port-{mode_name}-subpath-file"));
         assert!(
             inside.join("file.txt").is_file(),
@@ -3322,9 +3341,9 @@ fn checkout_user_mode_and_subpath_match_the_tool() {
     }
 }
 
-/// The subpaths `checkout` refuses. Both implementations exit 1 and leave no
-/// destination behind; the words differ, which
-/// `docs/conformance/cli-surface.md`, "P2" records.
+/// The subpaths that `checkout` refuses. ostrya and the `ostree` command exit
+/// 1 and leave no destination. The words differ, and this is a recorded
+/// divergence.
 #[test]
 fn checkout_refuses_a_subpath_that_names_nothing() {
     let tmp = TmpDir::new("checkout-subpath-refuse");
@@ -3450,21 +3469,20 @@ fn composefs_checkout_matches_library() {
     assert!(!cli_bytes.is_empty(), "composefs image is non-empty");
 }
 
-/// The two composefs switches of `checkout`, over a repository holding one
-/// tree, in each mode the port and the tool can both commit into.
+/// The two composefs switches of `checkout`, over a repository with one tree,
+/// in each mode that ostrya and the `ostree` command can both commit into.
 /// `--composefs` writes the verity image, and `--composefs-noverity` writes
 /// the image whose metacopy xattr carries no digest. The switches are
-/// independent and the no-verity switch decides, so the two combined forms
-/// write the no-verity image whatever their order. Each form is held against
-/// the tool's own image for the same commit.
+/// independent, and the no-verity switch decides. As a result, the two
+/// combined forms write the no-verity image in either order. The test compares
+/// each form with the image of `ostree` for the same commit.
 ///
-/// Every destination is created at mode 0600 first, so each form also states
-/// that both implementations replace a destination that already exists rather
-/// than write into it: the image lands at mode 0644 on both sides at the umask
-/// the run carries. That the tool's image mode is 0644 whatever the umask is
-/// the observation recorded in `docs/format-reference.md`, "composefs"; the
-/// port reaches the same mode by `fchmod` on the open descriptor, which takes
-/// no umask.
+/// The test creates every destination at mode 0600 first. Each form then also
+/// states that both commands replace an existing destination with a new file.
+/// The image gets mode 0644 for both commands at the umask of the run. The
+/// `ostree` command gives the image mode 0644 for any umask. This is an
+/// observed fact. ostrya gets the same mode with `fchmod` on the open
+/// descriptor, which ignores the umask.
 #[test]
 fn checkout_composefs_switches_match_the_tool() {
     if !ostree_available() {
@@ -3513,10 +3531,10 @@ fn composefs_switches_match_the_tool(base: &Path, mode: RepoMode) {
     .ok()
     .stdout_trimmed();
 
-    // The tool writes the image through a temporary file it creates in the
-    // working directory and links to the destination, so both implementations
-    // run from the directory the destinations sit in. One image per form and
-    // per implementation leaves eight files to compare.
+    // The `ostree` command writes the image through a temporary file in the
+    // working directory, and then links the file to the destination. As a
+    // result, both commands run from the directory of the destinations. One
+    // image for each form and each command gives eight files to compare.
     let mut written = Vec::new();
     for (n, flags) in [
         ["--composefs"].as_slice(),
@@ -3603,13 +3621,14 @@ fn composefs_switches_match_the_tool(base: &Path, mode: RepoMode) {
 }
 
 /// A composefs image holds a child name of at most 255 bytes. A filesystem
-/// holds no longer name, so each side commits a tar archive whose member name
-/// comes from a pax `path` record. Both commit the 255-byte and the 256-byte
-/// name to the same checksum. At 255 bytes both composefs switches write the
-/// same image bytes, and `commit --generate-composefs-metadata` writes the same
-/// commit. At 256 bytes both refuse each form at exit 1 and write no image, no
-/// commit, and no ref. The two refusals are worded differently, so the test
-/// compares the exit status and standard output only.
+/// holds no longer name, so each command commits a tar archive whose member
+/// name comes from a pax `path` record. Both commands commit the 255-byte and
+/// the 256-byte name to the same checksum. At 255 bytes, both composefs
+/// switches write the same image bytes, and
+/// `commit --generate-composefs-metadata` writes the same commit. At 256 bytes,
+/// both commands refuse each form at exit 1 and write no image, no commit, and
+/// no ref. The two refusals have different words, so the test compares only the
+/// exit status and standard output.
 #[test]
 fn checkout_composefs_child_name_bound_matches_the_tool() {
     if !ostree_available() {
@@ -3629,8 +3648,9 @@ fn checkout_composefs_child_name_bound_matches_the_tool() {
             &["commit", "-b", &branch, FIXED_TIMESTAMP, &source],
         );
 
-        // The tool writes the image through a temporary file in the working
-        // directory, so both sides run from the directory of the destinations.
+        // The `ostree` command writes the image through a temporary file in the
+        // working directory, so both commands run from the directory of the
+        // destinations.
         for flag in ["--composefs", "--composefs-noverity"] {
             let label = format!("checkout {flag} over a {len}-byte name");
             let port_image = base.join(format!("port{len}{flag}.cfs"));
@@ -3712,11 +3732,11 @@ fn checkout_composefs_child_name_bound_matches_the_tool() {
     }
 }
 
-/// A composefs export that fails part way writes no destination and leaves a
-/// destination that already exists as it was, byte for byte and at the mode it
-/// carried. The failure comes from a content object removed from the
-/// repository after the commit, which the export reaches only while it builds
-/// the image.
+/// If a composefs export fails part way, it writes no destination. It leaves a
+/// destination that already exists as it was, byte for byte and with the same
+/// mode. The failure comes from a content object that the test removes from
+/// the repository after the commit. The export reaches that object only while
+/// it builds the image.
 #[test]
 fn checkout_composefs_failure_leaves_no_destination() {
     let tmp = TmpDir::new("checkout-composefs-failure");
@@ -3775,8 +3795,8 @@ fn checkout_composefs_failure_leaves_no_destination() {
             );
         };
 
-        // A destination the failed export would have had to create is not
-        // created.
+        // If the destination does not exist, the failed export does not create
+        // it.
         let port_image = base.join(format!("port-{name}.cfs"));
         fail(&port_image);
         assert!(
@@ -3784,9 +3804,9 @@ fn checkout_composefs_failure_leaves_no_destination() {
             "the failed `{flag}` left a destination behind",
         );
 
-        // A destination that already exists is left as it was. The export
-        // serializes as it builds, so a destination it opened directly would be
-        // truncated before the failure reached it.
+        // The failed export leaves a destination that already exists as it
+        // was. The export serializes the image while it builds it. An export
+        // that opens the destination directly truncates it before the failure.
         let kept = base.join(format!("kept-{name}.cfs"));
         std::fs::write(&kept, b"a file the export has no claim on").unwrap();
         std::fs::set_permissions(&kept, PermissionsExt::from_mode(0o600)).unwrap();
@@ -3803,8 +3823,9 @@ fn checkout_composefs_failure_leaves_no_destination() {
         );
     }
 
-    // The port exports through a temporary file in the destination's directory.
-    // A failure removes it, so four failures leave the directory with none.
+    // ostrya exports through a temporary file in the directory of the
+    // destination. A failure removes this file, so after four failures the
+    // directory holds no temporary file.
     let leftover: Vec<_> = std::fs::read_dir(base)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
@@ -3816,7 +3837,7 @@ fn checkout_composefs_failure_leaves_no_destination() {
     );
 }
 
-/// Commit the fixture tree into a fresh archive repo and return its path.
+/// Commit the fixture tree into a new archive repository and return its path.
 fn commit_fixture(base: &Path) -> PathBuf {
     build_fixture_source(base);
     let repo = create_repo(base, RepoMode::Archive);
@@ -3847,7 +3868,7 @@ fn sign_verify_delete_ed25519() {
     let repo = commit_fixture(base);
     let repo_s = repo.to_str().unwrap();
 
-    // Sign with the default (ed25519) engine using the base64 secret key.
+    // Sign with the default engine (ed25519) and the base64 secret key.
     ostrya(
         &["sign", "--repo", repo_s, COMMIT, ED25519_SECRET_B64],
         None,
@@ -3855,7 +3876,7 @@ fn sign_verify_delete_ed25519() {
     )
     .ok();
 
-    // The public key verifies; a wrong key does not.
+    // The public key verifies the signature. A wrong key does not.
     let good = ostrya(
         &[
             "sign",
@@ -3878,7 +3899,7 @@ fn sign_verify_delete_ed25519() {
     );
     assert!(!bad.status.success(), "a wrong key must not verify");
 
-    // The tool verifies the port-written signature.
+    // The `ostree` command verifies the signature that ostrya wrote.
     if ostree_supports_ed25519() {
         let out = Command::new("ostree")
             .arg(format!("--repo={}", repo.display()))
@@ -3898,7 +3919,7 @@ fn sign_verify_delete_ed25519() {
         );
     }
 
-    // Delete by the public key; verification then fails.
+    // Delete the signature by the public key. Verification then fails.
     let del = ostrya(
         &[
             "sign",
@@ -3933,9 +3954,9 @@ fn sign_verify_delete_ed25519() {
 }
 
 /// Each command that writes refs, `config`, a remote keyring, `summary`, or
-/// detached metadata takes the update lock once. With `lock-timeout-secs=0` a
-/// command that waited for a lock of its own would fail at once, so each of
-/// them completing proves that none waits for itself.
+/// detached metadata takes the update lock once. With `lock-timeout-secs=0`, a
+/// command that waits for a lock that it holds fails at once. If each command
+/// completes, no command waits for itself.
 #[test]
 fn writers_take_the_update_lock_once() {
     let tmp = TmpDir::new("writers-update-lock");
@@ -3970,8 +3991,8 @@ fn writers_take_the_update_lock_once() {
             src.to_str().unwrap(),
         ],
     ];
-    // A remote whose keyring the command imports, and its removal, which
-    // removes the keyring.
+    // A remote with a keyring that the command imports, and the removal of the
+    // remote, which also removes the keyring.
     #[cfg(feature = "gpg")]
     let (_home, import) = if gpg_available() {
         let home = GpgHome::create(base, "Writers <writers@example.invalid>");
@@ -4018,8 +4039,8 @@ fn writers_take_the_update_lock_once() {
 #[cfg(feature = "spki")]
 #[test]
 fn sign_verify_spki_selects_the_engine() {
-    // The base64 PKCS#8 secret key and SubjectPublicKeyInfo public key shared
-    // with the library `sign_spki` test.
+    // The base64 PKCS#8 secret key and SubjectPublicKeyInfo public key. The
+    // library `sign_spki` test uses the same keys.
     const SECRET_PKCS8_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
     const PUBLIC_SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
 
@@ -4088,7 +4109,7 @@ fn sign_verify_delete_gpg() {
     home.export_to(&public);
     let public_s = public.to_str().unwrap();
 
-    // Sign with the key gpg resolves in the fixture home directory.
+    // Sign with the key that gpg resolves in the fixture home directory.
     ostrya(
         &[
             "sign",
@@ -4125,7 +4146,7 @@ fn sign_verify_delete_gpg() {
     verified.ok();
     assert!(verified.stdout_trimmed().contains("verification OK"));
 
-    // Delete by the key's fingerprint, then verification fails.
+    // Delete the signature by the key fingerprint. Verification then fails.
     let del = ostrya(
         &[
             "sign",
@@ -4164,8 +4185,8 @@ fn sign_verify_delete_gpg() {
     );
 }
 
-/// gpg verify with no `--keys-file` falls back to the default trusted set:
-/// the `*.gpg` keyrings in the directory named by `OSTREE_GPG_HOME`.
+/// With no `--keys-file`, a gpg verify uses the default trusted set: the
+/// `*.gpg` keyrings in the directory that `OSTREE_GPG_HOME` names.
 #[cfg(feature = "gpg")]
 #[test]
 fn sign_verify_gpg_default_trust() {
@@ -4181,7 +4202,8 @@ fn sign_verify_gpg_default_trust() {
     let fpr = home.fingerprint();
     let home_s = home.dir.to_str().unwrap().to_owned();
 
-    // Sign, then publish the public keyring as `*.gpg` in a trusted.gpg.d dir.
+    // Sign, then publish the public keyring as `*.gpg` in a `trusted.gpg.d`
+    // directory.
     ostrya(
         &[
             "sign",
@@ -4203,8 +4225,8 @@ fn sign_verify_gpg_default_trust() {
     home.export_to(&trusted.join("key.gpg"));
     let trusted_s = trusted.to_str().unwrap();
 
-    // With OSTREE_GPG_HOME pointing at that directory and no --keys-file,
-    // verification succeeds against the discovered keyring.
+    // If `OSTREE_GPG_HOME` names that directory and no `--keys-file` is given,
+    // verification with the keyring in that directory succeeds.
     let verified = ostrya(
         &["sign", "--verify", "--repo", repo_s, "-s", "gpg", COMMIT],
         None,
@@ -4213,7 +4235,8 @@ fn sign_verify_gpg_default_trust() {
     verified.ok();
     assert!(verified.stdout_trimmed().contains("verification OK"));
 
-    // An OSTREE_GPG_HOME with no keyrings trusts nothing, so verify fails.
+    // An `OSTREE_GPG_HOME` with no keyrings trusts no key, so verification
+    // fails.
     let empty = base.join("empty.gpg.d");
     std::fs::create_dir(&empty).unwrap();
     let failed = ostrya(
@@ -4291,7 +4314,8 @@ fn static_delta_list_and_apply_offline() {
     let repo = commit_fixture(base);
     let repo_arg = format!("--repo={}", repo.display());
 
-    // The tool generates a from-scratch delta to the fixture commit.
+    // The `ostree` command generates a from-scratch delta to the fixture
+    // commit.
     let generated = Command::new("ostree")
         .args([
             &repo_arg,
@@ -4305,7 +4329,7 @@ fn static_delta_list_and_apply_offline() {
         .unwrap();
     assert!(generated.status.success(), "tool delta generate failed");
 
-    // `list` prints the delta names, matching the tool.
+    // `list` prints the delta names, as the `ostree` command does.
     let listed = ostrya(
         &["static-delta", "--repo", repo.to_str().unwrap(), "list"],
         None,
@@ -4313,7 +4337,7 @@ fn static_delta_list_and_apply_offline() {
     );
     assert_eq!(listed.ok().stdout_trimmed(), COMMIT);
 
-    // `apply-offline` reproduces the target commit in a fresh repository.
+    // `apply-offline` reproduces the target commit in a new repository.
     let dst = base.join("dst");
     block_on(async {
         Repo::create(&dst, CreateOptions::new(RepoMode::Archive))
@@ -4334,7 +4358,7 @@ fn static_delta_list_and_apply_offline() {
     );
     assert_applied_without_ref(&applied, &dst, COMMIT, "apply");
 
-    // The tool reads the tree the port produced.
+    // The `ostree` command reads the tree that ostrya produced.
     let ls = Command::new("ostree")
         .args([&format!("--repo={}", dst.display()), "ls", "-R", COMMIT])
         .output()
@@ -4381,7 +4405,9 @@ fn static_delta_generate_signs_and_indexes() {
     let dir = only_delta_dir(&repo);
     assert!(dir.join("superblock").exists(), "no superblock at {dir:?}");
 
-    // The tool verifies the signature the port wrote and applies the delta.
+    // The `ostree` command verifies the signature that ostrya wrote. Its
+    // `indexes` subcommand lists the target commit. ostrya then applies the
+    // delta.
     let verified = Command::new("ostree")
         .args([
             &format!("--repo={}", repo.display()),
@@ -4439,8 +4465,8 @@ fn static_delta_generate_relative_output_dir() {
     let base = tmp.path();
     let repo = commit_fixture(base);
 
-    // `--output-dir` resolves against the working directory, so the delta lands
-    // at base/rel and signing reaches the same files.
+    // `--output-dir` resolves against the working directory. The delta goes to
+    // `base/rel`, and the sign step signs the delta in that directory.
     let generated = ostrya_in(
         Some(base),
         &[
@@ -4476,7 +4502,7 @@ fn static_delta_generate_relative_output_dir() {
         "the delta at {dir:?} is unsigned"
     );
 
-    // The signed delta applies into a fresh repository.
+    // The signed delta applies into a new repository.
     let dst = base.join("dst");
     block_on(async {
         Repo::create(&dst, CreateOptions::new(RepoMode::Archive))
@@ -4504,9 +4530,9 @@ fn static_delta_generate_refuses_output_dir_with_reindex() {
     let repo = commit_fixture(base);
     let out = base.join("out");
 
-    // Indexing covers the deltas under the repository's `deltas/` tree, so the
-    // pair would write a delta and index nothing. It is refused instead, before
-    // anything is written.
+    // The index covers the deltas under the `deltas/` tree of the repository.
+    // A delta in an `--output-dir` is outside that tree, so `--reindex` adds
+    // nothing for it. ostrya refuses the pair before it writes anything.
     let refused = ostrya(
         &[
             "static-delta",
@@ -4537,14 +4563,14 @@ fn static_delta_generate_refuses_output_dir_with_reindex() {
 
 // --- pull over HTTP ----------------------------------------------------------
 
-/// A static file server over HTTP/1.1, serving one directory. The threads are
-/// detached and the listener closes with the process.
+/// A static file server over HTTP/1.1 for one directory. The threads are
+/// detached, and the listener closes with the process.
 ///
-/// It answers `GET /<path>` with the file's bytes and 404 where the directory
-/// holds no such regular file, which is the whole of what a repository fetch
-/// reads. Each accepted connection runs in its own thread and stays open for as
-/// many requests as the client sends, so a pull holding several fetches at once
-/// is served without ordering them.
+/// It answers `GET /<path>` with the bytes of the file. If the directory holds
+/// no such regular file, it answers 404. A repository fetch needs no other
+/// answer. Each accepted connection runs in its own thread and stays open for
+/// all the requests that the client sends. As a result, the server does not
+/// serialize the parallel fetches of a pull.
 struct FileServer {
     port: u16,
     log: Arc<Mutex<Vec<ServedRequest>>>,
@@ -4564,7 +4590,7 @@ struct ServedRequest {
 enum Fault {
     /// Answer 503 with an empty body.
     Unavailable { times: usize },
-    /// Declare the file's whole length, send half of it, and close the
+    /// Declare the whole length of the file, send half of it, and close the
     /// connection.
     Truncate { times: usize },
     /// Send the file `bytes` bytes at a time, one piece every `interval`, on
@@ -4575,8 +4601,8 @@ enum Fault {
     },
 }
 
-/// A fault and the path it applies to, with the count of answers it has left.
-/// A count of `usize::MAX` never runs out.
+/// A fault, the path that it applies to, and the count of the answers that it
+/// still applies to. A count of `usize::MAX` does not decrease.
 struct Injected {
     target: String,
     fault: Fault,
@@ -4584,8 +4610,8 @@ struct Injected {
 }
 
 impl Injected {
-    /// Whether the fault applies to this answer for `path`, spending one from
-    /// the count where it does.
+    /// Returns `true` if the fault applies to this answer for `path`. If it
+    /// applies, the count decreases by one.
     fn hits(&self, path: &str) -> bool {
         if path != self.target {
             return false;
@@ -4661,20 +4687,22 @@ impl FileServer {
             .collect()
     }
 
-    /// Whether every request served so far carried `line` among its headers.
+    /// Returns `true` if the server answered at least one request and every
+    /// request carried `line` in its headers.
     fn every_request_carried(&self, line: &str) -> bool {
         let log = self.log.lock().unwrap();
         !log.is_empty() && log.iter().all(|r| r.headers.iter().any(|h| h == line))
     }
 
-    /// Drop the record, so a second pull's requests are read on their own.
+    /// Clear the record, so that the test reads the requests of a second pull
+    /// on their own.
     fn clear(&self) {
         self.log.lock().unwrap().clear();
     }
 }
 
-/// Answer requests on one connection until the client closes it, injecting
-/// `fault` where one is given.
+/// Answer requests on one connection until the client closes it. If `fault` is
+/// given, inject it.
 fn serve_connection(
     stream: TcpStream,
     root: &Path,
@@ -4682,7 +4710,8 @@ fn serve_connection(
     fault: Option<&Injected>,
 ) {
     // Each answer goes out as a head write and a body write. Without
-    // `TCP_NODELAY` the body waits for the client's delayed ACK of the head.
+    // `TCP_NODELAY`, the body waits for the delayed ACK of the head from the
+    // client.
     let _ = stream.set_nodelay(true);
     let mut reader = BufReader::new(stream.try_clone().expect("clone connection"));
     let mut writer = stream;
@@ -4741,8 +4770,8 @@ fn serve_connection(
                         return;
                     }
                     for piece in bytes.chunks(step) {
-                        // A client that gave up closes the connection, which
-                        // ends the trickle.
+                        // A client that stops the transfer closes the
+                        // connection. This ends the trickle.
                         if writer.write_all(piece).is_err() {
                             return;
                         }
@@ -4767,8 +4796,8 @@ fn serve_connection(
     }
 }
 
-/// The file a request path names under `root`, or `None` where the path names
-/// no regular file or would leave the directory.
+/// The file that a request path names under `root`. `None` if the path is
+/// empty, holds a `.` or `..` component, or names no regular file.
 fn served_path(root: &Path, path: &str) -> Option<PathBuf> {
     if path.is_empty() || path.split('/').any(|part| part == ".." || part == ".") {
         return None;
@@ -4777,8 +4806,8 @@ fn served_path(root: &Path, path: &str) -> Option<PathBuf> {
     joined.is_file().then_some(joined)
 }
 
-/// Append `[remote "origin"]` with `url` and the extra keys `extra` supplies to
-/// a repository's config.
+/// Append `[remote "origin"]` with `url` and the extra keys of `extra` to the
+/// config of a repository.
 fn configure_remote(repo: &Path, url: &str, extra: &str) {
     let config = repo.join("config");
     let mut text = std::fs::read_to_string(&config).unwrap();
@@ -4786,8 +4815,8 @@ fn configure_remote(repo: &Path, url: &str, extra: &str) {
     std::fs::write(&config, text).unwrap();
 }
 
-/// A remote archive repository under `base/<name>` holding the fixture commit
-/// on `test/main`, with a summary.
+/// A remote archive repository under `base/<name>` with the fixture commit on
+/// `test/main` and a summary.
 fn build_remote(base: &Path, name: &str) -> PathBuf {
     let dir = base.join(name);
     std::fs::create_dir_all(&dir).unwrap();
@@ -4814,14 +4843,14 @@ fn pull_over_http_reproduces_the_remote_tree() {
     let base = tmp.path();
     let remote = build_remote(base, "remote");
     let server = FileServer::start(&remote);
-    // bare-user-only discards ownership, so the checkout below applies no chown
-    // and runs unprivileged. The fixture is committed under canonical
-    // permissions, which is the form that destination stores.
+    // bare-user-only discards ownership, so the checkout of this test applies
+    // no chown and runs unprivileged. The fixture is committed with canonical
+    // permissions, which is the form that this destination stores.
     let dest_dir = base.join("dest");
     std::fs::create_dir_all(&dest_dir).unwrap();
     let dest = create_repo(&dest_dir, RepoMode::BareUserOnly);
-    // The remotes these tests serve publish unsigned commits, and `gpg-verify`
-    // defaults to on, so the section states the policy the pull runs under.
+    // The remotes of these tests publish unsigned commits, and `gpg-verify` is
+    // on by default, so the remote section states the policy of the pull.
     configure_remote(&dest, &server.url(), "gpg-verify=false\n");
 
     let pulled = ostrya(
@@ -4848,8 +4877,8 @@ fn pull_over_http_reproduces_the_remote_tree() {
         pulled.stdout_trimmed()
     );
 
-    // The ref lands under the remote's own name, and the tree it names checks
-    // out as the tree the fixture committed.
+    // The ref goes under the name of the remote. A checkout of the tree that
+    // it names gives the tree that the fixture committed.
     assert_eq!(
         resolve(&dest, &format!("origin:{BRANCH}")).as_deref(),
         Some(COMMIT)
@@ -4869,13 +4898,14 @@ fn pull_over_http_reproduces_the_remote_tree() {
     .ok();
     assert_eq!(describe_tree(&out), describe_tree(&base.join("remote/src")));
 
-    // The header reached every request the fetcher sent.
+    // The header reached every request that the fetcher sent.
     assert!(
         server.every_request_carried("x-ostrya-test: on"),
         "the extra header did not reach every request: {:?}",
         server.seen()
     );
-    // A header value holding an `=` arrives whole, split only at the first one.
+    // A header value with an `=` arrives whole. Only the first `=` splits the
+    // name from the value.
     assert!(
         server.every_request_carried("x-trace: a=b=c"),
         "the header with an `=` in its value did not reach every request: {:?}",
@@ -4888,10 +4918,10 @@ fn pull_over_http_reproduces_the_remote_tree() {
     );
 }
 
-/// The statistics line with its seconds replaced, the one figure a rerun of
-/// the same pull may change. The transferred figure stays: the test server
-/// answers 404 with an empty body, so the tool and the port count the same
-/// bytes.
+/// The statistics line with its seconds replaced. The seconds are the one
+/// figure that can change when the same pull runs again. The transferred
+/// figure stays: the test server answers 404 with an empty body, so ostrya and
+/// the `ostree` command count the same bytes.
 fn normalized_statistics(stdout: &[u8]) -> String {
     let text = String::from_utf8(stdout.to_vec()).unwrap();
     text.split("; ")
@@ -4905,10 +4935,10 @@ fn normalized_statistics(stdout: &[u8]) -> String {
         .join("; ")
 }
 
-/// Pull `test/main` from `url` into a new repository of `mode` under
-/// `base/<name>` with `bin`, the port or the tool, `times` times, and return
-/// the last pull's run. Standard output is a pipe, so no progress line is
-/// written.
+/// Pull `test/main` from `url` `times` times into a new repository of `mode`
+/// under `base/<name>`, and return the run of the last pull. The pull runs with
+/// ostrya, or with the `ostree` command if `tool` is set. Standard output is a
+/// pipe, so no progress line is written.
 fn statistics_pull(
     base: &Path,
     name: &str,
@@ -4933,12 +4963,17 @@ fn statistics_pull(
     last.unwrap()
 }
 
-/// To a pipe, each implementation prints one statistics line on standard
-/// output and nothing on standard error, in the same words and counts: a loose
-/// pull into `bare-user`, a repeat pull into `archive` that finds the commit
-/// present and reads no body byte, which drops the transfer clause, and a
-/// delta pull into `bare-user`. The transferred figure and the seconds are
-/// replaced before the lines are compared.
+/// If standard output is a pipe, ostrya and the `ostree` command each print one
+/// statistics line on standard output and nothing on standard error. The words
+/// and counts are the same for each of these pulls:
+///
+/// - a loose pull into `bare-user`
+/// - a repeat pull into `archive` that finds the commit and reads no body byte,
+///   so the line has no transfer clause
+/// - a delta pull into `bare-user`
+///
+/// The seconds are replaced before the lines are compared. The transferred
+/// figure stays.
 #[test]
 fn pull_statistics_line_matches_the_tool() {
     let tool = ostree_available();
@@ -4947,7 +4982,7 @@ fn pull_statistics_line_matches_the_tool() {
     let loose = FileServer::start(&build_remote(base, "remote"));
     let delta = FileServer::start(&build_subpath_remote(base, "delta-remote", true));
     // Each row: a name, the server, the destination mode, how many pulls, and
-    // the line the port prints last.
+    // the line that ostrya prints last.
     let rows: [(&str, &FileServer, RepoMode, usize, &str); 3] = [
         (
             "loose",
@@ -5041,9 +5076,10 @@ fn pull_url_override_states_its_own_policy() {
     let dest_s = dest.to_str().unwrap();
     let url = server.url();
 
-    // No `[remote "origin"]` section describes this remote, so the pull takes
-    // the configuration defaults. `gpg-verify` is on by default and the remote
-    // holds no keys, so the pull is refused and publishes nothing.
+    // No `[remote "origin"]` section describes this remote, so the pull uses
+    // the configuration defaults. `gpg-verify` is on by default, and the
+    // remote has no keys. As a result, the pull is refused and publishes
+    // nothing.
     let refused = ostrya(
         &["pull", "--repo", dest_s, "--url", &url, "origin", BRANCH],
         None,
@@ -5052,8 +5088,8 @@ fn pull_url_override_states_its_own_policy() {
     assert!(!refused.status.success(), "an unsigned commit was accepted");
     assert_eq!(resolve(&dest, &format!("origin:{BRANCH}")), None);
 
-    // Turning the check off on the command line states the policy the absent
-    // section cannot.
+    // A command-line option that turns the check off states the policy that
+    // the absent section cannot state.
     ostrya(
         &[
             "pull",
@@ -5084,7 +5120,7 @@ fn pull_mirror_writes_local_refs_and_copies_the_summary() {
     let dest = build_dest(base, "dest");
     configure_remote(&dest, &server.url(), "gpg-verify=false\n");
 
-    // A mirror pull naming no ref takes every ref the summary lists.
+    // A mirror pull that names no ref takes every ref that the summary lists.
     ostrya(
         &[
             "pull",
@@ -5154,8 +5190,8 @@ fn pull_depth_and_commit_metadata_only() {
     )
     .ok();
 
-    // Both commits of the chain are here, each still marked partial, and no
-    // content object was fetched.
+    // Both commits of the chain are in the destination, and each is still
+    // marked partial. The pull fetched no content object.
     for commit in [child.as_str(), COMMIT] {
         let object = dest.join(format!("objects/{}/{}.commit", &commit[..2], &commit[2..]));
         assert!(object.is_file(), "commit {commit} was not imported");
@@ -5179,8 +5215,8 @@ fn pull_timestamp_check_refuses_an_older_tip() {
     let base = tmp.path();
     let newer = build_remote(base, "newer");
 
-    // A second remote publishing the same branch at an earlier timestamp, which
-    // is the downgrade the check exists to refuse.
+    // A second remote that publishes the same branch with an earlier
+    // timestamp. This is the downgrade that the check refuses.
     let older_dir = base.join("older");
     std::fs::create_dir_all(&older_dir).unwrap();
     let older = create_repo(&older_dir, RepoMode::Archive);
@@ -5236,7 +5272,7 @@ fn pull_timestamp_check_refuses_an_older_tip() {
         "the refused pull moved the ref"
     );
 
-    // Without the check the same pull moves the ref back.
+    // Without the check, the same pull moves the ref back.
     ostrya(
         &[
             "pull", "--repo", dest_s, "--url", &older_url, "origin", BRANCH,
@@ -5257,8 +5293,8 @@ fn pull_timestamp_check_from_rev_refuses_an_older_tip() {
     let base = tmp.path();
     let newer = build_remote(base, "newer");
 
-    // A second remote publishing the same branch at an earlier timestamp, which
-    // is the downgrade the check exists to refuse.
+    // A second remote that publishes the same branch with an earlier
+    // timestamp. This is the downgrade that the check refuses.
     let older_dir = base.join("older");
     std::fs::create_dir_all(&older_dir).unwrap();
     let older = create_repo(&older_dir, RepoMode::Archive);
@@ -5293,8 +5329,8 @@ fn pull_timestamp_check_from_rev_refuses_an_older_tip() {
         Some(COMMIT)
     );
 
-    // `origin:test/main` names the ref the destination now holds, so the rev
-    // resolves to the newer tip pulled above.
+    // `origin:test/main` names the ref in the destination, so the rev resolves
+    // to the newer tip of the first pull.
     let older_url = older_server.url();
     let from_rev = format!("origin:{BRANCH}");
     let refused = ostrya(
@@ -5332,8 +5368,8 @@ fn pull_static_delta_switches() {
     let remote = build_remote(base, "remote");
     let remote_s = remote.to_str().unwrap().to_owned();
 
-    // A from-scratch delta to the fixture commit, indexed, so a pull into an
-    // empty destination finds one.
+    // A from-scratch delta to the fixture commit, in the index, so that a pull
+    // into an empty destination finds a delta.
     ostrya(
         &[
             "static-delta",
@@ -5356,8 +5392,8 @@ fn pull_static_delta_switches() {
     let dest = build_dest(base, "dest");
     configure_remote(&dest, &url, "gpg-verify=false\n");
 
-    // The default pull takes the delta: its superblock is fetched, and the
-    // objects it carries are never asked for loose.
+    // The default pull uses the delta: it fetches the superblock, and it does
+    // not ask for the objects of the delta as loose objects.
     ostrya(
         &["pull", "--repo", dest.to_str().unwrap(), "origin", BRANCH],
         None,
@@ -5382,7 +5418,7 @@ fn pull_static_delta_switches() {
         server.seen()
     );
 
-    // The same pull with deltas off asks for the objects loose instead.
+    // With deltas off, the same pull asks for the objects as loose objects.
     server.clear();
     let plain = build_dest(base, "plain");
     configure_remote(&plain, &url, "gpg-verify=false\n");
@@ -5417,7 +5453,7 @@ fn pull_static_delta_switches() {
         server.seen()
     );
 
-    // A remote advertising no delta at all is refused when one is required.
+    // If a delta is required, a remote that advertises no delta is refused.
     let bare_remote = build_remote(base, "nodelta");
     let bare_server = FileServer::start(&bare_remote);
     let required = build_dest(base, "required");
@@ -5450,8 +5486,8 @@ fn pull_localcache_repo_supplies_the_objects() {
     let dest = build_dest(base, "dest");
     configure_remote(&dest, &server.url(), "gpg-verify=false\n");
 
-    // A cache holding everything the commit reaches, which is the remote's own
-    // directory read as a local repository.
+    // A cache with all the objects that the commit reaches: the directory of
+    // the remote, read as a local repository.
     ostrya(
         &[
             "pull",
@@ -5493,8 +5529,8 @@ fn pull_sign_verify_switch_overrides_the_configuration() {
     let server = FileServer::start(&remote);
     let url = server.url();
 
-    // A destination asking for the sign-api axis, with the key that signed the
-    // commit: the pull carries a signature the policy accepts.
+    // A destination that asks for sign-api verification, with the key that
+    // signed the commit. The pull carries a signature that the policy accepts.
     let signed = build_dest(base, "signed");
     configure_remote(
         &signed,
@@ -5514,8 +5550,8 @@ fn pull_sign_verify_switch_overrides_the_configuration() {
         Some(COMMIT)
     );
 
-    // The same configuration with another key refuses the commit, and the
-    // switch turning the axis off on the command line accepts it.
+    // The same configuration with another key refuses the commit. The
+    // command-line switch that turns sign-api verification off accepts it.
     let other = base64::encode(&[0u8; 32]);
     let overridden = build_dest(base, "overridden");
     configure_remote(
@@ -5548,18 +5584,19 @@ fn pull_sign_verify_switch_overrides_the_configuration() {
     );
 }
 
-// --- `pull` network tuning against the tool ----------------------------------
+// --- `pull` network tuning against `ostree` ----------------------------------
 //
-// Each implementation pulls from a server of its own, which injects one fault
-// into its answers for one object and counts the requests for that object. The
-// counts are the oracle: the retry count, the switch that turns retries off,
-// and the low-speed rule each decide how many times an object is asked for.
+// ostrya and the `ostree` command each pull from a separate server. The server
+// injects one fault into its answers for one object and counts the requests
+// for that object. The counts are the oracle: the retry count, the switch that
+// turns retries off, and the low-speed rule each set how many times the pull
+// asks for an object.
 
-/// A remote for the network-tuning tests under `base/<name>`: the fixture tree
-/// and a file of `size` bytes that do not compress, and the request path of
-/// that file's object, which is the largest object the remote serves. With a
-/// `size` of 150, at one byte every 10 milliseconds, the object takes about two
-/// seconds to send.
+/// A remote for the network-tuning tests under `base/<name>`, with the fixture
+/// tree and a file of `size` bytes that do not compress. It also returns the
+/// request path of the object of that file, the largest object of the remote.
+/// With a `size` of 150, at one byte every 10 milliseconds, the object takes
+/// about two seconds to send.
 fn build_tuning_remote(base: &Path, name: &str, size: usize) -> (PathBuf, String) {
     let dir = base.join(name);
     std::fs::create_dir_all(&dir).unwrap();
@@ -5610,7 +5647,7 @@ fn build_tuning_remote(base: &Path, name: &str, size: usize) -> (PathBuf, String
     (repo, target)
 }
 
-/// One pull of `test/main` by one implementation, from a server of its own.
+/// One pull of `test/main` by one command, from a separate server.
 struct FaultedPull {
     run: Run,
     dest: PathBuf,
@@ -5620,8 +5657,8 @@ struct FaultedPull {
 }
 
 impl FaultedPull {
-    /// The exit status, the request count, and whether the ref landed, which is
-    /// what the two implementations are compared on.
+    /// The exit status, the request count, and `true` if the ref landed. The
+    /// test compares the two commands on these values.
     fn outcome(&self) -> (Option<i32>, usize, bool) {
         (
             self.run.status.code(),
@@ -5631,9 +5668,10 @@ impl FaultedPull {
     }
 }
 
-/// Pull `test/main` into a fresh archive repository under `base/<name>` with
-/// `args`, by the tool where `tool` is set and by the port otherwise, from a
-/// server injecting `fault` into its answers for `target`.
+/// Pull `test/main` with `args` into a new archive repository under
+/// `base/<name>`, from a server that injects `fault` into its answers for
+/// `target`. If `tool` is set, the `ostree` command pulls. If not, ostrya
+/// pulls.
 fn faulted_pull(
     base: &Path,
     name: &str,
@@ -5664,8 +5702,8 @@ fn faulted_pull(
     }
 }
 
-/// The same pull by the port and, where `tool` is set, by the tool, the two
-/// running at once.
+/// The same pull by ostrya and, if `tool` is set, by the `ostree` command. The
+/// two pulls run at the same time.
 fn faulted_pulls(
     base: &Path,
     name: &str,
@@ -5717,8 +5755,8 @@ fn concurrent_pulls<T: Send>(count: usize, pull: impl Fn(usize) -> T + Sync) -> 
     })
 }
 
-/// Assert that the port's pull had `expected` as its outcome, and the tool's
-/// the same where it ran.
+/// Assert that the pull of ostrya had `expected` as its outcome. If the
+/// `ostree` command ran, assert the same for its pull.
 fn assert_pull_outcome(
     label: &str,
     ours: &FaultedPull,
@@ -5752,9 +5790,9 @@ fn pull_network_retries_against_a_503_server_match_the_tool() {
     let (remote, target) = build_tuning_remote(base, "remote", 150);
     let always = Fault::Unavailable { times: usize::MAX };
 
-    // A 503 is retryable: the default makes one request and five repeats, a
-    // count makes one and that many, and the switch makes one whatever count
-    // stands beside it, in either order.
+    // A 503 is retryable. The default makes one request and five repeats. A
+    // count makes one request and that number of repeats. The switch makes one
+    // request with any count beside it, in either order.
     let cases: &[(&[&str], usize)] = &[
         (&[], 6),
         (&["--network-retries=2"], 3),
@@ -5789,8 +5827,8 @@ fn pull_network_retries_against_a_503_server_match_the_tool() {
         );
     }
 
-    // The switch takes no value. The tool discards one and still turns retries
-    // off, and the port refuses it before a request is made.
+    // The switch takes no value. The `ostree` command discards a value and
+    // turns retries off. ostrya refuses the value before it makes a request.
     let args = ["--disable-retry-on-network-errors=false"];
     let (ours, theirs) = faulted_pulls(base, "suffix", &remote, &target, always, tool, &args);
     assert_eq!(ours.outcome(), (Some(1), 0, false));
@@ -5811,8 +5849,8 @@ fn pull_retries_a_truncated_body_as_the_tool_does() {
     let base = tmp.path();
     let (remote, target) = build_tuning_remote(base, "remote", 150);
 
-    // A body cut once is fetched again, and the pull completes with the tree
-    // the remote holds.
+    // If the body is cut once, the pull fetches it again and completes with
+    // the tree of the remote.
     let (ours, theirs) = faulted_pulls(
         base,
         "once",
@@ -5828,7 +5866,7 @@ fn pull_retries_a_truncated_body_as_the_tool_does() {
         assert_eq!(loose_objects(&theirs.dest), loose_objects(&ours.dest));
     }
 
-    // A body cut every time spends the retry count and fails the pull.
+    // If the body is cut each time, the pull spends the retry count and fails.
     let (ours, theirs) = faulted_pulls(
         base,
         "always",
@@ -5841,7 +5879,7 @@ fn pull_retries_a_truncated_body_as_the_tool_does() {
     assert_pull_outcome("cut always", &ours, theirs.as_ref(), (Some(1), 2, false));
 }
 
-/// The exit status, the request count, and whether the ref landed, as
+/// The exit status, the request count, and `true` if the ref landed, as
 /// [`FaultedPull::outcome`] reports them.
 type PullOutcome = (Option<i32>, usize, bool);
 
@@ -5858,20 +5896,20 @@ fn pull_low_speed_options_match_the_tool() {
         interval: std::time::Duration::from_millis(10),
     };
     // 2600 bytes, then the rest of the object 2.5 seconds later. No byte
-    // arrives in the second whole second, but the rate over the seconds so
-    // far stays above 1000 bytes per second.
+    // arrives in the second whole second. The rate over all the seconds until
+    // then stays more than 1000 bytes per second.
     let bursts = Fault::Trickle {
         bytes: 2600,
         interval: std::time::Duration::from_millis(2500),
     };
     let one_second = ["--low-speed-limit-bytes=1000", "--low-speed-time-seconds=1"];
 
-    // Each case: the options, the fault, whether it pulls the bursty remote,
-    // and the outcome both implementations have.
+    // Each case: the options, the fault, `true` if it pulls the bursty remote,
+    // and the outcome of both commands.
     let cases: &[(&[&str], Fault, bool, PullOutcome)] = &[
-        // Below 1000 bytes per second for one second, the transfer is
-        // abandoned, and the abandon is retryable. A negative limit keeps the
-        // default of 1000.
+        // If the rate is less than 1000 bytes per second for one second, the
+        // transfer stops, and this failure is retryable. A negative limit
+        // keeps the default of 1000.
         (
             &[one_second[0], one_second[1], "--network-retries=1"],
             trickle,
@@ -5902,8 +5940,8 @@ fn pull_low_speed_options_match_the_tool() {
             false,
             (Some(0), 1, true),
         ),
-        // Bursts whose rate stays above the limit complete, though a whole
-        // second carries no byte.
+        // Bursts complete if their rate stays more than the limit, also when
+        // one whole second carries no byte.
         (
             &[one_second[0], one_second[1], "--network-retries=0"],
             bursts,
@@ -5930,8 +5968,8 @@ fn pull_low_speed_options_match_the_tool() {
     });
     for ((args, _, _, expected), (ours, theirs)) in cases.iter().zip(&pulls) {
         assert_pull_outcome(&args.join(" "), ours, theirs.as_ref(), *expected);
-        // An abandoned transfer ends after about one second an attempt, well
-        // before the trickle would have sent the object.
+        // A stopped transfer ends after about one second for each attempt.
+        // The trickle needs more time than that to send the object.
         if expected.0 == Some(1) {
             assert!(
                 ours.elapsed < std::time::Duration::from_secs(10),
@@ -5951,8 +5989,8 @@ fn pull_low_speed_values_are_read_as_the_tool_reads_them() {
     let base = tmp.path();
     let port_repo = build_dest(base, "port");
     let tool_repo = build_dest(base, "tool");
-    // The values are read while the options are read, ahead of the remote, so
-    // a repository with no remote states the refusal.
+    // Both commands read the values with the options, before the remote. As
+    // a result, a repository with no remote shows the refusal.
     for flag in ["--low-speed-limit-bytes", "--low-speed-time-seconds"] {
         for value in ["abc", "99999999999", "5 ", ""] {
             let arg = format!("{flag}={value}");
@@ -5996,14 +6034,14 @@ fn pull_stops_at_the_first_exhausted_object() {
             .filter(|name| name.starts_with("staging-"))
             .collect::<Vec<_>>()
     };
-    // The port publishes no object and removes the partial marker. Its staging
-    // directory goes with the transaction; a removal that races a write still
-    // in flight leaves the directory for the next transaction to reap, so the
-    // test does not read it.
+    // ostrya publishes no object and removes the partial marker. Its staging
+    // directory goes away with the transaction. If the removal races a write
+    // that is still in progress, the directory stays for the next transaction
+    // to remove. As a result, the test does not read it.
     assert!(loose_objects(&ours.dest).is_empty());
     assert!(entries(&ours.dest.join("state")).is_empty());
-    // The tool publishes no object either, and keeps what it fetched in a
-    // staging directory, with the commit marked partial.
+    // The `ostree` command also publishes no object. It keeps what it fetched
+    // in a staging directory, and the commit stays marked partial.
     if let Some(theirs) = &theirs {
         assert!(loose_objects(&theirs.dest).is_empty());
         let kept = staging(&theirs.dest);
@@ -6018,14 +6056,15 @@ fn pull_stops_at_the_first_exhausted_object() {
 
 // --- pull and pull-local: durability -----------------------------------------
 //
-// These tests are the `evidence:` the M10 records under "pull -- durability"
-// and "pull-local -- durability" cite: the harness serves no remote and reads
-// no syscall, so the sync-call claims are stated here, under `strace`, for the
-// port and for the tool wherever each is installed.
+// The M10 records "pull -- durability" and "pull-local -- durability" cite
+// these tests as their `evidence:`. The harness serves no remote and reads no
+// syscall. As a result, these tests state the sync-call claims under `strace`,
+// for ostrya and for the `ostree` command where each is installed.
 
-/// The durability rows the `pull` and `pull-local` syscall tests share: a tag,
-/// a line written into the destination's `[core]` section, the switches,
-/// whether any sync call is expected, and whether the per-object sync is.
+/// The durability rows of the `pull` and `pull-local` syscall tests. A row
+/// holds a tag, a line for the `[core]` section of the destination, and the
+/// switches. It also holds `true` if a sync call is expected, and `true` if
+/// the per-object sync is expected.
 type DurabilityRow = (
     &'static str,
     Option<&'static str>,
@@ -6055,7 +6094,7 @@ const PULL_DURABILITY_ROWS: [DurabilityRow; 6] = [
     ),
 ];
 
-/// Write `line` into the `[core]` section of a repository's config.
+/// Write `line` into the `[core]` section of the config of a repository.
 fn set_core_key(repo: &Path, line: &str) {
     let config = repo.join("config");
     let text = std::fs::read_to_string(&config).unwrap();
@@ -6066,9 +6105,9 @@ fn set_core_key(repo: &Path, line: &str) {
     .unwrap();
 }
 
-/// How many content objects a repository stores as regular files: the objects
-/// the per-object sync covers. A `bare` symlink object is a symlink inode and
-/// is not counted.
+/// The number of content objects that a repository stores as regular files:
+/// the objects that the per-object sync covers. A `bare` symlink object is a
+/// symlink inode and is not counted.
 fn regular_content_objects(repo: &Path) -> usize {
     files_under(&repo.join("objects"))
         .into_iter()
@@ -6086,8 +6125,8 @@ fn regular_content_objects(repo: &Path) -> usize {
         .count()
 }
 
-/// Every file under `objects/` and `refs/` with its bytes, and the summary
-/// where the repository holds one: what a durability option must not change.
+/// Every file under `objects/` and `refs/` with its bytes, and the summary if
+/// the repository has one. A durability option must not change these bytes.
 fn stored_bytes(repo: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     let mut out = Vec::new();
     for sub in ["objects", "refs"] {
@@ -6102,13 +6141,16 @@ fn stored_bytes(repo: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     out
 }
 
-/// Hold the sync calls of one syncing run to the inventory the tables in
-/// `docs/format-reference.md`, "The fsync vocabulary", record: `per_object`
-/// calls on a staged temporary file under `tmp/staging-*`, one `fsync` per
-/// fanout directory under `objects/`, one of `objects/`, one of each directory
-/// in `extra_dirs`, one `fdatasync` of the ref's temporary file whose path
-/// starts with `ref_temp`, one `syncfs` of the repository, and `total` calls
-/// in all.
+/// Assert that the sync calls of one syncing run are the expected inventory:
+///
+/// - `per_object` calls on a staged temporary file under `tmp/staging-*`
+/// - one `fsync` for each fanout directory under `objects/`
+/// - one `fsync` of `objects/`
+/// - one `fsync` of each directory in `extra_dirs`
+/// - one `fdatasync` of the temporary file of the ref, whose path starts with
+///   `ref_temp`
+/// - one `syncfs` of the repository
+/// - `total` calls in all
 fn assert_durability_syncs(
     label: &str,
     repo: &Path,
@@ -6163,8 +6205,8 @@ fn assert_durability_syncs(
     );
 }
 
-/// An archive repository at `base/remote` holding corpus `C0` on `main`, with
-/// a summary, committed by the port under a fixed timestamp.
+/// An archive repository at `base/remote` with corpus `C0` on `main` and a
+/// summary. ostrya commits the corpus with a fixed timestamp.
 fn build_c0_remote(base: &Path) -> PathBuf {
     build_c0_remote_with(base, &[])
 }
@@ -6196,8 +6238,8 @@ fn build_c0_remote_with(base: &Path, extra: &[&str]) -> PathBuf {
     remote
 }
 
-/// The binaries a durability test measures: the port always, and the tool
-/// wherever it is installed.
+/// The binaries that a durability test measures: ostrya always, and the
+/// `ostree` command where it is installed.
 fn durability_binaries() -> Vec<(&'static str, String)> {
     let mut binaries = vec![("port", env!("CARGO_BIN_EXE_ostrya").to_owned())];
     if ostree_available() {
@@ -6207,15 +6249,18 @@ fn durability_binaries() -> Vec<(&'static str, String)> {
 }
 
 /// `--disable-fsync` and `--per-object-fsync` on an HTTP `pull`, and the two
-/// `[core]` keys beside them, over corpus `C0` into an `archive` and a
-/// `bare-user` destination. `--disable-fsync` and `[core] fsync=false` each
-/// turn every sync off and win over `--per-object-fsync`; the switch and the
-/// `per-object-fsync` key each add one sync per content object and none per
-/// metadata object. The syncing rows are held to the whole call inventory, and
-/// the totals (tool 11 and 15, port 13 and 17) are asserted beside it. The port
-/// also syncs `refs/remotes/origin`, which holds the ref, and `refs/remotes`,
-/// where the ref write creates `origin`, which the tool does not. Every row of
-/// both binaries exits 0 and stores the same bytes.
+/// `[core]` keys `fsync` and `per-object-fsync`, over corpus `C0` into an
+/// `archive` and a `bare-user` destination. `--disable-fsync` and
+/// `[core] fsync=false` each turn every sync off and win over
+/// `--per-object-fsync`. The switch and the `per-object-fsync` key each add one
+/// sync for each content object and none for a metadata object.
+///
+/// The test checks the syncing rows against the full call inventory, which
+/// includes the totals (11 and 15 for the `ostree` command, 13 and 17 for
+/// ostrya). ostrya also syncs `refs/remotes/origin`, which holds the ref, and
+/// `refs/remotes`, where the ref write creates `origin`. `ostree` does not sync
+/// these directories. Every row of both binaries exits 0 and stores the same
+/// bytes.
 #[test]
 fn pull_fsync_switches_control_the_syscalls() {
     if !strace_available() {
@@ -6282,10 +6327,11 @@ fn pull_fsync_switches_control_the_syscalls() {
     }
 }
 
-/// A `--mirror` pull of every ref copies the remote's summary. By default the
-/// port also syncs the summary file and the repository root, which the tool
-/// does not (tool 11 calls, port 14 over corpus `C0`); under `--disable-fsync`
-/// neither makes a sync call, and both copy the same summary.
+/// A `--mirror` pull of every ref copies the summary of the remote. By default,
+/// ostrya also syncs the summary file and the repository root. The `ostree`
+/// command does not sync them (over corpus `C0`, 11 calls for `ostree` and 14
+/// for ostrya). Under `--disable-fsync`, neither command makes a sync call, and
+/// both copy the same summary.
 #[test]
 fn pull_mirror_disable_fsync_syncs_nothing() {
     if !strace_available() {
@@ -6350,13 +6396,15 @@ fn pull_mirror_disable_fsync_syncs_nothing() {
 }
 
 /// A pulled commit that carries detached metadata, over corpus `C0` into an
-/// `archive` destination: under `--disable-fsync` neither the tool nor the port
-/// makes a sync call on `pull-local`, on an HTTP `pull`, or on a `--mirror`
-/// pull, and both store the source's `.commitmeta`. By default the tool makes
-/// no sync call for the `.commitmeta` (11 calls on each pull), and the port
-/// makes none on the file it stages, whose data the `syncfs` of the
-/// publication step makes durable, and one more `fsync` of its fanout
-/// directory after the rename into `objects/` (13, 14, and 15 calls).
+/// `archive` destination. Under `--disable-fsync`, neither ostrya nor the
+/// `ostree` command makes a sync call on `pull-local`, on an HTTP `pull`, or on
+/// a `--mirror` pull. Both store the `.commitmeta` of the source.
+///
+/// By default, `ostree` makes no sync call for the `.commitmeta` (11 calls on
+/// each pull). ostrya makes no sync call on the file that it stages, because
+/// the `syncfs` of the publication step makes its data durable. ostrya makes
+/// one more `fsync`, of the fanout directory of the file after the rename into
+/// `objects/` (13, 14, and 15 calls).
 #[test]
 fn pull_disable_fsync_syncs_no_detached_metadata() {
     if !strace_available() {
@@ -6374,7 +6422,7 @@ fn pull_disable_fsync_syncs_no_detached_metadata() {
             .count()
     };
     assert_eq!(commitmeta(&remote), 1, "the source holds detached metadata");
-    // (tag, command, the port's default call count)
+    // (tag, command, the default call count of ostrya)
     let pulls: [(&str, &[&str], usize); 3] = [
         ("pull-local", &["pull-local", src, "main"], 13),
         ("pull", &["pull", "origin", "main"], 14),
@@ -6422,13 +6470,15 @@ fn pull_disable_fsync_syncs_no_detached_metadata() {
 }
 
 /// `--disable-fsync` and `--per-object-fsync` on `pull-local`, with the rows of
-/// the HTTP test, from an `archive` source. Into an `archive` destination every
-/// object is hardlinked, so no row syncs an object (tool 11, port 12); into a
-/// `bare-user` destination the content is re-ingested and the per-object rows
-/// sync each content object (tool 15, port 16). The port also syncs
-/// `refs/heads`, which the tool does not. A port-only row copies into
-/// `archive` under `--force-copy --per-object-fsync`, where the content
-/// objects are synced and the copied metadata objects are not.
+/// the HTTP test, from an `archive` source. Into an `archive` destination,
+/// every object is hardlinked, so no row syncs an object (11 calls for the
+/// `ostree` command, 12 for ostrya). Into a `bare-user` destination, the
+/// content is ingested again, and the per-object rows sync each content object
+/// (15 for `ostree`, 16 for ostrya).
+///
+/// ostrya also syncs `refs/heads`, and `ostree` does not. One row for ostrya
+/// alone copies into `archive` under `--force-copy --per-object-fsync`. In that
+/// row, the content objects are synced and the copied metadata objects are not.
 #[test]
 fn pull_local_fsync_switches_control_the_syscalls() {
     if !strace_available() {
@@ -6502,15 +6552,17 @@ fn pull_local_fsync_switches_control_the_syscalls() {
     }
 }
 
-/// Both switches take no value and are given once. The tool reads and discards
-/// an `=VALUE` suffix and accepts a repeat; the port refuses both at exit 1 and
-/// writes no object and no ref. Both refuse `--fsync`, which neither command
-/// has. A `[core] fsync` or `[core] per-object-fsync` value the reader refuses
-/// is refused under every switch state by both, whether the pull has objects
-/// to import or finds the destination already holding them, and the
-/// destination is left as it stood. One held destination per command serves
-/// every held row: each row writes the refused key, and the config is restored
-/// after the row.
+/// Both switches take no value and are given once. The `ostree` command reads
+/// and discards an `=VALUE` suffix and accepts a repeat. ostrya refuses both at
+/// exit 1 and writes no object and no ref. Both commands refuse `--fsync`,
+/// which neither command has.
+///
+/// If the config reader refuses a `[core] fsync` or `[core] per-object-fsync`
+/// value, both commands refuse it under every switch state. This applies if
+/// the pull has objects to import, and also if the destination already holds
+/// them. The destination stays as it was. One held destination for each
+/// command serves every held row: each row writes the refused key, and the
+/// test restores the config after the row.
 #[test]
 fn pull_fsync_switches_parse_as_switches() {
     let tool = ostree_available();
@@ -6550,7 +6602,7 @@ fn pull_fsync_switches_parse_as_switches() {
     if tool {
         whos.push("tool");
     }
-    // (switches, the port's refusal text; `None` where both refuse)
+    // (switches, the refusal text of ostrya, or `None` if both refuse)
     let parse_cases: [(&[&str], Option<&str>); 5] = [
         (&["--disable-fsync=false"], Some("unexpected value 'false'")),
         (
@@ -6589,7 +6641,7 @@ fn pull_fsync_switches_parse_as_switches() {
                 assert!(files_under(&repo.join("refs")).is_empty(), "{label}");
             }
         }
-        // A destination that already holds the commit under the ref the
+        // A destination that already holds the commit under the ref that the
         // command writes.
         let held_repo = fresh();
         let repo_arg = format!("--repo={}", held_repo.display());
@@ -6628,17 +6680,19 @@ fn pull_fsync_switches_parse_as_switches() {
 
 // --- pull: scope and trust ---------------------------------------------------
 //
-// These tests are the `evidence:` the M10 records under "pull -- scope and
-// trust" cite: the harness serves no remote, so the object inventory, the ref,
-// and the partial marker each `--subpath` form leaves are compared here against
-// the tool wherever it is installed.
+// The M10 records "pull -- scope and trust" cite these tests as their
+// `evidence:`. The harness serves no remote. As a result, these tests compare
+// the object inventory, the ref, and the partial marker that each `--subpath`
+// form leaves. If the `ostree` command is installed, the tests compare them
+// with the result of that command.
 
-/// A remote under `base/<name>` whose tree has siblings of distinct content and
-/// of distinct directory modes, so every dirtree and dirmeta the walk may skip
-/// is an object of its own: the files `top` and `a`, `sub/f1`, `sub/deeper/f2`,
-/// `other/g`, and one directory `x` of identical content under both `sub` and
-/// `other`. `test/main` holds two commits, the second adding `sub/f3`. A
-/// from-scratch delta of the tip is generated when `delta` is set.
+/// A remote under `base/<name>` with a tree of siblings of different content
+/// and different directory modes. As a result, each dirtree and dirmeta that
+/// the walk can skip is a separate object. The tree holds the files `top`, `a`,
+/// `sub/f1`, `sub/deeper/f2`, and `other/g`. It also holds one directory `x` of
+/// identical content under both `sub` and `other`. `test/main` holds two
+/// commits, and the second adds `sub/f3`. If `delta` is set, the function
+/// generates a from-scratch delta of the tip.
 fn build_subpath_remote(base: &Path, name: &str, delta: bool) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
@@ -6732,16 +6786,17 @@ fn pull_result(dest: &Path) -> PullResult {
     (loose_objects(dest), refs, state)
 }
 
-/// The port's exit code and what it left, and the tool's exit status and what
-/// it left where it ran.
+/// The exit code of ostrya and what it left, and, if the `ostree` command ran,
+/// its exit status and what it left.
 type SubpathPulls = (
     (Option<i32>, PullResult),
     Option<(std::process::ExitStatus, PullResult)>,
 );
 
-/// Pull `test/main` from `url` with `args` into a fresh destination of `mode`
-/// under `base/<tag>`, by the port and, where `tool` is set, by the tool into a
-/// destination of its own. Returns each side's exit status and what it left.
+/// Pull `test/main` from `url` with `args` into a new destination of `mode`
+/// under `base/<tag>`, by ostrya. If `tool` is set, the `ostree` command also
+/// pulls, into a separate destination. Returns the exit status of each command
+/// and what it left.
 fn subpath_pulls(
     base: &Path,
     tag: &str,
@@ -6774,9 +6829,9 @@ fn subpath_pulls(
 }
 
 /// Pull with each row of `rows` into an archive and a bare-user destination,
-/// by the port and, where the tool is present, by the tool, and assert both
-/// leave the same objects, the same ref, and the same zero-length partial
-/// marker on each commit reached.
+/// by ostrya and, if the `ostree` command is installed, by `ostree`. Assert
+/// that both leave the same objects, the same ref, and the same zero-length
+/// partial marker on each commit that the pull reaches.
 fn assert_subpath_rows_match_the_tool(name: &str, rows: &[&[&str]]) {
     let tool = ostree_available();
     let tmp = TmpDir::new(name);
@@ -6802,8 +6857,8 @@ fn assert_subpath_rows_match_the_tool(name: &str, rows: &[&[&str]]) {
     }
 }
 
-/// A directory, a file, a name the tree does not hold, `/`, and a trailing `/`
-/// each fetch what the tool fetches.
+/// A directory, a file, a name that the tree does not hold, `/`, and a trailing
+/// `/` each fetch what the `ostree` command fetches.
 #[test]
 fn pull_subpath_forms_match_the_tool() {
     assert_subpath_rows_match_the_tool(
@@ -6820,8 +6875,8 @@ fn pull_subpath_forms_match_the_tool() {
     );
 }
 
-/// An empty, a `.`, or a `..` component, and a file passed mid-path, each fetch
-/// what the tool fetches.
+/// An empty, a `.`, or a `..` component, and a file in the middle of the path
+/// each fetch what the `ostree` command fetches.
 #[test]
 fn pull_subpath_unmatched_components_match_the_tool() {
     assert_subpath_rows_match_the_tool(
@@ -6837,8 +6892,8 @@ fn pull_subpath_unmatched_components_match_the_tool() {
     );
 }
 
-/// Several values fetch the union, as in the tool, a shared dirtree that no
-/// value names whole among them.
+/// Several values fetch the union of their subpaths, as in the `ostree`
+/// command. One row has a shared dirtree that no value names whole.
 #[test]
 fn pull_subpath_unions_match_the_tool() {
     assert_subpath_rows_match_the_tool(
@@ -6851,7 +6906,7 @@ fn pull_subpath_unions_match_the_tool() {
 }
 
 /// `--subpath` beside `--depth`, `--commit-metadata-only`, `--mirror`,
-/// `--untrusted`, and `--http-trusted` leaves what the tool leaves.
+/// `--untrusted`, and `--http-trusted` leaves what the `ostree` command leaves.
 #[test]
 fn pull_subpath_with_other_options_matches_the_tool() {
     assert_subpath_rows_match_the_tool(
@@ -6866,12 +6921,12 @@ fn pull_subpath_with_other_options_matches_the_tool() {
     );
 }
 
-/// One dirtree reached at two `--subpath` positions is walked under both: `x`
-/// is named whole under one directory and as a directory alone under the
-/// other, so its file is fetched whatever the order of the values. The tool
-/// walks such a dirtree once, under the first walk to reach it, so whether it
-/// fetches the file follows the order its fetches complete in; everything else
-/// it leaves agrees with the port.
+/// ostrya walks a dirtree that two `--subpath` positions reach under both
+/// positions. `x` is named whole under one directory and as a directory alone
+/// under the other. ostrya fetches its file in any order of the values.
+/// The `ostree` command walks such a dirtree once, under the first walk that
+/// reaches it. The order in which its fetches complete decides if `ostree`
+/// fetches the file. All else that `ostree` leaves agrees with ostrya.
 #[test]
 fn pull_subpath_walks_a_shared_dirtree_under_every_position() {
     let tool = ostree_available();
@@ -6901,7 +6956,8 @@ fn pull_subpath_walks_a_shared_dirtree_under_every_position() {
             tool,
         );
         assert_eq!(code, Some(0), "{args:?}");
-        // The one content object fetched is `s`, which both copies of `x` hold.
+        // The one content object that the pull fetches is `s`, which both
+        // copies of `x` hold.
         let fetched: Vec<_> = ours.0.iter().filter(|(_, ext)| ext == "filez").collect();
         assert_eq!(fetched.len(), 1, "{args:?}");
         assert!(shared.contains(fetched[0]), "{args:?}");
@@ -6924,8 +6980,8 @@ fn pull_subpath_walks_a_shared_dirtree_under_every_position() {
 }
 
 /// A later pull without `--subpath` completes the commit and removes the
-/// marker, and a `--subpath` pull of a commit already complete writes none, as
-/// in the tool.
+/// marker. A `--subpath` pull of a complete commit writes no marker. Both are
+/// as in the `ostree` command.
 #[test]
 fn pull_after_a_subpath_pull_clears_the_marker() {
     let tool = ostree_available();
@@ -6965,7 +7021,7 @@ fn pull_after_a_subpath_pull_clears_the_marker() {
 }
 
 /// A from-scratch delta is applied whole under `--subpath` into a bare-user
-/// destination, and the commit keeps its marker, as in the tool.
+/// destination, and the commit keeps its marker, as in the `ostree` command.
 #[test]
 fn pull_subpath_applies_a_delta_whole_as_the_tool_does() {
     let tool = ostree_available();
@@ -7002,8 +7058,8 @@ fn pull_subpath_applies_a_delta_whole_as_the_tool_does() {
     }
 }
 
-/// Into an archive destination a `--subpath` pull takes no delta and fetches
-/// the subpath loose, as in the tool.
+/// Into an archive destination, a `--subpath` pull takes no delta and fetches
+/// the subpath as loose objects, as in the `ostree` command.
 #[test]
 fn pull_subpath_into_an_archive_takes_no_delta() {
     let tool = ostree_available();
@@ -7043,10 +7099,11 @@ fn pull_subpath_into_an_archive_takes_no_delta() {
     }
 }
 
-/// A commit the destination holds partial, under a ref naming it, takes no
-/// delta from a remote whose summary names the from-scratch delta alone: a
-/// `--subpath` pull after a `--commit-metadata-only` pull, and a full pull
-/// after that, each fetch what is missing loose and leave what the tool leaves.
+/// The destination holds a partial commit under a ref that names it. This
+/// commit takes no delta from a remote whose summary names only the
+/// from-scratch delta. A `--subpath` pull after a `--commit-metadata-only`
+/// pull, and a full pull after that, each fetch the missing objects as loose
+/// objects. Each leaves what the `ostree` command leaves.
 #[test]
 fn pull_of_a_commit_held_partial_takes_no_delta() {
     let tool = ostree_available();
@@ -7092,9 +7149,9 @@ fn pull_of_a_commit_held_partial_takes_no_delta() {
     }
 }
 
-/// A relative and an empty `--subpath` are refused at exit 1 with nothing
-/// written. The tool ends on an assertion (`SIGABRT`, exit 134 from a shell)
-/// and writes nothing either.
+/// ostrya refuses a relative and an empty `--subpath` at exit 1 and writes
+/// nothing. The `ostree` command ends on an assertion (`SIGABRT`, exit 134 from
+/// a shell) and also writes nothing.
 #[test]
 fn pull_refuses_a_relative_or_empty_subpath() {
     let tool = ostree_available();
@@ -7122,18 +7179,19 @@ fn pull_refuses_a_relative_or_empty_subpath() {
     }
 }
 
-/// `--http-trusted` keeps the checksum check: under `--mirror` into an archive
-/// destination a corrupt `.filez` fails the port's pull with nothing written,
-/// where the tool stores it, exits 0, and fails a later `fsck`. Without
-/// `--mirror`, and under `--untrusted`, both refuse it.
+/// `--http-trusted` keeps the checksum verification. Under `--mirror` into an
+/// archive destination, a corrupt `.filez` fails the pull of ostrya, and ostrya
+/// writes nothing. The `ostree` command stores the object, exits 0, and fails a
+/// later `fsck`. Without `--mirror`, and under `--untrusted`, both commands
+/// refuse the object.
 #[test]
 fn pull_http_trusted_keeps_the_checksum_check() {
     let tool = ostree_available();
     let tmp = TmpDir::new("pull-http-trusted");
     let base = tmp.path();
     let remote = build_subpath_remote(base, "remote", false);
-    // One content object's payload is flipped in place, so its bytes no
-    // longer hash to its name.
+    // The test flips one bit of the payload of one content object in place.
+    // Its bytes then do not hash to its name.
     let (victim, _) = loose_objects(&remote)
         .into_iter()
         .find(|(_, ext)| ext == "filez")
@@ -7178,9 +7236,9 @@ fn pull_http_trusted_keeps_the_checksum_check() {
     }
 }
 
-/// `--untrusted` and `--http-trusted` are switches: `clap` refuses a value and a
-/// repeat of either at exit 1 with nothing written, where the tool discards the
-/// value, takes the repeat, and pulls.
+/// `--untrusted` and `--http-trusted` are switches. `clap` refuses a value and
+/// a repeat of either switch at exit 1, and ostrya writes nothing. The `ostree`
+/// command discards the value, accepts the repeat, and pulls.
 #[test]
 fn pull_trust_switches_parse_as_switches() {
     let tool = ostree_available();
@@ -7215,8 +7273,8 @@ fn pull_trust_switches_parse_as_switches() {
     }
 }
 
-/// `pull-local` takes neither `--subpath` nor `--http-trusted`, in the port or
-/// in the tool, and imports nothing.
+/// `pull-local` takes neither `--subpath` nor `--http-trusted`, in ostrya and
+/// in the `ostree` command, and imports nothing.
 #[test]
 fn pull_local_refuses_subpath_and_http_trusted() {
     let tool = ostree_available();
@@ -7250,9 +7308,9 @@ fn pull_local_refuses_subpath_and_http_trusted() {
     }
 }
 
-/// A `--depth` below -1 is refused at exit 1 with nothing written. The tool
-/// ends on an assertion (`SIGABRT`, exit 134 from a shell) and writes nothing
-/// either.
+/// ostrya refuses a `--depth` less than -1 at exit 1 and writes nothing. The
+/// `ostree` command ends on an assertion (`SIGABRT`, exit 134 from a shell) and
+/// also writes nothing.
 #[test]
 fn pull_local_refuses_a_depth_below_minus_one() {
     let tool = ostree_available();
@@ -7290,9 +7348,9 @@ fn pull_local_refuses_a_depth_below_minus_one() {
     }
 }
 
-/// A `--depth` below -1 is refused at exit 1 before the first request, with
-/// nothing written. The tool ends on the same assertion as `pull-local`,
-/// sends no request, and writes nothing either.
+/// ostrya refuses a `--depth` less than -1 at exit 1 before the first request,
+/// and writes nothing. The `ostree` command ends on the same assertion as for
+/// `pull-local`, sends no request, and also writes nothing.
 #[test]
 fn pull_refuses_a_depth_below_minus_one() {
     let tool = ostree_available();
@@ -7327,27 +7385,27 @@ fn pull_refuses_a_depth_below_minus_one() {
     assert!(server.seen().is_empty(), "{:?}", server.seen());
 }
 
-// --- refs, rev-parse, and cat against the tool -------------------------------
+// --- refs, rev-parse, and cat against `ostree` -------------------------------
 //
-// These five tests are the `evidence:` the M10 records
-// `refs/nested-prefix-stripping`, `refs/alias-round-trip`,
+// The M10 records `refs/nested-prefix-stripping`, `refs/alias-round-trip`,
 // `refs/collections-listing`, `rev-parse/ancestry-suffix`, and
-// `cat/path-resolution-edges` cite: each covers a case the conformance
-// harness's `repo-with-commit` setup cannot bind, so the record names the test
-// instead of a `run:` line (`docs/conformance/m10-cli-behavior.matrix`).
+// `cat/path-resolution-edges` cite these five tests as their `evidence:`. Each
+// test covers a case that the `repo-with-commit` setup of the conformance
+// harness cannot bind. As a result, the record names the test and has no
+// `run:` line.
 //
-// Each test builds one repository, gives each implementation its own
-// byte-identical copy where the invocation mutates state, and compares the raw
-// standard output, standard error, and exit status. The two copies hold the same
-// commits, so no checksum needs masking.
+// Each test builds one repository. If the invocation changes state, each
+// command gets a separate byte-identical copy. The test compares the raw
+// standard output, standard error, and exit status of ostrya and the `ostree`
+// command. The two copies hold the same commits, so no checksum needs a mask.
 
-/// Run the `ostree` tool with `args`.
+/// Run the `ostree` command with `args`.
 fn ostree(args: &[&str]) -> Run {
     ostree_env(args, &[])
 }
 
-/// Run the `ostree` tool from `cwd`, for the cases where a relative path
-/// argument makes the working directory part of the behaviour under test.
+/// Run the `ostree` command from `cwd`. The tests use it where a relative path
+/// argument makes the working directory part of the behavior under test.
 fn ostree_in(cwd: &Path, args: &[&str]) -> Run {
     let out = Command::new("ostree")
         .current_dir(cwd)
@@ -7362,8 +7420,9 @@ fn ostree_in(cwd: &Path, args: &[&str]) -> Run {
     }
 }
 
-/// The same with `env` added to the tool's environment, which the commits both
-/// implementations must reproduce need for `SOURCE_DATE_EPOCH`.
+/// Run the `ostree` command with `args` and with `env` added to its
+/// environment. The commits that both commands must reproduce need `env` for
+/// `SOURCE_DATE_EPOCH`.
 fn ostree_env(args: &[&str], env: &[(&str, &str)]) -> Run {
     let mut command = Command::new("ostree");
     command.args(args).stdin(Stdio::null());
@@ -7378,13 +7437,14 @@ fn ostree_env(args: &[&str], env: &[(&str, &str)]) -> Run {
     }
 }
 
-/// Run `args` against each implementation's own repository, passing the path as
-/// a trailing `--repo`, the position both accept in either form.
+/// Run `args` against the separate repository of each command. The path goes
+/// in a `--repo PATH` pair right after the subcommand name. At this position,
+/// both commands accept the `--repo PATH` form and the `--repo=PATH` form.
 fn run_both(port_repo: &Path, tool_repo: &Path, args: &[&str]) -> (Run, Run) {
     run_both_env(port_repo, tool_repo, args, &[])
 }
 
-/// The same with `env` given to both implementations.
+/// The same with `env` given to both commands.
 fn run_both_env(
     port_repo: &Path,
     tool_repo: &Path,
@@ -7411,13 +7471,13 @@ fn run_both_env(
     (port, tool)
 }
 
-/// Run `args` against `repo` under both implementations and assert that the
-/// exit status and both streams agree.
+/// Run `args` with ostrya against `port_repo` and with the `ostree` command
+/// against `tool_repo`, and assert that the exit status and both streams agree.
 fn assert_agrees(port_repo: &Path, tool_repo: &Path, args: &[&str]) {
     assert_agrees_env(port_repo, tool_repo, args, &[]);
 }
 
-/// The same with `env` given to both implementations.
+/// The same with `env` given to both commands.
 fn assert_agrees_env(port_repo: &Path, tool_repo: &Path, args: &[&str], env: &[(&str, &str)]) {
     let (port, tool) = run_both_env(port_repo, tool_repo, args, env);
     assert_runs_agree(&port, &tool, &args.join(" "));
@@ -7440,9 +7500,10 @@ fn assert_runs_agree(port: &Run, tool: &Run, label: &str) {
     );
 }
 
-/// The same, for a failing invocation whose message both implementations word
-/// identically: the exit status, standard output, and the last line of standard
-/// error, which is the `error: ` line the usage block precedes.
+/// The same check for a failing invocation with a message that both commands
+/// word the same. Both runs must exit 1, standard output must agree, and
+/// standard error must hold `message`, the `error: ` line after the usage
+/// block.
 fn assert_agrees_on_error(port_repo: &Path, tool_repo: &Path, args: &[&str], message: &str) {
     let (port, tool) = run_both(port_repo, tool_repo, args);
     assert_runs_agree_on_error(&port, &tool, &args.join(" "), message);
@@ -7499,8 +7560,8 @@ fn describe_refs(repo: &Path) -> Vec<String> {
     out
 }
 
-/// Copy `repo` to `base/<name>` so each implementation mutates its own tree
-/// while both hold the same commits.
+/// Copy `repo` to `base/<name>`, so that each command changes its own tree
+/// while both trees hold the same commits.
 fn clone_repo(base: &Path, repo: &Path, name: &str) -> PathBuf {
     let destination = base.join(name);
     let status = Command::new("cp")
@@ -7513,8 +7574,8 @@ fn clone_repo(base: &Path, repo: &Path, name: &str) -> PathBuf {
     destination
 }
 
-/// Commit `tree` onto `branch`, optionally parented on `parent`, and return the
-/// new commit checksum.
+/// Commit `tree` onto `branch` and return the new commit checksum. If
+/// `parent` is given, the new commit has it as its parent.
 fn commit_tree(repo: &Path, branch: &str, tree: &Path, parent: Option<&str>) -> String {
     let repo = repo.to_str().unwrap();
     let tree = tree.to_str().unwrap();
@@ -7536,16 +7597,16 @@ fn commit_tree(repo: &Path, branch: &str, tree: &Path, parent: Option<&str>) -> 
     ostrya(&args, None, &[]).ok().stdout_trimmed()
 }
 
-/// Point a ref at a commit by writing its file, for the refs a CLI option does
-/// not create: a remote ref and a collection-mirror ref.
+/// Point a ref at a commit: write the ref file. This is for the refs that no
+/// CLI option creates: a remote ref and a collection-mirror ref.
 fn write_ref_file(repo: &Path, relpath: &str, commit: &str) {
     let path = repo.join("refs").join(relpath);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, format!("{commit}\n")).unwrap();
 }
 
-/// A repository holding a nested branch name, a flat one, and two remote refs,
-/// which the prefix-stripping and sort-order cases need.
+/// A repository with a nested branch name, a flat one, and two remote refs.
+/// The cases for prefix stripping and sort order need these refs.
 fn build_multi_ref_repo(base: &Path) -> PathBuf {
     build_fixture_source(base);
     let repo = create_repo(base, RepoMode::Archive);
@@ -7567,7 +7628,7 @@ fn refs_listing_matches_the_tool() {
     let tmp = TmpDir::new("refs-list");
     let base = tmp.path();
     let repo = build_multi_ref_repo(base);
-    // Listing mutates nothing, so both implementations read the one repository
+    // A listing changes nothing, so both commands read the same repository,
     // and their output compares with no checksum masking.
     for args in [
         vec!["refs"],
@@ -7587,8 +7648,8 @@ fn refs_listing_matches_the_tool() {
         vec!["refs", "-r", "origin:rr"],
         vec!["refs", "origin:rr/deep"],
         vec!["refs", "origin:rr/x"],
-        // A whole-remote prefix names every ref of that remote, and there is no
-        // ref name below it to strip, so each row keeps its whole refspec.
+        // A whole-remote prefix names every ref of that remote. The prefix has
+        // no ref-name part to strip, so each row keeps its whole refspec.
         vec!["refs", "origin:"],
         vec!["refs", "-r", "origin:"],
         vec!["refs", "origin:."],
@@ -7599,8 +7660,8 @@ fn refs_listing_matches_the_tool() {
         vec!["refs", "test", "plain"],
         vec!["refs", "plain", "test"],
         vec!["refs", "test", "test"],
-        // Two prefixes matching one ref: the name is stripped by the prefix
-        // that selected the row, so this prints `main` and then `test/main`.
+        // Two prefixes that match one ref: the prefix that selected the row
+        // strips the name, so this prints `main` and then `test/main`.
         vec!["refs", "test", "test/main"],
         vec!["refs", "test/main", "test"],
         vec!["refs", "-r", "test", "test/main"],
@@ -7609,13 +7670,13 @@ fn refs_listing_matches_the_tool() {
     }
 }
 
-/// A PREFIX no ref name can hold ends the invocation in both implementations,
-/// before it matches anything, in every listing form and in `--delete`. The two
-/// word the refusal differently -- the tool prefixes its line with `Listing
-/// refs: ` and the port reports the refspec rule's one message
-/// (`docs/conformance/cli-surface.md`, "P1") -- so each side's wording is
-/// asserted against itself and the exit status, standard output, and refs tree
-/// are compared.
+/// If no ref name can hold a PREFIX, both commands end the invocation before
+/// the prefix matches anything. This holds in every listing form and in
+/// `--delete`. The wording of the refusal differs: the `ostree` command starts
+/// its line with `Listing refs: `, and ostrya reports the one message of its
+/// refspec rule. This is a recorded divergence. The test asserts the wording
+/// of each command separately, and compares the exit status, standard output,
+/// and refs tree.
 #[test]
 fn refs_refuses_an_invalid_prefix() {
     if !ostree_available() {
@@ -7624,7 +7685,7 @@ fn refs_refuses_an_invalid_prefix() {
     let tmp = TmpDir::new("refs-prefix");
     let base = tmp.path();
     let repo = build_multi_ref_repo(base);
-    // An alias, so the `-A` forms print a row of their own before a refusal.
+    // An alias, so that the `-A` forms print a row before a refusal.
     std::os::unix::fs::symlink("test/main", repo.join("refs/heads/al")).unwrap();
 
     let refused = |port_repo: &Path, tool_repo: &Path, args: &[&str], prefix: &str| {
@@ -7656,9 +7717,9 @@ fn refs_refuses_an_invalid_prefix() {
         );
     };
 
-    // Every form the refspec rule refuses: a component that is empty, `.`, or
-    // `..`, and a `<remote>:` half that is empty or holds a `/`. A listing
-    // mutates nothing, so both implementations read the one repository.
+    // Every form that the refspec rule refuses: a component that is empty, `.`,
+    // or `..`, and a `<remote>:` half that is empty or holds a `/`. A listing
+    // changes nothing, so both commands read the same repository.
     for prefix in [
         "test/",
         "/test",
@@ -7688,8 +7749,8 @@ fn refs_refuses_an_invalid_prefix() {
         }
     }
 
-    // The check runs where each prefix is taken, so the rows an earlier valid
-    // prefix printed stand ahead of the refusal.
+    // The check runs when each prefix is taken, so the rows that an earlier
+    // valid prefix printed come before the refusal.
     for args in [
         vec!["refs", "test", "test/"],
         vec!["refs", "-r", "test", "test/"],
@@ -7698,13 +7759,14 @@ fn refs_refuses_an_invalid_prefix() {
         refused(&repo, &repo, &args, "test/");
     }
 
-    // A `<remote>:` prefix whose ref half is empty or `.` passes this check and
-    // names every ref of that remote, which `refs_whole_remote_prefix_matches_
-    // the_tool` and `refs_listing_matches_the_tool` cover.
+    // A `<remote>:` prefix with an empty or `.` ref half passes this check and
+    // names every ref of that remote. The tests
+    // `refs_whole_remote_prefix_matches_the_tool` and
+    // `refs_listing_matches_the_tool` cover this case.
 
-    // A delete mutates, so each implementation gets its own copy: the refs an
-    // earlier valid prefix removed stand, and the refused prefix removes
-    // nothing.
+    // A delete changes the repository, so each command gets a separate copy.
+    // The refs that an earlier valid prefix removed stay removed, and the
+    // refused prefix removes nothing.
     let port = clone_repo(base, &repo, "prefix-port");
     let tool = clone_repo(base, &repo, "prefix-tool");
     refused(
@@ -7722,13 +7784,13 @@ fn refs_refuses_an_invalid_prefix() {
     assert!(port.join("refs/heads/test/main").exists());
 }
 
-/// A PREFIX whose path under `refs/` runs through a ref file ends the
-/// invocation in both implementations, before the prefix matches anything, in
-/// every listing form and in `--delete`. The two word the refusal differently --
-/// the tool names the path and the syscall, and the port reports the one message
-/// it gives that condition (`docs/conformance/cli-surface.md`, "P1") -- so each
-/// side's wording is asserted against itself and the exit status, standard
-/// output, and refs tree are compared.
+/// If the path of a PREFIX under `refs/` goes through a ref file, both commands
+/// end the invocation before the prefix matches anything. This holds in every
+/// listing form and in `--delete`. The wording of the refusal differs: the
+/// `ostree` command names the path and the syscall, and ostrya reports the one
+/// message that it gives for this condition. This is a recorded divergence.
+/// The test asserts the wording of each command separately, and compares the
+/// exit status, standard output, and refs tree.
 #[test]
 fn refs_refuses_a_prefix_through_a_ref_file() {
     if !ostree_available() {
@@ -7737,8 +7799,8 @@ fn refs_refuses_a_prefix_through_a_ref_file() {
     let tmp = TmpDir::new("refs-notdir");
     let base = tmp.path();
     let repo = build_multi_ref_repo(base);
-    // An alias, so a prefix reaching a ref file through a link is covered and the
-    // `-A` forms print a row of their own before a refusal.
+    // An alias. With it, the test covers a prefix that reaches a ref file
+    // through a link, and the `-A` forms print a row before a refusal.
     std::os::unix::fs::symlink("test/main", repo.join("refs/heads/al")).unwrap();
 
     let refused = |port_repo: &Path, tool_repo: &Path, args: &[&str], path: &str| {
@@ -7774,10 +7836,10 @@ fn refs_refuses_a_prefix_through_a_ref_file() {
         );
     };
 
-    // A ref file as the prefix's last component, as an inner one, and reached
-    // through an alias, under `refs/heads` and under `refs/remotes` alike. A
-    // single prefix removes nothing, so both implementations read the one
-    // repository in every form here.
+    // A ref file as the last component of the prefix, as an inner component,
+    // and reached through an alias, under `refs/heads` and under
+    // `refs/remotes`. A single prefix removes nothing, so both commands read
+    // the same repository in every form of this loop.
     for (prefix, path) in [
         ("plain/x", "refs/heads/plain/x"),
         ("plain/x/y", "refs/heads/plain/x/y"),
@@ -7799,8 +7861,8 @@ fn refs_refuses_a_prefix_through_a_ref_file() {
         }
     }
 
-    // A prefix naming nothing at all is not an error, which is what keeps the
-    // probe to the one condition.
+    // A prefix that names nothing is not an error. As a result, the probe
+    // covers only the one condition.
     for args in [
         vec!["refs", "nosuch/x"],
         vec!["refs", "-A", "nosuch/x"],
@@ -7809,8 +7871,8 @@ fn refs_refuses_a_prefix_through_a_ref_file() {
         assert_agrees(&repo, &repo, &args);
     }
 
-    // The refspec rule comes first, so a prefix breaking both rules draws the
-    // refspec message from both implementations.
+    // The refspec rule comes first, so a prefix that breaks both rules gets the
+    // refspec message from both commands.
     let (port, tool) = run_both(&repo, &repo, &["refs", "plain/x/"]);
     for (who, run, message) in [
         ("port", &port, "error: Invalid refspec plain/x/"),
@@ -7827,7 +7889,7 @@ fn refs_refuses_a_prefix_through_a_ref_file() {
         );
     }
 
-    // The rows an earlier valid prefix printed stand ahead of the refusal.
+    // The rows that an earlier valid prefix printed come before the refusal.
     refused(
         &repo,
         &repo,
@@ -7841,9 +7903,9 @@ fn refs_refuses_a_prefix_through_a_ref_file() {
         "refs/heads/plain/x",
     );
 
-    // A delete mutates, so each implementation gets its own copy: the refs an
-    // earlier valid prefix removed stand, and the refused prefix leaves the ref
-    // file its path ran through in place.
+    // A delete changes the repository, so each command gets a separate copy.
+    // The refs that an earlier valid prefix removed stay removed. The refused
+    // prefix leaves in place the ref file that its path goes through.
     let port = clone_repo(base, &repo, "notdir-port");
     let tool = clone_repo(base, &repo, "notdir-tool");
     refused(
@@ -7860,8 +7922,8 @@ fn refs_refuses_a_prefix_through_a_ref_file() {
     assert!(!port.join("refs/heads/deep/nest/ing").exists());
     assert!(port.join("refs/heads/plain").exists());
 
-    // The prefix behind the refused one never runs, so the ref it would have
-    // removed stands in both.
+    // The prefix after the refused one does not run, so the ref that it names
+    // stays in both copies.
     let port = clone_repo(base, &repo, "notdir-port-behind");
     let tool = clone_repo(base, &repo, "notdir-tool-behind");
     let before = describe_refs(&port);
@@ -7876,15 +7938,21 @@ fn refs_refuses_a_prefix_through_a_ref_file() {
 }
 
 /// A whole-remote PREFIX -- `<remote>:` or `<remote>:.` -- selects every ref of
-/// the remote it names. The default listing and `-r` agree with the tool
-/// verbatim, and `refs_listing_matches_the_tool` compares them. Three forms
-/// diverge, each pinned here so a change to either side is caught: the tool
-/// builds every name it prints or deletes by joining the prefix's ref half with
-/// the name below it, so `--list` prints `origin:./rr/x`, `-A` prints
-/// `./rr/remal`, and `--delete` is refused on that joined name, which the tool's
-/// own refspec rule rejects. The port prints the refspec and refuses the delete
-/// naming the prefix as given (`docs/conformance/cli-surface.md`, "P1"). Both
-/// refuse the delete, remove nothing, and exit 1.
+/// the remote that it names. The default listing and `-r` agree with the
+/// `ostree` command word for word, and `refs_listing_matches_the_tool` compares
+/// them. Three forms diverge. This test pins each one, so that it catches a
+/// change in either command. `ostree` builds each name that it prints or
+/// deletes: it joins the ref half of the prefix with the name under it. As a
+/// result:
+///
+/// - `--list` prints `origin:./rr/x`
+/// - `-A` prints `./rr/remal`
+/// - `--delete` refuses the joined name, because the refspec rule of `ostree`
+///   rejects it
+///
+/// ostrya prints the refspec, and its refusal of the delete names the prefix as
+/// given. This is a recorded divergence. Both commands refuse the delete,
+/// remove nothing, and exit 1.
 #[test]
 fn refs_whole_remote_prefix_matches_the_tool() {
     if !ostree_available() {
@@ -7893,12 +7961,12 @@ fn refs_whole_remote_prefix_matches_the_tool() {
     let tmp = TmpDir::new("refs-whole-remote");
     let base = tmp.path();
     let repo = build_multi_ref_repo(base);
-    // An alias beside the remote refs, so the `-A` forms carry a row.
+    // An alias next to the remote refs, so that the `-A` forms print a row.
     std::os::unix::fs::symlink("x", repo.join("refs/remotes/origin/rr/remal")).unwrap();
 
-    // A listing mutates nothing, so both implementations read the one
-    // repository. `--list` suppresses the stripping, and the two name the same
-    // three refs differently.
+    // A listing changes nothing, so both commands read the same repository.
+    // `--list` turns off the stripping, and each command names the same three
+    // refs in a different form.
     for prefix in ["origin:", "origin:."] {
         let (port, tool) = run_both(&repo, &repo, &["refs", "--list", prefix]);
         assert_eq!(
@@ -7917,8 +7985,8 @@ fn refs_whole_remote_prefix_matches_the_tool() {
         assert_eq!(tool.ok().stdout_trimmed(), "./rr/remal -> x");
     }
 
-    // A delete mutates, so each implementation gets its own copy. A whole-remote
-    // prefix matching a ref is refused and removes nothing.
+    // A delete changes the repository, so each command gets a separate copy.
+    // A whole-remote prefix that matches a ref is refused and removes nothing.
     for (prefix, name) in [("origin:", "empty"), ("origin:.", "dot")] {
         let port = clone_repo(base, &repo, &format!("del-port-{name}"));
         let tool = clone_repo(base, &repo, &format!("del-tool-{name}"));
@@ -7936,9 +8004,10 @@ fn refs_whole_remote_prefix_matches_the_tool() {
             port_stderr.contains(&format!("error: Invalid refspec {prefix}")),
             "the port's stderr does not name the prefix as given:\n{port_stderr}"
         );
-        // The tool names the refspec it built for one of the matched refs, which
-        // carries the `.` of the join; which ref it names follows its own
-        // directory order, so the assertion stops at the join.
+        // The `ostree` command names the refspec that it built for one of the
+        // matched refs. This refspec holds the `.` of the join. The directory
+        // order of `ostree` decides which ref it names, so the assertion stops
+        // at the join.
         let tool_stderr = String::from_utf8_lossy(&tool_run.stderr).into_owned();
         assert!(
             tool_stderr.contains("Invalid refspec origin:./"),
@@ -7948,7 +8017,7 @@ fn refs_whole_remote_prefix_matches_the_tool() {
         assert_eq!(describe_refs(&tool), before, "the tool removed a ref");
     }
 
-    // A whole-remote prefix matching no ref is not an error.
+    // A whole-remote prefix that matches no ref is not an error.
     for (prefix, name) in [("nosuch:", "empty"), ("nosuch:.", "dot")] {
         let port = clone_repo(base, &repo, &format!("miss-port-{name}"));
         let tool = clone_repo(base, &repo, &format!("miss-tool-{name}"));
@@ -7958,7 +8027,7 @@ fn refs_whole_remote_prefix_matches_the_tool() {
         assert_eq!(describe_refs(&tool), before);
     }
 
-    // The prefixes ahead of the refused one keep their effect.
+    // The prefixes before the refused one keep their effect.
     let port = clone_repo(base, &repo, "order-port");
     let tool = clone_repo(base, &repo, "order-tool");
     let (port_run, tool_run) = run_both(&port, &tool, &["refs", "--delete", "deep", "origin:"]);
@@ -7977,10 +8046,10 @@ fn refs_whole_remote_prefix_matches_the_tool() {
     assert!(!port.join("refs/heads/deep/nest/ing").exists());
     assert!(port.join("refs/remotes/origin/rr/x").exists());
 
-    // Each prefix is matched against the ref set as the prefixes ahead of it
-    // left it. `origin:rr` empties the remote, so the whole-remote prefix behind
-    // it matches nothing and exits 0; a prefix emptying part of the remote
-    // leaves the whole-remote prefix matching the rest, which is refused.
+    // Each prefix matches against the ref set that the prefixes before it
+    // left. `origin:rr` empties the remote, so the whole-remote prefix after
+    // it matches nothing, and the command exits 0. If a prefix empties part of
+    // the remote, the whole-remote prefix matches the rest and is refused.
     for (args, name) in [
         (vec!["refs", "--delete", "origin:rr", "origin:"], "emptied"),
         (
@@ -8032,7 +8101,7 @@ fn refs_alias_matches_the_tool() {
     let repo = build_multi_ref_repo(base);
     let head = resolve(&repo, "test/main").unwrap();
 
-    // A create mutates, so each implementation gets its own copy.
+    // A create changes the repository, so each command gets a separate copy.
     let port = clone_repo(base, &repo, "alias-port");
     let tool = clone_repo(base, &repo, "alias-tool");
     for args in [
@@ -8046,7 +8115,7 @@ fn refs_alias_matches_the_tool() {
         describe_refs(&tool),
         "the two alias writes left different refs trees",
     );
-    // The link body is relative to the alias's own directory.
+    // The link body is relative to the directory of the alias.
     assert_eq!(
         std::fs::read_link(port.join("refs/heads/al")).unwrap(),
         Path::new("test/main"),
@@ -8056,11 +8125,11 @@ fn refs_alias_matches_the_tool() {
         Path::new("../plain"),
     );
 
-    // The listings both implementations produce over the aliases just written.
-    // A PREFIX naming a ref exactly is answered by that ref, printed with its
-    // commit checksum in the target position, whether the ref is an alias
-    // (`al`, `nested/q`), a plain ref (`test/main`), or a remote ref
-    // (`origin:rr/x`); a bare checksum names no ref and prints nothing. Every
+    // The listings that both commands produce over the new aliases. If a
+    // PREFIX names a ref exactly, that ref answers it, with its commit
+    // checksum in the target position. This holds for an alias (`al`,
+    // `nested/q`), a plain ref (`test/main`), and a remote ref
+    // (`origin:rr/x`). A bare checksum names no ref and prints nothing. Every
     // other prefix filters the aliases nested under it.
     for args in [
         vec!["refs", "-A"],
@@ -8086,12 +8155,12 @@ fn refs_alias_matches_the_tool() {
         assert_agrees(&port, &tool, &args);
     }
 
-    // An alias records a name, so a target naming a commit is refused. NEWREF
-    // holds a name outside the hex alphabet, which keeps this step reachable
-    // whatever the corpus hashes to: the existence check resolves NEWREF, both
-    // implementations read a run of lowercase hex as an abbreviated checksum,
-    // and a NEWREF prefixing a commit of this repository is answered by the
-    // existence refusal instead (`docs/conformance/cli-surface.md`, "X1").
+    // An alias records a name, so a target that names a commit is refused.
+    // NEWREF holds a name outside the hex alphabet, so this step is reachable
+    // for every corpus hash. The existence check resolves NEWREF, and both
+    // commands read a run of lowercase hex as an abbreviated checksum. If
+    // NEWREF is a prefix of a commit of this repository, the existence refusal
+    // answers it, and this step does not run.
     for target in [head.as_str(), "test/main^", "nosuch"] {
         assert_agrees_on_error(
             &port,
@@ -8100,12 +8169,13 @@ fn refs_alias_matches_the_tool() {
             &format!("error: Cannot create alias to non-existent ref: {target}"),
         );
     }
-    // An alias lives under `refs/heads`, so a NEWREF naming a remote is refused
-    // and nothing is written. The remote half is the whole message, whether the
-    // remote exists or not, and the step sits after the three NEWREF checks and
-    // before the positional resolves: an unresolvable positional and an
-    // existence check `--force` suppressed both reach it, and a NEWREF the ref
-    // rule refuses stops one step earlier.
+    // An alias is under `refs/heads`, so a NEWREF that names a remote is
+    // refused, and nothing is written. The message names only the remote
+    // half, for a remote that exists and for one that does not. This step
+    // comes after the three NEWREF checks and before the positional resolves.
+    // As a result, an unresolvable positional and an existence check that
+    // `--force` turns off both reach this step. A NEWREF that the ref rule
+    // refuses stops one step earlier.
     let before = describe_refs(&port);
     for (args, message) in [
         (
@@ -8132,8 +8202,8 @@ fn refs_alias_matches_the_tool() {
             vec!["refs", "-A", "--create=origin:bad/", "test/main"],
             "error: Invalid refspec origin:bad/",
         ),
-        // A NEWREF holding a second `:` fails the ref-name rule at the same
-        // step in both implementations, ahead of the remote refusal.
+        // A NEWREF with a second `:` fails the ref-name rule at the same step
+        // in both commands, before the remote refusal.
         (
             vec!["refs", "-A", "--create=a:b:c", "test/main"],
             "error: Invalid refspec a:b:c",
@@ -8152,7 +8222,7 @@ fn refs_alias_matches_the_tool() {
         "the tool wrote a remote alias"
     );
 
-    // --force replaces a ref file with an alias symlink.
+    // `--force` replaces a ref file with an alias symlink.
     assert_agrees(
         &port,
         &tool,
@@ -8167,10 +8237,11 @@ fn refs_alias_matches_the_tool() {
             .is_symlink()
     );
 
-    // The one divergence, pinned so a change to either side is caught: the tool
-    // names an alias under `refs/remotes/<remote>/` by its path below the
-    // remote, dropping the remote and printing a name that resolves to nothing;
-    // the port prints the refspec (`docs/conformance/cli-surface.md`, "P1").
+    // A recorded divergence, pinned so that a change in either command is
+    // caught.
+    // The `ostree` command names an alias under `refs/remotes/<remote>/` by its
+    // path under the remote. It drops the remote and prints a name that
+    // resolves to nothing. ostrya prints the refspec.
     for repo in [&port, &tool] {
         std::os::unix::fs::symlink("x", repo.join("refs/remotes/origin/rr/remal")).unwrap();
     }
@@ -8189,11 +8260,12 @@ fn refs_alias_matches_the_tool() {
     assert_eq!(port_lines, "origin:rr/remal -> x");
     assert_eq!(tool_lines, "rr/remal -> x");
 
-    // A target under `refs/remotes` is the one `-A --create` writes differently,
-    // so it gets its own pair of clones. The port writes the path to the target
-    // ref's file and the tool writes the refspec verbatim, which under
-    // `refs/heads` names no file. Both listings print `origin:rr/x` for it
-    // (`docs/conformance/cli-surface.md`, "P1").
+    // A target under `refs/remotes` is the one target that `-A --create`
+    // writes differently in each command, so it gets a separate pair of
+    // clones. ostrya writes the path to the file of the target ref. The
+    // `ostree` command writes the refspec word for word, which names no file
+    // under `refs/heads`. Both listings print `origin:rr/x` for it. This is a
+    // recorded divergence.
     let remote_port = clone_repo(base, &repo, "alias-remote-port");
     let remote_tool = clone_repo(base, &repo, "alias-remote-tool");
     assert_agrees(
@@ -8209,9 +8281,10 @@ fn refs_alias_matches_the_tool() {
         std::fs::read_link(remote_tool.join("refs/heads/xal")).unwrap(),
         Path::new("origin:rr/x"),
     );
-    // Each implementation reading the repository it wrote prints the same line.
+    // If each command reads the repository that it wrote, both print the same
+    // line.
     assert_agrees(&remote_port, &remote_tool, &["refs", "-A"]);
-    // The port's link resolves under both implementations.
+    // The link that ostrya wrote resolves in both commands.
     for run in [
         ostrya(
             &["rev-parse", "--repo", remote_port.to_str().unwrap(), "xal"],
@@ -8226,8 +8299,9 @@ fn refs_alias_matches_the_tool() {
     ] {
         assert_eq!(run.ok().stdout_trimmed(), head);
     }
-    // The tool's link resolves under neither, and its own default listing stops
-    // on it, which is the dangling-alias divergence reached by its own write.
+    // The link that the `ostree` command wrote resolves in neither command,
+    // and the default listing of `ostree` stops on it. This is the
+    // dangling-alias divergence, which the write of `ostree` itself causes.
     for run in [
         ostrya(
             &["rev-parse", "--repo", remote_tool.to_str().unwrap(), "xal"],
@@ -8255,12 +8329,16 @@ fn refs_alias_matches_the_tool() {
     );
 }
 
-/// A repository holding the refs and aliases the `--delete` alias guard needs:
-/// an alias whose body climbs out of its own directory (`test/al`), one naming
-/// another alias (`alal`), one whose flat body names a ref at the `refs/heads`
-/// root while the link itself resolves inside the alias's own directory
-/// (`test/al2`), and two naming a remote ref, in the port's body form (`ral`)
-/// and in the tool's (`ral2`).
+/// A repository with the refs and aliases that the `--delete` alias guard
+/// needs:
+///
+/// - an alias with a body that climbs out of its directory (`test/al`)
+/// - an alias that names another alias (`alal`)
+/// - an alias with a flat body that names a ref at the `refs/heads` root,
+///   while the link resolves in the directory of the alias
+///   (`test/al2`)
+/// - two aliases that name a remote ref, in the body form of ostrya (`ral`)
+///   and in the body form of the `ostree` command (`ral2`)
 fn build_alias_guard_repo(base: &Path) -> PathBuf {
     build_fixture_source(base);
     let repo = create_repo(base, RepoMode::Archive);
@@ -8291,10 +8369,10 @@ fn refs_delete_alias_guard_matches_the_tool() {
     let base = tmp.path();
     let repo = build_alias_guard_repo(base);
 
-    // A ref an alias names is refused, and the prefix removes nothing. One
-    // alias names each of these refs, so both implementations name the same
-    // pair. The body an alias names its target by is the link body with the
-    // leading `../` components removed, read as a ref name under `refs/heads`:
+    // A ref that an alias names is refused, and the prefix removes nothing.
+    // One alias names each of these refs, so both commands name the same
+    // pair. An alias names its target by the link body without the leading
+    // `../` components, read as a ref name under `refs/heads`. For example,
     // `test/al2 -> other` guards `other`.
     for (name, args, message) in [
         (
@@ -8321,11 +8399,14 @@ fn refs_delete_alias_guard_matches_the_tool() {
         assert_eq!(describe_refs(&tool), before, "the tool removed a ref");
     }
 
-    // The refs outside the guard: the ref the link resolves to, which its body
-    // does not name (`test/other`, where `test/al2 -> other`); a remote ref two
-    // aliases name, in either body form; an alias no alias names; and an alias
-    // the prefix ahead of it freed, the alias set being read as the prefixes
-    // ahead left it.
+    // The refs outside the guard:
+    //
+    // - the ref that the link resolves to, which its body does not name
+    //   (`test/other`, where `test/al2 -> other`)
+    // - a remote ref that two aliases name, one in each body form
+    // - an alias that no alias names
+    // - an alias that the prefix before it freed, because the alias set is
+    //   read as the prefixes before it left it
     for (name, args, gone) in [
         (
             "link-resolves-here",
@@ -8366,10 +8447,10 @@ fn refs_delete_alias_guard_matches_the_tool() {
         }
     }
 
-    // A prefix matching more than one guarded ref: both refuse and the prefix
-    // ahead of it keeps its effect. Which pair the message names follows each
-    // implementation's own enumeration order, so the assertion stops at the
-    // guard's words (`docs/conformance/cli-surface.md`, "P1").
+    // A prefix that matches more than one guarded ref: both commands refuse,
+    // and the prefix before it keeps its effect. The enumeration order of each
+    // command decides which pair the message names, so the assertion stops at
+    // the words of the guard. This is a recorded divergence.
     let port = clone_repo(base, &repo, "guard-port-order");
     let tool = clone_repo(base, &repo, "guard-tool-order");
     let before = describe_refs(&port);
@@ -8386,7 +8467,7 @@ fn refs_delete_alias_guard_matches_the_tool() {
             "the {who}'s stderr lacks the guard:\n{stderr}"
         );
     }
-    // The port removes what `deep` matched and nothing of what `test` matched.
+    // ostrya removes what `deep` matched and nothing that `test` matched.
     let expected: Vec<String> = before
         .iter()
         .filter(|line| !line.starts_with("heads/deep/nest/ing "))
@@ -8397,9 +8478,10 @@ fn refs_delete_alias_guard_matches_the_tool() {
         expected,
         "the port's refused prefix removed a ref",
     );
-    // The tool removes the matched refs its own removal order reached ahead of
-    // the guarded one, so its tree is what the port left, less any of the
-    // unguarded refs `test` matched (`docs/conformance/cli-surface.md`, "P1").
+    // The `ostree` command removes the matched refs that its removal order
+    // reached before the guarded one. As a result, its tree is the tree that
+    // ostrya left, less some or none of the unguarded refs that `test`
+    // matched. This is a recorded divergence.
     let after = describe_refs(&tool);
     let unguarded = ["heads/test/other ", "heads/test/al2 "];
     for line in &expected {
@@ -8422,9 +8504,9 @@ fn refs_delete_alias_guard_matches_the_tool() {
     }
     assert!(port.join("refs/heads/test/other").exists());
 
-    // With `-c` the guard does not apply: the collection's own refs are removed,
-    // the aliases among them included. The same repository refuses the same ref
-    // without `-c`.
+    // With `-c`, the guard does not apply: the refs of the collection are
+    // removed, and the aliases among them too. The same repository refuses the
+    // same ref without `-c`.
     let coll = base.join("coll");
     ostrya(
         &[
@@ -8468,13 +8550,17 @@ fn refs_delete_alias_guard_matches_the_tool() {
         "error: Ref 'test/main' has an active alias: 'test/al'",
     );
 
-    // The refusal is per prefix in both and atomic in the port alone: the tool
-    // removes the members of the selected set its own removal order reached
-    // ahead of the guarded one (`docs/conformance/cli-surface.md`, "P1"). One
-    // guarded member among sixteen sits late in that order, which is what the
-    // two repositories below pin -- the plain form over refs, the `-A` form over
-    // aliases -- each holding one alias for its guarded member, so both
-    // implementations name the same pair.
+    // Both commands refuse for each prefix, and only ostrya makes the refusal
+    // atomic. The `ostree` command removes the members of the selected set
+    // that its removal order reached before the guarded one. This is a
+    // recorded divergence. The two repositories of this test pin it with one
+    // guarded member among sixteen, late in that order:
+    //
+    // - the plain form over refs
+    // - the `-A` form over aliases
+    //
+    // Each repository holds one alias for its guarded member, so both commands
+    // name the same pair.
     let plain = base.join("partial-plain");
     let aliased = base.join("partial-alias");
     for path in [&plain, &aliased] {
@@ -8544,10 +8630,13 @@ fn refs_delete_alias_guard_matches_the_tool() {
     }
 }
 
-/// A repository holding what the `-A --delete` selection needs: an alias nested
-/// under a directory prefix (`test/al`), one at the `refs/heads` root naming a
-/// ref that a prefix also matches (`topal -> test/other`), an alias under
-/// `refs/remotes` (`origin:rr/remal`), and refs no alias names.
+/// A repository with what the `-A --delete` selection needs:
+///
+/// - an alias nested under a directory prefix (`test/al`)
+/// - an alias at the `refs/heads` root that names a ref that a prefix also
+///   matches (`topal -> test/other`)
+/// - an alias under `refs/remotes` (`origin:rr/remal`)
+/// - refs that no alias names
 fn build_alias_delete_repo(base: &Path) -> PathBuf {
     build_fixture_source(base);
     let repo = create_repo(base, RepoMode::Archive);
@@ -8567,10 +8656,10 @@ fn build_alias_delete_repo(base: &Path) -> PathBuf {
     repo
 }
 
-/// `-A --delete` removes, for each prefix, the set a `-A` listing prints for it:
-/// the ref the prefix names exactly, or the aliases nested under it. The plain
-/// form removes every ref the prefix matches, so the two select different files
-/// for the same prefix.
+/// For each prefix, `-A --delete` removes the set that a `-A` listing prints
+/// for it: the ref that the prefix names exactly, or the aliases nested under
+/// it. The plain form removes every ref that the prefix matches, so the two
+/// forms select different files for the same prefix.
 #[test]
 fn refs_delete_aliases_matches_the_tool() {
     if !ostree_available() {
@@ -8580,10 +8669,10 @@ fn refs_delete_aliases_matches_the_tool() {
     let base = tmp.path();
     let repo = build_alias_delete_repo(base);
 
-    // A directory prefix removes the aliases below it and leaves the refs; a
-    // prefix naming a ref exactly removes that one ref, whether it is an alias,
-    // a plain ref, or a remote ref. The plain `--delete` of the same prefix
-    // stands beside each alias-only case, since the two select different files.
+    // A directory prefix removes the aliases under it and keeps the refs. A
+    // prefix that names a ref exactly removes that one ref: an alias, a plain
+    // ref, or a remote ref. Each alias-only case has the plain `--delete` of
+    // the same prefix next to it, because the two forms select different files.
     for (name, args, gone, kept) in [
         (
             "aliases-below",
@@ -8622,8 +8711,8 @@ fn refs_delete_aliases_matches_the_tool() {
             vec!["refs/remotes/origin/rr/x"],
         ),
         // The contrast with the plain form over one prefix: `-A` finds no alias
-        // below `deep` and removes nothing, where `--delete deep` removes the
-        // ref below it.
+        // under `deep` and removes nothing, and `--delete deep` removes the ref
+        // under it.
         (
             "no-alias-below",
             vec!["refs", "-A", "--delete", "deep"],
@@ -8654,16 +8743,16 @@ fn refs_delete_aliases_matches_the_tool() {
             vec![],
             vec!["refs/remotes/origin/rr/remal"],
         ),
-        // Per prefix, in argument order: `test` frees its alias, `deep` holds no
-        // alias, and `other` names a ref exactly.
+        // For each prefix, in argument order: `test` frees its alias, `deep`
+        // holds no alias, and `other` names a ref exactly.
         (
             "per-prefix",
             vec!["refs", "-A", "--delete", "test", "deep", "other"],
             vec!["refs/heads/test/al", "refs/heads/other"],
             vec!["refs/heads/deep/nest/ing", "refs/heads/test/main"],
         ),
-        // The alias set is read as the prefixes ahead left it, so the second
-        // `test` finds no alias below itself and removes nothing.
+        // The alias set is read as the prefixes before it left it, so the
+        // second `test` finds no alias under it and removes nothing.
         (
             "live-set",
             vec!["refs", "-A", "--delete", "test", "test"],
@@ -8696,8 +8785,8 @@ fn refs_delete_aliases_matches_the_tool() {
         }
     }
 
-    // The guard of the plain form applies to the set `-A` selected: the ref a
-    // prefix names exactly, and the alias below a directory prefix.
+    // The guard of the plain form applies to the set that `-A` selected: the
+    // ref that a prefix names exactly, and the alias under a directory prefix.
     for (name, args, message, gone) in [
         (
             "guard-exact",
@@ -8711,7 +8800,7 @@ fn refs_delete_aliases_matches_the_tool() {
             "error: Ref 'test/other' has an active alias: 'topal'",
             vec![],
         ),
-        // The prefix ahead of the refused one keeps its effect.
+        // The prefix before the refused one keeps its effect.
         (
             "guard-after-a-prefix",
             vec!["refs", "-A", "--delete", "test", "test/other"],
@@ -8738,7 +8827,7 @@ fn refs_delete_aliases_matches_the_tool() {
         }
     }
 
-    // No prefix reports the message the plain form reports.
+    // With no prefix, `-A --delete` reports the message of the plain form.
     let port = clone_repo(base, &repo, "sel-port-no-prefix");
     let tool = clone_repo(base, &repo, "sel-tool-no-prefix");
     assert_agrees_on_error(
@@ -8749,9 +8838,9 @@ fn refs_delete_aliases_matches_the_tool() {
     );
     assert_eq!(describe_refs(&port), describe_refs(&tool));
 
-    // A whole-remote prefix holding an alias is refused and removes nothing in
-    // both, each naming what its own selection produced
-    // (`docs/conformance/cli-surface.md`, "P1").
+    // A whole-remote prefix that holds an alias is refused and removes nothing
+    // in both commands. Each command names what its selection produced. This
+    // is a recorded divergence.
     for prefix in ["origin:", "origin:."] {
         let port = clone_repo(base, &repo, &format!("sel-port-whole{}", prefix.len()));
         let tool = clone_repo(base, &repo, &format!("sel-tool-whole{}", prefix.len()));
@@ -8770,10 +8859,11 @@ fn refs_delete_aliases_matches_the_tool() {
         assert_eq!(describe_refs(&tool), before, "the tool removed a ref");
     }
 
-    // The divergence, pinned so a change to either side is caught: the tool
-    // removes each nested alias by the name it prints for it, and for an alias
-    // under `refs/remotes` that name drops the remote, so the tool removes no
-    // alias of that remote. The port removes the alias its own listing names.
+    // A second recorded divergence, pinned so that a change in either command
+    // is caught. The `ostree` command removes each nested alias by the name
+    // that it prints for it. For an alias under `refs/remotes`, that name
+    // drops the remote, so `ostree` removes no alias of that remote. ostrya
+    // removes the alias that its listing names.
     let port = clone_repo(base, &repo, "sel-port-remote-prefix");
     let tool = clone_repo(base, &repo, "sel-tool-remote-prefix");
     let (port_run, tool_run) = run_both(&port, &tool, &["refs", "-A", "--delete", "origin:rr"]);
@@ -8791,9 +8881,9 @@ fn refs_delete_aliases_matches_the_tool() {
             .is_ok(),
         "the tool removed the remote alias",
     );
-    // The same name read under `refs/heads`: where a local ref carries the
-    // remote alias's path below the remote, the tool removes that local ref and
-    // the port removes the alias the prefix named.
+    // The same name read under `refs/heads`. A local ref can have the path of
+    // the remote alias under the remote. Then the `ostree` command removes
+    // that local ref, and ostrya removes the alias that the prefix named.
     let collide = base.join("collide");
     ostrya(
         &[
@@ -8827,9 +8917,9 @@ fn refs_delete_aliases_matches_the_tool() {
         "the tool kept the local ref its own name reached",
     );
 
-    // `-c` wins over `-A` in either order, so both remove the collection's own
-    // refs with the aliases among them. The repository carries no mirror ref, so
-    // the two trees compare with the own-collection-id divergence out of the way.
+    // `-c` wins over `-A` in each order, so both commands remove the refs of
+    // the collection and the aliases among them. The repository has no mirror
+    // ref, so the two trees compare without the own-collection-id divergence.
     let coll = base.join("coll");
     ostrya(
         &[
@@ -8879,9 +8969,10 @@ fn refs_delete_aliases_matches_the_tool() {
     }
 }
 
-/// A collection repository holding both sources of a collection ref under its
-/// own id: the local refs its `collection-id` qualifies, an alias among them, and
-/// mirror refs carrying that same id, beside the mirror ref of a foreign id.
+/// A collection repository with both sources of a collection ref under its
+/// own id: the local refs that its `collection-id` qualifies, an alias among
+/// them, and mirror refs with that same id. It also holds the mirror ref of a
+/// foreign id.
 fn build_own_collection_repo(base: &Path) -> PathBuf {
     build_fixture_source(base);
     let repo = base.join("own-coll");
@@ -8909,11 +9000,11 @@ fn build_own_collection_repo(base: &Path) -> PathBuf {
     repo
 }
 
-/// `refs -c --delete` of the id equal to the repository's own `collection-id`
-/// removes the refs under `refs/heads`, the aliases among them, and keeps the
-/// mirror refs carrying that id; a foreign id removes the mirror refs it names.
-/// The `-c` listing prints both sets for either id, so the two ids share one
-/// selection and differ in the removal.
+/// If the id of `refs -c --delete` is the `collection-id` of the repository,
+/// the command removes the refs under `refs/heads` and the aliases among them.
+/// It keeps the mirror refs with that id. A foreign id removes the mirror refs
+/// that it names. The `-c` listing prints both sets for each id, so the two ids
+/// share one selection and differ in the removal.
 #[test]
 fn refs_delete_collection_own_id_matches_the_tool() {
     if !ostree_available() {
@@ -8923,8 +9014,8 @@ fn refs_delete_collection_own_id_matches_the_tool() {
     let base = tmp.path();
     let repo = build_own_collection_repo(base);
 
-    // The listing reads the mirror refs of the own id, so what follows compares
-    // removals over one selection.
+    // The listing reads the mirror refs of the own id, so the next steps
+    // compare removals over one selection.
     for args in [
         vec!["refs", "-c"],
         vec!["refs", "-c", "-r"],
@@ -9026,8 +9117,8 @@ fn refs_delete_collection_own_id_matches_the_tool() {
         }
     }
 
-    // The own id over a repository whose only ref of that id is a mirror ref:
-    // both remove nothing and exit 0.
+    // The own id over a repository in which the only ref of that id is a
+    // mirror ref: both commands remove nothing and exit 0.
     let src = base.join("src");
     let mirror_only = base.join("mirror-only");
     ostrya(
@@ -9056,8 +9147,8 @@ fn refs_delete_collection_own_id_matches_the_tool() {
     assert_eq!(describe_refs(&port), before, "the port removed a ref");
     assert_eq!(describe_refs(&tool), before, "the tool removed a ref");
 
-    // A local ref carrying a mirror ref's name under the own id: the local ref is
-    // removed and the mirror ref of that name stands.
+    // A local ref with the name of a mirror ref under the own id: the local
+    // ref is removed, and the mirror ref of that name stays.
     let same_name = base.join("same-name");
     ostrya(
         &[
@@ -9087,8 +9178,8 @@ fn refs_delete_collection_own_id_matches_the_tool() {
         "the port removed the mirror ref",
     );
 
-    // With no `collection-id` the repository owns no id, so every mirror ref a
-    // prefix names is removed.
+    // With no `collection-id`, the repository owns no id, so every mirror ref
+    // that a prefix names is removed.
     let no_id = create_repo(base, RepoMode::Archive);
     let head = commit_tree(&no_id, "keep", &src, None);
     write_ref_file(&no_id, "mirrors/org.example.Coll/mm", &head);
@@ -9120,8 +9211,9 @@ fn refs_create_ancestry_suffix_matches_the_tool() {
     build_fixture_source(base);
     let repo = create_repo(base, RepoMode::Archive);
     let src = base.join("src");
-    // Two branches: `chain`, whose tip has a parent, and `only`, a root commit,
-    // so a NEWREF suffix resolves in one and stops at the root in the other.
+    // Two branches: `chain`, with a tip that has a parent, and `only`, a root
+    // commit. A NEWREF suffix resolves in the first and stops at the root in
+    // the second.
     let root = commit_tree(&repo, "chain", &src, None);
     std::fs::write(src.join("hello.txt"), b"second revision\n").unwrap();
     commit_tree(&repo, "chain", &src, Some(&root));
@@ -9129,9 +9221,10 @@ fn refs_create_ancestry_suffix_matches_the_tool() {
 
     let port = clone_repo(base, &repo, "suffix-port");
     let tool = clone_repo(base, &repo, "suffix-tool");
-    // Without `--force` the NEWREF is resolved as a revision first, so a suffix
-    // whose base resolves reads as an existing ref, and one whose base is a root
-    // commit stops there. `-A` takes the same two paths.
+    // Without `--force`, the NEWREF first resolves as a revision. As a result,
+    // a suffix with a base that resolves reads as an existing ref. A suffix
+    // with a root commit as its base stops there. `-A` takes the same
+    // two paths.
     for args in [
         vec!["refs", "--create=chain^", "chain"],
         vec!["refs", "-A", "--create=chain^", "chain"],
@@ -9149,9 +9242,9 @@ fn refs_create_ancestry_suffix_matches_the_tool() {
         &["refs", "--create=only^", "chain"],
         &format!("error: Commit {lone} has no parent"),
     );
-    // `--force` suppresses the already-exists refusal alone: the resolution
-    // still runs, so an ancestry that resolves reaches the name check and a base
-    // that is a root commit stops at the resolution.
+    // `--force` turns off only the already-exists refusal. The resolution
+    // still runs, so an ancestry that resolves reaches the name check, and a
+    // base that is a root commit stops at the resolution.
     for args in [
         vec!["refs", "--create=chain^", "--force", "chain"],
         vec!["refs", "-A", "--create=chain^", "--force", "chain"],
@@ -9165,9 +9258,10 @@ fn refs_create_ancestry_suffix_matches_the_tool() {
         &format!("error: Commit {lone} has no parent"),
     );
 
-    // A suffix whose base names no ref: the tool dies on a signal
-    // (`docs/conformance/cli-surface.md`, "P1"), so the port's refusal stands on
-    // its own, worded the way the tool words the name it does refuse.
+    // A suffix with a base that names no ref: the `ostree` command dies on a
+    // signal. This is a recorded divergence. The test asserts the refusal of
+    // ostrya alone, with the words that `ostree` uses for a name that it
+    // refuses.
     let refused = ostrya(
         &[
             "refs",
@@ -9238,10 +9332,10 @@ fn refs_collections_match_the_tool() {
         vec!["refs", "-c", "org.example.Mirror"],
         vec!["refs", "-c", "org.example.Local"],
         vec!["refs", "-c", "org.example.Local", "org.example.Mirror"],
-        // -c wins over -A: the two together list collection refs.
+        // `-c` wins over `-A`: the two options together list collection refs.
         vec!["refs", "-c", "-A"],
-        // A collection-qualified listing excludes the remote refs the plain
-        // listing includes.
+        // A collection-qualified listing excludes the remote refs that the
+        // plain listing includes.
         vec!["refs"],
     ] {
         assert_agrees(&repo, &repo, &args);
@@ -9283,8 +9377,8 @@ fn refs_create_collection_matches_the_tool() {
     let tool = clone_repo(base, &repo, "coll-create-tool");
 
     // `-c --create` takes NEWREF as `<collection-id>:<ref>` and writes
-    // `refs/mirrors/<collection-id>/<ref>`. `-c` wins over `-A` here too, so the
-    // third write is a ref file and not a symlink.
+    // `refs/mirrors/<collection-id>/<ref>`. `-c` wins over `-A` here too, so
+    // the third write is a plain ref file.
     for args in [
         vec!["refs", "-c", "--create=org.example.Fresh:new", "plain"],
         vec!["refs", "-c", "--create=org.example.Fresh:a/b", "plain"],
@@ -9296,7 +9390,7 @@ fn refs_create_collection_matches_the_tool() {
             "plain",
         ],
         vec!["refs", "-c", "--create=_x.y:z", "plain"],
-        // --force replaces the collection ref just written.
+        // `--force` replaces the collection ref that the first write created.
         vec![
             "refs",
             "-c",
@@ -9320,9 +9414,12 @@ fn refs_create_collection_matches_the_tool() {
             .is_file()
     );
 
-    // The refusals, in the order the two take them: the existence check reads
-    // NEWREF as an ordinary refspec, the pair shape follows, the positional
-    // resolves next, and the collection id is validated last.
+    // The refusals, in the order that both commands take them:
+    //
+    // 1. the existence check, which reads NEWREF as an ordinary refspec
+    // 2. the check of the pair shape
+    // 3. the resolution of the positional
+    // 4. the check of the collection id
     for (args, message) in [
         (
             vec!["refs", "-c", "--create=plain", "plain"],
@@ -9356,8 +9453,8 @@ fn refs_create_collection_matches_the_tool() {
             vec!["refs", "-c", "--create=nocollection", "plain"],
             "error: Invalid collection ID nocollection".to_owned(),
         ),
-        // --force suppresses the already-exists refusal, so a name the existence
-        // check resolves reaches the collection-id validation.
+        // `--force` turns off the already-exists refusal, so a name that the
+        // existence check resolves reaches the check of the collection id.
         (
             vec!["refs", "-c", "--create=plain", "--force", "plain"],
             "error: Invalid collection ID plain".to_owned(),
@@ -9366,15 +9463,14 @@ fn refs_create_collection_matches_the_tool() {
         assert_agrees_on_error(&port, &tool, &args, &message);
     }
 
-    // A NEWREF with no `:` that is a collection id carries no ref name. This is
-    // the one divergence: the tool prints a GLib assertion line before its own
-    // message, and the port prints the message alone
-    // (`docs/conformance/cli-surface.md`, "P1"). The two are compared here
-    // rather than through `assert_agrees_on_error` because the tool's outcome
-    // depends on its build: 2026.1 prints the critical line and exits 1, and
-    // 2026.2 leaves the error unset and aborts in `ostree_run` on
-    // `assertion failed: (success || error)`. The port's refusal is the same
-    // either way, so it is what this states.
+    // A NEWREF with no `:` that is a collection id holds no ref name. This is
+    // a recorded divergence: the `ostree` command prints a GLib assertion line
+    // before its message, and ostrya prints only the message. The test
+    // compares the two runs here, outside `assert_agrees_on_error`, because
+    // the outcome of `ostree` depends on its build. 2026.1 prints the critical
+    // line and exits 1. 2026.2 leaves the error unset and aborts in
+    // `ostree_run` on `assertion failed: (success || error)`. The refusal of
+    // ostrya is the same for both builds, so the test asserts it.
     let refused = ostrya(
         &[
             "refs",
@@ -9410,8 +9506,9 @@ fn refs_create_collection_matches_the_tool() {
         other => panic!("the tool neither refused nor died on a signal: {other:?}"),
     }
 
-    // A ref name ending in `^` kills the tool the way it does without `-c`, so
-    // the port's refusal stands on its own (`cli-surface.md`, "P1").
+    // A ref name that ends in `^` kills the `ostree` command, as it does
+    // without `-c`. This is a recorded divergence, so the test asserts the
+    // refusal of ostrya alone.
     let refused = ostrya(
         &[
             "refs",
@@ -9460,15 +9557,16 @@ fn invalid_refspec_matches_the_tool() {
     let port = clone_repo(base, &repo, "refspec-port");
     let tool = clone_repo(base, &repo, "refspec-tool");
 
-    // A refspec that would leave the `refs/` tree is refused in the same words
-    // wherever it is taken: as NEWREF, as the positional revision, and as a
-    // revision of its own. The suffix is stripped before the name is reported,
-    // and a `<remote>:` prefix is part of it.
+    // A refspec that leads out of the `refs/` tree is refused with the same
+    // words at each place that takes it: as NEWREF, as the positional
+    // revision, and as a standalone revision (`rev-parse`, `cat`). The suffix
+    // is removed before the name is reported, and a `<remote>:` prefix is
+    // part of the name.
     for (args, message) in [
         (vec!["refs", "--create=a/../b", "plain"], "a/../b"),
         (vec!["refs", "-A", "--create=a/../b", "plain"], "a/../b"),
-        // Under `-A` the NEWREF steps precede the target's existence check, so a
-        // refused NEWREF is reported over a refused target.
+        // Under `-A`, the NEWREF steps come before the existence check of the
+        // target, so the refusal of NEWREF wins over the refusal of the target.
         (vec!["refs", "-A", "--create=a/../b", "a/../b"], "a/../b"),
         (vec!["refs", "--create=fresh", "a/../b"], "a/../b"),
         // A remote is one component, so a `/` in it names no remote.
@@ -9479,8 +9577,8 @@ fn invalid_refspec_matches_the_tool() {
         (vec!["rev-parse", "."], "."),
         (vec!["rev-parse", "origin:../escape"], "origin:../escape"),
         (vec!["cat", "a/../b", "/hello.txt"], "a/../b"),
-        // Under `-c` the whole `<collection-id>:<ref>` pair is the name, and
-        // either half can carry the fault.
+        // Under `-c`, the whole `<collection-id>:<ref>` pair is the name, and
+        // each half can hold the fault.
         (vec!["refs", "-c", "--create=:bar", "plain"], ":bar"),
         (
             vec!["refs", "-c", "--create=org.example.Fresh:", "plain"],
@@ -9490,8 +9588,8 @@ fn invalid_refspec_matches_the_tool() {
             vec!["refs", "-c", "--create=org.example.Fresh:a/../b", "plain"],
             "org.example.Fresh:a/../b",
         ),
-        // Under `--force` the name is still refused before the positional
-        // resolves, which `nosuch` states.
+        // Under `--force`, the name is still refused before the positional
+        // resolves. The positional `nosuch` shows this.
         (
             vec!["refs", "--create=a/../b", "--force", "nosuch"],
             "a/../b",
@@ -9514,12 +9612,16 @@ fn invalid_refspec_matches_the_tool() {
             &format!("error: Invalid refspec {message}"),
         );
     }
-    // An alias target reaches an existence check that stands ahead of the ref
-    // name rule, so every name the rule refuses is reported as a name no ref
-    // holds, in both implementations, and no `Invalid refspec` line reaches this
-    // site: a traversal component, an empty component, `.`, `..`, the empty
-    // name, an empty ref half, a second `:`, a `/` in the remote half, a `~` in
-    // a component, and an ancestry suffix, which names a commit.
+    // An alias target reaches an existence check that comes before the ref
+    // name rule. As a result, both commands report every name that the rule
+    // refuses as a name that no ref holds. No `Invalid refspec` line comes
+    // from this site. The names are:
+    //
+    // - a traversal component, an empty component, `.`, and `..`
+    // - the empty name and an empty ref half
+    // - a second `:` and a `/` in the remote half
+    // - a `~` in a component
+    // - an ancestry suffix, which names a commit
     for target in [
         "a/../b",
         "a//b",
@@ -9539,9 +9641,9 @@ fn invalid_refspec_matches_the_tool() {
             &format!("error: Cannot create alias to non-existent ref: {target}"),
         );
     }
-    // The tool's check answers the two i/o conditions with that same line, where
-    // the port reports the message it gives each of them
-    // (`docs/conformance/cli-surface.md`, "P1").
+    // The check of the `ostree` command answers the two i/o conditions with
+    // that same line. ostrya reports the message that it gives for each
+    // condition. This is a recorded divergence.
     for (target, message) in [
         ("plain/x", "error: i/o error: Not a directory (os error 20)"),
         ("deep", "error: i/o error: Is a directory (os error 21)"),
@@ -9571,8 +9673,8 @@ fn invalid_refspec_matches_the_tool() {
         "a refused name wrote a ref",
     );
 
-    // A branch name the ref-name rule refuses is refused by `commit -b` in both
-    // implementations: exit 1, and no ref written.
+    // If the ref-name rule refuses a branch name, `commit -b` refuses it in
+    // both commands: exit 1, and no ref is written.
     let src = base.join("src");
     let before = describe_refs(&port);
     for branch in ["tes~t", "te st", "a^b"] {
@@ -9608,12 +9710,11 @@ fn invalid_refspec_matches_the_tool() {
         "the tool wrote a refused name"
     );
 
-    // Two divergences the same surface carries, recorded in
-    // `docs/conformance/cli-surface.md`, "P1".
+    // Two recorded divergences on the same surface.
     //
-    // The empty refspec is the zero-length case of the tool's
-    // abbreviated-checksum scan, and the count that decides it is of commits;
-    // the port refuses the name.
+    // The empty refspec is the zero-length case of the abbreviated-checksum
+    // scan of the `ostree` command. The count that decides it is a count of
+    // commits. ostrya refuses the name.
     let (refused, searched) = run_both(&port, &tool, &["rev-parse", ""]);
     assert_eq!(refused.status.code(), Some(1));
     assert_eq!(
@@ -9627,10 +9728,10 @@ fn invalid_refspec_matches_the_tool() {
         String::from_utf8_lossy(&searched.stderr),
     );
 
-    // A ref name that names a directory is refused by both where the tool's
-    // `--create` scan finds a ref below the name, in one message from the port and
-    // in three from the tool, two of which carry a name the port cannot
-    // reproduce: a ref read in directory order, and a temporary file.
+    // Both commands refuse a ref name that names a directory if the `--create`
+    // scan of the `ostree` command finds a ref under the name. ostrya gives one
+    // message. `ostree` gives three, and two of them hold a name that ostrya
+    // cannot reproduce: a ref read in directory order, and a temporary file.
     for (args, tail) in [
         (
             vec!["refs", "--create=deep", "plain"],
@@ -9665,18 +9766,20 @@ fn invalid_refspec_matches_the_tool() {
         "a refused write over a ref directory changed `refs/`",
     );
 
-    // That scan runs under `refs/heads` alone, so a directory it passes is
-    // replaced by the ref file at exit 0 and the refs below it are removed, where
-    // the port refuses (`docs/conformance/cli-surface.md`, "P1"). The two trees
-    // part company here, so this pair of clones is its own.
+    // That scan runs only under `refs/heads`. If the scan passes a directory,
+    // the `ostree` command replaces it with the ref file at exit 0 and removes
+    // the refs under it. ostrya refuses. This is a recorded divergence. The two
+    // trees differ from this point, so this part uses a separate pair of
+    // clones.
     let dir_port = clone_repo(base, &repo, "refspec-dir-port");
     let dir_tool = clone_repo(base, &repo, "refspec-dir-tool");
     let before = describe_refs(&dir_port);
     let head = resolve(&repo, "plain").unwrap();
 
-    // Under `-A` a NEWREF naming a remote reaches no directory check in either
-    // implementation: the tool refuses at its remote-alias step and the port at
-    // the existence check ahead of it, and neither writes.
+    // Under `-A`, a NEWREF that names a remote reaches no directory check in
+    // either command. The `ostree` command refuses at its remote-alias step,
+    // and ostrya refuses at the existence check before that step. Neither
+    // command writes.
     let (refused, aliased) = run_both(
         &dir_port,
         &dir_tool,
@@ -9698,8 +9801,9 @@ fn invalid_refspec_matches_the_tool() {
         assert_eq!(String::from_utf8_lossy(&run.stderr), message);
     }
 
-    // The plain form over a directory under `refs/remotes`: the tool writes the
-    // ref file in its place and destroys `origin:rr/x` and `origin:rr/deep/y`.
+    // The plain form over a directory under `refs/remotes`: the `ostree`
+    // command writes the ref file in its place and destroys `origin:rr/x` and
+    // `origin:rr/deep/y`.
     let (refused, replaced) = run_both(
         &dir_port,
         &dir_tool,
@@ -9729,9 +9833,9 @@ fn invalid_refspec_matches_the_tool() {
         "the tool kept the refs below the directory it replaced:\n{after:#?}",
     );
 
-    // An empty directory under `refs/heads` takes the same path, and `--delete`
-    // leaves one behind in both implementations when it removes a directory's
-    // last ref, so the shape arrives from either writer.
+    // An empty directory under `refs/heads` takes the same path. If `--delete`
+    // removes the last ref of a directory, both commands leave the empty
+    // directory, so each writer can make this shape.
     assert_agrees(&dir_port, &dir_tool, &["refs", "--delete", "deep/nest/ing"]);
     let (refused, written) = run_both(
         &dir_port,
@@ -9756,9 +9860,9 @@ fn invalid_refspec_matches_the_tool() {
     );
 }
 
-/// A refspec whose remote or name fails the ref-name rule is refused by `refs
-/// --create`: exit 1, nothing on standard output, and no ref written. The
-/// test needs no `ostree` tool.
+/// `refs --create` refuses a refspec if its remote or its name fails the
+/// ref-name rule: exit 1, nothing on standard output, and no ref written. The
+/// test does not need the `ostree` command.
 #[test]
 fn a_refspec_outside_the_ref_name_rule_is_refused_on_write() {
     let tmp = TmpDir::new("refspec-rule-write");
@@ -9790,7 +9894,7 @@ fn a_refspec_outside_the_ref_name_rule_is_refused_on_write() {
 
 /// A ref name that is not valid UTF-8 is refused at the decoding of the
 /// arguments: exit 1, nothing on standard output, and no ref written. The
-/// test needs no `ostree` tool.
+/// test does not need the `ostree` command.
 #[test]
 fn a_non_utf8_ref_name_is_refused() {
     use std::ffi::OsStr;
@@ -9849,9 +9953,9 @@ fn rev_parse_ancestry_matches_the_tool() {
     build_fixture_source(base);
     let repo = create_repo(base, RepoMode::Archive);
     let src = base.join("src");
-    // The chain is built by committing three times onto one branch, each commit
-    // taking the branch's tip as its parent with no `--parent` of its own: a
-    // commit onto an existing branch takes the branch's tip as its parent.
+    // The test builds the chain with three commits onto one branch, with no
+    // `--parent` option. A commit onto an existing branch takes the tip of the
+    // branch as its parent.
     let root = commit_tree(&repo, "chain", &src, None);
     std::fs::write(src.join("hello.txt"), b"second revision\n").unwrap();
     commit_tree(&repo, "chain", &src, None);
@@ -9869,14 +9973,14 @@ fn rev_parse_ancestry_matches_the_tool() {
     ] {
         assert_agrees(&repo, &repo, &args);
     }
-    // Walking past the root commit reports the root's own checksum.
+    // A walk past the root commit reports the checksum of the root.
     assert_agrees_on_error(
         &repo,
         &repo,
         &["rev-parse", "chain^^^"],
         &format!("error: Commit {root} has no parent"),
     );
-    // Three commits, so --single has no single answer.
+    // Three commits, so `--single` has no single answer.
     assert_agrees_on_error(
         &repo,
         &repo,
@@ -9885,8 +9989,8 @@ fn rev_parse_ancestry_matches_the_tool() {
     );
 
     // `~N` and `^N` are not revision syntax. The ref-name rule refuses both
-    // names in both implementations, so each reports the whole revision as an
-    // invalid refspec. A checksum carrying either suffix takes the same path.
+    // names in both commands, so each command reports the whole revision as
+    // an invalid refspec. A checksum with either suffix takes the same path.
     let suffixed = format!("{tip}~1");
     for rev in ["chain~1", "chain^2", suffixed.as_str()] {
         assert_agrees_on_error(
@@ -9898,10 +10002,9 @@ fn rev_parse_ancestry_matches_the_tool() {
     }
 }
 
-/// A revision naming a commit the store does not hold: refused where the commit
-/// is read, in each implementation's own words, and accepted where the site
-/// takes the checksum without reading it
-/// (`docs/format-reference.md`, "Revision syntax").
+/// A revision that names a commit that the store does not hold. Each site that
+/// reads the commit refuses it, in the words of each command. Each site that
+/// takes the checksum without a read accepts it.
 #[test]
 fn absent_commit_object_matches_the_tool() {
     if !ostree_available() {
@@ -9916,8 +10019,9 @@ fn absent_commit_object_matches_the_tool() {
     let absent = "0".repeat(64);
     let ancestor = format!("{absent}^");
 
-    // The tool names the loose object file it looked for and the port names the
-    // object type the library looked up, both exiting 1 and writing nothing.
+    // The `ostree` command names the loose object file that it looked for.
+    // ostrya names the object type that the library looked up. Both exit 1 and
+    // write nothing.
     let refused = |port_repo: &Path, tool_repo: &Path, args: &[&str]| {
         let (port, tool) = run_both(port_repo, tool_repo, args);
         for (who, run, message) in [
@@ -9947,17 +10051,18 @@ fn absent_commit_object_matches_the_tool() {
     refused(&repo, &repo, &["cat", &absent, "/hello.txt"]);
     refused(&repo, &repo, &["cat", &ancestor, "/hello.txt"]);
     refused(&repo, &repo, &["rev-parse", &ancestor]);
-    // `log` and `ls` resolve a commit too, so the starting revision draws the
-    // same pair rather than `log` reading an absent commit as an empty history.
+    // `log` and `ls` also resolve a commit, so the starting revision gets the
+    // same pair of refusals. `log` does not read an absent commit as an empty
+    // history.
     refused(&repo, &repo, &["log", &absent]);
     refused(&repo, &repo, &["ls", &absent]);
 
     // A bare checksum reaches no object, so `rev-parse` prints it and exits 0.
     assert_agrees(&repo, &repo, &["rev-parse", &absent]);
 
-    // The positional revision of `--create` reaches no object either, so both
-    // write a ref file holding the absent checksum, and reading that ref reports
-    // the same pair the checksum reports.
+    // The positional revision of `--create` also reaches no object, so both
+    // commands write a ref file with the absent checksum. A read of that ref
+    // reports the same pair that the checksum reports.
     let port_repo = clone_repo(base, &repo, "absent-port");
     let tool_repo = clone_repo(base, &repo, "absent-tool");
     assert_agrees(
@@ -9978,9 +10083,9 @@ fn absent_commit_object_matches_the_tool() {
     assert_agrees(&port_repo, &tool_repo, &["rev-parse", "dangling"]);
 }
 
-/// A 64-character revision names a commit in lowercase hex alone. An uppercase
-/// or mixed-case name of that length is a ref name wherever a revision or a
-/// NEWREF is taken (`docs/format-reference.md`, "Revision syntax").
+/// A 64-character revision names a commit only in lowercase hex. An uppercase
+/// or mixed-case name of that length is a ref name at each place that takes a
+/// revision or a NEWREF.
 #[test]
 fn checksum_case_matches_the_tool() {
     if !ostree_available() {
@@ -9994,8 +10099,9 @@ fn checksum_case_matches_the_tool() {
     commit_tree(&repo, "test/main", &src, None);
     let real = resolve(&repo, "test/main").unwrap();
     let upper = real.to_uppercase();
-    // One uppercase character parts the two readings, so the mixed case raises
-    // the checksum's first letter and leaves the rest alone.
+    // One uppercase character is enough to separate the two readings. The
+    // mixed case changes the first letter of the checksum to uppercase and
+    // keeps the rest.
     let letter = real.find(|c: char| c.is_ascii_alphabetic()).unwrap();
     let mixed = format!(
         "{}{}{}",
@@ -10009,9 +10115,10 @@ fn checksum_case_matches_the_tool() {
     let checkout = base.join("co");
     let checkout = checkout.to_str().unwrap();
 
-    // The read sites: the uppercase name reaches the ref lookup and both report
-    // the line they give a name that resolves to nothing. The mixed case of a
-    // lowercase checksum is that same name, and the lowercase form resolves.
+    // The read sites: the uppercase name reaches the ref lookup, and both
+    // commands report the line that they give for a name that resolves to
+    // nothing. The mixed case of a lowercase checksum is also such a name, and
+    // the lowercase form resolves.
     for args in [
         vec!["rev-parse", real.as_str()],
         vec!["rev-parse", upper.as_str()],
@@ -10022,7 +10129,7 @@ fn checksum_case_matches_the_tool() {
         vec!["cat", upper.as_str(), "/hello.txt"],
         vec!["cat", mixed.as_str(), "/hello.txt"],
         vec!["checkout", upper.as_str(), checkout],
-        // As a PREFIX the name is matched and not resolved, so neither case
+        // As a PREFIX, the name is matched without a resolve, so neither case
         // matches a ref here.
         vec!["refs", upper.as_str()],
         vec!["refs", "--list", absent_lower.as_str()],
@@ -10030,8 +10137,8 @@ fn checksum_case_matches_the_tool() {
         assert_agrees(&repo, &repo, &args);
     }
 
-    // A NEWREF of that shape is read as a revision by the existence check, so
-    // the uppercase name is free and the lowercase one is taken.
+    // The existence check reads a NEWREF of that shape as a revision, so the
+    // uppercase name is free and the lowercase one is taken.
     let port_repo = clone_repo(base, &repo, "case-port");
     let tool_repo = clone_repo(base, &repo, "case-tool");
     let same_refs = |port: &Path, tool: &Path, what: &str| {
@@ -10055,8 +10162,8 @@ fn checksum_case_matches_the_tool() {
         describe_refs(&port_repo).contains(&format!("heads/{upper} = {real}")),
         "the ref file the uppercase NEWREF named is absent",
     );
-    // The ref that name now carries is what a revision of that name resolves
-    // to, and an alias records it.
+    // A revision of that name resolves to the ref that the name now has, and an
+    // alias records it.
     assert_agrees(&port_repo, &tool_repo, &["rev-parse", &upper]);
     assert_agrees(&port_repo, &tool_repo, &["cat", &upper, "/hello.txt"]);
     assert_agrees(&port_repo, &tool_repo, &["refs"]);
@@ -10066,8 +10173,8 @@ fn checksum_case_matches_the_tool() {
         &["refs", "-A", "--create=al", &upper],
     );
     same_refs(&port_repo, &tool_repo, "after an alias to that ref");
-    // The alias guard reads the link body as a name, so the ref it holds is
-    // guarded under that name in both.
+    // The alias guard reads the link body as a name, so in both commands the
+    // guard holds the ref under that name.
     assert_agrees_on_error(
         &port_repo,
         &tool_repo,
@@ -10081,7 +10188,7 @@ fn checksum_case_matches_the_tool() {
         "after removing the alias and the ref",
     );
 
-    // The refusals the same shapes draw, each leaving `refs/` untouched.
+    // The refusals that the same shapes get. No refusal changes `refs/`.
     let port_repo = clone_repo(base, &repo, "case-refused-port");
     let tool_repo = clone_repo(base, &repo, "case-refused-tool");
     for (args, message) in [
@@ -10121,10 +10228,10 @@ fn checksum_case_matches_the_tool() {
         "a refused invocation changed the refs tree",
     );
 
-    // `commit --parent` takes a checksum in the tool and any revision in the
-    // port, so the uppercase form is a ref name to the port and a malformed
-    // checksum to the tool. Both refuse and write no ref
-    // (`docs/conformance/cli-surface.md`, "P2").
+    // In the `ostree` command, `commit --parent` takes a checksum. In ostrya,
+    // it takes any revision. As a result, ostrya reads the uppercase form as a
+    // ref name, and `ostree` reads it as a malformed checksum. Both refuse and
+    // write no ref. This is a recorded divergence.
     let parent = format!("--parent={upper}");
     let (port, tool) = run_both(
         &port_repo,
@@ -10140,7 +10247,8 @@ fn checksum_case_matches_the_tool() {
             src.to_str().unwrap(),
         ],
     );
-    // The tool names the first character its own reader refuses, by byte value.
+    // The `ostree` command names the first character that its reader refuses,
+    // by byte value.
     let raised = upper.as_bytes()[letter];
     for (who, run, message) in [
         (
@@ -10160,10 +10268,10 @@ fn checksum_case_matches_the_tool() {
     }
     same_refs(&port_repo, &tool_repo, "after a refused --parent");
 
-    // Ref file content is the other side of the rule, and only an out-of-band
-    // write puts an uppercase checksum there: both implementations render a
-    // checksum in lowercase. The port's reader takes either case and the tool
-    // refuses the file.
+    // Ref file content is the other side of the rule. Only an out-of-band
+    // write puts an uppercase checksum there, because both commands render a
+    // checksum in lowercase. The reader of ostrya takes both cases, and the
+    // `ostree` command refuses the file.
     for repo in [&port_repo, &tool_repo] {
         std::fs::write(
             repo.join("refs/heads/uc"),
@@ -10184,15 +10292,17 @@ fn checksum_case_matches_the_tool() {
     );
 }
 
-/// `commit` parenting: a branch's current tip is the parent a commit naming that
-/// branch inherits, a tip standing over an absent commit object included,
-/// `--parent=none` and `--orphan` each ask for a root commit while the ref still
-/// moves, `--orphan` alone permits a commit that names no branch, and a commit
-/// naming neither is refused (`docs/format-reference.md`, "CLI output formats").
+/// The parent rules of `commit`:
 ///
-/// Both sides commit under one `SOURCE_DATE_EPOCH`, so each printed checksum
-/// states the whole commit object, the `parent` field included, rather than
-/// stating that a commit happened.
+/// - A commit that names a branch inherits the current tip of the branch as
+///   its parent. This also applies if the tip names an absent commit object.
+/// - `--parent=none` and `--orphan` each ask for a root commit, and the ref
+///   still moves.
+/// - Only `--orphan` permits a commit that names no branch.
+/// - A commit that names neither is refused.
+///
+/// Both commands commit under one `SOURCE_DATE_EPOCH`, so each printed checksum
+/// states the whole commit object, the `parent` field included.
 #[test]
 fn commit_parenting_matches_the_tool() {
     if !ostree_available() {
@@ -10213,8 +10323,8 @@ fn commit_parenting_matches_the_tool() {
             .sum::<usize>()
     };
     let epoch = [("SOURCE_DATE_EPOCH", SOURCE_DATE_EPOCH)];
-    /// A commit onto the branch `chain`, with `extra` between the subject and the
-    /// tree the commit reads.
+    /// The arguments of a commit onto the branch `chain`, with `extra` between
+    /// the subject and the tree that the commit reads.
     fn commit_args<'a>(subject: &'a str, extra: &[&'a str], src: &'a str) -> Vec<&'a str> {
         let mut args = vec!["commit", "-b", "chain", "-s", subject];
         args.extend_from_slice(extra);
@@ -10222,8 +10332,8 @@ fn commit_parenting_matches_the_tool() {
         args
     }
 
-    // The first commit onto a fresh branch has no tip to take, so it is a root
-    // commit; the second takes the tip the first left.
+    // The first commit onto a new branch has no tip to take, so it is a root
+    // commit. The second commit takes the tip that the first one left.
     let port_repo = clone_repo(base, &empty, "chain-port");
     let tool_repo = clone_repo(base, &empty, "chain-tool");
     assert_agrees_env(
@@ -10260,9 +10370,10 @@ fn commit_parenting_matches_the_tool() {
     let chained = clone_repo(base, &port_repo, "chained");
     let tip = resolve(&chained, "chain").expect("the second commit moved the ref");
 
-    // The tip is read from the ref file and not loaded, so a ref standing over an
-    // absent commit object is inherited unread. Only an out-of-band write puts
-    // such a ref in place, so the ref file is written here.
+    // The commit reads the tip from the ref file and does not load the commit
+    // object. As a result, a ref that names an absent commit object is
+    // inherited without a read. Only an out-of-band write puts such a ref in
+    // place, so the test writes the ref file.
     let port_repo = clone_repo(base, &empty, "unread-port");
     let tool_repo = clone_repo(base, &empty, "unread-tool");
     let unread = "a".repeat(64);
@@ -10304,9 +10415,9 @@ fn commit_parenting_matches_the_tool() {
         "the two refs trees differ after a commit over an absent tip",
     );
 
-    // Each form that asks for a root commit over a branch that has a tip. The ref
-    // moves to the new commit in both cases, so the suppressed parent is the whole
-    // observable effect of `--orphan` where a branch is named.
+    // Each form that asks for a root commit over a branch that has a tip. The
+    // ref moves to the new commit in both cases. As a result, if a branch is
+    // named, the only visible effect of `--orphan` is the missing parent.
     for (case, extra) in [("none", "--parent=none"), ("orphan", "--orphan")] {
         let port_repo = clone_repo(base, &chained, &format!("{case}-port"));
         let tool_repo = clone_repo(base, &chained, &format!("{case}-tool"));
@@ -10331,8 +10442,8 @@ fn commit_parenting_matches_the_tool() {
         );
     }
 
-    // An explicit `--parent` beside `--orphan` still parents the commit, so what
-    // `--orphan` suppresses is the implicit parent alone.
+    // An explicit `--parent` with `--orphan` still gives the commit a parent,
+    // so `--orphan` removes only the implicit parent.
     let port_repo = clone_repo(base, &chained, "orphan-parent-port");
     let tool_repo = clone_repo(base, &chained, "orphan-parent-tool");
     let parent = format!("--parent={root}");
@@ -10348,9 +10459,9 @@ fn commit_parenting_matches_the_tool() {
         "`--orphan --parent` did not take the parent it was given",
     );
 
-    // `--orphan` with no branch: both print a checksum and write no ref, and the
-    // commit carries an empty `ostree.ref-binding`, which the tool reads back out
-    // of the port's own commit.
+    // `--orphan` with no branch: both commands print a checksum and write no
+    // ref. The commit holds an empty `ostree.ref-binding`, and the `ostree`
+    // command reads this binding back from the commit that ostrya wrote.
     let port_repo = clone_repo(base, &empty, "no-branch-port");
     let tool_repo = clone_repo(base, &empty, "no-branch-tool");
     let orphan = [
@@ -10387,8 +10498,9 @@ fn commit_parenting_matches_the_tool() {
         "the tool read another binding out of the port's orphan commit",
     );
 
-    // A commit naming neither a branch nor `--orphan` is refused before the parent
-    // is read, before the tree is read, and before anything is published.
+    // A commit that names neither a branch nor `--orphan` is refused. The
+    // refusal comes before the parent is read, before the tree is read, and
+    // before anything is published.
     let port_repo = clone_repo(base, &empty, "neither-port");
     let tool_repo = clone_repo(base, &empty, "neither-tool");
     for args in [
@@ -10412,9 +10524,9 @@ fn commit_parenting_matches_the_tool() {
         assert_eq!(objects(repo), 0, "the {who} published an object");
     }
 
-    // The `--parent` literal is lowercase alone, so any other spelling is a
-    // revision, which parts the two implementations the way every `--parent`
-    // value that is no checksum does (`docs/conformance/cli-surface.md`, "P2").
+    // The `--parent` literal `none` is only lowercase, so each other spelling
+    // is a revision. As with every `--parent` value that is not a checksum,
+    // the two commands differ here. This is a recorded divergence.
     let (port, tool) = run_both(
         &port_repo,
         &tool_repo,
@@ -10430,10 +10542,9 @@ fn commit_parenting_matches_the_tool() {
     }
 }
 
-/// `commit -b` refuses a branch name of 64 lowercase hex characters -- the shape
-/// resolution reads as a checksum, so a ref carrying it is reachable by no
-/// revision -- and takes every other name of that length
-/// (`docs/format-reference.md`, "Revision syntax").
+/// `commit -b` refuses a branch name of 64 lowercase hex characters, and takes
+/// every other name of that length. Resolution reads that shape as a checksum,
+/// so no revision can reach a ref with that name.
 #[test]
 fn commit_checksum_branch_name_matches_the_tool() {
     if !ostree_available() {
@@ -10471,7 +10582,8 @@ fn commit_checksum_branch_name_matches_the_tool() {
         run_both(port, tool, &args)
     };
 
-    // The refusal itself: both name the branch as given and write no ref.
+    // The refusal itself: both commands name the branch as given and write no
+    // ref.
     let port_repo = clone_repo(base, &empty, "guard-port");
     let tool_repo = clone_repo(base, &empty, "guard-tool");
     let refused = commit_args(&lower, src);
@@ -10484,20 +10596,20 @@ fn commit_checksum_branch_name_matches_the_tool() {
             "the {who} wrote a ref for the refused branch name",
         );
     }
-    // The tool writes the tree and the commit object before it reads the branch
-    // name, so the refusal leaves them in `objects/`; the port publishes a
-    // transaction's objects at commit and therefore publishes none
-    // (`docs/conformance/cli-surface.md`, "P2"). The refs tree above is the
-    // oracle the two share.
+    // The `ostree` command writes the tree and the commit object before it
+    // reads the branch name, so the refusal leaves them in `objects/`. ostrya
+    // publishes the objects of a transaction at commit, so it publishes none.
+    // This is a recorded divergence. The refs-tree comparison of this step is
+    // the oracle that both commands share.
     assert_eq!(objects(&port_repo), 0, "the port published an object");
     assert!(
         objects(&tool_repo) > 0,
         "the tool published no object before the refusal",
     );
 
-    // The guard sits at the ref write, so every fault ahead of it is reported
-    // instead: an unresolvable `--parent` and a tree path that does not open,
-    // each worded per implementation.
+    // The guard is at the ref write, so the command reports each fault that
+    // comes before the guard: an unresolvable `--parent` and a tree path that
+    // does not open. Each command uses its own words.
     let mut parent = commit_args(&lower, src);
     parent.insert(6, "--parent=nosuchref".to_owned());
     for (args, port_line, tool_line) in [
@@ -10520,11 +10632,12 @@ fn commit_checksum_branch_name_matches_the_tool() {
         }
     }
 
-    // Every other 64-character shape is a branch name to both: one character
-    // short, one long, one outside the hex class, all-uppercase, and one raised
-    // character. Each side commits with its own binary and neither passes a
-    // timestamp, so the two checksums differ wherever the runs straddle a
-    // second; the claim is that each wrote the ref its own commit named.
+    // Both commands read every other shape of the 64-character name as a
+    // branch name: one character short, one character long, one outside the
+    // hex class, all uppercase, and one uppercase character. Each command
+    // commits with its own binary, and neither passes a timestamp. As a result,
+    // the two checksums differ if the runs fall in different seconds. The
+    // claim is that each command wrote the ref that its own commit named.
     let port_repo = clone_repo(base, &empty, "shapes-port");
     let tool_repo = clone_repo(base, &empty, "shapes-tool");
     let mixed = format!("{}B", "b".repeat(63));
@@ -10558,11 +10671,11 @@ fn commit_checksum_branch_name_matches_the_tool() {
     }
 }
 
-/// `commit -b` refuses a branch name ending in `^` -- the second shape the
-/// revision syntax shadows, read as ancestry wherever a revision is taken -- in
-/// the words the port already gives that shape at `refs --create`. The tool
-/// parts three ways over the base the suffix names
-/// (`docs/conformance/cli-surface.md`, "P2").
+/// `commit -b` refuses a branch name that ends in `^`, with the words that
+/// ostrya gives that shape at `refs --create`. This is the second shape that
+/// the revision syntax shadows: each place that takes a revision reads it as
+/// ancestry. The `ostree` command differs in three ways, by the base that the
+/// suffix names. This is a recorded divergence.
 #[test]
 fn commit_ancestry_branch_name_matches_the_tool() {
     if !ostree_available() {
@@ -10604,8 +10717,9 @@ fn commit_ancestry_branch_name_matches_the_tool() {
         assert_eq!(String::from_utf8_lossy(&got.stderr), want);
     };
 
-    // A base that names no ref: the port refuses at the ref write and the tool
-    // dies on a signal, so the refs tree is the oracle the two share.
+    // A base that names no ref: ostrya refuses at the ref write, and the
+    // `ostree` command dies on a signal. As a result, the refs tree is the
+    // oracle that both commands share.
     let port_repo = clone_repo(base, &empty, "absent-port");
     let tool_repo = clone_repo(base, &empty, "absent-tool");
     for branch in ["main^", "a^^"] {
@@ -10618,19 +10732,21 @@ fn commit_ancestry_branch_name_matches_the_tool() {
         );
     }
 
-    // An empty base, which is the zero-length case of the tool's
-    // abbreviated-checksum scan, so over a repository holding no commit it
-    // reaches the ref store and names nothing there, and both refuse: the port
-    // names the branch as given and the tool the base it split off.
+    // An empty base is the zero-length case of the abbreviated-checksum scan
+    // of the `ostree` command. In a repository with no commit, the scan
+    // reaches the ref store and finds nothing there, and both commands refuse.
+    // ostrya names the branch as given, and `ostree` names the base that it
+    // split off.
     for branch in ["^", "^^"] {
         let (port, tool) = run(&commit_args(branch, src), &port_repo, &tool_repo);
         refused("port", &port, &format!("error: Invalid refspec {branch}\n"));
         refused("tool", &tool, "error: Invalid refspec \n");
     }
 
-    // The tool reads the branch name before it commits the tree here, where the
-    // 64-character guard reads it after, so neither side published an object
-    // and both left `refs/` alone.
+    // For these names, the `ostree` command reads the branch name before it
+    // commits the tree. For the 64-character guard, it reads the name after
+    // the commit. As a result, neither command published an object, and both
+    // left `refs/` unchanged.
     for (who, repo) in [("port", &port_repo), ("tool", &tool_repo)] {
         assert_eq!(
             describe_refs(repo),
@@ -10640,8 +10756,8 @@ fn commit_ancestry_branch_name_matches_the_tool() {
         assert_eq!(objects(repo), 0, "the {who} published an object");
     }
 
-    // A base resolving to a root commit: the port reports the name and the tool
-    // reports the walk it could not take.
+    // A base that resolves to a root commit: ostrya reports the name, and the
+    // `ostree` command reports the walk that failed.
     let rooted = clone_repo(base, &empty, "rooted");
     let root = commit_tree(&rooted, "main", &tree, None);
     let rooted_refs = describe_refs(&rooted);
@@ -10655,19 +10771,19 @@ fn commit_ancestry_branch_name_matches_the_tool() {
         &format!("error: Commit {root} has no parent\n"),
     );
 
-    // The two faults that stand ahead of the port's guard, each worded per
-    // implementation: an unresolvable `--parent`, which both read first, and a
-    // tree path that does not open, which the tool reaches only after the
-    // branch name it already refused.
+    // Two faults come before the guard of ostrya, and each command reports
+    // them in its own words. Both commands read an unresolvable `--parent`
+    // first. The `ostree` command reaches a tree path that does not open only
+    // after the branch name, which it already refused.
     let mut parent = commit_args("main^", src);
     parent.insert(6, "--parent=nosuchref".to_owned());
     let (port, tool) = run(&parent, &port_repo, &tool_repo);
     refused("port", &port, "error: Refspec 'nosuchref' not found\n");
     refused("tool", &tool, "error: Invalid rev nosuchref\n");
-    // The other resolution failure a `--parent` reaches, in the same words every
-    // subcommand taking a revision gives it: the ancestry of a root commit. The
-    // tool's `--parent` takes a checksum alone, so it refuses the syntax
-    // (`docs/conformance/cli-surface.md`, "P2").
+    // The other resolution failure that a `--parent` reaches: the ancestry of
+    // a root commit. ostrya reports it in the same words as every subcommand
+    // that takes a revision. The `--parent` of the `ostree` command takes only
+    // a checksum, so it refuses the syntax. This is a recorded divergence.
     let mut ancestry = commit_args("main^", src);
     ancestry.insert(6, "--parent=main^".to_owned());
     let (port, tool) = run(&ancestry, &port_repo, &tool_repo);
@@ -10696,8 +10812,9 @@ fn commit_ancestry_branch_name_matches_the_tool() {
         );
     }
 
-    // A base resolving to a commit that has a parent, where the two agree in
-    // full: the walk succeeds and the tool refuses the name it then reads.
+    // A base that resolves to a commit with a parent. Here both commands agree
+    // in full: the walk succeeds, and then the `ostree` command reads the name
+    // and refuses it.
     let chained = clone_repo(base, &rooted, "chained");
     commit_tree(&chained, "main", &tree, Some(&root));
     let port_repo = clone_repo(base, &chained, "chained-port");
@@ -10716,8 +10833,8 @@ fn commit_ancestry_branch_name_matches_the_tool() {
         ],
     );
 
-    // A `^` inside the name fails the ref-name rule, so both refuse it with the
-    // same line and write nothing.
+    // A `^` inside the name fails the ref-name rule, so both commands refuse it
+    // with the same line and write nothing.
     let port_repo = clone_repo(base, &empty, "interior-port");
     let tool_repo = clone_repo(base, &empty, "interior-tool");
     let (port, tool) = run(&commit_args("a^b", src), &port_repo, &tool_repo);
@@ -10731,12 +10848,12 @@ fn commit_ancestry_branch_name_matches_the_tool() {
         );
     }
 
-    // What the guard stands for. A ref of the refused shape now arrives by an
-    // out-of-band write alone, and where one stands the tool's enumeration skips
-    // it without a word, so its `prune --refs-only` reads the commit that ref
-    // holds as unreachable and deletes it, leaving the ref file over an absent
-    // object. The same holds for a name such as `odd~1` that the ref-name rule
-    // refuses.
+    // The reason for the guard. Only an out-of-band write can make a ref of the
+    // refused shape. If such a ref exists, the enumeration of the `ostree`
+    // command skips it with no message. As a result, `prune --refs-only` of
+    // `ostree` reads the commit of that ref as unreachable and deletes it. The
+    // ref file then names an absent object. The same applies to a name that
+    // the ref-name rule refuses, for example `odd~1`.
     let shadowed = clone_repo(base, &rooted, "shadowed");
     std::fs::remove_file(shadowed.join("refs/heads/main")).unwrap();
     write_ref_file(&shadowed, "heads/main^", &root);
@@ -10783,28 +10900,29 @@ fn cat_path_resolution_matches_the_tool() {
     std::os::unix::fs::symlink("../a.txt", src.join("sub/parent")).unwrap();
     std::os::unix::fs::symlink("/a.txt", src.join("absolute")).unwrap();
     std::os::unix::fs::symlink("gone", src.join("dangling")).unwrap();
-    // A chain deeper than any one link, ending at a regular file: `deep0` is
-    // the head and 64 links lie between it and `a.txt`.
+    // A chain deeper than any one link, which ends at a regular file: `deep0`
+    // is the head, and 64 links lie between it and `a.txt`.
     let mut target = "a.txt".to_owned();
     for index in (0..64).rev() {
         let link = format!("deep{index}");
         std::os::unix::fs::symlink(&target, src.join(&link)).unwrap();
         target = link;
     }
-    // A link naming itself, which the tool recurses on until it dies.
+    // A link that names itself. The `ostree` command recurses on it until it
+    // dies.
     std::os::unix::fs::symlink("self", src.join("self")).unwrap();
     let repo = create_repo(base, RepoMode::Archive);
     commit_tree(&repo, "paths", &src, None);
 
     for args in [
-        // A symlink in the final position is followed, and a chain to its end,
-        // 64 links deep included.
+        // A symlink in the final position is followed, and so is a chain to its
+        // end, also a chain 64 links deep.
         vec!["cat", "paths", "/to-file"],
         vec!["cat", "paths", "/to-link"],
         vec!["cat", "paths", "/deep0"],
         vec!["cat", "paths", "/sub/sibling"],
-        // The target is resolved against the link's own directory, and `..` is
-        // looked up literally, so a target holding one fails.
+        // The target resolves against the directory of the link, and `..` is
+        // looked up as a literal name, so a target with `..` fails.
         vec!["cat", "paths", "/sub/parent"],
         // An absolute target is resolved against the commit root.
         vec!["cat", "paths", "/absolute"],
@@ -10818,20 +10936,20 @@ fn cat_path_resolution_matches_the_tool() {
         vec!["cat", "paths", "//a.txt"],
         vec!["cat", "paths", "/sub/../a.txt"],
         // An empty argument reaches no component and reports the root as
-        // absent; `/` reaches the root and is refused as a directory.
+        // absent. `/` reaches the root and is refused as a directory.
         vec!["cat", "paths", ""],
         vec!["cat", "paths", "/"],
         // A non-final component that is a file.
         vec!["cat", "paths", "/a.txt/b.txt"],
-        // Several paths, with the failure after a file already written.
+        // Several paths, with the failure after a file that is already written.
         vec!["cat", "paths", "/a.txt", "/sub/b.txt"],
         vec!["cat", "paths", "/a.txt", "/nope"],
     ] {
         assert_agrees(&repo, &repo, &args);
     }
 
-    // The link naming itself runs against the port alone, since the tool dies
-    // on a signal there.
+    // The link that names itself runs against ostrya alone, because the
+    // `ostree` command dies on a signal there.
     let run = ostrya(
         &[
             "cat",
@@ -10852,8 +10970,8 @@ fn cat_path_resolution_matches_the_tool() {
 }
 
 /// A deterministic pseudo-random payload of `len` bytes, from a 64-bit linear
-/// congruential generator, so a chunk boundary that dropped, repeated, or
-/// reordered bytes changes the output.
+/// congruential generator. If a chunk boundary drops, repeats, or reorders
+/// bytes, the output changes.
 fn pseudo_random_payload(len: usize) -> Vec<u8> {
     let mut state = 0x2545_f491_4f6c_dd1du64;
     let mut out = Vec::with_capacity(len + 8);
@@ -10868,13 +10986,17 @@ fn pseudo_random_payload(len: usize) -> Vec<u8> {
 }
 
 /// `cat` writes a payload larger than any buffer on its path byte for byte, in
-/// every mode a commit lands in.
+/// every mode that a commit can go into.
 ///
-/// This is the guard on the streaming claim: `FileObject::write_to` moves
-/// bounded chunks, and each mode stores the payload differently -- zlib-deflated
-/// inside an `archive` object, raw in `bare-user`, raw with no xattr header in
-/// `bare-user-only`. Where the tool is available it reads the port's own
-/// repository, so the stored bytes are checked from both sides.
+/// This test guards the streaming claim: `FileObject::write_to` moves bounded
+/// chunks. Each mode stores the payload differently:
+///
+/// - zlib-deflated inside an `archive` object
+/// - raw in `bare-user`
+/// - raw with no xattr header in `bare-user-only`
+///
+/// If the `ostree` command is available, it reads the repository of ostrya, so
+/// both commands check the stored bytes.
 #[test]
 fn cat_streams_a_large_payload_in_every_mode() {
     let tmp = TmpDir::new("cat-large");
@@ -10932,13 +11054,13 @@ fn cat_streams_a_large_payload_in_every_mode() {
     }
 }
 
-/// A refusal after a large payload keeps every byte already written.
+/// A refusal after a large payload keeps every byte that is already written.
 ///
-/// The stdout writer stages a write in an in-memory pipe a blocking worker
-/// drains, so the bytes it still holds reach the descriptor only once the writes
-/// settle. `cat` settles them on the refusal path as well as on the success one,
-/// which this pins with a payload larger than that pipe and a second path the
-/// lookup refuses.
+/// The stdout writer stages a write in an in-memory pipe that a blocking
+/// worker drains. The bytes that the pipe still holds reach the descriptor
+/// only when the writes settle. `cat` settles them on the refusal path and on
+/// the success path. This test pins that with a payload larger than the pipe
+/// and a second path that the lookup refuses.
 #[test]
 fn cat_keeps_the_payload_written_before_a_refusal() {
     let tmp = TmpDir::new("cat-refusal-tail");
@@ -11003,10 +11125,10 @@ fn cat_keeps_the_payload_written_before_a_refusal() {
 
 // --- show, log, ls, config ---------------------------------------------------
 
-/// The fixture repository read through `show` and `ls`, without the reference
-/// tool: the reports the port produces for the commit, its tree, and one file
-/// object, held to the text the tool was observed to write for them
-/// (`docs/format-reference.md`, "CLI output formats").
+/// The fixture repository read through `show` and `ls`, without the `ostree`
+/// command. The test reads the reports of ostrya for the commit, its tree, and
+/// one file object. It holds them to the text that `ostree` writes for them,
+/// as observed.
 #[test]
 fn show_and_ls_report_the_fixture() {
     let tmp = TmpDir::new("show-fixture");
@@ -11039,7 +11161,8 @@ fn show_and_ls_report_the_fixture() {
         "the commit report"
     );
 
-    // The symlink object's own report, reached by the checksum `ls -C` names.
+    // The report of the symlink object, reached through the checksum that
+    // `ls -C` names.
     let listing = ostrya(&[&repo_arg, "ls", "-C", BRANCH], None, &[]);
     let link_checksum = String::from_utf8(listing.ok().stdout.clone())
         .unwrap()
@@ -11064,11 +11187,11 @@ fn show_and_ls_report_the_fixture() {
     );
 }
 
-/// A repository the reference tool builds, holding what the port's own `commit`
-/// cannot yet state: a body, an empty subject, a `version` key, metadata of
-/// every type the format uses, and recorded sizes. The reading commands are then
-/// compared over it, which is also the interop direction that matters -- the
-/// port reads what the tool wrote.
+/// A repository that the `ostree` command builds. It holds a body, an empty
+/// subject, a `version` key, metadata of every type that the format uses, and
+/// recorded sizes. The tests compare the read subcommands of ostrya and
+/// `ostree` over it. This also covers one interop direction: ostrya reads what
+/// `ostree` wrote.
 #[cfg(unix)]
 fn tool_read_fixture(base: &Path) -> PathBuf {
     let repo = base.join("toolrepo");
@@ -11084,8 +11207,9 @@ fn tool_read_fixture(base: &Path) -> PathBuf {
     let repo_arg = format!("--repo={}", repo.display());
     ostree(&[&repo_arg, "init", "--mode=archive"]).ok();
     let src_arg = src.display().to_string();
-    // A subject and a two-line body, then a second commit onto the same branch
-    // so the walk has a parent to follow, with sizes recorded.
+    // A first commit with a subject. Then a second commit onto the same branch,
+    // with a subject, a two-line body, and recorded sizes. The walk then has a
+    // parent to follow.
     ostree(&[
         &repo_arg,
         "commit",
@@ -11112,8 +11236,8 @@ fn tool_read_fixture(base: &Path) -> PathBuf {
         &src_arg,
     ])
     .ok();
-    // A commit with no subject and a body alone, one with a `version` key, one
-    // with a multi-line subject, and one carrying metadata of every type.
+    // A commit with a body and no subject, one with a `version` key, one with a
+    // multi-line subject, and one with metadata of every type.
     ostree(&[
         &repo_arg,
         "commit",
@@ -11165,8 +11289,8 @@ fn tool_read_fixture(base: &Path) -> PathBuf {
         "--add-metadata=nested=[[byte 0x01], @ay []]",
         "--add-metadata=strs=['x','y']",
         "--add-metadata=dict=@a{sv} {}",
-        // The nested-maybe chains, whose printed text states its set levels
-        // with a `just ` for each of them.
+        // The nested-maybe chains. Their printed text states each set level
+        // with a `just `.
         "--add-metadata=mnothing=@mmi nothing",
         "--add-metadata=mjust=@mmi just nothing",
         "--add-metadata=mjust2=@mmmi just just nothing",
@@ -11174,10 +11298,13 @@ fn tool_read_fixture(base: &Path) -> PathBuf {
         "--add-metadata=mvar=@mmv just nothing",
         "--add-metadata=marr=@ammi [just nothing, nothing, just just 5]",
         "--add-metadata=mdictv=@a{smmi} {'a': just nothing, 'b': nothing}",
-        // The escape tables both printers carry: a string holding the short
-        // escapes, one holding the quote in use, one holding characters past
-        // ASCII, a bytestring holding an escape and a byte past ASCII, and a
-        // byte array that is no bytestring.
+        // The escape tables of both printers:
+        //
+        // - a string with the short escapes
+        // - a string with the quote in use
+        // - a string with characters past ASCII
+        // - a bytestring with an escape and a byte past ASCII
+        // - a byte array that is not a bytestring
         "--add-metadata=esc='a\\tb\\nc\\u001bd\\\\e\"f'",
         "--add-metadata=quoted=\"it's\"",
         "--add-metadata=uni='héllo 中文'",
@@ -11188,7 +11315,7 @@ fn tool_read_fixture(base: &Path) -> PathBuf {
         &src_arg,
     ])
     .ok();
-    // A pre-epoch timestamp, whose stored field is the two's-complement form.
+    // A pre-epoch timestamp. The stored field holds its two's-complement form.
     ostree(&[
         &repo_arg,
         "commit",
@@ -11203,10 +11330,14 @@ fn tool_read_fixture(base: &Path) -> PathBuf {
     repo
 }
 
-/// Every `show` form over the tool-built repository, both implementations
-/// reading the same objects: the commit report, the raw variant with and without
-/// the byte-order conversion, the metadata and detached-metadata modes, the
-/// sizes, and the refusals.
+/// Every `show` form over the repository that the `ostree` command built. Both
+/// commands read the same objects. The forms:
+///
+/// - the commit report
+/// - the raw variant, with and without the byte-order conversion
+/// - the metadata and detached-metadata modes
+/// - the sizes
+/// - the refusals
 #[test]
 fn show_forms_match_the_tool() {
     if !ostree_available() {
@@ -11218,7 +11349,7 @@ fn show_forms_match_the_tool() {
     let tip = resolve(&repo, BRANCH).expect("the fixture branch resolves");
     let typed = resolve(&repo, "typed").expect("the typed branch resolves");
 
-    // The tree's own object checksums, read out of the port's `ls -C`.
+    // The object checksums of the tree, from the `ls -C` output of ostrya.
     let listing = ostrya(
         &[
             &format!("--repo={}", repo.display()),
@@ -11235,9 +11366,9 @@ fn show_forms_match_the_tool() {
         .lines()
         .map(str::to_owned)
         .collect();
-    // The path is its own whitespace-delimited column, so a line is found by
-    // that column and the checksums read by index: one for a file, the dirtree
-    // and then the dirmeta for a directory.
+    // The path is a separate column between whitespace. The closure finds a
+    // line by that column and reads a checksum by index. A file line has one
+    // checksum, and a directory line has the dirtree and then the dirmeta.
     let column = |path: &str, index: usize| {
         lines
             .iter()
@@ -11286,8 +11417,8 @@ fn show_forms_match_the_tool() {
         assert_agrees(&repo, &repo, &args);
     }
 
-    // Every metadata value type, each with and without `--print-hex` and the
-    // byte-order conversion.
+    // Every metadata value type, each with no option, with the byte-order
+    // conversion (`-B`), and with `--print-hex`.
     for key in [
         "ts",
         "n",
@@ -11320,7 +11451,8 @@ fn show_forms_match_the_tool() {
         assert_agrees(&repo, &repo, &["show", "--print-hex", &arg, &typed]);
     }
 
-    // The precedence among the reporting modes, one pair per observed rule.
+    // The precedence of the report modes, one option pair for each observed
+    // rule.
     let tip_ref: &str = &tip;
     for args in [
         vec![
@@ -11345,9 +11477,10 @@ fn show_forms_match_the_tool() {
     }
 }
 
-/// `show --print-related` over a commit that carries a non-empty related array.
-/// No `commit` option writes one, so the commit is assembled through the library
-/// and written into the object store, and both implementations read it back.
+/// `show --print-related` over a commit with a related array that is not empty.
+/// No `commit` option writes such an array. The test builds the commit through
+/// the library and writes it into the object store. ostrya reads it back, and
+/// if the `ostree` command is installed, both commands read it back.
 #[test]
 fn show_print_related_lists_each_pair() {
     let tmp = TmpDir::new("show-related");
@@ -11394,8 +11527,9 @@ fn show_print_related_lists_each_pair() {
     }
 }
 
-/// `log` over the tool-built repository: the walk, the raw form, an ancestry
-/// suffix, and the note a parent whose commit object is absent draws.
+/// `log` over the repository that the `ostree` command built. The forms are
+/// the walk, the raw form, an ancestry suffix, and the note that `log` prints
+/// for a parent with no commit object.
 #[test]
 fn log_forms_match_the_tool() {
     if !ostree_available() {
@@ -11418,8 +11552,8 @@ fn log_forms_match_the_tool() {
         assert_agrees(&repo, &repo, &args);
     }
 
-    // With the parent's commit object removed, the walk reports what it holds
-    // and stops.
+    // After the test removes the commit object of the parent, the walk reports
+    // the commits that the repository holds and stops.
     std::fs::remove_file(
         repo.join("objects")
             .join(&parent[..2])
@@ -11430,10 +11564,11 @@ fn log_forms_match_the_tool() {
     assert_agrees(&repo, &repo, &["log", "--raw", BRANCH]);
 }
 
-/// `log`'s per-commit report verifies GPG signatures against the repository's
-/// own `gpgkeys.gpg`, not the process's working directory. Run with no `cwd`
-/// override, so the two differ, the case `log` once broke by passing `.` as
-/// the repository path instead of the one `show` receives from `resolve_repo`.
+/// The report of `log` for each commit verifies GPG signatures against the
+/// `gpgkeys.gpg` file of the repository. The working directory of the process
+/// has no effect. The test runs with no `cwd` override, so the two directories
+/// differ. A `log` that passes `.` as the repository path fails this test. It
+/// must use the path that `show` also receives from `resolve_repo`.
 #[cfg(feature = "gpg")]
 #[test]
 fn log_verifies_signatures_against_the_repo_not_the_cwd() {
@@ -11475,9 +11610,15 @@ fn log_verifies_signatures_against_the_repo_not_the_cwd() {
     );
 }
 
-/// `ls` over the tool-built repository, in every option combination and over
-/// each path form: the tree root, a nested directory, a file, a symlink, a
-/// relative path, and a path naming nothing.
+/// `ls` over the repository that the `ostree` command built, in every option
+/// combination and over each path form:
+///
+/// - the tree root
+/// - a nested directory
+/// - a file
+/// - a symlink
+/// - a relative path
+/// - a path that names nothing
 #[test]
 fn ls_forms_match_the_tool() {
     if !ostree_available() {
@@ -11486,9 +11627,9 @@ fn ls_forms_match_the_tool() {
     let tmp = TmpDir::new("ls-tool");
     let base = tmp.path();
     let repo = tool_read_fixture(base);
-    // Two xattrs on one file, so the `-X` column has more than one entry to
-    // report and the `a(ayay)` printer's annotation cascade past the first
-    // entry runs against the tool rather than only a hand-written value.
+    // Two xattrs on one file, so the `-X` column reports more than one entry.
+    // Then the `ostree` command, in addition to a hand-written value, checks
+    // the annotation cascade of the `a(ayay)` printer after the first entry.
     let src = base.join("readsrc");
     let set = std::process::Command::new("setfattr")
         .args(["-n", "user.foo", "-v", "bar"])
@@ -11546,11 +11687,13 @@ fn ls_forms_match_the_tool() {
     }
 }
 
-/// `ls -R` follows each subdirectory's contents immediately after its own
-/// line, even past a sibling directory (`docs/format-reference.md`, "ls",
-/// "Order and recursion"). Every fixture elsewhere in this file has at most
-/// one subdirectory per level, which cannot tell a level-order listing apart
-/// from the tool's pre-order one, so this builds a tree with two.
+/// `ls -R` prints the contents of each subdirectory directly after the line of
+/// that subdirectory, also when a sibling directory comes next. This is the
+/// pre-order listing of the `ostree` command.
+///
+/// Every other fixture in this file has at most one subdirectory on each level.
+/// Such a tree gives the same listing in level order and in pre-order, so this
+/// test builds a tree with two subdirectories on one level.
 #[test]
 fn ls_recursive_visits_each_subtree_before_its_next_sibling() {
     let tmp = TmpDir::new("ls-siblings");
@@ -11560,9 +11703,9 @@ fn ls_recursive_visits_each_subtree_before_its_next_sibling() {
     std::fs::create_dir_all(src.join("db")).unwrap();
     std::fs::write(src.join("da/f1.txt"), b"one\n").unwrap();
     std::fs::write(src.join("db/f2.txt"), b"two\n").unwrap();
-    // `create_dir_all` and `fs::write` reduce 0777 and 0666 by the process
-    // umask, and the mode reaches the recorded dirmeta and file mode the
-    // listing below states, so every mode is pinned.
+    // `create_dir_all` and `fs::write` remove the umask bits of the process
+    // from 0777 and 0666. The mode goes into the recorded dirmeta and file
+    // mode that the listing of this test states, so the test sets every mode.
     for rel in ["", "da", "db"] {
         chmod_to(&src.join(rel), 0o755);
     }
@@ -11601,9 +11744,9 @@ fn ls_recursive_visits_each_subtree_before_its_next_sibling() {
     }
 }
 
-/// `config get` over each key class the repository config holds, and over the
-/// value forms GKeyFile escapes, plus every refusal both implementations word
-/// the same way.
+/// `config get` over each key class of the repository config and over the
+/// value forms that GKeyFile escapes. The test also covers every refusal that
+/// ostrya and the `ostree` command word the same way.
 #[test]
 fn config_get_matches_the_tool() {
     if !ostree_available() {
@@ -11645,9 +11788,9 @@ fn config_get_matches_the_tool() {
     }
 }
 
-/// Two repositories of one mode, one per implementation, for a cell whose
-/// invocation writes: each side acts on its own repository and the two `config`
-/// files are then compared.
+/// Two repositories of one mode, one for each command, for a cell whose
+/// invocation writes. Each command acts on its own repository, and then the
+/// test compares the two `config` files.
 fn create_repo_pair(base: &Path, mode: RepoMode) -> (PathBuf, PathBuf) {
     let port = base.join("port");
     let tool = base.join("tool");
@@ -11661,9 +11804,9 @@ fn config_text(repo: &Path) -> String {
     std::fs::read_to_string(repo.join("config")).unwrap()
 }
 
-/// Run `args` against each side's own repository, assert the two agree on the
-/// exit status and both streams, and assert their `config` files hold the same
-/// bytes afterwards.
+/// Run `args` against the repository of each command. Assert that the two runs
+/// agree on the exit status and both streams. Assert also that the two
+/// `config` files hold the same bytes after the runs.
 fn assert_config_agrees(port_repo: &Path, tool_repo: &Path, args: &[&str]) {
     assert_agrees(port_repo, tool_repo, args);
     assert_eq!(
@@ -11674,12 +11817,12 @@ fn assert_config_agrees(port_repo: &Path, tool_repo: &Path, args: &[&str]) {
     );
 }
 
-/// Run one `remote` invocation against each side's own repository with a
+/// Run one `remote` invocation against the repository of each command, with a
 /// leading `--repo=PATH`.
 ///
-/// `remote` itself takes no `--repo` in the tool -- its nested subcommands do,
-/// and the leading position reaches both -- so the shared trailing-`--repo`
-/// runner cannot serve this family.
+/// In the `ostree` command, `remote` itself takes no `--repo`, and its nested
+/// subcommands do. The leading position works in both commands. The shared
+/// runner with a trailing `--repo` cannot serve this family.
 fn run_remote_both(
     port_repo: &Path,
     tool_repo: &Path,
@@ -11705,8 +11848,8 @@ fn run_remote_both(
     (port, tool)
 }
 
-/// Run one `remote` invocation on both sides, assert the two agree, and assert
-/// the two `config` files still hold the same bytes.
+/// Run one `remote` invocation in both commands. Assert that the two runs agree
+/// and that the two `config` files still hold the same bytes.
 fn assert_remote_config_agrees(port_repo: &Path, tool_repo: &Path, args: &[&str]) {
     let (port, tool) = run_remote_both(port_repo, tool_repo, args, &[]);
     assert_runs_agree(&port, &tool, &args.join(" "));
@@ -11718,8 +11861,8 @@ fn assert_remote_config_agrees(port_repo: &Path, tool_repo: &Path, args: &[&str]
     );
 }
 
-/// The same for a `remote` invocation each implementation precedes with its own
-/// usage text.
+/// The same for a `remote` invocation for which each command prints its own
+/// usage text before the error.
 fn assert_remote_config_agrees_on_error(
     port_repo: &Path,
     tool_repo: &Path,
@@ -11736,9 +11879,9 @@ fn assert_remote_config_agrees_on_error(
     );
 }
 
-/// The same for an invocation each implementation precedes with its own usage
-/// text: the exit status, standard output, and the `error: ` line are compared,
-/// and the two `config` files must still hold the same bytes.
+/// The same for an invocation for which each command prints its own usage text
+/// before the error. This compares the exit status, standard output, and the
+/// `error: ` line. The two `config` files must still hold the same bytes.
 fn assert_config_agrees_on_error(port_repo: &Path, tool_repo: &Path, args: &[&str], message: &str) {
     assert_agrees_on_error(port_repo, tool_repo, args, message);
     assert_eq!(
@@ -11749,8 +11892,9 @@ fn assert_config_agrees_on_error(port_repo: &Path, tool_repo: &Path, args: &[&st
     );
 }
 
-/// `config set` and `config unset` write the document the way the tool writes
-/// it: the same bytes, the same refusals, and a value that reads back whole.
+/// `config set` and `config unset` write the `config` document as the `ostree`
+/// command writes it. Both commands write the same bytes and give the same
+/// refusals, and a value reads back whole.
 #[test]
 fn config_set_and_unset_match_the_tool() {
     if !ostree_available() {
@@ -11759,19 +11903,21 @@ fn config_set_and_unset_match_the_tool() {
     let tmp = TmpDir::new("config-write");
     let (port, tool) = create_repo_pair(tmp.path(), RepoMode::Archive);
     for args in [
-        // A new key joins its group at the end; a new group follows a blank line.
+        // A new key goes to the end of its group. A new group comes after a
+        // blank line.
         vec!["config", "set", "core.newkey", "somevalue"],
         vec!["config", "set", "newgroup.k", "v"],
         vec!["config", "set", "--group=core", "k2", "v2"],
         // An existing key keeps its position.
         vec!["config", "set", "core.newkey", "second"],
-        // The escaping a value carries on write, and reading it back.
+        // The escapes that a value gets on write, and the read-back of the
+        // value.
         vec!["config", "set", "core.list", "a;b;c"],
         vec!["config", "set", "core.lead", "   ab"],
         vec!["config", "set", "core.nl", "a\nb"],
         vec!["config", "get", "core.nl"],
         vec!["config", "get", "core.lead"],
-        // A quoted group name reached through the `section.key` form.
+        // A quoted group name, given in the `section.key` form.
         vec![
             "config",
             "set",
@@ -11779,13 +11925,14 @@ fn config_set_and_unset_match_the_tool() {
             "https://example.invalid/r",
         ],
         vec!["config", "get", "remote \"x\".url"],
-        // Removing a key leaves its group's header behind.
+        // A removed key leaves the header of its group in the document.
         vec!["config", "set", "g.k", "v"],
         vec!["config", "unset", "g.k"],
-        // A key and a group the document does not hold are both success.
+        // If the document does not hold the key or the group, the command
+        // succeeds.
         vec!["config", "unset", "core.absent"],
         vec!["config", "unset", "nogroup.k"],
-        // The refusals, each worded the same way on both sides.
+        // The refusals, each with the same words in both commands.
         vec!["config", "set", "core.k"],
         vec!["config", "set"],
         vec!["config", "unset"],
@@ -11796,14 +11943,15 @@ fn config_set_and_unset_match_the_tool() {
     ] {
         assert_config_agrees(&port, &tool, &args);
     }
-    // The operand-count refusal comes with each implementation's own usage text.
+    // Each command prints its own usage text before the refusal of the operand
+    // count.
     for args in [
         vec!["config", "set", "core.k", "v", "extra"],
         vec!["config", "unset", "core.k", "extra"],
     ] {
         assert_config_agrees_on_error(&port, &tool, &args, "error: Too many arguments given");
     }
-    // The document the port rewrote reparses in the tool.
+    // The `ostree` command can parse the document that ostrya wrote.
     let read_back = ostree(&[
         "config",
         "--repo",
@@ -11814,9 +11962,10 @@ fn config_set_and_unset_match_the_tool() {
     assert_eq!(read_back.ok().stdout_trimmed(), "second");
 }
 
-/// `remote add` and `remote delete` write the same configuration the tool
-/// writes, and the two agree on every refusal. The one divergence is the blank
-/// line a deleted group leaves behind in the tool's file.
+/// `remote add` and `remote delete` write the same configuration as the
+/// `ostree` command, and both commands agree on every refusal. The one
+/// divergence is the blank line that `ostree` keeps in its file after it
+/// deletes the last group.
 #[test]
 fn remote_add_and_delete_match_the_tool() {
     if !ostree_available() {
@@ -11848,7 +11997,7 @@ fn remote_add_and_delete_match_the_tool() {
             "--set=tls-permissive=true",
             "--set=zzz=1",
         ],
-        // `--no-sign-verify` turns the GPG check off as well.
+        // `--no-sign-verify` also turns off the GPG verification.
         vec![
             "remote",
             "add",
@@ -11871,7 +12020,8 @@ fn remote_add_and_delete_match_the_tool() {
             "https://example.invalid/r",
             "--sign-verify=ed25519=file:/etc/keys.ed25519",
         ],
-        // A metalink URL becomes its own key; a mirrorlist one stays in `url`.
+        // A metalink URL goes into a separate key. A mirrorlist URL stays in
+        // `url`.
         vec![
             "remote",
             "add",
@@ -11905,7 +12055,7 @@ fn remote_add_and_delete_match_the_tool() {
         vec!["remote", "add", ".", "https://example.invalid/r"],
         vec!["remote", "add", "we ird", "https://example.invalid/r"],
         vec!["remote", "add", "a/b", "https://example.invalid/r"],
-        // The option refusals that carry no usage text.
+        // The option refusals with no usage text.
         vec![
             "remote",
             "add",
@@ -11920,8 +12070,8 @@ fn remote_add_and_delete_match_the_tool() {
             "https://example.invalid/r",
             "--sign-verify=bogus",
         ],
-        // Listing, and the URL of one remote. `list -u` refuses the metalink
-        // remote, after the names before it are printed.
+        // The listing, and the URL of one remote. `list -u` prints the names
+        // before the metalink remote and then refuses that remote.
         vec!["remote", "list"],
         vec!["remote", "list", "-u"],
         vec!["remote", "show-url", "origin"],
@@ -11932,7 +12082,7 @@ fn remote_add_and_delete_match_the_tool() {
     ] {
         assert_remote_config_agrees(&port, &tool, &args);
     }
-    // The refusals each implementation precedes with its own usage text.
+    // The refusals for which each command prints its own usage text first.
     for (args, message) in [
         (
             vec!["remote", "add"],
@@ -11959,7 +12109,8 @@ fn remote_add_and_delete_match_the_tool() {
         assert_remote_config_agrees_on_error(&port, &tool, &args, message);
     }
 
-    // Either implementation lists the remotes out of the other's file.
+    // Each command lists the remotes from the file that the other command
+    // wrote.
     let cross = |repo: &Path| {
         let repo_arg = format!("--repo={}", repo.display());
         let port = ostrya(&[&repo_arg, "remote", "list", "-u"], None, &[]);
@@ -11983,10 +12134,10 @@ fn remote_add_and_delete_match_the_tool() {
         config_text(&port)
     );
 
-    // Removing the last section is where the two files part: the tool keeps the
-    // blank line that separated it and the port keeps none. Both documents
-    // reparse to the same configuration, which the tool reading the port's own
-    // file states.
+    // The two files differ after the removal of the last section. The `ostree`
+    // command keeps the blank line before that section, and ostrya keeps none.
+    // Both documents parse to the same configuration. `ostree` reads the file
+    // of ostrya and shows this.
     for name in [
         "branched", "opts", "unsigned", "inline", "fromfile", "mirrors", "_",
     ] {
@@ -12038,8 +12189,8 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// Wait until `child` has `file` open, as `/proc/<pid>/fd` shows it. Panic
-/// when the child ends first, or when `GUARD_WAIT` passes.
+/// Wait until `child` has `file` open, as `/proc/<pid>/fd` shows it. Panic if
+/// the child ends first, or if `GUARD_WAIT` passes.
 fn wait_for_open_file(child: &mut std::process::Child, file: &Path, shown: &str) {
     use std::time::Instant;
 
@@ -12121,7 +12272,7 @@ fn run_under_held_guard(repo: &Path, args: &[&str]) -> Run {
     })
 }
 
-/// A fresh repository whose lock waits have no limit, for the tests that hold
+/// A new repository with no limit on its lock waits, for the tests that hold
 /// the update guard while a command runs.
 fn create_unlimited_wait_repo(base: &Path) -> PathBuf {
     let repo = create_repo(base, RepoMode::Archive);
@@ -12259,10 +12410,10 @@ fn remote_delete_removes_the_keyring_before_the_config() {
     assert!(keyring.is_dir(), "the keyring directory is gone");
 }
 
-/// A `remote delete` whose write of `config` fails has removed the trusted
-/// keyring already, and `config` keeps the remote. The file size limit of the
-/// child is 0, so the write of `config` fails with `EFBIG`, and the temporary
-/// file of the write does not stay.
+/// If the write of `config` by `remote delete` fails, the trusted keyring is
+/// already removed, and `config` keeps the remote. The file size limit of the
+/// child is 0, so the write of `config` fails with `EFBIG`. No temporary file
+/// of the write stays.
 #[test]
 fn remote_delete_keeps_the_remote_when_the_config_write_fails() {
     let tmp = TmpDir::new("remote-delete-config-write");
@@ -12373,9 +12524,9 @@ fn remote_add_if_not_exists_imports_no_keyring_for_an_existing_remote() {
     );
 }
 
-/// `remote add --if-not-exists` checks again under the update lock. A remote
-/// that another writer added while the command waited is kept as it is, and
-/// the command imports no keyring.
+/// `remote add --if-not-exists` checks again under the update lock. The command
+/// keeps a remote that another writer added while the command waited, and
+/// imports no keyring.
 #[test]
 fn remote_add_if_not_exists_keeps_a_remote_added_under_a_held_guard() {
     let tmp = TmpDir::new("remote-add-if-not-exists-guard");
@@ -12516,9 +12667,9 @@ fn remote_refs_and_summary_match_the_tool() {
     for repo in [&port, &tool] {
         configure_remote(repo, &server.url(), "gpg-verify=false\n");
     }
-    // The summary's `last-modified` is the remote's own, so both sides read one
-    // value; `TZ` fixes the zone the tool renders it in, which the port renders
-    // in UTC whatever the zone.
+    // The `last-modified` value of the summary comes from the remote, so both
+    // commands read one value. `TZ` sets the zone in which the `ostree` command
+    // shows it. ostrya shows it in UTC in every zone.
     let env = &[("TZ", "UTC")];
     for args in [
         vec!["remote", "refs", "origin"],
@@ -12552,7 +12703,8 @@ fn remote_refs_and_summary_match_the_tool() {
         let (port_run, tool_run) = run_remote_both(&port, &tool, &args, env);
         assert_runs_agree(&port_run, &tool_run, &args.join(" "));
     }
-    // The missing-operand refusal comes with each implementation's own usage.
+    // Each command prints its own usage text before the refusal of a missing
+    // operand.
     for args in [vec!["remote", "refs"], vec!["remote", "summary"]] {
         let (port_run, tool_run) = run_remote_both(&port, &tool, &args, env);
         assert_runs_agree_on_error(
@@ -12563,7 +12715,8 @@ fn remote_refs_and_summary_match_the_tool() {
         );
     }
 
-    // A remote publishing no summary is refused in each subcommand's own words.
+    // If a remote publishes no summary, each subcommand refuses it with its own
+    // words.
     let bare = build_dest(base, "bare-remote");
     let bare_server = FileServer::start(&bare);
     for repo in [&port, &tool] {
@@ -12584,10 +12737,10 @@ fn remote_refs_and_summary_match_the_tool() {
     }
 }
 
-/// `remote gpg-import` writes a keyring the tool reads and reads one the tool
-/// wrote, counts what it added the way the tool counts it, and the key it
-/// imports verifies a commit signed with that key. `gpg-list-keys` reports the
-/// keys either implementation imported.
+/// `remote gpg-import` writes a keyring that the `ostree` command reads, and
+/// reads a keyring that `ostree` wrote. It counts the added keys as `ostree`
+/// counts them. The key that it imports verifies a commit signed with that key.
+/// `gpg-list-keys` reports the keys that each command imported.
 #[cfg(feature = "gpg")]
 #[test]
 fn remote_gpg_keyring_round_trips_with_the_tool() {
@@ -12607,8 +12760,8 @@ fn remote_gpg_keyring_round_trips_with_the_tool() {
     for repo in [&port, &tool] {
         configure_remote(repo, "https://example.invalid/r", "");
     }
-    // The import reports the same count on both sides, a repeated import adds
-    // nothing, and a `KEY-ID` selection takes the one key it names.
+    // The import reports the same count in both commands. A repeated import
+    // adds nothing, and a `KEY-ID` selection takes only the key that it names.
     for args in [
         vec!["remote", "gpg-import", "origin", &keyring_arg],
         vec!["remote", "gpg-import", "origin", &keyring_arg],
@@ -12619,7 +12772,8 @@ fn remote_gpg_keyring_round_trips_with_the_tool() {
         let (port_run, tool_run) = run_remote_both(&port, &tool, &args, &[]);
         assert_runs_agree(&port_run, &tool_run, &args.join(" "));
     }
-    // Naming both key sources is refused ahead of the usage text in both.
+    // Both commands refuse a call that names both key sources, before the
+    // usage text.
     let both_sources = vec!["remote", "gpg-import", "origin", &keyring_arg, "--stdin"];
     let (port_run, tool_run) = run_remote_both(&port, &tool, &both_sources, &[]);
     assert_runs_agree_on_error(
@@ -12629,9 +12783,9 @@ fn remote_gpg_keyring_round_trips_with_the_tool() {
         "error: --keyring and --stdin are mutually exclusive",
     );
 
-    // Each implementation reads the keyring the other wrote. The listing itself
-    // parts on two lines the port does not produce (`cli-surface.md`, "P3"), so
-    // the claim is the fingerprint and the user id.
+    // Each command reads the keyring that the other command wrote. The listings
+    // differ in two lines that ostrya does not print, so the test asserts the
+    // fingerprint and the user id. This is a recorded divergence.
     for repo in [&port, &tool] {
         let repo_arg = format!("--repo={}", repo.display());
         let listing = ostrya(&[&repo_arg, "remote", "gpg-list-keys", "origin"], None, &[]);
@@ -12648,8 +12802,8 @@ fn remote_gpg_keyring_round_trips_with_the_tool() {
         );
     }
 
-    // The imported key verifies a commit the tool signed with it, through the
-    // remote the keyring belongs to.
+    // The imported key verifies a commit that the `ostree` command signed with
+    // it, through the remote that owns the keyring.
     let signed = commit_fixture(base);
     let signed_s = signed.to_str().unwrap();
     configure_remote(&signed, "https://example.invalid/r", "");
@@ -12687,7 +12841,7 @@ fn remote_gpg_keyring_round_trips_with_the_tool() {
         "the imported keyring must verify the commit it signed"
     );
 
-    // Deleting the remote takes its keyring with it, in both.
+    // In both commands, the deletion of the remote also deletes its keyring.
     for repo in [&port, &tool] {
         assert!(repo.join("origin.trustedkeys.gpg").exists());
     }
@@ -12701,17 +12855,20 @@ fn remote_gpg_keyring_round_trips_with_the_tool() {
     }
 }
 
-/// A re-export stating a later key expiry reaches a remote's trusted keyring
-/// in both implementations: the count stays at zero, the key that had expired
-/// verifies the commit again, and each implementation reads the keyring the
-/// other wrote.
+/// In ostrya and the `ostree` command, a re-export with a later key expiry
+/// reaches the trusted keyring of a remote:
 ///
-/// The key was created with a lifetime of one day and signed the commit while
-/// it was live. The keyring the first import writes therefore states an expiry
-/// that has passed, and both implementations refuse the signature over it. The
-/// bytes the second import writes part: the port writes the offered certificate
-/// where the held one stood and the tool merges the offered packets into it
-/// (`cli-surface.md`, "P3").
+/// - the count stays at zero
+/// - the expired key verifies the commit again
+/// - each command reads the keyring that the other command wrote
+///
+/// The key has a lifetime of one day, and it signed the commit while it was
+/// valid. The keyring that the first import writes states an expiry in the
+/// past, so both commands refuse the signature.
+///
+/// The bytes that the second import writes differ. ostrya writes the offered
+/// certificate in the place of the held one. `ostree` merges the offered
+/// packets into the held one. This is a recorded divergence.
 #[cfg(feature = "gpg")]
 #[test]
 fn remote_gpg_import_carries_a_key_expiry_extension() {
@@ -12726,8 +12883,9 @@ fn remote_gpg_import_carries_a_key_expiry_extension() {
     home.export_to(&expiring);
     let expiring_arg = format!("--keyring={}", expiring.display());
 
-    // One repository per implementation, each holding the same commit, signed
-    // with that key and read through the remote the keyring belongs to.
+    // One repository for each command. Each holds the same commit, signed with
+    // that key, and each command reads it through the remote that owns the
+    // keyring.
     build_fixture_source(base);
     let src = base.join("src");
     let mut repos = Vec::new();
@@ -12767,8 +12925,8 @@ fn remote_gpg_import_carries_a_key_expiry_extension() {
     }
     let (port, tool) = (repos[0].clone(), repos[1].clone());
 
-    // The keyring stating the expiry that has passed. Both implementations
-    // count the key and then refuse the signature it made.
+    // The keyring with the expiry in the past. Both commands count the key and
+    // then refuse the signature that it made.
     let args = ["remote", "gpg-import", "origin", &expiring_arg];
     let (port_run, tool_run) = run_remote_both(&port, &tool, &args, &[]);
     assert_runs_agree(&port_run, &tool_run, "remote gpg-import, the first import");
@@ -12782,8 +12940,8 @@ fn remote_gpg_import_carries_a_key_expiry_extension() {
         );
     }
 
-    // The re-export stating ten years. Both count no key and both then report
-    // a good signature.
+    // The re-export with a lifetime of ten years. Both commands count no key,
+    // and then both report a good signature.
     home.set_expire_at("20250102T000000!", "10y");
     let extended = base.join("extended.gpg");
     home.export_to(&extended);
@@ -12807,9 +12965,9 @@ fn remote_gpg_import_carries_a_key_expiry_extension() {
         );
     }
 
-    // The bytes part. The port's keyring is the offered export, and the tool's
-    // merge keeps the packets the earlier export carried and its own Trust
-    // packets, so its file is the longer one.
+    // The bytes differ. The keyring of ostrya is the offered export. The merge
+    // of the `ostree` command keeps the packets of the earlier export and its
+    // own Trust packets, so its file is longer.
     let name = "origin.trustedkeys.gpg";
     let port_ring = std::fs::read(port.join(name)).unwrap();
     let tool_ring = std::fs::read(tool.join(name)).unwrap();
@@ -12819,8 +12977,8 @@ fn remote_gpg_import_carries_a_key_expiry_extension() {
         "the tool's merged keyring must carry more than the offered export"
     );
 
-    // Each implementation reads the keyring the other wrote and reports a good
-    // signature over it.
+    // Each command reads the keyring that the other command wrote and reports a
+    // good signature over it.
     std::fs::write(port.join(name), &tool_ring).unwrap();
     std::fs::write(tool.join(name), &port_ring).unwrap();
     let (port_run, tool_run) = run_remote_both(&port, &tool, &show, &[]);
@@ -12833,28 +12991,27 @@ fn remote_gpg_import_carries_a_key_expiry_extension() {
     }
 }
 
-/// A re-export carrying a key revocation a designated revoker made reaches a
-/// remote's trusted keyring in both implementations, where the keyring under
-/// edit or the offered stream states the revoker: each implementation then
-/// refuses the signature the revoked key made.
+/// A re-export with a key revocation by a designated revoker reaches the
+/// trusted keyring of a remote in ostrya and in the `ostree` command. This
+/// holds if the keyring under edit or the offered stream states the revoker.
+/// Then each command refuses the signature of the revoked key.
 ///
-/// Two states, measured against `ostree` 2026.1 and `gpg` 2.4.9
-/// (`docs/conformance/cli-surface.md`, "P3"):
+/// Two states, measured against `ostree` 2026.1 and `gpg` 2.4.9:
 ///
-/// - H, the keyring holds the signing key K and the revoker R and the offered
-///   stream carries the re-export of K. Both count no key and both then refuse
-///   the signature;
-/// - J, the keyring holds K alone and the offered stream carries the re-export
-///   of K together with R's certificate. Both count one key, R, and both then
-///   refuse the signature. With the selector naming K alone, R is not written,
-///   both count no key, and both then report a good signature, since no key in
-///   the keyring resolves the revoker.
+/// - H: the keyring holds the signing key K and the revoker R, and the offered
+///   stream holds the re-export of K. Both commands count no key, and then both
+///   refuse the signature.
+/// - J: the keyring holds only K, and the offered stream holds the re-export of
+///   K and the certificate of R. Both commands count one key, R, and then both
+///   refuse the signature. If the selector names only K, the commands do not
+///   write R. Then both count no key and both report a good signature, because
+///   no key in the keyring resolves the revoker.
 ///
-/// The two verdict lines part in their wording, which "P1" of
-/// `cli-surface.md` records: the port reports `BAD signature from` and the tool
-/// `Key revoked`. The bytes part as the two carry the revocation in: the port
-/// writes the offered certificate where the held one stood and the tool merges
-/// the offered packets into it (`cli-surface.md`, "P3").
+/// The wording of the two verdict lines differs. ostrya reports
+/// `BAD signature from`, and `ostree` reports `Key revoked`. The bytes also
+/// differ, because each command adds the revocation in its own way. ostrya
+/// writes the offered certificate in the place of the held one. `ostree` merges
+/// the offered packets into the held one. Both are recorded divergences.
 #[cfg(feature = "gpg")]
 #[test]
 fn remote_gpg_import_carries_a_designated_revokers_revocation() {
@@ -12901,8 +13058,9 @@ fn remote_gpg_import_carries_a_designated_revokers_revocation() {
     );
     state.assert_revoked(&port, &tool);
 
-    // The same offered stream with the selector naming K alone. R is not
-    // written, so the keyring states a revocation no key in it resolves.
+    // The same offered stream, with a selector that names only K. The commands
+    // do not write R, so the keyring states a revocation that no key in it
+    // resolves.
     let (port, tool) = state.repositories(base, "j2");
     let (port_run, tool_run) = state.import(&port, &tool, &state.designating);
     assert_runs_agree(&port_run, &tool_run, "remote gpg-import, K alone");
@@ -12927,27 +13085,29 @@ fn remote_gpg_import_carries_a_designated_revokers_revocation() {
     state.assert_good(&port, &tool);
 }
 
-/// The two states where the revocation reaches the tool's keyring and not the
-/// port's, so the revoked key keeps speaking for the port's remote.
+/// The two states in which the revocation reaches the keyring of the `ostree`
+/// command and not the keyring of ostrya. The revoked key then stays valid for
+/// the remote of ostrya.
 ///
-/// The port's import is a function of the two byte streams it is given and
-/// writes no revocation it cannot verify. The tool merges the offered packets
-/// into its keyblock whether or not it can verify them, so a revoker that
-/// arrives by another route makes the merged packet speak. Measured against
-/// `ostree` 2026.1 and `gpg` 2.4.9
-/// (`docs/conformance/cli-surface.md`, "P3"):
+/// The import of ostrya uses only the two byte streams that it gets. It writes
+/// no revocation that it cannot verify. `ostree` merges the offered packets
+/// into its keyblock, also if it cannot verify them. If a revoker then arrives
+/// by another route, the merged packet takes effect.
 ///
-/// - I, R's certificate stands in the global trusted directory and the
-///   remote's keyring holds K alone. The port writes nothing and the tool
-///   merges the revocation, and both report a good signature, since neither
-///   resolves a revoker across the boundary between two keyring sources;
-/// - K, R is absent everywhere when the re-export is offered and is imported
-///   after. The port writes nothing for the re-export, so R's later arrival
-///   revokes nothing, and the port reports a good signature where the tool
-///   reports `Key revoked`.
+/// Measured against `ostree` 2026.1 and `gpg` 2.4.9:
 ///
-/// Both follow from the rule of the port's import stated above.
-/// `cli-surface.md`, "P3", records both.
+/// - I: the certificate of R is in the global trusted directory, and the
+///   keyring of the remote holds only K. ostrya writes nothing, and `ostree`
+///   merges the revocation. Both report a good signature, because neither
+///   command resolves a revoker across the boundary between two keyring
+///   sources.
+/// - K: R is in no keyring when the test offers the re-export, and the test
+///   imports R after that. ostrya writes nothing for the re-export, so the
+///   later import of R revokes nothing. ostrya reports a good signature, and
+///   `ostree` reports `Key revoked`.
+///
+/// Both states follow from this import rule of ostrya. Both are recorded
+/// divergences.
 #[cfg(feature = "gpg")]
 #[test]
 fn remote_gpg_import_leaves_an_unverifiable_revocation_out() {
@@ -12962,8 +13122,8 @@ fn remote_gpg_import_leaves_an_unverifiable_revocation_out() {
     std::fs::copy(&state.revoker, global.join("r.gpg")).unwrap();
     let env = [("OSTREE_GPG_HOME", global.to_str().unwrap())];
 
-    // State I. The import reads the two streams alone, so R in the global
-    // trusted directory reaches neither implementation's import.
+    // State I. The import reads only the two streams, so R in the global
+    // trusted directory reaches the import of neither command.
     let (port, tool) = state.repositories(base, "i");
     let (port_run, tool_run) = state.import(&port, &tool, &state.designating);
     assert_runs_agree(&port_run, &tool_run, "remote gpg-import, K alone");
@@ -12971,14 +13131,14 @@ fn remote_gpg_import_leaves_an_unverifiable_revocation_out() {
     let args = ["remote", "gpg-import", "origin", &keyring];
     let (port_run, tool_run) = run_remote_both(&port, &tool, &args, &env);
     assert_runs_agree(&port_run, &tool_run, "remote gpg-import, the revocation");
-    // The bytes part: the port's keyring is the one it held and the tool's
-    // carries the merged revocation.
+    // The bytes differ: the keyring of ostrya is the one that it held, and the
+    // keyring of the `ostree` command holds the merged revocation.
     let name = "origin.trustedkeys.gpg";
     let held = std::fs::read(&state.designating).unwrap();
     assert_eq!(std::fs::read(port.join(name)).unwrap(), held);
     assert!(std::fs::read(tool.join(name)).unwrap().len() > held.len());
-    // The verdict agrees, for reasons that part: the port's keyring states no
-    // revocation, and the tool holds one and passes it over.
+    // The verdict agrees, for different reasons. The keyring of ostrya states
+    // no revocation. `ostree` holds one and does not apply it.
     for (label, repo, is_port) in [("the port", &port, true), ("the tool", &tool, false)] {
         let text = state.show(repo, is_port, &env);
         assert!(
@@ -12987,10 +13147,10 @@ fn remote_gpg_import_leaves_an_unverifiable_revocation_out() {
         );
     }
 
-    // Over the keyring the tool's own import wrote, the two verdicts part and
-    // the port is the stricter one: the port's verify path resolves a revoker
-    // among every certificate it loads, whichever source carried it, and the
-    // tool resolves none standing in another keyring source.
+    // Over the keyring that the import of `ostree` wrote, the two verdicts
+    // differ, and ostrya is the stricter command. The verify path of ostrya
+    // resolves a revoker among all certificates that it loads, from any
+    // source. `ostree` resolves no revoker that is in another keyring source.
     let merged = std::fs::read(tool.join(name)).unwrap();
     std::fs::write(port.join(name), &merged).unwrap();
     let port_text = state.show(&port, true, &env);
@@ -13004,9 +13164,9 @@ fn remote_gpg_import_leaves_an_unverifiable_revocation_out() {
         "the tool resolved a revoker out of the global trusted directory:\n{tool_text}"
     );
 
-    // State K. The re-export is offered with R absent everywhere, and R is
-    // imported after. The tool's merged packet then speaks and the port has
-    // written none.
+    // State K. The test offers the re-export while R is in no keyring, and
+    // imports R after that. The merged packet of the `ostree` command then
+    // takes effect. ostrya wrote no such packet.
     let (port, tool) = state.repositories(base, "k");
     let (port_run, tool_run) = state.import(&port, &tool, &state.designating);
     assert_runs_agree(&port_run, &tool_run, "remote gpg-import, K alone");
@@ -13026,31 +13186,31 @@ fn remote_gpg_import_leaves_an_unverifiable_revocation_out() {
     );
 }
 
-/// A signing key K that designates a revoker R, and the certificate streams a
-/// revocation R made over K is stated over. Each stream is a file, since an
-/// import names one with `--keyring`.
+/// A signing key K that designates a revoker R, and the certificate streams of
+/// the tests that state a revocation of K by R. Each stream is a file, because
+/// an import names its stream with `--keyring`.
 #[cfg(feature = "gpg")]
 struct RevokedKey {
-    /// The home holding both secret keys, which signs each commit.
+    /// The home with both secret keys. It signs each commit.
     home: GpgHome,
-    /// K's primary key fingerprint, uppercase hex.
+    /// The fingerprint of the primary key of K, in uppercase hex.
     key: String,
-    /// K carrying the designation and no revocation.
+    /// K with the designation and no revocation.
     designating: PathBuf,
-    /// R's certificate.
+    /// The certificate of R.
     revoker: PathBuf,
     /// The two of them, in that order.
     pair: PathBuf,
-    /// The re-export of K carrying the revocation R made.
+    /// The re-export of K with the revocation that R made.
     revoked: PathBuf,
-    /// That re-export and R's certificate, in that order.
+    /// That re-export and the certificate of R, in that order.
     revoked_pair: PathBuf,
 }
 
 #[cfg(feature = "gpg")]
 impl RevokedKey {
-    /// Build the keys and the streams under `base`. The home keeps signing
-    /// with K, since the revocation is merged in a home of its own (see
+    /// Build the keys and the streams under `base`. The home still signs with
+    /// K, because the merge of the revocation runs in a separate home (see
     /// [`merged_export`]).
     fn build(base: &Path) -> RevokedKey {
         let home = GpgHome::create(base, "Signing K <k@ostrya.example>");
@@ -13087,8 +13247,8 @@ impl RevokedKey {
         }
     }
 
-    /// One repository per implementation under `base/<tag>-<name>`, each
-    /// holding the same commit signed with K and the remote `origin`.
+    /// One repository for each command under `base/<tag>-<name>`. Each holds
+    /// the same commit, signed with K, and the remote `origin`.
     fn repositories(&self, base: &Path, tag: &str) -> (PathBuf, PathBuf) {
         let src = base.join("src");
         let mut repos = Vec::new();
@@ -13129,14 +13289,14 @@ impl RevokedKey {
         (repos[0].clone(), repos[1].clone())
     }
 
-    /// One `remote gpg-import` of the stream at `keyring` on both sides.
+    /// One `remote gpg-import` of the stream at `keyring` in both commands.
     fn import(&self, port: &Path, tool: &Path, keyring: &Path) -> (Run, Run) {
         let arg = format!("--keyring={}", keyring.display());
         run_remote_both(port, tool, &["remote", "gpg-import", "origin", &arg], &[])
     }
 
-    /// What `show --gpg-verify-remote=origin` reports over `repo`, read by the
-    /// port where `port` is set and by the tool where it is not.
+    /// What `show --gpg-verify-remote=origin` reports over `repo`. If `port` is
+    /// set, ostrya reads it. If not, the `ostree` command reads it.
     fn show(&self, repo: &Path, port: bool, env: &[(&str, &str)]) -> String {
         let args = ["show", "--gpg-verify-remote=origin", BRANCH];
         let mut all = vec![format!("--repo={}", repo.display())];
@@ -13150,7 +13310,7 @@ impl RevokedKey {
         run.ok().stdout_trimmed()
     }
 
-    /// Assert that each implementation reports the signature good.
+    /// Assert that each command reports a good signature.
     fn assert_good(&self, port: &Path, tool: &Path) {
         for (label, repo, is_port) in [("the port", port, true), ("the tool", tool, false)] {
             let text = self.show(repo, is_port, &[]);
@@ -13161,8 +13321,7 @@ impl RevokedKey {
         }
     }
 
-    /// Assert that each implementation refuses the signature, each in its own
-    /// wording.
+    /// Assert that each command refuses the signature, each with its own words.
     fn assert_revoked(&self, port: &Path, tool: &Path) {
         let text = self.show(port, true, &[]);
         assert!(
@@ -13176,7 +13335,7 @@ impl RevokedKey {
         );
     }
 
-    /// The primary-key fingerprints the remote's trusted keyring holds, as
+    /// The primary-key fingerprints in the trusted keyring of the remote, as
     /// `gpg` reports them.
     fn keys_in(&self, repo: &Path) -> Vec<String> {
         let out = self
@@ -13209,16 +13368,17 @@ impl RevokedKey {
     }
 }
 
-/// A repository holding two GPG signatures that do not verify, with the
-/// signing key in the trusted keyring of the remote `origin`.
+/// A repository with two GPG signatures that do not verify. The signing key is
+/// in the trusted keyring of the remote `origin`.
 ///
-/// The commit on `bad/one` is signed, and the commits on `bad/two` and
-/// `bad/three` each hold a copy of that commit's detached metadata, so each of
-/// those two stored signatures stands over a payload other than the one it was
-/// made over and the cryptography refuses it. The issuer stays resolvable, so
-/// the report names the signing key. The return value is the repository and
-/// the checksums of the commits on `bad/two` and `bad/three`, which carry one
-/// refused signature each.
+/// The commit on `bad/one` is signed. The commits on `bad/two` and `bad/three`
+/// each hold a copy of the detached metadata of that commit. Each of these two
+/// stored signatures belongs to a different payload, so the cryptography
+/// refuses it. The issuer stays resolvable, so the report names the signing
+/// key.
+///
+/// The return value is the repository and the checksums of the commits on
+/// `bad/two` and `bad/three`, with one refused signature each.
 #[cfg(feature = "gpg")]
 fn bad_signature_repo(base: &Path, home: &GpgHome, keyring: &Path) -> (PathBuf, String, String) {
     build_fixture_source(base);
@@ -13290,7 +13450,7 @@ fn bad_signature_repo(base: &Path, home: &GpgHome, keyring: &Path) -> (PathBuf, 
     (repo, checksums.remove(1), third)
 }
 
-/// The one `Signature made` line a signature report draws, with the leading
+/// The one `Signature made` line of a signature report, with the leading
 /// indent removed.
 #[cfg(feature = "gpg")]
 fn signature_made_line(report: &str) -> &str {
@@ -13311,22 +13471,27 @@ fn reported_key_id(report: &str) -> &str {
         .unwrap_or_else(|| panic!("no `key ID` field in `{line}`"))
 }
 
-/// The signature report line `show` draws over a signature that does not
-/// verify names the same key in both implementations, and both refuse the
-/// signature in the same words.
+/// For a signature that does not verify, the signature report line of `show`
+/// names the same key in ostrya and in the `ostree` command. Both commands
+/// refuse the signature with the same words.
 ///
-/// A signing subkey made the signature, so the report names two keys: the
-/// subkey on the report line and the primary key that binds it on the tool's
-/// `Primary key ID` line. Three differences stand here, all of them recorded
-/// in `cli-surface.md`, "P1". The tool holds no instant and no algorithm for a
-/// signature the cryptography refused, so it draws the Unix epoch and
-/// `[unknown name]` in their places, where the port draws an empty instant and
-/// `unknown`. The host time zone and locale decide how the tool renders that
-/// instant, so the epoch stands here as the year alone, with `TZ=UTC` set to
-/// hold the run inside 1970. The `Primary key ID` line is one the port draws
-/// nowhere, and the key it names stands in the port's record, where
-/// `sign --delete` reads it
-/// (`sign_delete_reaches_a_signature_that_does_not_verify`).
+/// A signing subkey made the signature, so the report names two keys. The
+/// report line names the subkey. The `Primary key ID` line of `ostree` names
+/// the primary key that binds the subkey.
+///
+/// Three differences are recorded divergences:
+///
+/// - The instant: `ostree` holds no instant for a signature that the
+///   cryptography refused, so it prints the Unix epoch. ostrya prints an empty
+///   instant.
+/// - The algorithm: `ostree` holds no algorithm for such a signature, so it
+///   prints `[unknown name]`. ostrya prints `unknown`.
+/// - The `Primary key ID` line: ostrya prints this line nowhere. The key that
+///   the line names is in the record of ostrya, where `sign --delete` reads it
+///   (`sign_delete_reaches_a_signature_that_does_not_verify`).
+///
+/// The host time zone and locale decide how `ostree` shows the instant, so the
+/// test checks only the year of the epoch. `TZ=UTC` keeps the run inside 1970.
 #[cfg(feature = "gpg")]
 #[test]
 fn show_reports_a_bad_signature_like_the_tool() {
@@ -13350,7 +13515,7 @@ fn show_reports_a_bad_signature_like_the_tool() {
     let port = ostrya(&args, None, &[]).ok().stdout_trimmed();
     let tool = ostree_env(&args, &[("TZ", "UTC")]).ok().stdout_trimmed();
 
-    // Both refuse the signature, word for word.
+    // Both commands refuse the signature with the same words.
     let verdict = "BAD signature from \"Badsig <badsig@ostrya.example>\"";
     for (label, report) in [("the port", &port), ("the tool", &tool)] {
         assert!(
@@ -13359,14 +13524,15 @@ fn show_reports_a_bad_signature_like_the_tool() {
         );
     }
 
-    // Both name the signing subkey on the line above the verdict.
+    // Both commands name the signing subkey on the line before the verdict.
     let key_id = &subkey[subkey.len() - 16..];
     assert_eq!(reported_key_id(&port), key_id, "the port's key ID");
     assert_eq!(reported_key_id(&tool), key_id, "the tool's key ID");
 
-    // The recorded differences, stated so a change in either is reported. Each
-    // one is read off the report line, so no other line of the report answers
-    // for it.
+    // The recorded divergences, asserted so that the test reports a change in
+    // either command. The test reads the instant and the algorithm from the
+    // report line, so no other line of the report can satisfy these
+    // assertions.
     assert_eq!(
         signature_made_line(&port),
         format!("Signature made  using unknown key ID {key_id}"),
@@ -13391,14 +13557,15 @@ fn show_reports_a_bad_signature_like_the_tool() {
     );
 }
 
-/// `sign --delete KEY-ID` removes a signature whose issuer the trusted set
-/// holds and whose cryptography fails, under the key id of the signing key and
-/// under the key id of the certificate that holds it. A signing subkey made
-/// the signature here, so those two key ids differ. The record such a
-/// signature draws names both keys, and the delete matches a KEY-ID against
-/// either field. `ostree gpg-sign --delete` over the same commit removes the
-/// signature under either key id and under either whole fingerprint, measured
-/// against `ostree` 2026.1.
+/// `sign --delete KEY-ID` removes a signature if the trusted set holds its
+/// issuer and its cryptography fails. The KEY-ID can be the key id of the
+/// signing key or the key id of the certificate that holds that key. A signing
+/// subkey made the signature here, so these two key ids differ.
+///
+/// The record of such a signature names both keys, and the delete matches a
+/// KEY-ID against either field. Over the same commit,
+/// `ostree gpg-sign --delete` removes the signature by either key id and by
+/// either whole fingerprint. This is measured against `ostree` 2026.1.
 #[cfg(feature = "gpg")]
 #[test]
 fn sign_delete_reaches_a_signature_that_does_not_verify() {
@@ -13432,7 +13599,8 @@ fn sign_delete_reaches_a_signature_that_does_not_verify() {
         .stdout_trimmed()
     };
 
-    // One commit per KEY-ID, so each delete runs over a signature of its own.
+    // One commit for each KEY-ID, so each delete runs over a separate
+    // signature.
     for (checksum, key_id, named) in [
         (&by_subkey, &signing_key_id, "the signing subkey"),
         (&by_primary, &primary_key_id, "the primary key"),
@@ -13475,9 +13643,9 @@ fn sign_delete_reaches_a_signature_that_does_not_verify() {
     }
 }
 
-/// `show --print-variant-type` reads a file as a value of a named type, which
-/// makes the tool a byte-exact oracle for the GVariant text form. Each case is
-/// a hand-written serialized value covering one rule of the form.
+/// `show --print-variant-type` reads a file as a value of a named type. This
+/// makes the `ostree` command a byte-exact oracle for the GVariant text form.
+/// Each case is a hand-written serialized value for one rule of the form.
 #[test]
 fn variant_text_matches_the_tool() {
     if !ostree_available() {
@@ -13526,7 +13694,7 @@ fn variant_text_matches_the_tool() {
         ("bool_false", "b", &[0x00]),
         ("bool_true", "b", &[0x01]),
         ("byte", "y", &[0x2a]),
-        // Containers: where the annotation lands, and the empty forms.
+        // Containers: the position of the type annotation, and the empty forms.
         ("as", "as", b"a\0bb\0\x02\x05"),
         (
             "aay_first_bytestring",
@@ -13562,7 +13730,8 @@ fn variant_text_matches_the_tool() {
         let arg = format!("--print-variant-type={signature}");
         assert_agrees(&repo, &repo, &["show", &arg, path.to_str().unwrap()]);
     }
-    // A path that does not open is refused in the tool's own words.
+    // ostrya refuses a path that does not open with the words of the `ostree`
+    // command.
     let missing = base.join("nosuchfile");
     assert_agrees(
         &repo,
@@ -13571,8 +13740,10 @@ fn variant_text_matches_the_tool() {
     );
 }
 
-/// A signature that names no type is refused, which is the shape the tool dies
-/// on (`docs/conformance/cli-surface.md`, "P1").
+/// ostrya refuses a signature that names no type. The `ostree` command ends on
+/// a signal for this shape: `SIGSEGV` for `(s`, `zz`, and `m`, and `SIGABRT`
+/// for `r`, `*`, and `?`. Measured against `ostree` 2026.1. This is a recorded
+/// divergence.
 #[test]
 fn show_refuses_a_variant_type_that_is_not_a_type() {
     let tmp = TmpDir::new("variant-type-refused");
@@ -13606,15 +13777,14 @@ fn show_refuses_a_variant_type_that_is_not_a_type() {
 
 // --- `commit` message, metadata, and ref bindings ----------------------------
 //
-// Each test builds one repository per implementation, runs the same invocation
+// Each test builds one repository for each command, runs the same invocation
 // against both, and compares the exit status and both streams. `commit` prints
-// the checksum it made, so an agreeing standard output is checksum agreement
-// over the commit object, which is what the subject, the body, the metadata
-// dict, and its entry order all reach
-// (`docs/format-reference.md`, "CLI output formats").
+// the checksum of the commit that it made. If the standard output agrees, the
+// checksum of the commit object agrees. The subject, the body, the metadata
+// dict, and its entry order all go into that checksum.
 
-/// A repository pair in `mode` and the materialized corpus, for the `commit`
-/// option families below.
+/// A repository pair in `mode` and the materialized corpus, for the tests of
+/// the `commit` option families.
 fn commit_pair(base: &Path, mode: RepoMode) -> (PathBuf, PathBuf, PathBuf) {
     let tree = base.join("tree");
     ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
@@ -13622,13 +13792,13 @@ fn commit_pair(base: &Path, mode: RepoMode) -> (PathBuf, PathBuf, PathBuf) {
     (port_repo, tool_repo, tree)
 }
 
-/// The fixed timestamp every commit below states, which is what makes its
-/// checksum reproducible across the two implementations.
+/// The fixed timestamp of the commits in the `commit` tests. With it, both
+/// commands make a commit with the same checksum.
 const FIXED_TIMESTAMP: &str = "--timestamp=@1700000000";
 
-/// `commit -m/--body` and `-F/--body-file` reach the commit's body field, `-F`
-/// wins over `-m` in either order, and a body file neither implementation can
-/// read is refused in the same words.
+/// `commit -m/--body` and `-F/--body-file` set the body field of the commit.
+/// `-F` wins over `-m` in either order. If neither command can read a body
+/// file, both refuse it with the same words.
 #[test]
 fn commit_body_forms_match_the_tool() {
     if !ostree_available() {
@@ -13663,15 +13833,15 @@ fn commit_body_forms_match_the_tool() {
         assert_agrees(&port_repo, &tool_repo, &args);
     };
 
-    // The body is stored verbatim: no trimming, no newline normalization, and a
-    // body with no subject is accepted.
+    // The commit stores the body as given, with no trimming and no newline
+    // normalization. A body with no subject is accepted.
     agrees(&["-m", "body text"]);
     agrees(&["-s", "subj", "-m", "body text"]);
     agrees(&["-s", "s", "-m", "line1\nline2"]);
-    // Given more than once, the last value wins.
+    // If the option is given more than once, the last value wins.
     agrees(&["-m", "one", "-m", "two"]);
-    // A body file is taken byte for byte, its trailing newlines and its
-    // surrounding spaces included, and an empty file gives an empty body.
+    // The commit takes a body file byte for byte, with its trailing newlines
+    // and its surrounding spaces. An empty file gives an empty body.
     for path in [&body_file, &empty, &trailing, &no_newline, &spaces] {
         agrees(&["-F", path.to_str().unwrap()]);
     }
@@ -13683,9 +13853,9 @@ fn commit_body_forms_match_the_tool() {
     agrees(&["-F", absent.to_str().unwrap()]);
     agrees(&["-F", "-"]);
     agrees(&["-F", src]);
-    // The two content refusals carry `error: Invalid UTF-8` at exit 1 from both,
-    // which is what the record states, so the words and the status are held
-    // rather than the two sides agreeing on some other answer.
+    // Both commands give the two content refusals as `error: Invalid UTF-8` at
+    // exit 1, as the record states. The test asserts these words and this
+    // status, so an agreement of both commands on another answer fails.
     for (branch, path) in [("bodybad", &bad_utf8), ("bodynul", &with_nul)] {
         let args = [
             "commit",
@@ -13710,9 +13880,10 @@ fn write_script(path: &Path, body: &str) -> PathBuf {
     path.to_owned()
 }
 
-/// `commit -e/--editor` writes the tool's own template into a temporary file,
-/// runs the editor named by the environment as a shell command line, and reads
-/// the subject and the body back out of what the editor left.
+/// `commit -e/--editor` writes the template of the `ostree` command into a
+/// temporary file. It runs the editor that the environment names as a shell
+/// command line. Then it reads the subject and the body from the file that the
+/// editor left.
 #[test]
 fn commit_editor_matches_the_tool() {
     if !ostree_available() {
@@ -13723,8 +13894,8 @@ fn commit_editor_matches_the_tool() {
     let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::Archive);
     let src = tree.to_str().unwrap();
 
-    // An editor that copies the template it is given to `$DUMP`, so the two
-    // templates compare byte for byte.
+    // An editor that copies its template to `$DUMP`, so that the test can
+    // compare the two templates byte for byte.
     let dump = write_script(&base.join("dump.sh"), "#!/bin/sh\ncp \"$1\" \"$DUMP\"\n");
     // An editor that replaces the template, one that leaves it alone, one that
     // writes a message and then fails, and one that fails at once.
@@ -13738,7 +13909,7 @@ fn commit_editor_matches_the_tool() {
         &base.join("writefail.sh"),
         "#!/bin/sh\nprintf 'GoodSubject\\nGoodBody\\n' > \"$1\"\nexit 3\n",
     );
-    // An editor that writes whatever `$EDCONTENT` names, for the parse rules.
+    // An editor that writes the text of `$EDCONTENT`, for the parse rules.
     let content = write_script(
         &base.join("content.sh"),
         "#!/bin/sh\nprintf '%b' \"$EDCONTENT\" > \"$1\"\n",
@@ -13755,9 +13926,9 @@ fn commit_editor_matches_the_tool() {
     );
     let removes = write_script(&base.join("remove.sh"), "#!/bin/sh\nrm -f \"$1\"\n");
 
-    // The template bytes. Each side dumps its own copy, and the two are
-    // compared directly: the branch block, its absence under `--orphan`, and a
-    // `-s` value appended after the block.
+    // The template bytes. Each command dumps its own copy, and the test
+    // compares the two copies directly. The cases are the branch block, no
+    // branch block under `--orphan`, and a `-s` value after the block.
     let template = |label: &str, extra: &[&str]| {
         let mut written = Vec::new();
         for (name, repo) in [("port", &port_repo), ("tool", &tool_repo)] {
@@ -13771,8 +13942,8 @@ fn commit_editor_matches_the_tool() {
             args.extend(extra.iter().map(|arg| (*arg).to_owned()));
             args.push(src.to_owned());
             let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-            // Both variables ahead of `EDITOR` must be absent, not empty: an
-            // empty one is set and so is chosen.
+            // The two variables that come before `EDITOR` must be absent. An
+            // empty variable is set, so the command chooses it.
             let env: Vec<(&str, &str)> = vec![
                 ("EDITOR", dump.to_str().unwrap()),
                 ("DUMP", target.to_str().unwrap()),
@@ -13799,8 +13970,8 @@ fn commit_editor_matches_the_tool() {
     );
     template("multiline", &["-b", "BR", "-s", "S1\nS2"]);
 
-    // The editor's own result, and the fault it reports. Each case runs the same
-    // invocation on both sides with the same environment.
+    // The result of the editor, and the fault that it reports. Each case runs
+    // the same invocation in both commands with the same environment.
     let mut cell = 0;
     let mut agrees = |editor: &Path, edcontent: &str, extra: &[&str]| {
         cell += 1;
@@ -13813,8 +13984,8 @@ fn commit_editor_matches_the_tool() {
             ("EDCONTENT", edcontent),
         ];
         let (port, tool) = run_both_no_editor(&port_repo, &tool_repo, &args, &env);
-        // The temporary file's name is each implementation's own, so a message
-        // naming it is compared with the name masked.
+        // Each command gives the temporary file its own name, so the test masks
+        // the name in a message before the comparison.
         assert_runs_agree(&mask_temp(&port), &mask_temp(&tool), &args.join(" "));
     };
     agrees(&writer, "", &[]);
@@ -13823,26 +13994,27 @@ fn commit_editor_matches_the_tool() {
     agrees(&writer, "", &["-s", "CliSubject"]);
     agrees(&writer, "", &["-m", "CliBody"]);
     agrees(&writer, "", &["-s", "CliS", "-m", "CliB"]);
-    // `-e` replaces the body outright, so `-F` is never read: a body file that
-    // does not open leaves the commit standing.
+    // `-e` replaces the whole body, so the command never reads `-F`. A body
+    // file that does not open does not stop the commit.
     agrees(
         &writer,
         "",
         &["-F", base.join("nope.txt").to_str().unwrap()],
     );
-    // A non-zero editor exit aborts, and what the editor wrote is discarded.
+    // A non-zero exit of the editor aborts the commit, and the command discards
+    // what the editor wrote.
     agrees(&failing, "", &[]);
     agrees(&write_then_fail, "", &[]);
     agrees(Path::new("/nonexistent/editor"), "", &[]);
-    // What the editor left is read under the rules `-F/--body-file` states: a
-    // byte that is not UTF-8 and a NUL both report `Invalid UTF-8`, and a file
-    // the editor removed reports `openat(<path>): <reason>`.
+    // The command reads the file that the editor left with the rules of
+    // `-F/--body-file`. A byte that is not UTF-8 and a NUL both report
+    // `Invalid UTF-8`. A file that the editor removed reports
+    // `openat(<path>): <reason>`.
     agrees(&invalid_utf8, "", &[]);
     agrees(&nul_byte, "", &[]);
     agrees(&removes, "", &[]);
 
-    // The parse rules over the edited text, each pair one case of the table in
-    // `format-reference.md`.
+    // The parse rules over the edited text, one case for each text.
     for text in [
         "Subject line\\n",
         "Subject line\\n\\nBody line 1\\nBody line 2\\n",
@@ -13872,7 +14044,8 @@ fn commit_editor_matches_the_tool() {
         agrees(&content, text, &[]);
     }
 
-    // The temporary file is created readable and writable by its owner alone.
+    // The command creates the temporary file with read and write permission
+    // for its owner only.
     let stat = "stat -c %a";
     let (port, tool) = run_both_no_editor(
         &port_repo,
@@ -13891,9 +14064,9 @@ fn commit_editor_matches_the_tool() {
         "the tool's editor file mode"
     );
 
-    // Where the editor stands in the fault order. A marker the editor writes
-    // states whether it ran; the metadata options are read ahead of it and the
-    // tree and the timestamp behind it.
+    // The position of the editor in the fault order. A marker file that the
+    // editor writes shows if the editor ran. The command reads the metadata
+    // options before the editor, and the tree and the timestamp after it.
     let marker = write_script(
         &base.join("marker.sh"),
         "#!/bin/sh\ntouch \"$MARK\"\nprintf 'S\\nB\\n' > \"$1\"\n",
@@ -13925,17 +14098,16 @@ fn commit_editor_matches_the_tool() {
             assert_eq!(mark.exists(), ran, "{name} editor ran for {args:?}");
         }
     };
-    // A metadata value the reader refuses stands ahead of the editor.
+    // A metadata value that the reader refuses comes before the editor.
     order_agrees(&["--add-metadata=k=[]", FIXED_TIMESTAMP], src, false);
     order_agrees(
         &["--add-metadata-string=noequals", FIXED_TIMESTAMP],
         src,
         false,
     );
-    // A timestamp the reader refuses and a tree that does not open stand behind
-    // it. The tree refusal is worded per implementation
-    // (`docs/conformance/cli-surface.md`, "P2"), so only the order is
-    // compared here.
+    // A timestamp that the reader refuses and a tree that does not open come
+    // after it. Each command uses its own words for the tree refusal, so the
+    // test compares only the order. This is a recorded divergence.
     order_agrees(&["--timestamp=notatime"], src, true);
     order_agrees(
         &[FIXED_TIMESTAMP],
@@ -13944,14 +14116,16 @@ fn commit_editor_matches_the_tool() {
     );
 }
 
-/// The `-e/--editor` file is read to at most 128 mebibytes, the bound
-/// `-F/--body-file` takes. A file of exactly that size commits, and the tool
-/// reaches the same commit; one byte more reports `Commit message larger than
-/// 134217728 bytes` at exit 1 and writes no ref, which is the port's own bound
-/// (`docs/conformance/cli-surface.md`, "Scope of CLI compatibility").
+/// ostrya reads the `-e/--editor` file to at most 128 mebibytes, the same
+/// bound as for `-F/--body-file`. A file of exactly that size commits, and the
+/// `ostree` command makes the same commit. One byte more reports
+/// `Commit message larger than 134217728 bytes` at exit 1 and writes no ref.
+/// This bound belongs to ostrya. For a larger file, `ostree` writes the commit.
+/// This is a recorded divergence, and the test does not run `ostree` on it.
 ///
-/// Ignored by default: it writes a 128 mebibyte file and copies it once per
-/// case; run with `cargo test -p ostrya-cli --test cli -- --ignored`.
+/// The test is ignored by default, because it writes a 128 mebibyte file and
+/// copies it once for each case. To run it, use
+/// `cargo test -p ostrya-cli --test cli -- --ignored`.
 #[test]
 #[ignore = "writes a 128 MiB editor file; run with --ignored"]
 fn commit_editor_file_is_capped() {
@@ -13964,9 +14138,9 @@ fn commit_editor_file_is_capped() {
     let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::Archive);
     let src = tree.to_str().unwrap();
 
-    // The file the editor copies from, one byte over the limit: a subject line
-    // and a comment line that carries the bulk, so the message parsed out of it
-    // stays small at either size and the commit is cheap to write.
+    // The source file of the editor, one byte more than the limit: a subject
+    // line and a comment line with the bulk of the bytes. The parsed message
+    // stays small at both sizes, so the commit writes little data.
     let big = base.join("big");
     let mut out = std::io::BufWriter::new(std::fs::File::create(&big).unwrap());
     out.write_all(b"S\n#").unwrap();
@@ -13985,7 +14159,7 @@ fn commit_editor_file_is_capped() {
         "the source file is the wrong size"
     );
 
-    // The editor writes the leading `$SIZE` bytes of that file, so one source
+    // The editor writes the first `$SIZE` bytes of that file, so one source
     // file serves both sizes.
     let editor = write_script(
         &base.join("copy.sh"),
@@ -14011,8 +14185,8 @@ fn commit_editor_file_is_capped() {
         run_cleared(program, &args, &env)
     };
 
-    // Exactly the limit is accepted, and both implementations reach the same
-    // commit.
+    // A file of exactly the limit is accepted. If the `ostree` command is
+    // installed, both commands make the same commit.
     let port = invoke(env!("CARGO_BIN_EXE_ostrya"), &port_repo, LIMIT, "atlimit");
     assert!(
         port.status.success(),
@@ -14035,7 +14209,7 @@ fn commit_editor_file_is_capped() {
         );
     }
 
-    // One byte more is refused and nothing is written.
+    // ostrya refuses one byte more and writes nothing.
     let port = invoke(
         env!("CARGO_BIN_EXE_ostrya"),
         &port_repo,
@@ -14058,13 +14232,13 @@ fn commit_editor_file_is_capped() {
     );
 }
 
-/// `commit -e` holds no repository lock while the message is being written: the
-/// transaction opens once the editor has returned, so an exclusive operation on
-/// the same repository runs during the editing session.
+/// `commit -e` holds no repository lock while the user writes the message. The
+/// transaction opens when the editor returns, so an exclusive operation on the
+/// same repository can run during the editing session.
 ///
-/// The repository states `lock-timeout-secs=1`, so an acquisition that has to
-/// wait for the editing session fails inside a second and this test reports it
-/// rather than waiting out the default five-minute timeout.
+/// The repository states `lock-timeout-secs=1`. If an acquisition waits for
+/// the editing session, it fails within one second, and the test reports the
+/// failure. The test does not wait for the default timeout of five minutes.
 #[test]
 fn commit_editor_holds_no_repository_lock() {
     use std::time::{Duration, Instant};
@@ -14078,8 +14252,8 @@ fn commit_editor_holds_no_repository_lock() {
     config.push_str("lock-timeout-secs=1\n");
     std::fs::write(repo.join("config"), config).unwrap();
 
-    // The editor states that it started, waits long enough for the acquisition
-    // below to run inside the session, then writes the message.
+    // The editor marks its start and waits 4 seconds, so that the acquisition
+    // of this test runs inside the session. Then it writes the message.
     let started_marker = base.join("editing");
     let editor = write_script(
         &base.join("slow.sh"),
@@ -14108,17 +14282,18 @@ fn commit_editor_holds_no_repository_lock() {
     command.env("OSTREE_EDITOR", &editor);
     let child = command.spawn().expect("spawn the port");
 
-    // Wait for the editing session to open, bounded so a child that never runs
-    // the editor fails here instead of hanging.
+    // Wait for the editing session to open. The wait has a limit of 30
+    // seconds, so a child that never runs the editor fails here and does not
+    // hang.
     let deadline = Instant::now() + Duration::from_secs(30);
     while !started_marker.exists() {
         assert!(Instant::now() < deadline, "the editor never started");
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // An exclusive hold excludes every other holder, so it succeeds only where
-    // the editing session holds nothing. The hold is released at once, well
-    // inside the session, so the commit takes its own lock unimpeded.
+    // An exclusive hold excludes every other holder, so it succeeds only if
+    // the editing session holds no lock. The test releases the hold at once,
+    // early in the session, so the commit takes its own lock with no wait.
     let (acquired, waited) = block_on(async {
         let repo = Repo::open(&repo).await.unwrap();
         let started = Instant::now();
@@ -14156,17 +14331,18 @@ fn commit_editor_holds_no_repository_lock() {
     );
 }
 
-/// The environment variables that name the editor, which a case controlling one
-/// of them must clear on both sides so the host's own value cannot reach the
-/// invocation.
+/// The environment variables that name the editor. A case that controls one of
+/// them must clear them in both commands, so that a value of the host cannot
+/// reach the invocation.
 const EDITOR_VARIABLES: [&str; 4] = ["OSTREE_EDITOR", "VISUAL", "EDITOR", "GIT_EDITOR"];
 
-/// Run the port with the editor variables cleared and `env` applied over them.
+/// Run ostrya with the editor variables cleared and `env` applied over them.
 fn ostrya_no_editor(args: &[&str], env: &[(&str, &str)]) -> Run {
     run_cleared(env!("CARGO_BIN_EXE_ostrya"), args, env)
 }
 
-/// Run the tool with the editor variables cleared and `env` applied over them.
+/// Run the `ostree` command with the editor variables cleared and `env`
+/// applied over them.
 fn ostree_no_editor(args: &[&str], env: &[(&str, &str)]) -> Run {
     run_cleared("ostree", args, env)
 }
@@ -14190,8 +14366,9 @@ fn run_cleared(program: &str, args: &[&str], env: &[(&str, &str)]) -> Run {
     }
 }
 
-/// Run `args` against each side's own repository with the editor environment
-/// cleared, passing the repository as a trailing `--repo`.
+/// Run `args` against the repository of each command with the editor
+/// environment cleared. The repository goes in a `--repo` after the
+/// subcommand name.
 fn run_both_no_editor(
     port_repo: &Path,
     tool_repo: &Path,
@@ -14217,8 +14394,8 @@ fn run_both_no_editor(
     (port, tool)
 }
 
-/// The same run with the editor's temporary-file path replaced, each
-/// implementation naming its own.
+/// The same run with the temporary-file name of the editor masked, because
+/// each command gives that file its own name.
 fn mask_temp(run: &Run) -> Run {
     fn mask(bytes: &[u8]) -> Vec<u8> {
         let text = String::from_utf8_lossy(bytes);
@@ -14227,8 +14404,8 @@ fn mask_temp(run: &Run) -> Run {
             if index > 0 {
                 out.push('/');
             }
-            // A temporary name is a dot and six characters, the shape both
-            // implementations give it.
+            // A temporary name is a dot and six characters. Both commands give
+            // it this shape.
             let temp = part.len() >= 7
                 && part.starts_with('.')
                 && part[1..7].chars().all(|c| c.is_ascii_alphanumeric());
@@ -14249,8 +14426,8 @@ fn mask_temp(run: &Run) -> Run {
 }
 
 /// `commit --add-metadata-string` and `--add-metadata` write the commit
-/// metadata dict, in the entry order the commit checksum states, and refuse the
-/// same arguments in the same words.
+/// metadata dict in the entry order that the commit checksum states. Both
+/// commands refuse the same arguments with the same words.
 #[test]
 fn commit_metadata_matches_the_tool() {
     if !ostree_available() {
@@ -14272,8 +14449,8 @@ fn commit_metadata_matches_the_tool() {
         assert_runs_agree(&port, &tool, &args.join(" "));
         (port, tool)
     };
-    // Which side of the reader a value falls on, stated absolutely, so a value
-    // both implementations came to refuse could not sit in the accepted set.
+    // The exit status that the reader gives a value, asserted for each command.
+    // This keeps a value that both commands refuse out of the accepted set.
     let landed = |port: &Run, tool: &Run, value: &str, code: i32| {
         for (who, run) in [("port", port), ("tool", tool)] {
             assert_eq!(
@@ -14285,8 +14462,8 @@ fn commit_metadata_matches_the_tool() {
         }
     };
 
-    // `--add-metadata-string` splits at the first `=`, so a value may hold
-    // further ones, and an empty value is accepted.
+    // `--add-metadata-string` splits at the first `=`, so a value can hold more
+    // `=` characters. An empty value is accepted.
     agrees(&["--add-metadata-string=foo=bar"]);
     agrees(&["--add-metadata-string=foo=has=equals=in=value"]);
     agrees(&["--add-metadata-string=key="]);
@@ -14295,8 +14472,9 @@ fn commit_metadata_matches_the_tool() {
         "--add-metadata-string=foo=bar",
         "--add-metadata-string=foo=second",
     ]);
-    // The entry order is by group, not by command-line position: every
-    // `--add-metadata-string` first, then every `--add-metadata`.
+    // The entry order goes by option group: first every
+    // `--add-metadata-string`, then every `--add-metadata`. The command-line
+    // position has no effect on it.
     agrees(&[
         "--add-metadata-string=s1=A",
         "--add-metadata=m1='B'",
@@ -14305,13 +14483,13 @@ fn commit_metadata_matches_the_tool() {
     ]);
     agrees(&["--add-metadata-string=dup=str", "--add-metadata=dup='var'"]);
     agrees(&["--add-metadata=dup='var'", "--add-metadata-string=dup=str"]);
-    // A user key may carry a name the binding keys use; the automatic entry is
-    // written beside it.
+    // A user key can have a name that the binding keys use. The command writes
+    // the automatic entry next to it.
     agrees(&["--add-metadata-string=ostree.ref-binding=hijack"]);
 
-    // Every value form the GVariant text reader accepts, one commit each. The
-    // agreeing checksum states that the value serialized to the same bytes, host
-    // byte order included.
+    // Every value form that the GVariant text reader accepts, one commit for
+    // each. The agreeing checksum shows that the value serialized to the same
+    // bytes, with the host byte order.
     for value in [
         "'a string'",
         "\"double quoted\"",
@@ -14353,7 +14531,7 @@ fn commit_metadata_matches_the_tool() {
         "just 'x'",
         "@mi 5",
         "@mu 7",
-        // A nested maybe, where the set levels and the value both belong to the
+        // A nested maybe. The set levels and the value are both part of the
         // stored bytes.
         "@mmi nothing",
         "@mmi just nothing",
@@ -14401,20 +14579,22 @@ fn commit_metadata_matches_the_tool() {
         "(1,)",
         "()",
         "[1,2,3]",
-        // A bytestring ends at the first NUL its escapes produce.
+        // A bytestring ends at the first NUL that its escapes make.
         "b'\\0'",
         "b''",
         "b'\\400'",
         "b'\\0001'",
         "b'a\\0b'",
         "b'\\101'",
-        // A bytestring has no `\u` escape, so the backslash drops and the
-        // digits stay.
+        // A bytestring has no `\u` escape, so the reader drops the backslash
+        // and keeps the digits.
         "b'\\u0000'",
         "b'a\\u0000b'",
-        // Every escape a string literal takes: the short forms, the quote in
-        // use, an unknown escape that drops the backslash and keeps the byte,
-        // and the line continuation a backslash before a line feed makes.
+        // Every escape that a string literal takes:
+        // - the short forms
+        // - the quote in use
+        // - an unknown escape, which drops the backslash and keeps the byte
+        // - the line continuation of a backslash before a line feed
         "'a\\ab'",
         "'a\\bb'",
         "'a\\fb'",
@@ -14429,11 +14609,11 @@ fn commit_metadata_matches_the_tool() {
         "'a\\\nb'",
         "'\\\n'",
         "b'a\\\nb'",
-        // A `\\` takes the backslash, so the line feed after it is the
-        // literal's own and stays.
+        // A `\\` takes the backslash, so the line feed after it belongs to the
+        // literal and stays.
         "'a\\\\\nb'",
         // A unicode escape that names a character, in either digit case, and a
-        // character written through as itself.
+        // character written as itself.
         "'\\u00e9'",
         "'\\u00E9'",
         "'a\\u0041b'",
@@ -14444,14 +14624,15 @@ fn commit_metadata_matches_the_tool() {
         "'héllo'",
         "'中文'",
         "b'hé'",
-        // The escapes a bytestring takes beside its octal ones.
+        // The escapes that a bytestring takes in addition to its octal escapes.
         "b'a\\tb'",
         "b'a\\nb'",
         "b'a\\vb'",
         "b'a\\\\b'",
         "b\"a\\\"b\"",
         "b'a\\zb'",
-        // A binary literal, and the hexadecimal body an integer reader takes.
+        // A binary literal, and the hexadecimal body that an integer reader
+        // takes.
         "0b101",
         "0B101",
         "byte 0b11111111",
@@ -14470,25 +14651,26 @@ fn commit_metadata_matches_the_tool() {
         // A leading zero with no digit after it is octal zero.
         "0",
         "-0",
-        // A leading `+`, and the exponent's own sign.
+        // A leading `+`, and the sign of the exponent.
         "+5",
         "1e+3",
         "1.5e+10",
         "+1.5",
         "@d +1",
-        // A hexadecimal body carrying a fraction is a double with no binary
+        // A hexadecimal body with a fraction is a double with no binary
         // exponent of its own.
         "0x1.8",
         "@d 0x1.8",
         "@d 0x.8",
         "0x.8p1",
-        // The reader the target type picks, which reads the same text twice.
+        // The reader that the target type selects, which reads the same text
+        // twice.
         "@d 017",
         "double 0777",
         "@d 0x10",
         "@d 1E3",
         "double 1E3",
-        // The sign the reader takes ahead of the body.
+        // The sign that the reader takes before the body.
         "-",
         "@i -",
         "@t -",
@@ -14503,12 +14685,14 @@ fn commit_metadata_matches_the_tool() {
         "double nan",
         "just nan",
         "[1, nan]",
-        // An underflow to zero is kept where a decimal subnormal is refused.
+        // The reader keeps an underflow to zero and refuses a decimal
+        // subnormal.
         "1e-400",
         "-1e-400",
         "2.2250738585072014e-308",
-        // A hexadecimal body states its value in binary, so a subnormal it
-        // states exactly is kept, and so is an underflow to zero.
+        // A hexadecimal body states its value in binary, so the reader keeps a
+        // subnormal that the body states exactly. It also keeps an underflow to
+        // zero.
         "@d 0x1p-1023",
         "@d 0x1p-1074",
         "@d -0x1p-1074",
@@ -14518,13 +14702,14 @@ fn commit_metadata_matches_the_tool() {
         "@d 0x0.8p-1074",
         "@d 0x1p-9999999999",
         "@d 0x0.0p2147483647",
-        // A mantissa past 32 hexadecimal digits keeps the digits it states,
-        // and the digits below the double's lowest bit round the result.
+        // A mantissa of more than 32 hexadecimal digits keeps the digits that
+        // it states. The digits that are less significant than the lowest bit
+        // of the double round the result.
         "@d 0xffffffffffffffffffffffffffffffffffffffffp0",
         "@d 0x1.0000000000000000000000000000000000001p0",
         "@d 0x1000000000000000000000000000000000001p-140",
         "@d 0x1.fffffffffffff7ffffffffp1023",
-        // The object paths and the signatures both readers take.
+        // The object paths and the signatures that both readers take.
         "objectpath '/'",
         "objectpath '/a_b'",
         "objectpath '/A/9'",
@@ -14552,29 +14737,29 @@ fn commit_metadata_matches_the_tool() {
         "uint16 65535",
         "handle -1",
         "handle 2147483647",
-        // A declaration ends at the character that closes the value around it,
-        // which is `>` in a variant, `:` in a dict key, and `,` in a tuple.
+        // A declaration ends at the character that closes the value around it.
+        // This is `>` in a variant, `:` in a dict key, and `,` in a tuple.
         "<@u 5>",
         "{@s 'a': 5}",
         "(@u 5,)",
         "@a{sv} {'a': <@u 5>}",
-        // An array settles one element type over every element, so a later
-        // element states the type an earlier empty one could not.
+        // An array sets one element type for all elements, so a later element
+        // can state the type that an earlier empty element does not state.
         "[[], [1]]",
         "[@ai [], [1]]",
         "[nothing, just 'a']",
         // A tab separates the same way a space does.
         "\t42",
         "[1,\t2]",
-        // The mantissa forms a decimal literal may leave out.
+        // The mantissa parts that a decimal literal can omit.
         "1.",
         ".5",
         "-.5",
         "1.e3",
-        // A container nested to the depth both readers take.
+        // A container nested to the depth that both readers take.
         "[[[[[[[[[[1]]]]]]]]]]",
-        // A dictionary takes its value type from the first entry, so the entry
-        // order picks the stored type and the agreeing checksum states it.
+        // A dictionary takes its value type from the first entry. The entry
+        // order selects the stored type, and the agreeing checksum states it.
         "{'a': 1, 'b': uint32 2}",
         "{'a': uint32 2, 'b': 1}",
         "{'a': 1.5, 'b': 1}",
@@ -14584,9 +14769,9 @@ fn commit_metadata_matches_the_tool() {
         "{'a': 1, 'b': 2, 'c': uint32 3}",
         "{'a': uint32 1, 'b': 2, 'c': 3}",
         "{1: 'a', 2.5: 'b'}",
-        // A type already in force takes the value beside a declaration and
-        // drops the declaration, so `@o` under `s` stores a string and its
-        // object-path check never runs.
+        // A type that is already in force takes the value next to a declaration
+        // and drops the declaration. As a result, `@o` under `s` stores a
+        // string, and the object-path check of `@o` never runs.
         "{'a': 'x', 'b': @o '/y'}",
         "{'a': 'x', 'b': @o 'notapath'}",
         "{'a': 1, 'b': @mi 2}",
@@ -14597,7 +14782,7 @@ fn commit_metadata_matches_the_tool() {
         landed(&port, &tool, value, 0);
     }
 
-    // Every refusal the reader gives, with the offsets it reports.
+    // Every refusal that the reader gives, with the offsets that it reports.
     for value in [
         "[]",
         "",
@@ -14645,25 +14830,25 @@ fn commit_metadata_matches_the_tool() {
         "@(i) (1)",
         "(1 2)",
         "(1,2,)",
-        // The exponent marker is lower case in a literal with no type.
+        // In a literal with no type, the exponent marker is lowercase.
         "1E3",
         "1E",
         "0x1p3",
-        // A subnormal is out of the range the reader takes.
+        // A subnormal is out of the range that the reader takes.
         "5e-324",
         "1e-310",
         "1e-308",
         "1e400",
         "1.7976931348623157e309",
-        // A hexadecimal body that rounds to a subnormal it does not state
-        // exactly, and one over the double range.
+        // A hexadecimal body that rounds to a subnormal that it does not state
+        // exactly, and a body that is out of the double range.
         "@d 0x1.8p-1074",
         "@d 0x1.0000000000001p-1030",
         "@d 0x1.0000000000000000001p-1075",
         "@d 0x1p1024",
         "@d 0x1.fffffffffffff8p1023",
         "@d 0x1p2147483647",
-        // The character each reader stopped at.
+        // The character at which each reader stopped.
         "1.5.5",
         "1..5",
         "1e",
@@ -14685,28 +14870,29 @@ fn commit_metadata_matches_the_tool() {
         "@d 0b101",
         "int64 -9223372036854775809",
         "-18446744073709551615",
-        // The range of each narrow integer type, on both sides.
+        // The range of each narrow integer type, one value past each end.
         "int16 32768",
         "int16 -32769",
         "uint16 65536",
         "uint16 -1",
         "handle 2147483648",
         "handle -2147483649",
-        // A type keyword drives the check into the value beside it.
+        // A type keyword applies the check to the value next to it.
         "boolean 1",
         "string 5",
-        // A literal whose quote never closes, with the backslash that reaches
-        // the end of the text among them.
+        // Literals with a quote that never closes. One of them has a backslash
+        // at the end of the text.
         "b'x",
         "'a\\",
-        // An array whose elements all state nothing names the whole value.
+        // If no element of an array states a type, the refusal names the whole
+        // value.
         "[[], []]",
         // An object path and a signature are checked.
         "objectpath 'notapath'",
         "objectpath ''",
         "objectpath '/a/'",
         "objectpath '//'",
-        // A path element takes letters, digits and the underscore alone.
+        // A path element takes only letters, digits, and the underscore.
         "objectpath '/a-b'",
         "objectpath '/a.b'",
         "objectpath '/a b'",
@@ -14715,9 +14901,11 @@ fn commit_metadata_matches_the_tool() {
         "signature 'zz'",
         "signature 'ms'",
         "@g 'zz'",
-        // A signature body holds complete definite types alone: a tuple that
-        // never closes, a closing bracket with no opening one, a dict entry
-        // whose key is not basic, and each indefinite character.
+        // A signature body holds only complete definite types. The refusals:
+        // - a tuple that never closes
+        // - a closing bracket with no opening bracket
+        // - a dict entry with a key that is not basic
+        // - each indefinite character
         "signature '(i'",
         "signature 'i)'",
         "signature '{as}'",
@@ -14725,7 +14913,8 @@ fn commit_metadata_matches_the_tool() {
         "signature 'r'",
         "signature '*'",
         "signature '?'",
-        // A declaration is scanned whole, and an indefinite one is named.
+        // The reader scans a declaration whole, and the refusal names an
+        // indefinite declaration.
         "@z 5",
         "@r 5",
         "@* 5",
@@ -14733,13 +14922,14 @@ fn commit_metadata_matches_the_tool() {
         "@m* 5",
         "@i5",
         "@ii",
-        // A declaration drives the check into the members.
+        // A declaration applies the check to the members.
         "@as [1]",
         "@ai [1,'a']",
         "@a{ss} {'a': 5}",
         "@a{sv} {'a': 1}",
         "@ai 5",
-        // The whole value is named where nothing in it states a type.
+        // If nothing in the value states a type, the refusal names the whole
+        // value.
         "[[]]",
         "just []",
         "just nothing",
@@ -14748,15 +14938,15 @@ fn commit_metadata_matches_the_tool() {
         "[<[]>]",
         "{nothing: 1}",
         "{'a': 1, 2: 'b'}",
-        // The closing brackets each carry their own wording.
+        // Each closing bracket has its own wording.
         "<1 2>",
         "{'a', 5, 6}",
-        // A unicode escape names the digits that are there.
+        // The refusal of a unicode escape names the digits that the text holds.
         "'\\uZZZZ'",
         "'\\u12'",
         "'\\U0001'",
-        // An escape naming U+0000 is refused with the same words, at the
-        // offset of the digits, wherever the literal stands.
+        // An escape that names U+0000 gets the same refusal words, at the
+        // offset of the digits, in every position of the literal.
         "'\\u0000'",
         "'\\U00000000'",
         "'a\\u0000b'",
@@ -14772,8 +14962,8 @@ fn commit_metadata_matches_the_tool() {
         "<'\\u0000'>",
         "@ms '\\u0000'",
         "('\\u0000',)",
-        // A later dictionary value is read against the type the first entry
-        // settled, and the refusal names that type.
+        // The reader checks a later dictionary value against the type that the
+        // first entry set, and the refusal names that type.
         "{'a': 1, 'b': 1.5}",
         "{'a': 'x', 'b': just 'y'}",
         "{'a': 1, 'b': just 2}",
@@ -14787,8 +14977,8 @@ fn commit_metadata_matches_the_tool() {
         "{'a': 1, 'b': 0x1.8p1}",
         "{'a': 'y', 'b': nothing}",
         "@as [@i 5]",
-        // A first value that states no type names the whole value, and no
-        // later entry fills it in.
+        // If the first value states no type, the refusal names the whole value.
+        // No later entry sets the type.
         "{'a': [], 'b': 5}",
         "{'a': [], 'b': [1]}",
         "{'a': nothing, 'b': 'y'}",
@@ -14801,10 +14991,12 @@ fn commit_metadata_matches_the_tool() {
         landed(&port, &tool, value, 1);
     }
 
-    // The nesting cap, at the level past the one both readers take. The offset
-    // agrees for the brackets; `<`, `just`, a type keyword and a declaration
-    // carry an offset the tool leaves uninitialized, which `cli-surface.md`
-    // records as a divergence and no cell holds.
+    // The nesting cap. The text reader of ostrya takes 127 levels and refuses
+    // the level 128. Both commands refuse a value of 128 or 129 levels. The
+    // offset agrees for the brackets. For `<`, `just`, a type
+    // keyword, and a declaration, the `ostree` command leaves the offset
+    // uninitialized.
+    // This is a recorded divergence, and no cell of this test holds it.
     for (open, close) in [("[", "]"), ("(", ")")] {
         for depth in [128usize, 129] {
             let value = format!("{}1{}", open.repeat(depth), close.repeat(depth));
@@ -14812,14 +15004,13 @@ fn commit_metadata_matches_the_tool() {
         }
     }
 
-    // The type-depth cap. A signature value is checked as a type string
-    // alone, which takes 129 levels. A declaration takes the levels its type
-    // carries counted from the level the declaration sits at, and 128 levels
-    // in all.
+    // The type-depth cap. The reader checks a signature value only as a type
+    // string, which takes 129 levels. A declaration counts the levels of its
+    // type from the level of the declaration, and takes 128 levels in all.
     let arrays = |count: usize| "a".repeat(count);
     for value in [
-        // Well inside both caps, where a reader carrying a lower one of its
-        // own would already part from the tool.
+        // Well inside both caps. At this depth, a reader with a lower cap of
+        // its own already differs from the `ostree` command.
         format!("signature '{}y'", arrays(65)),
         format!("@{}y []", arrays(65)),
         format!("@{}r 5", arrays(66)),
@@ -14831,14 +15022,14 @@ fn commit_metadata_matches_the_tool() {
         format!("@{}y []", arrays(127)),
         format!("@{}y []", arrays(128)),
         format!("@{}y []", arrays(129)),
-        // An indefinite declaration is named as such only where it is inside
-        // the cap; past it the depth is named, and past the type-string limit
-        // the declaration is invalid.
+        // The refusal names an indefinite declaration as indefinite only inside
+        // the cap. After the cap, the refusal names the depth. After the
+        // type-string limit, the declaration is invalid.
         format!("@{}r 5", arrays(127)),
         format!("@{}r 5", arrays(128)),
         format!("@{}r 5", arrays(129)),
-        // The empty tuple carries no level of its own, so it reaches one
-        // level deeper than a leaf, and a dict entry is measured by its value.
+        // The empty tuple has no level of its own, so it reaches one level
+        // deeper than a leaf. The value of a dict entry sets its depth.
         format!("@{}() []", arrays(128)),
         format!("@{}() []", arrays(129)),
         format!("@{}(y) []", arrays(126)),
@@ -14846,7 +15037,8 @@ fn commit_metadata_matches_the_tool() {
         format!("@{}{{s()}} []", arrays(127)),
         format!("@{}{{sy}} []", arrays(126)),
         format!("@{}{{sy}} []", arrays(127)),
-        // A declaration inside a container counts from that container's level.
+        // A declaration inside a container counts from the level of that
+        // container.
         format!("[@{}y []]", arrays(126)),
         format!("[@{}y []]", arrays(127)),
     ] {
@@ -14866,8 +15058,9 @@ fn commit_metadata_matches_the_tool() {
     agrees(&["--add-detached-metadata-string=noequals"]);
 }
 
-/// `commit --keep-metadata` carries a key over from the resolved parent, which
-/// is `--parent` where it is given and the branch tip otherwise.
+/// `commit --keep-metadata` copies a key from the resolved parent. If
+/// `--parent` is given, the resolved parent is that commit. If not, it is the
+/// branch tip.
 #[test]
 fn commit_keep_metadata_matches_the_tool() {
     if !ostree_available() {
@@ -14887,8 +15080,9 @@ fn commit_keep_metadata_matches_the_tool() {
         assert_agrees(&port_repo, &tool_repo, &args);
     };
 
-    // The parent both sides then read from: one commit holding three keys, one
-    // of them numeric so the carried bytes are checked as bytes.
+    // The parent that both commands then read from: one commit with three
+    // keys. One key is numeric, so that the test checks the carried bytes as
+    // bytes.
     agrees(
         &[
             "-b",
@@ -14908,8 +15102,8 @@ fn commit_keep_metadata_matches_the_tool() {
     .stdout_trimmed();
     let explicit = format!("--parent={parent}");
 
-    // Keys are carried in command-line order, after both add groups, and a key
-    // given twice is carried twice.
+    // The commit carries keys in command-line order, after both add groups. A
+    // key given twice is carried twice.
     agrees(
         &[
             "-b",
@@ -14959,8 +15153,8 @@ fn commit_keep_metadata_matches_the_tool() {
         ],
         FIXED_TIMESTAMP,
     );
-    // `--no-bindings` suppresses the automatic key alone, so one carried by
-    // hand survives it.
+    // `--no-bindings` turns off only the automatic key, so a key that
+    // `--keep-metadata` carries stays.
     agrees(
         &[
             "-b",
@@ -14971,7 +15165,7 @@ fn commit_keep_metadata_matches_the_tool() {
         ],
         FIXED_TIMESTAMP,
     );
-    // The branch tip is the implicit parent, and `--orphan` beside an explicit
+    // The branch tip is the implicit parent, and `--orphan` with an explicit
     // `--parent` still reads that parent.
     agrees(
         &["-b", "main", "--keep-metadata=k1"],
@@ -14982,8 +15176,8 @@ fn commit_keep_metadata_matches_the_tool() {
         FIXED_TIMESTAMP,
     );
 
-    // The refusals: a key the parent does not hold, and every shape that
-    // resolves no parent at all.
+    // The refusals: a key that the parent does not hold, and every shape that
+    // resolves no parent.
     agrees(
         &["-b", "main", &explicit, "--keep-metadata=nosuch"],
         FIXED_TIMESTAMP,
@@ -14996,9 +15190,9 @@ fn commit_keep_metadata_matches_the_tool() {
     );
 }
 
-/// A commit metadata dict holding several keys in an order that is neither the
-/// command-line order nor a sorted one reaches one checksum in both
-/// implementations, and every key of it reads back by name.
+/// A commit metadata dict has several keys in an order that is not the
+/// command-line order and not sorted. The dict gets one checksum in ostrya and
+/// the `ostree` command. Every key of the dict reads back by name.
 #[test]
 fn commit_metadata_reads_back_in_any_key_order() {
     if !ostree_available() {
@@ -15010,10 +15204,10 @@ fn commit_metadata_reads_back_in_any_key_order() {
     let src = tree.to_str().unwrap();
 
     // The option groups put both `--add-metadata` keys after both
-    // `--add-metadata-string` keys, so the dict stands as `zulu`, `alpha`,
-    // `mike`, `bravo`, `ostree.ref-binding`. That order is the command line's
-    // order under neither reading and is sorted under none. The agreeing
-    // checksum states the stored bytes, the entry order among them.
+    // `--add-metadata-string` keys, so the dict order is `zulu`, `alpha`,
+    // `mike`, `bravo`, `ostree.ref-binding`. That order is not the order of the
+    // command line in any reading, and it is not sorted. The checksums agree,
+    // so the stored bytes agree, and the entry order is part of these bytes.
     assert_agrees(
         &port_repo,
         &tool_repo,
@@ -15032,15 +15226,15 @@ fn commit_metadata_reads_back_in_any_key_order() {
         ],
     );
 
-    // Every key reads back by name, whatever slot it stands in, and both
-    // implementations print the same value for it.
+    // Every key reads back by name, in any slot of the dict. Both commands
+    // print the same value for it.
     for key in ["zulu", "alpha", "mike", "bravo", "ostree.ref-binding"] {
         let arg = format!("--print-metadata-key={key}");
         assert_agrees(&port_repo, &tool_repo, &["show", &arg, "order"]);
     }
 
-    // The listing sorts the names, so it states nothing about the stored order
-    // and reaches the same five keys on both sides.
+    // The listing sorts the names, so it tells nothing about the stored order.
+    // Both commands list the same five keys.
     assert_agrees(
         &port_repo,
         &tool_repo,
@@ -15048,8 +15242,8 @@ fn commit_metadata_reads_back_in_any_key_order() {
     );
 }
 
-/// A metadata key given twice stands twice in the dict, and a read-back by that
-/// name reaches the entry standing first in both implementations.
+/// A metadata key given twice is in the dict twice. In ostrya and in the
+/// `ostree` command, a read-back by that name gets the first entry.
 #[test]
 fn commit_duplicate_metadata_key_reads_back_the_first() {
     if !ostree_available() {
@@ -15060,8 +15254,8 @@ fn commit_duplicate_metadata_key_reads_back_the_first() {
     let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::Archive);
     let src = tree.to_str().unwrap();
 
-    // The agreeing checksum states that both entries stand, which is what
-    // `commit/metadata-duplicate-key` holds.
+    // The checksums agree, so both entries are in the dict. The cell
+    // `commit/metadata-duplicate-key` holds the same fact.
     assert_agrees(
         &port_repo,
         &tool_repo,
@@ -15078,8 +15272,8 @@ fn commit_duplicate_metadata_key_reads_back_the_first() {
         ],
     );
 
-    // The name reaches the first of the two entries, so the slot an entry
-    // stands in decides the value a reader by name gets.
+    // The name gets the first of the two entries, so the slot of an entry
+    // sets the value that a read by name gets.
     let args = ["show", "--print-metadata-key=foo", "dup"];
     let (port, tool) = run_both(&port_repo, &tool_repo, &args);
     assert_runs_agree(&port, &tool, &args.join(" "));
@@ -15090,8 +15284,8 @@ fn commit_duplicate_metadata_key_reads_back_the_first() {
     );
 }
 
-/// `commit --add-detached-metadata-string` writes the `.commitmeta` file beside
-/// the commit and leaves the commit checksum alone.
+/// `commit --add-detached-metadata-string` writes the `.commitmeta` file next
+/// to the commit and does not change the commit checksum.
 #[test]
 fn commit_detached_metadata_matches_the_tool() {
     if !ostree_available() {
@@ -15117,8 +15311,8 @@ fn commit_detached_metadata_matches_the_tool() {
         )
         .ok()
         .stdout_trimmed();
-        // The detached file is outside the commit object, so it is compared as
-        // bytes at the loose path both implementations write it to.
+        // The detached file is outside the commit object, so the test compares
+        // its bytes at the loose path where both commands write it.
         let relative = format!("objects/{}/{}.commitmeta", &checksum[..2], &checksum[2..]);
         let written = std::fs::read(port_repo.join(&relative)).unwrap_or_else(|err| {
             panic!("`{}` wrote no detached metadata: {err}", extra.join(" "))
@@ -15134,7 +15328,7 @@ fn commit_detached_metadata_matches_the_tool() {
             "`{}` wrote different detached metadata",
             extra.join(" "),
         );
-        // And the key listing both report over it.
+        // The test also compares the key listing of both commands for the file.
         assert_agrees(
             &port_repo,
             &tool_repo,
@@ -15150,7 +15344,8 @@ fn commit_detached_metadata_matches_the_tool() {
         "--add-detached-metadata-string=dup=one",
         "--add-detached-metadata-string=dup=two",
     ]);
-    // An empty key is accepted here, unlike the two commit-metadata options.
+    // This option accepts an empty key. The two commit-metadata options refuse
+    // it.
     agrees(&["--add-detached-metadata-string==x"]);
     agrees(&["--add-detached-metadata-string=k="]);
     agrees(&[
@@ -15221,15 +15416,16 @@ fn commit_ref_bindings_match_the_tool() {
     ] {
         agrees(&[&format!("--bind-ref={name}")], None);
     }
-    // The 64-lowercase-hex name `-b` refuses is a name `--bind-ref` accepts, so
-    // the guard covers the ref the command writes and not the name it records.
+    // `--bind-ref` accepts the 64-lowercase-hex name that `-b` refuses. The
+    // guard applies to the ref that the command writes, and not to the name
+    // that the command records.
     agrees(
         &["--bind-ref=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"],
         Some("okbr"),
     );
 
-    // `--no-bindings` writes no binding key at all and overrides `--bind-ref`,
-    // so a commit that adds nothing else reaches one object whatever it names.
+    // `--no-bindings` writes no binding key and overrides `--bind-ref`, so a
+    // commit that adds nothing else gets one object for all branch names.
     agrees(&["--no-bindings"], Some("b2"));
     agrees(&["--no-bindings", "--bind-ref=x"], Some("b6"));
     agrees(&["--no-bindings"], Some(""));
@@ -15269,21 +15465,21 @@ fn commit_ref_bindings_match_the_tool() {
         );
     }
 
-    // `--orphan` writes the key with an empty array, and `--bind-ref` beside it
-    // fills that array with the bound names alone.
+    // `--orphan` writes the key with an empty array. With `--bind-ref`, the
+    // array holds only the bound names.
     agrees(&[], Some(""));
     agrees(&["--bind-ref=only"], Some(""));
     agrees(&["--bind-ref=zz", "--bind-ref=aa"], Some(""));
-    // `--bind-ref` names no branch, so a commit carrying it alone is refused by
-    // the ordinary branch check.
+    // `--bind-ref` names no branch, so the usual branch check refuses a commit
+    // that has only this option.
     assert_agrees(
         &port_repo,
         &tool_repo,
         &["commit", FIXED_TIMESTAMP, "--bind-ref=noBranch", src],
     );
 
-    // A repository carrying a collection id writes the second binding key after
-    // the first, and `--no-bindings` removes both.
+    // A repository with a collection id writes the second binding key after the
+    // first. `--no-bindings` removes both keys.
     let collection = base.join("collection");
     std::fs::create_dir_all(&collection).unwrap();
     let mut repos = Vec::new();
@@ -15319,11 +15515,13 @@ fn commit_ref_bindings_match_the_tool() {
         collection_checksums.push(port.stdout_trimmed());
     }
 
-    // The dict itself, read back out of each repository by that implementation's
-    // own `show --raw`: the second binding key stands after the first, a
-    // `--bind-ref` name reaches the first key alone, and `--no-bindings` leaves
-    // neither. The four invocations above agree with each other, so the read-back
-    // is what states the order and the removal.
+    // The test reads the dict back from each repository with the `show --raw`
+    // of the command that wrote it. The read-back shows three facts:
+    // - the second binding key comes after the first
+    // - a `--bind-ref` name goes only into the first key
+    // - `--no-bindings` keeps neither key
+    // The five commits of the loop agree in both commands. Only the read-back
+    // of four of them shows the order and the removal.
     let raw = |repo: &Path, checksum: &str, port: bool| -> String {
         let repo_arg = format!("--repo={}", repo.display());
         let args = ["show", &repo_arg, "--raw", checksum];
@@ -15341,8 +15539,8 @@ fn commit_ref_bindings_match_the_tool() {
     };
     let collection = "'ostree.collection-binding': <'org.example.Test'>";
     for (repo, port) in [(&repos[0], true), (&repos[1], false)] {
-        // The plain branch, the bound name beside it, and the orphan: the ref
-        // binding stands first and the collection binding follows it.
+        // The plain branch, the branch with a bound name, and the orphan: the
+        // ref binding comes first, and the collection binding comes after it.
         for (checksum, names) in [
             (&collection_checksums[0], "'ostree.ref-binding': <['cb1']>"),
             (
@@ -15374,9 +15572,10 @@ fn commit_ref_bindings_match_the_tool() {
     }
 }
 
-/// Every GVariant type prints, the ones outside the on-disk format among them.
-/// Each case is one normal-form file read under one signature, compared against
-/// the tool (`docs/format-reference.md`, "The GVariant text form").
+/// `show --print-variant-type` prints each basic GVariant type and the maybe
+/// types `ms` and `mi`, with the types that the on-disk format does not use.
+/// Each case is one file in normal form that `show` reads with one signature.
+/// The test compares the GVariant text form with the `ostree` command.
 #[test]
 fn show_prints_every_variant_type_the_tool_prints() {
     if !ostree_available() {
@@ -15417,15 +15616,16 @@ fn show_prints_every_variant_type_the_tool_prints() {
 
 // --- the walk modifiers and the checkout speedup -----------------------------
 //
-// These five tests are the `evidence:` the M10 records under `commit` cite for
-// the cases a single `run:` line cannot state: every one of them needs a
-// control file, a checkout, or a second invocation reading what the first left.
-// Each builds one source tree and gives each implementation its own repository,
-// so the commit checksum both print is the comparison.
+// The conformance records of `commit` cite the seven tests of this section as
+// `evidence:` for the cases that one `run:` line cannot state. Each of these
+// cases needs a control file, a checkout, or a second invocation that reads
+// what the first one left. Each test builds one source tree and gives ostrya
+// and the `ostree` command a repository each. The test compares the commit
+// checksum that each command prints.
 
-/// Build the walk-modifier source tree: two directories, a symlink, and
-/// regular files covering the execute-bit and special-bit cases
-/// `--mode-ro-executables` distinguishes.
+/// Builds the walk-modifier source tree: two directories, a symlink, and
+/// regular files for the execute-bit and special-bit cases that
+/// `--mode-ro-executables` tells apart.
 fn build_walk_source(base: &Path) -> PathBuf {
     let src = base.join("walk");
     std::fs::create_dir_all(src.join("dir1/sub")).unwrap();
@@ -15456,12 +15656,12 @@ fn build_walk_source(base: &Path) -> PathBuf {
     src
 }
 
-/// Compare a `commit` invocation, with the `Unmatched ... path:` lines of both
-/// sides sorted before the comparison.
+/// Compares a `commit` invocation, and sorts the `Unmatched ... path:` lines of
+/// both commands before the comparison.
 ///
-/// The tool emits those lines in a hash order rather than the file order, so
-/// the two implementations agree on the set and not on the sequence
-/// (`docs/conformance/cli-surface.md`, "P2").
+/// The `ostree` command prints those lines in a hash order, and ostrya prints
+/// them in the file order. The two commands agree on the set of lines and not
+/// on the sequence. This is a recorded divergence.
 fn assert_agrees_unordered(port_repo: &Path, tool_repo: &Path, args: &[&str]) {
     let (port, tool) = run_both(port_repo, tool_repo, args);
     let sorted = |run: &Run| {
@@ -15483,9 +15683,9 @@ fn assert_agrees_unordered(port_repo: &Path, tool_repo: &Path, args: &[&str]) {
     );
 }
 
-/// `commit --statoverride=PATH` reads its file the same way in both
-/// implementations: the entry syntax, the mode arithmetic, the entries it
-/// applies to, and the three refusals.
+/// `commit --statoverride=PATH` reads its file the same way in ostrya and the
+/// `ostree` command. The test covers the entry syntax, the mode arithmetic,
+/// the entries that the file applies to, and the three refusals.
 #[test]
 fn commit_statoverride_matches_the_tool() {
     if !ostree_available() {
@@ -15516,8 +15716,8 @@ fn commit_statoverride_matches_the_tool() {
         }
     };
 
-    // The mode is read in base 10 and ORed into the entry's own mode; an `=`
-    // prefix states the permission bits instead, the file-type bits staying.
+    // The mode is read in base 10 and ORed into the mode of the entry. An `=`
+    // prefix sets the permission bits, and the file-type bits stay.
     agrees(&file("8 /plain.txt\n"), false);
     agrees(
         &file("=384 /plain.txt\n=448 /dir2/b.txt\n8 /grpx\n=511 /dir1\n"),
@@ -15526,21 +15726,21 @@ fn commit_statoverride_matches_the_tool() {
     agrees(&file("=4095 /plain.txt\n"), false);
     agrees(&file("=2048 /plain.txt\n"), false);
     agrees(&file("=33261 /plain.txt\n"), false);
-    // The root directory, a nested file, and a symlink are all valid targets,
-    // and an entry over a directory is not recursive.
+    // The root directory, a nested file, and a symlink are all valid targets.
+    // An entry for a directory is not recursive.
     agrees(&file("=511 /\n"), false);
     agrees(&file("=448 /dir1/sub/deep.txt\n"), false);
     agrees(&file("=448 /link\n"), false);
     agrees(&file("=511 /dir1\n"), false);
-    // A value whose file-type bits land inside the symlink's own leaves a
-    // symlink, permission bits and all.
+    // If the file-type bits of a value fall inside the file-type bits of the
+    // symlink, the entry stays a symlink, with its permission bits.
     agrees(&file("=32768 /link\n"), false);
     agrees(&file("=8192 /link\n"), false);
     agrees(&file("=33261 /link\n"), false);
-    // A path named more than once by one form takes the value of the last line
-    // naming it, and the OR form stands ahead of the `=` form for a path both
-    // forms name, whichever order the two lines come in. A value of zero under
-    // the OR form still shadows the `=` entry.
+    // If one form names a path more than once, the path takes the value of the
+    // last line that names it. If both forms name a path, the OR form wins, in
+    // either order of the two lines. An OR value of zero also hides the `=`
+    // entry.
     agrees(&file("=448 /plain.txt\n=511 /plain.txt\n"), false);
     agrees(&file("=511 /plain.txt\n=448 /plain.txt\n"), false);
     agrees(&file("8 /plain.txt\n16 /plain.txt\n"), false);
@@ -15552,12 +15752,12 @@ fn commit_statoverride_matches_the_tool() {
         false,
     );
     agrees(&file("448 /link\n=511 /link\n"), false);
-    // A directory below the walk root of this filesystem source spends the OR
-    // entry and takes no value from it: the entry counts as matched and the mode
-    // stays what the walk found, or what an `=` entry over the same path states.
-    // The walk root takes the OR form as a file does.
+    // A directory under the walk root of this filesystem source spends the OR
+    // entry and takes no value from it. The entry counts as matched. The mode
+    // stays the mode that the walk found, or the mode of an `=` entry for the
+    // same path. The walk root takes the OR form as a file does.
     // `commit_statoverride_spends_one_entry_per_run` states the archive member
-    // that takes the value, and the spend rule over more than one source.
+    // that takes the value, and the spend rule for more than one source.
     agrees(&file("16 /dir1\n"), false);
     agrees(&file("2048 /dir1/sub\n"), false);
     agrees(&file("16 /dir1\n=8 /dir1\n"), false);
@@ -15569,30 +15769,31 @@ fn commit_statoverride_matches_the_tool() {
     agrees(&file("\n8 /plain.txt\n\n"), false);
     agrees(&file(""), false);
     agrees(&file("8 /plain.txt"), false);
-    // A mode field holding no digit is the value zero.
+    // A mode field with no digit is the value zero.
     agrees(&file("abc /plain.txt\n"), false);
     agrees(&file("= /plain.txt\n"), false);
     agrees(&file("=abc /plain.txt\n"), false);
-    // A sign and leading zeros belong to the field: `+448` and `0000448` are
-    // the value 448 under either form, and `-0` is zero. A reader dropping the
-    // sign or stopping at the zeros would reach another mode than the tool's.
+    // A sign and leading zeros are part of the field: `+448` and `0000448` are
+    // the value 448 in both forms, and `-0` is zero. If a reader drops the sign
+    // or stops at the zeros, it gets a mode that differs from the mode of the
+    // `ostree` command.
     agrees(&file("+448 /plain.txt\n"), false);
     agrees(&file("0000448 /plain.txt\n"), false);
     agrees(&file("=+448 /plain.txt\n"), false);
     agrees(&file("=0000448 /plain.txt\n"), false);
     agrees(&file("-0 /plain.txt\n"), false);
-    // An `=` entry matching nothing is ignored; every other entry that matched
-    // nothing is reported, the raw text after the first space being what the
-    // report names.
+    // An `=` entry that matches nothing is ignored. Each other entry that
+    // matches nothing is reported. The report names the raw text after the
+    // first space.
     agrees(&file("=448 /nope\n"), false);
     agrees(&file("448 /nope.txt\n"), true);
     agrees(&file("448 /z1\n448 /a2\n448 /m3\n448 /b4\n448 /y5\n"), true);
     {
-        // The one thing the two do not share, held in the direction measured:
-        // the port reports each unmatched path in the order the file first
-        // names it and the tool reports them in a hash order
-        // (`docs/conformance/cli-surface.md`, "P2"). The run exits 1 on both
-        // sides, standard output stays empty, and each path draws one line.
+        // The one difference of the two commands, asserted in the direction
+        // that was measured. ostrya reports each unmatched path in the order
+        // in which the file first names it. `ostree` reports the paths in a
+        // hash order. This is a recorded divergence. Both commands exit 1,
+        // standard output stays empty, and each path gets one line.
         let option = file("448 /z1\n448 /a2\n448 /m3\n448 /b4\n448 /y5\n");
         let args = ["commit", "-b", "unmatched", FIXED_TIMESTAMP, &option, src];
         let (port, tool) = run_both(&port_repo, &tool_repo, &args);
@@ -15619,7 +15820,8 @@ fn commit_statoverride_matches_the_tool() {
             ["/z1", "/a2", "/b4", "/m3", "/y5"],
             "the tool's recorded hash order moved",
         );
-        // One line per path, whichever form names it and however often.
+        // One line for each path, for each form that names it and for each
+        // number of times that it is named.
         let once = file("448 /nope\n449 /nope\n=450 /nope\n");
         let args = ["commit", "-b", "once", FIXED_TIMESTAMP, &once, src];
         let (port, tool) = run_both(&port_repo, &tool_repo, &args);
@@ -15631,8 +15833,8 @@ fn commit_statoverride_matches_the_tool() {
             );
         }
     }
-    // A path named more than once is reported once, and an `=` entry over the
-    // same path adds no line of its own.
+    // A path that is named more than once is reported once. An `=` entry for
+    // the same path adds no line of its own.
     agrees(&file("448 /nope\n449 /nope\n"), true);
     agrees(&file("448 /nope\n=449 /nope\n"), true);
     agrees(&file("=449 /nope\n448 /nope\n"), true);
@@ -15651,7 +15853,8 @@ fn commit_statoverride_matches_the_tool() {
     );
     agrees(&format!("--statoverride={src}"), false);
 
-    // Given more than once, the last value replaces the earlier ones.
+    // If the option is given more than once, the last value replaces the
+    // earlier ones.
     let first = file("448 /nope\n");
     let second = file("8 /plain.txt\n");
     branch += 1;
@@ -15662,13 +15865,13 @@ fn commit_statoverride_matches_the_tool() {
         &["commit", "-b", &name, FIXED_TIMESTAMP, &first, &second, src],
     );
 
-    // A byte the file cannot hold refuses the whole file at exit 1, with
-    // `error: Invalid UTF-8` alone on standard error, nothing on standard
-    // output, and no ref written. Two paths differing only in such a byte would
-    // otherwise collapse to one string and match the wrong entry. The check
-    // covers the whole file and stands ahead of the walk, ahead of the other
-    // control file's unmatched report, and ahead of a tree path that does not
-    // open, which the last three rows state.
+    // A byte that the file cannot hold refuses the whole file at exit 1. Only
+    // `error: Invalid UTF-8` goes to standard error, nothing goes to standard
+    // output, and no ref is written. Without this refusal, two paths that
+    // differ only in such a byte become one string and match the wrong entry.
+    // The check applies to the whole file. It comes before the walk, before
+    // the unmatched report of the other control file, and before a tree path
+    // that does not open. The last three rows state these three cases.
     let unmatched_skip = base.join("enc-unmatched.txt");
     std::fs::write(&unmatched_skip, "/nope\n").unwrap();
     let unmatched_skip = format!("--skip-list={}", unmatched_skip.display());
@@ -15730,15 +15933,16 @@ fn commit_statoverride_matches_the_tool() {
         }
     }
 
-    // `--canonical-permissions` stands last of the three mode modifiers, so the
-    // reduction states the mode a `--statoverride` entry ends at. This is the
-    // pair that breaks commutativity: the other two modifiers are AND masks and
-    // commute with the reduction, where an `=` entry assigns and a plain entry
-    // ORs. The reduction also restores the file type the walk found, so a value
-    // carrying file-type bits of its own leaves the entry the kind it is.
-    // The mode one entry ends at, read out of the committed tree, so the order
-    // of the three modifiers is stated and not inferred from the checksum. The
-    // reverse order would leave `-00777`, `-04000`, and `d00777`.
+    // `--canonical-permissions` is the last of the three mode modifiers, so the
+    // reduction sets the final mode of a `--statoverride` entry. This pair
+    // does not commute. The other two modifiers are AND masks and commute
+    // with the reduction. An `=` entry assigns, and a plain entry ORs. The
+    // reduction also restores the file type that the walk found. As a result,
+    // a value with its own file-type bits does not change the kind of entry.
+    // The test reads the final mode of one entry from the committed tree. The
+    // order of the three modifiers is then stated, and not inferred from the
+    // checksum. If the reduction ran first, three rows end at `-00777`,
+    // `-04000`, and `d00777`.
     let row = |repo: &Path, rev: &str, path: &str, port: bool| -> String {
         let repo_arg = format!("--repo={}", repo.display());
         let args = ["ls", &repo_arg, "-R", rev];
@@ -15774,7 +15978,7 @@ fn commit_statoverride_matches_the_tool() {
         ("=40960 /plain.txt\n", None, Some("/plain.txt"), "-00000"),
         ("=49152 /dir1\n", None, Some("/dir1"), "d00000"),
         // All three mode modifiers on one command line: the rule runs first,
-        // the entry states the mode next, and the reduction stands last.
+        // the entry sets the mode next, and the reduction comes last.
         (
             "=511 /roexec\n",
             Some("--mode-ro-executables"),
@@ -15810,12 +16014,12 @@ fn commit_statoverride_matches_the_tool() {
         }
     }
 
-    // A `--skip-list` beside the statoverride file. A path the skip list prunes
-    // counts as reached, so the entry naming it draws no report, whichever form
-    // it takes and whichever order the command line gives the two options. A
-    // path below a pruned directory is one the walk never reached. The walk root
-    // counts as reached even where the skip list prunes it, which leaves the
-    // empty-tree refusal alone to report.
+    // A `--skip-list` with the statoverride file. A path that the skip list
+    // prunes counts as reached, so the entry that names it gets no report. This
+    // is true for both forms and for both orders of the two options. The walk
+    // never reaches a path under a pruned directory. The walk root counts as
+    // reached also when the skip list prunes it. Then only the empty-tree
+    // refusal is reported.
     for (over, skip, reversed) in [
         ("16 /plain.txt\n", "/plain.txt\n", false),
         ("16 /dir1\n", "/dir1\n", false),
@@ -15855,13 +16059,12 @@ fn commit_statoverride_matches_the_tool() {
     }
 }
 
-/// An OR-form `--statoverride` entry reaches one entry of the tree per run: the
-/// first entry any source offers under the path spends it, and a later source
-/// under that path keeps the mode it brought. A directory below the walk root
-/// spends the entry and takes no value from it, except over an archive member,
-/// where the OR value reaches a directory as well. The `=` form is not spent and
-/// applies in every source (`docs/format-reference.md`, "CLI output formats",
-/// `commit`).
+/// An OR-form `--statoverride` entry applies to one entry of the tree in each
+/// run. The first entry that a source gives for the path spends it. A later
+/// source with that path keeps the mode that it brought. A directory under
+/// the walk root spends the entry and takes no value from it. The exception
+/// is an archive member, where the OR value applies to a directory too. The
+/// `=` form is not spent and applies in each source.
 #[test]
 fn commit_statoverride_spends_one_entry_per_run() {
     if !ostree_available() {
@@ -15871,9 +16074,10 @@ fn commit_statoverride_spends_one_entry_per_run() {
     let base = tmp.path();
     let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Archive);
     let root = build_overlay_sources(base);
-    // `t1` and `t2` hold `/common`, `/f.txt`, and `/link` alike and differ in
-    // the content of each, so the source a path ended at is visible. Each is
-    // packed as well, giving the same corpus as an archive.
+    // `t1` and `t2` hold the same paths `/common`, `/f.txt`, and `/link`, with
+    // different content in each. As a result, the source of the final entry
+    // of a path is visible. The test also packs each tree into an archive with
+    // the same corpus.
     let dir1 = format!("--tree=dir={}", root.join("t1").display());
     let dir2 = format!("--tree=dir={}", root.join("t2").display());
     let a1 = base.join("a1.tar");
@@ -15906,8 +16110,8 @@ fn commit_statoverride_spends_one_entry_per_run() {
         assert_agrees(&port_repo, &tool_repo, &args);
         name
     };
-    // The mode one path ended at, read out of both repositories, so each arm
-    // states the rule and does not merely state that the two sides agree.
+    // The final mode of one path, read from both repositories, so each arm
+    // states the rule, in addition to the agreement of the two commands.
     let mode = |branch: &str, path: &str| -> String {
         let mut recorded = Vec::new();
         for (repo, port) in [(&port_repo, true), (&tool_repo, false)] {
@@ -15933,9 +16137,9 @@ fn commit_statoverride_spends_one_entry_per_run() {
         recorded.pop().unwrap()
     };
 
-    // One source. A directory below the walk root takes no value from the OR
-    // form over a `dir=` walk and over a `ref=` source, and takes it over an
-    // archive member. The `=` form reaches the directory from all three.
+    // One source. A directory under the walk root takes no value from the OR
+    // form in a `dir=` walk and in a `ref=` source. An archive member takes the
+    // value. The `=` form applies to the directory in all three source kinds.
     let over_dir = file("16 /common\n");
     let assign_dir = file("=504 /common\n");
     for source in [&dir1, &ref1] {
@@ -15961,9 +16165,10 @@ fn commit_statoverride_spends_one_entry_per_run() {
         );
     }
 
-    // Two sources. The first entry offered under the path spends the OR entry,
-    // so an earlier source holding the path leaves the archive's directory
-    // member alone, and an earlier source that does not hold it does not.
+    // Two sources. The first entry that a source gives for the path spends the
+    // OR entry. If an earlier source holds the path, the directory member of
+    // the archive keeps its mode. If the earlier source does not hold the path,
+    // the archive member takes the value.
     let name = agrees(&over_dir, &[&dir1, &tar1]);
     assert_eq!(
         mode(&name, "/common"),
@@ -15982,8 +16187,8 @@ fn commit_statoverride_spends_one_entry_per_run() {
         "d00755",
         "the second archive took the value the first archive spent",
     );
-    // A path the earlier source does not hold is still the archive's to spend:
-    // `/onlyB` is `t2`'s alone.
+    // The archive can spend the entry for a path that the earlier source does
+    // not hold: only `t2` holds `/onlyB`.
     let over_only = file("16 /onlyB\n");
     let name = agrees(&over_only, &[&dir1, &tar2]);
     assert_eq!(
@@ -15998,9 +16203,9 @@ fn commit_statoverride_spends_one_entry_per_run() {
         "the OR form reached a directory below the walk root of the second walk",
     );
 
-    // The spend rule holds over every entry kind, not over directories alone: a
-    // regular file, a symlink, and the walk root all keep the mode the second
-    // source brought.
+    // The spend rule applies to each entry kind, and not only to directories.
+    // A regular file, a symlink, and the walk root all keep the mode that the
+    // second source brought.
     for (body, path, spent, alone) in [
         ("16 /f.txt\n", "/f.txt", "-00644", "-00664"),
         ("2048 /link\n", "/link", "l00777", "l04777"),
@@ -16022,8 +16227,8 @@ fn commit_statoverride_spends_one_entry_per_run() {
             );
         }
     }
-    // The `=` form is not spent: it applies in every source that offers the
-    // path, so the second source's entry carries it too.
+    // The `=` form is not spent. It applies in each source that gives the
+    // path, so the entry of the second source gets it too.
     let assign_file = file("=448 /f.txt\n");
     for pair in [[&dir1, &dir2], [&tar1, &tar2]] {
         let name = agrees(&assign_file, &pair);
@@ -16034,8 +16239,8 @@ fn commit_statoverride_spends_one_entry_per_run() {
         );
     }
 
-    // A spent entry counts as reached, so it draws no unmatched report, and a
-    // path no source holds is still reported whichever sources the run names.
+    // A spent entry counts as reached, so it gets no unmatched report. A path
+    // that no source holds is reported, for all sources that the run names.
     let absent = file("16 /f.txt\n16 /nope\n");
     branch += 1;
     let name = format!("s{branch}");
@@ -16068,12 +16273,14 @@ fn commit_statoverride_spends_one_entry_per_run() {
     }
 }
 
-/// The two `--statoverride` classes the port and the tool part on: a mode field
-/// the port reads in decimal alone, and a value renaming an entry's file type to
-/// one the object model does not hold (`docs/conformance/cli-surface.md`, "P2").
+/// The two `--statoverride` classes where ostrya and the `ostree` command
+/// differ:
+/// - a mode field that ostrya reads only in decimal
+/// - a value that changes the file type of an entry to a type that the object
+///   model does not hold
 ///
-/// Every cell here is a recorded divergence, so the assertion is that each side
-/// behaves the recorded way, which pins both.
+/// Each cell of this test is a recorded divergence. The test asserts that each
+/// command behaves in the recorded way, so the test holds the behavior of both.
 #[test]
 fn commit_statoverride_divergences_stand_as_recorded() {
     if !ostree_available() {
@@ -16096,7 +16303,8 @@ fn commit_statoverride_divergences_stand_as_recorded() {
         args.extend_from_slice(extra);
         args.push(src);
         let runs = run_both(&port_repo, &tool_repo, &args);
-        // A refusal writes nothing, so the branch the run named stays absent.
+        // A refusal writes nothing, so the branch that the run named does not
+        // exist.
         if runs.0.status.code() != Some(0) {
             assert!(
                 !port_repo.join("refs/heads").join(&name).exists(),
@@ -16106,9 +16314,10 @@ fn commit_statoverride_divergences_stand_as_recorded() {
         runs
     };
 
-    // The tool reads the mode field as a C `double`, so a hexadecimal literal, a
-    // decimal point, and an exponent all reach it. The port reads the leading
-    // decimal run, so each of these lands on a different commit, both at exit 0.
+    // The `ostree` command reads the mode field as a C `double`, so it reads a
+    // hexadecimal literal, a decimal point, and an exponent. ostrya reads the
+    // leading decimal run, so each of these values gives a different commit.
+    // Both commands exit 0.
     for body in [
         "0x1ff /plain.txt\n",
         "0X1FF /plain.txt\n",
@@ -16130,9 +16339,9 @@ fn commit_statoverride_divergences_stand_as_recorded() {
             "`{body}` no longer diverges; the recorded divergence is stale"
         );
     }
-    // The port reads the sign, so `4294967295` and `-1` are two spellings of
-    // `0xFFFFFFFF`: each renames the type and draws the refusal the class below
-    // states, where the tool commits at exit 0.
+    // ostrya reads the sign, so `4294967295` and `-1` are two spellings of
+    // `0xFFFFFFFF`. Each one changes the file type and gets the refusal of the
+    // symlink class of this test. `ostree` commits at exit 0.
     for body in ["4294967295 /plain.txt\n", "-1 /plain.txt\n"] {
         let (port, tool) = run(body, &[]);
         assert_eq!(tool.status.code(), Some(0), "tool refused `{body}`");
@@ -16145,12 +16354,12 @@ fn commit_statoverride_divergences_stand_as_recorded() {
         );
     }
 
-    // The tool's own conversion of a value its `double` reader cannot hold in
-    // 32 bits: `4294967296`, `1e100`, `inf`, `nan`, and `4294967295` all reach
-    // the commit the literal `2147483648` gives, which is `0x80000000`. Each row
-    // is a root commit onto one branch, so the ref binding is the same in every
-    // one and the checksum states the mode alone. The port reads `2147483648`
-    // itself, so the two meet there.
+    // The conversion of `ostree` for a value that its `double` reader cannot
+    // hold in 32 bits. `4294967296`, `1e100`, `inf`, `nan`, and `4294967295`
+    // all give the commit of the literal `2147483648`, which is `0x80000000`.
+    // Each row is a root commit on one branch, so the ref binding is the same
+    // in each row. The checksum then states only the mode. ostrya reads
+    // `2147483648` as the same value, so the two commands agree there.
     let mut conversion = 0;
     let mut convert = |body: &str| -> (Run, Run) {
         conversion += 1;
@@ -16193,9 +16402,10 @@ fn commit_statoverride_divergences_stand_as_recorded() {
         );
     }
 
-    // A value renaming a symlink to a type the object model does not hold: the
-    // tool writes an object its own reader then refuses, and the port refuses
-    // the header. Both name the refusal; neither writes a usable object.
+    // A value that changes a symlink to a type that the object model does not
+    // hold. `ostree` writes an object that its own reader then refuses. ostrya
+    // refuses the header. Each command names a refusal, and neither command
+    // writes a usable object.
     for body in ["=4096 /link\n", "=16384 /link\n", "=49152 /link\n"] {
         let (port, tool) = run(body, &[]);
         assert_eq!(tool.status.code(), Some(0), "tool refused `{body}`");
@@ -16208,8 +16418,8 @@ fn commit_statoverride_divergences_stand_as_recorded() {
         );
     }
 
-    // The directory arm of the same class: both refuse at exit 1 and word it
-    // differently.
+    // The directory arm of the same class: both commands refuse at exit 1,
+    // with different words.
     for path in ["/dir1", "/"] {
         for value in [33261, 32768, 4096, 8192, 40960, 49152] {
             let body = format!("={value} {path}\n");
@@ -16230,9 +16440,9 @@ fn commit_statoverride_divergences_stand_as_recorded() {
         }
     }
 
-    // What the tool wrote at exit 0 is an object its own readers refuse. The
-    // renamed symlink fails its checkout, and the renamed regular file fails
-    // its `fsck`, which reads every object the repository holds.
+    // The object that `ostree` wrote at exit 0 is an object that its own
+    // readers refuse. The checkout of the changed symlink fails. The changed
+    // regular file fails `fsck`, which reads each object of the repository.
     let renamed = base.join("div-symlink.txt");
     std::fs::write(&renamed, "=4096 /link\n").unwrap();
     let option = format!("--statoverride={}", renamed.display());
@@ -16277,8 +16487,8 @@ fn commit_statoverride_divergences_stand_as_recorded() {
     );
 }
 
-/// `commit --skip-list=PATH` prunes the same entries in both implementations,
-/// checks every entry it holds, and refuses the same three ways.
+/// `commit --skip-list=PATH` prunes the same entries in ostrya and the `ostree`
+/// command, checks each entry of the file, and refuses in the same three ways.
 #[test]
 fn commit_skip_list_matches_the_tool() {
     if !ostree_available() {
@@ -16309,7 +16519,8 @@ fn commit_skip_list_matches_the_tool() {
         }
     };
 
-    // A file, a symlink, and a directory whose whole subtree goes with it.
+    // A file, a symlink, and a directory, which the skip list prunes with its
+    // whole subtree.
     agrees(&file("/plain.txt\n"), false);
     agrees(&file("/link\n"), false);
     agrees(&file("/dir1\n"), false);
@@ -16319,7 +16530,8 @@ fn commit_skip_list_matches_the_tool() {
     agrees(&file("\n/plain.txt\n\n"), false);
     agrees(&file("/plain.txt\n/plain.txt\n"), false);
     agrees(&file(""), false);
-    // Every child of the root may go, leaving a tree of the root alone.
+    // The skip list can prune each child of the root. The tree then holds only
+    // the root.
     agrees(
         &file(
             "/plain.txt\n/run.sh\n/roexec\n/grpx\n/setuid\n/setgid\n/sticky\n\
@@ -16339,8 +16551,8 @@ fn commit_skip_list_matches_the_tool() {
     }
     agrees(&file("/\n/nope\n"), true);
     agrees(&file("/\n/plain.txt\n"), true);
-    // Every entry is checked, and an entry inside a pruned directory is one the
-    // walk never reached.
+    // Each entry is checked. The walk never reaches an entry inside a pruned
+    // directory.
     agrees(&file("/nope\n"), true);
     agrees(&file("/z1\n/a2\n/m3\n/b4\n/y5\n"), true);
     // A path named more than once is reported once.
@@ -16359,7 +16571,7 @@ fn commit_skip_list_matches_the_tool() {
     );
     agrees(&format!("--skip-list={src}"), false);
 
-    // A byte the file cannot hold refuses the whole file, ahead of the walk.
+    // A byte that the file cannot hold refuses the whole file, before the walk.
     for (index, body) in [
         b"/plain.txt\n/bad\xff.txt\n".to_vec(),
         b"/plain\0.txt\n".to_vec(),
@@ -16378,8 +16590,8 @@ fn commit_skip_list_matches_the_tool() {
         );
     }
 
-    // The statoverride file is read first, so its unmatched report stands ahead
-    // of the skip list's whichever order the command line states.
+    // The statoverride file is read first, so its unmatched report comes before
+    // the report of the skip list, in both orders of the command line.
     let so = base.join("both-so.txt");
     std::fs::write(&so, "448 /nope-so\n").unwrap();
     let so = format!("--statoverride={}", so.display());
@@ -16389,9 +16601,9 @@ fn commit_skip_list_matches_the_tool() {
         let name = format!("t{branch}");
         let args = ["commit", "-b", &name, FIXED_TIMESTAMP, first, second, src];
         assert_agrees_unordered(&port_repo, &tool_repo, &args);
-        // The unordered comparison sorts the lines, so the order of the two
-        // checks is stated here: the statoverride report ends the run and the
-        // skip list is never reached, whichever order the command line gives.
+        // The unordered comparison sorts the lines, so this check states the
+        // order of the two checks. The statoverride report ends the run, and
+        // the skip list is never reached, in both orders of the command line.
         let (port, tool) = run_both(&port_repo, &tool_repo, &args);
         let label = args.join(" ");
         for (who, run) in [("port", &port), ("tool", &tool)] {
@@ -16409,8 +16621,8 @@ fn commit_skip_list_matches_the_tool() {
     }
 }
 
-/// `commit --mode-ro-executables` clears the write bits of every regular file
-/// carrying an execute bit, and runs ahead of `--statoverride`.
+/// `commit --mode-ro-executables` clears the write bits of each regular file
+/// with an execute bit, and runs before `--statoverride`.
 #[test]
 fn commit_mode_ro_executables_matches_the_tool() {
     if !ostree_available() {
@@ -16442,9 +16654,9 @@ fn commit_mode_ro_executables_matches_the_tool() {
         assert_agrees(&port_repo, &tool_repo, &args);
     };
 
-    // The rule alone over the mode grid, then beside each option it composes
-    // with: `--statoverride` states the mode it ends at, and
-    // `--canonical-permissions` runs ahead of both.
+    // The rule alone on the mode grid, then with each option that it composes
+    // with. `--statoverride` sets the mode after the rule, and
+    // `--canonical-permissions` runs after both.
     agrees(&[]);
     agrees(&[&so]);
     agrees(&["--canonical-permissions"]);
@@ -16452,9 +16664,9 @@ fn commit_mode_ro_executables_matches_the_tool() {
     agrees(&["--no-xattrs"]);
 }
 
-/// `commit --skip-if-unchanged` writes nothing where the walked tree matches
-/// the resolved parent: the parent's checksum on standard output, exit 0, and
-/// the ref left where it stood.
+/// If the walked tree matches the resolved parent, `commit --skip-if-unchanged`
+/// writes nothing. It prints the checksum of the parent on standard output,
+/// exits 0, and does not move the ref.
 #[test]
 fn commit_skip_if_unchanged_matches_the_tool() {
     if !ostree_available() {
@@ -16488,13 +16700,14 @@ fn commit_skip_if_unchanged_matches_the_tool() {
     // The first run commits and the second one skips.
     agrees(&[], "t1");
     agrees(&[], "t1");
-    // The commit's own metadata takes no part in the comparison.
+    // The metadata of the commit is not part of the comparison.
     agrees(&["-s", "a different subject"], "t1");
     agrees(&["--add-metadata-string=k=v"], "t1");
-    // A modifier that changes the tree commits, and repeating it skips.
+    // A modifier that changes the tree commits. A repeat of the same modifier
+    // skips.
     agrees(&["--owner-uid=0"], "t1");
     agrees(&["--owner-uid=0"], "t1");
-    // A change to the root dirmeta alone is a change.
+    // A change to only the root dirmeta is a change.
     let so = base.join("siu-so.txt");
     std::fs::write(&so, "=511 /\n").unwrap();
     let so = format!("--statoverride={}", so.display());
@@ -16524,8 +16737,8 @@ fn commit_skip_if_unchanged_matches_the_tool() {
             "the {who} accepted an unmatched statoverride entry beside `--skip-if-unchanged`",
         );
     }
-    // A fresh branch has no parent to compare with, and neither does `--orphan`
-    // or `--parent=none`.
+    // A new branch has no parent for the comparison. `--orphan` and
+    // `--parent=none` also have no parent.
     agrees(&[], "t2");
     agrees(&["--parent=none"], "t2");
     assert_agrees(
@@ -16557,7 +16770,8 @@ fn commit_skip_if_unchanged_matches_the_tool() {
     ];
     let (port, tool) = run_both(&port_repo, &tool_repo, &args);
     assert_runs_agree(&port, &tool, &args.join(" "));
-    // The parent's own checksum is printed, at exit 0, and no ref is created.
+    // The command prints the checksum of the parent, exits 0, and creates no
+    // ref.
     for (who, run) in [("port", &port), ("tool", &tool)] {
         assert_eq!(
             run.status.code(),
@@ -16579,14 +16793,15 @@ fn commit_skip_if_unchanged_matches_the_tool() {
     }
 }
 
-/// The reason a run gives on standard error, with the one wording the two
-/// implementations differ on folded into a single token.
+/// Returns the reason that a run gives on standard error, with one token for
+/// the one wording where the two commands differ.
 ///
-/// Recording the ownership write a non-root user cannot make is the tool's
-/// `Writing content object: fchown: Operation not permitted` and the port's
-/// `i/o error: Operation not permitted (os error 1)`
-/// (`docs/conformance/cli-surface.md`, "P2"). Every other line has to match, so
-/// a cell where both sides fail still has to fail for the same reason.
+/// If a user that is not root records an ownership that it cannot write, the
+/// `ostree` command prints
+/// `Writing content object: fchown: Operation not permitted`. ostrya prints
+/// `i/o error: Operation not permitted (os error 1)`. This is a recorded
+/// divergence. Each other line must match, so if both commands fail in a cell,
+/// they must fail for the same reason.
 fn refusal_reason(run: &Run) -> String {
     let text = String::from_utf8_lossy(&run.stderr).into_owned();
     let mut lines: Vec<String> = text
@@ -16604,9 +16819,9 @@ fn refusal_reason(run: &Run) -> String {
 }
 
 /// `commit --link-checkout-speedup` and `-I/--devino-canonical` resolve a
-/// source file that is a hardlink to one of the repository's own objects, and
-/// reach the tool's own commit checksum in every repository mode and in both
-/// checkout forms the tool hardlinks under.
+/// source file that is a hardlink to an object of the repository. They get
+/// the commit checksum of the `ostree` command in each repository mode, and in
+/// both checkout forms where `ostree` makes hardlinks.
 #[test]
 fn commit_checkout_speedup_matches_the_tool() {
     if !ostree_available() {
@@ -16624,19 +16839,21 @@ fn commit_checkout_speedup_matches_the_tool() {
     std::fs::write(&sk, "/run.sh\n").unwrap();
     let sk = format!("--skip-list={}", sk.display());
 
-    // The arms are a repository mode paired with a checkout form and with the
-    // number of devino-cache hits that pairing leaves.
+    // Each arm is a repository mode with a checkout form and with the number
+    // of devino-cache hits of that pair.
     //
-    // `-U` is the one form every mode accepts, and in `bare-user` it is the
-    // form that leaves the repository's own `user.ostreemeta` xattr on the
-    // hardlinked files, which is where the two speedup options and the plain
-    // walk part. `-H` hardlinks the stored objects themselves, which is the
-    // form that puts a `bare` repository's symlink object on one end of a
-    // hardlink pair. The tool takes `-H` in `bare` alone: an `archive`
-    // repository answers `error: Bare repository mode cannot hardlink in user
-    // checkout mode` and a `bare-user` repository answers `error: User
-    // repository mode requires user checkout mode to hardlink`, both at exit 1
-    // (`docs/conformance/cli-surface.md`, "P2").
+    // `-U` is the one form that all modes accept. In `bare-user`, it is the
+    // form that leaves the `user.ostreemeta` xattr of the repository on the
+    // hardlinked files. There the two speedup options and the plain walk
+    // differ. `-H` hardlinks the stored objects, so the symlink object of a
+    // `bare` repository is one end of a hardlink pair. The `ostree` command
+    // accepts `-H` only in `bare`. Both refusals exit 1:
+    // - `archive`:
+    //   `error: Bare repository mode cannot hardlink in user checkout mode`
+    // - `bare-user`:
+    //   `error: User repository mode requires user checkout mode to hardlink`
+    //
+    // The refusals of ostrya use other words. This is a recorded divergence.
     for (index, (mode, form, hits)) in [
         (RepoMode::Archive, "-U", 0),
         (RepoMode::BareUser, "-U", 13),
@@ -16684,13 +16901,13 @@ fn commit_checkout_speedup_matches_the_tool() {
             .success()
         );
 
-        // What the `-U` checkout of a `bare-user` repository leaves on disk,
-        // which is where the plain walk and the two flagged walks part: the
-        // objects are hardlinked, so each file carries the repository's own
-        // `user.ostreemeta` xattr and its inode holds the permission bits with
-        // the setuid, setgid, and sticky bits cleared. An `-H` checkout of a
-        // `bare-user` repository is refused by the tool, so no arm pairs the
-        // two and the block stays with `-U`.
+        // The files that the `-U` checkout of a `bare-user` repository leaves
+        // on disk. These files make the plain walk and the two flagged walks
+        // differ. The objects are hardlinked, so each file has the
+        // `user.ostreemeta` xattr of the repository. Its inode holds the
+        // permission bits with the setuid, setgid, and sticky bits cleared.
+        // `ostree` refuses an `-H` checkout of a `bare-user` repository, so no
+        // arm has this pair, and the block applies only to `-U`.
         if mode == RepoMode::BareUser && form == "-U" {
             let setuid = port_out.join("setuid");
             let bits = std::fs::symlink_metadata(&setuid)
@@ -16716,15 +16933,14 @@ fn commit_checkout_speedup_matches_the_tool() {
             }
         }
 
-        // How many entries the cache resolved, read from each side's own
-        // `--table-output` block. `Content Cache Hits` counts the content
-        // objects a devino-cache hit resolved (`docs/format-reference.md`,
-        // "CLI output formats"). The count is the assertion the checksums
-        // cannot make: a `bare` repository stores a symlink object as a
-        // symlink, so an `-H` checkout hardlinks that inode as well and the
-        // walk resolves the symlink beside the thirteen regular files. Dropping
-        // the symlink from the cache scan leaves the fourteen at thirteen and
-        // every checksum unmoved.
+        // The number of entries that the cache resolved, read from the
+        // `--table-output` block of each command. `Content Cache Hits` counts
+        // the content objects that a devino-cache hit resolved. The checksums
+        // cannot make this assertion. A `bare` repository stores a symlink
+        // object as a symlink, so an `-H` checkout hardlinks that inode too.
+        // The walk then resolves the symlink and the thirteen regular files.
+        // If the cache scan skips the symlink, the count of fourteen becomes
+        // thirteen, and no checksum changes.
         let cache_hits = |repo: &Path, out: &Path, port: bool| -> u32 {
             let args = [
                 "commit".to_owned(),
@@ -16761,10 +16977,10 @@ fn commit_checkout_speedup_matches_the_tool() {
             "`checkout {form}` over {mode:?} resolved a different number of entries",
         );
 
-        // The source path differs per side, so the invocation is assembled per
-        // side and the two runs are compared directly. The agreed standard
-        // output is returned, so that one invocation's checksum can be held
-        // against another's.
+        // The source path is different for each command, so the closure makes
+        // the invocation for each command and compares the two runs directly.
+        // It returns the standard output that both commands agree on, so the
+        // test can compare the checksums of two invocations.
         let compare = |extra: &[&str]| -> String {
             let build = |repo: &Path, out: &Path| {
                 let mut args = vec![
@@ -16808,9 +17024,10 @@ fn commit_checkout_speedup_matches_the_tool() {
         let speedup = compare(&["--link-checkout-speedup"]);
         let devino = compare(&["-I"]);
         let no_xattrs = compare(&["--no-xattrs"]);
-        // Every modifier still applies over an object `--link-checkout-speedup`
-        // resolved, so each pairing reaches its own commit. A pairing this user
-        // cannot make prints nothing and is left to the agreement above.
+        // Each modifier also applies to an object that
+        // `--link-checkout-speedup` resolved, so each pair gets its own commit.
+        // If this user cannot make a pair, the run prints nothing, and only the
+        // agreement check of `compare` applies.
         for extra in [
             vec!["--link-checkout-speedup", so.as_str()],
             vec!["--link-checkout-speedup", "--mode-ro-executables"],
@@ -16831,8 +17048,8 @@ fn commit_checkout_speedup_matches_the_tool() {
         compare(&["-I", "--mode-ro-executables"]);
         let devino_owned = compare(&["-I", "--owner-uid=7"]);
         compare(&["-I", &sk]);
-        // An `archive` repository stores no object a checkout can hardlink, so
-        // nothing resolves and `-I` is the plain walk there.
+        // An `archive` repository stores no object that a checkout can
+        // hardlink, so nothing resolves, and `-I` is the plain walk there.
         if mode == RepoMode::Archive {
             assert_eq!(
                 devino, plain,
@@ -16845,8 +17062,8 @@ fn commit_checkout_speedup_matches_the_tool() {
             );
         }
 
-        // The cache keys on the inode, so a hardlinked copy of the checkout
-        // resolves the same way the checkout itself does.
+        // The cache key is the inode, so a hardlinked copy of the checkout
+        // resolves in the same way as the checkout.
         let link_copy = |from: &Path, to: &Path| {
             assert!(
                 Command::new("cp")
@@ -16885,27 +17102,29 @@ fn commit_checkout_speedup_matches_the_tool() {
             (tool.status.code(), tool.stdout_trimmed()),
             "a hardlinked copy of the checkout disagrees over {mode:?}"
         );
-        // The cache keys on the inode, so the copy reaches the commit the
-        // checkout itself reaches.
+        // The cache key is the inode, so the copy gets the same commit as the
+        // checkout.
         assert_eq!(
             port.stdout_trimmed(),
             speedup,
             "a hardlinked copy of the checkout resolved otherwise over {mode:?}",
         );
 
-        // The relation the record `commit/devino-bare-user-user-mode-xattr`
-        // states, held between the invocations above rather than between the
-        // two implementations. A `-U` checkout of a `bare-user` repository
-        // hardlinks the stored objects. Those objects carry the repository's
-        // own `user.ostreemeta` xattr, and their inodes hold the permission
-        // bits without the setuid, setgid, and sticky bits. The plain walk
-        // commits the xattr and the reduced bits; `--no-xattrs` drops the xattr
-        // and keeps the reduced bits; either speedup option resolves the object
-        // and reaches the source tree itself. Those three walks reach three
-        // different commits, so both options change the checksum and
-        // `--no-xattrs` does not recover the flagged one. The relations are
-        // properties of the `-U` checkout, so the guard names the form as well
-        // as the mode.
+        // The relation that the record
+        // `commit/devino-bare-user-user-mode-xattr` states. The test checks it
+        // between the invocations of this arm, and not between the two
+        // commands. A `-U` checkout of a `bare-user` repository hardlinks the
+        // stored objects. Those objects have the `user.ostreemeta` xattr of the
+        // repository. Their inodes hold the permission bits without the setuid,
+        // setgid, and sticky bits.
+        // - The plain walk commits the xattr and the reduced bits.
+        // - `--no-xattrs` drops the xattr and keeps the reduced bits.
+        // - Each speedup option resolves the object and gets the source tree.
+        //
+        // These three walks get three different commits, so both options change
+        // the checksum, and `--no-xattrs` does not give the flagged commit. The
+        // relations are properties of the `-U` checkout, so the guard names the
+        // form and the mode.
         if mode == RepoMode::BareUser && form == "-U" {
             let port_repo_arg = format!("--repo={}", port_repo.display());
             let tool_repo_arg = format!("--repo={}", tool_repo.display());
@@ -16928,9 +17147,9 @@ fn commit_checkout_speedup_matches_the_tool() {
                 speedup, devino,
                 "`--link-checkout-speedup` and `-I` reach different commits over bare-user",
             );
-            // `-I` skips the modifiers for every entry that resolves, and the
+            // `-I` skips the modifiers for each entry that resolves. The
             // directories and the symlink resolve to nothing, so they take the
-            // declared uid and the two commits part.
+            // declared uid, and the two commits differ.
             assert_ne!(
                 devino_owned, devino,
                 "`-I --owner-uid=7` reached the option-free `-I` commit over bare-user",
@@ -16968,13 +17187,13 @@ fn commit_checkout_speedup_matches_the_tool() {
             );
         }
 
-        // What an `-H` checkout holds, which is the other side of the block
-        // above. That checkout hardlinks the stored objects themselves, and a
-        // `bare` repository stores each object with the source file's own mode,
-        // uid, gid, and xattrs, so the destination is the source tree again.
-        // Every walk over it reaches the source tree's own commit, the plain
-        // one included, so the cache-hit count above is the whole record of
-        // what the two options resolved.
+        // The content of an `-H` checkout, which is the opposite case of the
+        // `bare-user` block. That checkout hardlinks the stored objects. A
+        // `bare` repository stores each object with the mode, uid, gid, and
+        // xattrs of the source file, so the destination is the source tree
+        // again. Each walk of it, the plain walk too, gets the commit of the
+        // source tree. As a result, only the cache-hit count records what the
+        // two options resolved.
         if form == "-H" {
             let port_repo_arg = format!("--repo={}", port_repo.display());
             let tool_repo_arg = format!("--repo={}", tool_repo.display());
@@ -17010,13 +17229,13 @@ fn commit_checkout_speedup_matches_the_tool() {
 // --- `commit` derived metadata -----------------------------------------------
 //
 // `--generate-sizes`, `--bootable`, and `--generate-composefs-metadata` each
-// derive a metadata key from the tree the commit carries, so the claim is
-// checksum agreement over the commit object. The `ostree.sizes` entries are
-// compared record by record as well, through the tool's own printer read against
-// both repositories (`docs/format-reference.md`, "Metadata object formats").
+// derive a metadata key from the tree of the commit. The claim is that the
+// checksums of the commit object agree. The test also compares the
+// `ostree.sizes` entries record by record. The printer of the `ostree` command
+// reads them from both repositories.
 
-/// Build a tree holding one kernel directory under `usr/lib/modules`, the shape
-/// `--bootable` reads.
+/// Builds a tree with one kernel directory under `usr/lib/modules`, the shape
+/// that `--bootable` reads.
 fn build_kernel_tree(root: &Path) {
     let modules = root.join("usr/lib/modules/6.1.0-test");
     std::fs::create_dir_all(modules.join("kernel")).unwrap();
@@ -17028,9 +17247,9 @@ fn build_kernel_tree(root: &Path) {
     std::os::unix::fs::symlink("../etc/conf", root.join("usr/link")).unwrap();
 }
 
-/// The metadata dict of one commit, as that implementation's own `show --raw`
-/// prints it. The `port` flag picks the reader, so a claim about the stored key
-/// order is read by the implementation that wrote it.
+/// Returns the metadata dict of one commit, as the `show --raw` of the command
+/// that wrote it prints it. The `port` flag selects the reader, so the command
+/// that wrote the commit reads the stored key order.
 fn raw_commit(repo: &Path, rev: &str, port: bool) -> String {
     let repo_arg = format!("--repo={}", repo.display());
     let args = ["show", &repo_arg, "--raw", rev];
@@ -17048,9 +17267,9 @@ fn raw_commit(repo: &Path, rev: &str, port: bool) -> String {
     String::from_utf8(run.stdout).expect("the printed dict is text")
 }
 
-/// The `ostree.sizes` value of `rev` in `repo`, as the tool's own printer
-/// renders it. Both repositories are read by the tool, so the comparison is over
-/// the packed records themselves rather than over the commit checksum.
+/// Returns the `ostree.sizes` value of `rev` in `repo`, as the printer of the
+/// `ostree` command shows it. `ostree` reads both repositories, so the test
+/// compares the packed records, in addition to the commit checksum.
 fn printed_sizes(repo: &Path, rev: &str) -> String {
     let run = ostree(&[
         "show",
@@ -17068,9 +17287,11 @@ fn printed_sizes(repo: &Path, rev: &str) -> String {
 }
 
 /// `commit --generate-sizes` writes `ostree.sizes` in an archive repository and
-/// nothing in the others, and the packed records agree with the tool's over
-/// several trees, over a second commit that reaches deduplicated objects, and
-/// over the tar stream.
+/// nothing in the other modes. The packed records agree with the records of
+/// the `ostree` command for these cases:
+/// - several trees
+/// - a second commit that reaches deduplicated objects
+/// - the tar stream
 #[test]
 fn commit_generate_sizes_matches_the_tool() {
     if !ostree_available() {
@@ -17113,8 +17334,8 @@ fn commit_generate_sizes_matches_the_tool() {
                 ],
             );
         }
-        // Outside archive mode the request writes no key, so the commit is the
-        // one the same invocation without it makes.
+        // Outside archive mode, the request writes no key, so the commit is the
+        // same commit that the invocation without the option makes.
         let plain = ostrya(
             &[
                 "commit",
@@ -17151,7 +17372,7 @@ fn commit_generate_sizes_matches_the_tool() {
         );
     }
 
-    // The packed records themselves, read from both repositories by the tool.
+    // The packed records, which `ostree` reads from both repositories.
     let side = base.join("records");
     std::fs::create_dir_all(&side).unwrap();
     let (port_repo, tool_repo, tree) = commit_pair(&side, RepoMode::Archive);
@@ -17177,8 +17398,8 @@ fn commit_generate_sizes_matches_the_tool() {
         assert!(printed.starts_with("[[byte "), "unexpected rendering");
     }
 
-    // A second commit lists every object the tree reaches, the ones that
-    // deduplicated against the first commit included.
+    // A second commit lists each object that the tree reaches, also the
+    // objects that are shared with the first commit by deduplication.
     let more = base.join("more");
     let copy = Command::new("cp")
         .args(["-a"])
@@ -17201,8 +17422,8 @@ fn commit_generate_sizes_matches_the_tool() {
         ],
     );
 
-    // The tar stream: the port reads it on standard input where the tool takes
-    // `--tree=tar=PATH`, and the key covers the imported tree the same way.
+    // The tar stream: ostrya reads it on standard input, and `ostree` takes
+    // `--tree=tar=PATH`. The key covers the imported tree in the same way.
     let tar = base.join("tree.tar");
     assert!(
         Command::new("tar")
@@ -17244,8 +17465,8 @@ fn commit_generate_sizes_matches_the_tool() {
         tool.ok().stdout_trimmed(),
         "the tar stream and --tree=tar disagree under --generate-sizes"
     );
-    // The key is written for the tar form as it is for a directory walk, so it
-    // is read back out of both repositories rather than left to the checksum.
+    // The key is written for the tar form as for a directory walk. The test
+    // reads it back from both repositories, in addition to the checksum.
     let port_tar_sizes = printed_sizes(&port_repo, "tarred");
     assert!(
         port_tar_sizes.starts_with("[[byte "),
@@ -17257,18 +17478,17 @@ fn commit_generate_sizes_matches_the_tool() {
         "the tar form's ostree.sizes records disagree",
     );
 
-    // Over a source list the key is scoped to what the last source contributed
-    // plus the directory objects the serialization wrote, so the composition
-    // shows in the commit checksum
-    // (`docs/format-reference.md`, "CLI output formats", `commit`).
+    // For a source list, the key holds the content of the last source and the
+    // directory objects that the serialization wrote. As a result, the
+    // composition shows in the commit checksum.
     let sources = build_overlay_sources(base);
     let t1 = sources.join("t1").to_str().unwrap().to_owned();
     let t2 = sources.join("t2").to_str().unwrap().to_owned();
-    // The empty source's root mode is pinned to the mode `build_overlay_sources`
-    // gives `t1`'s root. The two implementations part over `ostree.sizes` where
-    // an earlier source's root dirmeta is a different object from the last
-    // source's, so the arm below states the composition rule and not that
-    // divergence.
+    // The root mode of the empty source is set to the root mode of `t1` from
+    // `build_overlay_sources`. The two commands differ in `ostree.sizes` if the
+    // root dirmeta of an earlier source and the root dirmeta of the last source
+    // are different objects. The arms of `sized` state the composition rule and
+    // not that divergence.
     let empty = sources.join("nothing");
     std::fs::create_dir_all(&empty).unwrap();
     chmod_to(&empty, 0o755);
@@ -17293,7 +17513,7 @@ fn commit_generate_sizes_matches_the_tool() {
         args.extend_from_slice(extra);
         assert_agrees(&port_repo, &tool_repo, &args);
         // Each composition writes the key, and the records agree entry by
-        // entry, which the commit checksum alone does not state.
+        // entry. The commit checksum alone does not state this.
         let records = printed_sizes(&port_repo, &name);
         assert!(
             records.starts_with("[[byte "),
@@ -17319,7 +17539,7 @@ fn commit_generate_sizes_matches_the_tool() {
         &format!("--tree=dir={t1}"),
         &format!("--tree=dir={}", empty.display()),
     ]);
-    // A `--base` layer contributes nothing; a `ref=` source contributes its
+    // A `--base` layer contributes nothing. A `ref=` source contributes its
     // whole tree.
     sized(&["--base=sizebase", &format!("--tree=dir={t2}")]);
     sized(&[&format!("--tree=dir={t2}"), "--tree=ref=sizebase"]);
@@ -17331,8 +17551,8 @@ fn commit_generate_sizes_matches_the_tool() {
     ]);
 }
 
-/// The stored size of one loose object, named by its checksum, in an archive
-/// repository.
+/// Returns the stored size of one loose object, named by its checksum, in an
+/// archive repository.
 fn filez_size(repo: &Path, checksum: &str) -> u64 {
     let (prefix, rest) = checksum.split_at(2);
     let path = repo
@@ -17344,8 +17564,8 @@ fn filez_size(repo: &Path, checksum: &str) -> u64 {
         .len()
 }
 
-/// The content checksum the tool reads for `path` in `rev`, out of either
-/// implementation's repository.
+/// Returns the content checksum that the `ostree` command reads for `path` in
+/// `rev`, from the repository of either command.
 fn content_checksum(repo: &Path, rev: &str, path: &str) -> String {
     let run = ostree(&["ls", "-C", &format!("--repo={}", repo.display()), rev, path]);
     let line = run.ok().stdout_trimmed();
@@ -17355,11 +17575,12 @@ fn content_checksum(repo: &Path, rev: &str, path: &str) -> String {
         .to_owned()
 }
 
-/// The two DEFLATE encoders reach two stored sizes for most payloads, so an
-/// archive `--generate-sizes` commit of such a tree reaches two commit
-/// checksums (`docs/conformance/cli-surface.md`, "P2"). The named payloads pin
-/// the divergence: a change in the port's encoder or in the archive compression
-/// level moves the port's numbers, and a change in the tool's moves the tool's.
+/// The two DEFLATE encoders give two stored sizes for most payloads, so an
+/// archive `--generate-sizes` commit of such a tree gets two commit checksums.
+/// This is a recorded divergence. The named payloads hold the divergence. A
+/// change in the encoder or the archive compression level of ostrya changes
+/// the numbers of ostrya. A change in the encoder of `ostree` changes the
+/// numbers of `ostree`.
 #[test]
 fn commit_generate_sizes_deflate_divergence_stands_as_recorded() {
     if !ostree_available() {
@@ -17368,7 +17589,8 @@ fn commit_generate_sizes_deflate_divergence_stands_as_recorded() {
     let tmp = TmpDir::new("commit-sizes-deflate");
     let base = tmp.path();
     let tree = base.join("tree");
-    // `C9`'s `large.bin` is a 1 MiB byte-cycle; `repeat50` is 50 `a` bytes.
+    // The `large.bin` of `C9` is a 1 MiB byte-cycle. `repeat50` is 50 `a`
+    // bytes.
     ostrya_conformance::corpus::materialize("C9", &tree).unwrap();
     std::fs::write(tree.join("repeat50"), vec![b'a'; 50]).unwrap();
     let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Archive);
@@ -17395,7 +17617,7 @@ fn commit_generate_sizes_deflate_divergence_stands_as_recorded() {
     let port_commit = port.ok().stdout_trimmed();
     let tool_commit = tool.ok().stdout_trimmed();
 
-    // Object identity is over the uncompressed bytes, so the two repositories
+    // The object identity uses the uncompressed bytes, so the two repositories
     // name the same objects and stay interoperable.
     for path in ["/large.bin", "/repeat50"] {
         assert_eq!(
@@ -17405,7 +17627,7 @@ fn commit_generate_sizes_deflate_divergence_stands_as_recorded() {
         );
     }
 
-    // The stored sizes part, and the recorded numbers are these.
+    // The stored sizes differ. These are the recorded numbers.
     for (path, tool_size, port_size) in [("/large.bin", 4424, 4421), ("/repeat50", 40, 50)] {
         let checksum = content_checksum(&port_repo, &port_commit, path);
         assert_eq!(
@@ -17418,8 +17640,8 @@ fn commit_generate_sizes_deflate_divergence_stands_as_recorded() {
         );
     }
 
-    // `ostree.sizes` records those sizes, so the commit checksums part with
-    // them, while the same tree without the option reaches one checksum.
+    // `ostree.sizes` records those sizes, so the commit checksums differ too.
+    // The same tree without the option gets one checksum.
     assert_ne!(
         port_commit, tool_commit,
         "the recorded --generate-sizes divergence is gone over a tree that carries it"
@@ -17439,8 +17661,8 @@ fn commit_generate_sizes_deflate_divergence_stands_as_recorded() {
 }
 
 /// `commit --bootable` derives `ostree.linux` and `ostree.bootable` from the one
-/// kernel directory in the committed tree, and refuses in the tool's words where
-/// the tree holds no kernel or more than one.
+/// kernel directory in the committed tree. If the tree holds no kernel or more
+/// than one, ostrya refuses with the words of the `ostree` command.
 #[test]
 fn commit_bootable_matches_the_tool() {
     if !ostree_available() {
@@ -17465,8 +17687,9 @@ fn commit_bootable_matches_the_tool() {
             vec![],
             vec!["--no-bindings"],
             vec!["--bind-ref=other"],
-            // The derived value replaces one the command line supplies for the
-            // same key, so these three reach the commit `--bootable` alone makes.
+            // The derived value replaces a value that the command line gives
+            // for the same key. These three cases get the same commit as
+            // `--bootable` alone.
             vec!["--add-metadata-string=ostree.linux=9.9.9"],
             vec!["--add-metadata-string=ostree.bootable=false"],
             vec![
@@ -17484,10 +17707,14 @@ fn commit_bootable_matches_the_tool() {
             assert_agrees(&port_repo, &tool_repo, &args);
         }
 
-        // The derived pair itself, read back out of both repositories: the
-        // version the one kernel directory names, the boolean beside it, one
-        // entry of each name, and the slot the pair holds ahead of the
-        // bindings, whatever the command line supplied under those names.
+        // The derived pair, read back from both repositories. The test checks:
+        // - the version that the one kernel directory names
+        // - the boolean with it
+        // - one entry of each name
+        // - the slot of the pair before the bindings
+        //
+        // These facts are true for all values that the command line gives for
+        // those names.
         for (repo, port) in [(&port_repo, true), (&tool_repo, false)] {
             for branch in ["bt0", "bt3", "bt4", "bt5"] {
                 let text = raw_commit(repo, branch, port);
@@ -17519,10 +17746,11 @@ fn commit_bootable_matches_the_tool() {
             }
         }
 
-        // The derived value replaces one the command line supplies under the
-        // same name and keeps the derived slot, so the four spellings reach one
-        // commit. One branch name and `--parent=none` hold the ref binding and
-        // the parent still, so the checksum states the dict alone.
+        // The derived value replaces a value that the command line gives for
+        // the same name, and keeps the derived slot. As a result, the four
+        // spellings get one commit. One branch name and `--parent=none` keep
+        // the ref binding and the parent constant, so the checksum states only
+        // the dict.
         let mut reached = Vec::new();
         for extra in [
             vec![],
@@ -17608,8 +17836,8 @@ fn commit_bootable_matches_the_tool() {
     std::fs::write(stray_modules.join("9.0/vmlinuz"), b"k\n").unwrap();
     std::fs::write(stray_modules.join("README"), b"x\n").unwrap();
 
-    // Each shape is either refused by both or accepted by both, which the
-    // agreement alone does not state, so the status is held on each side.
+    // Both commands refuse each shape, or both accept it. The agreement alone
+    // does not state this, so the test asserts the status of each command.
     for (n, (src, accepted)) in [
         (&no_usr, false),
         (&no_lib, false),
@@ -17649,9 +17877,9 @@ fn commit_bootable_matches_the_tool() {
         }
     }
 
-    // The derived keys stand after the control-file reports, after the
-    // empty-tree refusal, and after `--skip-if-unchanged`, so each of those
-    // reaches its own message over a tree holding no kernel.
+    // The derived keys come after the control-file reports, after the
+    // empty-tree refusal, and after `--skip-if-unchanged`. As a result, each of
+    // these gives its own message for a tree with no kernel.
     let unmatched = base.join("skip.txt");
     std::fs::write(&unmatched, "/nope.txt\n").unwrap();
     let prune_root = base.join("prune.txt");
@@ -17679,7 +17907,7 @@ fn commit_bootable_matches_the_tool() {
         let (port, tool) = run_both(&port_repo, &tool_repo, &args);
         let label = args.join(" ");
         assert_runs_agree(&port, &tool, &label);
-        // The walk's own fault is the one reported, and the kernel search never
+        // The command reports the fault of the walk. The kernel search never
         // runs, so its message is absent.
         assert_runs_agree_on_error(&port, &tool, &label, reported);
         for (who, run) in [("port", &port), ("tool", &tool)] {
@@ -17708,9 +17936,9 @@ fn commit_bootable_matches_the_tool() {
             src,
         ],
     );
-    // The same pairing over a tree holding no kernel: the match is reported
-    // ahead of the kernel search, so the parent's checksum is printed at exit 0
-    // where the search alone would refuse.
+    // The same pair of options for a tree with no kernel. The match is
+    // reported before the kernel search, so the command prints the checksum of
+    // the parent at exit 0. The kernel search alone refuses this tree.
     let no_kernel_src = no_usr.to_str().unwrap();
     let seeded = run_both(
         &port_repo,
@@ -17789,8 +18017,8 @@ fn commit_bootable_matches_the_tool() {
 }
 
 /// `commit --generate-composefs-metadata` stores the fs-verity digest of the
-/// tree's composefs image, which is the same value in every repository mode that
-/// holds the same tree.
+/// composefs image of the tree. The digest is the same value in each repository
+/// mode that holds the same tree.
 #[test]
 fn commit_generate_composefs_metadata_matches_the_tool() {
     if !ostree_available() {
@@ -17845,8 +18073,9 @@ fn commit_generate_composefs_metadata_matches_the_tool() {
         );
         digests.push((mode, printed.ok().stdout_trimmed()));
     }
-    // The digest tracks the tree, so the three modes that store the same tree
-    // reach one value; `bare-user-only` canonicalizes the tree and so differs.
+    // The digest follows the tree, so the three modes that store the same tree
+    // get one value. `bare-user-only` canonicalizes the tree, so its value is
+    // different.
     let value = |wanted: RepoMode| {
         digests
             .iter()
@@ -17864,11 +18093,11 @@ fn commit_generate_composefs_metadata_matches_the_tool() {
     assert_ne!(value(RepoMode::Archive), value(RepoMode::BareUserOnly));
 }
 
-/// A value supplied under the composefs digest's own name takes the derived
-/// digest, in the slot the supplied value already stands in, over each of the
-/// three routes that reach the metadata dict. A key the dict does not already
-/// hold is appended after the bindings, so the supplied value moves the derived
-/// entry ahead of `ostree.ref-binding`.
+/// If a value is given for the name of the composefs digest, the derived digest
+/// replaces it in the slot of the given value. This is true for each of the
+/// three routes into the metadata dict. A key that the dict does not hold yet
+/// goes after the bindings, so the given value moves the derived entry before
+/// `ostree.ref-binding`.
 #[test]
 fn commit_generate_composefs_metadata_over_a_supplied_value() {
     if !ostree_available() {
@@ -17912,8 +18141,8 @@ fn commit_generate_composefs_metadata_over_a_supplied_value() {
         assert_agrees(&port_repo, &tool_repo, &args);
     }
 
-    // `--keep-metadata` carries the supplied value over from the parent, so the
-    // derived digest replaces it there too.
+    // `--keep-metadata` copies the given value from the parent, so the derived
+    // digest replaces it there too.
     assert_agrees(
         &port_repo,
         &tool_repo,
@@ -17940,10 +18169,10 @@ fn commit_generate_composefs_metadata_over_a_supplied_value() {
         ],
     );
 
-    // The commits agree, so the entry order agrees with them. The tool's own
-    // printer states which order that is: one entry either way, standing after
-    // the bindings where nothing supplied the key and ahead of them where
-    // something did.
+    // The commits agree, so the entry order agrees too. The printer of the
+    // `ostree` command states the order. There is one entry in each case. If
+    // no option gives the key, the entry comes after the bindings. If an option
+    // gives the key, the entry comes before them.
     let slots = |branch: &str| -> (usize, usize) {
         let run = ostree(&[
             "show",
@@ -17977,8 +18206,8 @@ fn commit_generate_composefs_metadata_over_a_supplied_value() {
         );
     }
 
-    // And the value in that slot is the derived digest, which the supplied one
-    // never reaches.
+    // The value in that slot is the derived digest. The given value never
+    // stays.
     let stored = |branch: &str| -> String {
         let run = ostree(&[
             "show",
@@ -18000,10 +18229,9 @@ fn commit_generate_composefs_metadata_over_a_supplied_value() {
     }
 }
 
-/// The derived keys take the slots the metadata key order gives them: the
-/// `--bootable` pair first, the user keys next, then the bindings, then the
-/// composefs digest, and `ostree.sizes` last
-/// (`docs/format-reference.md`, "CLI output formats", `commit`).
+/// The derived keys take the slots of the metadata key order. The `--bootable`
+/// pair comes first, then the user keys, the bindings, and the composefs
+/// digest. `ostree.sizes` comes last.
 #[test]
 fn commit_derived_metadata_key_order() {
     let tmp = TmpDir::new("commit-derived-order");
@@ -18056,15 +18284,16 @@ fn commit_derived_metadata_key_order() {
     }
 }
 
-/// Build the two overlay sources the composition cases use: `t1` and `t2`
-/// share `f.txt` and `common/`, and each carries a directory the other does
-/// not. Returns the parent holding both.
+/// Builds the two overlay sources of the composition cases. `t1` and `t2`
+/// share `f.txt` and `common/`, and each one has a directory that the other
+/// does not have. Returns the parent directory of both.
 fn build_overlay_sources(base: &Path) -> PathBuf {
     let root = base.join("sources");
     // `create_dir_all` and `fs::write` reduce 0777 and 0666 by the process
-    // umask, and the mode reaches the recorded dirmeta and file mode, so every
-    // mode this helper creates is pinned. The `m1`/`m2` pair below already
-    // states its directory modes, which is what these calls do for the rest.
+    // umask, and the mode goes into the recorded dirmeta and file mode. As a
+    // result, this helper sets each mode that it creates. The `m1`/`m2` pair
+    // sets its directory modes itself. The `chmod_to` calls do the same for the
+    // other entries.
     std::fs::create_dir_all(&root).unwrap();
     chmod_to(&root, 0o755);
     for (name, own) in [("t1", "onlyA"), ("t2", "onlyB")] {
@@ -18082,8 +18311,8 @@ fn build_overlay_sources(base: &Path) -> PathBuf {
         chmod_to(&dir.join("common").join(format!("{name}.txt")), 0o644);
         chmod_to(&dir.join(own).join("own.txt"), 0o644);
     }
-    // A symlink naming a directory, for the `dir=` source that resolves to a
-    // tree through a link.
+    // A symlink that names a directory, for the `dir=` source that resolves to
+    // a tree through a link.
     std::os::unix::fs::symlink("t1", root.join("dirlink")).unwrap();
     // A file and a directory at the same path, for the two type-change
     // refusals. The name is reported without its parents.
@@ -18096,7 +18325,7 @@ fn build_overlay_sources(base: &Path) -> PathBuf {
     }
     chmod_to(&root.join("n1/a/b/p/i"), 0o644);
     chmod_to(&root.join("n2/a/b/p"), 0o644);
-    // Two trees whose shared directories differ in mode alone.
+    // Two trees whose shared directories differ only in mode.
     for (name, mode) in [("m1", 0o700u32), ("m2", 0o751)] {
         let dir = root.join(name);
         std::fs::create_dir_all(dir.join("d")).unwrap();
@@ -18109,7 +18338,7 @@ fn build_overlay_sources(base: &Path) -> PathBuf {
     root
 }
 
-/// Pack `dir` as an uncompressed tar with a `./` root member, next to it.
+/// Packs `dir` as an uncompressed tar with a `./` root member, at `archive`.
 fn pack_tar(dir: &Path, archive: &Path) {
     let status = Command::new("tar")
         .arg("-cf")
@@ -18122,10 +18351,10 @@ fn pack_tar(dir: &Path, archive: &Path) {
     assert!(status.success(), "tar failed to pack {}", dir.display());
 }
 
-/// One 512-byte tar header block. `gnu` picks the old-GNU magic and version
-/// (`ustar` plus two spaces and a NUL) over the ustar pair (`ustar`, NUL, `00`).
-/// The name is taken as bytes, so a pathname that is not valid UTF-8 can be
-/// stated.
+/// Returns one 512-byte tar header block. If `gnu` is `true`, the block has the
+/// old-GNU magic and version (`ustar` plus two spaces and a NUL). If not, it
+/// has the ustar pair (`ustar`, NUL, `00`). The name is bytes, so the block can
+/// hold a pathname that is not valid UTF-8.
 fn tar_header(
     name: &[u8],
     mode: u32,
@@ -18144,7 +18373,8 @@ fn tar_header(
     put(&mut h, 116, b"0000000\0");
     put(&mut h, 124, format!("{size:011o}\0").as_bytes());
     put(&mut h, 136, b"00000000000\0");
-    // The checksum field is summed as eight spaces and written afterwards.
+    // The checksum field counts as eight spaces in the sum. The sum goes into
+    // the field after that.
     put(&mut h, 148, b"        ");
     h[156] = typeflag;
     put(&mut h, 157, link.as_bytes());
@@ -18159,10 +18389,11 @@ fn tar_header(
     h
 }
 
-/// Pack an archive whose symlink members carry a spread of header mode fields.
-/// `tar` writes `0777` for every symlink member it packs, so the field is
-/// written here directly. The last two names hold a full `st_mode` in the octal
-/// field, which states what happens to the bits above the low twelve.
+/// Packs an archive whose symlink members have a range of header mode fields.
+/// `tar` writes `0777` for each symlink member that it packs, so this helper
+/// writes the field directly. The last two names hold a full `st_mode` in the
+/// octal field, which states what happens to the bits higher than the low
+/// twelve.
 fn pack_symlink_modes(archive: &Path, gnu: bool) {
     let modes: &[(&str, u32)] = &[
         ("l0000", 0o0),
@@ -18194,14 +18425,15 @@ fn pack_symlink_modes(archive: &Path, gnu: bool) {
             gnu,
         ));
     }
-    // Two zero blocks end the stream, and the whole is padded to a tar record.
+    // Two zero blocks end the stream, and the stream is padded to a tar record.
     out.resize(out.len() + 1024, 0);
     out.resize(out.len().next_multiple_of(10240), 0);
     std::fs::write(archive, &out).unwrap();
 }
 
-/// Pack an archive holding a `./` root member and one regular file whose name
-/// holds the byte `0xFF`, which no pathname the `run:` grammar writes can hold.
+/// Packs an archive with a `./` root member and one regular file whose name
+/// holds the byte `0xFF`. No pathname that the `run:` grammar writes can hold
+/// this byte.
 fn pack_invalid_pathname(archive: &Path) {
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(&tar_header(b"./", 0o755, b'5', "", 0, false));
@@ -18216,18 +18448,19 @@ fn pack_invalid_pathname(archive: &Path) {
     ));
     out.extend_from_slice(body);
     out.resize(out.len().next_multiple_of(512), 0);
-    // Two zero blocks end the stream, and the whole is padded to a tar record.
+    // Two zero blocks end the stream, and the stream is padded to a tar record.
     out.resize(out.len() + 1024, 0);
     out.resize(out.len().next_multiple_of(10240), 0);
     std::fs::write(archive, &out).unwrap();
 }
 
-/// Pack an archive holding a `./` root member and one regular file whose name
+/// Packs an archive with a `./` root member and one regular file whose name
 /// is `len` bytes. The name goes in a pax `path` record, because the name
 /// field of a header holds 100 bytes.
 fn pack_long_name(archive: &Path, len: usize) {
     let path = format!("./{}", "n".repeat(len));
-    // A record states its own length in decimal, the digits included.
+    // A record states its own length in decimal. The length includes its own
+    // digits.
     let rest = format!(" path={path}\n");
     let mut size = rest.len() + 1;
     while format!("{size}{rest}").len() != size {
@@ -18250,18 +18483,21 @@ fn pack_long_name(archive: &Path, len: usize) {
     out.extend_from_slice(&tar_header(b"./long", 0o644, b'0', "", body.len(), false));
     out.extend_from_slice(body);
     out.resize(out.len().next_multiple_of(512), 0);
-    // Two zero blocks end the stream, and the whole is padded to a tar record.
+    // Two zero blocks end the stream, and the stream is padded to a tar record.
     out.resize(out.len() + 1024, 0);
     out.resize(out.len().next_multiple_of(10240), 0);
     std::fs::write(archive, &out).unwrap();
 }
 
 /// `commit --tree=dir=`, `--tree=tar=`, and `--tree=ref=` compose as one
-/// ordered overlay: directories merge, a later source's directory metadata
-/// replaces the earlier one, later files replace earlier files, and a name that
-/// changes between a file and a directory is refused. Every accepted form is
-/// compared by the commit checksum, so what is compared is the tree both
-/// implementations wrote.
+/// ordered overlay:
+/// - directories merge
+/// - the directory metadata of a later source replaces the earlier one
+/// - later files replace earlier files
+/// - a name that changes between a file and a directory is refused
+///
+/// The test compares each accepted form by the commit checksum, so it compares
+/// the tree that ostrya and the `ostree` command wrote.
 #[test]
 fn commit_tree_sources_match_the_tool() {
     if !ostree_available() {
@@ -18281,7 +18517,7 @@ fn commit_tree_sources_match_the_tool() {
     let tar = |archive: &Path| format!("--tree=tar={}", archive.display());
 
     // Both repositories hold the same two committed trees, so `ref=` names the
-    // same revisions on each side.
+    // same revisions in each command.
     for (branch, source) in [("src1", &t1), ("src2", &t2)] {
         assert_agrees(
             &port_repo,
@@ -18306,9 +18542,9 @@ fn commit_tree_sources_match_the_tool() {
         assert_agrees(&port_repo, &tool_repo, &args);
     };
 
-    // One source of each kind, then every ordered pair of kinds. The order
-    // decides `f.txt` and the root's metadata, so the two directions reach
-    // different checksums and each is compared on its own.
+    // One source of each kind, then each ordered pair of kinds. The order sets
+    // `f.txt` and the metadata of the root, so the two directions get different
+    // checksums, and the test compares each direction separately.
     agrees(&[&format!("--tree=dir={t1}")]);
     agrees(&["--tree=ref=src1"]);
     agrees(&[&tar(&a_tar)]);
@@ -18324,12 +18560,12 @@ fn commit_tree_sources_match_the_tool() {
     agrees(&[&tar(&a_tar), &format!("--tree=dir={t2}")]);
     agrees(&[&tar(&a_tar), &tar(&b_tar)]);
     agrees(&[&format!("--tree=dir={t1}"), &tar(&b_tar), "--tree=ref=src1"]);
-    // A trailing slash on a `dir=` value, and a revision expression `ref=`
-    // resolves the way `rev-parse` does.
+    // A trailing slash on a `dir=` value. The second row repeats the `ref=`
+    // pair of the ordered pairs and holds no revision expression.
     agrees(&[&format!("--tree=dir={t1}/")]);
     agrees(&["--tree=ref=src1", "--tree=ref=src2"]);
-    // Directory metadata: the later source's dirmeta replaces the earlier one
-    // for the root and for a shared subdirectory.
+    // Directory metadata: the dirmeta of the later source replaces the earlier
+    // one for the root and for a shared subdirectory.
     agrees(&[
         &format!("--tree=dir={}", path("m1")),
         &format!("--tree=dir={}", path("m2")),
@@ -18338,13 +18574,14 @@ fn commit_tree_sources_match_the_tool() {
         &format!("--tree=dir={}", path("m2")),
         &format!("--tree=dir={}", path("m1")),
     ]);
-    // A positional PATH beside any `--tree` is ignored, unopened, at exit 0,
-    // and so is every positional after the first where no `--tree` is given.
+    // If a `--tree` is given, a positional PATH is ignored and not opened, and
+    // the command exits 0. If no `--tree` is given, each positional after the
+    // first is ignored in the same way.
     agrees(&[&format!("--tree=dir={t1}"), &t2]);
     agrees(&[&format!("--tree=dir={t1}"), "/nonexistent-xyz"]);
     agrees(&[&t1, &t2]);
 
-    // The two type-change refusals name the entry and not its path.
+    // The two type-change refusals name the entry, without its path.
     for (first, second, message) in [
         ("n1", "n2", "error: Can't replace directory with file: p"),
         ("n2", "n1", "error: Can't replace file with directory: p"),
@@ -18399,7 +18636,7 @@ fn commit_tree_sources_match_the_tool() {
         let (port, tool) = run_both(&port_repo, &tool_repo, &line);
         let label = line.join(" ");
         assert_runs_agree(&port, &tool, &label);
-        // Each is a refusal, which the agreement alone does not state.
+        // Each case is a refusal. The agreement alone does not state this.
         for (who, run) in [("port", &port), ("tool", &tool)] {
             assert_eq!(
                 run.status.code(),
@@ -18411,8 +18648,9 @@ fn commit_tree_sources_match_the_tool() {
     }
 }
 
-/// `commit --base=REV` is the bottom layer whatever its position, the last
-/// value wins, and no commit modifier reaches an entry that survives from it.
+/// `commit --base=REV` is the bottom layer in each position on the command
+/// line, and the last value wins. No commit modifier applies to an entry that
+/// stays from the base.
 #[test]
 fn commit_base_matches_the_tool() {
     if !ostree_available() {
@@ -18427,10 +18665,10 @@ fn commit_base_matches_the_tool() {
     let tar = base.join("t2.tar");
     pack_tar(&root.join("t2"), &tar);
 
-    // One xattr on the entry that survives from the base and one on the entry
-    // the later source brings, so `--no-xattrs` states which of the two the
-    // modifier reaches. A filesystem that carries no user xattr leaves the two
-    // arms below out.
+    // One xattr is on the entry that stays from the base. One xattr is on the
+    // entry that the later source brings. `--no-xattrs` then states which of
+    // the two the modifier applies to. If the filesystem holds no user xattr,
+    // the test skips the two xattr arms.
     let setfattr = |path: &Path, name: &str, value: &str| -> bool {
         Command::new("setfattr")
             .args(["-n", name, "-v", value])
@@ -18466,28 +18704,29 @@ fn commit_base_matches_the_tool() {
         name
     };
 
-    // The base under one source, on either side of it, and repeated.
+    // The base under one source, before and after the source, and twice.
     agrees(&["--base=src1", &format!("--tree=dir={t2}")]);
     agrees(&[&format!("--tree=dir={t2}"), "--base=src1"]);
     agrees(&["--base=src1", "--base=src2", &format!("--tree=dir={t2}")]);
     agrees(&["--base=src1", &format!("--tree=tar={}", tar.display())]);
     agrees(&["--base=src1", "--tree=ref=src2"]);
-    // A skip list naming the walk root prunes the walk, so the base is the
-    // whole tree and the commit is written rather than refused as empty.
+    // A skip list that names the walk root prunes the walk, so the base is the
+    // whole tree. The command writes the commit and does not refuse it as
+    // empty.
     let root_skip = base.join("skip-root.txt");
     std::fs::write(&root_skip, "/\n").unwrap();
     let root_skip = format!("--skip-list={}", root_skip.display());
     agrees(&["--base=src1", &root_skip, &format!("--tree=dir={t2}")]);
-    // The pruned walk accounts no object, so `--generate-sizes` writes no
-    // `ostree.sizes` key and the commit states the same checksum without one.
+    // The pruned walk counts no object, so `--generate-sizes` writes no
+    // `ostree.sizes` key, and the checksum is the same as without the key.
     agrees(&[
         "--base=src1",
         &root_skip,
         "--generate-sizes",
         &format!("--tree=dir={t2}"),
     ]);
-    // No modifier reaches an entry that survives from the base, and every
-    // modifier reaches one that arrives from a `--tree`, `ref=` included.
+    // No modifier applies to an entry that stays from the base. Each modifier
+    // applies to an entry that comes from a `--tree`, `ref=` too.
     let owned = agrees(&[
         "--base=src1",
         &format!("--tree=dir={t2}"),
@@ -18511,11 +18750,11 @@ fn commit_base_matches_the_tool() {
         None
     };
 
-    // What the two commits above recorded, read back per entry. `ls -X -R`
-    // prints the mode, the ownership, the size, and the xattr set of each path,
-    // so the row of an entry that survives from the base equals the row the base
-    // commit itself holds, and the row of an entry the later source brought
-    // carries what the modifier did to it.
+    // The test reads back, for each entry, what the commits `owned` and `bare`
+    // recorded. `ls -X -R` prints the mode, the ownership, the size, and the
+    // xattr set of each path. The row of an entry that stays from the base is
+    // equal to the row in the base commit. The row of an entry from the later
+    // source shows the change of the modifier.
     let row = |repo: &Path, rev: &str, path: &str, port: bool| -> String {
         let repo_arg = format!("--repo={}", repo.display());
         let args = ["ls", &repo_arg, "-X", "-R", rev];
@@ -18600,9 +18839,9 @@ fn commit_base_matches_the_tool() {
     );
 }
 
-/// `commit --tree=tar=PATH` reads an archive into the same overlay a filesystem
-/// source lands in, and `--tar-autocreate-parents` supplies the directories the
-/// archive never names.
+/// `commit --tree=tar=PATH` reads an archive into the same overlay as a
+/// filesystem source. `--tar-autocreate-parents` supplies the directories that
+/// the archive never names.
 #[test]
 fn commit_tar_source_matches_the_tool() {
     if !ostree_available() {
@@ -18616,8 +18855,8 @@ fn commit_tar_source_matches_the_tool() {
     let full = base.join("full.tar");
     pack_tar(&root.join("t1"), &full);
 
-    // An archive with no root member, one whose member names a parent no
-    // member creates, an empty archive, and one carrying a hardlink.
+    // An archive with no root member, an archive with a member whose parent no
+    // member creates, an empty archive, and an archive with a hardlink.
     let pack = |args: &[&str], archive: &Path| {
         let status = Command::new("tar")
             .arg("-cf")
@@ -18654,15 +18893,17 @@ fn commit_tar_source_matches_the_tool() {
 
     agrees(&[&tar(&full)]);
     agrees(&[&tar(&hard)]);
-    // Every modifier that reaches a filesystem source reaches an archive too.
+    // Each modifier that applies to a filesystem source applies to an archive
+    // too.
     agrees(&[&tar(&full), "--canonical-permissions"]);
     agrees(&[&tar(&full), "--no-xattrs"]);
     agrees(&[&tar(&full), "--owner-uid=77", "--owner-gid=78"]);
     agrees(&[&tar(&full), "--mode-ro-executables"]);
-    // A `--statoverride` entry reaches an archive's symlink member as it reaches
-    // a filesystem symlink: the member carries the `S_IFLNK` file type, so the
-    // entry states the permission bits the content object records, and the
-    // canonical reduction leaves a symlink's mode as the entry left it.
+    // A `--statoverride` entry applies to a symlink member of an archive as to
+    // a filesystem symlink. The member has the `S_IFLNK` file type, so the
+    // entry sets the permission bits that the content object records. The
+    // canonical reduction does not change the mode that the entry gave to a
+    // symlink.
     let over_assign = base.join("over-assign.txt");
     std::fs::write(&over_assign, "=448 /link\n").unwrap();
     let assign = format!("--statoverride={}", over_assign.display());
@@ -18672,10 +18913,10 @@ fn commit_tar_source_matches_the_tool() {
     agrees(&[&tar(&full), &assign]);
     agrees(&[&tar(&full), &or]);
     agrees(&[&tar(&full), &assign, "--canonical-permissions"]);
-    // An archive member is the one source the OR form reaches over a directory
-    // below the walk root, where a filesystem walk leaves the directory at the
-    // mode it found. `commit_statoverride_spends_one_entry_per_run` states the
-    // rule in full; the two arms here hold it over this test's own corpus.
+    // For a directory under the walk root, the OR form applies only to an
+    // archive member. A filesystem walk keeps the mode that it found for the
+    // directory. `commit_statoverride_spends_one_entry_per_run` states the full
+    // rule. The two arms of this test check it on the corpus of this test.
     let over_dir = base.join("over-dir.txt");
     std::fs::write(&over_dir, "16 /common\n").unwrap();
     let or_dir = format!("--statoverride={}", over_dir.display());
@@ -18708,9 +18949,9 @@ fn commit_tar_source_matches_the_tool() {
         "d00755",
         "the OR form reached a directory below the walk root of a `dir=` source",
     );
-    // The entry reaches an archive's symlink member as it reaches a filesystem
-    // symlink, so the two sources under one entry reach one commit. One branch
-    // name and `--parent=none` hold the ref binding and the parent still.
+    // The entry applies to a symlink member of an archive as to a filesystem
+    // symlink, so the two sources with one entry get one commit. One branch
+    // name and `--parent=none` keep the ref binding and the parent constant.
     let mut over_both = Vec::new();
     for source in [format!("--tree=dir={t1}"), tar(&full)] {
         let args = [
@@ -18730,14 +18971,14 @@ fn commit_tar_source_matches_the_tool() {
         over_both[0], over_both[1],
         "the entry reached the archive's symlink member otherwise",
     );
-    // A walk filter reaches an archive too.
+    // A walk filter applies to an archive too.
     let skip = base.join("tar-skip.txt");
     std::fs::write(&skip, "/common\n").unwrap();
     agrees(&[&tar(&full), &format!("--skip-list={}", skip.display())]);
-    // A symlink member records the low twelve bits of its own header mode
-    // field, the setuid, setgid, and sticky bits included, and drops the bits
-    // above them. The old-GNU and the ustar header forms are read alike, and
-    // the canonical reduction leaves the mode as the member left it.
+    // A symlink member records the low twelve bits of its header mode field,
+    // with the setuid, setgid, and sticky bits, and drops the higher bits. The
+    // old-GNU and the ustar header forms are read in the same way. The
+    // canonical reduction does not change the mode of the member.
     let mut header_forms = Vec::new();
     for (gnu, name) in [(true, "sym-gnu.tar"), (false, "sym-ustar.tar")] {
         let sym = base.join(name);
@@ -18746,8 +18987,9 @@ fn commit_tar_source_matches_the_tool() {
         agrees(&[&tar(&sym), "--canonical-permissions"]);
         header_forms.push(form);
     }
-    // The two header forms are read alike, which one branch each cannot state,
-    // so the two trees are compared through the tool's own recursive listing.
+    // The two header forms are read in the same way. One branch for each form
+    // cannot state this, so the test compares the two trees with the recursive
+    // listing of the `ostree` command.
     let listing = |branch: &str| -> String {
         let run = ostree(&[
             "ls",
@@ -18762,25 +19004,25 @@ fn commit_tar_source_matches_the_tool() {
         listing(&header_forms[1]),
         "the old-GNU and the ustar header forms are read differently",
     );
-    // An archive naming no root member leaves the tree without one, which is
-    // the empty-tree refusal, unless another source supplied it.
+    // If an archive names no root member and no other source supplies one, the
+    // tree has no root, and the command gives the empty-tree refusal.
     agrees(&[&tar(&rootless)]);
     agrees(&[&tar(&empty)]);
     agrees(&[&format!("--tree=dir={t1}"), &tar(&rootless)]);
-    // A member whose parent no member names is refused, and the refusal names
-    // the first absent ancestor.
+    // A member whose parent no member names is refused. The refusal names the
+    // first absent ancestor.
     agrees(&[&tar(&deep)]);
     agrees(&[&format!("--tree=dir={t1}"), &tar(&deep)]);
-    // `--tar-autocreate-parents` supplies the root as `0755 0:0` where nothing
-    // else does, and supplies an intermediate parent with the triggering
-    // member's ownership, rewriting the root's metadata to match.
+    // If no other source supplies the root, `--tar-autocreate-parents` supplies
+    // it as `0755 0:0`. It supplies an intermediate parent with the ownership
+    // of the member that needs it, and changes the root metadata to match.
     let supplied_deep = agrees(&[&tar(&deep), "--tar-autocreate-parents"]);
     let supplied_empty = agrees(&[&tar(&empty), "--tar-autocreate-parents"]);
     agrees(&[&tar(&rootless), "--tar-autocreate-parents"]);
-    // The values the flag supplies, read out of both repositories: a root no
-    // member names is mode `0755` owned `0:0`, and an intermediate parent is
-    // mode `0755` with the triggering member's ownership, which the root's own
-    // metadata is rewritten to.
+    // The values that the flag supplies, read from both repositories. A root
+    // that no member names has mode `0755` and owner `0:0`. An intermediate
+    // parent has mode `0755` and the ownership of the member that needs it.
+    // The root metadata changes to these values.
     let meta = std::fs::metadata(&root).expect("the source tree stats");
     let owner = format!("{} {}", meta.uid(), meta.gid());
     for (repo, port) in [(&port_repo, true), (&tool_repo, false)] {
@@ -18819,13 +19061,14 @@ fn commit_tar_source_matches_the_tool() {
         &tar(&deep),
         "--tar-autocreate-parents",
     ]);
-    // The flag is accepted, and does nothing, where no archive is read.
+    // If no archive is read, the flag is accepted and does nothing.
     agrees(&[&format!("--tree=dir={t1}"), "--tar-autocreate-parents"]);
 }
 
-/// A member whose pathname holds a byte that is not valid UTF-8 is refused by
-/// both at exit 1, in the same words. The `run:` grammar writes no archive, so
-/// the cell `commit/tree-tar-pathname-not-utf8` cites this test.
+/// If the pathname of an archive member has a byte that is not valid UTF-8,
+/// ostrya and the `ostree` command refuse it. Both exit 1 with the same words.
+/// The `run:` grammar writes no archive, so the cell
+/// `commit/tree-tar-pathname-not-utf8` cites this test.
 #[test]
 fn commit_tar_pathname_not_utf8_is_refused() {
     if !ostree_available() {
@@ -18850,10 +19093,10 @@ fn commit_tar_pathname_not_utf8_is_refused() {
     );
 }
 
-/// A filesystem entry whose name holds a byte that is not valid UTF-8 refuses
-/// the commit in both, ahead of the walk callbacks, so a `--skip-list` or a
-/// `--statoverride` path spelling the replacement character reaches no such
-/// entry. The `run:` grammar writes no such name, so the cell
+/// If the name of a filesystem entry has a byte that is not valid UTF-8, both
+/// commands refuse the commit before the walk callbacks. A `--skip-list` or a
+/// `--statoverride` path with the replacement character does not apply to such
+/// an entry. The `run:` grammar writes no such name, so the cell
 /// `commit/tree-dir-name-not-utf8` cites this test.
 #[test]
 fn commit_tree_name_not_utf8_is_refused() {
@@ -18872,10 +19115,10 @@ fn commit_tree_name_not_utf8_is_refused() {
     std::fs::write(&raw, "raw\n").unwrap();
     let src = src.to_str().unwrap().to_owned();
 
-    // The control files spell the replacement character, which is the string a
-    // lossy conversion of the raw name would give. Each of the three forms
-    // leaves that entry alone, so the walk still reaches the name it cannot
-    // hold and the run is refused.
+    // The control files have the replacement character, which is the string
+    // that a lossy conversion of the raw name gives. None of the three forms
+    // applies to that entry. The walk still reaches the name that it cannot
+    // hold, and the command refuses the run.
     let skip = base.join("skip.txt");
     std::fs::write(&skip, "/bad\u{fffd}.txt\n").unwrap();
     let skip = format!("--skip-list={}", skip.display());
@@ -18896,9 +19139,9 @@ fn commit_tree_name_not_utf8_is_refused() {
         args.push(&src);
         let (port, tool) = run_both(&port_repo, &tool_repo, &args);
         let label = args.join(" ");
-        // The two word the refusal differently, which
-        // `docs/conformance/cli-surface.md`, "P2" records; the exit status, the
-        // empty standard output, and the unwritten ref are the requirement.
+        // The two commands use different words for the refusal. This is a
+        // recorded divergence. The requirement is the exit status, the empty
+        // standard output, and no written ref.
         for (who, run) in [("port", &port), ("tool", &tool)] {
             assert_eq!(run.status.code(), Some(1), "the {who} accepted `{label}`");
             assert!(
@@ -18921,7 +19164,7 @@ fn commit_tree_name_not_utf8_is_refused() {
 }
 
 /// `commit --tar-pathname-filter=REGEX,REPLACEMENT` renames each member of an
-/// archive before it is placed.
+/// archive before the member goes into the tree.
 #[test]
 fn commit_tar_pathname_filter_matches_the_tool() {
     if !ostree_available() {
@@ -18942,14 +19185,14 @@ fn commit_tar_pathname_filter_matches_the_tool() {
     pack_tar(&hl, &hard);
     let source = format!("--tree=tar={}", full.display());
 
-    // The branch name holds a character that is not a hexadecimal digit, so it
-    // cannot read as an abbreviated commit checksum. Both implementations
-    // resolve the implicit parent of `commit -b NAME` through a revision parse
-    // that accepts one, so a hexadecimal name prefixing a commit this repository
-    // already holds takes that commit as its parent where no such ref stands.
-    // The two agree on that, but it is a second variable in this sweep, whose
-    // subject is the filter, so the names here keep clear of it
-    // (`docs/format-reference.md`, "Revision syntax").
+    // The branch name has a character that is not a hexadecimal digit, so it
+    // cannot read as an abbreviated commit checksum. Both commands resolve the
+    // implicit parent of `commit -b NAME` through a revision parse that accepts
+    // an abbreviated checksum. If no such ref exists, a hexadecimal name that
+    // is a prefix of a commit in this repository takes that commit as its
+    // parent.
+    // The two commands agree on that. The subject of this sweep is the filter,
+    // so the names keep clear of this second variable.
     let mut branch = 0;
     let mut agrees = |extra: &[&str]| {
         branch += 1;
@@ -18960,13 +19203,13 @@ fn commit_tar_pathname_filter_matches_the_tool() {
     };
 
     // The value splits at the first comma, the replacement is global, and a
-    // member the expression does not match is kept unchanged.
+    // member that the expression does not match keeps its name.
     agrees(&[&source, "--tar-pathname-filter=^f.txt$,g.txt"]);
     agrees(&[&source, "--tar-pathname-filter=t,T"]);
     agrees(&[&source, "--tar-pathname-filter=zzz,yyy"]);
     agrees(&[&source, "--tar-pathname-filter=^f.txt$,a,b"]);
-    // A directory member carries its trailing slash, so renaming a directory
-    // and renaming its children are two different expressions.
+    // A directory member has its trailing slash, so a rename of a directory
+    // and a rename of its children are two different expressions.
     agrees(&[&source, r"--tar-pathname-filter=^common/(.*),X/\1"]);
     // A named group, its replacement reference, an inline case flag, and a
     // character class.
@@ -18975,7 +19218,7 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         r"--tar-pathname-filter=(?i)ONLY(?<rest>.*),X\g<rest>",
     ]);
     agrees(&[&source, "--tar-pathname-filter=[aeiou],_"]);
-    // `$1` carries no meaning in the replacement.
+    // `$1` has no special meaning in the replacement.
     agrees(&[&source, "--tar-pathname-filter=^f.txt$,$1.txt"]);
     // The last occurrence of the option wins.
     agrees(&[
@@ -18983,32 +19226,37 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         "--tar-pathname-filter=^f.txt$,one",
         r"--tar-pathname-filter=^common/(.*),X/\1",
     ]);
-    // A hardlink's target is a member name, so the filter reaches it too; a
-    // symlink's target is not a member name and is left as it stands.
+    // The target of a hardlink is a member name, so the filter applies to it
+    // too. The target of a symlink is not a member name and does not change.
     agrees(&[
         &format!("--tree=tar={}", hard.display()),
         "--tar-pathname-filter=^one$,uno",
     ]);
-    // The filter reaches an archive read beside a filesystem source, and
-    // renaming a subtree onto one the filesystem source already made merges
-    // the two.
+    // The filter applies to an archive that is read with a filesystem source.
+    // If the filter renames a subtree to a subtree that the filesystem source
+    // already made, the two subtrees merge.
     agrees(&[
         &format!("--tree=dir={t2}"),
         &source,
         r"--tar-pathname-filter=^onlyA(.*),onlyB\1",
     ]);
-    // The value is read as an archive is loaded, so a command line naming no
-    // archive carries a malformed one at exit 0.
+    // The command reads the value when it loads an archive. A command line that
+    // names no archive accepts a malformed value at exit 0.
     agrees(&[&format!("--tree=dir={t2}"), "--tar-pathname-filter=nocomma"]);
     agrees(&[
         &format!("--tree=dir={t2}"),
         "--tar-pathname-filter=dir1((,x",
     ]);
 
-    // Constructs both dialects share, each reaching the tool's commit checksum:
-    // the absolute anchors, a word boundary and its negation, the POSIX class
-    // names, the hexadecimal escapes, a Unicode property, a bound, and an
-    // inline-option group.
+    // Constructs that both dialects share. Each gets the commit checksum of the
+    // `ostree` command:
+    // - the absolute anchors
+    // - a word boundary and its negation
+    // - the POSIX class names
+    // - the hexadecimal escapes
+    // - a Unicode property
+    // - a bound
+    // - an inline-option group
     for filter in [
         r"--tar-pathname-filter=\Af,Q",
         r"--tar-pathname-filter=f\.txt\z,Q",
@@ -19027,8 +19275,8 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         agrees(&[&source, filter]);
     }
 
-    // The canonical use of the option: strip a leading directory. The directory
-    // member maps onto the empty string, which names the tree root.
+    // The canonical use of the option is to remove a leading directory. The
+    // directory member maps to the empty string, which names the tree root.
     let dir1 = root.join("dir1");
     std::fs::create_dir_all(dir1.join("sub")).unwrap();
     std::fs::write(dir1.join("t.txt"), "t\n").unwrap();
@@ -19047,13 +19295,14 @@ fn commit_tar_pathname_filter_matches_the_tool() {
     agrees(&[&nested_source, r"--tar-pathname-filter=^dir1/(.*)$,\1"]);
     agrees(&[&nested_source, r"--tar-pathname-filter=^dir1/(.*),X/\1"]);
 
-    // A quantified atom over a long member name is matched rather than refused,
-    // and so is an expression whose backtracking would grow exponentially
-    // without the required literal PCRE2 finds in it: `^(a+)+b` needs a `b` the
-    // name does not hold, so the match ends without backtracking. 250
-    // characters is the longest name a filesystem holds. Both reach the tool's
-    // commit checksum at exit 0, inside a bound a matcher that did backtrack
-    // over that name could not meet.
+    // A quantified atom over a long member name matches, and the command does
+    // not refuse it. The same applies to an expression with exponential
+    // backtracking that a required literal stops. PCRE2 finds that literal:
+    // `^(a+)+b` needs a `b` that the name does not hold. The match then ends
+    // with no backtracking. 250 characters is the longest name that a
+    // filesystem holds. Both filters get the commit checksum of `ostree` at
+    // exit 0. They finish inside a bound that a matcher with backtracking over
+    // that name cannot meet.
     let long = root.join("long");
     std::fs::create_dir_all(&long).unwrap();
     std::fs::write(long.join("a".repeat(250)), "x\n").unwrap();
@@ -19100,13 +19349,16 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         );
     }
 
-    // Constructs PCRE2 carries, each reaching the tool's commit checksum: the
-    // four lookarounds, the atomic group, the comment group, the literal span,
-    // `\N`, a backreference, the extended flag, and a callout. `\C` matches one
-    // byte, which rewrites an all-ASCII name without splitting a character. The
-    // two backtracking verbs and the start-of-pattern options close the set;
-    // the port injects a start-of-pattern option of its own for the newline
-    // convention, and a value that states one itself is placed after it.
+    // Constructs of PCRE2. Each gets the commit checksum of `ostree`:
+    // - the four lookarounds, the atomic group, and the comment group
+    // - the literal span, `\N`, and a backreference
+    // - the extended flag and a callout
+    // - `\C`, which matches one byte and does not split a character of an
+    //   all-ASCII name
+    // - the two backtracking verbs and the start-of-pattern options
+    // ostrya adds a start-of-pattern option of its own for the newline
+    // convention. If the value states such an option, ostrya puts it after
+    // the added one.
     for filter in [
         r"--tar-pathname-filter=(?=f)x,Q",
         r"--tar-pathname-filter=(?=f).,Q",
@@ -19132,9 +19384,9 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         agrees(&[&source, filter]);
     }
 
-    // An archive whose member names hold a doubled letter, a space, and an
-    // upper-case letter, which is what a backreference, `\K`, a subroutine
-    // call, `\h`, and an octal escape need in order to match.
+    // An archive with member names that hold a doubled letter, a space, and an
+    // upper-case letter. A backreference, `\K`, a subroutine call, `\h`, and an
+    // octal escape need these names to match.
     let doubled = root.join("doubled");
     std::fs::create_dir_all(&doubled).unwrap();
     for member in ["ff.txt", "f.txt", "a b.txt", "A.txt"] {
@@ -19147,8 +19399,8 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         r"--tar-pathname-filter=(?<=f)f,Q",
         r"--tar-pathname-filter=(f)\1,Q",
         r"--tar-pathname-filter=f\Kf,Q",
-        // A possessive quantifier gives nothing back where its greedy form
-        // does, so `^f*+f` and `^f*f` answer differently over `ff.txt`.
+        // A possessive quantifier gives nothing back, and its greedy form
+        // does. `^f*+f` and `^f*f` give different results over `ff.txt`.
         r"--tar-pathname-filter=^f*+f,Q",
         r"--tar-pathname-filter=^f*f,Q",
         r"--tar-pathname-filter=^(f(?R)?),Q",
@@ -19158,29 +19410,29 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         r"--tar-pathname-filter=\h,Q",
         r"--tar-pathname-filter=\101,Q",
         r"--tar-pathname-filter=(?J)(?<n>f)|(?<n>x),Q",
-        // A duplicate name in the expression, paired with a read of that name
-        // from the replacement. The match sets one group of the pair, and the
-        // name reaches the group the match set: `f.txt` sets the first group
-        // and `A.txt` the second.
+        // A duplicate name in the expression, with a read of that name in the
+        // replacement. The match sets one group of the pair, and the name gets
+        // the group that the match set. `f.txt` sets the first group, and
+        // `A.txt` sets the second.
         r"--tar-pathname-filter=(?J)(?<n>f)|(?<n>A),[\g<n>]",
-        // An empty match advances the splice past one whole character, which
-        // leaves that character in the name. The lookbehind holds the
-        // expression off the archive's root member, whose name is empty.
+        // An empty match moves the splice past one whole character, and that
+        // character stays in the name. The lookbehind keeps the expression off
+        // the root member of the archive, which has an empty name.
         r"--tar-pathname-filter=(?<=.)x*,Q",
-        // A lazy quantifier prefers its empty branch, so the splice advances
-        // past the character rather than retrying the offset for a non-empty
-        // match. The two loop shapes part here and nowhere else.
+        // A lazy quantifier prefers its empty branch, so the splice moves past
+        // the character. It does not try the offset again for a non-empty
+        // match. The two loop shapes differ here and at no other place.
         r"--tar-pathname-filter=(?<=.)f*?,Q",
-        // A greedy quantifier matches once and then matches empty where that
-        // match ended, which is where the splice loop's two positions part
-        // for a non-empty match. `ff.txt` holds the doubled letter that
-        // reaches it.
+        // A greedy quantifier matches once and then matches empty at the end
+        // of that match. At that point, the two positions of the splice loop
+        // differ for a non-empty match. `ff.txt` holds the doubled letter that
+        // gets to this case.
         r"--tar-pathname-filter=(?<=.)f*,Q",
     ] {
         agrees(&[&doubled_source, filter]);
     }
 
-    // One archive per member name that states a dialect semantic.
+    // One archive for each member name that shows a semantic of the dialect.
     let pack_named = |name: &str, members: &[&str]| -> String {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -19199,7 +19451,7 @@ fn commit_tar_pathname_filter_matches_the_tool() {
     let embedded = pack_named("embedded", &["a\nb.txt"]);
 
     // UCP is on, so `\d`, `\w`, `\s`, and the POSIX class names are
-    // Unicode-aware, and UTF is on, so `.` consumes one character and not one
+    // Unicode-aware. UTF is on, so `.` consumes one character and not one
     // byte.
     agrees(&[&digit, r"--tar-pathname-filter=\d,Q"]);
     agrees(&[&letter, r"--tar-pathname-filter=^\w,Q"]);
@@ -19208,7 +19460,7 @@ fn commit_tar_pathname_filter_matches_the_tool() {
     agrees(&[&space, r"--tar-pathname-filter=\s,Q"]);
     agrees(&[&multibyte, r"--tar-pathname-filter=(?<=.)x*,Q"]);
 
-    // `$` and `\Z` match before a final newline where `\z` does not.
+    // `$` and `\Z` match before a final newline, and `\z` does not.
     for filter in [
         r"--tar-pathname-filter=^f\.txt$,Q",
         r"--tar-pathname-filter=^f\.txt\Z,Q",
@@ -19228,10 +19480,9 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         agrees(&[&embedded, filter]);
     }
 
-    // The newline convention is `any`: a carriage return, the pair, a vertical
-    // tab, a form feed, `U+0085`, `U+2028`, and `U+2029` each end a line, so
-    // `$` and `\Z` match before one and `.` consumes none of them
-    // (`docs/conformance/cli-surface.md`, "P2").
+    // The newline convention is `any`. Each of these ends a line: a carriage
+    // return, the pair, a vertical tab, a form feed, `U+0085`, `U+2028`, and
+    // `U+2029`. `$` and `\Z` match before one, and `.` consumes none of them.
     for (name, member) in [
         ("nl-cr", "c\r"),
         ("nl-crlf", "c\r\n"),
@@ -19250,7 +19501,8 @@ fn commit_tar_pathname_filter_matches_the_tool() {
             agrees(&[&one, filter]);
         }
     }
-    // A convention the value states itself wins over the injected one, in both.
+    // If the value states a convention, it wins over the added one in both
+    // commands.
     for (name, member) in [("nl-cr", "c\r"), ("nl-crlf", "c\r\n")] {
         let one = pack_named(name, &[member]);
         for filter in [
@@ -19278,10 +19530,10 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         }
     }
 
-    // Values both refuse. The port words its refusals in PCRE2's own terms,
-    // which GLib rewords for some reasons, so the refusal is compared and the
-    // wording is compared only where it was measured to agree
-    // (`docs/conformance/cli-surface.md`, "P2").
+    // Values that both commands refuse. ostrya words its refusals in the terms
+    // of PCRE2, and GLib rewords some of these reasons. This is a recorded
+    // divergence. The test compares the refusal, and compares the words only
+    // where a measurement showed that they agree.
     let mut refused = 0;
     let mut both_refuse = |extra: &[&str]| {
         refused += 1;
@@ -19290,10 +19542,10 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         args.extend_from_slice(extra);
         let (port, tool) = run_both(&port_repo, &tool_repo, &args);
         let label = args.join(" ");
-        // The port exits 1 and names the refusal. The tool ends the run without
-        // a commit, and for a malformed replacement it ends on a GLib assertion
-        // rather than an exit status, which is the recorded reference defect
-        // (`docs/conformance/cli-surface.md`, "P2").
+        // ostrya exits 1 and names the refusal. The `ostree` command ends the
+        // run with no commit. For a malformed replacement, `ostree` ends on a
+        // GLib assertion and not with an exit status. This defect of `ostree`
+        // is a recorded divergence.
         assert_eq!(
             port.status.code(),
             Some(1),
@@ -19321,42 +19573,43 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         );
     };
     for filter in [
-        // A value with no comma, and an expression neither engine compiles: an
-        // unbalanced group, an unknown escape, an unknown verb, an unknown
-        // POSIX class name, and a repeat count above PCRE2's own limit.
+        // A value with no comma, and expressions that neither engine compiles.
+        // These are an unbalanced group, an unknown escape, an unknown verb, an
+        // unknown POSIX class name, and a repeat count past the PCRE2 limit.
         "--tar-pathname-filter=nocomma",
         "--tar-pathname-filter=dir1((,x",
         r"--tar-pathname-filter=\q,Q",
         "--tar-pathname-filter=(*BOGUS)f,Q",
         "--tar-pathname-filter=[[:bogus:]],Q",
         "--tar-pathname-filter=f{65536},Q",
-        // An expression whose empty match at the start of every name rewrites
-        // the archive's own root member, which leaves each remaining member
-        // with no parent, and a group reference in the replacement that reaches
-        // a member collision.
+        // Expressions with an empty match at the start of each name. The match
+        // rewrites the root member of the archive, so the other members have
+        // no parent. The last expression has a group reference in the
+        // replacement that causes a collision of members.
         r"--tar-pathname-filter=\K,Q",
         "--tar-pathname-filter=f*+,Q",
         "--tar-pathname-filter=(x*)+,Q",
         r"--tar-pathname-filter=^(only)(A.*)$,\2\1",
-        // A replacement escape GLib does not know.
+        // Replacement escapes that GLib does not know.
         r"--tar-pathname-filter=^f.txt$,\q",
         r"--tar-pathname-filter=^f.txt$,\",
         r"--tar-pathname-filter=^f.txt$,\g<",
-        // A rewrite that maps every member onto one name puts a file member
-        // where an earlier member made a directory.
+        // A rewrite that maps each member to one name puts a file member where
+        // an earlier member made a directory.
         "--tar-pathname-filter=.*,Q",
-        // The archive's root member maps onto a name that already stands.
+        // The root member of the archive maps to a name that already exists.
         "--tar-pathname-filter=^$,q/",
         "--tar-pathname-filter=^common/$,QQ/",
     ] {
         both_refuse(&[&source, filter]);
     }
 
-    // The port reports the code-unit offset PCRE2 answers, and each loop below
-    // compares the port's line exactly. The tool reads the offset from the
-    // PCRE2 the host links, and the value follows that PCRE2 version, so the
-    // test compares the tool's line exactly except for the offset digits
-    // (`docs/conformance/cli-surface.md`, "P2").
+    // ostrya reports the code-unit offset that PCRE2 gives. The next three
+    // loops compare the line of ostrya exactly. The `ostree` command reads the
+    // offset from the PCRE2 that the host links and counts it in characters.
+    // The value changes with that PCRE2 version. This is a recorded
+    // divergence. The test compares the line of `ostree` exactly, except for
+    // the offset digits.
     let tool_refusal_agrees = |stderr: &[u8], expression: &str, reason: &str| {
         let stderr = String::from_utf8_lossy(stderr);
         let head = format!(
@@ -19412,9 +19665,9 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         );
     }
 
-    // The reason string is a recorded divergence in the compile-failure line:
-    // GLib passes some of PCRE2's reasons through and rewords others
-    // (`docs/conformance/cli-surface.md`, "P2").
+    // The reason string in the compile-failure line is a recorded divergence.
+    // GLib passes some reasons of PCRE2 through with no change and rewords
+    // others.
     for (filter, expression, at, port_reason, tool_reason) in [
         (
             "--tar-pathname-filter=dir1((,x",
@@ -19465,12 +19718,13 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         );
     }
 
-    // The port reports the code-unit offset PCRE2 answers, which is a byte
-    // offset for the 8-bit library. A non-ASCII character ahead of the error
-    // point adds the extra bytes it occupies, so the two-byte `é` adds one and
-    // the four-byte `U+1F600` adds three. Each expression carries one error the
-    // loop above already words, so the count is stated apart from the error
-    // kind (`docs/conformance/cli-surface.md`, "P2").
+    // ostrya reports the code-unit offset that PCRE2 gives, which is a byte
+    // offset for the 8-bit library. Each non-ASCII character before the error
+    // point adds its extra bytes. The two-byte `é` adds one, and the four-byte
+    // `U+1F600` adds three. The offset of `ostree` counts characters. This is
+    // a recorded divergence. Each expression has one error that the two earlier
+    // loops already word, so the test checks the count apart from the error
+    // kind.
     for (filter, expression, port_at, port_reason, tool_reason) in [
         (
             r"--tar-pathname-filter=é\q,Q",
@@ -19556,10 +19810,10 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         );
     }
 
-    // A match-time limit refuses the commit. PCRE2 accounts a step budget, so an
-    // expression with no required literal ends the match rather than running on.
-    // The tool ends the run on a GLib assertion at exit 134 in the same case,
-    // which is the recorded exit-path divergence.
+    // A match-time limit refuses the commit. PCRE2 counts a step budget, so the
+    // match of an expression with no required literal stops at the limit. In
+    // the same case, the `ostree` command ends the run on a GLib assertion at
+    // exit 134. This is the recorded exit-path divergence.
     for (filter, expression) in [
         (r"--tar-pathname-filter=(a+)+\d,Q", r"(a+)+\d"),
         ("--tar-pathname-filter=(a+)+[0-9],Q", "(a+)+[0-9]"),
@@ -19595,9 +19849,9 @@ fn commit_tar_pathname_filter_matches_the_tool() {
     }
 
     // `\C` matches one byte, so a rewrite over a multi-byte name can split a
-    // character. The port refuses the member, and the tool ends the run on a
-    // GLib assertion whose message reads `bad offset into UTF string`. Neither
-    // writes a commit.
+    // character. ostrya refuses the member. The `ostree` command ends the run
+    // on a GLib assertion with the message `bad offset into UTF string`.
+    // Neither command writes a commit.
     let args = [
         "commit",
         "-b",
@@ -19636,9 +19890,9 @@ fn commit_tar_pathname_filter_matches_the_tool() {
     }
 }
 
-/// `commit --consume` empties each filesystem source as it is walked, before
-/// the commit object and the ref are written, and removes the source directory
-/// itself unless the path is spelled `.`.
+/// `commit --consume` empties each filesystem source during the walk, before
+/// the command writes the commit object and the ref. If the path is not `.`,
+/// the command also removes the source directory.
 #[test]
 fn commit_consume_matches_the_tool() {
     if !ostree_available() {
@@ -19648,8 +19902,8 @@ fn commit_consume_matches_the_tool() {
     let base = tmp.path();
     let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Archive);
 
-    // Each case gets its own source pair, one per implementation, since the
-    // run destroys it.
+    // Each case gets its own source pair, one for each command, because the
+    // run destroys the source.
     let build = |name: &str| -> (PathBuf, PathBuf) {
         let mut out = Vec::new();
         for side in ["port", "tool"] {
@@ -19668,8 +19922,8 @@ fn commit_consume_matches_the_tool() {
         }
     };
 
-    // A `--tree=dir=` source, a positional one, and a trailing slash: the
-    // directory itself goes in each.
+    // A `--tree=dir=` source, a positional source, and a trailing slash. In
+    // each case, the directory itself goes too.
     let mut branch = 0;
     let mut consumed = |name: &str, spell: &dyn Fn(&Path) -> Vec<String>| {
         branch += 1;
@@ -19702,8 +19956,8 @@ fn commit_consume_matches_the_tool() {
             state(&tool_src),
             "the two left {name} in different states"
         );
-        // The commit is written and the source directory is gone, which the
-        // agreement of the two runs does not state on its own.
+        // The commit is written and the source directory is gone. The agreement
+        // of the two runs does not show this alone.
         for (who, run) in [("port", &port), ("tool", &tool)] {
             assert_eq!(
                 run.status.code(),
@@ -19725,10 +19979,10 @@ fn commit_consume_matches_the_tool() {
     });
     consumed("positional", &|dir| vec![dir.display().to_string()]);
 
-    // A `ref=` source and a `tar=` source are left alone: the commit is written,
-    // the `dir=` source beside them is gone, and the ref and the archive file
-    // both survive. The ref has to resolve for the claim to be stated, so both
-    // repositories carry one.
+    // The command does not touch a `ref=` source or a `tar=` source. The commit
+    // is written, the `dir=` source with them is gone, and the ref and the
+    // archive file both stay. The check needs a ref that resolves, so both
+    // repositories have one.
     let seed = base.join("seed");
     std::fs::create_dir_all(seed.join("s")).unwrap();
     std::fs::write(seed.join("s/keep.txt"), "keep\n").unwrap();
@@ -19767,8 +20021,9 @@ fn commit_consume_matches_the_tool() {
     }
     assert!(archive.exists(), "the `tar=` source was consumed");
 
-    // A walk filter does not spare a path from the removal: the source is gone
-    // whatever the filter kept out of the commit, and the commit is written.
+    // A walk filter does not keep a path from the removal. The source is gone
+    // for all paths that the filter kept out of the commit, and the commit is
+    // written.
     let skip_list = base.join("skip-list");
     std::fs::write(&skip_list, "/skipme\n").unwrap();
     let (port_filtered, tool_filtered) = build("filtered");
@@ -19805,9 +20060,9 @@ fn commit_consume_matches_the_tool() {
         "a filtered path left the source behind"
     );
 
-    // A removal that fails reports the entry's own name. The source holds one
-    // entry inside a directory the walk may read and not write, so the name is
-    // the same in both.
+    // A removal that fails reports the name of the entry. The source holds one
+    // entry in a directory that the walk can read and cannot write, so the name
+    // is the same in both commands.
     let mut runs = Vec::new();
     let mut sources = Vec::new();
     for (index, repo) in [&port_repo, &tool_repo].iter().enumerate() {
@@ -19851,8 +20106,8 @@ fn commit_consume_matches_the_tool() {
         std::fs::set_permissions(src.join("ro"), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    // Two sources are both consumed, and the second failing leaves the first
-    // gone with no commit written.
+    // Both sources are consumed. If the second source fails, the first source
+    // is gone and no commit is written.
     let (port_first, tool_first) = build("first");
     let (port_second, tool_second) = build("second");
     for (repo, first, second) in [
@@ -19921,9 +20176,9 @@ fn commit_consume_matches_the_tool() {
         "the first source was not consumed"
     );
 
-    // A source spelled `.` keeps the directory and loses its contents; `./` is
-    // another spelling, so the removal is attempted and its failure aborts the
-    // commit and names the path.
+    // A source spelled `.` keeps the directory and loses its contents. `./` is
+    // a different spelling, so the command tries to remove the directory. That
+    // removal fails, and the failure stops the commit and names the path.
     for (index, spelling) in [".", "./"].iter().enumerate() {
         let (port_src, tool_src) = build(&format!("dot{index}"));
         let mut runs = Vec::new();
@@ -19953,16 +20208,16 @@ fn commit_consume_matches_the_tool() {
     }
 }
 
-/// `commit --consume` removes a source subtree the filter kept out of the
-/// commit whatever its depth. The removal descends with a bounded number of
-/// descriptors, so a chain deeper than the descriptor limit the run holds is
-/// removed whole and the commit is written. The run states the limit itself:
-/// the limit the harness inherits stands far above any depth a test builds in
+/// `commit --consume` removes a source subtree that the filter kept out of the
+/// commit, at any depth. The removal uses a bounded number of descriptors. A
+/// chain deeper than the descriptor limit of the run is removed completely,
+/// and the commit is written. The run sets its own limit, because the
+/// inherited limit is far more than any depth that a test can build in
 /// reasonable time.
 #[test]
 fn commit_consume_removes_a_deep_filtered_tree() {
-    // The depth of the chain the skip list prunes, and the descriptor limit
-    // the run holds, which stands well below it.
+    // The depth of the chain that the skip list prunes, and the descriptor
+    // limit of the run, which is much less than the depth.
     const DEPTH: usize = 512;
     const NOFILE: usize = 128;
 
@@ -19978,8 +20233,8 @@ fn commit_consume_removes_a_deep_filtered_tree() {
     std::fs::create_dir_all(&chain).unwrap();
     std::fs::write(src.join("keep.txt"), "keep\n").unwrap();
 
-    // The skip list prunes the chain at its root, so the walk never descends
-    // into it and the consuming removal is what empties it.
+    // The skip list prunes the chain at its root, so the walk never goes into
+    // it. Only the consuming removal empties it.
     let skip_list = base.join("skip-list");
     std::fs::write(&skip_list, "/deep\n").unwrap();
 
@@ -20011,13 +20266,13 @@ fn commit_consume_removes_a_deep_filtered_tree() {
     assert!(!src.exists(), "the consuming commit left the source behind");
 }
 
-/// A second ed25519 sign fixture, so a multi-key run states an order.
+/// A second ed25519 sign fixture, so that a run with two keys shows an order.
 const ED25519_SECRET2_B64: &str =
     "vvLhmBcasjZ09s+tBj6bor7aXGEBSB2bM3PS9kc+MpHlZgDjxcMu3VPDpQPqYXmwzMlEJeqlpSM8+s7YLfum2g==";
 
-/// `commit --sign` and `--sign-from-file` reach the same `ostree.sign.ed25519`
-/// key, one signature per occurrence and in a fixed order, and both
-/// implementations write the same `.commitmeta` bytes.
+/// `commit --sign` and `--sign-from-file` write to the same
+/// `ostree.sign.ed25519` key, with one signature for each occurrence in a fixed
+/// order. ostrya and the `ostree` command write the same `.commitmeta` bytes.
 #[test]
 fn commit_sign_ed25519_matches_the_tool() {
     if !ostree_supports_ed25519() {
@@ -20041,9 +20296,10 @@ fn commit_sign_ed25519_matches_the_tool() {
         "k5.txt",
         &format!("{ED25519_SECRET_B64}\n{ED25519_SECRET2_B64}\n"),
     );
-    // A first line carrying a byte sequence that is not UTF-8, and one a NUL
-    // byte cuts short. Both are read as bytes, so the key is what stands ahead
-    // of the NUL and the invalid sequence contributes nothing to the decode.
+    // A first line with a byte sequence that is not UTF-8, and a first line
+    // that a NUL byte cuts short. Both commands read the lines as bytes. The
+    // key is the text before the NUL, and the invalid sequence adds nothing to
+    // the decode.
     let write_bytes = |name: &str, bytes: &[u8]| {
         let path = base.join(name);
         std::fs::write(&path, bytes).unwrap();
@@ -20080,8 +20336,8 @@ fn commit_sign_ed25519_matches_the_tool() {
     agrees(&["--sign", ED25519_SECRET_B64, "--sign", ED25519_SECRET2_B64]);
     agrees(&["--sign", ED25519_SECRET2_B64, "--sign", ED25519_SECRET_B64]);
     let doubled = agrees(&["--sign", ED25519_SECRET_B64, "--sign", ED25519_SECRET_B64]);
-    // One occurrence writes one 64-byte element under the engine's own key, and
-    // a second occurrence of one key writes a second element.
+    // One occurrence writes one 64-byte element under the key of the engine. A
+    // second occurrence of the same key writes a second element.
     for repo in [&port_repo, &tool_repo] {
         assert_eq!(
             signature_elements(repo, &single, "ostree.sign.ed25519"),
@@ -20098,8 +20354,8 @@ fn commit_sign_ed25519_matches_the_tool() {
     }
     // `--sign-type=ed25519` is the default, so naming it changes nothing.
     agrees(&["--sign-type=ed25519", "--sign", ED25519_SECRET_B64]);
-    // A file contributes its first line alone, with or without a trailing
-    // newline and with surrounding spaces.
+    // A file gives only its first line, with or without a trailing newline, and
+    // with spaces around it.
     for path in [
         &one,
         &no_newline,
@@ -20111,13 +20367,13 @@ fn commit_sign_ed25519_matches_the_tool() {
         agrees(&["--sign-from-file", path]);
     }
     agrees(&["--sign-from-file", &one, "--sign-from-file", &two]);
-    // The two lists are separate: every `--sign` key signs before every
-    // `--sign-from-file` key, whatever the command line's order.
+    // The two lists are separate. Each `--sign` key signs before each
+    // `--sign-from-file` key, in both orders of the command line.
     agrees(&["--sign", ED25519_SECRET_B64, "--sign-from-file", &two]);
     agrees(&["--sign-from-file", &two, "--sign", ED25519_SECRET_B64]);
-    // Several shapes held against each other over one orphan commit. Each shape
-    // runs against a fresh repository pair, so the signature the run appends
-    // stands alone and the bytes of one shape are comparable with another's.
+    // The test compares several shapes with each other over one orphan commit.
+    // Each shape runs against a new repository pair. The signature that the run
+    // appends is then the only one, so the bytes of two shapes are comparable.
     let mut fresh = 0;
     let mut detached = |extra: &[&str]| -> (Vec<u8>, Vec<u8>) {
         fresh += 1;
@@ -20151,8 +20407,9 @@ fn commit_sign_ed25519_matches_the_tool() {
         list_order[0], list_order[1],
         "the two interleavings of the key lists wrote different signatures",
     );
-    // The elements follow the command line and no occurrence is dropped, so the
-    // two key orders and the one key twice are three different arrays.
+    // The elements are in the order of the command line, and no occurrence is
+    // dropped. The two key orders and the one key twice give three different
+    // arrays.
     let shapes = [
         detached(&["--sign", ED25519_SECRET_B64, "--sign", ED25519_SECRET2_B64]),
         detached(&["--sign", ED25519_SECRET2_B64, "--sign", ED25519_SECRET_B64]),
@@ -20164,8 +20421,8 @@ fn commit_sign_ed25519_matches_the_tool() {
             "signing shapes {left} and {right} wrote one array",
         );
     }
-    // Each file form contributes the key its first line holds, so every one of
-    // them reaches the signature the key named on the command line makes.
+    // Each file form gives the key in its first line. Each form then gets the
+    // same signature as the key on the command line.
     let plain = detached(&["--sign", ED25519_SECRET_B64]);
     for path in [
         &one,
@@ -20182,8 +20439,8 @@ fn commit_sign_ed25519_matches_the_tool() {
         );
     }
 
-    // Signing an orphan commit writes the `.commitmeta` and no ref, which is
-    // what states that the signature stands outside the commit's own hash.
+    // If `commit --orphan` signs, it writes the `.commitmeta` and no ref. This
+    // shows that the signature is outside the hash of the commit.
     let orphan = vec![
         "commit",
         "--orphan",
@@ -20223,10 +20480,10 @@ fn commit_sign_ed25519_matches_the_tool() {
     }
 }
 
-/// The `.commitmeta` bytes both implementations wrote for `branch` agree.
-/// The length in bytes of each element one detached signature key holds, read
-/// through the tool's own printer, so an element count and an element size are
-/// stated rather than inferred from two agreeing files.
+/// Returns the length in bytes of each element of one detached signature key.
+/// The function reads the key through the printer of the `ostree` command.
+/// The test then checks an element count and an element size directly, and
+/// does not infer them from two files that agree.
 fn signature_elements(repo: &Path, rev: &str, key: &str) -> Vec<usize> {
     let run = ostree(&[
         "show",
@@ -20234,8 +20491,8 @@ fn signature_elements(repo: &Path, rev: &str, key: &str) -> Vec<usize> {
         &format!("--print-detached-metadata-key={key}"),
         rev,
     ]);
-    // The printer annotates the first element alone, so the elements are the
-    // bracketed groups inside the outer array and not the annotated ones.
+    // The printer annotates only the first element, so the elements are the
+    // bracketed groups inside the outer array, and not the annotated ones.
     let text = run.ok().stdout_trimmed();
     let inner = text
         .strip_prefix('[')
@@ -20248,6 +20505,7 @@ fn signature_elements(repo: &Path, rev: &str, key: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Asserts that the `.commitmeta` bytes of `rev` agree in both repositories.
 fn assert_commitmeta_agrees(port_repo: &Path, tool_repo: &Path, rev: &str, label: &str) {
     let checksum = ostrya(
         &["rev-parse", "--repo", port_repo.to_str().unwrap(), rev],
@@ -20264,8 +20522,9 @@ fn assert_commitmeta_agrees(port_repo: &Path, tool_repo: &Path, rev: &str, label
     );
 }
 
-/// The `commit` signing refusals: a key of the wrong length, a `--sign-type`
-/// name no engine carries, and a `--sign-from-file` path that does not open.
+/// The signature refusals of `commit`. The causes are a key of the wrong
+/// length, a `--sign-type` name that no engine has, and a `--sign-from-file`
+/// path that does not open.
 #[test]
 fn commit_sign_refusals_match_the_tool() {
     if !ostree_supports_ed25519() {
@@ -20280,9 +20539,9 @@ fn commit_sign_refusals_match_the_tool() {
     let short = base.join("short.txt");
     std::fs::write(&short, format!("{ED25519_PUBLIC_B64}\n")).unwrap();
     let short = short.to_str().unwrap();
-    // A first line that is not UTF-8, and one a NUL byte cuts short. The reader
-    // works on bytes, so the first decodes what its alphabet characters carry
-    // and the second stops at the NUL.
+    // A first line that is not UTF-8, and a first line that a NUL byte cuts
+    // short. The reader works on bytes. The first line decodes the characters
+    // of the base64 alphabet that it holds, and the second stops at the NUL.
     let raw = base.join("raw.txt");
     std::fs::write(&raw, b"AAAA\xffAAAA\n").unwrap();
     let raw = raw.to_str().unwrap();
@@ -20299,14 +20558,14 @@ fn commit_sign_refusals_match_the_tool() {
         args.push(src);
         assert_agrees(&port_repo, &tool_repo, &args);
         // Nothing was published and no ref moved, so the branch resolves to
-        // nothing on either side.
+        // nothing in both repositories.
         assert_agrees(&port_repo, &tool_repo, &["rev-parse", &branch]);
         branch
     };
 
-    // A key of any length but 64 bytes, read through a decoder that skips every
-    // character outside the base64 alphabet. The length the decode reached is
-    // the one the refusal names, on both sides.
+    // Keys with a length other than 64 bytes. The decoder skips each character
+    // outside the base64 alphabet. In both commands, the refusal names the
+    // length that the decode gives.
     for (key, bytes) in [
         ("zzz", 0),
         ("", 0),
@@ -20328,11 +20587,11 @@ fn commit_sign_refusals_match_the_tool() {
     agrees(&["--sign-from-file", short]);
     agrees(&["--sign-from-file", raw]);
     agrees(&["--sign-from-file", nul]);
-    // Padding acts per group and per position: three bytes come out of each
-    // complete four-character group and each of that group's last two
-    // characters that is a padding character removes one of them again. Every
-    // string over `A` and `=` up to length five states the rule, and a padding
-    // character inserted into a valid key states it over a long input.
+    // Padding applies to each group and to each position. Each complete
+    // four-character group gives three bytes. Each padding character in the
+    // last two characters of that group removes one of these bytes. All strings
+    // over `A` and `=` with a length up to five show the rule. A padding
+    // character in a valid key shows the rule over a long input.
     let mut padded: Vec<String> = Vec::new();
     for width in 1..=5u32 {
         for bits in 0..1u32 << width {
@@ -20343,9 +20602,9 @@ fn commit_sign_refusals_match_the_tool() {
             );
         }
     }
-    // Offset 10 is left out: there the shifted key still decodes to 64 bytes
-    // and the two part on the keypair check instead, which
-    // `docs/conformance/cli-surface.md` records as its own divergence.
+    // The test leaves out offset 10. At that offset, the shifted key still
+    // decodes to 64 bytes, and the two commands differ on the keypair check.
+    // That difference is a separate recorded divergence.
     for offset in [0, 1, 40, 86, 87] {
         let mut key = ED25519_SECRET_B64.to_owned();
         key.insert(offset, '=');
@@ -20354,12 +20613,12 @@ fn commit_sign_refusals_match_the_tool() {
     for key in &padded {
         agrees(&["--sign", key]);
     }
-    // A stray character after a pasted key opens an incomplete group, which
-    // contributes nothing, so the key still decodes to 64 bytes and signs.
+    // A stray character after a pasted key starts an incomplete group, which
+    // adds nothing. The key still decodes to 64 bytes and signs.
     let with_tail = format!("{ED25519_SECRET_B64}A");
     let signed = agrees(&["--sign", &with_tail]);
-    // "still signs" is the claim, so the signature is read back rather than
-    // left to the two runs agreeing.
+    // The claim is that the key still signs, so the test reads the signature
+    // back. The agreement of the two runs does not show this.
     for repo in [&port_repo, &tool_repo] {
         assert_eq!(
             signature_elements(repo, &signed, "ostree.sign.ed25519"),
@@ -20368,8 +20627,8 @@ fn commit_sign_refusals_match_the_tool() {
             repo.display(),
         );
     }
-    // A `--sign-type` name no engine carries, and the one name that carries its
-    // own refusal. Both are read only where a key is given.
+    // A `--sign-type` name that no engine has, and the one name with its own
+    // refusal. The commands read the name only if a key is given.
     agrees(&["--sign-type=nosuch", "--sign", ED25519_SECRET_B64]);
     agrees(&["--sign-type=", "--sign", ED25519_SECRET_B64]);
     agrees(&["--sign-type=ED25519", "--sign", ED25519_SECRET_B64]);
@@ -20388,7 +20647,8 @@ fn commit_sign_refusals_match_the_tool() {
         "--sign",
         ED25519_SECRET_B64,
     ]);
-    // With no key at all the name is never read, so a garbage one commits.
+    // If no key is given, the commands never read the name, so a garbage name
+    // commits.
     agrees(&["--sign-type=nosuch"]);
     agrees(&["--sign-type=dummy"]);
     // A `--sign-from-file` path that does not open, a directory, and an empty
@@ -20396,16 +20656,16 @@ fn commit_sign_refusals_match_the_tool() {
     agrees(&["--sign-from-file", absent]);
     agrees(&["--sign-from-file", src]);
     agrees(&["--sign-from-file", ""]);
-    // The fault order inside the step: `--sign-type` first, then every `--sign`
-    // key, then every `--sign-from-file` path, whatever the command line's
-    // order.
+    // The fault order in the step: `--sign-type` first, then each `--sign` key,
+    // then each `--sign-from-file` path, in each order of the command line.
     agrees(&["--sign", "zzz", "--sign-from-file", absent]);
     agrees(&["--sign-from-file", absent, "--sign", "zzz"]);
     agrees(&["--sign", ED25519_SECRET_B64, "--sign-from-file", absent]);
     agrees(&["--sign-type=nosuch", "--sign", "zzz"]);
 }
 
-/// The first loose object under `objects` whose name ends in `extension`.
+/// Returns the first loose object under `dir` with a name that ends in
+/// `extension`.
 fn find_extension(dir: &Path, extension: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     for entry in entries.map(Result::unwrap) {
@@ -20424,9 +20684,9 @@ fn find_extension(dir: &Path, extension: &str) -> Option<PathBuf> {
     None
 }
 
-/// The signature is produced before the ref moves. A key that cannot sign
-/// leaves the ref where it stood and publishes nothing; a ref write that cannot
-/// happen leaves the commit and its `.commitmeta` durable with no ref.
+/// The command makes the signature before the ref moves. A key that cannot
+/// sign leaves the ref where it was and publishes nothing. If the ref write
+/// cannot occur, the commit and its `.commitmeta` stay durable with no ref.
 #[test]
 fn commit_sign_precedes_the_ref_write() {
     if !ostree_supports_ed25519() {
@@ -20456,7 +20716,7 @@ fn commit_sign_precedes_the_ref_write() {
         found
     };
 
-    // A first commit both sides make, so the ref has somewhere to stand.
+    // A first commit in both repositories, so that the ref has a target.
     assert_agrees(
         &port_repo,
         &tool_repo,
@@ -20467,8 +20727,8 @@ fn commit_sign_precedes_the_ref_write() {
         .map(|repo| count(repo, "commit"))
         .collect();
 
-    // A sign failure over a changed tree: the ref stands and nothing new is
-    // published.
+    // A signature failure over a changed tree. The ref does not move, and
+    // nothing new is published.
     std::fs::write(tree.join("sign-order.txt"), "second\n").unwrap();
     assert_agrees(
         &port_repo,
@@ -20502,8 +20762,8 @@ fn commit_sign_precedes_the_ref_write() {
         );
     }
 
-    // A ref write that cannot happen: the commit and its `.commitmeta` are both
-    // durable and the ref does not move.
+    // A ref write that cannot occur. The commit and its `.commitmeta` are both
+    // durable, and no ref is written.
     for repo in [&port_repo, &tool_repo] {
         let heads = repo.join("refs/heads");
         std::fs::set_permissions(&heads, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -20527,8 +20787,8 @@ fn commit_sign_precedes_the_ref_write() {
         let heads = repo.join("refs/heads");
         std::fs::set_permissions(&heads, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    // The two word the write failure differently; the claim is the state each
-    // leaves behind (`docs/conformance/cli-surface.md`, "P2").
+    // The two commands use different words for the write failure. This is a
+    // recorded divergence. The claim is the state that each command leaves.
     for (who, run) in [("port", &port), ("tool", &tool)] {
         assert_eq!(
             run.status.code(),
@@ -20542,8 +20802,8 @@ fn commit_sign_precedes_the_ref_write() {
             1,
             "the signature was not written before the ref"
         );
-        // The commit the signature names is durable beside it, which the
-        // signature's own loose path states.
+        // The commit that the signature names is durable next to it. The loose
+        // path of the signature gives the path of the commit.
         let signed = find_extension(&repo.join("objects"), "commitmeta")
             .expect("the signature's loose path");
         assert!(
@@ -20558,8 +20818,8 @@ fn commit_sign_precedes_the_ref_write() {
     }
 }
 
-/// `commit --add-detached-metadata-string` replaces the whole stored detached
-/// metadata where a signing option appends to it, and the stored keys keep
+/// `commit --add-detached-metadata-string` replaces all the stored detached
+/// metadata, and a signing option appends to it. The stored keys keep the
 /// insertion order: the user keys, then `ostree.sign.<type>`, then
 /// `ostree.gpgsigs`.
 #[test]
@@ -20572,8 +20832,8 @@ fn commit_sign_replace_and_append_match_the_tool() {
     let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::Archive);
     let src = tree.to_str().unwrap();
 
-    // Every step lands on one orphan checksum, so each run edits the metadata
-    // the one before it left.
+    // Each step gets the same orphan checksum, so each run edits the metadata
+    // that the run before it left.
     let step = |extra: &[&str]| -> (String, Vec<u8>) {
         let mut args = vec!["commit", "--orphan", "-s", "same", FIXED_TIMESTAMP];
         args.extend_from_slice(extra);
@@ -20634,7 +20894,8 @@ fn commit_sign_replace_and_append_match_the_tool() {
         "the append dropped one of the two keys: {}",
         appended.0,
     );
-    // Both in one run: the user key replaces, the signature appends onto it.
+    // Both options in one run. The user key replaces the metadata, and the
+    // signature appends to it.
     step(&[
         "--add-detached-metadata-string=k2=v2",
         "--sign",
@@ -20643,8 +20904,8 @@ fn commit_sign_replace_and_append_match_the_tool() {
     // A second signature over a stored commit appends to the array.
     let grown = step(&["--sign", ED25519_SECRET_B64]);
     // `--orphan` resolves no parent, so `--skip-if-unchanged` has nothing to
-    // compare against and the run signs like any other: the array grows by one
-    // element over the step before it.
+    // compare against. The run signs as all other runs do, and the array grows
+    // by one element over the step before it.
     let skipped = step(&["--skip-if-unchanged", "--sign", ED25519_SECRET2_B64]);
     assert!(
         skipped.1.len() > grown.1.len(),
@@ -20652,9 +20913,9 @@ fn commit_sign_replace_and_append_match_the_tool() {
     );
 }
 
-/// `commit --gpg-sign` and `--gpg-homedir` write `ostree.gpgsigs`, one element
-/// per occurrence and in command-line order, and each implementation's
-/// signature verifies through the other's `show --gpg-verify-remote`.
+/// `commit --gpg-sign` and `--gpg-homedir` write `ostree.gpgsigs`, with one
+/// element for each occurrence in command-line order. The signature of each
+/// command verifies through `show --gpg-verify-remote` of both commands.
 #[cfg(feature = "gpg")]
 #[test]
 fn commit_gpg_sign_matches_the_tool() {
@@ -20672,9 +20933,9 @@ fn commit_gpg_sign_matches_the_tool() {
     let home = GpgHome::create(base, "Ostrya Commit Test <cli-commit@ostrya.example>");
     let fpr = home.fingerprint();
     let home_s = home.dir.to_str().unwrap().to_owned();
-    // Both implementations run `gpg` in the empty home, so it is held as a
-    // fixture whose drop stops the GnuPG daemons of the home and removes
-    // their socket directory.
+    // Both commands run `gpg` in the empty home, so the test holds it as a
+    // fixture. The drop of the fixture stops the GnuPG daemons of the home and
+    // removes their socket directory.
     let empty = GpgHome {
         dir: base.join("emptyhome"),
     };
@@ -20684,12 +20945,12 @@ fn commit_gpg_sign_matches_the_tool() {
     let absent_home = base.join("no-such-home");
     let absent_home = absent_home.to_str().unwrap().to_owned();
 
-    // The refusals, which name the home directory the run read. Neither
-    // implementation distinguishes a missing home directory from one holding no
-    // matching key.
+    // The refusals, which name the home directory that the run read. Neither
+    // command distinguishes a missing home directory from a home directory with
+    // no matching key.
     let mut cell = 0;
-    // `refused` is the line both sides carry, so the refusal is held in the
-    // words the record states and not only as an agreement.
+    // `refused` is the line that both commands print. The test checks the
+    // refusal in the words of the record, and not only as an agreement.
     let mut agrees_env = |extra: &[&str], env: &[(&str, &str)], refused: Option<&str>| -> String {
         cell += 1;
         let branch = format!("gpg{cell}");
@@ -20721,9 +20982,9 @@ fn commit_gpg_sign_matches_the_tool() {
         branch
     };
     let with_home: &[(&str, &str)] = &[("GNUPGHOME", &home_s)];
-    // A selector under eight bytes is refused without a lookup, whatever it
-    // names, so a user-id substring that resolves to a key still draws the
-    // refusal and no arbitrary key is picked.
+    // The commands refuse a selector of less than eight bytes with no lookup,
+    // for all names. A user-id substring that resolves to a key still gets the
+    // refusal, and no arbitrary key is selected.
     for selector in ["", "O", "Ostrya", "Ostrya ", "cli-com", "@cli"] {
         agrees_env(
             &[&format!("--gpg-sign={selector}")],
@@ -20731,8 +20992,8 @@ fn commit_gpg_sign_matches_the_tool() {
             Some("Unable to lookup key ID"),
         );
     }
-    // Eight bytes and longer reach the lookup: a selector naming nothing is
-    // refused by path, and one naming the key signs.
+    // A selector of eight bytes or more goes to the lookup. The lookup refuses
+    // a selector that names no key, and a selector that names the key signs.
     agrees_env(
         &["--gpg-sign=zzzzzzzz"],
         with_home,
@@ -20764,8 +21025,8 @@ fn commit_gpg_sign_matches_the_tool() {
         &[],
         Some("No gpg key found with ID"),
     );
-    // `--gpg-homedir` wins over `GNUPGHOME`: the populated home the environment
-    // names is never read, so the run fails.
+    // `--gpg-homedir` wins over `GNUPGHOME`. The commands never read the
+    // populated home that the environment names, so the run fails.
     agrees_env(
         &["--gpg-sign", &fpr, "--gpg-homedir", &empty_home],
         with_home,
@@ -20773,8 +21034,8 @@ fn commit_gpg_sign_matches_the_tool() {
     );
     // `--gpg-homedir` with no `--gpg-sign` is accepted and changes nothing.
     agrees_env(&["--gpg-homedir", &home_s], &[], None);
-    // The selector that names the key signs, which the refusals above make the
-    // discriminating half of the length rule.
+    // The selector that names the key signs. This signature and the earlier
+    // refusals of short selectors together show the length rule.
     for repo in [&port_repo, &tool_repo] {
         assert_eq!(
             signature_elements(repo, &signs, "ostree.gpgsigs").len(),
@@ -20783,9 +21044,9 @@ fn commit_gpg_sign_matches_the_tool() {
             repo.display(),
         );
     }
-    // A signed commit reaches the same checksum on both sides. The signature
-    // bytes differ per run, so the claim is the checksum and the key set, not
-    // the `.commitmeta` bytes.
+    // A signed commit gets the same checksum in both commands. The signature
+    // bytes differ for each run, so the claim is the checksum and the key set.
+    // The `.commitmeta` bytes are not part of the claim.
     for (n, extra) in [
         vec!["--gpg-sign".to_owned(), fpr.clone()],
         vec![
@@ -20815,8 +21076,8 @@ fn commit_gpg_sign_matches_the_tool() {
             &["show", "--list-detached-metadata-keys", &branch],
         );
     }
-    // One element per occurrence, with no deduplication, which the key listing
-    // cannot show because it names each key once.
+    // One element for each occurrence, with no deduplication. The key listing
+    // cannot show this, because it names each key once.
     for repo in [&port_repo, &tool_repo] {
         assert_eq!(
             signature_elements(repo, "gpgok0", "ostree.gpgsigs").len(),
@@ -20832,7 +21093,8 @@ fn commit_gpg_sign_matches_the_tool() {
         );
     }
 
-    // Each side's signature verifies through the other's remote keyring.
+    // The signature of each command verifies through the remote keyring of
+    // each command, the other command included.
     let public = base.join("public.gpg");
     home.export_to(&public);
     let public_s = public.to_str().unwrap();
@@ -20886,14 +21148,16 @@ fn commit_gpg_sign_matches_the_tool() {
         }
     }
 
-    // The port's stored dict keeps insertion order: the caller's
-    // detached-metadata keys in command-line order, then `ostree.sign.<type>`,
-    // then `ostree.gpgsigs`, whatever order the signing options take. The order
-    // is read out of the raw `.commitmeta`, since `show
-    // --list-detached-metadata-keys` sorts instead. The tool's own order over a
-    // set holding all three depends on the key names, so the tool is compared
-    // only over the name where the two meet
-    // (`docs/conformance/cli-surface.md`, "P2").
+    // The stored dict of ostrya keeps the insertion order in both orders of the
+    // signing options:
+    // - the detached-metadata keys of the caller, in command-line order
+    // - then `ostree.sign.<type>`
+    // - then `ostree.gpgsigs`
+    // The test reads the order from the raw `.commitmeta`, because
+    // `show --list-detached-metadata-keys` sorts the keys. The order of the
+    // `ostree` command over a set with all three depends on the key names. The
+    // test compares `ostree` only over the names where the two orders agree.
+    // This is a recorded divergence.
     let mut order_cell = 0;
     let mut order_agrees = |users: &[&str], gpg_first: bool, compare_tool: bool| -> String {
         order_cell += 1;
@@ -20927,8 +21191,9 @@ fn commit_gpg_sign_matches_the_tool() {
                 args.join(" "),
             );
         } else {
-            // The recorded divergence, held in the direction measured: over
-            // these names the tool's own container gives another order.
+            // The recorded divergence, asserted in the direction that was
+            // measured. Over these names, the container of `ostree` gives a
+            // different order.
             assert_ne!(
                 detached_key_order(&tool_repo, &branch, &wanted),
                 wanted,
@@ -20939,20 +21204,20 @@ fn commit_gpg_sign_matches_the_tool() {
         }
         branch
     };
-    // `zzz` is a name over which the tool's order is the insertion order too.
+    // Over the name `zzz`, the order of `ostree` is also the insertion order.
     order_agrees(&["zzz"], false, true);
     order_agrees(&["zzz"], true, true);
-    // `foo` and `user.first` are names over which it is not, so these state the
-    // port alone.
+    // Over `foo` and `user.first`, it is not. These cases check the insertion
+    // order of ostrya and the different order of `ostree`.
     let unsorted = order_agrees(&["foo"], false, false);
     order_agrees(&["foo"], true, false);
     order_agrees(&["user.first"], false, false);
     order_agrees(&["user.first"], true, false);
-    // Two user keys of one run keep the command line's order between them.
+    // Two user keys of one run keep the order of the command line.
     order_agrees(&["zzz", "zzy"], false, true);
 
-    // The stored order is the one the raw file holds; the key listing sorts
-    // instead, which is why the order is read out of the file.
+    // The stored order is the order in the raw file. The key listing sorts the
+    // keys, so the test reads the order from the file.
     let listed = ostrya(
         &[
             "show",
@@ -20976,8 +21241,8 @@ fn commit_gpg_sign_matches_the_tool() {
         "the listing and the stored order are one, so the listing states the order",
     );
 
-    // A selector eight bytes or longer that names more than one secret key is
-    // refused rather than resolved to one of them.
+    // The commands refuse a selector of eight bytes or more that names more
+    // than one secret key. They do not resolve it to one of the keys.
     home.add_key("Ostrya Commit Spare <cli-spare@ostrya.example>");
     agrees_env(&["--gpg-sign=Ostrya C"], with_home, Some("ambiguous"));
     agrees_env(
@@ -20987,12 +21252,12 @@ fn commit_gpg_sign_matches_the_tool() {
     );
 }
 
-/// The detached-metadata keys of `rev`, ordered as the raw `.commitmeta`
-/// stores them.
+/// Returns the detached-metadata keys of `rev` in the order of the raw
+/// `.commitmeta`.
 ///
-/// A GVariant `a{sv}` holds each entry's key as a NUL-terminated string in
-/// stored order, so the first byte offset of each name gives that order.
-/// `wanted` names the keys to look for, each of which must be present.
+/// A GVariant `a{sv}` holds the key of each entry as a NUL-terminated string in
+/// stored order. The first byte offset of each name then gives that order.
+/// `wanted` names the keys to find. Each of these keys must be present.
 #[cfg(feature = "gpg")]
 fn detached_key_order(repo: &Path, rev: &str, wanted: &[&str]) -> Vec<String> {
     let checksum = ostrya(
@@ -21017,10 +21282,10 @@ fn detached_key_order(repo: &Path, rev: &str, wanted: &[&str]) -> Vec<String> {
     found.into_iter().map(|(_, key)| key).collect()
 }
 
-/// A `--sign-from-file` file whose first line is empty, and a file with no
-/// bytes at all, are refused cleanly. Reference build 2026.1 dies on a signal
-/// for each of the two, so this states the port alone
-/// (`docs/conformance/cli-surface.md`, "P2").
+/// ostrya refuses cleanly a `--sign-from-file` file with an empty first line,
+/// and a file with no bytes. The 2026.1 build of the `ostree` command dies on a
+/// signal for each of the two, so this test checks ostrya alone. This is a
+/// recorded divergence.
 #[test]
 fn commit_sign_from_file_empty_line_is_refused_cleanly() {
     let tmp = TmpDir::new("commit-sign-empty-line");
@@ -21035,8 +21300,8 @@ fn commit_sign_from_file_empty_line_is_refused_cleanly() {
     let empty = base.join("no-bytes.txt");
     std::fs::write(&empty, "").unwrap();
 
-    // The number of commit objects the repository holds, so "as it stands" is
-    // read and not assumed.
+    // The number of commit objects in the repository. The test reads the state
+    // of the repository and does not assume it.
     let commits = |repo: &Path| -> usize {
         fn walk(dir: &Path, found: &mut usize) {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -21094,10 +21359,10 @@ fn commit_sign_from_file_empty_line_is_refused_cleanly() {
         );
     }
 
-    // A first line longer than the port's cap is refused rather than cut, so
-    // no run reports a length shorter than the file holds. The tool reads a
-    // line of any length and reports the whole of it
-    // (`docs/conformance/cli-surface.md`, "P2").
+    // ostrya refuses a first line longer than its cap of 65536 bytes, and does
+    // not cut the line. No run then reports a length shorter than the line in
+    // the file. The `ostree` command reads a line of any length and reports all
+    // of it. This is a recorded divergence.
     let over_long = base.join("over-long.txt");
     std::fs::write(&over_long, "A".repeat(100_000)).unwrap();
     let run = ostrya(
@@ -21136,9 +21401,9 @@ fn commit_sign_from_file_empty_line_is_refused_cleanly() {
     );
 }
 
-/// A 64-byte `--sign` value whose halves are not an ed25519 key pair is refused
-/// cleanly. The tool signs both shapes, so this states the port alone
-/// (`docs/conformance/cli-surface.md`, "P2").
+/// ostrya refuses cleanly a 64-byte `--sign` value with halves that are not an
+/// ed25519 key pair. The `ostree` command signs both shapes. This is a recorded
+/// divergence. The test checks `ostree` only if it supports ed25519.
 #[test]
 fn commit_sign_keypair_mismatch_is_refused_cleanly() {
     let tmp = TmpDir::new("commit-sign-keypair");
@@ -21148,8 +21413,9 @@ fn commit_sign_keypair_mismatch_is_refused_cleanly() {
     let src = base.join("src");
     let src = src.to_str().unwrap();
 
-    // The fixture key's seed followed by another key's public key, and 64 bytes
-    // whose trailing half is not a curve point.
+    // Two values. The first is the seed of the fixture key followed by the
+    // public key of another key. The second is 64 bytes with a trailing half
+    // that is not a curve point.
     let secret = decode_test_base64(ED25519_SECRET_B64);
     let other = decode_test_base64(ED25519_SECRET2_B64);
     let mismatched = encode_test_base64(&[&secret[..32], &other[32..]].concat());
@@ -21189,8 +21455,9 @@ fn commit_sign_keypair_mismatch_is_refused_cleanly() {
             "a refused signing run moved the ref"
         );
 
-        // The tool takes the same value: it signs at exit 0 and stores one
-        // 64-byte element, which is the state the port refuses to write.
+        // The `ostree` command accepts the same value. It signs at exit 0 and
+        // stores one 64-byte element, which is the state that ostrya refuses
+        // to write.
         if ostree_supports_ed25519() {
             let tool_repo = base.join(format!("tool{n}"));
             block_on(async {
@@ -21226,13 +21493,13 @@ fn commit_sign_keypair_mismatch_is_refused_cleanly() {
 
 // --- abbreviated checksum resolution -----------------------------------------
 //
-// A revision shorter than a full checksum names the one commit object whose
-// checksum starts with it, wherever a revision is taken
-// (`docs/format-reference.md`, "Revision syntax"). Each test commits corpus `C0`
-// under a fixed timestamp, so the two implementations hold the same commit
-// checksum and one prefix string states the same case on both sides.
+// A revision shorter than a full checksum names the one commit object with a
+// checksum that starts with it. This applies in each place that takes a
+// revision. Each test commits corpus `C0` under a fixed timestamp. The two
+// commands then hold the same commit checksum, and one prefix string gives the
+// same case in both commands.
 
-/// Every loose object in a repository as `(checksum, extension)`.
+/// Returns each loose object in a repository as `(checksum, extension)`.
 fn loose_objects(repo: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for fanout in object_fanouts(repo) {
@@ -21249,8 +21516,8 @@ fn loose_objects(repo: &Path) -> Vec<(String, String)> {
     out
 }
 
-/// The checksum of one loose object that is not a commit, for the prefix that
-/// must match nothing.
+/// Returns the checksum of one loose object that is not a commit, for the
+/// prefix that must match nothing.
 fn a_non_commit_object(repo: &Path) -> String {
     loose_objects(repo)
         .into_iter()
@@ -21259,8 +21526,9 @@ fn a_non_commit_object(repo: &Path) -> String {
         .0
 }
 
-/// Commit corpus `C0` into both repositories on `branch` under the fixed
-/// timestamp, asserting the two agree, and return the checksum they printed.
+/// Commits corpus `C0` into both repositories on `branch` under the fixed
+/// timestamp. Asserts that the two runs agree, and returns the printed
+/// checksum.
 fn commit_both(port_repo: &Path, tool_repo: &Path, tree: &Path, branch: &str) -> String {
     let args = [
         "commit",
@@ -21274,9 +21542,9 @@ fn commit_both(port_repo: &Path, tool_repo: &Path, tree: &Path, branch: &str) ->
     port.ok().stdout_trimmed()
 }
 
-/// A prefix resolves to the commit it names at every length, an object that is
-/// no commit is not reachable by prefix, and the case rule and the ancestry
-/// suffix hold over an abbreviated name as they do over a full checksum.
+/// A prefix of each tested length resolves to the commit that it names. A
+/// prefix cannot reach an object that is not a commit. The case rule and the
+/// ancestry suffix apply to an abbreviated name as to a full checksum.
 #[test]
 fn abbreviated_checksum_resolves_like_the_tool() {
     if !ostree_available() {
@@ -21287,8 +21555,9 @@ fn abbreviated_checksum_resolves_like_the_tool() {
     let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::Archive);
     let commit = commit_both(&port_repo, &tool_repo, &tree, "base");
 
-    // Every length from one character to one short of the whole checksum
-    // resolves, and the whole checksum keeps resolving to itself.
+    // Lengths from one character to one less than the whole checksum resolve.
+    // The test takes the lengths 1, 2, 3, 4, 8, 32, and 63. The whole checksum
+    // still resolves to itself.
     for len in [1usize, 2, 3, 4, 8, 32, 63, 64] {
         assert_agrees(&port_repo, &tool_repo, &["rev-parse", &commit[..len]]);
     }
@@ -21304,39 +21573,39 @@ fn abbreviated_checksum_resolves_like_the_tool() {
         &tool_repo,
         &["rev-parse", &commit[..8].to_uppercase()],
     );
-    // A prefix carried by a dirtree, a dirmeta, or a file object alone matches
-    // nothing: the match set holds commit objects. Both stores hold the same
-    // object names, the corpus and the timestamp being fixed.
+    // A prefix of only a dirtree, a dirmeta, or a file object matches nothing,
+    // because the match set holds commit objects. The corpus and the timestamp
+    // are fixed, so both stores hold the same object names.
     let other = a_non_commit_object(&port_repo);
     assert_eq!(other, a_non_commit_object(&tool_repo));
     for len in [1usize, 4, 8] {
         assert_agrees(&port_repo, &tool_repo, &["rev-parse", &other[..len]]);
     }
-    // A hex name no commit begins with is a ref name, so a ref of that name
-    // resolves through the ref store.
+    // A hex name that starts no commit checksum is a ref name, so a ref of that
+    // name resolves through the ref store.
     assert_agrees(&port_repo, &tool_repo, &["refs", "--create=dddd", "base"]);
     assert_agrees(&port_repo, &tool_repo, &["rev-parse", "dddd"]);
     // The existence check of `--create=NEWREF` resolves NEWREF, so a NEWREF
-    // that is a prefix of a commit names one.
+    // that is a prefix of a commit names that commit.
     assert_agrees(
         &port_repo,
         &tool_repo,
         &["refs", &format!("--create={}", &commit[..6]), "base"],
     );
     // `refs -A --create` takes a ref name and not a revision, so a prefix there
-    // names no ref: both report `Cannot create alias to non-existent ref` and
-    // neither writes an alias (`docs/format-reference.md`, "Revision syntax").
+    // names no ref. Both commands report `Cannot create alias to non-existent
+    // ref`, and neither writes an alias.
     assert_agrees(
         &port_repo,
         &tool_repo,
         &["refs", "-A", "--create=al", &commit[..6]],
     );
     // A `-A` listing matches its PREFIX against the ref names and the alias
-    // names rather than resolving it, so a prefix naming neither prints nothing
-    // at exit 0 in both, where a resolution would print the commit it reaches.
-    // The alias written here is what an unfiltered `-A` listing prints, so the
-    // empty listing under the prefix states that the prefix selected by match
-    // (`docs/format-reference.md`, "Revision syntax").
+    // names, and does not resolve it. A prefix that names neither prints
+    // nothing at exit 0 in both commands. A resolution prints the commit that
+    // the prefix gives. An unfiltered `-A` listing prints the alias that this
+    // test writes. The empty listing under the prefix then shows that the
+    // prefix selected by match.
     assert_agrees(
         &port_repo,
         &tool_repo,
@@ -21358,8 +21627,9 @@ fn abbreviated_checksum_resolves_like_the_tool() {
     assert_agrees(&port_repo, &tool_repo, &["ls", &short]);
     assert_agrees(&port_repo, &tool_repo, &["cat", &short, "/file.txt"]);
     assert_agrees(&port_repo, &tool_repo, &["diff", &short, "base"]);
-    // `commit` resolves one at `--tree=ref=` and at `--base`, so the checksum
-    // both print states that each read the same tree.
+    // `commit` resolves an abbreviated name at `--tree=ref=` and at `--base`.
+    // The checksum that both commands print shows that each read the same
+    // tree.
     assert_agrees(
         &port_repo,
         &tool_repo,
@@ -21386,10 +21656,10 @@ fn abbreviated_checksum_resolves_like_the_tool() {
     assert_eq!(describe_refs(&port_repo), describe_refs(&tool_repo));
 }
 
-/// `commit -b NAME`, where NAME is a prefix of a commit the repository holds and
-/// names no ref, parents the new commit on that commit. The checksum both
-/// implementations print is the oracle, since a differing parent gives a
-/// differing commit object.
+/// If NAME is a prefix of a commit in the repository and names no ref,
+/// `commit -b NAME` makes that commit the parent of the new commit. The
+/// checksum that ostrya and the `ostree` command print is the oracle, because
+/// a different parent gives a different commit object.
 #[test]
 fn commit_branch_name_as_abbreviated_checksum_matches_the_tool() {
     if !ostree_available() {
@@ -21401,8 +21671,8 @@ fn commit_branch_name_as_abbreviated_checksum_matches_the_tool() {
     let first = commit_both(&port_repo, &tool_repo, &tree, "base");
     let prefix = first[..4].to_owned();
 
-    // The branch names no ref, so the implicit parent is what the name resolves
-    // to as a revision: the commit it prefixes.
+    // The branch names no ref, so the implicit parent is the result of the name
+    // as a revision. That is the commit that the name is a prefix of.
     let second = commit_both(&port_repo, &tool_repo, &tree, &prefix);
     assert_ne!(first, second);
     assert_agrees(&port_repo, &tool_repo, &["show", &second]);
@@ -21418,10 +21688,10 @@ fn commit_branch_name_as_abbreviated_checksum_matches_the_tool() {
         "the commit under a prefix branch name carries no parent:\n{shown}"
     );
 
-    // The branch now holds `second`, and the name still resolves to `first`, so
-    // a further commit on it takes `first` as its parent again. The ref file is
-    // read as a file: resolving the name would give the prefix match, which is
-    // the behavior under test.
+    // The branch now holds `second`, and the name still resolves to `first`. A
+    // further commit on the branch takes `first` as its parent again. The test
+    // reads the ref file as a file, because a resolution of the name gives the
+    // prefix match, which is the behavior under test.
     let ref_file = port_repo.join("refs").join("heads").join(&prefix);
     assert_eq!(
         std::fs::read_to_string(&ref_file).unwrap().trim(),
@@ -21433,10 +21703,10 @@ fn commit_branch_name_as_abbreviated_checksum_matches_the_tool() {
         Some(first.as_str()),
         "the name must resolve to the commit it prefixes"
     );
-    // The commit object it writes therefore reproduces `second` byte for byte,
-    // the tree and the timestamp being the same. A parent taken from the ref
-    // file would give another checksum, so this states which of the two the
-    // implicit parent read.
+    // The tree and the timestamp are the same, so the commit object that it
+    // writes is `second` byte for byte. A parent from the ref file gives a
+    // different checksum. This shows which of the two the implicit parent
+    // read.
     let third = commit_both(&port_repo, &tool_repo, &tree, &prefix);
     assert_eq!(
         third, second,
@@ -21445,9 +21715,10 @@ fn commit_branch_name_as_abbreviated_checksum_matches_the_tool() {
     assert_eq!(describe_refs(&port_repo), describe_refs(&tool_repo));
 }
 
-/// A prefix more than one commit carries resolves nowhere: both implementations
-/// report `Refspec <prefix> not unique` at exit 1, at every site that takes a
-/// revision, and `commit -b <prefix>` writes neither an object nor a ref.
+/// A prefix of more than one commit resolves to nothing. At each site that
+/// takes a revision, ostrya and the `ostree` command report
+/// `Refspec <prefix> not unique` at exit 1. `commit -b <prefix>` writes no
+/// object and no ref.
 #[test]
 fn ambiguous_abbreviated_checksum_is_refused_like_the_tool() {
     if !ostree_available() {
@@ -21457,9 +21728,9 @@ fn ambiguous_abbreviated_checksum_is_refused_like_the_tool() {
     let base = tmp.path();
     let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::Archive);
 
-    // Commit distinct bodies until two commits share their first character. The
-    // checksums are content-addressed and the timestamp is fixed, so the
-    // collision falls the same way in both stores.
+    // The test commits different bodies until two commits share their first
+    // character. The checksums are content-addressed and the timestamp is
+    // fixed, so the collision is the same in both stores.
     let mut heads: Vec<String> = Vec::new();
     let mut prefix = None;
     for n in 0..400 {
@@ -21485,8 +21756,9 @@ fn ambiguous_abbreviated_checksum_is_refused_like_the_tool() {
     }
     let prefix = prefix.expect("two commits sharing a first character");
 
-    // Every revision site reports the same refusal, the ancestry suffix
-    // included: nothing resolved to walk back from.
+    // Each revision site reports the same refusal. The ancestry suffix also
+    // fails, because nothing resolved to walk back from. The test checks the
+    // suffix after the `-A` cases, with an agreement check only.
     for args in [
         vec!["rev-parse", &prefix],
         vec!["show", &prefix],
@@ -21504,10 +21776,9 @@ fn ambiguous_abbreviated_checksum_is_refused_like_the_tool() {
             &format!("error: Refspec {prefix} not unique"),
         );
     }
-    // `refs -A --create` takes a ref name and not a revision, so the prefix is
-    // matched against no commit there and the ambiguity is never reached: both
-    // report the line they report for a prefix one commit carries
-    // (`docs/format-reference.md`, "Revision syntax").
+    // `refs -A --create` takes a ref name and not a revision, so the command
+    // matches the prefix against no commit there. The ambiguity never occurs.
+    // Both commands report the same line as for a prefix of one commit.
     let alias_args = ["refs", "-A", "--create=alamb", &prefix];
     assert_agrees(&port_repo, &tool_repo, &alias_args);
     assert_agrees_on_error(
@@ -21516,12 +21787,12 @@ fn ambiguous_abbreviated_checksum_is_refused_like_the_tool() {
         &alias_args,
         &format!("error: Cannot create alias to non-existent ref: {prefix}"),
     );
-    // A `-A` listing matches its PREFIX rather than resolving it, so the
-    // ambiguity is never reached there: the prefix names no ref and no alias,
-    // and both print nothing at exit 0 in place of the `not unique` line every
-    // revision site reports. The alias written here is what an unfiltered `-A`
-    // listing prints, so the empty listing under the prefix states that the
-    // prefix selected by match (`docs/format-reference.md`, "Revision syntax").
+    // A `-A` listing matches its PREFIX and does not resolve it, so the
+    // ambiguity never occurs there. The prefix names no ref and no alias. Both
+    // commands print nothing at exit 0, and not the `not unique` line of each
+    // revision site. An unfiltered `-A` listing prints the alias that this test
+    // writes. The empty listing under the prefix then shows that the prefix
+    // selected by match.
     assert_agrees(
         &port_repo,
         &tool_repo,
@@ -21557,8 +21828,8 @@ fn ambiguous_abbreviated_checksum_is_refused_like_the_tool() {
     assert_eq!(describe_refs(&port_repo), describe_refs(&tool_repo));
 }
 
-/// Decode standard padded base64, for building the key fixtures the tests above
-/// need.
+/// Decodes standard padded base64, for the key fixtures of the signature
+/// tests.
 fn decode_test_base64(text: &str) -> Vec<u8> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let body = text.trim_end_matches('=');
@@ -21587,7 +21858,7 @@ fn decode_test_base64(text: &str) -> Vec<u8> {
     out
 }
 
-/// Encode bytes as standard padded base64.
+/// Encodes bytes as standard padded base64.
 fn encode_test_base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
@@ -21609,7 +21880,8 @@ fn encode_test_base64(bytes: &[u8]) -> String {
 
 // --- [ex-ostrya] repository config keys ---------------------------------------
 
-/// A one-file tree at `base/<name>`, its content naming it.
+/// Creates a one-file tree at `base/<name>` and returns its path. The content
+/// of the file is the name.
 fn ex_ostrya_tree(base: &Path, name: &str) -> PathBuf {
     let dir = base.join(name);
     std::fs::create_dir_all(&dir).unwrap();
@@ -21617,8 +21889,8 @@ fn ex_ostrya_tree(base: &Path, name: &str) -> PathBuf {
     dir
 }
 
-/// Commit `base/<name>` into the repository at `repo`, with the given metadata
-/// and, where `branch` names one, a ref pointing at the result.
+/// Commits `base/<name>` into the repository at `repo` with the given metadata.
+/// If `branch` is given, the function also sets a ref to the result.
 fn ex_ostrya_commit(
     repo: &Path,
     base: &Path,
@@ -21657,7 +21929,8 @@ fn ex_ostrya_commit(
     })
 }
 
-/// An `a{sv}` holding one key whose value is an `aay` of commit checksums.
+/// Returns an `a{sv}` with one key that has an `aay` of commit checksums as its
+/// value.
 fn ex_ostrya_checksum_list(key: &str, commits: &[Checksum]) -> Value {
     let elements = commits
         .iter()
@@ -21672,7 +21945,7 @@ fn ex_ostrya_checksum_list(key: &str, commits: &[Checksum]) -> Value {
     ])])
 }
 
-/// Whether the repository still holds `commit` as an object.
+/// Returns `true` if the repository still holds `commit` as an object.
 fn ex_ostrya_holds(repo: &Path, commit: &Checksum) -> bool {
     block_on(async {
         Repo::open(repo)
@@ -21684,9 +21957,9 @@ fn ex_ostrya_holds(repo: &Path, commit: &Checksum) -> bool {
     })
 }
 
-/// `prune` reads `[ex-ostrya] gc-root-metadata-keys` and keeps the commits the
-/// named metadata key holds. Without the key the same prune sweeps them, which
-/// is what the tool's own prune does.
+/// `prune` reads `[ex-ostrya] gc-root-metadata-keys` and keeps the commits that
+/// the named metadata key holds. If the key is not set, the same prune removes
+/// them, as the prune of the `ostree` command does.
 #[test]
 fn prune_honours_the_configured_gc_root_metadata_keys() {
     const GC_KEY: &str = "app.gc-roots";
@@ -21755,21 +22028,24 @@ fn prune_refuses_a_malformed_gc_root_metadata_keys_value() {
 
 // --- prune -------------------------------------------------------------------
 //
-// Each test builds one repository, copies it per implementation, runs the same
-// line on each, and holds the two to the same exit status, the same two lines of
-// standard output, and the same loose-object and static-delta inventory. The two
-// copies hold the same commits, so no checksum needs masking.
+// Each test builds one repository and copies it for each command. The test
+// runs the same line in each copy. It then asserts the same exit status, the
+// same two lines of standard output, and the same inventory of loose objects
+// and static deltas. The two copies hold the same commits, so no checksum
+// needs a mask.
 
-/// The base timestamp the prune fixtures commit at, and the step between two
-/// commits of one branch, so a timestamp cut between them is spellable.
+/// The base timestamp of the prune fixtures, and the step between two commits
+/// of one branch. With these values, a test can write a timestamp cut between
+/// two commits.
 const PRUNE_BASE_TS: u64 = 1_700_000_000;
 const PRUNE_STEP: u64 = 86_400;
 
-/// The environment every prune comparison runs under, so the decimal separator
-/// and the size units the totals line renders are the same on any host.
+/// The environment of each prune comparison. The decimal separator and the size
+/// units of the totals line are then the same on each host.
 const PRUNE_ENV: [(&str, &str); 1] = [("LC_ALL", "C.UTF-8")];
 
-/// Commit `tree` onto `branch` at a fixed timestamp, returning the checksum.
+/// Commits `tree` to `branch` at the fixed timestamp of `step`, and returns the
+/// checksum.
 fn prune_commit(repo: &Path, branch: &str, tree: &Path, step: u64) -> String {
     let timestamp = format!("--timestamp=@{}", PRUNE_BASE_TS + PRUNE_STEP * step);
     ostrya(
@@ -21791,8 +22067,8 @@ fn prune_commit(repo: &Path, branch: &str, tree: &Path, step: u64) -> String {
     .stdout_trimmed()
 }
 
-/// Every loose object and every static-delta directory of a repository, sorted:
-/// the oracle for what a prune removed.
+/// Returns each loose object and each static-delta directory of a repository,
+/// sorted. This list is the oracle for what a prune removed.
 fn prune_inventory(repo: &Path) -> Vec<String> {
     fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -21817,8 +22093,8 @@ fn prune_inventory(repo: &Path) -> Vec<String> {
     out
 }
 
-/// A repository holding `main` with three commits and `other` with two, each
-/// branch one payload per commit and each commit one step older than the next.
+/// Creates a repository with `main` at three commits and `other` at two. Each
+/// commit has one payload, and each commit is one step older than the next.
 fn build_prune_repo(base: &Path, mode: RepoMode) -> PathBuf {
     let repo = create_repo(base, mode);
     let tree = base.join("prune-tree");
@@ -21832,9 +22108,9 @@ fn build_prune_repo(base: &Path, mode: RepoMode) -> PathBuf {
     repo
 }
 
-/// A repository holding `main` with five commits and a second ref `mid` at the
-/// third of them, so the two branches share their history and a bound one of
-/// them carries stands on the other's walk.
+/// Creates a repository with `main` at five commits and a second ref `mid` at
+/// the third commit. The two branches share their history, so a bound of one
+/// branch is on the walk of the other.
 fn build_shared_history_prune_repo(base: &Path, mode: RepoMode) -> PathBuf {
     let repo = create_repo(base, mode);
     let tree = base.join("shared-tree");
@@ -21858,9 +22134,9 @@ fn build_shared_history_prune_repo(base: &Path, mode: RepoMode) -> PathBuf {
     repo
 }
 
-/// Run `prune` with `args` against a copy of `repo` under each implementation
-/// and hold the two to the same exit status, standard output, and inventory.
-/// Returns the port's standard output.
+/// Runs `prune` with `args` against a copy of `repo` for each command. Asserts
+/// the same exit status, standard output, and inventory, and returns the
+/// standard output of ostrya.
 fn assert_prune_agrees(base: &Path, repo: &Path, tag: &str, args: &[&str]) -> String {
     let port_repo = clone_repo(base, repo, &format!("{tag}-port"));
     let tool_repo = clone_repo(base, repo, &format!("{tag}-tool"));
@@ -21895,9 +22171,10 @@ fn assert_prune_agrees(base: &Path, repo: &Path, tag: &str, args: &[&str]) -> St
     String::from_utf8(port.stdout).unwrap()
 }
 
-/// The totals text: two lines, the count the run considered and the outcome,
-/// under `--no-prune` and without it. Carries `prune/totals-nothing-to-delete`,
-/// `prune/totals-deleted-line`, and `prune/totals-would-delete-line`.
+/// The totals text, with `--no-prune` and without it. The text has two lines:
+/// the count that the run examined, and the result. The test carries
+/// `prune/totals-nothing-to-delete`, `prune/totals-deleted-line`, and
+/// `prune/totals-would-delete-line`.
 #[test]
 fn prune_totals_match_the_tool() {
     if !ostree_available() {
@@ -21931,8 +22208,8 @@ fn prune_totals_match_the_tool() {
         "the dry-run form: {dry:?}",
     );
 
-    // The count is taken after `--delete-commit` has removed its target, so
-    // deleting one commit lowers it by one.
+    // The command takes the count after `--delete-commit` removes its target.
+    // The deletion of one commit decreases the count by one.
     let root = resolve(&repo, "main^^").unwrap();
     let delete = format!("--delete-commit={root}");
     let after = assert_prune_agrees(base, &repo, "delete-commit", &[&delete]);
@@ -21948,9 +22225,9 @@ fn prune_totals_match_the_tool() {
     };
     assert_eq!(total(&after) + 1, total(&nothing));
 
-    // Detached commit metadata is outside both counts: a repository whose every
-    // commit carries a `.commitmeta` reports the same total as the same
-    // repository without one, and the bytes a removed `.commitmeta` freed are
+    // Detached commit metadata is outside both counts. If each commit of a
+    // repository has a `.commitmeta`, the total is the same as for the
+    // repository with none. The bytes that a removed `.commitmeta` freed are
     // not in the sum.
     let detached = create_repo(base, RepoMode::BareUser);
     let tree = base.join("detached-tree");
@@ -21990,9 +22267,10 @@ fn prune_totals_match_the_tool() {
     );
 }
 
-/// The size a totals line renders: the byte count below 1000 and a decimal (SI)
-/// quantity above it. Carries `prune/totals-size-below-1000`,
-/// `prune/totals-size-si-rendering`, and `prune/totals-size-unit-boundary`.
+/// The size in a totals line: the byte count if the size is less than 1000, and
+/// a decimal (SI) quantity for a larger size. The test carries
+/// `prune/totals-size-below-1000`, `prune/totals-size-si-rendering`, and
+/// `prune/totals-size-unit-boundary`.
 #[test]
 fn prune_totals_size_rendering_matches_the_tool() {
     if !ostree_available() {
@@ -22004,15 +22282,15 @@ fn prune_totals_size_rendering_matches_the_tool() {
         .into_iter()
         .enumerate()
     {
-        // `bare-user` stores the payload uncompressed and needs no privilege,
-        // so the bytes a run frees are the bytes the tree holds.
+        // `bare-user` stores the payload with no compression and needs no
+        // privilege, so the bytes that a run frees are the bytes of the tree.
         let repo = create_repo(base, RepoMode::BareUser);
         let tree = base.join(format!("size-tree-{index}"));
         std::fs::create_dir_all(&tree).unwrap();
         std::fs::write(tree.join("payload.bin"), vec![b'x'; payload]).unwrap();
         prune_commit(&repo, "main", &tree, 0);
-        // Dropping the ref leaves the whole commit unreachable, so the freed
-        // sum is the four objects it wrote.
+        // The deletion of the ref makes the whole commit unreachable, so the
+        // freed sum is the four objects that the commit wrote.
         ostrya(
             &[
                 "refs",
@@ -22039,8 +22317,8 @@ fn prune_totals_size_rendering_matches_the_tool() {
     }
 }
 
-/// `--commit-only` names the restriction in the first line, counts commit
-/// objects alone, and leaves the trees a deleted commit reached. Carries
+/// `--commit-only` names the restriction in the first line, counts only commit
+/// objects, and keeps the trees that a deleted commit reached. The test carries
 /// `prune/totals-commit-only`, `prune/commit-only-count`, and
 /// `prune/commit-only-leaves-the-tree`.
 #[test]
@@ -22073,9 +22351,9 @@ fn prune_commit_only_matches_the_tool() {
     );
 }
 
-/// `--keep-younger-than` roots the walk on the refs alone, keeps every ref head
-/// whatever its timestamp, and replaces the `--depth` bound. Carries
-/// `prune/keep-younger-than-epoch`,
+/// `--keep-younger-than` uses only the refs as roots of the walk, keeps each
+/// ref head at any timestamp, and replaces the `--depth` bound. The test
+/// carries `prune/keep-younger-than-epoch`,
 /// `prune/keep-younger-than-offset-datetime`,
 /// `prune/keep-younger-than-implies-refs-only`,
 /// `prune/keep-younger-than-keeps-every-ref-head`, and
@@ -22088,7 +22366,8 @@ fn prune_keep_younger_than_matches_the_tool() {
     let tmp = TmpDir::new("prune-kyt");
     let base = tmp.path();
     let repo = build_prune_repo(base, RepoMode::BareUser);
-    // An orphan younger than every cut below, named by no ref.
+    // An orphan that no ref names. It is younger than each cut of this test,
+    // with one exception: `@2000000000`.
     let orphan_tree = base.join("orphan-tree");
     std::fs::create_dir_all(&orphan_tree).unwrap();
     std::fs::write(orphan_tree.join("payload.txt"), b"orphan\n").unwrap();
@@ -22108,8 +22387,8 @@ fn prune_keep_younger_than_matches_the_tool() {
     let cut = format!("--keep-younger-than=@{}", PRUNE_BASE_TS + PRUNE_STEP * 50);
     let text = assert_prune_agrees(base, &repo, "kyt-epoch", &[&cut]);
     assert!(text.contains("\nDeleted "), "{text:?}");
-    // The orphan is younger than the cut and still goes: the option roots the
-    // walk on the refs alone.
+    // The orphan is younger than the cut and still goes, because the option
+    // uses only the refs as roots of the walk.
     let swept = clone_repo(base, &repo, "kyt-orphan");
     let orphan_object = swept
         .join("objects")
@@ -22131,7 +22410,9 @@ fn prune_keep_younger_than_matches_the_tool() {
         "a timestamp cut sweeps an unreferenced commit younger than the cut",
     );
 
-    // Every ref head is older than this cut and every one of them stays.
+    // Each ref head stays. Each head is older than `cut`. The last two rows use
+    // other cuts: a date and time with an offset, and two occurrences of the
+    // option.
     for args in [
         vec![cut.as_str()],
         vec!["--refs-only", cut.as_str()],
@@ -22148,9 +22429,9 @@ fn prune_keep_younger_than_matches_the_tool() {
         assert_prune_agrees(base, &repo, &tag, &args);
     }
 
-    // A cut older than every commit leaves each branch whole, where the same
-    // `--depth=0` alone keeps each head alone. The orphan still goes, the cut
-    // rooting the walk on the refs.
+    // A cut older than each commit keeps each branch whole. The same
+    // `--depth=0` with no cut keeps only each head. The orphan still goes,
+    // because the cut uses only the refs as roots of the walk.
     let old = format!("--keep-younger-than=@{}", PRUNE_BASE_TS - 1);
     assert_prune_agrees(base, &repo, "kyt-old", &["--depth=0", &old]);
     let kept = clone_repo(base, &repo, "kyt-old-kept");
@@ -22177,10 +22458,10 @@ fn prune_keep_younger_than_matches_the_tool() {
     );
 }
 
-/// The `--keep-younger-than` value dialect: the port takes `@SECONDS` and an
-/// absolute date and time carrying a UTC offset, and refuses the tool's
-/// local-time, relative, and empty forms. Carries
-/// `prune/keep-younger-than-unparseable`,
+/// The value dialect of `--keep-younger-than`. ostrya accepts `@SECONDS` and an
+/// absolute date and time with a UTC offset. It refuses the local-time,
+/// relative, and empty forms of the `ostree` command. This is a recorded
+/// divergence. The test carries `prune/keep-younger-than-unparseable`,
 /// `prune/keep-younger-than-local-time`, `prune/keep-younger-than-relative`,
 /// and `prune/keep-younger-than-empty`.
 #[test]
@@ -22192,7 +22473,8 @@ fn prune_keep_younger_than_dialect_parts_from_the_tool() {
     let base = tmp.path();
     let repo = build_prune_repo(base, RepoMode::BareUser);
 
-    // Both refuse the same words, so the pair compares whole.
+    // Both commands refuse these values with the same words, so the test
+    // compares the full pair.
     for value in ["garbage", "@", "@abc", "1700000000", "2023-13-45T00:00:00Z"] {
         let port_repo = clone_repo(base, &repo, "kyt-bad-port");
         let tool_repo = clone_repo(base, &repo, "kyt-bad-tool");
@@ -22220,8 +22502,8 @@ fn prune_keep_younger_than_dialect_parts_from_the_tool() {
         std::fs::remove_dir_all(&tool_repo).unwrap();
     }
 
-    // The three forms the tool reads through a time-zone database or a
-    // natural-language date reader and the port refuses.
+    // The three forms that `ostree` reads through a time-zone database or a
+    // natural-language date reader. ostrya refuses them.
     for value in ["2023-11-15", "2023-11-15 22:13:20", "1 hour ago", "now", ""] {
         let port_repo = clone_repo(base, &repo, "kyt-lossy-port");
         let tool_repo = clone_repo(base, &repo, "kyt-lossy-tool");
@@ -22247,9 +22529,9 @@ fn prune_keep_younger_than_dialect_parts_from_the_tool() {
     }
 }
 
-/// `--only-branch` prunes the branch it names and retains every other one in
-/// full, roots the walk on the refs alone, and resolves its value as a
-/// revision. Carries `prune/only-branch-names-the-branch`,
+/// `--only-branch` prunes the branch that it names and keeps each other branch
+/// in full. It uses only the refs as roots of the walk, and resolves its value
+/// as a revision. The test carries `prune/only-branch-names-the-branch`,
 /// `prune/only-branch-retains-the-others`, `prune/only-branch-repeated`,
 /// `prune/only-branch-implies-refs-only`,
 /// `prune/only-branch-abbreviated-checksum`, and `prune/only-branch-unknown`.
@@ -22289,10 +22571,10 @@ fn prune_only_branch_matches_the_tool() {
     assert!(text.ends_with("No unreachable objects\n"), "{text:?}");
 }
 
-/// `--retain-branch-depth` replaces the global depth for the branch it names,
-/// a depth of 0 leaves the branch at the global depth, the last entry for a
-/// branch decides it, and a named branch is not retained in full by
-/// `--only-branch`. Carries `prune/retain-branch-depth-value`,
+/// `--retain-branch-depth` replaces the global depth for the branch that it
+/// names. A depth of 0 leaves the branch at the global depth. The last entry
+/// for a branch decides its depth. `--only-branch` does not keep a named branch
+/// in full. The test carries `prune/retain-branch-depth-value`,
 /// `prune/retain-branch-depth-replaces-the-global`,
 /// `prune/retain-branch-depth-zero-is-no-value`,
 /// `prune/retain-branch-depth-last-wins`,
@@ -22384,8 +22666,9 @@ fn prune_retain_branch_depth_matches_the_tool() {
     }
 }
 
-/// A branch bound belongs to the commit the ref names, so it stands wherever a
-/// walk reaches that commit and replaces the bound the walk carried. Carries
+/// A branch bound belongs to the commit that the ref names. The bound applies
+/// at each place where a walk reaches that commit, and it replaces the bound of
+/// the walk. The test carries
 /// `prune/ref-target-bound-replaces-the-inherited-one`,
 /// `prune/ref-target-bound-is-not-narrowed`,
 /// `prune/only-branch-cuts-shared-history`,
@@ -22399,12 +22682,12 @@ fn prune_bounds_stand_at_every_ref_target_matching_the_tool() {
     let tmp = TmpDir::new("prune-shared-history");
     let base = tmp.path();
     let repo = build_shared_history_prune_repo(base, RepoMode::BareUser);
-    // The third commit's own timestamp, so a cut at it keeps it and drops its
-    // parents.
+    // The timestamp of the third commit, so a cut at that time keeps the
+    // commit and drops its parents.
     let cut = format!("--keep-younger-than=@{}", PRUNE_BASE_TS + PRUNE_STEP * 3);
 
     for (tag, args) in [
-        // `mid` cuts the history `main` runs through it.
+        // `mid` cuts the history that `main` runs through `mid`.
         (
             "shared-rbd",
             vec!["--refs-only", "--retain-branch-depth=mid=1"],
@@ -22414,9 +22697,9 @@ fn prune_bounds_stand_at_every_ref_target_matching_the_tool() {
             "shared-global",
             vec!["--refs-only", "--depth=0", "--retain-branch-depth=main=-1"],
         ),
-        // The bound at `mid` replaces the one the arrival carried rather than
-        // narrowing it: `mid` at the global depth 3 keeps the whole chain,
-        // where the two parent hops the arrival had left would cut it.
+        // The bound at `mid` replaces the bound of the arrival, and does not
+        // narrow it. `mid` at the global depth 3 keeps the whole chain. If the
+        // bound of the arrival applied, its two remaining parent hops cut it.
         (
             "shared-no-narrow",
             vec!["--refs-only", "--depth=3", "--retain-branch-depth=mid=0"],
@@ -22433,14 +22716,14 @@ fn prune_bounds_stand_at_every_ref_target_matching_the_tool() {
     ] {
         assert_prune_agrees(base, &repo, tag, &args);
     }
-    // A timestamp cut at a ref target replaces the depth the arrival carried.
+    // A timestamp cut at a ref target replaces the depth of the arrival.
     assert_prune_agrees(
         base,
         &repo,
         "shared-cut",
         &["--refs-only", &cut, "--retain-branch-depth=main=-1"],
     );
-    // A per-branch depth roots the walk on the refs alone, the way
+    // A per-branch depth uses only the refs as roots of the walk, as
     // `--only-branch` and `--keep-younger-than` do.
     assert_prune_agrees(
         base,
@@ -22450,9 +22733,10 @@ fn prune_bounds_stand_at_every_ref_target_matching_the_tool() {
     );
 }
 
-/// The `--retain-branch-depth` value dialect: both refuse a value carrying no
-/// `=` and a depth with no digits, and the tool reads a leading run of digits
-/// where the port refuses the value whole. Carries
+/// The value dialect of `--retain-branch-depth`. ostrya and the `ostree`
+/// command refuse a value with no `=` and a depth with no digits. `ostree`
+/// reads a leading run of digits, and ostrya refuses the whole value. This is
+/// a recorded divergence. The test carries
 /// `prune/retain-branch-depth-no-equals`,
 /// `prune/retain-branch-depth-nonnumeric`, and
 /// `prune/retain-branch-depth-trailing-text`.
@@ -22465,7 +22749,7 @@ fn prune_retain_branch_depth_value_dialect_parts_from_the_tool() {
     let base = tmp.path();
     let repo = build_prune_repo(base, RepoMode::BareUser);
 
-    // Both refuse, in the same words.
+    // Both commands refuse, with the same words.
     for (value, message) in [
         ("main", "Invalid value main, must specify BRANCH=DEPTH"),
         ("", "Invalid value , must specify BRANCH=DEPTH"),
@@ -22514,8 +22798,8 @@ fn prune_retain_branch_depth_value_dialect_parts_from_the_tool() {
         std::fs::remove_dir_all(&tool_repo).unwrap();
     }
 
-    // The five spellings the tool's leading-digit-run reader takes and the
-    // port's strict reader refuses.
+    // The five values that the leading-digit reader of `ostree` accepts and the
+    // strict reader of ostrya refuses.
     for (value, depth) in [
         ("main=0x1", "0x1"),
         ("main=0=1", "0=1"),
@@ -22559,8 +22843,9 @@ fn prune_retain_branch_depth_value_dialect_parts_from_the_tool() {
     }
 }
 
-/// `--depth` outside `-1`: `-1` alone keeps the whole ancestry and every other
-/// negative value keeps the head alone. Carries `prune/depth-minus-two`.
+/// `--depth` values other than `-1`. Only `-1` keeps the whole ancestry, and
+/// each other negative value keeps only the head. The test carries
+/// `prune/depth-minus-two`.
 #[test]
 fn prune_depth_outside_minus_one_matches_the_tool() {
     if !ostree_available() {
@@ -22576,9 +22861,9 @@ fn prune_depth_outside_minus_one_matches_the_tool() {
     }
 }
 
-/// A prune removes the static delta of every commit it deleted and keeps a
-/// delta whose source commit it deleted, the delta directory whole and its
-/// fanout parent in place. Carries `prune/static-delta-swept-with-its-target`
+/// A prune removes the static delta of each commit that it deletes. It keeps a
+/// delta whose source commit it deletes, with the whole delta directory and its
+/// fanout parent. The test carries `prune/static-delta-swept-with-its-target`
 /// and `prune/static-delta-source-is-kept`.
 #[test]
 fn prune_sweeps_the_static_delta_of_a_pruned_commit() {
@@ -22607,9 +22892,9 @@ fn prune_sweeps_the_static_delta_of_a_pruned_commit() {
         .ok();
     }
 
-    // `--depth=0` prunes `c1` and `c2`: the delta whose target is `c2` goes and
-    // the delta whose source is `c2` stays. `--depth=1` prunes `c1` alone,
-    // which is no delta's target, so neither goes.
+    // `--depth=0` prunes `c1` and `c2`. The delta with the target `c2` goes,
+    // and the delta with the source `c2` stays. `--depth=1` prunes only `c1`,
+    // which is the target of no delta, so both deltas stay.
     for (tag, args) in [
         ("delta-cut", vec!["--refs-only", "--depth=0"]),
         ("delta-keep", vec!["--refs-only", "--depth=1"]),
@@ -22651,9 +22936,9 @@ fn prune_sweeps_the_static_delta_of_a_pruned_commit() {
     );
 }
 
-/// `--static-deltas-only` requires `--delete-commit` and, with it, removes the
-/// static deltas the named commit targets and no loose object. Carries
-/// `prune/static-deltas-only-needs-delete-commit` and
+/// `--static-deltas-only` requires `--delete-commit`. With it, the prune
+/// removes the static deltas that target the named commit, and no loose
+/// object. The test carries `prune/static-deltas-only-needs-delete-commit` and
 /// `prune/static-deltas-only-deletes-the-delta-alone`.
 #[test]
 fn prune_static_deltas_only_matches_the_tool() {
@@ -22682,9 +22967,9 @@ fn prune_static_deltas_only_matches_the_tool() {
         .ok();
     }
 
-    // The requirement. Both refuse at exit 1 and remove nothing; the tool's
-    // line carries a URL the port does not write, so the two are held to the
-    // sentence they share.
+    // The requirement. Both commands refuse at exit 1 and remove nothing. The
+    // line of `ostree` has a URL that ostrya does not write, so the test checks
+    // only the sentence that the two lines share.
     for extra in [
         vec![],
         vec!["--refs-only", "--depth=0"],
@@ -22728,8 +23013,9 @@ fn prune_static_deltas_only_matches_the_tool() {
         std::fs::remove_dir_all(&tool_repo).unwrap();
     }
 
-    // Each of the three commits as the delta key. `c3` is the branch head,
-    // which a plain `--delete-commit` refuses and this option does not.
+    // The loop uses each of the three commits as the delta key. `c3` is the
+    // branch head. A plain `--delete-commit` refuses it, and this option
+    // accepts it.
     for (index, target) in [&c1, &c2, &c3].into_iter().enumerate() {
         let option = format!("--delete-commit={target}");
         let tag = format!("sdo-{index}");
@@ -22741,10 +23027,10 @@ fn prune_static_deltas_only_matches_the_tool() {
     }
 }
 
-/// A prune writes a `.tombstone-commit` for every commit it removes where
-/// `--delete-commit` is given or `[core] tombstone-commits` is set, and counts
-/// the markers in neither total. Carries `prune/tombstone-on-delete-commit`
-/// and `prune/tombstone-on-config-key`.
+/// If `--delete-commit` is given or `[core] tombstone-commits` is set, a prune
+/// writes a `.tombstone-commit` for each commit that it removes. Neither total
+/// counts the markers. The test carries `prune/tombstone-on-delete-commit` and
+/// `prune/tombstone-on-config-key`.
 #[test]
 fn prune_writes_a_tombstone_for_every_commit_it_removes() {
     if !ostree_available() {
@@ -22765,7 +23051,7 @@ fn prune_writes_a_tombstone_for_every_commit_it_removes() {
     );
     assert!(text.contains("\nDeleted "), "{text:?}");
 
-    // The config key turns the same behavior on with no `--delete-commit`.
+    // The config key gives the same behavior with no `--delete-commit`.
     let configured = base.join("configured");
     std::fs::create_dir_all(&configured).unwrap();
     let configured = clone_repo(&configured, &repo, "repo");
@@ -22794,7 +23080,8 @@ fn prune_writes_a_tombstone_for_every_commit_it_removes() {
         "tomb-key-commit-only",
         &["--refs-only", "--depth=0", "--commit-only"],
     );
-    // The markers a run leaves are outside the count the next run reports.
+    // The count of the next run does not include the markers that a run
+    // leaves.
     let swept = clone_repo(base, &configured, "tomb-second");
     let swept_arg = format!("--repo={}", swept.display());
     ostrya(
@@ -22806,11 +23093,11 @@ fn prune_writes_a_tombstone_for_every_commit_it_removes() {
     assert_prune_agrees(base, &swept, "tomb-second-run", &[]);
 }
 
-/// `prune` writes one line of its own to standard error where the repository
-/// config sets `[core] locking` false, and writes none where the key holds its
-/// default. The key decides whether the run takes the repository lock and
-/// decides nothing else, so the two arms write one standard-output text and
-/// leave one object inventory, and the line is additive.
+/// If the repository config sets `[core] locking` to false, `prune` writes one
+/// line of its own to standard error. If the key has its default value,
+/// `prune` writes no such line. The key controls only the repository lock of
+/// the run. The two arms write the same standard output and leave the same
+/// object inventory, and the line is an addition to the output.
 #[test]
 fn prune_warns_where_locking_is_disabled() {
     let mut outcomes: Vec<(String, Vec<String>)> = Vec::new();
@@ -22822,13 +23109,14 @@ fn prune_warns_where_locking_is_disabled() {
         let repo = create_repo(base, RepoMode::Archive);
         let repo_arg = format!("--repo={}", repo.display());
         ex_ostrya_commit(&repo, base, "head", None, Some("main"));
-        // An unreferenced commit, so the run has something to remove and the
-        // inventory the two arms leave is an oracle rather than a constant.
+        // An unreferenced commit gives the run something to remove. The
+        // inventory that the two arms leave is then an oracle, because the run
+        // changes it.
         ex_ostrya_commit(&repo, base, "orphan", None, None);
 
         if !locking {
-            // A fresh config holds `[core]` as its only group, so a bare
-            // append lands inside it.
+            // A new config has `[core]` as its only group, so a plain append
+            // goes into that group.
             let mut config = std::fs::read_to_string(repo.join("config")).unwrap();
             config.push_str("locking=false\n");
             std::fs::write(repo.join("config"), config).unwrap();
@@ -22861,10 +23149,11 @@ fn prune_warns_where_locking_is_disabled() {
     );
 }
 
-/// The port and the tool part on a ref name the tool's ref enumeration skips:
-/// the tool's `prune --refs-only` reads the commit that ref holds as
-/// unreachable and deletes it, and the port enumerates the name and keeps the
-/// commit. Carries `prune/refs-only-deletes-a-shadowed-ref-commit`.
+/// ostrya and the `ostree` command differ on a ref name that the ref
+/// enumeration of `ostree` skips. `prune --refs-only` of `ostree` reads the
+/// commit of that ref as unreachable and deletes it. ostrya enumerates the name
+/// and keeps the commit. This is a recorded divergence. The test carries
+/// `prune/refs-only-deletes-a-shadowed-ref-commit`.
 #[test]
 fn prune_refs_only_parts_on_a_shadowed_ref_name() {
     if !ostree_available() {
@@ -22926,10 +23215,10 @@ fn prune_refs_only_parts_on_a_shadowed_ref_name() {
     }
 }
 
-/// The three boolean flags `prune` gains are refused on a second occurrence by
-/// the port and taken by the tool, which is the repeated-boolean-flag class the
-/// port's CLI carries throughout. Carries `prune/commit-only-repeated` and
-/// `prune/refs-only-repeated`.
+/// ostrya refuses a second occurrence of each of three boolean flags of
+/// `prune`, and the `ostree` command accepts it. ostrya refuses each repeated
+/// boolean flag in its whole CLI. This is a recorded divergence. The test
+/// carries `prune/commit-only-repeated` and `prune/refs-only-repeated`.
 #[test]
 fn prune_repeated_boolean_flags_part_from_the_tool() {
     if !ostree_available() {
@@ -22977,15 +23266,16 @@ fn prune_repeated_boolean_flags_part_from_the_tool() {
 // passes.
 // ---------------------------------------------------------------------------
 
-/// The environment every `fsck` comparison runs under, so the quotation marks
-/// the binding messages carry render the same way on any host.
+/// The environment of each `fsck` comparison. It makes the quotation marks in
+/// the binding messages the same on each host.
 const FSCK_ENV: [(&str, &str); 1] = [("LC_ALL", "C.UTF-8")];
 
-/// The timestamp every `fsck` fixture commits at, so a rebuild of the fixture
-/// writes the same commits.
+/// The base timestamp of each `fsck` fixture commit, so a rebuild of the
+/// fixture writes the same commits.
 const FSCK_BASE_TS: u64 = 1_700_000_000;
 
-/// Commit `tree` onto `branch` at a fixed timestamp, returning the checksum.
+/// Commits `tree` onto `branch` at `FSCK_BASE_TS + step` and returns the
+/// checksum.
 fn fsck_commit(repo: &Path, branch: &str, tree: &Path, step: u64) -> String {
     ostrya(
         &[
@@ -23006,11 +23296,12 @@ fn fsck_commit(repo: &Path, branch: &str, tree: &Path, step: u64) -> String {
     .stdout_trimmed()
 }
 
-/// A repository at `base/name` holding `test` with `commits` commits over a
-/// two-entry tree: a regular file that changes each time and a nested file.
+/// Creates a repository at `base/name` with `commits` commits on `test`. The
+/// tree has two entries: a regular file that changes for each commit and a
+/// nested file.
 ///
-/// Every content object is a regular file, so a test that corrupts one reaches
-/// a payload both implementations read the same way.
+/// Each content object is a regular file, so a test that corrupts one gets a
+/// payload that both commands read the same way.
 fn build_fsck_repo(base: &Path, name: &str, mode: RepoMode, commits: u64) -> PathBuf {
     let repo = base.join(name);
     block_on(async {
@@ -23026,8 +23317,8 @@ fn build_fsck_repo(base: &Path, name: &str, mode: RepoMode, commits: u64) -> Pat
     repo
 }
 
-/// Every loose object and every `state/` marker of a repository, sorted: the
-/// oracle for what a `fsck` run removed, wrote, and marked.
+/// Returns each loose object and each `state/` marker of a repository, sorted.
+/// The list is the oracle for what a `fsck` run removed, wrote, and marked.
 fn fsck_inventory(repo: &Path) -> Vec<String> {
     fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -23051,11 +23342,10 @@ fn fsck_inventory(repo: &Path) -> Vec<String> {
     out
 }
 
-/// Standard output with the progress block dropped.
+/// Returns standard output with the progress block removed.
 ///
-/// The tool writes a progress line and the port writes none
-/// (`docs/conformance/cli-surface.md`, "fsck"), so the block is outside every
-/// comparison.
+/// The `ostree` command writes a progress line and ostrya writes none, so no
+/// comparison includes the block. This is a recorded divergence.
 fn fsck_normalize_stdout(text: &str) -> String {
     let mut out = String::new();
     for line in text.lines() {
@@ -23068,18 +23358,20 @@ fn fsck_normalize_stdout(text: &str) -> String {
     out
 }
 
-/// Standard error with each finding's commit list sorted and the lines sorted.
+/// Returns standard error with the commit list of each finding sorted, and the
+/// lines sorted.
 ///
-/// The tool emits its findings, and the commits inside one finding, in the
-/// iteration order of its own hash containers; the port emits both sorted
-/// (`docs/conformance/cli-surface.md`, "fsck").
+/// The `ostree` command writes its findings, and the commits in one finding, in
+/// the iteration order of its hash containers. ostrya writes both in sorted
+/// order. This is a recorded divergence.
 fn fsck_normalize_stderr(text: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(fsck_sort_commit_list).collect();
     lines.sort();
     lines.join("\n")
 }
 
-/// One line with the commit list after `in commits ` sorted.
+/// Returns one line with the commit list after `In commits ` or `in commits `
+/// sorted.
 fn fsck_sort_commit_list(line: &str) -> String {
     for marker in ["In commits ", "in commits "] {
         let Some(head) = line.find(marker) else {
@@ -23101,10 +23393,10 @@ fn fsck_sort_commit_list(line: &str) -> String {
     line.to_owned()
 }
 
-/// Run one `fsck` invocation under both implementations over byte-identical
-/// copies of `repo`, and hold them to the same exit status, the same
-/// normalized standard output and standard error, and the same object and
-/// `state/` inventory. Returns the port's standard output.
+/// Runs one `fsck` command line with both commands over byte-identical copies
+/// of `repo`. Asserts the same exit status, the same normalized standard output
+/// and standard error, and the same object and `state/` inventory. Returns the
+/// standard output of ostrya.
 fn assert_fsck_agrees(base: &Path, repo: &Path, tag: &str, args: &[&str]) -> String {
     let port_repo = clone_repo(base, repo, &format!("{tag}-port"));
     let tool_repo = clone_repo(base, repo, &format!("{tag}-tool"));
@@ -23146,9 +23438,9 @@ fn assert_fsck_agrees(base: &Path, repo: &Path, tag: &str, args: &[&str]) -> Str
     String::from_utf8(port.stdout).unwrap()
 }
 
-/// One `fsck` run of the port alone over a copy of `repo`, returning its
-/// standard error. `assert_fsck_agrees` holds the two implementations
-/// together; this states what the port writes where the two part.
+/// Runs `fsck` of ostrya alone over a copy of `repo` and returns its standard
+/// error. `assert_fsck_agrees` compares the two commands. This function shows
+/// what ostrya writes where the two commands differ.
 fn fsck_port_stderr(base: &Path, repo: &Path, tag: &str, args: &[&str]) -> String {
     let port_repo = clone_repo(base, repo, &format!("{tag}-port-only"));
     let repo_arg = format!("--repo={}", port_repo.display());
@@ -23159,27 +23451,27 @@ fn fsck_port_stderr(base: &Path, repo: &Path, tag: &str, args: &[&str]) -> Strin
     String::from_utf8_lossy(&port.stderr).into_owned()
 }
 
-/// One loose object of `ty` reachable from the repository, by its path.
+/// Returns the path of the loose object `checksum` of type `ty` in `repo`.
 fn fsck_object_path(repo: &Path, checksum: &str, ty: ObjectType, mode: RepoMode) -> PathBuf {
     let name = ObjectName::new(Checksum::from_hex(checksum).unwrap(), ty);
     repo.join("objects").join(name.loose_path(mode))
 }
 
-/// Append one byte to `path`, so the object no longer hashes to its name while
-/// it still reads as the object it is. A flipped byte would break a symlink
-/// object's target or a compressed object's frame, which each implementation
-/// then reports in its own words.
+/// Appends one byte to `path`. The object then does not hash to its name, and
+/// it still reads as an object of the same kind. A changed byte can break the
+/// target of a symlink object or the frame of a compressed object. Each command
+/// then reports the fault with its own words.
 fn fsck_corrupt_object(path: &Path) {
     let mut bytes = std::fs::read(path).unwrap();
     bytes.push(b'x');
     std::fs::write(path, &bytes).unwrap();
 }
 
-/// Change one byte of a commit object's text, so the object no longer hashes
-/// to its name while its GVariant framing stands. An appended byte moves the
-/// framing the trailing offsets state, and the tool then refuses the object
-/// before it checksums it. `branch` is the name the commit carries, whose
-/// first byte is the one changed.
+/// Changes one byte in the text of a commit object. The object then does not
+/// hash to its name, and its GVariant framing stays valid. An appended byte
+/// moves the framing that the trailing offsets give. The `ostree` command then
+/// refuses the object before it computes the checksum. `branch` is the name in
+/// the commit. The function changes the first byte of that name to uppercase.
 fn fsck_corrupt_commit(path: &Path, branch: &str) {
     let mut bytes = std::fs::read(path).unwrap();
     let needle = branch.as_bytes();
@@ -23191,8 +23483,8 @@ fn fsck_corrupt_commit(path: &Path, branch: &str) {
     std::fs::write(path, &bytes).unwrap();
 }
 
-/// The checksum of one object of `ty` the commit at `rev` reaches, chosen by
-/// its position in the sorted set.
+/// Returns the checksum of one object of `ty` that the commit at `rev`
+/// reaches. It is the first checksum in sorted order.
 fn fsck_reachable_object(repo: &Path, rev: &str, ty: ObjectType) -> String {
     block_on(async {
         let handle = Repo::open(repo).await.unwrap();
@@ -23210,10 +23502,10 @@ fn fsck_reachable_object(repo: &Path, rev: &str, ty: ObjectType) -> String {
     })
 }
 
-/// The five-line text a sound repository writes, what `-q` drops from it, and
-/// that the five other switches leave it whole. Carries `fsck/clean-default`,
-/// `fsck/clean-quiet`, `fsck/clean-quiet-long`, `fsck/clean-all`,
-/// `fsck/clean-delete`, `fsck/clean-add-tombstones`,
+/// The five-line text of a sound repository, the lines that `-q` removes, and
+/// the five other switches that leave the text unchanged. The test carries
+/// `fsck/clean-default`, `fsck/clean-quiet`, `fsck/clean-quiet-long`,
+/// `fsck/clean-all`, `fsck/clean-delete`, `fsck/clean-add-tombstones`,
 /// `fsck/clean-verify-bindings`, and `fsck/clean-verify-back-refs`.
 #[test]
 fn fsck_clean_output_matches_the_tool() {
@@ -23246,8 +23538,7 @@ fn fsck_clean_output_matches_the_tool() {
         "the port writes no progress line: {default:?}"
     );
 
-    // `-q` and `--quiet` are one flag, and it drops the four phase lines and
-    // nothing else.
+    // `-q` and `--quiet` are one flag. It removes only the four phase lines.
     for spelling in ["-q", "--quiet"] {
         let quiet = assert_fsck_agrees(base, &repo, "quiet", &[spelling]);
         assert_eq!(
@@ -23257,8 +23548,8 @@ fn fsck_clean_output_matches_the_tool() {
         );
     }
 
-    // The five switches leave a sound repository's text and its objects
-    // untouched.
+    // The five switches leave the text and the objects of a sound repository
+    // unchanged.
     for switch in [
         "-a",
         "--delete",
@@ -23271,8 +23562,8 @@ fn fsck_clean_output_matches_the_tool() {
     }
 }
 
-/// A checksum mismatch, over a content object, a dirtree, and a commit object,
-/// with and without `-a`. Carries `fsck/corrupt-no-switch-continues`,
+/// A checksum mismatch in a content object, a dirtree, and a commit object,
+/// with and without `-a`. The test carries `fsck/corrupt-no-switch-continues`,
 /// `fsck/corrupt-all-continues`, and `fsck/corrupt-metadata-wording`.
 #[test]
 fn fsck_corruption_matches_the_tool() {
@@ -23303,11 +23594,11 @@ fn fsck_corruption_matches_the_tool() {
         for args in [vec!["-a"], vec!["-q", "-a"]] {
             assert_fsck_agrees(base, &repo, label, &args);
         }
-        // A run naming neither `-a` nor `--delete` carries the walk to its end
-        // in the port and ends the tool at the mismatch, so the two exit 1
-        // over the same repository and part on the text alone: the port writes
-        // the finding plain and closes with its own `error: ` line
-        // (`docs/conformance/cli-surface.md`, "fsck").
+        // If a run names neither `-a` nor `--delete`, ostrya walks to the end
+        // and the `ostree` command stops at the mismatch. Both commands exit 1
+        // and leave the same repository. They differ only in the text. ostrya
+        // writes the finding with no prefix and ends with its own `error: `
+        // line. This is a recorded divergence.
         let ((port_code, port_inv), (tool_code, tool_inv)) =
             fsck_repository_outcome(base, &repo, &format!("{label}-plain"), &[]);
         assert_eq!(port_code, Some(1), "{label}: the port exits 1");
@@ -23327,9 +23618,10 @@ fn fsck_corruption_matches_the_tool() {
     }
 }
 
-/// `--delete` unlinks each mismatching object, marks every commit that reaches
-/// one partial, and runs to the end of the walk. Carries
-/// `fsck/delete-removes-and-marks` and `fsck/delete-inventory`.
+/// `--delete` unlinks each object with a mismatch and marks each commit that
+/// reaches such an object as partial. The run continues to the end of the walk.
+/// The test carries `fsck/delete-removes-and-marks` and
+/// `fsck/delete-inventory`.
 #[test]
 fn fsck_delete_matches_the_tool() {
     if !ostree_available() {
@@ -23339,7 +23631,8 @@ fn fsck_delete_matches_the_tool() {
     let base = tmp.path();
     let sound = build_fsck_repo(base, "repo", RepoMode::BareUser, 2);
 
-    // Two faulty objects, so the run has a second to reach after the first.
+    // Two faulty objects, so the run has a second object to reach after the
+    // first.
     let repo = clone_repo(base, &sound, "two-faults");
     for rev in ["test", "test^"] {
         let checksum = fsck_reachable_object(&repo, rev, ObjectType::File);
@@ -23360,15 +23653,16 @@ fn fsck_delete_matches_the_tool() {
         "`--delete` runs to the end of the walk: {findings:?}"
     );
     assert_fsck_agrees(base, &repo, "delete", &["--delete"]);
-    // A second run over the deleted objects reports them absent, which states
-    // the two left the same repository behind.
+    // A second run over the deleted objects reports them as absent. This shows
+    // that the two commands left the same repository.
     assert_fsck_agrees(base, &repo, "delete-twice", &["--delete"]);
 }
 
-/// A referenced object that is absent: reported after the walk as `.file`
-/// whatever the mode, marking every commit that reaches it partial, except a
-/// dirtree, which ends the run. Carries
-/// `fsck/missing-content-marks-partial` and `fsck/missing-dirtree-aborts`.
+/// If a referenced object is absent, `fsck` reports it after the walk as
+/// `.file` in each repository mode. It marks each commit that reaches the
+/// object as partial. An absent dirtree is the exception: it ends the run.
+/// The test carries `fsck/missing-content-marks-partial` and
+/// `fsck/missing-dirtree-aborts`.
 #[test]
 fn fsck_missing_object_matches_the_tool() {
     if !ostree_available() {
@@ -23401,9 +23695,10 @@ fn fsck_missing_object_matches_the_tool() {
     }
 }
 
-/// A commit already carrying a `.commitpartial` marker is skipped, counted,
-/// and reported, and `--add-tombstones` drops the standard-output count.
-/// Carries `fsck/partial-commit-skipped` and
+/// `fsck` skips, counts, and reports a commit that already has a
+/// `.commitpartial` marker. `--add-tombstones` removes the count line from
+/// standard output.
+/// The test carries `fsck/partial-commit-skipped` and
 /// `fsck/partial-line-suppressed-by-tombstones`.
 #[test]
 fn fsck_partial_commit_matches_the_tool() {
@@ -23435,9 +23730,10 @@ fn fsck_partial_commit_matches_the_tool() {
     );
 }
 
-/// `--add-tombstones` deletes the commit whose parent commit object is absent
-/// and writes the marker naming it, one generation per run. Carries
-/// `fsck/add-tombstones-writes-and-deletes` and `fsck/add-tombstones-cascade`.
+/// `--add-tombstones` deletes the commit whose parent commit object is absent,
+/// and writes the marker that names it. Each run removes one generation.
+/// The test carries `fsck/add-tombstones-writes-and-deletes` and
+/// `fsck/add-tombstones-cascade`.
 #[test]
 fn fsck_add_tombstones_matches_the_tool() {
     if !ostree_available() {
@@ -23464,8 +23760,10 @@ fn fsck_add_tombstones_matches_the_tool() {
         "an absent parent commit is not a fault: {quiet:?}"
     );
 
-    // Each run walks the branch back one commit. The third fails in the ref
-    // phase, the ref standing over the commit the second run removed.
+    // Each run walks the branch back by one commit. The third run removes the
+    // head that the ref names, and each of the three runs exits 0. A fourth
+    // run fails in the ref phase, because the ref then points to a removed
+    // commit. Measured against `ostree` 2026.1.
     let port_repo = clone_repo(base, &repo, "cascade-port");
     let tool_repo = clone_repo(base, &repo, "cascade-tool");
     for round in 1..=3 {
@@ -23510,7 +23808,7 @@ fn fsck_add_tombstones_matches_the_tool() {
         );
     }
 
-    // The marker each wrote holds the same bytes.
+    // The markers of both commands have the same bytes.
     let third = resolve(&sound, "test^^").unwrap();
     let marker = |repo: &Path| {
         std::fs::read(fsck_object_path(
@@ -23525,10 +23823,16 @@ fn fsck_add_tombstones_matches_the_tool() {
     assert_eq!(marker(&port_repo).len(), 78);
 }
 
-/// `--verify-bindings` over a ref the commit does not name, over a commit
-/// carrying several bindings, over a commit carrying none, over a remote ref,
-/// and over a collection id the commit does not carry. Carries
-/// `fsck/verify-bindings-extra-ref` and `fsck/verify-bindings-collection`.
+/// `--verify-bindings` over these cases:
+///
+/// - a ref that the commit does not name
+/// - a commit with several bindings
+/// - a commit with no binding
+/// - a remote ref
+/// - a collection id that the commit does not have
+///
+/// The test carries `fsck/verify-bindings-extra-ref` and
+/// `fsck/verify-bindings-collection`.
 #[test]
 fn fsck_verify_bindings_matches_the_tool() {
     if !ostree_available() {
@@ -23537,7 +23841,7 @@ fn fsck_verify_bindings_matches_the_tool() {
     let tmp = TmpDir::new("fsck-bindings");
     let base = tmp.path();
 
-    // A second ref at a commit bound to one branch alone.
+    // A second ref at a commit that is bound to only one branch.
     let extra = build_fsck_repo(base, "extra", RepoMode::BareUser, 1);
     ostrya(
         &[
@@ -23554,8 +23858,8 @@ fn fsck_verify_bindings_matches_the_tool() {
         assert_fsck_agrees(base, &extra, "extra-ref", &args);
     }
 
-    // The same ref written under `refs/remotes`, which the message names by
-    // its bare name.
+    // The same ref under `refs/remotes`. The message names it by its bare
+    // name.
     let remote = clone_repo(base, &extra, "remote-src");
     let tip = resolve(&remote, "test").unwrap();
     std::fs::remove_file(remote.join("refs/heads/beta")).unwrap();
@@ -23563,7 +23867,7 @@ fn fsck_verify_bindings_matches_the_tool() {
     std::fs::write(remote.join("refs/remotes/origin/beta"), format!("{tip}\n")).unwrap();
     assert_fsck_agrees(base, &remote, "remote-ref", &["--verify-bindings"]);
 
-    // A commit carrying three bindings, so the parenthetical lists them all.
+    // A commit with three bindings, so the text in parentheses lists all three.
     let many = build_fsck_repo(base, "many", RepoMode::BareUser, 0);
     let tree = base.join("many-tree");
     ostrya(
@@ -23597,7 +23901,7 @@ fn fsck_verify_bindings_matches_the_tool() {
     .ok();
     assert_fsck_agrees(base, &many, "many-bindings", &["--verify-bindings"]);
 
-    // An orphan commit, whose binding list is empty, reached through a ref.
+    // An orphan commit with an empty binding list, which a ref points to.
     let orphan = build_fsck_repo(base, "orphan", RepoMode::BareUser, 0);
     let checksum = ostrya(
         &[
@@ -23628,7 +23932,7 @@ fn fsck_verify_bindings_matches_the_tool() {
     .ok();
     assert_fsck_agrees(base, &orphan, "no-refs", &["--verify-bindings"]);
 
-    // A collection id the commit's own binding does not carry.
+    // A collection id that the binding of the commit does not have.
     let collection = base.join("collection");
     ostrya(
         &[
@@ -23658,9 +23962,15 @@ fn fsck_verify_bindings_matches_the_tool() {
     assert_fsck_agrees(base, &collection, "collection-bad", &["--verify-bindings"]);
 }
 
-/// `--verify-back-refs` over a branch with a parent, over a bound name no ref
-/// carries, over a collection ref, and beside `--verify-bindings`, which it
-/// does not turn on. Carries `fsck/verify-back-refs-non-tip`,
+/// `--verify-back-refs` over these cases:
+///
+/// - a branch with a parent
+/// - a bound name that no ref has
+/// - a collection ref
+/// - a run with `--verify-bindings`, which `--verify-back-refs` does not turn
+///   on
+///
+/// The test carries `fsck/verify-back-refs-non-tip`,
 /// `fsck/verify-back-refs-absent-ref`, and
 /// `fsck/verify-back-refs-does-not-imply-bindings`.
 #[test]
@@ -23671,15 +23981,15 @@ fn fsck_verify_back_refs_matches_the_tool() {
     let tmp = TmpDir::new("fsck-back-refs");
     let base = tmp.path();
 
-    // A single-commit branch passes and a two-commit branch does not, the
-    // parent carrying the branch name its tip holds.
+    // A branch with one commit passes, and a branch with two commits fails.
+    // The parent has the same branch name as the tip.
     let one = build_fsck_repo(base, "one", RepoMode::BareUser, 1);
     let text = assert_fsck_agrees(base, &one, "one-commit", &["--verify-back-refs"]);
     assert!(text.contains("no errors found"), "{text:?}");
     let two = build_fsck_repo(base, "two", RepoMode::BareUser, 2);
     assert_fsck_agrees(base, &two, "two-commits", &["--verify-back-refs"]);
 
-    // A bound name no ref carries.
+    // A bound name that no ref has.
     let bound = build_fsck_repo(base, "bound", RepoMode::BareUser, 0);
     ostrya(
         &[
@@ -23700,7 +24010,8 @@ fn fsck_verify_back_refs_matches_the_tool() {
     .ok();
     assert_fsck_agrees(base, &bound, "absent-bound-ref", &["--verify-back-refs"]);
 
-    // A collection ref the binding names that the store no longer carries.
+    // A collection ref that the binding names and that the store does not
+    // have after the change of `core.collection-id`.
     let collection = base.join("back-collection");
     ostrya(
         &[
@@ -23730,8 +24041,9 @@ fn fsck_verify_back_refs_matches_the_tool() {
     .ok();
     assert_fsck_agrees(base, &collection, "coll-gone", &["--verify-back-refs"]);
 
-    // The two options are independent: the repository `--verify-bindings`
-    // refuses passes `--verify-back-refs`, and only naming both runs both.
+    // The two options are independent. The repository that fails
+    // `--verify-bindings` passes `--verify-back-refs`. Only a run with both
+    // options runs both checks.
     let extra = build_fsck_repo(base, "independent", RepoMode::BareUser, 1);
     ostrya(
         &[
@@ -23756,9 +24068,9 @@ fn fsck_verify_back_refs_matches_the_tool() {
     }
 }
 
-/// A ref over an absent commit ends the run in the phase that reads it, and a
-/// remote ref is named by its bare name where a mirror ref is named by its
-/// collection pair. Carries `fsck/dangling-ref-ends-run` and
+/// A ref that points to an absent commit ends the run in the phase that reads
+/// the ref. The message names a remote ref by its bare name and a mirror ref
+/// by its collection pair. The test carries `fsck/dangling-ref-ends-run` and
 /// `fsck/dangling-mirror-ref-ends-run`.
 #[test]
 fn fsck_dangling_ref_matches_the_tool() {
@@ -23784,9 +24096,10 @@ fn fsck_dangling_ref_matches_the_tool() {
     }
 }
 
-/// The two argument-parsing divergences at `fsck`: a repeated boolean flag and
-/// a positional argument, each of which the tool takes and the port refuses.
-/// Carries `fsck/repeated-flag-refused` and `fsck/positional-ignored`.
+/// The two argument-parsing divergences of `fsck`: a repeated boolean flag and
+/// a positional argument. The `ostree` command accepts each one, and ostrya
+/// refuses it.
+/// The test carries `fsck/repeated-flag-refused` and `fsck/positional-ignored`.
 #[test]
 fn fsck_argument_handling_parts_from_the_tool() {
     if !ostree_available() {
@@ -23821,14 +24134,13 @@ fn fsck_argument_handling_parts_from_the_tool() {
     assert_eq!(tool.status.code(), Some(0), "the tool ignores a positional");
 }
 
-/// One run's exit status and the inventory it left behind.
+/// The exit status of one run and the inventory that it left.
 type FsckOutcome = (Option<i32>, Vec<String>);
 
-/// Run one `fsck` invocation under both implementations over byte-identical
-/// copies of `repo`, and return the two exit statuses and the two
-/// inventories. The text each writes is the caller's to state, so a case whose
-/// two implementations word one condition differently can still hold them to
-/// the same repository.
+/// Runs one `fsck` command line with both commands over byte-identical copies
+/// of `repo`. Returns the two exit statuses and the two inventories. The caller
+/// checks the text. A case where the two commands use different words for one
+/// condition can still assert the same repository.
 fn fsck_repository_outcome(
     base: &Path,
     repo: &Path,
@@ -23854,16 +24166,16 @@ fn fsck_repository_outcome(
     outcome
 }
 
-/// Whether an inventory holds the loose object `checksum` of type `ty`.
+/// Returns `true` if an inventory has the loose object `checksum` of type `ty`.
 fn fsck_holds(inventory: &[String], checksum: &str, ty: ObjectType, mode: RepoMode) -> bool {
     let name = ObjectName::new(Checksum::from_hex(checksum).unwrap(), ty);
     let path = format!("objects/{}", name.loose_path(mode));
     inventory.contains(&path)
 }
 
-/// The checksum of the largest dirtree the commit at `rev` reaches, which is
-/// the root of a tree whose root holds more entries than any directory under
-/// it.
+/// Returns the checksum of the largest dirtree object that the commit at `rev`
+/// reaches. If the root of the tree has more entries than each directory under
+/// it, this is the root.
 fn fsck_widest_dirtree(repo: &Path, rev: &str, mode: RepoMode) -> String {
     block_on(async {
         let handle = Repo::open(repo).await.unwrap();
@@ -23885,9 +24197,9 @@ fn fsck_widest_dirtree(repo: &Path, rev: &str, mode: RepoMode) -> String {
     })
 }
 
-/// A repository at `base/name` holding one independent branch per name, each
-/// over a one-entry tree whose single file differs, so no two reach an object
-/// in common but the dirmeta.
+/// Creates a repository at `base/name` with one independent branch for each
+/// name. The tree of each branch has one file with different content, so the
+/// branches share only the dirmeta object.
 fn build_branch_fsck_repo(base: &Path, name: &str, mode: RepoMode, branches: &[&str]) -> PathBuf {
     let repo = base.join(name);
     block_on(async {
@@ -23902,9 +24214,9 @@ fn build_branch_fsck_repo(base: &Path, name: &str, mode: RepoMode, branches: &[&
     repo
 }
 
-/// An absent object never ends the walk: a run over two branches each missing
-/// one content object reports both and marks both commits partial. Carries
-/// `fsck/missing-continues-the-walk`.
+/// An absent object does not end the walk. A run over two branches, each with
+/// one absent content object, reports both and marks both commits as partial.
+/// The test carries `fsck/missing-continues-the-walk`.
 #[test]
 fn fsck_missing_object_does_not_end_the_walk() {
     if !ostree_available() {
@@ -23934,14 +24246,14 @@ fn fsck_missing_object_does_not_end_the_walk() {
         "the walk runs to its end: {text:?}"
     );
 
-    // An absent object beside a mismatch. The tool ends its run at the
-    // mismatch where the port carries the walk to its end, so the two are
-    // compared under `-a`, which carries both, and the no-switch run states
-    // the port's own claim: both findings are written plain and the run closes
-    // with its own `error: ` line.
+    // An absent object and a mismatch in one repository. The `ostree` command
+    // ends its run at the mismatch, and ostrya continues the walk to its end.
+    // The test compares the two commands under `-a`, which continues the walk
+    // in both. The run with no switch checks ostrya alone. ostrya writes both
+    // findings with no prefix and ends the run with its own `error: ` line.
     let mixed = build_branch_fsck_repo(base, "mixed", RepoMode::BareUser, &["one", "two"]);
-    // The port takes the commits in checksum order, so the branch whose commit
-    // sorts first loses its object and the other's is corrupted.
+    // ostrya takes the commits in checksum order. The branch whose commit sorts
+    // first loses its object, and the object of the other branch is corrupted.
     let mut branches = [
         (resolve(&mixed, "one").unwrap(), "one"),
         (resolve(&mixed, "two").unwrap(), "two"),
@@ -23987,10 +24299,11 @@ fn fsck_missing_object_does_not_end_the_walk() {
     );
 }
 
-/// The port carries a run past every fault it can continue past, so a
-/// repository holding three independent faults reports all three and marks
-/// both commits an absent object leaves incomplete, where the tool's run ends
-/// in its ref phase and marks none. Carries `fsck/reports-every-fault`.
+/// ostrya continues a run past each fault that permits it. For a repository
+/// with three independent faults, ostrya reports all three. It marks as partial
+/// both commits that an absent object leaves incomplete. The run of the
+/// `ostree` command ends in its ref phase and marks no commit. The test carries
+/// `fsck/reports-every-fault`.
 #[test]
 fn fsck_reports_every_fault_the_tool_ends_at() {
     if !ostree_available() {
@@ -24000,9 +24313,8 @@ fn fsck_reports_every_fault_the_tool_ends_at() {
     let base = tmp.path();
     let repo = build_branch_fsck_repo(base, "repo", RepoMode::BareUser, &["one", "two", "three"]);
 
-    // One commit object whose checksum does not match, which ends the tool's
-    // ref phase, and one absent content object under each of the two other
-    // branches.
+    // One commit object with a checksum mismatch, which ends the ref phase of
+    // `ostree`. Each of the two other branches has one absent content object.
     let tip = resolve(&repo, "three").unwrap();
     fsck_corrupt_commit(
         &fsck_object_path(&repo, &tip, ObjectType::Commit, RepoMode::BareUser),
@@ -24070,10 +24382,10 @@ fn fsck_reports_every_fault_the_tool_ends_at() {
         "the tool reports the one fault it ends at: {tool_text:?}"
     );
 }
-/// `--add-tombstones` acts after the object walk, and the walk beside a corrupt
-/// object reaches its end under `-a` or `--delete` alone, so the repository the
-/// two leave agrees in every arm. Carries `fsck/add-tombstones-under-all` and
-/// `fsck/delete-needs-no-all`.
+/// `--add-tombstones` acts after the object walk. If an object is corrupt, the
+/// tombstone step runs only under `-a` or under `--delete`. `--delete` needs
+/// no `-a`. Both commands leave the same repository in each arm. The test
+/// carries `fsck/add-tombstones-under-all` and `fsck/delete-needs-no-all`.
 #[test]
 fn fsck_add_tombstones_follows_the_all_switch() {
     if !ostree_available() {
@@ -24100,8 +24412,7 @@ fn fsck_add_tombstones_follows_the_all_switch() {
         RepoMode::BareUser,
     ));
 
-    // `-a` carries both implementations to the end of the walk, and the step
-    // then runs in each.
+    // Under `-a`, both commands get to the end of the walk and run the step.
     let ran = assert_fsck_agrees(base, &repo, "tomb-all", &["-a", "--add-tombstones"]);
     assert!(
         ran.contains("Adding tombstone"),
@@ -24115,10 +24426,11 @@ fn fsck_add_tombstones_follows_the_all_switch() {
             .count()
     };
 
-    // With no switch the walk ends at the corrupt object in both, so neither
-    // writes a tombstone. The text still parts -- the tool names the one fault
-    // it ends at and the port names every fault it reaches -- so the
-    // repository and the exit status are what the two are held to here.
+    // With no switch, the walk of the `ostree` command ends at the corrupt
+    // object. ostrya walks to the end and does not run the step. Neither
+    // command writes a tombstone. The text differs: `ostree` names the one
+    // fault that it ends at, and ostrya names each fault that it reaches. The
+    // test checks only the repository and the exit status.
     let ((port_code, port_inv), (tool_code, tool_inv)) =
         fsck_repository_outcome(base, &repo, "tomb-plain", &["--add-tombstones"]);
     assert_eq!(port_code, Some(1));
@@ -24126,8 +24438,8 @@ fn fsck_add_tombstones_follows_the_all_switch() {
     assert_eq!(port_inv, tool_inv, "neither writes a tombstone");
     assert_eq!(tombstones(&port_inv), 0, "the step is held back");
 
-    // `--delete` carries the walk to its end on its own, so the step runs
-    // under it with no `-a`, and `-a --delete` leaves the same repository.
+    // `--delete` alone continues the walk to its end, so the step runs with no
+    // `-a`. `-a --delete` leaves the same repository.
     for args in [
         vec!["--delete", "--add-tombstones"],
         vec!["-a", "--delete", "--add-tombstones"],
@@ -24140,8 +24452,8 @@ fn fsck_add_tombstones_follows_the_all_switch() {
         assert_eq!(tombstones(&port_inv), 1, "{args:?}: the step runs");
     }
 
-    // `--delete` alone takes no `-a` of its own: the two arms leave the same
-    // repository in each implementation.
+    // `--delete` needs no `-a`. The two arms leave the same repository in each
+    // command.
     let ((port_plain, plain_inv), (tool_plain, tool_plain_inv)) =
         fsck_repository_outcome(base, &repo, "del-plain", &["--delete"]);
     let ((port_all, all_inv), (tool_all, tool_all_inv)) =
@@ -24158,8 +24470,8 @@ fn fsck_add_tombstones_follows_the_all_switch() {
     assert_eq!(plain_inv, all_inv, "`-a` adds nothing to `--delete`");
     assert_eq!(tombstones(&plain_inv), 0, "no tombstone without the switch");
 
-    // An absent object never ends a walk, so the step runs beside one with no
-    // switch at all.
+    // An absent object does not end a walk, so the step runs with an absent
+    // object and no switch.
     let absent = clone_repo(base, &sound, "absent-src");
     std::fs::remove_file(fsck_object_path(
         &absent,
@@ -24183,9 +24495,10 @@ fn fsck_add_tombstones_follows_the_all_switch() {
     );
 }
 
-/// A metadata object whose bytes do not read as the type its name gives it is
-/// reported and left alone: `--delete` unlinks nothing and no commit is marked
-/// partial. Carries `fsck/broken-framing-dirtree-untouched` and
+/// The bytes of a metadata object can fail to read as the type that its name
+/// gives. `fsck` then reports the object and does not change it. `--delete`
+/// unlinks nothing, and no commit gets a partial marker. The test carries
+/// `fsck/broken-framing-dirtree-untouched` and
 /// `fsck/broken-framing-dirtree-kept`.
 #[test]
 fn fsck_leaves_a_broken_framing_dirtree_alone() {
@@ -24195,9 +24508,10 @@ fn fsck_leaves_a_broken_framing_dirtree_alone() {
     let tmp = TmpDir::new("fsck-framing");
     let base = tmp.path();
 
-    // A root dirtree wide enough that the appended byte reads as a framing
-    // offset inside the object. The tool's own reader then draws an entry out
-    // of the shifted bytes and ends the run before it checksums anything.
+    // A root dirtree that is wide enough that the appended byte reads as a
+    // framing offset inside the object. The reader of the `ostree` command then
+    // gets an entry from the shifted bytes. It ends the run before it computes
+    // a checksum.
     let wide = base.join("wide");
     block_on(async {
         Repo::create(&wide, CreateOptions::new(RepoMode::Archive))
@@ -24240,11 +24554,11 @@ fn fsck_leaves_a_broken_framing_dirtree_alone() {
         );
     }
 
-    // The recorded divergence: over a dirtree small enough that the appended
-    // byte reads as an offset past the object's own end, the tool's reader
-    // yields an empty dirtree, so the tool checksums the object and `--delete`
-    // removes it. The port refuses the object and keeps it
-    // (`docs/conformance/cli-surface.md`, "fsck").
+    // The recorded divergence. This dirtree is small, so the appended byte
+    // reads as an offset past the end of the object. The reader of `ostree`
+    // then gives an empty dirtree. `ostree` computes the checksum of the
+    // object, and `--delete` removes it. ostrya refuses the object and keeps
+    // it.
     let narrow = build_fsck_repo(base, "narrow", RepoMode::Archive, 1);
     let small = fsck_widest_dirtree(&narrow, "test", RepoMode::Archive);
     let small_path = fsck_object_path(&narrow, &small, ObjectType::DirTree, RepoMode::Archive);
@@ -24264,9 +24578,10 @@ fn fsck_leaves_a_broken_framing_dirtree_alone() {
     );
 }
 
-/// The port's `--no-mark-partial` extension keeps working with the other
-/// `fsck` options: `--delete` removes the object and writes no marker, so the
-/// next run verifies the commit again. Carries `fsck/no-mark-partial-extension`.
+/// The ostrya extension `--no-mark-partial` works with the other `fsck`
+/// options. `--delete` removes the object and writes no marker, so the next run
+/// verifies the commit again. The test carries
+/// `fsck/no-mark-partial-extension`.
 #[test]
 fn fsck_no_mark_partial_survives_the_new_options() {
     let tmp = TmpDir::new("fsck-no-mark");
@@ -24293,7 +24608,7 @@ fn fsck_no_mark_partial_survives_the_new_options() {
         "no marker is written"
     );
 
-    // The commit is still verified, the marker that would skip it absent.
+    // No marker skips the commit, so the run verifies it again.
     let again = ostrya(
         &["fsck", &format!("--repo={}", repo.display())],
         None,
@@ -24307,7 +24622,7 @@ fn fsck_no_mark_partial_survives_the_new_options() {
 }
 
 /// `pull-local` reads `[ex-ostrya] detached-metadata-exclude` from the
-/// destination and stores no detached-metadata key the list names.
+/// destination and stores no detached-metadata key that the list names.
 #[test]
 fn pull_local_honours_the_configured_detached_metadata_exclude() {
     let tmp = TmpDir::new("pull-local-detached-exclude");
@@ -24377,8 +24692,8 @@ fn pull_local_honours_the_configured_detached_metadata_exclude() {
     );
 }
 
-/// An `a{sv}` holding two string properties, one of them the key an exclude
-/// list names.
+/// Returns an `a{sv}` with two string properties. One of them is the key that
+/// the exclude list names.
 fn ex_ostrya_two_key_detached() -> Value {
     let entry = |key: &str, text: &str| {
         Value::Tuple(vec![
@@ -24395,17 +24710,17 @@ fn ex_ostrya_two_key_detached() -> Value {
     ])
 }
 
-/// `pull` over HTTP reads `[ex-ostrya] detached-metadata-exclude` from the
-/// destination too, so the key covers the fetcher's own `.commitmeta` write and
-/// not the local-pull path alone.
+/// `pull` over HTTP also reads `[ex-ostrya] detached-metadata-exclude` from the
+/// destination. The key applies to the `.commitmeta` write of the fetcher, and
+/// also to the local-pull path.
 #[test]
 fn pull_over_http_honours_the_configured_detached_metadata_exclude() {
     let tmp = TmpDir::new("pull-http-detached-exclude");
     let base = tmp.path();
     let remote = build_remote(base, "remote");
     let commit = Checksum::from_hex(COMMIT).unwrap();
-    // The remote serves the pair, so the destination's filter is what decides
-    // which of the two keys it keeps.
+    // The remote serves both keys, so the filter of the destination decides
+    // which key it keeps.
     block_on(async {
         Repo::open(&remote)
             .await
@@ -24451,14 +24766,15 @@ fn pull_over_http_honours_the_configured_detached_metadata_exclude() {
 
 // --- checkout: the union family and --allow-noent -------------------------
 
-/// Set `path`'s permission bits.
+/// Sets the permission bits of `path`.
 fn chmod_to(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-/// Give `path` one extended attribute through `setfattr`, reporting whether it
-/// landed. A host without the tool, or a filesystem that takes no user
-/// attribute, reports false and the caller states nothing about attributes.
+/// Gives `path` one extended attribute through `setfattr`. Returns `true` if
+/// the attribute is set. On a host without `setfattr`, or on a filesystem that
+/// refuses user attributes, it returns `false`. The caller then checks nothing
+/// about attributes.
 fn set_user_xattr(path: &Path, name: &str, value: &str) -> bool {
     Command::new("setfattr")
         .args(["-n", name, "-v", value])
@@ -24469,25 +24785,27 @@ fn set_user_xattr(path: &Path, name: &str, value: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// `describe_tree` with each regular file's content bytes in place of its
-/// length, for the checkout tests whose claim is what a file holds. The
-/// content is rendered in lowercase hexadecimal, and the trees these tests
-/// build hold small files.
+/// Returns `describe_tree` with the content bytes of each regular file in place
+/// of its length. The checkout tests that check file content use it. The
+/// content shows in lowercase hexadecimal, and the trees of these tests have
+/// small files (4096 bytes at most).
 ///
-/// The link count and the extended attributes are deliberately outside the
-/// comparison. The tool hardlinks an `archive` object out of an
-/// `uncompressed-objects-cache/` it maintains outside the on-disk format and
-/// the port copies, so the two agree on every byte of the destination and part
-/// on `st_nlink` alone (`docs/format-reference.md`, "Checkout"); and a
-/// `bare-user` object hardlinked under `-U` carries `user.ostreemeta` in both,
-/// which no `-U` checkout applies itself.
+/// The comparison does not include the link count and the extended
+/// attributes. The `ostree` command hardlinks an `archive` object from an
+/// `uncompressed-objects-cache/` that it keeps outside the on-disk format.
+/// ostrya copies the object. The two destinations agree on each byte and
+/// differ only in `st_nlink`.
 ///
-/// An entry that is a device, a fifo, or a socket renders its type, its
-/// permission bits, and its device number, so a whiteout character device and
-/// an empty regular file of the same name do not compare equal.
+/// A `bare-user` object hardlinked under `-U` has `user.ostreemeta` in both
+/// commands. No `-U` checkout applies that attribute itself.
 ///
-/// A root that does not exist renders one line saying so, so a case whose
-/// claim is that neither implementation created the destination compares.
+/// A device entry shows its type, its permission bits, and its device number.
+/// A fifo or a socket entry shows its type and its permission bits. A whiteout
+/// character device and an empty regular file of the same name then do not
+/// compare equal.
+///
+/// If the root does not exist, the result is one line that says so. A case can
+/// then check that neither command created the destination.
 fn describe_tree_with_content(root: &Path) -> Vec<String> {
     use std::fmt::Write as _;
 
@@ -24528,11 +24846,11 @@ fn describe_tree_with_content(root: &Path) -> Vec<String> {
             } else {
                 use std::os::unix::fs::FileTypeExt as _;
 
-                // A device, a fifo, or a socket reads as zero bytes, so the
-                // regular-file arm would render it as an empty file and a
-                // destination where one implementation wrote a whiteout device
-                // and the other an empty file would compare equal. The device
-                // number is rendered whole, and 0 is device 0:0.
+                // A device, a fifo, or a socket reads as zero bytes. If the
+                // regular-file arm handled it, it shows as an empty file. Then
+                // a whiteout device from one command and an empty file from
+                // the other compare equal. The full device number shows, and 0
+                // is device 0:0.
                 if ty.is_char_device() {
                     out.push(format!("{rel} chardev {perm:o} rdev {}", meta.rdev()));
                 } else if ty.is_block_device() {
@@ -24554,9 +24872,13 @@ fn describe_tree_with_content(root: &Path) -> Vec<String> {
     out
 }
 
-/// The tree the union-family tests check out: a regular file `f`, a symlink `l`
-/// naming it, a directory `d` holding one file, and a directory `xd` at mode
-/// 0750 carrying one `user.*` extended attribute where the host takes one.
+/// Builds the tree that the union-family tests check out:
+///
+/// - a regular file `f`
+/// - a symlink `l` that names `f`
+/// - a directory `d` with one file
+/// - a directory `xd` at mode 0750, with one `user.*` extended attribute if
+///   the host accepts it
 fn build_union_tree(dir: &Path) {
     std::fs::create_dir_all(dir.join("d")).unwrap();
     std::fs::create_dir_all(dir.join("xd")).unwrap();
@@ -24571,9 +24893,9 @@ fn build_union_tree(dir: &Path) {
     chmod_to(dir, 0o755);
 }
 
-/// A repository of `mode` under `base/name` holding one commit of `tree`, and
-/// that commit's checksum. The timestamp is fixed so both implementations read
-/// one checksum.
+/// Creates a repository of `mode` at `base/name` with one commit of `tree`.
+/// Returns the repository path and the checksum of the commit. The timestamp
+/// is fixed, so both commands read one checksum.
 fn union_repo(base: &Path, mode: RepoMode, name: &str, tree: &Path) -> (PathBuf, String) {
     let repo = base.join(name);
     block_on(async {
@@ -24598,8 +24920,8 @@ fn union_repo(base: &Path, mode: RepoMode, name: &str, tree: &Path) -> (PathBuf,
     (repo, rev)
 }
 
-/// Run `checkout` with the same options in both implementations, over one
-/// repository, into a destination of each one's own.
+/// Runs `checkout` with the same options in both commands, over one
+/// repository. Each command writes into its own destination.
 fn checkout_pair(
     repo: &Path,
     options: &[&str],
@@ -24626,7 +24948,7 @@ fn checkout_pair(
     (port, tool)
 }
 
-/// Assert two checkout runs reached the same exit status and left the same
+/// Asserts that two checkout runs have the same exit status and left the same
 /// destination tree.
 fn assert_checkout_pair(port: &Run, tool: &Run, port_dest: &Path, tool_dest: &Path, label: &str) {
     assert_eq!(
@@ -24643,11 +24965,12 @@ fn assert_checkout_pair(port: &Run, tool: &Run, port_dest: &Path, tool_dest: &Pa
     );
 }
 
-/// The destination pre-states the union modes are run over. A `None` builder
-/// leaves the destination absent.
+/// A destination pre-state for the union modes. A `None` builder leaves the
+/// destination absent.
 type UnionPrestate = (&'static str, Option<fn(&Path)>);
 
-/// One named destination the caller builds before a checkout runs over it.
+/// One named destination that the caller builds before a checkout runs over
+/// it.
 type DestBuilder = (&'static str, fn(&Path));
 
 /// The twelve destination pre-states of the union sweep.
@@ -24735,17 +25058,17 @@ const UNION_PRESTATES: &[UnionPrestate] = &[
     ),
 ];
 
-/// The three union modes over a destination the test pre-populates, in
+/// The three union modes over a destination that the test fills first, in
 /// `archive`, `bare-user`, and `bare`.
 ///
-/// Carries `checkout/union-over-a-populated-destination`,
+/// The test carries `checkout/union-over-a-populated-destination`,
 /// `checkout/union-add-over-a-populated-destination`,
 /// `checkout/union-identical-over-a-populated-destination`, and
 /// `checkout/union-identical-directories-are-reused`.
 ///
-/// `--union-identical` needs a hardlinking checkout, so it runs `-U -H` in
-/// `bare-user` and `-H` in `bare`, and it is left out of `archive`, where
-/// `checkout/union-identical-in-archive` states the refusal instead.
+/// `--union-identical` needs a hardlink checkout. It runs with `-U -H` in
+/// `bare-user` and with `-H` in `bare`. The test does not run it in `archive`.
+/// The cell `checkout/union-identical-in-archive` holds that refusal.
 #[test]
 fn checkout_union_modes_match_the_tool() {
     if !ostree_available() {
@@ -24789,8 +25112,9 @@ fn checkout_union_modes_match_the_tool() {
             }
         }
 
-        // The directory claim: a pre-existing directory keeps its own mode and
-        // a fresh one takes the commit's dirmeta.
+        // The directory claim. A directory that exists before the checkout
+        // keeps its mode. A new directory gets the mode of the dirmeta of the
+        // commit.
         let reused = base.join(format!("port-{mode_name}-union-dir-at-xd-0700"));
         assert_eq!(
             std::fs::symlink_metadata(reused.join("xd"))
@@ -24817,12 +25141,15 @@ fn checkout_union_modes_match_the_tool() {
 /// The three union options are mutually exclusive, and `--union-identical`
 /// needs `-H`.
 ///
-/// Carries `checkout/union-add-with-union-identical` and the ordering claim
-/// behind the other two pair cells, and the divergences
-/// `checkout/union-given-twice`, `checkout/whiteouts-given-twice`,
-/// `checkout/require-hardlinks-given-twice`,
-/// `checkout/bareuseronly-dirs-given-twice`, and
-/// `checkout/disable-cache-given-twice` record.
+/// The test carries `checkout/union-add-with-union-identical` and the order
+/// claim of the other two pair cells. It also carries the divergences that
+/// these cells record:
+///
+/// - `checkout/union-given-twice`
+/// - `checkout/whiteouts-given-twice`
+/// - `checkout/require-hardlinks-given-twice`
+/// - `checkout/bareuseronly-dirs-given-twice`
+/// - `checkout/disable-cache-given-twice`
 #[test]
 fn checkout_union_options_are_mutually_exclusive() {
     if !ostree_available() {
@@ -24869,7 +25196,8 @@ fn checkout_union_options_are_mutually_exclusive() {
         }
     }
 
-    // All three together report the first pair, which fixes the check order.
+    // With all three options, both commands report the first pair. This fixes
+    // the order of the checks.
     let all = ["--union", "--union-add", "--union-identical"];
     let port_dest = base.join("port-all-three");
     let tool_dest = base.join("tool-all-three");
@@ -24885,9 +25213,9 @@ fn checkout_union_options_are_mutually_exclusive() {
     }
     assert!(!port_dest.exists() && !tool_dest.exists());
 
-    // A repeated boolean flag: the tool takes a second occurrence and checks
-    // out, and the port refuses it as it refuses every repeated boolean flag
-    // (`docs/conformance/cli-surface.md`, "P2").
+    // A repeated boolean flag. The `ostree` command accepts a second occurrence
+    // and checks out. ostrya refuses it, as it refuses each repeated boolean
+    // flag. This is a recorded divergence.
     for (index, option) in [
         "--union",
         "--union-add",
@@ -24929,10 +25257,10 @@ fn checkout_union_options_are_mutually_exclusive() {
     }
 }
 
-/// The `-H` requirement `--union-identical` carries, over every repository
-/// mode, with and without `-U`, and with `-C`.
+/// The `-H` requirement of `--union-identical`, in each repository mode, with
+/// and without `-U`, and with `-C`.
 ///
-/// Carries `checkout/union-identical-without-require-hardlinks` and
+/// The test carries `checkout/union-identical-without-require-hardlinks` and
 /// `checkout/union-identical-in-archive`.
 #[test]
 fn checkout_union_identical_requires_require_hardlinks() {
@@ -24976,12 +25304,11 @@ fn checkout_union_identical_requires_require_hardlinks() {
                     String::from_utf8_lossy(&tool.stderr),
                 );
                 if port.status.code() != Some(0) {
-                    // Both refusals leave the destination with no entry in
-                    // it. The option-consistency refusals the port makes
-                    // through `clap` create no destination at all, and the
-                    // per-entry `-H` refusal both sides make over this tree
-                    // reaches the tree's first regular file, so the
-                    // destination directory stands and holds nothing.
+                    // Both refusals leave no entry in the destination. The
+                    // option-consistency refusals of ostrya through `clap`
+                    // create no destination. Both commands make the per-entry
+                    // `-H` refusal at the first regular file of this tree. The
+                    // destination directory then exists and is empty.
                     for (who, dest) in [("port", &port_dest), ("tool", &tool_dest)] {
                         let listing = describe_tree_with_content(dest);
                         assert!(
@@ -24993,7 +25320,8 @@ fn checkout_union_identical_requires_require_hardlinks() {
             }
         }
 
-        // A refusal leaves a destination that already existed as it was.
+        // A refusal does not change a destination that existed before the
+        // checkout.
         let port_dest = base.join(format!("port-gate-existing-{mode_name}"));
         let tool_dest = base.join(format!("tool-gate-existing-{mode_name}"));
         for dest in [&port_dest, &tool_dest] {
@@ -25021,9 +25349,10 @@ fn checkout_union_identical_requires_require_hardlinks() {
     }
 }
 
-/// `--allow-noent` against the tool: what it suppresses, and what it does not.
+/// `--allow-noent` against the `ostree` command: what the switch suppresses,
+/// and what it does not suppress.
 ///
-/// Carries `checkout/allow-noent-leaves-the-destination-alone`.
+/// The test carries `checkout/allow-noent-leaves-the-destination-alone`.
 #[test]
 fn checkout_allow_noent_matches_the_tool() {
     if !ostree_available() {
@@ -25041,7 +25370,8 @@ fn checkout_allow_noent_matches_the_tool() {
     ] {
         let (repo, rev) = union_repo(base, mode, &format!("repo-{mode_name}"), &tree);
 
-        // An absent subpath with the switch: exit 0 in both, no destination.
+        // An absent subpath with the switch: exit 0 in both commands, and no
+        // destination.
         for (case, subpath) in [("shallow", "/nope"), ("deep", "/d/nope")] {
             let port_dest = base.join(format!("port-{mode_name}-{case}"));
             let tool_dest = base.join(format!("tool-{mode_name}-{case}"));
@@ -25065,7 +25395,7 @@ fn checkout_allow_noent_matches_the_tool() {
             assert!(!tool_dest.exists(), "the tool created a destination");
         }
 
-        // The switch over a destination that already exists leaves it alone.
+        // If the destination already exists, the switch leaves it unchanged.
         let port_dest = base.join(format!("port-{mode_name}-existing"));
         let tool_dest = base.join(format!("tool-{mode_name}-existing"));
         for dest in [&port_dest, &tool_dest] {
@@ -25104,8 +25434,8 @@ fn checkout_allow_noent_matches_the_tool() {
             "{mode_name}: the destination keeps its own mode",
         );
 
-        // The refusals the switch does not reach, and the ordinary checkout it
-        // leaves alone.
+        // The refusals that the switch does not suppress, and the ordinary
+        // checkout that it does not change.
         let cases: [(&str, Vec<&str>, Option<i32>); 7] = [
             ("no-switch", vec!["-U", "--subpath=/nope"], Some(1)),
             (
@@ -25119,24 +25449,24 @@ fn checkout_allow_noent_matches_the_tool() {
                 vec!["-U", "--allow-noent", "--subpath=/d"],
                 Some(0),
             ),
-            // A `..` component names an entry no directory holds, so the
-            // switch reaches the refusal it carries.
+            // A `..` component names an entry that no directory has. The
+            // switch suppresses the refusal of this value.
             (
                 "parent-component",
                 vec!["-U", "--allow-noent", "--subpath=/d/../f"],
                 Some(0),
             ),
-            // A `..` followed by a name the directory before the `..` holds as
-            // a file. The value stops at the `..`, so the refusal it carries
-            // is an absent subpath and the switch reaches it.
+            // A `..` followed by a name that the directory before the `..` has
+            // as a file. The value stops at the `..`, so its refusal is for an
+            // absent subpath. The switch suppresses it.
             (
                 "parent-then-a-file",
                 vec!["-U", "--allow-noent", "--subpath=/d/../inner.txt/nope"],
                 Some(0),
             ),
-            // A file in a non-final position ahead of the `..`. The value
-            // stops at the file, so it runs through a non-directory and the
-            // switch does not reach that refusal.
+            // A file in a non-final position before the `..`. The value stops
+            // at the file, so the path goes through a non-directory. The switch
+            // does not suppress that refusal.
             (
                 "a-file-then-a-parent",
                 vec!["-U", "--allow-noent", "--subpath=/f/../d"],
@@ -25169,9 +25499,10 @@ fn checkout_allow_noent_matches_the_tool() {
     }
 }
 
-/// Create a character device 0:0 at `path`. Device number 0:0 is the overlayfs
-/// whiteout and its creation needs no capability, so this runs unprivileged.
-/// `mknod` is used because the test crate links no syscall wrapper.
+/// Creates a character device 0:0 at `path`. Device number 0:0 is the
+/// overlayfs whiteout. Its creation needs no capability, so this function runs
+/// with no privileges. The function runs `mknod` because the test crate links
+/// no syscall wrapper.
 fn mknod_whiteout(path: &Path) {
     let status = Command::new("mknod")
         .arg(path)
@@ -25181,8 +25512,8 @@ fn mknod_whiteout(path: &Path) {
     assert!(status.success(), "mknod {} failed", path.display());
 }
 
-/// A fifo at `path`, for a destination entry of a type neither implementation
-/// writes.
+/// Creates a fifo at `path`, for a destination entry of a type that neither
+/// command writes.
 fn mkfifo_at(path: &Path) {
     let status = Command::new("mkfifo")
         .arg(path)
@@ -25191,31 +25522,32 @@ fn mkfifo_at(path: &Path) {
     assert!(status.success(), "mkfifo {} failed", path.display());
 }
 
-/// The tree the whiteout tests check out. It carries a target for every marker
-/// and a marker of every type:
+/// Builds the tree that the whiteout tests check out. It has a target for each
+/// marker and a marker of each type:
 ///
 /// - regular-file per-name markers `.wh.present`, `.wh.absent`, `.wh.targetdir`,
-///   `.wh..a`, and `sub/.wh.present`;
-/// - a regular-file opaque marker `opqdir/.wh..wh..opq`;
+///   `.wh..a`, and `sub/.wh.present`
+/// - a regular-file opaque marker `opqdir/.wh..wh..opq`
 /// - regular-file passthrough markers `.ostree-wh.ptA` at 0644,
 ///   `.ostree-wh.pt755` at 0755, `.ostree-wh.ptsuid` at 04755,
-///   `.ostree-wh.ptsgid` at 02755, and `sub/.ostree-wh.nested`;
+///   `.ostree-wh.ptsgid` at 02755, and `sub/.ostree-wh.nested`
 /// - a directory named `.wh.dirmarker` and a directory named
-///   `.ostree-wh.adir`, neither of which is a marker;
+///   `.ostree-wh.adir`, neither of which is a marker
 /// - a symlink named `.wh.slink` and a symlink named `.ostree-wh.alink`,
-///   neither of which is a marker.
+///   neither of which is a marker
 ///
-/// The removal order is stated by two pairs. `.wh.present` sorts before
-/// `present`, so the marker removes the destination's entry and the commit's
-/// own `present` is written afterwards; `.wh..a` sorts after `.a`, so the
-/// marker removes the `.a` this same checkout wrote and the destination holds
-/// neither. `.wh.targetdir` names a directory the same commit writes, and files
-/// are iterated before directories, so the removal is of the destination's
-/// `targetdir` alone.
+/// Two pairs show the removal order. `.wh.present` sorts before `present`. The
+/// marker removes the entry of the destination, and then the checkout writes
+/// the `present` of the commit. `.wh..a` sorts after `.a`. The marker removes
+/// the `.a` that this checkout wrote, and the destination has neither entry.
 ///
-/// The setuid and setgid passthrough markers state the mode a checkout outside
-/// `-U` gives the device: a chown on a device node clears both bits, so the
-/// recorded mode has to be applied after the ownership.
+/// `.wh.targetdir` names a directory that the same commit writes. The checkout
+/// iterates files before directories, so the marker removes only the
+/// `targetdir` of the destination.
+///
+/// The setuid and setgid passthrough markers show the mode that a checkout
+/// without `-U` gives the device. A chown on a device node clears both bits,
+/// so the checkout must apply the recorded mode after the ownership.
 fn build_whiteout_tree(dir: &Path) {
     std::fs::create_dir_all(dir.join("sub")).unwrap();
     std::fs::create_dir_all(dir.join("targetdir")).unwrap();
@@ -25259,7 +25591,8 @@ fn build_whiteout_tree(dir: &Path) {
     chmod_to(dir, 0o755);
 }
 
-/// The names [`build_whiteout_tree`]'s per-name and passthrough markers act on.
+/// The names that the per-name and passthrough markers of `build_whiteout_tree`
+/// act on.
 const WHITEOUT_TARGETS: &[&str] = &[
     "present",
     "absent",
@@ -25275,11 +25608,12 @@ const WHITEOUT_TARGETS: &[&str] = &[
     "adir",
 ];
 
-/// The destination pre-states the whiteout sweeps run over.
+/// The destination pre-states of the whiteout sweeps.
 ///
-/// One type conflict is left out: a directory at a passthrough marker's target
-/// is the refusal `checkout_passthrough_whiteout_dispositions_match_the_tool`
-/// states.
+/// The list does not have one type conflict: a directory at the target of a
+/// passthrough marker. The test
+/// `checkout_passthrough_whiteout_dispositions_match_the_tool` checks that
+/// refusal.
 const WHITEOUT_PRESTATES: &[UnionPrestate] = &[
     ("absent", None),
     (
@@ -25356,13 +25690,14 @@ const WHITEOUT_PRESTATES: &[UnionPrestate] = &[
     ),
 ];
 
-/// The union arms a whiteout sweep runs. `--union-identical` is left out: its
-/// identity rule over a destination entry the sweep's pre-states differ from is
-/// `checkout_union_modes_match_the_tool`'s claim, and the two implementations
-/// refuse such an entry at their own point of the walk, which leaves the
-/// partial destinations no basis for comparison.
-/// `checkout_passthrough_whiteout_dispositions_match_the_tool` states the
-/// switch's own disposition under `--union-identical` over a one-marker tree.
+/// The union arms of a whiteout sweep. The list does not have
+/// `--union-identical`. Its identity rule applies to the destination entries
+/// of the pre-states that differ from the commit. That rule is the claim of
+/// `checkout_union_modes_match_the_tool`. The two commands refuse such an entry
+/// at different points of the walk, so the partial destinations cannot be
+/// compared. `checkout_passthrough_whiteout_dispositions_match_the_tool` checks
+/// the disposition of the switch under `--union-identical` over a tree with
+/// one marker.
 const WHITEOUT_ARMS: &[(&str, &[&str])] = &[
     ("plain", &["-U"]),
     ("union", &["-U", "--union"]),
@@ -25371,8 +25706,8 @@ const WHITEOUT_ARMS: &[(&str, &[&str])] = &[
     ("union-faithful", &["--union"]),
 ];
 
-/// Run one whiteout sweep: every repository mode, every union arm, every
-/// destination pre-state, with `switches` added to each arm.
+/// Runs one whiteout sweep over each repository mode, each union arm, and each
+/// destination pre-state. It adds `switches` to each arm.
 fn whiteout_sweep(label: &str, switches: &[&str]) {
     let tmp = TmpDir::new(label);
     let base = tmp.path();
@@ -25403,10 +25738,10 @@ fn whiteout_sweep(label: &str, switches: &[&str]) {
     }
 }
 
-/// `--whiteouts` over every repository mode, every union arm, and every
+/// `--whiteouts` over each repository mode, each union arm, and each
 /// destination pre-state.
 ///
-/// Carries `checkout/whiteouts-remove-and-drop-the-marker`,
+/// The test carries `checkout/whiteouts-remove-and-drop-the-marker`,
 /// `checkout/whiteouts-marker-naming-an-absent-entry`,
 /// `checkout/whiteouts-remove-a-directory-subtree`,
 /// `checkout/whiteouts-opaque-marker-clears-the-directory`, and
@@ -25419,10 +25754,10 @@ fn checkout_whiteouts_match_the_tool() {
     whiteout_sweep("checkout-whiteouts", &["--whiteouts"]);
 }
 
-/// `--process-passthrough-whiteouts` over the same sweep, the device's own
-/// claims, and the two switches together.
+/// `--process-passthrough-whiteouts` over the same sweep, the claims of the
+/// device, and the two switches together.
 ///
-/// Carries `checkout/passthrough-whiteouts-write-a-char-0-0-device`,
+/// The test carries `checkout/passthrough-whiteouts-write-a-char-0-0-device`,
 /// `checkout/passthrough-whiteouts-keep-the-marker-mode`,
 /// `checkout/passthrough-whiteouts-over-an-existing-entry`, and
 /// `checkout/whiteouts-and-passthrough-together`.
@@ -25436,11 +25771,10 @@ fn checkout_passthrough_whiteouts_match_the_tool() {
         &["--process-passthrough-whiteouts"],
     );
 
-    // The two marker sets are disjoint, so each single-switch sweep above
-    // already states that the other switch's names stay materialized. What the
-    // pair adds is that they do not interfere, which one destination per
-    // repository mode states, and that neither marker set answers to `-H` or
-    // `-C`.
+    // The two marker sets are disjoint. Each sweep with one switch already
+    // shows that the names of the other switch stay materialized. The pair adds
+    // two claims. The switches do not interfere, which one destination for each
+    // repository mode shows. Neither marker set changes under `-H` or `-C`.
     let tmp = TmpDir::new("checkout-both-whiteouts");
     let base = tmp.path();
     let tree = base.join("tree");
@@ -25469,9 +25803,9 @@ fn checkout_passthrough_whiteouts_match_the_tool() {
             ("faithful", vec!["--union"]),
             ("faithful-force-copy", vec!["-C", "--union"]),
         ];
-        // `-H` is taken only where the repository mode can hardlink into the
-        // checkout mode; the arms it refuses are the `-H` divergence's claim
-        // and not this test's.
+        // `-H` is accepted only if the repository mode can hardlink into the
+        // checkout mode. The arms that `-H` refuses are the claim of the `-H`
+        // divergence, and this test does not check them.
         match mode_name {
             "bare-user" => arms.push(("require-hardlinks", vec!["-U", "-H", "--union"])),
             "bare" => arms.push(("require-hardlinks", vec!["-H", "--union"])),
@@ -25493,11 +25827,16 @@ fn checkout_passthrough_whiteouts_match_the_tool() {
         }
     }
 
-    // The device's own claims, which the sweeps compare but do not name: the
-    // marker's permission bits, the device number, the depth, and the
-    // ownership a checkout outside `-U` applies. The bits reach `mknod`, where
-    // the process umask reduces them, so the absolute mode claim is made on the
-    // arm outside `-U`, which applies the recorded mode after the ownership.
+    // The claims of the device, which the sweeps compare and do not name:
+    //
+    // - the permission bits of the marker
+    // - the device number
+    // - the depth
+    // - the ownership that a checkout without `-U` applies
+    //
+    // The bits go to `mknod`, and the process umask reduces them there. The
+    // test checks the exact mode only on the arm without `-U`. That arm applies
+    // the recorded mode after the ownership.
     let (repo, rev) = bare_user_repo.expect("the bare-user fixture is built above");
     for (case, options) in [
         ("user", vec!["-U", "--process-passthrough-whiteouts"]),
@@ -25545,10 +25884,12 @@ fn checkout_passthrough_whiteouts_match_the_tool() {
     }
 }
 
-/// The markers act on a regular-file entry alone, and the opaque marker's
-/// clear is decided by the name alone.
+/// The per-name and passthrough markers act only on regular-file entries. For
+/// a non-directory entry, the name alone decides the clear of the opaque
+/// marker. A symlink `.wh..wh..opq` clears the directory, and a directory of
+/// that name does not.
 ///
-/// Carries `checkout/whiteout-markers-are-regular-files-only`.
+/// The test carries `checkout/whiteout-markers-are-regular-files-only`.
 #[test]
 fn checkout_whiteout_markers_act_on_regular_files_only() {
     if !ostree_available() {
@@ -25558,9 +25899,9 @@ fn checkout_whiteout_markers_act_on_regular_files_only() {
     let base = tmp.path();
     let both: &[&str] = &["--whiteouts", "--process-passthrough-whiteouts"];
 
-    // The sweep tree already holds a directory and a symlink under each
-    // marker prefix; this states their outcome against a destination that
-    // holds an entry at each of their target names.
+    // The sweep tree already has a directory and a symlink with each marker
+    // prefix. This case checks their result over a destination with an entry
+    // at each of their target names.
     let tree = base.join("tree");
     build_whiteout_tree(&tree);
     let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
@@ -25585,8 +25926,8 @@ fn checkout_whiteout_markers_act_on_regular_files_only() {
         );
     }
 
-    // The opaque marker as a symlink and as a directory, each needing a tree
-    // of its own.
+    // The opaque marker as a symlink and as a directory. Each needs its own
+    // tree.
     for (case, build) in [
         (
             "opaque-symlink",
@@ -25637,10 +25978,10 @@ fn checkout_whiteout_markers_act_on_regular_files_only() {
     }
 }
 
-/// With neither switch every marker is an ordinary entry and nothing is
+/// With neither switch, each marker is an ordinary entry and nothing is
 /// removed.
 ///
-/// Carries `checkout/whiteouts-off-materialize-the-markers`.
+/// The test carries `checkout/whiteouts-off-materialize-the-markers`.
 #[test]
 fn checkout_whiteouts_off_materialize_the_markers() {
     if !ostree_available() {
@@ -25692,13 +26033,14 @@ fn checkout_whiteouts_off_materialize_the_markers() {
     );
 }
 
-/// A marker naming no entry is refused, each refusal gated by its own switch
-/// and by the entry's type. The refusal comes mid-walk, so the destination
-/// directory stands and holds what the walk had already written.
+/// Both commands refuse a marker that names no entry. Each refusal depends on
+/// its own switch and on the type of the entry. The refusal comes during the
+/// walk, so the destination directory exists and has what the walk wrote
+/// before the refusal.
 ///
-/// Carries `checkout/whiteout-empty-name-refused` and
-/// `checkout/passthrough-whiteout-empty-name-refused`. The words part, so each
-/// side is asserted against its own message.
+/// The test carries `checkout/whiteout-empty-name-refused` and
+/// `checkout/passthrough-whiteout-empty-name-refused`. The words differ, so the
+/// test checks each command against its own message.
 #[test]
 fn checkout_whiteout_empty_names_are_refused() {
     if !ostree_available() {
@@ -25707,8 +26049,8 @@ fn checkout_whiteout_empty_names_are_refused() {
     let tmp = TmpDir::new("checkout-whiteout-empty");
     let base = tmp.path();
 
-    // One tree per marker, so the entry the walk reaches first is settled, and
-    // one tree holding both as symlinks.
+    // One tree for each marker, so the entry that the walk reaches first is
+    // known. One more tree has both markers as symlinks.
     let build_regular = |dir: &Path, marker: &str| {
         std::fs::create_dir_all(dir).unwrap();
         for name in [marker, "keep"] {
@@ -25734,7 +26076,7 @@ fn checkout_whiteout_empty_names_are_refused() {
     let (pt_repo, pt_rev) = union_repo(base, RepoMode::BareUser, "repo-pt", &pt);
     let (links_repo, links_rev) = union_repo(base, RepoMode::BareUser, "repo-links", &links);
 
-    // The port's words and the tool's, per marker.
+    // The words of ostrya and of `ostree`, for each marker.
     const WH_WORDS: (&str, &str) = (
         ".wh.: the whiteout names no entry",
         "Invalid empty whiteout",
@@ -25744,7 +26086,7 @@ fn checkout_whiteout_empty_names_are_refused() {
         "Invalid empty overlayfs whiteout",
     );
 
-    // The gating table: each refusal answers to its own switch alone.
+    // The gate table: only its own switch turns on each refusal.
     let arms: [(&str, &[&str], bool, bool); 4] = [
         ("neither", &[], false, false),
         ("whiteouts", &["--whiteouts"], true, false),
@@ -25792,9 +26134,9 @@ fn checkout_whiteout_empty_names_are_refused() {
                     "{label}: the tool's words: {}",
                     String::from_utf8_lossy(&tool.stderr),
                 );
-                // The marker sorts ahead of `keep`, so the walk had written
-                // nothing when the refusal fired, and the destination
-                // directory stands empty.
+                // The marker sorts before `keep`, so the walk wrote nothing
+                // before the refusal. The destination directory exists and is
+                // empty.
                 assert!(
                     port_dest.is_dir() && tool_dest.is_dir(),
                     "{label}: the destination directory was removed",
@@ -25810,7 +26152,7 @@ fn checkout_whiteout_empty_names_are_refused() {
             }
         }
 
-        // A symlink so named is materialized and no refusal fires.
+        // A symlink with such a name is materialized, and no refusal occurs.
         let label = format!("links/{case}");
         let port_dest = base.join(format!("port-links-{case}"));
         let tool_dest = base.join(format!("tool-links-{case}"));
@@ -25829,12 +26171,13 @@ fn checkout_whiteout_empty_names_are_refused() {
     }
 }
 
-/// A `--subpath` naming a marker file reaches the marker rules, so the marker
-/// is not materialized under its own name and the empty names keep their
-/// refusals. The opaque marker's clear is the directory walk's own pre-pass, so
-/// a subpath naming `.wh..wh..opq` drops the entry and clears nothing.
+/// If a `--subpath` names a marker file, the marker rules apply to it. The
+/// marker is then not materialized under its own name, and the empty names keep
+/// their refusals. The clear of the opaque marker is a pre-pass of the
+/// directory walk. A subpath that names `.wh..wh..opq` drops the entry and
+/// clears nothing.
 ///
-/// Carries `checkout/whiteouts-under-a-subpath-naming-a-marker`.
+/// The test carries `checkout/whiteouts-under-a-subpath-naming-a-marker`.
 #[test]
 fn checkout_whiteouts_under_a_subpath_match_the_tool() {
     if !ostree_available() {
@@ -25893,16 +26236,17 @@ fn checkout_whiteouts_under_a_subpath_match_the_tool() {
     }
 }
 
-/// `--whiteouts` widens the union-files disposition over a type conflict: a
-/// destination entry whose type is not the type the tree carries at that name is
-/// removed and the entry is written. The tree the case checks out holds no
-/// marker at all, so the widening answers to the switch and not to a marker.
+/// `--whiteouts` widens the union-files disposition over a type conflict. A
+/// destination entry can have a type that differs from the type in the tree at
+/// that name. The checkout then removes the entry and writes the tree entry.
+/// The tree of this case has no marker, so only the switch can cause the
+/// widening.
 ///
-/// The destination stands inside a parent directory of its own and the parent is
-/// what the two sides are compared over, so a case whose destination is itself a
-/// regular file, a symlink, or a fifo is rendered whole.
+/// The destination is inside its own parent directory, and the test compares
+/// the two parents. A case whose destination is a regular file, a symlink, or a
+/// fifo then shows in full.
 ///
-/// Carries `checkout/whiteouts-widen-a-union-type-conflict`.
+/// The test carries `checkout/whiteouts-widen-a-union-type-conflict`.
 #[test]
 fn checkout_whiteouts_widen_a_union_type_conflict() {
     if !ostree_available() {
@@ -25930,8 +26274,8 @@ fn checkout_whiteouts_widen_a_union_type_conflict() {
     chmod_to(&tree, 0o755);
     let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
 
-    // The pre-states that put the wrong type at a name the tree carries. Each
-    // builder receives the destination path and creates its own parent.
+    // The pre-states that put the wrong type at a name in the tree. Each
+    // builder gets the destination path and creates its own parent.
     type Conflict = (&'static str, fn(&Path));
     let conflicts: [Conflict; 17] = [
         ("dir-at-a-file", |dest| {
@@ -26033,10 +26377,10 @@ fn checkout_whiteouts_widen_a_union_type_conflict() {
         }),
     ];
 
-    // The arms the widening answers to and the arms it does not. `--whiteouts`
-    // widens union-files alone, so `--union-add` and `--union-identical` keep
-    // their own disposition, `--process-passthrough-whiteouts` widens nothing,
-    // and the checkout mode makes no difference.
+    // The arms with the widening and the arms without it. `--whiteouts` widens
+    // only union-files, so `--union-add` and `--union-identical` keep their own
+    // disposition. `--process-passthrough-whiteouts` widens nothing, and the
+    // checkout mode makes no difference.
     let arms: [(&str, &[&str]); 7] = [
         ("whiteouts", &["-U", "--union", "--whiteouts"]),
         ("neither", &["-U", "--union"]),
@@ -26080,9 +26424,9 @@ fn checkout_whiteouts_widen_a_union_type_conflict() {
     }
 
     // A `--subpath` narrows what the walk reaches, and the widening follows it.
-    // The destination directory a file subpath needs stands outside the reach:
-    // a destination that is not a directory is refused there under either
-    // switch.
+    // The widening does not apply to the destination directory that a file
+    // subpath needs. With or without `--whiteouts`, the checkout refuses a
+    // destination there that is not a directory.
     let reached = |name: &str| {
         *conflicts
             .iter()
@@ -26114,14 +26458,14 @@ fn checkout_whiteouts_widen_a_union_type_conflict() {
     }
 }
 
-/// The destination disposition each overwrite mode gives a passthrough
-/// whiteout, over a one-marker tree so the walk order around a refusal is
-/// settled, and the per-name whiteout's own disposition beside it.
+/// The destination disposition that each overwrite mode gives a passthrough
+/// whiteout, and the disposition of the per-name whiteout. The tree has one
+/// marker, so the walk order around a refusal is known.
 ///
-/// Carries `checkout/passthrough-whiteouts-over-an-existing-entry`,
+/// The test carries `checkout/passthrough-whiteouts-over-an-existing-entry`,
 /// `checkout/passthrough-whiteouts-over-a-directory`, and
-/// `checkout/whiteouts-are-union-mode-independent`. The refusal's words part,
-/// so each side is asserted against its own message.
+/// `checkout/whiteouts-are-union-mode-independent`. The words of the refusal
+/// differ, so the test checks each command against its own message.
 #[test]
 fn checkout_passthrough_whiteout_dispositions_match_the_tool() {
     if !ostree_available() {
@@ -26145,9 +26489,9 @@ fn checkout_passthrough_whiteout_dispositions_match_the_tool() {
     let (pt_repo, pt_rev) = union_repo(base, RepoMode::BareUser, "repo-pt", &pt);
     let (wh_repo, wh_rev) = union_repo(base, RepoMode::BareUser, "repo-wh", &wh);
 
-    // The six destination pre-states at the marker's target name. `absent`
-    // leaves the destination itself absent, which the modes with no union
-    // option need.
+    // The six destination pre-states at the target name of the marker.
+    // `absent` leaves the destination itself absent, which the modes with no
+    // union option need.
     let prestates: [UnionPrestate; 6] = [
         ("absent", None),
         (
@@ -26214,8 +26558,8 @@ fn checkout_passthrough_whiteout_dispositions_match_the_tool() {
                 let (port, tool) = checkout_pair(repo, &all, rev, &port_dest, &tool_dest);
                 assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &label);
 
-                // The one refusal the switches themselves reach: a passthrough
-                // marker over a destination directory, under `--union`.
+                // The one refusal that the switches cause: a passthrough marker
+                // over a destination directory, under `--union`.
                 if marker == "pt" && arm == "union" && state == "dir-at-dev" {
                     assert_eq!(port.status.code(), Some(1), "{label}: the port accepted");
                     assert!(
@@ -26237,11 +26581,12 @@ fn checkout_passthrough_whiteout_dispositions_match_the_tool() {
     }
 }
 
-/// The reach of `--allow-noent`, which is the one divergence the switch
-/// carries: the tool honors it on some command lines and the port on every
-/// one, and neither side writes anything either way.
+/// The reach of `--allow-noent`, which is the one divergence of this switch.
+/// The `ostree` command honors the switch on some command lines, and ostrya
+/// honors it on each command line. Neither command writes anything in either
+/// case.
 ///
-/// Carries `checkout/allow-noent-under-require-hardlinks`.
+/// The test carries `checkout/allow-noent-under-require-hardlinks`.
 #[test]
 fn checkout_allow_noent_reach_diverges_from_the_tool() {
     if !ostree_available() {
@@ -26253,9 +26598,9 @@ fn checkout_allow_noent_reach_diverges_from_the_tool() {
     build_union_tree(&tree);
     let (repo, rev) = union_repo(base, RepoMode::Bare, "repo", &tree);
 
-    // The tool's own table, measured. `--skip-list` is in
-    // `checkout_skip_list_drops_allow_noent_in_the_tool`, together with the
-    // two batch options that keep the switch.
+    // The measured table of `ostree`. The test
+    // `checkout_skip_list_drops_allow_noent_in_the_tool` holds `--skip-list`
+    // and the two batch options that keep the switch.
     let arms: [(&str, &[&str], i32); 12] = [
         ("bare", &[], 0),
         ("require-hardlinks", &["-H"], 1),
@@ -26303,8 +26648,8 @@ fn checkout_allow_noent_reach_diverges_from_the_tool() {
         );
     }
 
-    // Neither side touches a destination that already exists, whichever status
-    // it reaches. That is the fact the divergence's `loss:` field points at.
+    // Neither command changes a destination that already exists, with either
+    // exit status. The `loss:` field of the divergence record names this fact.
     for (case, switches) in [("keeps", ["-U"]), ("loses", ["-H"])] {
         let port_dest = base.join(format!("port-existing-{case}"));
         let tool_dest = base.join(format!("tool-existing-{case}"));
@@ -26326,11 +26671,13 @@ fn checkout_allow_noent_reach_diverges_from_the_tool() {
     }
 }
 
-/// The type conflicts no union mode resolves, the write order a refusal makes
-/// visible, and the symlink a union mode follows at a directory name inside the
-/// tree.
+/// Three facts of the union modes:
 ///
-/// Carries `checkout/union-type-conflicts`.
+/// - the type conflicts that no union mode resolves
+/// - the write order that a refusal shows
+/// - the symlink that a union mode follows at a directory name of the tree
+///
+/// The test carries `checkout/union-type-conflicts`.
 #[test]
 fn checkout_union_type_conflicts_match_the_tool() {
     if !ostree_available() {
@@ -26345,10 +26692,10 @@ fn checkout_union_type_conflicts_match_the_tool() {
         ("dir-at-f", |dest| {
             std::fs::create_dir_all(dest.join("f")).unwrap();
         }),
-        // A symlink to a directory at a directory name inside the tree is
-        // followed, and the subtree lands in the link's target. The
-        // `symlink-at-d` case below is the dangling form of the same shape,
-        // where following the link is what raises the error.
+        // A union mode follows a symlink to a directory at a directory name of
+        // the tree. It writes the subtree into the target of the link. The
+        // `symlink-at-d` case is the dangling form of the same shape. In that
+        // case, the union mode follows the link and gets the error.
         ("symlink-to-dir-at-d", |dest| {
             std::fs::create_dir_all(dest.join("real")).unwrap();
             std::os::unix::fs::symlink("real", dest.join("d")).unwrap();
@@ -26393,9 +26740,10 @@ fn checkout_union_type_conflicts_match_the_tool() {
     }
 }
 
-/// The destination forms the three union modes take, against the tool.
+/// The destination forms that the three union modes accept, checked against
+/// the `ostree` command.
 ///
-/// Carries `checkout/union-creates-or-reuses-the-destination`.
+/// The test carries `checkout/union-creates-or-reuses-the-destination`.
 #[test]
 fn checkout_union_destination_forms_match_the_tool() {
     if !ostree_available() {
@@ -26412,7 +26760,8 @@ fn checkout_union_destination_forms_match_the_tool() {
         ("union-add", vec!["-U", "--union-add"]),
         ("union-identical", vec!["-H", "--union-identical"]),
     ] {
-        // Absent: both create it at the tree root's dirmeta mode.
+        // Absent: both commands create it with the dirmeta mode of the tree
+        // root.
         let port_dest = base.join(format!("port-{arm}-fresh"));
         let tool_dest = base.join(format!("tool-{arm}-fresh"));
         let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
@@ -26438,7 +26787,7 @@ fn checkout_union_destination_forms_match_the_tool() {
             "{arm}: the created destination's own mode parts",
         );
 
-        // Pre-created at 0700: both keep 0700.
+        // Created first with mode 0700: both commands keep 0700.
         let port_dest = base.join(format!("port-{arm}-0700"));
         let tool_dest = base.join(format!("tool-{arm}-0700"));
         for dest in [&port_dest, &tool_dest] {
@@ -26459,7 +26808,8 @@ fn checkout_union_destination_forms_match_the_tool() {
             );
         }
 
-        // A parent that does not exist: both refuse, nothing created.
+        // A parent that does not exist: both commands refuse and create
+        // nothing.
         let port_dest = base.join(format!("port-{arm}-nodir/dest"));
         let tool_dest = base.join(format!("tool-{arm}-nodir/dest"));
         let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
@@ -26467,7 +26817,8 @@ fn checkout_union_destination_forms_match_the_tool() {
         assert_eq!(tool.status.code(), Some(1), "{arm}: the tool took it");
         assert!(!port_dest.exists() && !tool_dest.exists());
 
-        // A destination that is a regular file: both refuse, the file untouched.
+        // A destination that is a regular file: both commands refuse, and the
+        // file does not change.
         let port_dest = base.join(format!("port-{arm}-file"));
         let tool_dest = base.join(format!("tool-{arm}-file"));
         for dest in [&port_dest, &tool_dest] {
@@ -26484,7 +26835,7 @@ fn checkout_union_destination_forms_match_the_tool() {
             );
         }
 
-        // A destination that is a symlink to a directory is followed.
+        // Both commands follow a destination that is a symlink to a directory.
         let port_dest = base.join(format!("port-{arm}-link"));
         let tool_dest = base.join(format!("tool-{arm}-link"));
         for (dest, target) in [
@@ -26521,7 +26872,7 @@ fn checkout_union_destination_forms_match_the_tool() {
         );
     }
 
-    // The plain-checkout contrast: an existing destination is refused.
+    // The control: a plain checkout refuses a destination that exists.
     let port_dest = base.join("port-plain");
     let tool_dest = base.join("tool-plain");
     for dest in [&port_dest, &tool_dest] {
@@ -26540,16 +26891,17 @@ fn checkout_union_destination_forms_match_the_tool() {
     );
 }
 
-/// What `--union-identical` calls identical, held against the tool case by
-/// case over destinations the test builds by hand.
+/// The identity rule of `--union-identical`, checked against the `ostree`
+/// command case by case, over destinations that the test builds by hand.
 ///
-/// Carries `checkout/union-identical-identity-rule`.
+/// The test carries `checkout/union-identical-identity-rule`.
 ///
-/// One arm of the rule is out of reach without privilege: an object in a `bare`
-/// repository whose uid or gid differs from the invoking user's, which a `bare`
-/// commit cannot record unprivileged. The ownership clause is stated through
-/// `bare-user`, which records the ids in the metadata attribute, and through
-/// `bare-user-only`, which discards them.
+/// The test cannot reach one arm of the rule without privilege. This arm is an
+/// object in a `bare` repository with a uid or gid other than that of the
+/// invoking user. A `bare` commit cannot record such ids without privilege.
+/// The test checks the ownership clause through `bare-user`, which records the
+/// ids in the metadata attribute, and through `bare-user-only`, which discards
+/// them.
 #[test]
 fn checkout_union_identical_identity_matches_the_tool() {
     if !ostree_available() {
@@ -26564,8 +26916,8 @@ fn checkout_union_identical_identity_matches_the_tool() {
     std::os::unix::fs::symlink("f", tree.join("l")).unwrap();
     chmod_to(&tree, 0o755);
 
-    // Whether the host takes a user extended attribute at all, which the
-    // attribute case needs.
+    // The test checks if the host accepts a user extended attribute. The
+    // attribute case needs one.
     std::fs::write(base.join("probe"), b"").unwrap();
     let xattrs_work = set_user_xattr(&base.join("probe"), "user.probe", "v");
     if !xattrs_work {
@@ -26644,10 +26996,10 @@ fn checkout_union_identical_identity_matches_the_tool() {
             assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &label);
         }
 
-        // A destination an earlier hardlinking checkout of the same commit
-        // produced is already the loose object's inode, which the rule
-        // short-circuits on. Each implementation runs over a destination of its
-        // own making.
+        // After an earlier hardlink checkout of the same commit, the
+        // destination entry is the inode of the loose object. The rule takes
+        // that inode as identical with no further comparison. Each command runs
+        // over a destination that it made itself.
         let port_dest = base.join(format!("port-{arm}-relinked"));
         let tool_dest = base.join(format!("tool-{arm}-relinked"));
         let (port, tool) = checkout_pair(&repo, switches, &rev, &port_dest, &tool_dest);
@@ -26677,9 +27029,9 @@ fn checkout_union_identical_identity_matches_the_tool() {
         );
     }
 
-    // The ownership clause. A `bare-user` object records the committed ids and
-    // a `bare-user-only` object discards them, so one destination owned by the
-    // invoking user is refused in the first and kept in the second.
+    // The ownership clause. A `bare-user` object records the committed ids, and
+    // a `bare-user-only` object discards them. A destination that the invoking
+    // user owns is refused in `bare-user` and kept in `bare-user-only`.
     let owned_tree = base.join("owned-tree");
     std::fs::create_dir_all(&owned_tree).unwrap();
     std::fs::write(owned_tree.join("f"), b"payload\n").unwrap();
@@ -26731,11 +27083,12 @@ fn checkout_union_identical_identity_matches_the_tool() {
         );
     }
 
-    // The second conjunct: the destination's permission bits are compared
-    // against the loose object inode's. A `bare-user` inode carries
-    // `(logical_perm & 0o775) | 0o400`, so an object whose logical mode holds a
-    // bit that rule drops is identical to no destination at all, where the same
-    // object in `bare` is identical to a destination of its own mode.
+    // The second conjunct: the rule compares the permission bits of the
+    // destination with those of the loose object inode. A `bare-user` inode has
+    // the mode `(logical_perm & 0o775) | 0o400`. If the logical mode of an
+    // object has a bit that this formula drops, no destination is identical to
+    // the object. In `bare`, the same object is identical to a destination with
+    // its own mode.
     for perm in [0o666u32, 0o777, 0o1755, 0o2755, 0o4755] {
         let mode_tree = base.join(format!("tree-{perm:o}"));
         std::fs::create_dir_all(&mode_tree).unwrap();
@@ -26769,13 +27122,14 @@ fn checkout_union_identical_identity_matches_the_tool() {
 
 // --- checkout: path selection ------------------------------------------------
 //
-// `--skip-list=FILE` prunes tree paths; `--from-stdin` and `--from-file=FILE`
-// read a batch of checkouts. Each test builds its own repository and runs both
-// implementations over it, into a destination of each one's own.
+// `--skip-list=FILE` prunes tree paths. `--from-stdin` and `--from-file=FILE`
+// read a batch of checkouts. Each test builds its own repository and runs
+// ostrya and the `ostree` command over it, each into its own destination.
 
-/// Run the `ostree` tool from `cwd` with `args` and `stdin`, which `ostree()`
-/// pins to `/dev/null`. The streams the batch tests feed are a few bytes each,
-/// so the write completes before the tool's output can fill a pipe.
+/// Runs the `ostree` command from `cwd` with `args`, and writes `stdin` to its
+/// standard input. The helper `ostree()` sets standard input to `/dev/null`.
+/// The streams of the batch tests are a few bytes each, so the write completes
+/// before the output of `ostree` can fill a pipe.
 fn ostree_stdin(cwd: Option<&Path>, args: &[&str], stdin: &[u8]) -> Run {
     let mut command = Command::new("ostree");
     if let Some(dir) = cwd {
@@ -26802,9 +27156,9 @@ fn ostree_stdin(cwd: Option<&Path>, args: &[&str], stdin: &[u8]) -> Run {
     }
 }
 
-/// Run one batch `checkout` in both implementations over one repository, into a
-/// destination of each one's own. A batch invocation names its destination in
-/// the COMMIT slot, so the destination is the one positional given.
+/// Runs one batch `checkout` in ostrya and in the `ostree` command over one
+/// repository, each into its own destination. A batch invocation names its
+/// destination in the COMMIT slot, so the destination is the only positional.
 fn checkout_batch_pair(
     repo: &Path,
     options: &[&str],
@@ -26829,10 +27183,15 @@ fn checkout_batch_pair(
     (port, tool)
 }
 
-/// The tree the path-selection tests check out: a regular file `f1`, a symlink
-/// `link` naming it, a three-level directory chain `a/b/c`, and a second
-/// directory `d`, so a list entry can name a file, a symlink, a directory at
-/// each depth, and a path that matches nothing.
+/// Builds the tree that the path-selection tests check out:
+///
+/// - a regular file `f1`
+/// - a symlink `link` to `f1`
+/// - a directory chain `a/b/c` with three levels
+/// - a second directory `d`
+///
+/// Each directory holds one regular file. A list entry can then name a file, a
+/// symlink, a directory at each depth, and a path that matches nothing.
 fn build_skip_tree(dir: &Path) {
     std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
     std::fs::create_dir_all(dir.join("d")).unwrap();
@@ -26853,18 +27212,18 @@ fn build_skip_tree(dir: &Path) {
     chmod_to(dir, 0o755);
 }
 
-/// Write `content` to `base/name` and return the `--skip-list=` option naming
-/// it.
+/// Writes `content` to `base/name` and returns the `--skip-list=` option that
+/// names the file.
 fn skip_list_option(base: &Path, name: &str, content: &[u8]) -> String {
     let path = base.join(name);
     std::fs::write(&path, content).unwrap();
     format!("--skip-list={}", path.display())
 }
 
-/// The path forms a `--skip-list` entry takes, over every repository mode whose
-/// checkout path differs.
+/// The path forms that a `--skip-list` entry accepts, in each repository mode
+/// with a different checkout path.
 ///
-/// Carries `checkout/skip-list-prunes-a-file`,
+/// The test carries `checkout/skip-list-prunes-a-file`,
 /// `checkout/skip-list-prunes-a-directory-under-a-trailing-slash`,
 /// `checkout/skip-list-ignores-a-directory-without-a-trailing-slash`, and
 /// `checkout/skip-list-prunes-the-root`.
@@ -26878,9 +27237,9 @@ fn checkout_skip_list_matches_the_tool() {
     let tree = base.join("tree");
     build_skip_tree(&tree);
 
-    // Each entry is one skip-list file content. The root form asserts that
-    // neither implementation created a destination, which the tree walker
-    // renders as one `<no destination>` line.
+    // Each entry is the content of one skip-list file. For the root form, the
+    // test checks that neither command created a destination. The tree walker
+    // shows a missing destination as one `<no destination>` line.
     let forms: &[(&str, &str)] = &[
         ("file", "/f1\n"),
         ("file-no-leading-slash", "f1\n"),
@@ -26921,8 +27280,9 @@ fn checkout_skip_list_matches_the_tool() {
         }
     }
 
-    // The root form under a union mode over a destination that already holds a
-    // file: the pruned root writes nothing and the destination stands.
+    // The root form under a union mode, over a destination that already holds
+    // a file. The pruned root writes nothing, and the destination does not
+    // change.
     let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo-root-union", &tree);
     let option = skip_list_option(base, "skip-root.txt", b"/\n");
     let port_dest = base.join("port-root-union");
@@ -26952,11 +27312,15 @@ fn checkout_skip_list_matches_the_tool() {
     );
 }
 
-/// The line syntax of a `--skip-list` file: blank lines, a final line with no
-/// newline, duplicates, a line that matches nothing, and the absence of a
-/// comment syntax.
+/// The line syntax of a `--skip-list` file:
 ///
-/// Carries `checkout/skip-list-line-syntax`.
+/// - blank lines
+/// - a final line with no newline
+/// - duplicates
+/// - a line that matches nothing
+/// - the absence of a comment syntax
+///
+/// The test carries `checkout/skip-list-line-syntax`.
 #[test]
 fn checkout_skip_list_line_syntax_matches_the_tool() {
     if !ostree_available() {
@@ -26994,12 +27358,12 @@ fn checkout_skip_list_line_syntax_matches_the_tool() {
     }
 }
 
-/// The refusals a `--skip-list` file carries, and the last-value-wins rule a
-/// repeated option takes. The port reproduces the tool's four wordings, so the
-/// message compares as well as the status.
+/// The refusals of a `--skip-list` file, and the rule that the last value of a
+/// repeated option wins. ostrya gives the four messages of the `ostree`
+/// command, so the test compares the message and the exit status.
 ///
-/// Carries `checkout/skip-list-invalid-utf8`, `checkout/skip-list-unreadable`,
-/// and `checkout/skip-list-last-value-wins`.
+/// The test carries `checkout/skip-list-invalid-utf8`,
+/// `checkout/skip-list-unreadable`, and `checkout/skip-list-last-value-wins`.
 #[test]
 fn checkout_skip_list_refusals_match_the_tool() {
     if !ostree_available() {
@@ -27046,7 +27410,7 @@ fn checkout_skip_list_refusals_match_the_tool() {
         );
     }
 
-    // A repeated option takes the last value in both.
+    // In both commands, the last value of a repeated option wins.
     let first = skip_list_option(base, "first.txt", b"/f1\n");
     let second = skip_list_option(base, "second.txt", b"/link\n");
     let port_dest = base.join("port-last-wins");
@@ -27065,10 +27429,11 @@ fn checkout_skip_list_refusals_match_the_tool() {
     );
 }
 
-/// A `--skip-list` under a `--subpath`: the list is rooted at the subpath, and
-/// no spelling reaches the single object a file subpath names.
+/// A `--skip-list` under a `--subpath`. The paths of the list start at the
+/// subpath. No form of entry prunes the single object that a file subpath
+/// names.
 ///
-/// Carries `checkout/skip-list-under-a-subpath` and
+/// The test carries `checkout/skip-list-under-a-subpath` and
 /// `checkout/skip-list-does-not-reach-a-file-subpath`.
 #[test]
 fn checkout_skip_list_under_a_subpath_matches_the_tool() {
@@ -27108,10 +27473,10 @@ fn checkout_skip_list_under_a_subpath_matches_the_tool() {
     }
 }
 
-/// The filter decides a marker's own tree path ahead of the whiteout decision,
-/// and it does not decide the opaque clear.
+/// The filter acts on the tree path of a marker before the whiteout decision.
+/// The filter does not control the opaque clear.
 ///
-/// Carries `checkout/skip-list-precedes-a-whiteout-marker` and
+/// The test carries `checkout/skip-list-precedes-a-whiteout-marker` and
 /// `checkout/skip-list-does-not-reach-the-opaque-clear`.
 #[test]
 fn checkout_skip_list_precedes_the_whiteout_decision() {
@@ -27173,10 +27538,11 @@ fn checkout_skip_list_precedes_the_whiteout_decision() {
     }
 }
 
-/// `--skip-list` joins the set of options that make the tool drop
-/// `--allow-noent`, and the two batch options join the set that keeps it.
+/// `--skip-list` is one of the options that make the `ostree` command ignore
+/// `--allow-noent`. The two batch options are in the set that keeps the
+/// switch.
 ///
-/// Carries `checkout/skip-list-drops-allow-noent`.
+/// The test carries `checkout/skip-list-drops-allow-noent`.
 #[test]
 fn checkout_skip_list_drops_allow_noent_in_the_tool() {
     if !ostree_available() {
@@ -27189,8 +27555,8 @@ fn checkout_skip_list_drops_allow_noent_in_the_tool() {
     let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
     let option = skip_list_option(base, "skip.txt", b"/f1\n");
 
-    // The divergence: the tool ignores the switch while the line holds a
-    // readable `--skip-list`, and the port honors it.
+    // The divergence: if the command line holds a readable `--skip-list`,
+    // `ostree` ignores the switch and ostrya honors it.
     let port_dest = base.join("port-skip");
     let tool_dest = base.join("tool-skip");
     let (port, tool) = checkout_pair(
@@ -27205,7 +27571,7 @@ fn checkout_skip_list_drops_allow_noent_in_the_tool() {
     assert!(!port_dest.exists(), "the port created a destination");
     assert!(!tool_dest.exists(), "the tool created a destination");
 
-    // `--from-file` keeps the switch on both sides.
+    // Both commands keep the switch under `--from-file`.
     let empty = base.join("empty.batch");
     std::fs::write(&empty, b"").unwrap();
     let from_file = format!("--from-file={}", empty.display());
@@ -27221,7 +27587,8 @@ fn checkout_skip_list_drops_allow_noent_in_the_tool() {
     assert_eq!(port.status.code(), Some(0), "the port exits 0");
     assert_eq!(tool.status.code(), Some(0), "the tool exits 0");
 
-    // `--from-stdin` keeps it too, the pair's own subpath naming nothing.
+    // Both commands also keep it under `--from-stdin`. The subpath of the pair
+    // names nothing.
     let record = format!("{rev}\0/nope\0").into_bytes();
     let port_dest = base.join("port-from-stdin");
     let tool_dest = base.join("tool-from-stdin");
@@ -27237,11 +27604,15 @@ fn checkout_skip_list_drops_allow_noent_in_the_tool() {
     assert!(!port_dest.exists() && !tool_dest.exists());
 }
 
-/// The record format of a batch stream: NUL separation, an unterminated final
-/// record, an empty record ending the stream, the refspec's line-terminator
-/// strip, and the subpath record's lack of one.
+/// The record format of a batch stream:
 ///
-/// Carries `checkout/batch-pair-format`,
+/// - NUL separation
+/// - a final record with no terminator
+/// - an empty record that ends the stream
+/// - the strip of a line terminator from the refspec record
+/// - no such strip for the subpath record
+///
+/// The test carries `checkout/batch-pair-format`,
 /// `checkout/batch-odd-trailing-refspec`,
 /// `checkout/batch-empty-record-ends-the-stream`, and
 /// `checkout/batch-refspec-newline-strip`.
@@ -27256,8 +27627,8 @@ fn checkout_batch_pairs_match_the_tool() {
     build_skip_tree(&tree);
     let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
 
-    // Each stream is built from the branch name, so the records the test feeds
-    // are the ones a caller would write.
+    // Each template gets the commit checksum in place of each `@`, so the test
+    // feeds the records that a caller writes.
     let plain: &[&str] = &["-U", "--from-stdin"];
     let union: &[&str] = &["-U", "--from-stdin", "--union"];
     let cases: &[(&str, &[u8], &[&str])] = &[
@@ -27304,11 +27675,11 @@ fn checkout_batch_pairs_match_the_tool() {
     }
 }
 
-/// The destination a batch invocation writes into: the first positional, with
-/// every later one ignored by the tool, and every pair writing into that one
-/// destination.
+/// The destination of a batch invocation. It is the first positional, and the
+/// `ostree` command ignores each later positional. Each pair writes into that
+/// one destination.
 ///
-/// Carries `checkout/batch-destination-is-the-first-positional`,
+/// The test carries `checkout/batch-destination-is-the-first-positional`,
 /// `checkout/batch-pairs-share-one-destination`, and
 /// `checkout/batch-stops-at-the-first-failing-pair`.
 #[test]
@@ -27323,7 +27694,7 @@ fn checkout_batch_destination_matches_the_tool() {
     let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
     let stream = format!("{rev}\0/a\0").into_bytes();
 
-    // The first positional is the destination, and the tool ignores the second.
+    // The first positional is the destination, and `ostree` ignores the second.
     let repo_arg = format!("--repo={}", repo.display());
     let port_dest = base.join("port-first");
     let tool_dest = base.join("tool-first");
@@ -27359,8 +27730,8 @@ fn checkout_batch_destination_matches_the_tool() {
         "the second positional is not written to",
     );
 
-    // Two pairs over one destination without a union option: the second is a
-    // collision, and the first pair's output stays.
+    // Two pairs over one destination with no union option: the second pair
+    // collides, and the output of the first pair stays.
     let stream = format!("{rev}\0/a\0{rev}\0/d\0").into_bytes();
     let port_dest = base.join("port-collide");
     let tool_dest = base.join("tool-collide");
@@ -27383,7 +27754,7 @@ fn checkout_batch_destination_matches_the_tool() {
 
 /// The two batch sources, their precedence, and the repeated forms.
 ///
-/// Carries `checkout/from-stdin-wins-over-from-file` and
+/// The test carries `checkout/from-stdin-wins-over-from-file` and
 /// `checkout/from-file-last-value-wins`.
 #[test]
 fn checkout_batch_sources_and_precedence_match_the_tool() {
@@ -27404,7 +27775,7 @@ fn checkout_batch_sources_and_precedence_match_the_tool() {
     let from_second = format!("--from-file={}", second.display());
     let stdin_stream = format!("{rev}\0/d\0").into_bytes();
 
-    // `--from-file` alone, read with no stdin content behind it.
+    // `--from-file` alone, with an empty standard input.
     let port_dest = base.join("port-file");
     let tool_dest = base.join("tool-file");
     let (port, tool) =
@@ -27412,7 +27783,7 @@ fn checkout_batch_sources_and_precedence_match_the_tool() {
     assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "from-file");
     assert!(port_dest.join("f2").exists(), "the file's pair ran");
 
-    // Standard input wins over a file whatever the command-line order.
+    // Standard input wins over a file in each order on the command line.
     for (case, options) in [
         ("file-then-stdin", vec!["-U", &from_first, "--from-stdin"]),
         ("stdin-then-file", vec!["-U", "--from-stdin", &from_first]),
@@ -27425,7 +27796,7 @@ fn checkout_batch_sources_and_precedence_match_the_tool() {
         assert!(port_dest.join("f5").exists(), "{case}: stdin decided");
     }
 
-    // A repeated `--from-file` takes the last value.
+    // If `--from-file` is repeated, the last value wins.
     let port_dest = base.join("port-file-twice");
     let tool_dest = base.join("tool-file-twice");
     let (port, tool) = checkout_batch_pair(
@@ -27438,7 +27809,7 @@ fn checkout_batch_sources_and_precedence_match_the_tool() {
     assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "from-file-twice");
     assert!(port_dest.join("f5").exists(), "the second file decided");
 
-    // Standard input is left unread where neither switch is given.
+    // If neither switch is given, the command does not read standard input.
     let port_dest = base.join("port-unread");
     let tool_dest = base.join("tool-unread");
     let repo_arg = format!("--repo={}", repo.display());
@@ -27468,10 +27839,13 @@ fn checkout_batch_sources_and_precedence_match_the_tool() {
     assert!(port_dest.join("f1").exists(), "the whole tree was written");
 }
 
-/// The refusals a batch invocation carries: a `--from-file` that does not open,
-/// an unresolvable refspec record, and the stream's own stopping rule.
+/// The refusals of a batch invocation:
 ///
-/// Carries `checkout/from-file-open-failures` and
+/// - a `--from-file` that does not open
+/// - a refspec record that does not resolve
+/// - the stop rule of the stream
+///
+/// The test carries `checkout/from-file-open-failures` and
 /// `checkout/batch-allow-noent-skips-a-pair`.
 #[test]
 fn checkout_batch_refusals_match_the_tool() {
@@ -27489,8 +27863,8 @@ fn checkout_batch_refusals_match_the_tool() {
     std::fs::write(&unreadable, b"").unwrap();
     chmod_to(&unreadable, 0o000);
 
-    // The three open failures. Both exit 1 and neither creates a destination;
-    // the words part, which `cli-surface.md` records.
+    // The three open failures. Both commands exit 1, and neither creates a
+    // destination. The messages differ. This is a recorded divergence.
     for (case, path) in [
         ("absent", base.join("nosuch")),
         ("directory", base.join("adir")),
@@ -27513,8 +27887,8 @@ fn checkout_batch_refusals_match_the_tool() {
         );
     }
 
-    // A refspec record that does not resolve ends the run before anything is
-    // written, and the port reproduces the tool's wording there.
+    // A refspec record that does not resolve ends the run before the command
+    // writes anything. ostrya gives the message of `ostree` for this failure.
     let port_dest = base.join("port-badref");
     let tool_dest = base.join("tool-badref");
     let (port, tool) = checkout_batch_pair(
@@ -27532,8 +27906,8 @@ fn checkout_batch_refusals_match_the_tool() {
     );
     assert!(!port_dest.exists() && !tool_dest.exists());
 
-    // `--allow-noent` skips one pair and the stream continues; without it the
-    // run stops at the first failing pair.
+    // With `--allow-noent`, the run skips one pair and continues the stream.
+    // Without the switch, the run stops at the first failing pair.
     for (case, options, expected) in [
         (
             "allow-noent-first",
@@ -27566,10 +27940,11 @@ fn checkout_batch_refusals_match_the_tool() {
     assert!(port_dest.join("f5").exists(), "the good pair ran");
 }
 
-/// `--subpath` is dropped under a batch option, and the two composefs switches
-/// are taken with one, each pair writing the image of its own revision.
+/// A batch option makes the command ignore `--subpath`. Both composefs
+/// switches work with a batch option, and each pair writes the image of its
+/// own revision.
 ///
-/// Carries `checkout/batch-ignores-subpath`.
+/// The test carries `checkout/batch-ignores-subpath`.
 #[test]
 fn checkout_batch_ignores_subpath_and_takes_composefs() {
     if !ostree_available() {
@@ -27582,7 +27957,8 @@ fn checkout_batch_ignores_subpath_and_takes_composefs() {
     let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
     let stream = format!("{rev}\0/a\0").into_bytes();
 
-    // The pair's own subpath decides, and `--subpath` decides nothing.
+    // The subpath of the pair controls the checkout, and `--subpath` has no
+    // effect.
     let port_dest = base.join("port-subpath");
     let tool_dest = base.join("tool-subpath");
     let (port, tool) = checkout_batch_pair(
@@ -27598,11 +27974,11 @@ fn checkout_batch_ignores_subpath_and_takes_composefs() {
         "the pair's subpath is the one that decided",
     );
 
-    // Both composefs switches take a batch option, and the image is the one
-    // the pair's revision produces. The tool writes the image through a
-    // temporary file it creates in the working directory and links to the
-    // destination, so both implementations run from the directory the
-    // destinations sit in.
+    // Both composefs switches work with a batch option, and the image is the
+    // image of the revision of the pair. The `ostree` command writes the image
+    // to a temporary file in the working directory, and then links the file to
+    // the destination. For this reason, both commands run from the directory
+    // that holds the destinations.
     let repo_arg = format!("--repo={}", repo.display());
     for (case, switch) in [
         ("composefs", "--composefs"),
@@ -27642,8 +28018,8 @@ fn checkout_batch_ignores_subpath_and_takes_composefs() {
         );
     }
 
-    // A `--skip-list` alongside a composefs switch is refused in both, under
-    // the tool's own words, with no destination written.
+    // Both commands refuse a `--skip-list` together with a composefs switch,
+    // with the message of `ostree`, and write no destination.
     let option = skip_list_option(base, "skip.txt", b"/f1\n");
     let port_dest = base.join("port-composefs-skip");
     let tool_dest = base.join("tool-composefs-skip");
@@ -27663,16 +28039,18 @@ fn checkout_batch_ignores_subpath_and_takes_composefs() {
     assert!(!port_dest.exists() && !tool_dest.exists());
 }
 
-/// A batch stream costs the bytes it carries and a constant.
+/// A batch stream uses the memory of its bytes and a constant.
 ///
-/// The stream is read once into one buffer, and the record scan stops at the
-/// record that ends the stream, so the records past that one cost nothing. The
-/// bound is pinned by running the largest stream the port accepts -- 128
-/// mebibytes, every byte a NUL, so every byte is a record boundary and the
-/// first record ends the stream -- under an address-space limit of one
-/// gibibyte. A run holding a slice of every record needs 16 bytes per input
-/// byte, which is two gibibytes of slices on top of the buffer, so it cannot
-/// finish under that limit.
+/// ostrya reads the stream once into one buffer. The record scan stops at the
+/// record that ends the stream, so the records after that one cost nothing.
+///
+/// The test runs the largest stream that ostrya accepts under an address-space
+/// limit of one gibibyte. The stream is 128 mebibytes of NUL bytes. Each byte
+/// is a record boundary, and the first record ends the stream.
+///
+/// A run that keeps a slice of each record needs 16 bytes for each input byte.
+/// That is two gibibytes of slices in addition to the buffer, so such a run
+/// cannot finish under the limit.
 #[test]
 fn checkout_batch_stream_holds_no_more_than_the_stream() {
     let tmp = TmpDir::new("checkout-batch-bound");
@@ -27716,11 +28094,11 @@ fn checkout_batch_stream_holds_no_more_than_the_stream() {
     assert!(!dest.exists(), "a stream carrying no pair creates nothing");
 }
 
-/// The refusals the command line carries into one checkout stand inside the
-/// scope of one checkout, so a batch stream carrying no pair reaches none of
-/// them and a populated stream reaches every one of them.
+/// The refusals that the command line gives to one checkout apply inside the
+/// scope of one checkout. A batch stream with no pair causes none of them, and
+/// a stream with a pair causes each of them.
 ///
-/// Carries `checkout/batch-refusals-stand-inside-the-pair-scope` and
+/// The test carries `checkout/batch-refusals-stand-inside-the-pair-scope` and
 /// `checkout/batch-empty-destination`.
 #[test]
 fn checkout_batch_refusals_stand_inside_the_pair_scope() {
@@ -27734,9 +28112,9 @@ fn checkout_batch_refusals_stand_inside_the_pair_scope() {
     let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
     let absent = format!("--skip-list={}", base.join("nosuch").display());
 
-    // Seven command lines, each carrying one refusal. The first three are the
-    // union-option pairs, the fourth the `--union-identical` requirement, and
-    // the last three the composefs incompatibility.
+    // Seven command lines, each with one refusal. The first three are the pairs
+    // of union options. The fourth is the requirement of `--union-identical`.
+    // The last three are the composefs incompatibility.
     let lines: &[(&str, &[&str])] = &[
         ("union-and-union-add", &["--union", "--union-add"]),
         (
@@ -27758,8 +28136,8 @@ fn checkout_batch_refusals_stand_inside_the_pair_scope() {
     let populated = format!("{rev}\0/a\0").into_bytes();
 
     for (case, refusal) in lines {
-        // An empty stream carries no pair, so neither implementation makes the
-        // refusal and neither creates a destination.
+        // An empty stream holds no pair, so neither command refuses, and
+        // neither command creates a destination.
         let mut options = vec!["--from-stdin"];
         options.extend(refusal.iter().copied());
         let port_dest = base.join(format!("port-empty-{case}"));
@@ -27769,8 +28147,8 @@ fn checkout_batch_refusals_stand_inside_the_pair_scope() {
         assert_eq!(tool.status.code(), Some(0), "{case}: the tool exits 0");
         assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, case);
 
-        // A stream carrying one pair reaches the refusal in both, at exit 1
-        // with no destination created.
+        // With a stream of one pair, both commands refuse with exit 1 and
+        // create no destination.
         let port_dest = base.join(format!("port-pair-{case}"));
         let tool_dest = base.join(format!("tool-pair-{case}"));
         let (port, tool) = checkout_batch_pair(&repo, &options, &populated, &port_dest, &tool_dest);
@@ -27782,11 +28160,13 @@ fn checkout_batch_refusals_stand_inside_the_pair_scope() {
         );
     }
 
-    // A destination value of no bytes takes the same rule: an empty stream
-    // exits 0 and a populated one is refused, with nothing written either way.
-    // Both implementations run from a directory of their own, which the walk
-    // then compares, since an accepted empty value would write the tree into
-    // the working directory.
+    // The same rule applies to an empty destination value. An empty stream
+    // exits 0, and a stream with a pair is refused. Neither run writes
+    // anything.
+    //
+    // Each command runs from its own directory, and the test compares the two
+    // directories. If a command accepts the empty value, it writes the tree
+    // into the working directory.
     for (case, stream, expected) in [("empty-stream", &b""[..], 0), ("one-pair", &populated, 1)] {
         let port_cwd = base.join(format!("port-cwd-{case}"));
         let tool_cwd = base.join(format!("tool-cwd-{case}"));
@@ -27818,10 +28198,11 @@ fn checkout_batch_refusals_stand_inside_the_pair_scope() {
     }
 }
 
-/// A pruned root reads nothing of the destination path, so a destination under
-/// a directory that does not exist is checked out at exit 0.
+/// If the root is pruned, the checkout does not read the destination path. A
+/// destination under a directory that does not exist then checks out at exit
+/// 0.
 ///
-/// Carries `checkout/skip-list-root-needs-no-destination-parent`.
+/// The test carries `checkout/skip-list-root-needs-no-destination-parent`.
 #[test]
 fn checkout_skip_list_root_needs_no_destination_parent() {
     if !ostree_available() {
@@ -27845,7 +28226,7 @@ fn checkout_skip_list_root_needs_no_destination_parent() {
         "neither implementation created the destination's parent",
     );
 
-    // The batch path, the pair's own subpath rooting the list.
+    // The batch path. The subpath of the pair is the root of the list.
     let stream = format!("{rev}\0/a\0").into_bytes();
     let port_dest = base.join("port-batch-nodir").join("dest");
     let tool_dest = base.join("tool-batch-nodir").join("dest");
@@ -27863,7 +28244,7 @@ fn checkout_skip_list_root_needs_no_destination_parent() {
         "neither implementation created the destination's parent",
     );
 
-    // The control: with no list the same destination is refused in both.
+    // The control: with no list, both commands refuse the same destination.
     let port_dest = base.join("port-control").join("dest");
     let tool_dest = base.join("tool-control").join("dest");
     let (port, tool) = checkout_pair(&repo, &["-U"], &rev, &port_dest, &tool_dest);
@@ -27871,10 +28252,11 @@ fn checkout_skip_list_root_needs_no_destination_parent() {
     assert_eq!(tool.status.code(), Some(1), "the tool refuses the control");
 }
 
-/// An empty record in the subpath position is an empty subpath value, which the
-/// two implementations read differently.
+/// An empty record in the subpath position is an empty subpath value. The
+/// `ostree` command refuses this value, and ostrya checks out the whole tree.
+/// This is a recorded divergence.
 ///
-/// Carries `checkout/batch-empty-subpath-record`.
+/// The test carries `checkout/batch-empty-subpath-record`.
 #[test]
 fn checkout_batch_empty_subpath_record_diverges_from_the_tool() {
     if !ostree_available() {
@@ -27919,15 +28301,13 @@ fn checkout_batch_empty_subpath_record_diverges_from_the_tool() {
 
 // --- checkout: the hardlink requirement and the directory-mode mask ----------
 //
-// `-H/--require-hardlinks` refuses an entry the checkout would materialize by a
-// copy, `-M/--bareuseronly-dirs` reduces every directory the checkout creates
-// to `mode & 0775`, and `--disable-cache` suppresses the uncompressed-object
-// cache the tool keeps. The facts are recorded in `../docs/format-reference.md`,
-// "Checkout", and the cells these tests carry are in
-// `../docs/conformance/m10-cli-behavior.matrix`.
+// `-H/--require-hardlinks` refuses an entry that the checkout materializes as a
+// copy. `-M/--bareuseronly-dirs` reduces each directory that the checkout
+// creates to `mode & 0775`. `--disable-cache` suppresses the
+// uncompressed-object cache that the `ostree` command keeps.
 
-/// The four repository modes the tool carries, in the order the sweeps take
-/// them.
+/// The four repository modes of the `ostree` command, in the order of the
+/// sweeps.
 const HARDLINK_MODES: [(&str, RepoMode); 4] = [
     ("archive", RepoMode::Archive),
     ("bare", RepoMode::Bare),
@@ -27935,8 +28315,9 @@ const HARDLINK_MODES: [(&str, RepoMode); 4] = [
     ("bare-user-only", RepoMode::BareUserOnly),
 ];
 
-/// Whether `-H` refuses a regular file of non-zero length in this repository
-/// mode under this checkout mode, as the tool was measured to.
+/// Returns `true` if `-H` refuses a regular file of non-zero length in this
+/// repository mode and checkout mode. The table is measured on the `ostree`
+/// command.
 fn refuses_regular(mode: RepoMode, user_mode: bool) -> bool {
     !matches!(
         (mode, user_mode),
@@ -27944,8 +28325,9 @@ fn refuses_regular(mode: RepoMode, user_mode: bool) -> bool {
     )
 }
 
-/// Whether `-H` refuses a symlink in this repository mode under this checkout
-/// mode, as the tool was measured to. The set is not the regular-file set.
+/// Returns `true` if `-H` refuses a symlink in this repository mode and
+/// checkout mode. The table is measured on the `ostree` command. It differs
+/// from the table of `refuses_regular`.
 fn refuses_symlink(mode: RepoMode, user_mode: bool) -> bool {
     matches!(
         (mode, user_mode),
@@ -27953,7 +28335,7 @@ fn refuses_symlink(mode: RepoMode, user_mode: bool) -> bool {
     )
 }
 
-/// Create a repository of `mode` at `base/name`, with no commit.
+/// Creates a repository of `mode` at `base/name`, with no commit.
 fn hardlink_repo(base: &Path, mode: RepoMode, name: &str) -> PathBuf {
     let repo = base.join(name);
     block_on(async {
@@ -27962,8 +28344,8 @@ fn hardlink_repo(base: &Path, mode: RepoMode, name: &str) -> PathBuf {
     repo
 }
 
-/// Commit `tree` into `repo` under `branch` at a fixed timestamp, keeping the
-/// tree's own modes, and return the commit checksum.
+/// Commits `tree` into `repo` under `branch` at a fixed timestamp, and returns
+/// the commit checksum. The commit keeps the modes of the tree.
 fn commit_verbatim(repo: &Path, branch: &str, tree: &Path) -> String {
     ostrya(
         &[
@@ -27984,9 +28366,9 @@ fn commit_verbatim(repo: &Path, branch: &str, tree: &Path) -> String {
     .stdout_trimmed()
 }
 
-/// The corpus the `-H` sweeps check out: a regular file, a zero-length regular
-/// file, a symlink, and a directory holding one more regular file. It reaches
-/// every refusal the tool makes.
+/// Builds the corpus that the `-H` sweeps check out. The corpus holds a regular
+/// file, a zero-length regular file, a symlink, and a directory with one more
+/// regular file. The corpus causes each refusal of the `ostree` command.
 fn build_hardlink_tree(dir: &Path) {
     std::fs::create_dir_all(dir.join("d")).unwrap();
     std::fs::write(dir.join("f"), b"f-content\n").unwrap();
@@ -28000,8 +28382,8 @@ fn build_hardlink_tree(dir: &Path) {
     chmod_to(dir, 0o755);
 }
 
-/// The four single-shape trees the per-entry sweep needs, each holding one
-/// entry of one shape, under `base/shape-<name>`.
+/// Builds the four single-shape trees of the per-entry sweep, under
+/// `base/shape-<name>`. Each tree holds one entry of one shape.
 fn build_shape_trees(base: &Path) {
     std::fs::create_dir_all(base.join("shape-dir/d")).unwrap();
     chmod_to(&base.join("shape-dir/d"), 0o755);
@@ -28018,8 +28400,8 @@ fn build_shape_trees(base: &Path) {
     }
 }
 
-/// The inode numbers of every loose object of `repo`, so a destination entry
-/// can be told to be the object's own inode without naming a checksum.
+/// Returns the inode numbers of each loose object of `repo`. A test can then
+/// find if a destination entry is the inode of an object, with no checksum.
 fn object_inodes(repo: &Path) -> std::collections::HashSet<u64> {
     let mut out = std::collections::HashSet::new();
     let objects = repo.join("objects");
@@ -28037,10 +28419,13 @@ fn object_inodes(repo: &Path) -> std::collections::HashSet<u64> {
     out
 }
 
-/// Each non-directory of a checked-out tree, rendered as its path, its link
-/// count, and whether its inode is one of `repo`'s loose objects. This is what
-/// states a hardlink without naming a checksum. Each implementation is given
-/// its own copy of the repository, so the counts are its own.
+/// Describes each entry of a checked-out tree. A directory shows as its path
+/// and `dir`. Each other entry shows as its path, its link count, and a
+/// `shares-object` flag. The flag is `yes` if the inode is a loose object of
+/// `repo`. An absent `root` gives one `<no destination>` line.
+///
+/// The lines show a hardlink with no checksum. Each command gets its own copy
+/// of the repository, so each command has its own link counts.
 fn describe_tree_with_links(root: &Path, repo: &Path) -> Vec<String> {
     fn walk(
         dir: &Path,
@@ -28083,8 +28468,8 @@ fn describe_tree_with_links(root: &Path, repo: &Path) -> Vec<String> {
     out
 }
 
-/// Run `checkout` in the port alone, for the cases where each implementation
-/// reads a repository of its own.
+/// Runs `checkout` in ostrya alone, for the cases where each command reads its
+/// own repository.
 fn checkout_port(repo: &Path, options: &[&str], rev: &str, dest: &Path) -> Run {
     let repo_arg = format!("--repo={}", repo.display());
     let dest_path = dest.display().to_string();
@@ -28095,7 +28480,7 @@ fn checkout_port(repo: &Path, options: &[&str], rev: &str, dest: &Path) -> Run {
     ostrya(&args, None, &[])
 }
 
-/// The same in the tool alone.
+/// Runs the same `checkout` in the `ostree` command alone.
 fn checkout_tool(repo: &Path, options: &[&str], rev: &str, dest: &Path) -> Run {
     let repo_arg = format!("--repo={}", repo.display());
     let dest_path = dest.display().to_string();
@@ -28106,13 +28491,13 @@ fn checkout_tool(repo: &Path, options: &[&str], rev: &str, dest: &Path) -> Run {
     ostree(&args)
 }
 
-/// `-H` over the whole corpus, in every repository mode and under both checkout
-/// modes: the two implementations reach the same exit status and, where both
-/// take it, the same destination tree. The refusal stands ahead of the
-/// destination disposition, so an entry a union mode would keep or skip is
-/// refused all the same.
+/// `-H` over the whole corpus, in each repository mode and in both checkout
+/// modes. Both commands give the same exit status. If both commands accept the
+/// line, they write the same destination tree. The refusal comes before the
+/// destination disposition, so `-H` refuses an entry that a union mode keeps
+/// or skips.
 ///
-/// Carries `checkout/require-hardlinks-in-archive`,
+/// The test carries `checkout/require-hardlinks-in-archive`,
 /// `checkout/require-hardlinks-in-bare`,
 /// `checkout/require-hardlinks-in-bare-under-user-mode`,
 /// `checkout/require-hardlinks-in-bare-user-without-user-mode`,
@@ -28151,9 +28536,9 @@ fn checkout_require_hardlinks_refusals_match_the_tool() {
                 String::from_utf8_lossy(&port.stderr),
             );
 
-            // The refusal stands ahead of the destination disposition: an
-            // entry `--union-add` would keep and an entry `--union-identical`
-            // would call identical are refused all the same.
+            // The refusal comes before the destination disposition. `-H`
+            // refuses an entry that `--union-add` keeps, and an entry that
+            // `--union-identical` takes as identical.
             for union in ["--union-add", "--union-identical"] {
                 let mut options = vec!["-H", union];
                 if user_mode {
@@ -28182,13 +28567,14 @@ fn checkout_require_hardlinks_refusals_match_the_tool() {
     }
 }
 
-/// `-H` decides per entry, not per repository mode. A directory and a
-/// zero-length regular file never refuse, a regular file of non-zero length
-/// refuses wherever the mode pair gives a copy, and a symlink follows a table
-/// of its own. Thirty-two cells, four shapes over four repository modes under
-/// both checkout modes.
+/// `-H` decides for each entry separately. A directory and a zero-length
+/// regular file never refuse. A regular file of non-zero length refuses if the
+/// mode pair gives a copy. A symlink has its own table.
 ///
-/// Carries `checkout/require-hardlinks-refuses-at-the-entry`.
+/// The test has 32 cells: four shapes, four repository modes, and two checkout
+/// modes.
+///
+/// The test carries `checkout/require-hardlinks-refuses-at-the-entry`.
 #[test]
 fn checkout_require_hardlinks_refuses_at_the_entry() {
     if !ostree_available() {
@@ -28200,8 +28586,8 @@ fn checkout_require_hardlinks_refuses_at_the_entry() {
 
     for (mode_name, mode) in HARDLINK_MODES {
         let repo = hardlink_repo(base, mode, &format!("repo-{mode_name}"));
-        // Each shape is committed once per repository mode; the two checkout
-        // modes read the same four commits.
+        // The test commits each shape once in each repository mode. The two
+        // checkout modes read the same four commits.
         let shapes: [(&str, String); 4] = ["dir", "empty", "one", "sym"].map(|shape| {
             (
                 shape,
@@ -28237,11 +28623,11 @@ fn checkout_require_hardlinks_refuses_at_the_entry() {
     }
 }
 
-/// The refusal is raised where the entry is materialized, so a walk that
-/// refuses part-way through leaves the entries it already wrote. Both
-/// implementations leave the same partial destination.
+/// The refusal occurs where the checkout materializes the entry, so a walk that
+/// refuses part way keeps the entries that it already wrote. Both commands
+/// leave the same partial destination.
 ///
-/// Carries `checkout/require-hardlinks-leaves-a-partial-destination`.
+/// The test carries `checkout/require-hardlinks-leaves-a-partial-destination`.
 #[test]
 fn checkout_require_hardlinks_leaves_the_same_destination_on_a_refusal() {
     if !ostree_available() {
@@ -28277,11 +28663,11 @@ fn checkout_require_hardlinks_leaves_the_same_destination_on_a_refusal() {
     );
 }
 
-/// Where both implementations take `-H`, both hardlink the same entries out of
-/// their own repository and leave the same entries on inodes of their own. A
-/// zero-length regular file is on neither side's object inode.
+/// If both commands accept `-H`, both hardlink the same entries from their own
+/// repository. Both commands write the same other entries to new inodes.
+/// Neither command puts a zero-length regular file on an object inode.
 ///
-/// Carries `checkout/require-hardlinks-in-bare`,
+/// The test carries `checkout/require-hardlinks-in-bare`,
 /// `checkout/require-hardlinks-in-bare-user-under-user-mode`, and
 /// `checkout/require-hardlinks-in-bare-user-only`.
 #[test]
@@ -28330,14 +28716,17 @@ fn checkout_require_hardlinks_hardlinks_the_same_objects() {
     }
 }
 
-/// A destination directory on another filesystem than the repository is
-/// refused before any entry of it is written, whatever the subtree holds. The
-/// destination root reaches the refusal and so does every directory below it,
-/// which a destination symlink into the second filesystem puts under a union
-/// mode. A single file or symlink target takes no such check and refuses at
-/// the link itself, so a zero-length file is written there at exit 0.
+/// `-H` refuses a destination directory on a filesystem other than that of the
+/// repository. The refusal comes before the command writes an entry into the
+/// directory, for each shape of the subtree. The refusal applies to the
+/// destination root and to each directory under it.
 ///
-/// Carries `checkout/require-hardlinks-across-devices`.
+/// Under a union mode, a destination symlink into the second filesystem puts
+/// such a directory under the root. A single file or symlink target gets no
+/// such check and refuses at the link itself. A zero-length file target is
+/// then written at exit 0.
+///
+/// The test carries `checkout/require-hardlinks-across-devices`.
 #[test]
 fn checkout_require_hardlinks_refuses_across_devices() {
     if !ostree_available() {
@@ -28352,11 +28741,11 @@ fn checkout_require_hardlinks_refuses_across_devices() {
     let repo = hardlink_repo(base, RepoMode::Bare, "repo");
     let rev = commit_verbatim(&repo, BRANCH, &tree);
 
-    // A second filesystem is needed, and `/dev/shm` is one where the host
-    // gives it. A destination is needed to run anything at all, so an
-    // unwritable `/dev/shm` skips here; whether it is a second filesystem is
-    // read after the first assertion fails, so a host that has one cannot
-    // pass by skipping.
+    // The test needs a second filesystem. `/dev/shm` is one on a host that has
+    // it. The test needs a destination to run at all, so it skips if
+    // `/dev/shm` is not writable. The test reads the device of `/dev/shm` only
+    // if the first check fails, so a host with a second filesystem cannot pass
+    // by a skip.
     let other = Path::new("/dev/shm").join(format!("ostrya-cli-xdev-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&other);
     if std::fs::create_dir_all(&other).is_err() {
@@ -28387,18 +28776,18 @@ fn checkout_require_hardlinks_refuses_across_devices() {
             "the {who} left the destination directory with an entry in it",
         );
     }
-    // Without `-H` the same destination is written whole, so the refusal is
-    // the switch's and not the filesystem's.
+    // Without `-H`, the command writes a destination on the second filesystem
+    // in full. This shows that the switch causes the refusal.
     let plain = other.join("plain");
     let (port, tool) = checkout_pair(&repo, &[], &rev, &plain, &other.join("plain-tool"));
     port.ok();
     tool.ok();
     assert!(plain.join("d").is_dir());
 
-    // A destination directory below the root: the tree's `a` is a directory,
-    // the destination's `a` is a symlink into the second filesystem, and a
-    // union mode follows it. Every subtree shape refuses, a subtree of one
-    // empty directory among them, and nothing of it is written.
+    // A destination directory under the root. In the tree, `a` is a directory.
+    // In the destination, `a` is a symlink into the second filesystem, and a
+    // union mode follows it. Each subtree shape refuses, also a subtree of one
+    // empty directory. The command writes nothing of the subtree.
     let shapes: [DestBuilder; 5] = [
         ("dir", |d| {
             std::fs::create_dir_all(d.join("a/sub")).unwrap();
@@ -28455,8 +28844,8 @@ fn checkout_require_hardlinks_refuses_across_devices() {
         }
     }
 
-    // A single file or symlink target reaches no directory walk, so it takes
-    // no up-front check: the zero-length file is written and the other two
+    // A single file or symlink target has no directory walk, so it gets no
+    // check before the walk. The zero-length file is written, and the other two
     // shapes are refused where the link fails.
     for (shape, subpath, expected) in [
         ("empty", "--subpath=/a/e", 0),
@@ -28478,10 +28867,10 @@ fn checkout_require_hardlinks_refuses_across_devices() {
     let _ = std::fs::remove_dir_all(&other);
 }
 
-/// A pruned entry is never materialized, so it never refuses; and the gate
-/// follows a `--subpath` into the subtree it selects.
+/// A pruned entry is never materialized, so it never refuses. The `-H` gate
+/// follows a `--subpath` into the subtree that it selects.
 ///
-/// Carries `checkout/require-hardlinks-refuses-at-the-entry`.
+/// The test carries `checkout/require-hardlinks-refuses-at-the-entry`.
 #[test]
 fn checkout_require_hardlinks_and_skip_list_and_subpath_match_the_tool() {
     if !ostree_available() {
@@ -28494,8 +28883,8 @@ fn checkout_require_hardlinks_and_skip_list_and_subpath_match_the_tool() {
     let repo = hardlink_repo(base, RepoMode::Archive, "repo");
     let rev = commit_verbatim(&repo, BRANCH, &tree);
 
-    // A skip list that prunes every entry that would refuse leaves a tree of
-    // directories and one zero-length file, which both take.
+    // The skip list prunes each entry that `-H` refuses. A tree of directories
+    // and one zero-length file stays, and both commands accept it.
     let skip = base.join("skip.txt");
     std::fs::write(&skip, b"/f\n/l\n/d/nested\n").unwrap();
     let skip_option = format!("--skip-list={}", skip.display());
@@ -28516,8 +28905,8 @@ fn checkout_require_hardlinks_and_skip_list_and_subpath_match_the_tool() {
     );
     assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "skip-list");
 
-    // A subpath naming the zero-length file is taken and one naming the
-    // symlink is refused, in both.
+    // Both commands accept a subpath that names the zero-length file, and
+    // refuse a subpath that names the symlink.
     for (name, subpath, expected) in [("empty", "--subpath=/empty", 0), ("sym", "--subpath=/l", 1)]
     {
         let port_dest = base.join(format!("port-sub-{name}"));
@@ -28532,8 +28921,8 @@ fn checkout_require_hardlinks_and_skip_list_and_subpath_match_the_tool() {
         assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, name);
     }
 
-    // A batch stream carrying no pair reaches no checkout and no refusal; one
-    // carrying a pair reaches both.
+    // A batch stream with no pair runs no checkout and causes no refusal. A
+    // stream with a pair runs a checkout and causes the refusal.
     for (name, stream, expected) in [
         ("empty-stream", String::new(), 0),
         ("one-pair", format!("{rev}\0/\0"), 1),
@@ -28562,11 +28951,11 @@ fn checkout_require_hardlinks_and_skip_list_and_subpath_match_the_tool() {
     }
 }
 
-/// The tree the `-M` sweep checks out: twelve directory modes, one regular
-/// file above the mask, and one symlink.
+/// Builds the tree that the `-M` sweep checks out: twelve directory modes, one
+/// regular file with bits outside the mask (0666), and one symlink.
 fn build_dir_mode_tree(dir: &Path) {
-    // Every mode carries the owner-execute bit, which the walk of a source
-    // tree needs to descend a directory.
+    // Each mode has the owner-execute bit. The walk of a source tree needs this
+    // bit to enter a directory.
     const MODES: [u32; 12] = [
         0o700, 0o705, 0o774, 0o775, 0o776, 0o777, 0o1755, 0o1777, 0o2755, 0o3775, 0o4755, 0o7777,
     ];
@@ -28583,12 +28972,12 @@ fn build_dir_mode_tree(dir: &Path) {
     chmod_to(dir, 0o777);
 }
 
-/// `-M` reduces every directory the checkout creates to `mode & 0775`, at the
-/// destination root and at every depth below it, in every repository mode and
-/// under both checkout modes. A directory the checkout reuses keeps its own
-/// mode, and a regular file and a symlink are unaffected.
+/// `-M` reduces each directory that the checkout creates to `mode & 0775`. This
+/// applies at the destination root and at each depth under it, in each
+/// repository mode and in both checkout modes. A directory that the checkout
+/// reuses keeps its own mode. `-M` does not change a regular file or a symlink.
 ///
-/// Carries `checkout/bareuseronly-dirs-accepted` and
+/// The test carries `checkout/bareuseronly-dirs-accepted` and
 /// `checkout/bareuseronly-dirs-masks-created-directories-only`.
 #[test]
 fn checkout_bareuseronly_dirs_matches_the_tool() {
@@ -28632,11 +29021,11 @@ fn checkout_bareuseronly_dirs_matches_the_tool() {
                 &format!("{label}/no-switch"),
             );
 
-            // The walked tree the comparison above reads starts below the
-            // destination root, so the root's own mode is read here. The tree
-            // root is committed at 0777, which the mask reduces, so this
-            // states the root is masked in every repository mode and under
-            // both checkout modes.
+            // The tree walk of the earlier comparison starts under the
+            // destination root, so the test reads the mode of the root here.
+            // The tree root is committed at 0777, which the mask reduces. This
+            // check shows that the mask applies to the root in each repository
+            // mode and in both checkout modes.
             let root_mode =
                 |dest: &Path| std::fs::metadata(dest).unwrap().permissions().mode() & 0o7777;
             for (name, port_dest, tool_dest) in [
@@ -28655,10 +29044,11 @@ fn checkout_bareuseronly_dirs_matches_the_tool() {
                 "{label}: the mask did not reach the destination root",
             );
 
-            // `bare-user-only` canonicalizes a directory's mode at commit
-            // time, so every directory is already below the mask there and the
-            // switch is a no-op. Everywhere else it changes the tree, so a
-            // no-op implementation cannot pass.
+            // `bare-user-only` canonicalizes the mode of a directory at commit
+            // time. In that mode, each directory is already inside the mask,
+            // and the switch has no effect. In each other mode the switch
+            // changes the tree, so a version of ostrya that ignores the switch
+            // cannot pass.
             let differs =
                 describe_tree_with_content(&port_masked) != describe_tree_with_content(&port_plain);
             assert_eq!(
@@ -28667,11 +29057,12 @@ fn checkout_bareuseronly_dirs_matches_the_tool() {
                 "{label}: the switch's reach moved",
             );
 
-            // Four more directory modes at the destination root, which a
-            // `--subpath` states. The mask is read at one site, the fresh arm
-            // of the directory walk, and the root-mode assertion above already
-            // runs that site in every repository mode and under both checkout
-            // modes, so this sweep takes one cell of each.
+            // Four more directory modes at the destination root, through a
+            // `--subpath`. The mask is read at one site: the arm of the
+            // directory walk that creates a new directory. The earlier
+            // root-mode check runs that site in each repository mode and in
+            // both checkout modes. For this reason, this sweep runs in one cell
+            // only: `bare` without `-U`.
             if mode != RepoMode::Bare || user_mode {
                 continue;
             }
@@ -28700,8 +29091,8 @@ fn checkout_bareuseronly_dirs_matches_the_tool() {
             }
         }
 
-        // A directory the checkout reuses keeps its own mode, with the switch
-        // and without it.
+        // A directory that the checkout reuses keeps its own mode, with and
+        // without the switch.
         for (name, switches) in [
             ("reuse-m", vec!["-M", "--union"]),
             ("reuse", vec!["--union"]),
@@ -28732,11 +29123,11 @@ fn checkout_bareuseronly_dirs_matches_the_tool() {
 }
 
 /// `--disable-cache` changes no byte and no metadata of the destination. The
-/// tool writes an uncompressed-object cache for an `archive` repository checked
-/// out with `-U` and for no other combination, and writes none under the
-/// switch. The port keeps no such cache in any combination.
+/// `ostree` command writes an uncompressed-object cache only for an `archive`
+/// repository checked out with `-U`. It writes no cache under the switch.
+/// ostrya keeps no such cache in any combination.
 ///
-/// Carries `checkout/disable-cache-accepted` and
+/// The test carries `checkout/disable-cache-accepted` and
 /// `checkout/disable-cache-writes-no-cache-directory`.
 #[test]
 fn checkout_disable_cache_matches_the_tool() {
@@ -28753,8 +29144,8 @@ fn checkout_disable_cache_matches_the_tool() {
     let repo = hardlink_repo(base, RepoMode::Archive, "repo");
     let rev = commit_verbatim(&repo, BRANCH, &tree);
 
-    // Each arm takes its own repository copy, so one arm's cache does not
-    // decide the next one's.
+    // Each arm uses its own copy of the repository, so the cache of one arm
+    // has no effect on the next arm.
     let mut trees = Vec::new();
     for (name, switches) in [
         ("plain", vec!["-U"]),
@@ -28781,8 +29172,8 @@ fn checkout_disable_cache_matches_the_tool() {
         trees.push(describe_tree_with_content(&port_dest));
     }
 
-    // A cache the tool already populated is not read under the switch, and the
-    // destination is the same tree either way.
+    // Under the switch, `ostree` does not read a cache that it filled earlier.
+    // The destination is the same tree in both cases.
     let tool_repo = clone_repo(base, &repo, "tool-repo-populated");
     let warm = base.join("tool-warm");
     ostree(&[
@@ -28814,9 +29205,9 @@ fn checkout_disable_cache_matches_the_tool() {
     );
     assert_eq!(trees[0], trees[1], "the switch changed the destination");
 
-    // The switch is accepted in every repository mode, with and without `-U`,
-    // and neither side writes a cache directory under it. The `archive` arms
-    // read the repository built above, which no checkout has written to.
+    // Both commands accept the switch in each repository mode, with and without
+    // `-U`, and neither command writes a cache directory under it. The
+    // `archive` arms read the earlier repository, which no checkout wrote to.
     for (mode_name, mode) in HARDLINK_MODES {
         let (repo, rev) = if mode == RepoMode::Archive {
             (repo.clone(), rev.clone())
@@ -28844,11 +29235,11 @@ fn checkout_disable_cache_matches_the_tool() {
     }
 }
 
-/// Each of the four switches that decide how a checkout materializes an entry
-/// is refused alongside a composefs switch: both implementations exit 1 and
-/// neither writes a destination.
+/// Both commands refuse each of the four switches that control how a checkout
+/// materializes an entry, together with a composefs switch. Both commands exit
+/// 1, and neither writes a destination.
 ///
-/// Carries `checkout/require-hardlinks-with-composefs`,
+/// The test carries `checkout/require-hardlinks-with-composefs`,
 /// `checkout/force-copy-with-composefs`,
 /// `checkout/bareuseronly-dirs-with-composefs`, and
 /// `checkout/disable-cache-with-composefs`.
@@ -28895,7 +29286,7 @@ fn checkout_materialization_switches_refuse_composefs_in_both() {
         }
     }
 
-    // A destination that already exists is left as it was.
+    // A destination that already exists does not change.
     let port_dest = base.join("port-existing");
     let tool_dest = base.join("tool-existing");
     for dest in [&port_dest, &tool_dest] {
@@ -28914,19 +29305,20 @@ fn checkout_materialization_switches_refuse_composefs_in_both() {
     }
 }
 
-/// `checkout --fsync=POLICY` takes the tool's boolean words, refuses every
-/// other value in the tool's words and at the tool's own step, and changes no
-/// byte of the destination. `--disable-fsync` is refused by both.
+/// `checkout --fsync=POLICY` accepts the boolean words of the `ostree` command.
+/// It refuses each other value with the message of `ostree`, at the same step
+/// as `ostree`. It changes no byte of the destination. Both commands refuse
+/// `--disable-fsync`.
 ///
-/// The port's half of this runs on every host. The assertions that hold the
-/// port against the tool run where `ostree` is installed.
+/// The checks of ostrya alone run on each host. The checks that compare ostrya
+/// with `ostree` run where `ostree` is installed.
 ///
-/// The value reader is a `&str` reader that runs before the repository is
-/// opened, so it cannot vary by repository mode. The whole accepted set is
-/// therefore swept in one mode, and the two policies that set resolves to are
-/// swept in every mode, which covers both axes.
+/// The value reader is a `&str` reader that runs before the repository opens,
+/// so it cannot change with the repository mode. The test sweeps the whole
+/// accepted set in one mode. It sweeps the two policies of that set in each
+/// mode, which covers both axes.
 ///
-/// Carries `checkout/fsync-true`, `checkout/fsync-false`,
+/// The test carries `checkout/fsync-true`, `checkout/fsync-false`,
 /// `checkout/fsync-case-and-numeral`,
 /// `checkout/fsync-changes-no-destination-byte`, and
 /// `checkout/disable-fsync-refused`.
@@ -28938,8 +29330,8 @@ fn checkout_fsync_policy_matches_the_tool() {
     let tree = base.join("tree");
     build_hardlink_tree(&tree);
 
-    // Every accepted spelling, in both cases, the same set `commit` takes, and
-    // the two distinct policies that set resolves to.
+    // Each accepted spelling, in upper and lower case. `commit` accepts the
+    // same set. Then the two different policies that the set resolves to.
     let accepted: [&str; 11] = [
         "true", "TRUE", "tRuE", "yes", "yEs", "1", "false", "False", "no", "NO", "0",
     ];
@@ -28949,8 +29341,8 @@ fn checkout_fsync_policy_matches_the_tool() {
         let repo = hardlink_repo(base, mode, &format!("repo-{mode_name}"));
         let rev = commit_verbatim(&repo, BRANCH, &tree);
 
-        // The destination the policy is held against: the same checkout with no
-        // `--fsync` at all.
+        // The reference destination for the policy: the same checkout with no
+        // `--fsync`.
         let plain = base.join(format!("plain-{mode_name}"));
         checkout_port(&repo, &["-U"], &rev, &plain).ok();
         let expected = describe_tree_with_content(&plain);
@@ -28982,12 +29374,11 @@ fn checkout_fsync_policy_matches_the_tool() {
         }
     }
 
-    // A value neither reader holds, and the step the refusal stands at: ahead
-    // of the repository and ahead of the revision. Each line here names a
-    // DESTINATION, so `clap`'s own argument count is satisfied and the value
-    // reader answers (`../docs/conformance/cli-surface.md`, "checkout"). The
-    // valueless form takes the next word as its value, which is what the last
-    // case names.
+    // A value that neither reader accepts, and the step of the refusal: before
+    // the repository and before the revision. Each line names a DESTINATION, so
+    // the argument count of `clap` is satisfied and the value reader gives the
+    // error. The form with no value takes the next word as its value. The last
+    // case shows this.
     let repo = hardlink_repo(base, RepoMode::BareUser, "refusals");
     let rev = commit_verbatim(&repo, BRANCH, &tree);
     let absent = base.join("no-such-repo");
@@ -29017,8 +29408,8 @@ fn checkout_fsync_policy_matches_the_tool() {
         );
         assert!(!port_dest.exists(), "`{options:?}` created a destination",);
 
-        // The same value against a repository that does not exist: the read
-        // stands ahead of the repository.
+        // The same value against a repository that does not exist: the value
+        // read comes before the repository.
         let run = checkout_port(&absent, options, &rev, &port_dest);
         assert_eq!(
             String::from_utf8_lossy(&run.stderr).trim(),
@@ -29049,8 +29440,8 @@ fn checkout_fsync_policy_matches_the_tool() {
         );
     }
 
-    // `--disable-fsync` is refused by both and the words part
-    // (`../docs/conformance/cli-surface.md`, "checkout").
+    // Both commands refuse `--disable-fsync`, and the messages differ. This is
+    // a recorded divergence.
     let port_dest = base.join("port-disable-fsync");
     let port = checkout_port(&repo, &["-U", "--disable-fsync"], &rev, &port_dest);
     assert_eq!(port.status.code(), Some(1), "the port took --disable-fsync");
@@ -29073,11 +29464,13 @@ fn checkout_fsync_policy_matches_the_tool() {
         assert!(!tool_dest.exists(), "the tool created a destination");
     }
 
-    // The option given twice, carrying two different values in each order. The
-    // port refuses the line whichever values the two occurrences carry, and the
-    // tool takes it and exits 0 in both orders. Which occurrence the tool reads
-    // shows in no artifact here, so the sync-call counts state it in
-    // `checkout_fsync_policy_controls_the_syscalls`.
+    // The option given twice, with two different values in each order. ostrya
+    // refuses the line for all values of the two occurrences. `ostree` accepts
+    // the line and exits 0 in both orders. No artifact of this test shows which
+    // occurrence `ostree` reads.
+    //
+    // The sync-call counts in `checkout_fsync_policy_controls_the_syscalls`
+    // show it.
     for (first, last) in [("false", "true"), ("true", "false")] {
         let label = format!("--fsync={first} --fsync={last}");
         let first_option = format!("--fsync={first}");
@@ -29100,13 +29493,14 @@ fn checkout_fsync_policy_matches_the_tool() {
         }
     }
 
-    // A line that omits DESTINATION altogether. `clap` counts the positionals
-    // before the value reader runs, so the port names the missing positional
-    // where the tool names the value. Both exit 1 and create nothing, which the
-    // wording rule covers (`../docs/conformance/cli-surface.md`, "checkout").
-    // Each run takes the temporary directory as its working directory, since a
-    // line that took the value would name its destination after the revision
-    // and write it there.
+    // A line with no DESTINATION. `clap` counts the positionals before the
+    // value reader runs. ostrya names the missing positional, and `ostree`
+    // names the value. Both commands exit 1 and create nothing, so the wording
+    // rule covers the difference of the messages.
+    //
+    // Each run uses the temporary directory as its working directory. If a
+    // line accepts the value, it names its destination after the revision and
+    // writes it there.
     let repo_arg = format!("--repo={}", repo.display());
     let bare = [repo_arg.as_str(), "checkout", "-U", "--fsync=on", &rev];
     let run = ostrya_in(Some(base), &bare, None, &[]);
@@ -29144,8 +29538,8 @@ fn checkout_fsync_policy_matches_the_tool() {
         );
     }
 
-    // Each occurrence of a repeat is validated by the tool, so a value it does
-    // not hold is reported from either position.
+    // `ostree` checks each occurrence of a repeated option, so it reports a
+    // value that it does not accept in either position.
     if tool_present {
         for options in [
             ["-U", "--fsync=on", "--fsync=true"],
@@ -29164,24 +29558,25 @@ fn checkout_fsync_policy_matches_the_tool() {
     }
 }
 
-/// A `[core] fsync` value the reader does not hold is refused under every state
-/// of `checkout --fsync`, the option's own value included, and the tool refuses
-/// the same repository. The option narrows the configured policy, so the
-/// configured value is read before the narrowing and `--fsync=false` conceals
-/// nothing (`../docs/format-reference.md`, "The fsync vocabulary").
+/// ostrya refuses a `[core] fsync` value that its reader does not accept. It
+/// refuses the value with no option, with `--fsync=true`, and with
+/// `--fsync=false`. The `ostree` command refuses the same repository. The
+/// option narrows the configured policy, so the configured value is read
+/// before the narrowing and `--fsync=false` hides nothing.
 ///
-/// A `--composefs` export reaches no such read, because the port reads the key
-/// where the checkout path uses it and the export decision stands ahead of that
-/// place. The port writes the image and exits 0 where the tool refuses the
-/// repository, which is the divergence
-/// `../docs/conformance/cli-surface.md`, "checkout", records. The quotation
-/// marks the tool sets around the key name follow the locale, so the tool's
-/// line is held to the key name.
+/// A `--composefs` export does not read the key. ostrya reads the key where
+/// the checkout path uses it, and the export decision comes before that place.
+/// ostrya writes the image and exits 0, and `ostree` refuses the repository.
+/// This is a recorded divergence.
 ///
-/// The port's half runs on every host. The assertions about the tool run where
+/// The quotation marks of `ostree` around the key name follow the locale. For
+/// this reason, the test does not check the quotation marks in the line of
+/// `ostree`.
+///
+/// The checks of ostrya run on each host. The checks of `ostree` run where
 /// `ostree` is installed.
 ///
-/// Carries `checkout/composefs-keeps-a-bad-configured-fsync`.
+/// The test carries `checkout/composefs-keeps-a-bad-configured-fsync`.
 #[test]
 fn checkout_refuses_a_bad_configured_fsync_under_every_override() {
     let tool_present = ostree_available();
@@ -29237,8 +29632,8 @@ fn checkout_refuses_a_bad_configured_fsync_under_every_override() {
         assert!(!tool_dest.exists(), "the tool created a destination");
     }
 
-    // The composefs export, which reaches no read of the key. The port takes
-    // the repository and the tool refuses it.
+    // The composefs export, which does not read the key. ostrya accepts the
+    // repository, and `ostree` refuses it.
     let port_image = base.join("port-composefs");
     let run = checkout_port(&repo, &["-U", "--composefs"], &rev, &port_image);
     assert_eq!(
@@ -29269,43 +29664,46 @@ fn checkout_refuses_a_bad_configured_fsync_under_every_override() {
     }
 }
 
-/// The `--fsync=POLICY` policy is resolved from the repository config narrowed
-/// by the option, and the resolved value reaches every write the checkout
-/// makes. Neither half shows in a byte of the destination, so the claim is
-/// stated in syscalls: the four `checkout` rows of the table in
-/// `../docs/format-reference.md`, "The fsync vocabulary", measured for the port
-/// and for the tool over corpus `C0` in `archive` mode. Three of the four rows
-/// must issue no sync call at all, which is the narrowing rule.
+/// The `--fsync=POLICY` policy comes from the repository config, narrowed by
+/// the option. The resolved value applies to each write of the checkout.
+/// Neither fact shows in a byte of the destination, so the test counts
+/// syscalls.
 ///
-/// The syncing row is held to the total the table records, 2 for the tool and 5
-/// for the port, so the table and this test stay one record. The targets part:
-/// the tool syncs the temporary files of the uncompressed object cache it keeps
-/// under the repository, and the port, which keeps no such cache, syncs the
-/// files and the directories of the destination.
+/// The test runs the four `checkout` rows of the recorded fsync table. The
+/// rows are measured for ostrya and for the `ostree` command over corpus `C0`
+/// in `archive` mode. Two of the four rows must issue no sync call. This is
+/// the narrowing rule.
 ///
-/// It also states which occurrence of a repeated `--fsync` the tool reads,
-/// which is the last one, since both orders exit 0 and write one tree.
+/// Each syncing row must give the recorded total of sync calls: 2 for `ostree`
+/// and 5 for ostrya. The targets differ. `ostree` syncs the temporary files of
+/// the uncompressed object cache that it keeps under the repository. ostrya
+/// keeps no such cache and syncs the files and the directories of the
+/// destination.
 ///
-/// Every claim here is a count of syscalls, so the whole body needs `strace`
-/// and returns without an assertion where `strace` is absent. The rows that
-/// name the tool need `ostree` as well.
+/// The test also shows which occurrence of a repeated `--fsync` `ostree`
+/// reads: the last one. Both orders exit 0 and write one tree, so only the
+/// sync calls show it.
 ///
-/// Carries `checkout/fsync-syscalls` and `checkout/fsync-given-twice`.
+/// Each claim is a count of syscalls, so the whole test needs `strace`. If
+/// `strace` is absent, the test returns with no assertion. The rows of
+/// `ostree` also need `ostree`.
+///
+/// The test carries `checkout/fsync-syscalls` and `checkout/fsync-given-twice`.
 #[test]
 fn checkout_fsync_policy_controls_the_syscalls() {
     if !strace_available() {
         return;
     }
     let tmp = TmpDir::new("checkout-fsync-syscalls");
-    // `strace -y` prints the path a descriptor resolves to, so the paths the
-    // targets are named against must be resolved too.
+    // `strace -y` prints the resolved path of a descriptor, so the test
+    // resolves the paths that it compares with the targets.
     let base = &tmp.path().canonicalize().expect("the temp dir resolves");
     let tree = base.join("tree");
     ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
     let port = env!("CARGO_BIN_EXE_ostrya");
 
-    // (tag, configured `[core] fsync`, option, the calls the row expects). The
-    // tool is measured beside the port wherever it is installed.
+    // (tag, configured `[core] fsync`, option, 1 if the row syncs and 0 if it
+    // does not). If `ostree` is installed, the test measures it next to ostrya.
     let rows: [(&str, Option<&str>, Option<&str>, usize); 4] = [
         ("unset-on", None, Some("--fsync=true"), 1),
         ("unset-plain", None, None, 1),
@@ -29318,9 +29716,9 @@ fn checkout_fsync_policy_controls_the_syscalls() {
         binaries.push(("tool", "ostree".to_owned(), 2));
     }
 
-    // Every row of every binary is held against this one: the policy reaches
-    // the sync calls and leaves standard output, standard error, the exit
-    // status, and the destination where they stand.
+    // The test compares each row of each binary with the first row. The policy
+    // changes only the sync calls. Standard output, standard error, the exit
+    // status, and the destination stay the same.
     let mut answer: Option<(String, String, Option<i32>, Vec<String>)> = None;
     for (who, binary, total) in &binaries {
         for (tag, configured, option, expect_sync) in rows {
@@ -29379,8 +29777,7 @@ fn checkout_fsync_policy_controls_the_syscalls() {
                     calls.len(),
                 );
             } else {
-                // The totals `../docs/format-reference.md`, "The fsync
-                // vocabulary", records for corpus `C0` in `archive` mode.
+                // The recorded totals for corpus `C0` in `archive` mode.
                 assert_eq!(
                     calls.len(),
                     *total,
@@ -29389,10 +29786,10 @@ fn checkout_fsync_policy_controls_the_syscalls() {
                      {calls:?}",
                     calls.len(),
                 );
-                // `sync_calls` names a target under the repository relative to
-                // it and leaves every other path absolute, so the tool's
-                // targets are the relative ones and the port's are under the
-                // destination.
+                // `sync_calls` gives a target under the repository as a path
+                // relative to the repository, and each other path as an
+                // absolute path. The targets of `ostree` are the relative
+                // paths, and the targets of ostrya are under the destination.
                 let dest_prefix = format!("{dest_arg}/");
                 for (kind, path) in &calls {
                     let under_repo = !path.starts_with('/');
@@ -29406,10 +29803,10 @@ fn checkout_fsync_policy_controls_the_syscalls() {
                 }
             }
 
-            // The sync calls are the whole difference. Every row says nothing
-            // on either stream, exits the same way, and leaves the same
-            // destination, across the four policies and across the two
-            // binaries.
+            // The sync calls are the only difference. Each row writes nothing
+            // to either stream, gives the same exit status, and leaves the
+            // same destination. This is true for the four policies and for the
+            // two binaries.
             let observed = (
                 String::from_utf8_lossy(&run.stdout).into_owned(),
                 String::from_utf8_lossy(&run.stderr).into_owned(),
@@ -29430,12 +29827,13 @@ fn checkout_fsync_policy_controls_the_syscalls() {
         return;
     }
 
-    // Which occurrence of a repeated `--fsync` the tool reads. Both orders
-    // exit 0 and write one tree, so the count of sync calls is what states it.
-    // Each order takes a repository of its own: a first `archive` checkout
-    // fills the uncompressed object cache, and a second checkout out of the
-    // same repository issues no call whatever the policy resolves to, which
-    // would read as a syncing order that does not sync.
+    // Which occurrence of a repeated `--fsync` `ostree` reads. Both orders exit
+    // 0 and write one tree, so only the count of sync calls shows it.
+    //
+    // Each order uses its own repository. A first `archive` checkout fills the
+    // uncompressed object cache. A second checkout from the same repository
+    // issues no sync call under each resolved policy. A syncing order then
+    // shows as an order with no sync call.
     for (first, last, expect_sync) in [("false", "true", 2), ("true", "false", 0)] {
         let tag = format!("repeat-{first}-{last}");
         let repo = base.join(format!("tool-{tag}"));
@@ -29493,9 +29891,10 @@ fn checkout_fsync_policy_controls_the_syscalls() {
 
 // --- bare-user-shared permission bits ----------------------------------------
 
-/// The layout entries whose modes a `bare-user-shared` repository forces, with
-/// `.lock` last. `refs/heads/test` is the ref parent the `test/umask` branch
-/// creates, which the ref write path makes and not `init`.
+/// The layout entries with modes that a `bare-user-shared` repository forces,
+/// with `.lock` last. `refs/heads/test` is the parent directory of the ref of
+/// the `test/umask` branch. The ref write path creates it, and `init` does
+/// not.
 const SHARED_LAYOUT: &[&str] = &[
     "",
     "objects",
@@ -29511,18 +29910,19 @@ const SHARED_LAYOUT: &[&str] = &[
     ".lock",
 ];
 
-/// Run the `ostrya` binary under an explicit file-creation mask.
+/// Runs the `ostrya` binary under an explicit file-creation mask.
 ///
-/// `umask` is global to a process, and the library tests run on parallel
-/// threads, so the mask is set in the child alone: a shell sets it and then
-/// replaces itself with the binary. `Command::pre_exec` would do the same in
-/// one process, and this crate forbids unsafe code.
+/// `umask` is global to a process, and the test harness runs tests on parallel
+/// threads, so the mask is set only in the child. A shell sets the mask and
+/// then replaces itself with the binary. `Command::pre_exec` can do the same
+/// in one process, but it needs unsafe code, and this crate forbids unsafe
+/// code.
 fn ostrya_with_umask(mask: &str, args: &[&str]) -> Run {
     program_with_umask(env!("CARGO_BIN_EXE_ostrya"), mask, args)
 }
 
-/// Run `program` under an explicit file-creation mask, by the shell wrapper of
-/// [`ostrya_with_umask`].
+/// Runs `program` under an explicit file-creation mask, with the shell wrapper
+/// of `ostrya_with_umask`.
 fn program_with_umask(program: &str, mask: &str, args: &[&str]) -> Run {
     let mut script = format!("umask {mask}; exec '{program}'");
     for arg in args {
@@ -29549,8 +29949,8 @@ fn program_with_umask(program: &str, mask: &str, args: &[&str]) -> Run {
     }
 }
 
-/// The permission bits of each [`SHARED_LAYOUT`] entry of `repo`, the setgid
-/// bit included.
+/// Returns the permission bits of each `SHARED_LAYOUT` entry of `repo`, with
+/// the setgid bit.
 fn layout_modes(repo: &Path) -> Vec<(&'static str, u32)> {
     SHARED_LAYOUT
         .iter()
@@ -29570,8 +29970,9 @@ fn layout_modes(repo: &Path) -> Vec<(&'static str, u32)> {
         .collect()
 }
 
-/// Initialize a repository of `mode` at `base/tag` under the mask `mask`, then
-/// commit the fixture tree into it so the repository lock file is created.
+/// Initializes a repository of `repo_mode` at `base/tag` under the mask
+/// `mask`. Then commits the fixture tree into it, so the repository lock file
+/// exists.
 fn init_and_commit_with_umask(base: &Path, tag: &str, repo_mode: &str, mask: &str) -> PathBuf {
     let repo = base.join(tag);
     let src = base.join("src");
@@ -29604,8 +30005,8 @@ fn init_and_commit_with_umask(base: &Path, tag: &str, repo_mode: &str, mask: &st
     repo
 }
 
-/// A `bare-user-shared` repository takes the same layout and lock modes under
-/// any process file-creation mask, and a `bare-user` repository under the same
+/// A `bare-user-shared` repository gets the same layout and lock modes under
+/// each process file-creation mask. A `bare-user` repository under the same
 /// mask keeps the masked result.
 #[test]
 fn shared_repo_modes_do_not_follow_the_umask() {
@@ -29626,8 +30027,9 @@ fn shared_repo_modes_do_not_follow_the_umask() {
         assert_eq!(*mode, want, "the {name} entry");
     }
 
-    // The control: the same mask over a bare-user repository reaches every
-    // entry, which is what scopes the forcing to the one repository mode.
+    // The control: the same mask applies to each entry of a `bare-user`
+    // repository. This shows that only the one repository mode forces the
+    // modes.
     let control = init_and_commit_with_umask(base, "bare-user-077", "bare-user", "077");
     for (name, mode) in layout_modes(&control) {
         let want = if name == ".lock" { 0o600 } else { 0o700 };
@@ -29635,7 +30037,7 @@ fn shared_repo_modes_do_not_follow_the_umask() {
     }
 }
 
-/// The sole `state/<commit>.commitpartial` marker of `repo`.
+/// Returns the only `state/<commit>.commitpartial` marker of `repo`.
 fn partial_marker(repo: &Path) -> PathBuf {
     let state = repo.join("state");
     let mut found: Vec<PathBuf> = std::fs::read_dir(&state)
@@ -29651,9 +30053,10 @@ fn partial_marker(repo: &Path) -> PathBuf {
     found.pop().expect("the marker")
 }
 
-/// The `state/<commit>.commitpartial` marker a `bare-user-shared` repository
-/// writes takes 0644 under any process file-creation mask. The control is the
-/// same pull into a `bare-user` repository, where the mask reaches the marker.
+/// The `state/<commit>.commitpartial` marker of a `bare-user-shared` repository
+/// gets mode 0644 under each process file-creation mask. The control is the
+/// same pull into a `bare-user` repository, where the mask applies to the
+/// marker.
 #[test]
 fn shared_repo_partial_marker_mode_does_not_follow_the_umask() {
     let tmp = TmpDir::new("umask-marker");
@@ -29690,17 +30093,18 @@ fn shared_repo_partial_marker_mode_does_not_follow_the_umask() {
 
 // ---------------------------------------------------------------------------
 // `diff`: the five options, the change classes, the print order, and the
-// directory side. `docs/format-reference.md`, "CLI output formats", `diff`,
-// states the format these tests hold the two implementations to.
+// directory side. The tests check ostrya and the `ostree` command against the
+// same output format of `diff`.
 // ---------------------------------------------------------------------------
 
-/// Assert that both implementations agree on the exit status, standard error,
-/// and the set of lines standard output carries, the lines sorted first.
+/// Asserts that both commands give the same exit status, the same standard
+/// error, and the same set of lines on standard output. The lines are sorted
+/// first.
 ///
-/// A directory side names its entries in the order the directory returns them,
-/// which is the tool's own mechanism and which two copies of one tree need not
-/// share, so a run with a directory side is compared on its line set
-/// (`docs/conformance/cli-surface.md`, "P2").
+/// A directory side names its entries in the order that the directory returns
+/// them. The `ostree` command uses the same mechanism. Two copies of one tree
+/// can return different orders, so the test compares a run with a directory
+/// side on its set of lines.
 fn assert_diff_agrees_sorted(port_repo: &Path, tool_repo: &Path, args: &[&str]) {
     let (port, tool) = run_both(port_repo, tool_repo, args);
     let label = args.join(" ");
@@ -29723,9 +30127,9 @@ fn assert_diff_agrees_sorted(port_repo: &Path, tool_repo: &Path, args: &[&str]) 
     assert_eq!(sorted(&port), sorted(&tool), "`{label}` named other paths");
 }
 
-/// Make a named pipe at `path` through `mkfifo`, reporting whether it landed.
-/// A host without the tool, or a filesystem that takes no fifo, reports false
-/// and the caller states nothing about the kind.
+/// Makes a named pipe at `path` with `mkfifo`. Returns `true` if `mkfifo`
+/// succeeds. If the host has no `mkfifo`, or the filesystem accepts no fifo,
+/// it returns `false`. The caller then makes no claim about the kind.
 fn make_fifo(path: &Path) -> bool {
     Command::new("mkfifo")
         .arg(path)
@@ -29735,15 +30139,22 @@ fn make_fifo(path: &Path) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Write `content` into `path`, creating every parent directory.
+/// Writes `content` into `path`, and creates each missing parent directory.
 fn write_at(path: &Path, content: &[u8]) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, content).unwrap();
 }
 
-/// The three prefixes over an added file, a deleted file, a content change, a
-/// mode change, an extended attribute change, a symlink target change, an
-/// added directory, and a deleted directory.
+/// The `A`, `D`, and `M` prefixes of `diff` for these changes:
+///
+/// - an added file
+/// - a deleted file
+/// - a content change
+/// - a mode change
+/// - an extended attribute change
+/// - a symlink target change
+/// - an added directory
+/// - a deleted directory
 #[test]
 fn diff_change_classes_match_the_tool() {
     if !ostree_available() {
@@ -29787,9 +30198,10 @@ fn diff_change_classes_match_the_tool() {
     }
 }
 
-/// The walk order: the first side's entries in that side's own order,
-/// descending into a pair of directories where it stands, then the second
-/// side's entries in its own order.
+/// The walk order. First come the entries of the first side, in the order of
+/// that side. The walk enters a directory that is on both sides at its place
+/// in that order. Then come the entries of the second side, in their own
+/// order.
 #[test]
 fn diff_print_order_matches_the_tool() {
     if !ostree_available() {
@@ -29820,8 +30232,8 @@ fn diff_print_order_matches_the_tool() {
     let gb = commit_both(&port_repo, &tool_repo, &two, "g");
     assert_agrees(&port_repo, &tool_repo, &["diff", &ga, &gb]);
 
-    // An entry added inside a shared directory is named before the entries the
-    // root itself adds, the descent standing inside the first pass.
+    // An entry added in a shared directory comes before the entries that the
+    // root adds, because the descent is part of the first pass.
     let three = base.join("h1");
     write_at(&three.join("D1/keep"), b"k\n");
     write_at(&three.join("D2/keep"), b"k\n");
@@ -29838,8 +30250,8 @@ fn diff_print_order_matches_the_tool() {
     assert_agrees(&port_repo, &tool_repo, &["diff", &hb, &ha]);
 }
 
-/// An added directory lists itself and every descendant; a removed directory is
-/// one entry, without its former children.
+/// An added directory lists itself and each descendant. A removed directory is
+/// one entry, with no lines for its children.
 #[test]
 fn diff_directory_expansion_matches_the_tool() {
     if !ostree_available() {
@@ -29863,7 +30275,7 @@ fn diff_directory_expansion_matches_the_tool() {
 }
 
 /// A name that is a file on one side and a directory on the other is one
-/// modification, and the comparison does not descend into it.
+/// modification. The comparison does not descend into it.
 #[test]
 fn diff_type_change_matches_the_tool() {
     if !ostree_available() {
@@ -29887,7 +30299,7 @@ fn diff_type_change_matches_the_tool() {
     assert_agrees(&port_repo, &tool_repo, &["diff", &b, &a]);
 }
 
-/// The root directory's own metadata is outside the comparison.
+/// The metadata of the root directory is outside the comparison.
 #[test]
 fn diff_root_metadata_matches_the_tool() {
     if !ostree_available() {
@@ -29910,9 +30322,9 @@ fn diff_root_metadata_matches_the_tool() {
     assert_agrees(&port_repo, &tool_repo, &["diff", &a, &b]);
 }
 
-/// With one argument the first side is that argument with `^` appended, so
-/// `diff REV` compares the commit's parent against it and `diff REV^` compares
-/// the grandparent against the parent.
+/// With one argument, the first side is that argument with `^` added.
+/// `diff REV` compares the parent of the commit with the commit. `diff REV^`
+/// compares the grandparent with the parent.
 #[test]
 fn diff_parent_form_matches_the_tool() {
     if !ostree_available() {
@@ -29937,14 +30349,15 @@ fn diff_parent_form_matches_the_tool() {
     assert_agrees(&port_repo, &tool_repo, &["diff", &format!("{c}^")]);
     assert_agrees(&port_repo, &tool_repo, &["diff", "base^"]);
     assert_agrees(&port_repo, &tool_repo, &["diff", &b]);
-    // A root commit has no parent, and both name it in the same words.
+    // A root commit has no parent, and both commands report this with the same
+    // message.
     assert_agrees(&port_repo, &tool_repo, &["diff", &a]);
     assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &a]);
     assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &c]);
 }
 
-/// The four lines `--stats` writes over two differing commits, and what each
-/// flag combination prints.
+/// The four lines that `--stats` writes for two different commits, and the
+/// output of each flag combination.
 #[test]
 fn diff_stats_match_the_tool() {
     if !ostree_available() {
@@ -29967,18 +30380,18 @@ fn diff_stats_match_the_tool() {
 
     assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &a, &b]);
     assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &a, &a]);
-    // Two commits sharing no object report a count and a size of zero.
+    // Two commits with no shared object report a count and a size of zero.
     let three = base.join("s3");
     write_at(&three.join("nothing-in-common.txt"), b"z\n");
     let c = commit_both(&port_repo, &tool_repo, &three, "z");
     assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &a, &c]);
-    // `--stats` alone writes no per-path line, and `--fs-diff` brings them
-    // back.
+    // `--stats` alone writes no line for each path. `--fs-diff` writes these
+    // lines.
     assert_agrees(&port_repo, &tool_repo, &["diff", "--fs-diff", &a, &b]);
 }
 
-/// A commit counts its own objects alone: its parents and its detached
-/// metadata object are outside the set.
+/// The stats of a commit count only its own objects. Its parents and its
+/// detached metadata object are outside the set.
 #[test]
 fn diff_stats_object_set_matches_the_tool() {
     if !ostree_available() {
@@ -29994,11 +30407,11 @@ fn diff_stats_object_set_matches_the_tool() {
     write_at(&two.join("f.txt"), b"two\n");
     let a = commit_both(&port_repo, &tool_repo, &one, "o");
     let b = commit_both(&port_repo, &tool_repo, &two, "o");
-    // `b` carries `a` as its parent and still counts its own four objects.
+    // `b` has `a` as its parent, and it counts only its own four objects.
     assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &a, &b]);
 
-    // A commit carrying detached metadata counts the same objects, the
-    // `.commitmeta` being outside the set.
+    // A commit with detached metadata counts the same objects. The
+    // `.commitmeta` object is outside the set.
     let three = base.join("o3");
     write_at(&three.join("f.txt"), b"three\n");
     let args = [
@@ -30021,8 +30434,8 @@ fn diff_stats_object_set_matches_the_tool() {
     assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &d, &d]);
 }
 
-/// The per-path block is written before the stats block, whichever order the
-/// two flags carry.
+/// `diff` writes the block of paths before the stats block, in each order of
+/// the two flags.
 #[test]
 fn diff_stats_block_order_matches_the_tool() {
     if !ostree_available() {
@@ -30053,8 +30466,8 @@ fn diff_stats_block_order_matches_the_tool() {
     );
 }
 
-/// An `M` or a `D` path is named the way the first side names it and an `A`
-/// path the way the second does, and a directory side names a path with no
+/// `diff` names an `M` or a `D` path as the first side names it, and an `A`
+/// path as the second side names it. A directory side names a path with no
 /// leading separator.
 #[test]
 fn diff_path_rendering_matches_the_tool() {
@@ -30074,7 +30487,7 @@ fn diff_path_rendering_matches_the_tool() {
     let a = commit_both(&port_repo, &tool_repo, &one, "r");
     let second = two.to_str().unwrap();
 
-    // The tree the commit was made from compares equal to it.
+    // The source tree of the commit compares equal to the commit.
     assert_agrees(&port_repo, &tool_repo, &["diff", &a, one.to_str().unwrap()]);
     // A commit against a directory, and the reverse.
     assert_diff_agrees_sorted(&port_repo, &tool_repo, &["diff", &a, second]);
@@ -30084,10 +30497,11 @@ fn diff_path_rendering_matches_the_tool() {
         &tool_repo,
         &["diff", one.to_str().unwrap(), second],
     );
-    // A path that begins with neither `/` nor `./` is a revision, whatever the
-    // filesystem holds under that name. The two runs stand in the directory
-    // that holds `sub/dir`, so each argument names a directory the run can
-    // reach and the rule is the only thing that sends it to the ref store.
+    // A path that starts with neither `/` nor `./` is a revision, even if the
+    // filesystem holds an entry with that name. The working directory of both
+    // runs is the directory that holds `sub/dir`. Each argument names a
+    // directory that the run can reach, so only this rule sends the argument to
+    // the ref store.
     std::fs::create_dir_all(base.join("sub/dir")).unwrap();
     for spelled in ["sub", "sub/dir"] {
         let port = ostrya_in(
@@ -30104,13 +30518,13 @@ fn diff_path_rendering_matches_the_tool() {
     }
     assert_agrees(&port_repo, &tool_repo, &["diff", &a, "."]);
     assert_agrees(&port_repo, &tool_repo, &["diff", &a, ".."]);
-    // `--stats` reads both arguments as revisions, whatever their spelling.
+    // `--stats` reads both arguments as revisions, for each spelling.
     assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &a, second]);
 }
 
-/// Both implementations name a directory side's entries in the order the
-/// directory returns them, which two copies of one tree need not share, so the
-/// line sets are what this compares.
+/// Both commands name the entries of a directory side in the order that the
+/// directory returns them. Two copies of one tree can return different orders,
+/// so this test compares the sets of lines.
 #[test]
 fn diff_directory_order_matches_the_tool() {
     if !ostree_available() {
@@ -30120,7 +30534,7 @@ fn diff_directory_order_matches_the_tool() {
     let base = tmp.path();
     let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
 
-    // Two copies of one tree, the entries created in opposite orders.
+    // Two copies of one tree, with the entries created in opposite orders.
     let forward = base.join("f1");
     let backward = base.join("f2");
     let names = ["zz", "aa", "mm", "bb", "yy"];
@@ -30142,7 +30556,7 @@ fn diff_directory_order_matches_the_tool() {
         ],
     );
 
-    // An added subtree on a directory side expands in that side's own order.
+    // An added subtree on a directory side expands in the order of that side.
     let empty = base.join("f3");
     std::fs::create_dir_all(&empty).unwrap();
     let grown = base.join("f4");
@@ -30161,9 +30575,9 @@ fn diff_directory_order_matches_the_tool() {
     );
 }
 
-/// A device, a fifo, and a socket carry no prefix of their own: such an entry
-/// is `A` where it is on one side alone, and `M` where the other side holds a
-/// regular file of the same name or where its own metadata differs.
+/// A device, a fifo, and a socket have no prefix of their own. Such an entry is
+/// `A` if it is on one side only. It is `M` if the other side holds a regular
+/// file of the same name, or if its own metadata differs.
 #[test]
 fn diff_special_files_match_the_tool() {
     if !ostree_available() {
@@ -30191,11 +30605,12 @@ fn diff_special_files_match_the_tool() {
             return;
         }
     }
-    // A socket the second side alone holds.
+    // A socket that only the second side holds.
     let _socket = std::os::unix::net::UnixListener::bind(two.join("sock")).unwrap();
     // A fifo against a regular file of the same name.
     write_at(&one.join("swap"), b"regular\n");
-    // One fifo whose permission bits differ from the other side's.
+    // One fifo with permission bits that differ from the fifo on the other
+    // side.
     chmod_to(&one.join("perm"), 0o644);
     chmod_to(&two.join("perm"), 0o600);
 
@@ -30211,8 +30626,8 @@ fn diff_special_files_match_the_tool() {
     );
 }
 
-/// `--no-xattrs` reads no extended attribute from a directory side, and it
-/// reaches both directory sides and neither commit side.
+/// `--no-xattrs` reads no extended attribute from a directory side. It applies
+/// to both directory sides and to neither commit side.
 #[test]
 fn diff_no_xattrs_reaches_both_sides() {
     if !ostree_available() {
@@ -30241,18 +30656,18 @@ fn diff_no_xattrs_reaches_both_sides() {
     let first = one.to_str().unwrap();
     let second = two.to_str().unwrap();
 
-    // Two commits carry the attributes they were committed with, so the switch
-    // changes nothing there.
+    // Two commits keep the attributes of their source trees, so the switch
+    // changes nothing for them.
     assert_agrees(&port_repo, &tool_repo, &["diff", &a, &b]);
     assert_agrees(&port_repo, &tool_repo, &["diff", "--no-xattrs", &a, &b]);
     assert_agrees(&port_repo, &tool_repo, &["diff", "--no-xattrs", &a, &a]);
-    // The switch strips a directory side, so the stripped side then parts from
-    // the commit that carries the attributes.
+    // The switch removes the attributes from a directory side, so that side
+    // then differs from the commit that holds the attributes.
     assert_agrees(&port_repo, &tool_repo, &["diff", first, &a]);
     assert_diff_agrees_sorted(&port_repo, &tool_repo, &["diff", "--no-xattrs", first, &a]);
     assert_diff_agrees_sorted(&port_repo, &tool_repo, &["diff", "--no-xattrs", &a, first]);
-    // It strips both directory sides, so two directories differing in one
-    // attribute alone report nothing under it.
+    // The switch removes the attributes from both directory sides. Two
+    // directories that differ only in one attribute then report nothing.
     assert_diff_agrees_sorted(&port_repo, &tool_repo, &["diff", first, second]);
     assert_agrees(
         &port_repo,
@@ -30261,8 +30676,8 @@ fn diff_no_xattrs_reaches_both_sides() {
     );
 }
 
-/// `--owner-uid` and `--owner-gid` reach the second argument alone, and only
-/// where that argument is a directory.
+/// `--owner-uid` and `--owner-gid` apply only to the second argument, and only
+/// if that argument is a directory.
 #[test]
 fn diff_owner_override_side_matches_the_tool() {
     if !ostree_available() {
@@ -30279,25 +30694,25 @@ fn diff_owner_override_side_matches_the_tool() {
     let a = commit_both(&port_repo, &tool_repo, &tree, "w");
     let path = tree.to_str().unwrap();
 
-    // The tree the commit was made from compares equal to it until an
-    // override reaches the second side.
+    // The source tree of the commit compares equal to the commit until an
+    // override applies to the second side.
     assert_agrees(&port_repo, &tool_repo, &["diff", &a, path]);
     assert_agrees(&port_repo, &tool_repo, &["diff", "--owner-uid=0", &a, path]);
     assert_agrees(&port_repo, &tool_repo, &["diff", "--owner-gid=0", &a, path]);
-    // The first side is unaffected, so the same override the other way round
-    // reports nothing.
+    // The override does not change the first side, so the same override with
+    // the two arguments swapped reports nothing.
     assert_agrees(&port_repo, &tool_repo, &["diff", "--owner-uid=0", path, &a]);
     // Two commit sides ignore it.
     assert_agrees(&port_repo, &tool_repo, &["diff", "--owner-uid=0", &a, &a]);
-    // With two directory sides it still reaches one, so a directory compared
-    // against itself reports every entry.
+    // With two directory sides, the override applies to one side. A directory
+    // compared with itself then reports each entry.
     assert_diff_agrees_sorted(
         &port_repo,
         &tool_repo,
         &["diff", "--owner-uid=0", path, path],
     );
-    // A negative value declares nothing, and the C `int` dialect reaches the
-    // command.
+    // A negative value sets no override. The command reads the value in the C
+    // `int` dialect.
     assert_agrees(
         &port_repo,
         &tool_repo,
@@ -30308,7 +30723,7 @@ fn diff_owner_override_side_matches_the_tool() {
         &tool_repo,
         &["diff", "--owner-uid=0x10", "--owner-gid=0x10", &a, path],
     );
-    // A repeated value option takes the last occurrence in both.
+    // If a value option is repeated, both commands use the last occurrence.
     assert_agrees(
         &port_repo,
         &tool_repo,
@@ -30324,7 +30739,8 @@ fn diff_owner_override_side_matches_the_tool() {
         &tool_repo,
         &["diff", "--owner-uid=0", "--owner-uid=-1", &a, path],
     );
-    // A value neither reader can hold is refused in the same words.
+    // Both commands refuse a value that neither reader can hold, with the same
+    // message.
     assert_agrees(&port_repo, &tool_repo, &["diff", "--owner-uid=abc", &a, &a]);
     assert_agrees(
         &port_repo,
@@ -30333,10 +30749,10 @@ fn diff_owner_override_side_matches_the_tool() {
     );
 }
 
-/// One pair of directories, read by both implementations, holds the port to the
-/// order the directories return their entries in and to the `M`, `D`, `A`
-/// grouping. The two runs read the same two directories, so the order is not
-/// the port's own choice and the comparison can be exact.
+/// Both commands read one pair of directories. The test checks that ostrya
+/// gives the order in which the directories return their entries, and the
+/// `M`, `D`, `A` grouping. The two runs read the same two directories. The
+/// order is not a choice of ostrya, so the comparison can be exact.
 #[test]
 fn diff_directory_side_order_is_exact() {
     if !ostree_available() {
@@ -30373,9 +30789,9 @@ fn diff_directory_side_order_is_exact() {
     let (port, tool) = run_both(&port_repo, &tool_repo, &args);
     assert_runs_agree(&port, &tool, &args.join(" "));
 
-    // The claim is the order, so the run must name paths in an order sorting
-    // would change. `A` sorts ahead of `D` ahead of `M`, and the run carries
-    // all three groups.
+    // The test checks the order, so the run must name paths in an order that a
+    // sort changes. `A` sorts before `D`, and `D` sorts before `M`. The run
+    // holds all three groups.
     let text = String::from_utf8_lossy(&port.stdout).into_owned();
     let lines: Vec<&str> = text.lines().collect();
     let mut sorted = lines.clone();
@@ -30386,9 +30802,9 @@ fn diff_directory_side_order_is_exact() {
     );
 }
 
-/// A name the two sides hold at two kinds is one modification reached from the
-/// listing alone, so neither side is opened and an entry no read can reach does
-/// not end the run.
+/// If the two sides hold one name as two kinds of entry, the listing alone
+/// gives one modification. The command opens neither side, so an entry that no
+/// read can reach does not end the run.
 #[test]
 fn diff_type_change_over_an_unreadable_entry_matches_the_tool() {
     if !ostree_available() {
@@ -30398,7 +30814,8 @@ fn diff_type_change_over_an_unreadable_entry_matches_the_tool() {
     let base = tmp.path();
     let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
 
-    // A run that reads a mode-0 entry states nothing about this case.
+    // If the run can read a mode-0 entry, the test checks nothing about this
+    // case and stops.
     let probe = base.join("probe");
     std::fs::write(&probe, b"x").unwrap();
     chmod_to(&probe, 0o000);
@@ -30407,7 +30824,7 @@ fn diff_type_change_over_an_unreadable_entry_matches_the_tool() {
         return;
     }
 
-    // A regular file against a directory no read can enter.
+    // A regular file against a directory that no read can enter.
     let one = base.join("t1");
     write_at(&one.join("n"), b"file form\n");
     write_at(&one.join("other"), b"one\n");
@@ -30416,7 +30833,7 @@ fn diff_type_change_over_an_unreadable_entry_matches_the_tool() {
     write_at(&two.join("other"), b"two\n");
     chmod_to(&two.join("n"), 0o000);
 
-    // A regular file no read can open against a symlink.
+    // A regular file that no read can open, against a symlink.
     let three = base.join("t3");
     write_at(&three.join("n"), b"file form\n");
     let four = base.join("t4");
@@ -30434,23 +30851,24 @@ fn diff_type_change_over_an_unreadable_entry_matches_the_tool() {
         &["diff", three.to_str().unwrap(), four.to_str().unwrap()],
     );
 
-    // A commit side against a directory holding the same name at another kind.
+    // A commit side against a directory that holds the same name as another
+    // kind of entry.
     let five = base.join("t5");
     write_at(&five.join("n"), b"file form\n");
     let a = commit_both(&port_repo, &tool_repo, &five, "unreadable");
     assert_diff_agrees_sorted(&port_repo, &tool_repo, &["diff", &a, second]);
 
-    // The unreadable entry is restored so the temporary directory can be
-    // removed.
+    // The test restores the modes of the unreadable entries, so the temporary
+    // directory can be removed.
     chmod_to(&two.join("n"), 0o755);
     chmod_to(&three.join("n"), 0o644);
     chmod_to(&probe, 0o644);
 }
 
-/// An entry name and a symlink target that are not valid UTF-8 are listed,
-/// descended into, and carried to the end of the run. The port renders an
-/// invalid byte as U+FFFD, which `docs/conformance/cli-surface.md`, "P2",
-/// records.
+/// The command lists an entry name and a symlink target that are not valid
+/// UTF-8. It descends into such a directory and continues to the end of the
+/// run. ostrya renders an invalid byte as U+FFFD. This is a recorded
+/// divergence.
 #[test]
 fn diff_non_utf8_names_do_not_end_the_run() {
     if !ostree_available() {
@@ -30469,9 +30887,11 @@ fn diff_non_utf8_names_do_not_end_the_run() {
     let two = base.join("u2");
     std::fs::create_dir_all(&one).unwrap();
     std::fs::create_dir_all(&two).unwrap();
-    // A file of one invalid name whose content differs, a directory of another
-    // invalid name holding a changed file and an added one, and one valid name
-    // that changes.
+    // The fixture holds:
+    // - a file with an invalid name and different content
+    // - a directory with another invalid name, with a changed file and an
+    //   added file
+    // - a file with a valid name that changes
     write_at(&raw(&one, b"\xffname"), b"one\n");
     write_at(&raw(&two, b"\xffname"), b"two\n");
     write_at(&raw(&one, b"\xfedir").join("inner"), b"one\n");
@@ -30506,9 +30926,9 @@ fn diff_non_utf8_names_do_not_end_the_run() {
         "the added entry below the invalid directory name was not reported:\n{text}"
     );
 
-    // A symlink target that is not valid UTF-8 is carried the same way. The
-    // tool writes GLib criticals to standard error here, so the claim is the
-    // exit status and the paths standard output names.
+    // The command carries a symlink target that is not valid UTF-8 in the same
+    // way. Here the `ostree` command writes GLib criticals to standard error,
+    // so the test checks the exit status and the paths on standard output.
     let three = base.join("u3");
     let four = base.join("u4");
     std::fs::create_dir_all(&three).unwrap();
@@ -30565,18 +30985,18 @@ fn diff_mtime_is_not_compared() {
 // --- summary: the reading options --------------------------------------------
 //
 // `summary -v/--view`, `--raw`, `--list-metadata-keys`, and
-// `--print-metadata-key=KEY` read a `summary` file that no harness setup binds,
-// so the matrix records name these tests instead of a `run:` line
-// (`docs/conformance/m10-cli-behavior.matrix`).
+// `--print-metadata-key=KEY` read a `summary` file that no harness setup binds.
+// The matrix records name these tests, with no `run:` line.
 //
-// Each fixture is one repository that both implementations read, so both read
-// one `ostree.summary.last-modified`, which is wall-clock. `TZ` fixes the zone
-// the tool renders an instant in; the port renders in UTC whatever the zone,
-// which `docs/conformance/cli-surface.md`, "P3", records.
+// Each fixture is one repository that both commands read, so both read one
+// `ostree.summary.last-modified` value, which is wall-clock time. `TZ` sets the
+// zone in which the `ostree` command renders an instant. ostrya renders in UTC
+// for each `TZ`. This is a recorded divergence.
 
-/// Build one archive repository under `base/<name>` with the tool: `init` with
-/// `init_extra`, commit `tree` on each branch of `branches` at the fixed
-/// timestamp, then regenerate the summary with `summary_extra`.
+/// Builds one archive repository under `base/<name>` with the `ostree` command.
+/// It runs `init` with `init_extra`, commits `tree` on each branch of
+/// `branches` at the fixed timestamp, then regenerates the summary with
+/// `summary_extra`.
 fn summary_fixture(
     base: &Path,
     name: &str,
@@ -30607,9 +31027,9 @@ fn summary_fixture(
     repo
 }
 
-/// The four reading options report what the tool reports over one summary, and
-/// the precedence among them is the tool's: `--raw`, then `--view`, then
-/// `--list-metadata-keys`, then `--print-metadata-key`.
+/// The four reading options report what the `ostree` command reports for one
+/// summary. The precedence among them is the same as in `ostree`: `--raw`, then
+/// `--view`, then `--list-metadata-keys`, then `--print-metadata-key`.
 #[test]
 fn summary_reading_options_match_the_tool() {
     if !ostree_available() {
@@ -30622,7 +31042,7 @@ fn summary_reading_options_match_the_tool() {
     write_at(&tree.join("subdir/world.txt"), b"world\n");
     let env = &[("TZ", "UTC")];
 
-    // Two refs, and the four metadata keys the writer states.
+    // Two refs, and the four metadata keys that the summary writer sets.
     let plain = summary_fixture(base, "plain", &tree, &["one", "two/branch"], &[], &[]);
     for args in [
         vec!["summary", "--view"],
@@ -30643,7 +31063,7 @@ fn summary_reading_options_match_the_tool() {
         ],
         vec!["summary", "--print-metadata-key=absent"],
         vec!["summary", "--print-metadata-key="],
-        // The precedence, written in both orders where two switches compete.
+        // The precedence, in both orders for each pair of switches.
         vec!["summary", "--view", "--raw"],
         vec!["summary", "--raw", "--view"],
         vec!["summary", "--raw", "--list-metadata-keys"],
@@ -30684,10 +31104,10 @@ fn summary_reading_options_match_the_tool() {
         assert_agrees_env(&plain, &plain, &args, env);
     }
 
-    // `-v` writes the report `--view` writes. The tool turns its debug stream
-    // on with the short form and the port does not, so the claim here is
-    // standard output and the exit status (`cli-surface.md`, "summary"). The
-    // `--view` run is the one the `remote summary` cross-check below reads.
+    // `-v` writes the same report as `--view`. With the short form, `ostree`
+    // also turns on its debug stream. ostrya does not, so this test checks
+    // standard output and the exit status. This is a recorded divergence. The
+    // `remote summary` cross-check later in this test reads the `--view` run.
     let local = run_both_env(&plain, &plain, &["summary", "--view"], env);
     let (port, tool) = run_both_env(&plain, &plain, &["summary", "-v"], env);
     assert_eq!(
@@ -30707,11 +31127,12 @@ fn summary_reading_options_match_the_tool() {
         "`-v` and `--view` wrote different reports"
     );
 
-    // Metadata the command line supplied: the listing is sorted where the
-    // stored order is not, a labeled string prints bare and an unlabeled one
-    // keeps the quotes the text form gives it, and the report reads a value
-    // outside the labeled set in host order where `--raw` reads the whole
-    // document big-endian.
+    // Metadata from the command line:
+    // - the listing is sorted, and the stored order is not
+    // - a labeled string prints bare, and an unlabeled string keeps the quotes
+    //   of the text form
+    // - the report reads a value outside the labeled set in host order, and
+    //   `--raw` reads the whole document big-endian
     let extra = summary_fixture(
         base,
         "extra",
@@ -30747,7 +31168,8 @@ fn summary_reading_options_match_the_tool() {
         assert_agrees_env(&extra, &extra, &args, env);
     }
 
-    // A ref whose commit records a `version` key gains a `Version` line.
+    // If the commit of a ref records a `version` key, the report gets a
+    // `Version` line.
     let versioned = base.join("versioned");
     let versioned_arg = format!("--repo={}", versioned.display());
     ostree(&[&versioned_arg, "init", "--mode=archive"]).ok();
@@ -30766,8 +31188,8 @@ fn summary_reading_options_match_the_tool() {
         assert_agrees_env(&versioned, &versioned, &args, env);
     }
 
-    // A collection repository names each ref of field 0 as a pair, and a
-    // mirrored collection's refs are reported with them.
+    // A collection repository names each ref of field 0 as a pair. The report
+    // also names the refs of a mirrored collection.
     let other = summary_fixture(
         base,
         "other",
@@ -30824,8 +31246,8 @@ fn summary_reading_options_match_the_tool() {
         eprintln!("note: the mirror pull did not run, so the collection map is unstated");
     }
 
-    // A summary carrying a static delta prints the whole `a{sv}` on the
-    // `Static Deltas` line.
+    // If a summary holds a static delta, the report prints the whole `a{sv}`
+    // on the `Static Deltas` line.
     let delta = summary_fixture(base, "delta", &tree, &["one"], &[], &[]);
     let delta_arg = format!("--repo={}", delta.display());
     write_at(&tree.join("second.txt"), b"second\n");
@@ -30855,8 +31277,8 @@ fn summary_reading_options_match_the_tool() {
         eprintln!("note: the delta did not generate, so that report is unstated");
     }
 
-    // The local report is the report `remote summary` writes, in both
-    // implementations.
+    // In both commands, the local report is the same as the report that
+    // `remote summary` writes.
     let server = FileServer::start(&plain);
     let (port_client, tool_client) = create_repo_pair(base, RepoMode::Archive);
     for repo in [&port_client, &tool_client] {
@@ -30880,10 +31302,15 @@ fn summary_reading_options_match_the_tool() {
     );
 }
 
-/// The port's own side of the `summary` argument handling: a repository with no
-/// `summary` file, the no-option refusal, a positional argument, and a repeated
-/// switch. Each of the four is a divergence `docs/conformance/cli-surface.md`,
-/// "P2", records under "summary".
+/// The `summary` argument handling of ostrya, where it differs from the
+/// `ostree` command:
+///
+/// - a repository with no `summary` file
+/// - the refusal with no option
+/// - a positional argument
+/// - a repeated switch
+///
+/// Each of the four cases is a recorded divergence.
 #[test]
 fn summary_argument_handling_parts_from_the_tool() {
     if !ostree_available() {
@@ -30894,8 +31321,8 @@ fn summary_argument_handling_parts_from_the_tool() {
     let tree = base.join("tree");
     write_at(&tree.join("hello.txt"), b"hello\n");
 
-    // A repository with no summary file refuses every reading option at exit 1
-    // with nothing on standard output. The two word the refusal differently.
+    // A repository with no summary file refuses each reading option at exit 1,
+    // with nothing on standard output. The messages of the two commands differ.
     let bare = base.join("bare");
     ostree(&[
         &format!("--repo={}", bare.display()),
@@ -30914,7 +31341,8 @@ fn summary_argument_handling_parts_from_the_tool() {
         assert_runs_agree_on_error(&port, &tool, &args.join(" "), "No such file or directory");
     }
 
-    // With no option at all both refuse at exit 1 in their own words.
+    // With no option, both commands refuse at exit 1, each with its own
+    // message.
     let (port, tool) = run_both(&bare, &bare, &["summary"]);
     assert_eq!(port.status.code(), Some(1), "the port did not refuse");
     assert_eq!(tool.status.code(), Some(1), "the tool did not refuse");
@@ -30925,8 +31353,8 @@ fn summary_argument_handling_parts_from_the_tool() {
         "the port's refusal does not name what to pass"
     );
 
-    // `-u` does its work and returns, so no reading option writes a report
-    // beside it.
+    // `-u` does its work and returns, so a reading option with `-u` writes no
+    // report.
     let repo = summary_fixture(base, "updated", &tree, &["one"], &[], &[]);
     for args in [
         vec!["summary", "-u", "--view"],
@@ -30937,10 +31365,10 @@ fn summary_argument_handling_parts_from_the_tool() {
         assert_agrees_env(&repo, &repo, &args, &[("TZ", "UTC")]);
     }
 
-    // A positional argument: the tool accepts one and ignores it, writing the
-    // report as if it were absent. The port reads a positional as a signing
-    // key identifier, and signing precedes every reading option, so a word
-    // that is no key refuses and no report is written.
+    // A positional argument: `ostree` accepts one and ignores it. It writes the
+    // same report as with no positional. ostrya reads a positional as a
+    // signing key identifier, and signing comes before each reading option. A
+    // word that is not a key causes a refusal, and ostrya writes no report.
     let (port, tool) = run_both(&repo, &repo, &["summary", "--view", "extra"]);
     assert_eq!(port.status.code(), Some(1), "the port took the positional");
     assert_eq!(
@@ -30958,8 +31386,8 @@ fn summary_argument_handling_parts_from_the_tool() {
         "the tool wrote no report beside the positional"
     );
 
-    // A repeated switch: the tool takes a second occurrence and the port
-    // refuses it, the repeated-flag class the port carries throughout its CLI.
+    // A repeated switch: `ostree` accepts a second occurrence and ostrya
+    // refuses it. ostrya refuses a repeated flag in all of its CLI.
     for args in [
         vec!["summary", "-v", "-v"],
         vec!["summary", "--raw", "--raw"],
@@ -30991,15 +31419,15 @@ fn summary_argument_handling_parts_from_the_tool() {
 
 // --- summary: the writing options --------------------------------------------
 //
-// `summary -u` with `--sign`, `-m/--add-metadata`, and `--gpg-sign`. The tool
-// writes `ostree.summary.last-modified` from the wall clock, so each
-// comparison lets the tool write first, reads the instant it wrote, and gives
-// the port the same instant through `--last-modified`. The two copies of one
-// repository then hold the same `summary` bytes wherever the two writers
-// agree.
+// `summary -u` with `--sign`, `-m/--add-metadata`, and `--gpg-sign`. The
+// `ostree` command writes `ostree.summary.last-modified` from the wall clock.
+// Each comparison lets `ostree` write first and reads the instant that it
+// wrote. ostrya then gets the same instant through `--last-modified`. As a
+// result, the two copies of one repository hold the same `summary` bytes
+// where the two writers agree.
 
-/// The `ostree.summary.last-modified` value the tool reads out of `repo`, as
-/// seconds since the Unix epoch.
+/// Returns the `ostree.summary.last-modified` value that the `ostree` command
+/// reads from `repo`, as seconds since the Unix epoch.
 fn summary_last_modified(repo: &Path) -> String {
     let printed = ostree(&[
         &format!("--repo={}", repo.display()),
@@ -31014,9 +31442,9 @@ fn summary_last_modified(repo: &Path) -> String {
         .to_owned()
 }
 
-/// Run `summary -u` with `extra` in the tool over `tool_repo`, then in the port
-/// over `port_repo`. Where the tool wrote a summary, the port is given the
-/// instant the tool wrote.
+/// Runs `summary -u` with `extra` in the `ostree` command on `tool_repo`, then
+/// in ostrya on `port_repo`. If the run of `ostree` succeeds, ostrya gets the
+/// instant that `ostree` wrote.
 fn summary_update_both(
     port_repo: &Path,
     tool_repo: &Path,
@@ -31041,8 +31469,8 @@ fn summary_update_both(
     (port, tool)
 }
 
-/// The bytes of `summary` and `summary.sig` in `repo`, `None` for an absent
-/// file.
+/// Returns the bytes of `summary` and `summary.sig` in `repo`, with `None` for
+/// an absent file.
 fn summary_files(repo: &Path) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
     (
         std::fs::read(repo.join("summary")).ok(),
@@ -31050,8 +31478,8 @@ fn summary_files(repo: &Path) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
     )
 }
 
-/// The engine keys of `summary.sig` in `repo` in stored order, each with the
-/// signature blobs it holds.
+/// Returns the engine keys of `summary.sig` in `repo` in stored order, each
+/// with the signature blobs that it holds.
 fn summary_signatures(repo: &Path) -> Vec<(String, Vec<Vec<u8>>)> {
     let bytes = std::fs::read(repo.join("summary.sig")).expect("summary.sig exists");
     let dict = ostrya::from_bytes(&Type::parse("a{sv}").unwrap(), &bytes).unwrap();
@@ -31074,7 +31502,8 @@ fn summary_signatures(repo: &Path) -> Vec<(String, Vec<Vec<u8>>)> {
         .collect()
 }
 
-/// The keys of the summary's global metadata dict in `repo`, in stored order.
+/// Returns the keys of the global metadata dict of the summary in `repo`, in
+/// stored order.
 fn summary_metadata_keys(repo: &Path) -> Vec<String> {
     let bytes = std::fs::read(repo.join("summary")).unwrap();
     ostrya::Summary::parse(&bytes)
@@ -31087,7 +31516,7 @@ fn summary_metadata_keys(repo: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The first line of a run's standard error.
+/// Returns the first line of the standard error of a run.
 fn first_stderr_line(run: &Run) -> String {
     String::from_utf8_lossy(&run.stderr)
         .lines()
@@ -31096,8 +31525,8 @@ fn first_stderr_line(run: &Run) -> String {
         .to_owned()
 }
 
-/// A tool-built archive repository with two refs and a summary, and a copy of
-/// it for the port.
+/// Builds an archive repository with the `ostree` command, with two refs and a
+/// summary. Returns a copy for ostrya and the original, in this order.
 fn summary_writing_pair(base: &Path, name: &str) -> (PathBuf, PathBuf) {
     let tree = base.join(format!("{name}-tree"));
     write_at(&tree.join("hello.txt"), b"hello\n");
@@ -31114,8 +31543,8 @@ fn summary_writing_pair(base: &Path, name: &str) -> (PathBuf, PathBuf) {
     (port, tool)
 }
 
-/// A plain `summary -u` writes the bytes the tool writes, given the instant
-/// the tool wrote.
+/// A plain `summary -u` writes the same bytes as the `ostree` command, if it
+/// gets the instant that `ostree` wrote.
 #[test]
 fn summary_update_matches_the_tool_byte_for_byte() {
     if !ostree_available() {
@@ -31133,8 +31562,9 @@ fn summary_update_matches_the_tool_byte_for_byte() {
     );
 }
 
-/// `summary -u --sign` writes the `summary.sig` the tool writes, one signature
-/// per occurrence in command-line order, and `--sign` is read with `-u` alone.
+/// `summary -u --sign` writes the same `summary.sig` as the `ostree` command,
+/// with one signature for each occurrence, in command-line order. The command
+/// reads `--sign` only with `-u`.
 #[test]
 fn summary_sign_matches_the_tool() {
     if !ostree_supports_ed25519() {
@@ -31146,7 +31576,7 @@ fn summary_sign_matches_the_tool() {
     let k2 = format!("--sign={ED25519_SECRET2_B64}");
     let env = &[("TZ", "UTC")];
 
-    // Two keys, and one key twice: the signatures are not deduplicated.
+    // Two keys, and one key twice: the command keeps duplicate signatures.
     for (label, extra) in [
         ("two keys", vec![k1.as_str(), k2.as_str()]),
         ("one key twice", vec![k1.as_str(), k1.as_str()]),
@@ -31166,8 +31596,8 @@ fn summary_sign_matches_the_tool() {
         assert_eq!(signatures[0].1.len(), 2, "{label}: two signatures");
     }
 
-    // The positional keys the port carries sign the summary that stands with
-    // the bytes `--sign` gives under `-u`.
+    // ostrya accepts signing keys as positionals. They sign the current
+    // summary with the same bytes that `--sign` gives with `-u`.
     let (port, tool) = summary_writing_pair(base, "positional");
     let (port_run, tool_run) = summary_update_both(&port, &tool, &[&k1, &k2], &[]);
     port_run.ok();
@@ -31190,8 +31620,9 @@ fn summary_sign_matches_the_tool() {
         "the positional keys signed other bytes"
     );
 
-    // Beside a reading option `--sign` is inert: the report is written and
-    // nothing changes. Alone, it draws the no-option refusal.
+    // With a reading option, `--sign` has no effect: the command writes the
+    // report and changes nothing. Alone, `--sign` causes the refusal for no
+    // option.
     let before = summary_files(&tool);
     let (port_run, tool_run) = run_both_env(&port, &tool, &["summary", &k1, "--view"], env);
     assert_runs_agree(&port_run, &tool_run, "summary --sign --view");
@@ -31211,7 +31642,7 @@ fn summary_sign_matches_the_tool() {
     assert_eq!(summary_files(&tool), before);
 
     // `--sign-type` with no key signs nothing, and the regeneration removes
-    // the signature that stood.
+    // the old signature.
     for engine in ["ed25519", "dummy"] {
         let flag = format!("--sign-type={engine}");
         let (port_run, tool_run) = summary_update_both(&port, &tool, &[&flag], &[]);
@@ -31224,10 +31655,10 @@ fn summary_sign_matches_the_tool() {
     }
 }
 
-/// Every refusal of `summary -u` comes before the regeneration, so `summary`
-/// and `summary.sig` stay as they stood and a ref added since is not listed.
-/// The checks run in the tool's order: `-m`, then `--sign-type`, then the
-/// `--sign` keys.
+/// Each refusal of `summary -u` comes before the regeneration. `summary` and
+/// `summary.sig` do not change, and the summary does not list a new ref. The
+/// checks run in the order of the `ostree` command: `-m`, then `--sign-type`,
+/// then the `--sign` keys.
 #[test]
 fn summary_sign_refusals_keep_files() {
     if !ostree_supports_ed25519() {
@@ -31239,7 +31670,7 @@ fn summary_sign_refusals_keep_files() {
     let tree = base.join("tree");
     write_at(&tree.join("hello.txt"), b"hello\n");
     let tool = summary_fixture(base, "tool", &tree, &["one"], &[], &[&k1]);
-    // A ref the next regeneration would list.
+    // A ref that the next regeneration lists.
     ostree(&[
         &format!("--repo={}", tool.display()),
         "commit",
@@ -31287,9 +31718,9 @@ fn summary_sign_refusals_keep_files() {
         assert_eq!(summary_files(&tool), before, "the tool changed `{label}`");
     }
 
-    // The engines the tool's build does not carry for this option: the tool
-    // refuses the name, and the port refuses the key the engine cannot read.
-    // Both refuse before the regeneration.
+    // The `spki` engine, which the build of `ostree` does not have for this
+    // option: `ostree` refuses the name, and ostrya refuses the key that the
+    // engine cannot read. Both commands refuse before the regeneration.
     let (port_run, tool_run) =
         summary_update_both(&port, &tool, &["--sign=zzz", &k1, "--sign-type=spki"], &[]);
     assert_eq!(
@@ -31300,8 +31731,8 @@ fn summary_sign_refusals_keep_files() {
     assert_eq!(summary_files(&port), before);
     assert_eq!(summary_files(&tool), before);
 
-    // 64 zero bytes are no ed25519 key pair: the port refuses before the
-    // regeneration, and the tool signs.
+    // 64 zero bytes are not an ed25519 key pair. ostrya refuses before the
+    // regeneration, and `ostree` signs.
     let zero = format!("--sign={}", ostrya::base64::encode(&[0u8; 64]));
     let (port_run, tool_run) = summary_update_both(&port, &tool, &[&zero], &[]);
     assert_eq!(port_run.status.code(), Some(1));
@@ -31313,8 +31744,8 @@ fn summary_sign_refusals_keep_files() {
     tool_run.ok();
 }
 
-/// `summary -u -m` stores each value in the GVariant text form, host order
-/// included, and merges the caller keys with the writer's own.
+/// `summary -u -m` stores each value given in the GVariant text form, in host
+/// byte order. It merges the keys of the caller with the keys of the writer.
 #[test]
 fn summary_add_metadata_matches_the_tool() {
     if !ostree_available() {
@@ -31324,11 +31755,14 @@ fn summary_add_metadata_matches_the_tool() {
     let base = tmp.path();
     let env = &[("TZ", "UTC")];
     // Each round is a whole `summary -u`, which rebuilds the summary from the
-    // refs alone, so one pair serves every round.
+    // refs only, so one pair of repositories serves each round.
     let (port, tool) = summary_writing_pair(base, "pair");
 
-    // Byte-identical where the tool keeps the standard key order: a writer key
-    // replaced by the writer's value, a writer key given twice, the empty key.
+    // The bytes are identical where the `ostree` command keeps the standard key
+    // order:
+    // - a writer key that the value of the writer replaces
+    // - a writer key given twice
+    // - the empty key
     for extra in [
         vec!["-m", "ostree.summary.mode=\"x\""],
         vec!["-m", "ostree.summary.last-modified=uint64 5"],
@@ -31345,7 +31779,7 @@ fn summary_add_metadata_matches_the_tool() {
         );
     }
 
-    // The value each key reads back as, where the stored order parts.
+    // The value that each key reads back as, where the stored order differs.
     let expires = |seconds: i64| {
         format!(
             "ostree.summary.expires=uint64 {}",
@@ -31367,8 +31801,8 @@ fn summary_add_metadata_matches_the_tool() {
             vec!["-m", "ostree.summary.expires=uint64 9"],
             vec!["ostree.summary.expires"],
         ),
-        // The report reads `expires` big-endian as a signed count of seconds,
-        // and names an instant outside years 1 through 9999 invalid.
+        // The report reads `expires` big-endian as a signed count of seconds.
+        // It names an instant outside the years 1 through 9999 invalid.
         (
             vec!["-m", &expires(1_700_000_000)],
             vec!["ostree.summary.expires"],
@@ -31408,9 +31842,9 @@ fn summary_add_metadata_matches_the_tool() {
         assert_eq!(lines(&port_run), lines(&tool_run), "{}", extra.join(" "));
     }
 
-    // The key order: the tool writes the whole dict in hash-table order and
-    // the port writes the standard order, then the caller keys in
-    // first-occurrence order. The key set agrees.
+    // The key order: `ostree` writes the whole dict in hash-table order.
+    // ostrya writes the standard order, then the caller keys in
+    // first-occurrence order. The key sets agree.
     let (port_run, tool_run) = summary_update_both(&port, &tool, &["-m", "b=1", "-m", "n=2"], &[]);
     port_run.ok();
     tool_run.ok();
@@ -31435,9 +31869,9 @@ fn summary_add_metadata_matches_the_tool() {
     };
     assert_eq!(sorted(tool_keys), sorted(port_keys));
 
-    // Without `-u`, `-m` beside a reading option is inert, even one that
-    // cannot parse, and alone it draws the no-option refusal.
-    // A plain regeneration first, so the two `summary` files agree again.
+    // Without `-u`, `-m` with a reading option has no effect, even if its
+    // value cannot parse. Alone, `-m` causes the refusal for no option.
+    // A plain regeneration comes first, so the two `summary` files agree again.
     summary_update_both(&port, &tool, &[], &[]);
     let before = summary_files(&tool);
     assert_eq!(summary_files(&port), before);
@@ -31455,7 +31889,7 @@ fn summary_add_metadata_matches_the_tool() {
     assert_eq!(summary_files(&tool), before);
 }
 
-/// `--gpg-homedir` with no `--gpg-sign` is inert under `-u`.
+/// `--gpg-homedir` with no `--gpg-sign` has no effect with `-u`.
 #[test]
 fn summary_gpg_homedir_alone_is_inert() {
     if !ostree_available() {
@@ -31470,7 +31904,8 @@ fn summary_gpg_homedir_alone_is_inert() {
     assert_eq!(summary_files(&port), summary_files(&tool));
 }
 
-/// The key id `gpg --list-packets` reports for one signature blob.
+/// Returns the key id that `gpg --list-packets` reports for one signature
+/// blob.
 #[cfg(feature = "gpg")]
 fn signature_key_id(home: &GpgHome, dir: &Path, blob: &[u8]) -> String {
     let path = dir.join("blob.sig");
@@ -31490,8 +31925,9 @@ fn signature_key_id(home: &GpgHome, dir: &Path, blob: &[u8]) -> String {
         .unwrap_or_else(|| panic!("no signature packet in:\n{text}"))
 }
 
-/// Whether the tool verifies the summary of `server` with the certificate at
-/// `keyring` imported for the remote, through a client repository of its own.
+/// Returns `true` if the `ostree` command verifies the summary of `server`.
+/// `ostree` uses a client repository of its own, with the certificate at
+/// `keyring` imported for the remote.
 #[cfg(feature = "gpg")]
 fn tool_verifies_summary(base: &Path, name: &str, server: &Path, keyring: &Path) -> bool {
     let client = base.join(name);
@@ -31514,9 +31950,10 @@ fn tool_verifies_summary(base: &Path, name: &str, server: &Path, keyring: &Path)
 }
 
 /// `summary -u --gpg-sign` writes the GPG signatures under `ostree.gpgsigs`,
-/// ahead of `ostree.sign.ed25519` whatever the command-line order, one per
-/// occurrence in command-line order, and resolves every selector before the
-/// regeneration. Each implementation verifies what the other signed.
+/// with one signature for each occurrence, in command-line order.
+/// `ostree.gpgsigs` comes before `ostree.sign.ed25519` in each command-line
+/// order. The command resolves each selector before the regeneration. Each
+/// command verifies what the other command signed.
 #[cfg(feature = "gpg")]
 #[test]
 fn summary_gpg_sign_matches_the_tool() {
@@ -31537,9 +31974,9 @@ fn summary_gpg_sign_matches_the_tool() {
     let k1 = format!("--sign={ED25519_SECRET_B64}");
     let env = &[("TZ", "UTC")];
 
-    // Beside an ed25519 key, in both command-line orders: the GPG signature
-    // is stored first, and the ed25519 one over the same summary bytes is the
-    // same in both.
+    // With an ed25519 key, in both command-line orders: the command stores the
+    // GPG signature first. The ed25519 signature of the same summary bytes is
+    // the same in both commands.
     for (label, extra) in [
         (
             "gpg first",
@@ -31588,8 +32025,8 @@ fn summary_gpg_sign_matches_the_tool() {
         }
     }
 
-    // The lookup refusals, and the refusal orders against the other options.
-    // Each leaves both files as they stood.
+    // The lookup refusals, and the order of the refusals against the other
+    // options. No refusal changes the two files.
     let (port, tool) = summary_writing_pair(base, "refusals");
     summary_update_both(&port, &tool, &[&k1], &[]);
     let port = {
@@ -31626,8 +32063,8 @@ fn summary_gpg_sign_matches_the_tool() {
         assert_eq!(summary_files(&port), before, "the port changed `{label}`");
         assert_eq!(summary_files(&tool), before, "the tool changed `{label}`");
     }
-    // With no `--gpg-homedir` the refusal names `<default>`. `GNUPGHOME`
-    // points both at the isolated home.
+    // With no `--gpg-homedir`, the refusal names `<default>`. `GNUPGHOME`
+    // points both commands at the isolated home.
     let gnupghome = home.dir.display().to_string();
     let (port_run, tool_run) =
         summary_update_both(&port, &tool, &[absent], &[("GNUPGHOME", &gnupghome)]);
@@ -31638,7 +32075,7 @@ fn summary_gpg_sign_matches_the_tool() {
     assert_eq!(first_stderr_line(&port_run), first_stderr_line(&tool_run));
     assert_eq!(summary_files(&port), before);
 
-    // Without `-u`: inert beside a reading option, refused alone.
+    // Without `-u`: no effect with a reading option, and a refusal alone.
     assert_agrees_env(
         &port,
         &tool,
@@ -31654,8 +32091,8 @@ fn summary_gpg_sign_matches_the_tool() {
     assert_eq!(summary_files(&port), before);
     assert_eq!(summary_files(&tool), before);
 
-    // Each implementation verifies what either signed, and a foreign key
-    // verifies neither.
+    // Each command verifies what either command signed. A foreign key
+    // verifies neither signature.
     let keyring = base.join("a.gpg");
     home.export_one_to(&fpr_a, &keyring);
     let other_base = base.join("home-o");
@@ -31697,10 +32134,10 @@ fn summary_gpg_sign_matches_the_tool() {
     }
 }
 
-/// In a collection repository the port refuses `-m` before the regeneration,
-/// where the tool carries the caller keys into the `ostree-metadata` anchor
-/// commit. The refusal leaves `summary`, `summary.sig`, and the anchor ref as
-/// they stood.
+/// In a collection repository, ostrya refuses `-m` before the regeneration.
+/// The `ostree` command puts the caller keys into the `ostree-metadata` anchor
+/// commit. The refusal does not change `summary`, `summary.sig`, or the anchor
+/// ref.
 #[test]
 fn summary_add_metadata_in_a_collection_repository_is_refused() {
     if !ostree_supports_ed25519() {
@@ -31746,7 +32183,7 @@ fn summary_add_metadata_in_a_collection_repository_is_refused() {
     assert_eq!(summary_files(&port), before, "the port changed the files");
     assert_eq!(anchor(&port), anchor_before, "the port moved the anchor");
 
-    // The tool takes the run and stores the key in the anchor commit.
+    // `ostree` accepts the run and stores the key in the anchor commit.
     let tool_arg = format!("--repo={}", tool.display());
     ostree(&[&tool_arg, "summary", "-u", "-m", "k='v'"]).ok();
     let stored = ostree(&[
@@ -31760,10 +32197,10 @@ fn summary_add_metadata_in_a_collection_repository_is_refused() {
     assert_eq!(stored, "'v'");
 }
 
-/// Under the gpg engine, a `--sign` key and a positional key are looked up
-/// before the regeneration, so a key the home directory does not hold leaves
-/// `summary`, `summary.sig`, and the ref list as they stood. A key the home
-/// directory holds signs.
+/// With the gpg engine, ostrya looks up a `--sign` key and a positional key
+/// before the regeneration. If the home directory does not hold the key,
+/// `summary`, `summary.sig`, and the ref list do not change. A key that the
+/// home directory holds signs.
 #[cfg(feature = "gpg")]
 #[test]
 fn summary_gpg_engine_key_refusal_keeps_files() {
@@ -31780,7 +32217,7 @@ fn summary_gpg_engine_key_refusal_keeps_files() {
     write_at(&tree.join("hello.txt"), b"hello\n");
     let tool = summary_fixture(base, "tool", &tree, &["one"], &[], &[&k1]);
     let port = clone_repo(base, &tool, "port");
-    // A ref the next regeneration would list.
+    // A ref that the next regeneration lists.
     ostree(&[
         &format!("--repo={}", port.display()),
         "commit",
@@ -31823,10 +32260,14 @@ fn summary_gpg_engine_key_refusal_keeps_files() {
     }
 }
 
-/// The report reads `ostree.summary.collection-map` the way the tool does: a
-/// map of the type the key promises lists its refs, a checksum of another
-/// length is named in place of the hex, and a value of any other type lists
-/// no refs. `--print-metadata-key` and `--list-metadata-keys` agree too.
+/// The report reads `ostree.summary.collection-map` as the `ostree` command
+/// reads it:
+///
+/// - a map of the type that the key promises lists its refs
+/// - the report names a checksum of another length in place of the hex
+/// - a value of any other type lists no refs
+///
+/// `--print-metadata-key` and `--list-metadata-keys` also agree.
 #[test]
 fn summary_report_reads_a_collection_map_of_any_shape() {
     if !ostree_available() {
@@ -31865,7 +32306,7 @@ fn summary_report_reads_a_collection_map_of_any_shape() {
             ],
             env,
         );
-        // The report follows the stored order, which parts after `-m`, so its
+        // The report follows the stored order, which differs after `-m`. The
         // lines agree as a sequence of ref blocks and as a set of metadata
         // lines.
         let (port_run, tool_run) = run_both_env(&port, &tool, &["summary", "--view"], env);
@@ -31884,13 +32325,14 @@ fn summary_report_reads_a_collection_map_of_any_shape() {
 
 // --- static-delta: show and indexes -----------------------------------------
 //
-// `show` and `indexes` write nothing, so each test runs both implementations
-// over one repository and compares the exit status and both streams. The
-// deltas are the tool's own and the port's own, generated over trees built
-// here; the timestamp a delta carries is the one its generator wrote, and both
-// implementations read it from the one file.
+// `show` and `indexes` write nothing, so each test runs both commands on one
+// repository. It compares the exit status and both streams. The deltas come
+// from the `ostree` command and from ostrya, generated from trees that these
+// tests build. The timestamp of a delta is the one that its generator wrote.
+// Both commands read it from the same file.
 
-/// `len` bytes of xorshift64 output from `seed`, so two seeds give two objects.
+/// Returns `len` bytes of xorshift64 output from `seed`, so two different seeds
+/// give two different objects.
 fn delta_noise(len: usize, seed: u64) -> Vec<u8> {
     let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
     (0..len)
@@ -31903,8 +32345,8 @@ fn delta_noise(len: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-/// Run the tool against `repo` with `args`, asserting it succeeded, and return
-/// its trimmed standard output.
+/// Runs the `ostree` command on `repo` with `args`, asserts that it succeeds,
+/// and returns its trimmed standard output.
 fn ostree_ok(repo: &Path, args: &[&str]) -> String {
     let repo_arg = format!("--repo={}", repo.display());
     let mut all = vec![repo_arg.as_str()];
@@ -31918,9 +32360,10 @@ fn ostree_ok(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(run.stdout).unwrap().trim().to_owned()
 }
 
-/// A tool archive repository at `base/<name>` holding two commits on `m`: a
-/// small file, a 300,000-byte file, and a symlink, then the small file edited
-/// and 1,000 bytes appended to the large one. Returns the path and both
+/// Creates an archive repository at `base/<name>` with the `ostree` command,
+/// with two commits on `m`. The first commit holds a small file, a
+/// 300,000-byte file, and a symlink. The second commit edits the small file
+/// and appends 1,000 bytes to the large file. Returns the path and both
 /// commits.
 fn delta_show_repo(base: &Path, name: &str) -> (PathBuf, String, String) {
     let repo = base.join(name);
@@ -31964,10 +32407,10 @@ fn delta_show_repo(base: &Path, name: &str) -> (PathBuf, String, String) {
     (repo, c1, c2)
 }
 
-/// A tool archive repository at `base/<name>` holding one commit of a
-/// 5,000,000-byte file and, where `parts` is set, three 1,200,000-byte files
-/// that a 1-byte chunk size spreads over parts of their own. Returns the path
-/// and the commit.
+/// Creates an archive repository at `base/<name>` with the `ostree` command,
+/// with one commit of a 5,000,000-byte file. If `parts` is `true`, the commit
+/// also holds three 1,200,000-byte files. A 1-byte chunk size puts each of
+/// them in a part of its own. Returns the path and the commit.
 fn delta_fallback_repo(base: &Path, name: &str, parts: bool) -> (PathBuf, String) {
     let repo = base.join(name);
     ostree_ok(&repo, &["init", "--mode=archive"]);
@@ -31993,8 +32436,8 @@ fn delta_fallback_repo(base: &Path, name: &str, parts: bool) -> (PathBuf, String
     (repo, c)
 }
 
-/// `static-delta show ARG` agrees between the two implementations over `repo`,
-/// run from `cwd`, and the output of the port is returned.
+/// Asserts that `static-delta show ARG` agrees between both commands on
+/// `repo`, run from `cwd`. Returns the run of ostrya.
 fn assert_show_agrees_in(cwd: &Path, repo: &Path, arg: &str) -> Run {
     let repo_arg = format!("--repo={}", repo.display());
     let args = ["static-delta", &repo_arg, "show", arg];
@@ -32004,13 +32447,14 @@ fn assert_show_agrees_in(cwd: &Path, repo: &Path, arg: &str) -> Run {
     port
 }
 
-/// The same from the repository's parent directory.
+/// Does the same as `assert_show_agrees_in`, from the parent directory of the
+/// repository.
 fn assert_show_agrees(repo: &Path, arg: &str) -> Run {
     assert_show_agrees_in(repo.parent().unwrap(), repo, arg)
 }
 
-/// A count on a `show` line, `key` being for example `"bspatch="`, summed over
-/// the parts.
+/// Returns the sum over the parts of a count on a `show` line. `key` is the
+/// prefix of the count, for example `"bspatch="`.
 fn show_count(run: &Run, key: &str) -> u64 {
     String::from_utf8_lossy(&run.stdout)
         .split_whitespace()
@@ -32018,9 +32462,14 @@ fn show_count(run: &Run, key: &str) -> u64 {
         .sum()
 }
 
-/// `show` agrees byte for byte over the tool's deltas: from scratch, from a
-/// source commit with bspatch and rollsum write operations, a 5 MB fallback
-/// over four parts, and a signed delta. Carries
+/// `show` agrees byte for byte on the deltas of the `ostree` command:
+///
+/// - a delta from scratch
+/// - a delta from a source commit, with bspatch and rollsum write operations
+/// - a 5 MB fallback over four parts
+/// - a signed delta
+///
+/// The test carries
 /// `static-delta/show-{scratch,from-to,fallback,multipart,bspatch,signed}`.
 #[test]
 fn static_delta_show_matches_the_tool_over_the_tools_deltas() {
@@ -32082,9 +32531,10 @@ fn static_delta_show_matches_the_tool_over_the_tools_deltas() {
     }
 }
 
-/// `show` agrees byte for byte over the port's deltas, with the timestamp the
-/// port's `--timestamp` pins. Carries the same six cells as the test above,
-/// for the port as the producer.
+/// `show` agrees byte for byte on the deltas of ostrya, with the timestamp
+/// that the `--timestamp` option of ostrya sets. The test carries the same six
+/// cells as `static_delta_show_matches_the_tool_over_the_tools_deltas`, with
+/// ostrya as the producer.
 #[test]
 fn static_delta_show_matches_the_tool_over_the_ports_deltas() {
     if !ostree_available() {
@@ -32127,9 +32577,9 @@ fn static_delta_show_matches_the_tool_over_the_ports_deltas() {
     assert!(String::from_utf8_lossy(&run.stdout).contains("Signed: yes\n"));
 }
 
-/// A delta the tool writes with `--set-endianness=B` reads the same in both:
-/// `Endianness: big`, and every size field swapped. Carries
-/// `static-delta/show-big-endian`.
+/// Both commands read a delta that the `ostree` command writes with
+/// `--set-endianness=B` in the same way: `Endianness: big`, with each size
+/// field swapped. The test carries `static-delta/show-big-endian`.
 #[test]
 fn static_delta_show_reads_a_big_endian_delta() {
     if !ostree_available() {
@@ -32157,12 +32607,14 @@ fn static_delta_show_reads_a_big_endian_delta() {
     );
 }
 
-/// The tool's `--inline` delta carries its part in the metadata dict. The port
-/// reads the part from there in the name form and the path form alike. The tool
-/// reads no inline part: in both forms it opens the part file the repository
-/// would hold and refuses after `PartMeta0`, which is the recorded divergence.
-/// The port's part lines equal the tool's over the same delta written with its
-/// part as a file. Carries `static-delta/show-inline`.
+/// An `--inline` delta of the `ostree` command holds its part in the metadata
+/// dict. ostrya reads the part from there, in the name form and in the path
+/// form. `ostree` reads no inline part. In both forms, it opens the part file
+/// at its path in the repository and refuses after `PartMeta0`.
+///
+/// This is the recorded divergence. The part lines of ostrya are the same as
+/// the part lines of `ostree` for the same delta with its part written as a
+/// file. The test carries `static-delta/show-inline`.
 #[test]
 fn static_delta_show_reads_an_inline_delta() {
     if !ostree_available() {
@@ -32214,8 +32666,8 @@ fn static_delta_show_reads_an_inline_delta() {
             format!("error: openat({relative}/0): No such file or directory\n"),
             "{arg}"
         );
-        // The tool's lines up to its refusal are the port's up to the first
-        // part's payload line.
+        // The lines of `ostree` up to its refusal are the same as the lines of
+        // ostrya up to the payload line of the first part.
         let printed = String::from_utf8_lossy(&port.stdout).into_owned();
         let cut = printed.find("PartPayload0").unwrap();
         assert_eq!(
@@ -32226,11 +32678,12 @@ fn static_delta_show_reads_an_inline_delta() {
     }
 }
 
-/// A superblock named by path, relative or absolute, agrees in both. A
-/// directory and an absent path refuse alike. A superblock copied away from its
-/// parts is the recorded divergence: the tool reads the repository's parts for
-/// the delta it names, and the port reads the parts beside the file. Carries
-/// `static-delta/show-path-arg`.
+/// A superblock named by a relative or an absolute path gives the same output
+/// in both commands. Both commands refuse a directory and an absent path in
+/// the same way. A superblock copied away from its parts is the recorded
+/// divergence. The `ostree` command reads the parts in the repository for the
+/// delta that the superblock names, and ostrya reads the parts next to the
+/// file. The test carries `static-delta/show-path-arg`.
 #[test]
 fn static_delta_show_takes_a_superblock_path() {
     if !ostree_available() {
@@ -32287,9 +32740,10 @@ fn static_delta_show_takes_a_superblock_path() {
     assert!(!printed.contains("PartPayload0"), "{printed}");
 }
 
-/// The offsets of the two size fields of the fallback entry whose checksum is
-/// `hex`, in unsigned superblock bytes: the element `(yaytt)` starts one byte
-/// before the checksum, and its two `t` fields sit at 40 and 48 in it.
+/// Returns the offsets of the two size fields of the fallback entry with the
+/// checksum `hex`, in unsigned superblock bytes. The element `(yaytt)` starts
+/// one byte before the checksum. Its two `t` fields are at 40 and 48 in the
+/// element.
 fn fallback_size_offsets(bytes: &[u8], hex: &str) -> (usize, usize) {
     let checksum = Checksum::from_hex(hex).unwrap();
     let at = bytes
@@ -32299,11 +32753,16 @@ fn fallback_size_offsets(bytes: &[u8], hex: &str) -> (usize, usize) {
     (at - 1 + 40, at - 1 + 48)
 }
 
-/// The size wording agrees at every boundary: `0 bytes`, `1 byte`, `N bytes`,
-/// the U+00A0 before the unit, the unit chosen on the raw count, and the
-/// rounding of the exact double. The superblocks are the tool's own with the
-/// fallback entry's two sizes patched in place, beside the delta's parts, so
-/// both implementations read one set of parts.
+/// The size text agrees at each boundary:
+///
+/// - `0 bytes`, `1 byte`, `N bytes`
+/// - the U+00A0 before the unit
+/// - the unit chosen on the raw count
+/// - the rounding of the exact double
+///
+/// The superblocks are those of the `ostree` command, with the two sizes of
+/// the fallback entry patched in place. They are next to the parts of the
+/// delta, so both commands read one set of parts.
 #[test]
 fn static_delta_show_size_format_matches_the_tool() {
     if !ostree_available() {
@@ -32355,13 +32814,14 @@ fn static_delta_show_size_format_matches_the_tool() {
     }
 }
 
-/// Rebuild an unsigned superblock with field 5, the recursion array, replaced
-/// by `recursion`. The tuple's variable members are carved out at the framing
-/// offsets it ends with and laid out again under their alignments, and the
-/// framing is written at the width the new length takes.
+/// Rebuilds an unsigned superblock with `recursion` in place of field 5, the
+/// recursion array. The function cuts out the variable members of the tuple
+/// at the framing offsets at the end of the tuple. It lays them out again with
+/// their alignments, and writes the framing at the width that the new length
+/// needs.
 fn superblock_with_recursion(bytes: &[u8], recursion: &[u8]) -> Vec<u8> {
     // `(a{sv}tayay(a{sv}aya(say)sstayay)aya(uayttay)a(yaytt))`: the alignment of
-    // each member, and the members whose end a framing offset states.
+    // each member, and the members with an end that a framing offset states.
     const ALIGN: [usize; 8] = [8, 8, 1, 1, 8, 1, 8, 8];
     const FRAMED: [usize; 6] = [0, 2, 3, 4, 5, 6];
     let width = |len: usize| match len {
@@ -32411,7 +32871,8 @@ fn superblock_with_recursion(bytes: &[u8], recursion: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `Number of parents` is field 5's byte length over 64, in both.
+/// In both commands, `Number of parents` is the byte length of field 5 divided
+/// by 64, rounded down.
 #[test]
 fn static_delta_show_parent_count_matches_the_tool() {
     if !ostree_available() {
@@ -32444,7 +32905,7 @@ fn static_delta_show_parent_count_matches_the_tool() {
 }
 
 /// The name parser and the refusals agree: exit status, standard output, and
-/// standard error. Carries `static-delta/show-invalid-name` and
+/// standard error. The test carries `static-delta/show-invalid-name` and
 /// `static-delta/show-absent`.
 #[test]
 fn static_delta_show_refusals_match_the_tool() {
@@ -32488,7 +32949,7 @@ fn static_delta_show_refusals_match_the_tool() {
         assert!(run.stdout.is_empty(), "{arg}");
     }
 
-    // A missing part fails after its `PartMeta` line in both.
+    // In both commands, a missing part fails after its `PartMeta` line.
     let dir = repo.join(ostrya::static_delta_relative_dir(
         None,
         &Checksum::from_hex(&c1).unwrap(),
@@ -32501,8 +32962,8 @@ fn static_delta_show_refusals_match_the_tool() {
     assert!(!printed.contains("PartPayload0"), "{printed}");
 }
 
-/// An uncompressed part payload with empty tables, a 64-byte blob, and `ops`,
-/// framed at a one-byte offset width.
+/// Returns an uncompressed part payload with empty tables, a 64-byte blob, and
+/// `ops`, framed at a one-byte offset width.
 fn crafted_part(ops: &[u8]) -> Vec<u8> {
     let blob = [0u8; 64];
     let mut part = vec![0u8];
@@ -32514,12 +32975,16 @@ fn crafted_part(ops: &[u8]) -> Vec<u8> {
     part
 }
 
-/// The operands of an operation stream the tool's `show` counts unchecked
-/// count the same in the port: a `w` past the blob with no read source set and
-/// a `B` past the blob, at exit 0. An `S` past the blob refuses in both. An
-/// `o` whose mode index is outside the empty mode table aborts the tool and
-/// counts in the port, the recorded exit split. Each part is written in place
-/// of the tool's own, with its meta entry's checksum and size patched.
+/// `show` of the `ostree` command counts some operands of an operation stream
+/// with no check. ostrya counts them in the same way, at exit 0:
+///
+/// - a `w` past the blob with no read source set
+/// - a `B` past the blob
+///
+/// An `S` past the blob causes a refusal in both commands. An `o` with a mode
+/// index outside the empty mode table aborts `ostree` (signal 6), and ostrya
+/// counts it. This is the recorded exit split. Each crafted part replaces the
+/// part of `ostree`, with the checksum and the size in its meta entry patched.
 #[test]
 fn static_delta_show_counts_unchecked_operands_as_the_tool_does() {
     if !ostree_available() {
@@ -32581,11 +33046,16 @@ fn static_delta_show_counts_unchecked_operands_as_the_tool_does() {
     assert_eq!(tool.status.signal(), Some(6), "the tool did not abort");
 }
 
-/// `indexes` agrees: nothing for an absent or empty `delta-indexes/`, the
-/// targets `reindex` wrote, as a set since the tool prints `readdir` order and
-/// the port sorts, and the entries both skip. A `delta-indexes` that is a file
-/// fails in both. Carries `static-delta/indexes-empty`,
-/// `static-delta/indexes-after-reindex`, and
+/// `indexes` agrees in these cases:
+///
+/// - an absent or empty `delta-indexes/`: for an absent one, both commands
+///   print `(No static deltas indexes)`
+/// - the targets that `reindex` wrote, as a set, because the `ostree` command
+///   prints `readdir` order and ostrya sorts
+/// - the entries that both commands skip
+///
+/// A `delta-indexes` that is a file fails in both commands. The test carries
+/// `static-delta/indexes-empty`, `static-delta/indexes-after-reindex`, and
 /// `static-delta/indexes-skips-invalid`.
 #[test]
 fn static_delta_indexes_matches_the_tool() {
@@ -32594,8 +33064,8 @@ fn static_delta_indexes_matches_the_tool() {
     }
     let tmp = TmpDir::new("delta-indexes");
     let (repo, c1, c2) = delta_show_repo(tmp.path(), "repo");
-    // The tool reads `static-delta --repo PATH` as a subcommand named PATH, so
-    // the repository goes in the `=` form.
+    // `ostree` reads `static-delta --repo PATH` as a subcommand named PATH, so
+    // the repository is given in the `=` form.
     let repo_arg = format!("--repo={}", repo.display());
     let args = ["static-delta", repo_arg.as_str(), "indexes"];
     let both = || (ostrya(&args, None, &[]), ostree(&args));
@@ -32667,13 +33137,18 @@ fn static_delta_indexes_matches_the_tool() {
     assert!(port.stdout.is_empty() && tool.stdout.is_empty());
 }
 
-/// `list` agrees: `(No static deltas)` for an absent `deltas/`, an empty one,
-/// and an empty fanout, and the names of the deltas the tool generated, as a
-/// set since the tool prints `readdir` order and the port sorts. An entry with
-/// no superblock is skipped by both: an empty directory, a directory with a
-/// part alone, a regular file, and a dangling `superblock` symlink. Carries
-/// `static-delta/list-empty`, `static-delta/list-skips-dir-without-superblock`,
-/// and `static-delta/list-order`.
+/// `list` agrees in these cases:
+///
+/// - `(No static deltas)` for an absent `deltas/`, an empty one, and an empty
+///   fanout
+/// - the names of the deltas that the `ostree` command generated, as a set,
+///   because `ostree` prints `readdir` order and ostrya sorts
+///
+/// Both commands skip an entry with no superblock: an empty directory, a
+/// directory with only a part, a regular file, and a dangling `superblock`
+/// symlink. The test carries `static-delta/list-empty`,
+/// `static-delta/list-skips-dir-without-superblock`, and
+/// `static-delta/list-order`.
 #[test]
 fn static_delta_list_matches_the_tool() {
     if !ostree_available() {
@@ -32739,9 +33214,10 @@ fn static_delta_list_matches_the_tool() {
     assert_eq!(lines(&port), expected);
 }
 
-/// The recorded `list` divergences stand. The tool lists an entry whose name
-/// does not decode and that holds a superblock, and the port refuses it. The
-/// tool ignores an extra operand, and the port's parser refuses it.
+/// The recorded `list` divergences do not change. The `ostree` command lists
+/// an entry with a name that does not decode and that holds a superblock.
+/// ostrya refuses it. `ostree` ignores an extra operand, and the parser of
+/// ostrya refuses it.
 #[test]
 fn static_delta_list_divergences_stand_as_recorded() {
     if !ostree_available() {
@@ -32779,7 +33255,7 @@ enum DeltaTreeCase {
     /// The delta from a source commit moves out, and a symlink at its delta
     /// path points to it.
     LeafSymlink,
-    /// The fanout both deltas share moves out, and a symlink points to it.
+    /// The fanout that both deltas share moves out, and a symlink points to it.
     FanoutSymlink,
     /// A regular file directly under `deltas/`.
     File,
@@ -32787,7 +33263,8 @@ enum DeltaTreeCase {
     LeafLoop,
     /// A symlink to itself used as a fanout.
     FanoutLoop,
-    /// A directory at a delta path whose `superblock` is a symlink to itself.
+    /// A directory at a delta path, with a `superblock` that is a symlink to
+    /// itself.
     SuperblockLoop,
     /// The whole `deltas/` directory moves out, and a symlink at `deltas`
     /// points to it.
@@ -32798,11 +33275,11 @@ enum DeltaTreeCase {
     DeltasFile,
 }
 
-/// Copy `repo`, whose `deltas/` holds a delta from scratch to `c1` and a delta
-/// from `c1` to `c2` under one fanout, to `base/<tag>/repo`, and place `case`
-/// in the copy. What a symlink points to moves to `base/<tag>/outside`, and
-/// each symlink names its target relative to itself, so two copies describe
-/// the same.
+/// Copies `repo` to `base/<tag>/repo` and places `case` in the copy. The
+/// `deltas/` of `repo` holds a delta from scratch to `c1` and a delta from `c1`
+/// to `c2` under one fanout. The target of each symlink moves to
+/// `base/<tag>/outside`. Each symlink names its target relative to itself, so
+/// `describe_tree` gives the same lines for two copies.
 fn lay_delta_tree(
     base: &Path,
     repo: &Path,
@@ -32853,9 +33330,10 @@ fn lay_delta_tree(
     copy
 }
 
-/// The delta names and digests in the `Static Deltas` line of the tool's
-/// `summary --view` of `repo`, sorted, since the tool writes the map in the
-/// order of a hash table. Empty where the summary carries no delta.
+/// Returns the delta names and digests in the `Static Deltas` line of
+/// `summary --view` of the `ostree` command on `repo`. The list is sorted,
+/// because `ostree` writes the map in the order of a hash table. The list is
+/// empty if the summary holds no delta.
 fn summary_delta_entries(repo: &Path) -> Vec<String> {
     let run = ostree(&["summary", &format!("--repo={}", repo.display()), "--view"]);
     assert!(
@@ -32878,16 +33356,20 @@ fn summary_delta_entries(repo: &Path) -> Vec<String> {
     entries
 }
 
-/// `list`, `reindex`, and `summary -u` agree over a `deltas/` tree that holds
-/// a symlink, a file, or a symlink loop. A symlink at a delta path or used as
-/// a fanout is not followed, and the deltas behind it are not listed, indexed,
-/// or advertised. A regular file directly under `deltas/` and a symlink loop
-/// at a delta path or used as a fanout are skipped. A symlink at `deltas`
-/// itself is followed, and the deltas behind it are listed, indexed, and
-/// advertised. A dangling symlink at `deltas` holds no delta. A `superblock`
-/// that is a symlink loop and a regular file at `deltas` refuse all three at
-/// exit 1. Carries
-/// `static-delta/list-skips-dir-without-superblock`.
+/// `list`, `reindex`, and `summary -u` agree on a `deltas/` tree that holds a
+/// symlink, a file, or a symlink loop:
+///
+/// - The scan follows no symlink at a delta path or used as a fanout. The
+///   commands do not list, index, or advertise the deltas behind it.
+/// - The scan skips a regular file directly under `deltas/`, and a symlink
+///   loop at a delta path or used as a fanout.
+/// - The scan follows a symlink at `deltas` itself. The commands list, index,
+///   and advertise the deltas behind it.
+/// - A dangling symlink at `deltas` holds no delta.
+/// - A `superblock` that is a symlink loop and a regular file at `deltas`
+///   cause a refusal of all three commands at exit 1.
+///
+/// The test carries `static-delta/list-skips-dir-without-superblock`.
 #[test]
 fn static_delta_scan_follows_no_symlink_like_the_tool() {
     if !ostree_available() {
@@ -32972,12 +33454,15 @@ fn static_delta_scan_follows_no_symlink_like_the_tool() {
     }
 }
 
-/// The static-delta sweep of a prune agrees over a `deltas/` tree that holds a
-/// symlink, a file, or a symlink loop: it follows no symlink at a delta path or
-/// at a fanout, and it skips a regular file directly under `deltas/`, so the
-/// deltas behind a symlink stay and the run exits 0. A symlink at `deltas`
-/// itself is followed, and the delta behind it is removed. A dangling symlink
-/// at `deltas` holds no delta, and the run exits 0.
+/// The static-delta sweep of a prune agrees on a `deltas/` tree that holds a
+/// symlink, a file, or a symlink loop:
+///
+/// - The sweep follows no symlink at a delta path or at a fanout, and it skips
+///   a regular file directly under `deltas/`. The deltas behind a symlink
+///   stay, and the run exits 0.
+/// - The sweep follows a symlink at `deltas` itself and removes the delta
+///   behind it.
+/// - A dangling symlink at `deltas` holds no delta, and the run exits 0.
 #[test]
 fn prune_static_delta_sweep_follows_no_symlink_like_the_tool() {
     if !ostree_available() {
@@ -33028,14 +33513,14 @@ fn prune_static_delta_sweep_follows_no_symlink_like_the_tool() {
     }
 }
 
-/// The path of the delta to `to` from scratch below `deltas/`.
+/// Returns the path of the delta from scratch to `to`, relative to `deltas/`.
 fn scratch_dir(to: &str) -> PathBuf {
     let to = Checksum::from_hex(to).unwrap();
     let dir = ostrya::static_delta_relative_dir(None, &to);
     PathBuf::from(dir.strip_prefix("deltas/").unwrap())
 }
 
-/// The path of the delta from `from` to `to` below `deltas/`.
+/// Returns the path of the delta from `from` to `to`, relative to `deltas/`.
 fn pair_dir(from: &str, to: &str) -> PathBuf {
     let from = Checksum::from_hex(from).unwrap();
     let to = Checksum::from_hex(to).unwrap();
@@ -33043,9 +33528,9 @@ fn pair_dir(from: &str, to: &str) -> PathBuf {
     PathBuf::from(dir.strip_prefix("deltas/").unwrap())
 }
 
-/// `delete` agrees where `deltas` is a symlink. A symlink at `deltas` is
-/// followed, the delta behind it is removed, and the link stays. A dangling
-/// symlink at `deltas` holds no delta, and both refuse at exit 1.
+/// `delete` agrees if `deltas` is a symlink. The command follows a symlink at
+/// `deltas`, removes the delta behind it, and keeps the link. A dangling
+/// symlink at `deltas` holds no delta, and both commands refuse at exit 1.
 #[test]
 fn static_delta_delete_follows_a_deltas_symlink_like_the_tool() {
     if !ostree_available() {
@@ -33081,8 +33566,9 @@ fn static_delta_delete_follows_a_deltas_symlink_like_the_tool() {
     }
 }
 
-/// Run `static-delta delete` with `args` against each implementation's own
-/// repository, the repository in the `=` form the tool reads.
+/// Runs `static-delta delete` with `args` in each command on its own
+/// repository. The repository is given in the `=` form that the `ostree`
+/// command reads.
 fn run_delta_delete(port_repo: &Path, tool_repo: &Path, args: &[&str]) -> (Run, Run) {
     let run = |repo: &Path, tool: bool| {
         let repo_arg = format!("--repo={}", repo.display());
@@ -33097,10 +33583,15 @@ fn run_delta_delete(port_repo: &Path, tool_repo: &Path, args: &[&str]) -> (Run, 
     (run(port_repo, false), run(tool_repo, true))
 }
 
-/// `delete` agrees: no output at exit 0, the entry at the delta path removed
-/// whole whatever it is, a symlink removed as a link, and the fanout,
-/// `delta-indexes/`, and `summary` left as they were, so `indexes` still lists
-/// the targets. Carries `static-delta/delete-ok` and
+/// `delete` agrees:
+///
+/// - It writes no output, and it exits 0.
+/// - It removes the whole entry at the delta path, for each kind of entry.
+/// - It removes a symlink as a link.
+/// - It does not change the fanout, `delta-indexes/`, or `summary`, so
+///   `indexes` still lists the targets.
+///
+/// The test carries `static-delta/delete-ok` and
 /// `static-delta/delete-leaves-index`.
 #[test]
 fn static_delta_delete_matches_the_tool() {
@@ -33205,10 +33696,16 @@ fn static_delta_delete_matches_the_tool() {
     assert_eq!(lines(&port), expected, "the index still lists both targets");
 }
 
-/// The refusals of `delete` agree: no argument, a name the parser refuses, a
-/// path, and an absent delta, a dangling symlink at the delta path and a
-/// missing `deltas/` included. An extra positional and a symlink loop are the
-/// recorded divergences. Carries `static-delta/delete-absent`.
+/// The refusals of `delete` agree for these arguments:
+///
+/// - no argument
+/// - a name that the parser refuses
+/// - a path
+/// - an absent delta, which includes a dangling symlink at the delta path and
+///   a missing `deltas/`
+///
+/// An extra positional and a symlink loop are the recorded divergences.
+/// The test carries `static-delta/delete-absent`.
 #[test]
 fn static_delta_delete_refusals_match_the_tool() {
     if !ostree_available() {
@@ -33263,7 +33760,8 @@ fn static_delta_delete_refusals_match_the_tool() {
     let port = agree(&[&c2]);
     assert_eq!(String::from_utf8_lossy(&port.stderr), not_found);
 
-    // A dangling symlink at the delta path is an absent delta, and it stays.
+    // A dangling symlink at the delta path is an absent delta, and the symlink
+    // stays.
     let scratch2 = ostrya::static_delta_relative_dir(None, &to2);
     for repo in [&port_repo, &tool_repo] {
         let link = repo.join(&scratch2);
@@ -33277,7 +33775,8 @@ fn static_delta_delete_refusals_match_the_tool() {
         std::fs::remove_file(repo.join(&scratch2)).unwrap();
     }
 
-    // A symlink loop at the delta path fails in both, worded apart.
+    // A symlink loop at the delta path fails in both commands, with different
+    // messages.
     let leaf = Path::new(&scratch2).file_name().unwrap().to_owned();
     for repo in [&port_repo, &tool_repo] {
         std::os::unix::fs::symlink(&leaf, repo.join(&scratch2)).unwrap();
@@ -33301,8 +33800,8 @@ fn static_delta_delete_refusals_match_the_tool() {
         std::fs::remove_file(repo.join(&scratch2)).unwrap();
     }
 
-    // An extra positional: the tool ignores it and removes the delta, and the
-    // port refuses it and removes nothing.
+    // An extra positional: the `ostree` command ignores it and removes the
+    // delta. ostrya refuses it and removes nothing.
     let before = deltas(&port_repo);
     let (port, tool) = run_delta_delete(&port_repo, &tool_repo, &[&c1, "extra"]);
     assert_eq!(tool.status.code(), Some(0));
@@ -33339,9 +33838,9 @@ const ED25519_ZERO_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 /// 32 bytes that decode to no point on the curve.
 const ED25519_NOT_A_POINT_B64: &str = "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
-/// The fixture repository with a from-scratch delta to `COMMIT` the port
-/// signed with the shared key, and an unsigned delta of the same commit
-/// written to `base/unsigned`.
+/// Creates the fixture repository with a from-scratch delta to `COMMIT` that
+/// ostrya signs with the shared key. It also writes an unsigned delta of the
+/// same commit to `base/unsigned`.
 fn verify_fixture(base: &Path) -> PathBuf {
     let repo = commit_fixture(base);
     let repo_s = repo.to_str().unwrap();
@@ -33354,14 +33853,14 @@ fn verify_fixture(base: &Path) -> PathBuf {
     repo
 }
 
-/// Run `static-delta verify ARGS` against `repo` from `cwd`.
+/// Runs `static-delta verify ARGS` on `repo` from `cwd`.
 fn run_delta_verify(cwd: &Path, repo: &Path, args: &[&str]) -> Run {
     let repo_arg = format!("--repo={}", repo.display());
     let all = [&["static-delta", repo_arg.as_str(), "verify"][..], args].concat();
     ostrya_in(Some(cwd), &all, None, &[])
 }
 
-/// Assert the exit status and both streams of a `static-delta verify` run.
+/// Asserts the exit status and both streams of a `static-delta verify` run.
 fn assert_verify_run(run: &Run, code: i32, stdout: &str, stderr: &str, label: &str) {
     assert_eq!(
         (
@@ -33374,8 +33873,8 @@ fn assert_verify_run(run: &Run, code: i32, stdout: &str, stderr: &str, label: &s
     );
 }
 
-/// The key-list failure line for keys listed in the order the line names
-/// them.
+/// Returns the key-list failure line for `hexes`, in the order that the line
+/// names them.
 fn verify_key_list_error(hexes: &[&str]) -> String {
     let keys: Vec<String> = hexes.iter().map(|hex| format!("key '{hex}'")).collect();
     format!(
@@ -33384,8 +33883,9 @@ fn verify_key_list_error(hexes: &[&str]) -> String {
     )
 }
 
-/// Write a key store under `base/<name>` with `trusted` and `revoked` lines in
-/// `trusted.ed25519` and `revoked.ed25519`, each file only when given.
+/// Writes a key store under `base/<name>`, with the `trusted` lines in
+/// `trusted.ed25519` and the `revoked` lines in `revoked.ed25519`. It writes
+/// each file only if its list is not empty.
 fn verify_key_store(base: &Path, name: &str, trusted: &[&str], revoked: &[&str]) -> PathBuf {
     let dir = base.join(name);
     std::fs::create_dir_all(&dir).unwrap();
@@ -33397,9 +33897,9 @@ fn verify_key_store(base: &Path, name: &str, trusted: &[&str], revoked: &[&str])
     dir
 }
 
-/// `static-delta verify` prints `Verification OK` at exit 0 under the signing
-/// key, and `Verification fails` with the key-list line at exit 1 under any
-/// other key, the keys named in reverse order.
+/// With the signing key, `static-delta verify` prints `Verification OK` at
+/// exit 0. With each other key, it prints `Verification fails` and the
+/// key-list line at exit 1. The line names the keys in reverse order.
 #[test]
 fn static_delta_verify_reports_ok_and_fails() {
     let tmp = TmpDir::new("delta-verify-ok");
@@ -33445,10 +33945,13 @@ fn static_delta_verify_reports_ok_and_fails() {
     );
 }
 
-/// The key sources: the positionals and the last `--keys-file` combine, either
-/// one makes `--keys-dir` unread, the last `--keys-dir` is read with its
-/// `.d` directory and its revoked set, and `no keys loaded` is judged before
-/// revocation.
+/// The key sources:
+///
+/// - The positionals and the last `--keys-file` combine.
+/// - If either one is given, the command does not read `--keys-dir`.
+/// - The command reads the last `--keys-dir`, with its `.d` directory and its
+///   revoked set.
+/// - The command checks for `no keys loaded` before it applies revocation.
 #[test]
 fn static_delta_verify_key_sources() {
     let tmp = TmpDir::new("delta-verify-keys");
@@ -33585,8 +34088,8 @@ fn static_delta_verify_key_sources() {
         "the keys load before the argument resolves",
     );
 
-    // Empty lines and lone `\r` lines are skipped; CRLF, padding, and a
-    // character outside the alphabet are read leniently.
+    // The reader skips empty lines and lone `\r` lines. It reads CRLF,
+    // padding, and a character outside the alphabet leniently.
     let junk = format!("{}!{}", &ED25519_PUBLIC_B64[..4], &ED25519_PUBLIC_B64[4..]);
     std::fs::write(base.join("lenient"), format!("\n\r\n  {junk}  \r\n\n")).unwrap();
     ok(&["--keys-file=lenient", COMMIT], "lenient keys file");
@@ -33604,7 +34107,7 @@ fn static_delta_verify_key_sources() {
         "error: signature: ed25519: no valid keys in file 'blank'\n",
         "blank keys file",
     );
-    // A line of whitespace is a key of no byte.
+    // A line of whitespace is a key of zero bytes.
     let no_byte = "error: Invalid ed25519 public key: Ill-formed input: expected 32 bytes, \
                    got 0 bytes\n";
     for (name, text) in [
@@ -33641,10 +34144,13 @@ fn static_delta_verify_key_sources() {
     );
 }
 
-/// A key that is not a valid key refuses the run before standard output: a
-/// positional of the wrong length, a keys-file line of the wrong length beside
-/// a valid one, and 32 bytes that are no curve point, also beside the key that
-/// verifies the delta.
+/// An invalid key causes a refusal before the command writes to standard
+/// output:
+///
+/// - a positional of the wrong length
+/// - a keys-file line of the wrong length, next to a valid line
+/// - 32 bytes that are not a curve point, also next to the key that verifies
+///   the delta
 #[test]
 fn static_delta_verify_refuses_invalid_keys_before_output() {
     let tmp = TmpDir::new("delta-verify-invalid");
@@ -33687,10 +34193,16 @@ fn static_delta_verify_refuses_invalid_keys_before_output() {
     }
 }
 
-/// The sign types: `ed25519` is the default, `dummy` refuses in its own words
-/// with nothing on standard output, `gpg` and any unknown name print `Sign-type
-/// not supported`, and the last `--sign-type` wins. A build with the `spki`
-/// engine verifies a delta the port signs with it.
+/// The sign types:
+///
+/// - `ed25519` is the default.
+/// - `dummy` refuses with its own message and writes nothing on standard
+///   output.
+/// - `gpg` and each unknown name print `Sign-type not supported`.
+/// - The last `--sign-type` wins.
+///
+/// A build with the `spki` engine verifies a delta that ostrya signs with
+/// this engine.
 #[test]
 fn static_delta_verify_sign_types() {
     let tmp = TmpDir::new("delta-verify-types");
@@ -33781,10 +34293,11 @@ fn static_delta_verify_sign_types() {
     }
 }
 
-/// The argument is a name or, holding `/`, a superblock path; only the
-/// superblock is read, so a copy under another name verifies away from its
-/// parts. Every failure to resolve or read it follows `Verification fails`,
-/// and a missing argument refuses before the sign type is read.
+/// The argument is a delta name, or a superblock path if it contains `/`.
+/// The command reads only the superblock, so a copy with another name
+/// verifies away from its parts. Each failure to resolve or read the argument
+/// comes after `Verification fails`. If the argument is missing, the command
+/// refuses before it reads the sign type.
 #[test]
 fn static_delta_verify_argument_forms() {
     let tmp = TmpDir::new("delta-verify-args");
@@ -33838,8 +34351,8 @@ fn static_delta_verify_argument_forms() {
     );
 }
 
-/// A file that is not a superblock refuses after `Verification fails` with the
-/// port's parse sentence, where the tool reads the magic alone.
+/// If the file is not a superblock, ostrya refuses after `Verification fails`
+/// with the message of its parser. The `ostree` command reads only the magic.
 #[test]
 fn static_delta_verify_does_not_parse_as_the_tool_does() {
     let tmp = TmpDir::new("delta-verify-parse");
@@ -33852,8 +34365,9 @@ fn static_delta_verify_does_not_parse_as_the_tool_does() {
     assert!(String::from_utf8_lossy(&run.stderr).starts_with("error: "));
 }
 
-/// Run `static-delta verify ARGS` against `repo` from `cwd` under both
-/// implementations and assert the exit status and both streams agree.
+/// Runs `static-delta verify ARGS` against `repo` from `cwd` with ostrya and
+/// with the `ostree` command. Asserts that the exit status and both streams
+/// agree, and returns the run of ostrya.
 fn assert_verify_agrees(cwd: &Path, repo: &Path, args: &[&str]) -> Run {
     let repo_arg = format!("--repo={}", repo.display());
     let all = [&["static-delta", repo_arg.as_str(), "verify"][..], args].concat();
@@ -33863,10 +34377,15 @@ fn assert_verify_agrees(cwd: &Path, repo: &Path, args: &[&str]) -> Run {
     port
 }
 
-/// The cases both cross-tool tests run over `repo`, which holds an unsigned
-/// delta to `c1`, a delta to `c2` and a delta from `c1` to `c2`, both signed
-/// with the shared key. The key files, stores, and the copied superblock sit
-/// in `base`, the working directory of every run.
+/// Runs the cases of the two tests that compare ostrya with the `ostree`
+/// command over `repo`. `repo` has these deltas:
+///
+/// - an unsigned delta to `c1`
+/// - a delta to `c2`, signed with the shared key
+/// - a delta from `c1` to `c2`, signed with the shared key
+///
+/// The key files, the key stores, and the copied superblock are in `base`,
+/// the working directory of each run.
 fn assert_verify_cases_agree(base: &Path, repo: &Path, c1: &str, c2: &str) {
     std::fs::write(base.join("k1"), format!("{ED25519_PUBLIC_B64}\n")).unwrap();
     std::fs::write(base.join("k2"), format!("{ED25519_PUBLIC2_B64}\n")).unwrap();
@@ -33942,9 +34461,10 @@ fn assert_verify_cases_agree(base: &Path, repo: &Path, c1: &str, c2: &str) {
     }
 }
 
-/// `verify` agrees byte for byte over the tool's deltas. Carries
+/// `verify` of ostrya and of the `ostree` command agree byte for byte over
+/// the deltas of `ostree`. The test carries
 /// `static-delta/verify-{ok,wrong-key,unsigned,keys-file-last-wins,keys-file-overrides-keys-dir,path-arg}`
-/// for the tool as the producer.
+/// with `ostree` as the producer.
 #[test]
 fn static_delta_verify_matches_the_tool_over_the_tools_deltas() {
     if !ostree_supports_ed25519() {
@@ -33982,9 +34502,11 @@ fn static_delta_verify_matches_the_tool_over_the_tools_deltas() {
     assert_verify_cases_agree(tmp.path(), &repo, &c1, &c2);
 }
 
-/// `verify` agrees byte for byte over the port's deltas: the tool's `verify`
-/// reads a delta the port signs. Carries the same cells as the test above, for
-/// the port as the producer.
+/// `verify` of ostrya and of the `ostree` command agree byte for byte over
+/// the deltas of ostrya. `verify` of `ostree` reads a delta that ostrya signs.
+/// The test carries the same cells as
+/// `static_delta_verify_matches_the_tool_over_the_tools_deltas`, with ostrya as
+/// the producer.
 #[test]
 fn static_delta_verify_matches_the_tool_over_the_ports_deltas() {
     if !ostree_supports_ed25519() {
@@ -34010,9 +34532,16 @@ fn static_delta_verify_matches_the_tool_over_the_ports_deltas() {
     assert_verify_cases_agree(tmp.path(), &repo, &c1, &c2);
 }
 
-/// The refusals agree byte for byte: no argument, an unknown sign type, no key
-/// loaded, a positional of the wrong length, an empty keys file, and a missing
-/// one. Carries `static-delta/verify-no-keys`.
+/// The refusals of ostrya and of the `ostree` command agree byte for byte:
+///
+/// - no argument
+/// - an unknown sign type
+/// - no key loaded
+/// - a positional of the wrong length
+/// - an empty keys file
+/// - a missing keys file
+///
+/// The test carries `static-delta/verify-no-keys`.
 #[test]
 fn static_delta_verify_refusals_match_the_tool() {
     if !ostree_supports_ed25519() {
@@ -34064,7 +34593,7 @@ fn static_delta_verify_refusals_match_the_tool() {
 
 // --- static-delta generate ----------------------------------------------------
 
-/// The standard output of a `generate` run that reaches generation.
+/// Returns the standard output of a `generate` run that starts the generation.
 fn generate_block(from: Option<&str>, to: &str) -> String {
     format!(
         "Generating static delta:\n  From: {}\n  To:   {to}\n",
@@ -34072,8 +34601,9 @@ fn generate_block(from: Option<&str>, to: &str) -> String {
     )
 }
 
-/// Run `static-delta generate ARGS` from `cwd` against `repo` under one
-/// implementation, the port where `port` is set.
+/// Runs `static-delta generate ARGS` from `cwd` against `repo` with one
+/// command. If `port` is `true`, the command is ostrya. Otherwise it is the
+/// `ostree` command.
 fn run_generate(port: bool, cwd: &Path, repo: &Path, args: &[&str]) -> Run {
     let repo_arg = format!("--repo={}", repo.display());
     let all = [&["static-delta", repo_arg.as_str(), "generate"][..], args].concat();
@@ -34084,9 +34614,9 @@ fn run_generate(port: bool, cwd: &Path, repo: &Path, args: &[&str]) -> Run {
     }
 }
 
-/// Run `static-delta generate ARGS` under both implementations, each against
-/// its own repository and from its own working directory, and return the port's
-/// run and the tool's.
+/// Runs `static-delta generate ARGS` with ostrya and with the `ostree`
+/// command. Each command runs against its own repository and from its own
+/// working directory. Returns the run of ostrya and the run of `ostree`.
 fn generate_both(port: (&Path, &Path), tool: (&Path, &Path), args: &[&str]) -> (Run, Run) {
     (
         run_generate(true, port.0, port.1, args),
@@ -34094,7 +34624,8 @@ fn generate_both(port: (&Path, &Path), tool: (&Path, &Path), args: &[&str]) -> (
     )
 }
 
-/// The `static-delta list` output of `repo`, as the tool prints it, sorted.
+/// Returns the `static-delta list` output of `repo` from the `ostree` command,
+/// sorted.
 fn listed_deltas(repo: &Path) -> Vec<String> {
     let run = ostree(&[
         &format!("--repo={}", repo.display()),
@@ -34111,7 +34642,7 @@ fn listed_deltas(repo: &Path) -> Vec<String> {
     names
 }
 
-/// Every `superblock` file under `repo/deltas`.
+/// Returns each `superblock` file in the leaf directories of `repo/deltas`.
 fn delta_superblocks(repo: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(fanouts) = std::fs::read_dir(repo.join("deltas")) else {
@@ -34128,7 +34659,8 @@ fn delta_superblocks(repo: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The sorted names in a directory, or nothing where it is absent.
+/// Returns the sorted names in a directory, or an empty list if the directory
+/// is absent.
 fn entry_names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .map(|entries| {
@@ -34141,11 +34673,17 @@ fn entry_names(dir: &Path) -> Vec<String> {
     names
 }
 
-/// The default source, the positional target, and the two refusals agree:
-/// with neither `--from` nor `--empty` the source is the parent of TO, a root
-/// commit refuses, `--empty` with `--from` refuses before any revision
-/// resolves, and `--to` wins over the positional. A default parent absent from
-/// the repository fails after the block in both, with nothing listed. Carries
+/// The default source, the positional target, and the two refusals agree in
+/// ostrya and in the `ostree` command:
+///
+/// - If neither `--from` nor `--empty` is given, the source is the parent of
+///   TO.
+/// - A root commit is refused.
+/// - `--empty` with `--from` is refused before any revision resolves.
+/// - `--to` wins over the positional.
+///
+/// If the default parent is absent from the repository, both commands fail
+/// after the block and list no delta. The test carries
 /// `static-delta/generate-{default-parent,no-parent-refused,empty-and-from-refused,positional-to}`.
 #[test]
 fn static_delta_generate_defaults_match_the_tool() {
@@ -34218,7 +34756,7 @@ fn static_delta_generate_defaults_match_the_tool() {
         "error: TO revision must be specified\n"
     );
 
-    // A shallow copy holds the tip and not its parent.
+    // A shallow copy has the tip and not its parent.
     let mut shallow = Vec::new();
     for name in ["port-shallow", "tool-shallow"] {
         let copy = base.join(name);
@@ -34242,10 +34780,10 @@ fn static_delta_generate_defaults_match_the_tool() {
     assert_eq!(listed_deltas(&shallow[1]), vec!["(No static deltas)"]);
 }
 
-/// `-n` prints `Delta <name> already exists.` and writes nothing where the
-/// repository holds the delta's superblock, under `--filename` too, and
-/// regenerates where the directory holds a part alone. Carries
-/// `static-delta/generate-if-not-exists`.
+/// If the repository has the superblock of the delta, `-n` prints
+/// `Delta <name> already exists.` and writes nothing. This is also true with
+/// `--filename`. If the delta directory has only a part, `-n` generates the
+/// delta again. The test carries `static-delta/generate-if-not-exists`.
 #[test]
 fn static_delta_generate_if_not_exists_matches_the_tool() {
     if !ostree_available() {
@@ -34302,7 +34840,7 @@ fn static_delta_generate_if_not_exists_matches_the_tool() {
         .collect();
     assert_eq!(before, after, "-n rewrote a superblock");
 
-    // A delta directory holding a part alone counts as absent.
+    // A delta directory with only a part counts as absent.
     let relative = ostrya::static_delta_relative_dir(None, &Checksum::from_hex(&c1).unwrap());
     for r in [&port_repo, &tool_repo] {
         std::fs::remove_file(r.join(&relative).join("superblock")).unwrap();
@@ -34320,10 +34858,10 @@ fn static_delta_generate_if_not_exists_matches_the_tool() {
     assert!(tool_repo.join(&relative).join("superblock").exists());
 }
 
-/// `--filename=PATH` writes the superblock to PATH and the parts beside it,
-/// and the refused targets exit 1 in both. The tool's `verify` reads a
-/// superblock the port signed under `--filename`. Carries
-/// `static-delta/generate-filename-{file,dir-refused}`.
+/// `--filename=PATH` writes the superblock to PATH and the parts next to it.
+/// For a refused target, ostrya and the `ostree` command exit 1. `verify` of
+/// `ostree` reads a superblock that ostrya signed with `--filename`. The test
+/// carries `static-delta/generate-filename-{file,dir-refused}`.
 #[test]
 fn static_delta_generate_filename_matches_the_tool() {
     if !ostree_available() {
@@ -34361,8 +34899,8 @@ fn static_delta_generate_filename_matches_the_tool() {
         assert_eq!(entry_names(cwd), vec!["0", "dir", "out", "sbx"], "{who}");
     }
 
-    // A directory at PATH: the port refuses before any write, the tool at the
-    // rename after part 0 is written.
+    // A directory at PATH: ostrya refuses before any write. `ostree` refuses
+    // at the rename, after it writes part 0.
     for cwd in [&port_cwd, &tool_cwd] {
         std::fs::remove_dir_all(cwd.join("out")).unwrap();
         std::fs::create_dir_all(cwd.join("out/d")).unwrap();
@@ -34380,8 +34918,8 @@ fn static_delta_generate_filename_matches_the_tool() {
     assert_eq!(t.status.code(), Some(1));
     assert!(entry_names(&port_cwd.join("dir")).is_empty());
 
-    // A last component `.` after a file or an absent name: both refuse after
-    // the block and change nothing.
+    // A last component `.` after a file or an absent name: both commands
+    // refuse after the block and change nothing.
     for cwd in [&port_cwd, &tool_cwd] {
         std::fs::write(cwd.join("dir/keep"), b"keep\n").unwrap();
     }
@@ -34399,8 +34937,8 @@ fn static_delta_generate_filename_matches_the_tool() {
             );
         }
     }
-    // A last component `.` or `..` after a directory: the port refuses before
-    // any write, the tool at the rename after part 0 is written.
+    // A last component `.` or `..` after a directory: ostrya refuses before
+    // any write. `ostree` refuses at the rename, after it writes part 0.
     for path in ["dir/.", "dir/.."] {
         let arg = format!("--filename={path}");
         let (p, t) = generate_both(port, tool, &["--empty", &to_c1, &arg]);
@@ -34411,7 +34949,8 @@ fn static_delta_generate_filename_matches_the_tool() {
         assert_eq!(entry_names(&port_cwd.join("dir")), vec!["keep"], "{path}");
     }
 
-    // An empty PATH: `clap` refuses before the block, the tool after it.
+    // An empty PATH: `clap` in ostrya refuses before the block. `ostree`
+    // refuses after the block.
     let (p, t) = generate_both(port, tool, &["--empty", &to_c1, "--filename="]);
     assert_eq!(p.status.code(), Some(1));
     assert!(p.stdout.is_empty());
@@ -34425,14 +34964,14 @@ fn static_delta_generate_filename_matches_the_tool() {
         assert!(!cwd.join("nodir").exists(), "{who}");
     }
 
-    // A part file name: the tool writes a delta whose superblock replaced its
-    // part, the port refuses and writes nothing.
+    // A part file name: `ostree` writes a delta, and the superblock replaces
+    // its part. ostrya refuses and writes nothing.
     let (p, t) = generate_both(port, tool, &["--empty", &to_c1, "--filename=out/0"]);
     assert_eq!(p.status.code(), Some(1));
     assert!(t.status.success());
     assert_eq!(entry_names(&port_cwd.join("out")), vec!["d"]);
 
-    // Port only: --output-dir and --reindex beside --filename.
+    // ostrya only: --output-dir and --reindex with --filename.
     for extra in ["--output-dir=elsewhere", "--reindex"] {
         let run = run_generate(
             true,
@@ -34477,10 +35016,10 @@ fn static_delta_generate_filename_matches_the_tool() {
     }
 }
 
-/// A bad signing key exits 1 in both after the block, with the same last line
-/// on standard error and no superblock: the tool leaves part 0, the port reads
-/// the key before any part is written. Carries
-/// `static-delta/generate-bad-sign-key-no-superblock`.
+/// With a bad signing key, ostrya and the `ostree` command exit 1 after the
+/// block. Both write the same last line on standard error and no superblock.
+/// `ostree` leaves part 0. ostrya reads the key before it writes a part. The
+/// test carries `static-delta/generate-bad-sign-key-no-superblock`.
 #[test]
 fn static_delta_generate_bad_sign_key_writes_no_superblock() {
     if !ostree_supports_ed25519() {
@@ -34526,12 +35065,20 @@ fn static_delta_generate_bad_sign_key_writes_no_superblock() {
     assert!(!port_repo.join("deltas").exists());
 }
 
-/// The three size options are decimal megabytes in both: the fallback count
-/// and the part count agree between the tool's delta and the port's. The port
-/// patches a 1,024-byte edit at `--max-bsdiff-size=1`, which a 1-byte limit
-/// would not allow, and not at 0. A value outside whole decimal digits, or
-/// past the largest byte count, is refused by the port with nothing written;
-/// the tool takes it. `--max-chunk-size=0` is refused by the port. Carries
+/// The three size options are in decimal megabytes in ostrya and in the
+/// `ostree` command. The fallback count and the part count of the delta of
+/// `ostree` and of the delta of ostrya agree.
+///
+/// ostrya patches a 2-byte edit of a 1,024-byte object at
+/// `--max-bsdiff-size=1`, and not at 0. A limit of 1 byte is too small for
+/// this patch, so the value 1 is 1 megabyte. ostrya refuses these values and
+/// writes nothing:
+///
+/// - a value that is not only decimal digits
+/// - a value more than the largest byte count
+/// - `--max-chunk-size=0`
+///
+/// `ostree` accepts the first two kinds. The test carries
 /// `static-delta/generate-units-megabytes` and
 /// `static-delta/generate-size-junk-refused`.
 #[test]
@@ -34541,8 +35088,8 @@ fn static_delta_generate_sizes_are_megabytes() {
     }
     let tmp = TmpDir::new("delta-generate-sizes");
     let base = tmp.path();
-    // The fallback thresholds need the 5,000,000-byte file alone; the three
-    // 1,200,000-byte files are there for the chunk size.
+    // The fallback thresholds need only the 5,000,000-byte file. The three
+    // 1,200,000-byte files are for the chunk size.
     let (repo, c) = delta_fallback_repo(base, "repo", false);
     let (parts_repo, parts_c) = delta_fallback_repo(base, "parts", true);
     let counts = |run: &Run| {
@@ -34589,8 +35136,8 @@ fn static_delta_generate_sizes_are_megabytes() {
         );
     }
 
-    // A 1,024-byte object with a 2-byte edit, which the port patches with
-    // bspatch where the limit allows it.
+    // A 1,024-byte object with a 2-byte edit. If the limit allows it, ostrya
+    // patches the object with bspatch.
     let small = base.join("small");
     ostree_ok(&small, &["init", "--mode=archive"]);
     let tree = base.join("small-tree");
@@ -34644,11 +35191,12 @@ fn static_delta_generate_sizes_are_megabytes() {
     assert!(delta_superblocks(&small).is_empty());
 }
 
-/// The superblock type string, for reading the metadata dict of a
-/// superblock file.
+/// The GVariant type string of a superblock. The test helpers use it to read
+/// the metadata dict of a superblock file.
 const DELTA_SUPERBLOCK_SIG: &str = "(a{sv}tayay(a{sv}aya(say)sstayay)aya(uayttay)a(yaytt))";
 
-/// The metadata dict keys of an unsigned superblock file, in dict order.
+/// Returns the metadata dict keys of an unsigned superblock file, in dict
+/// order.
 fn superblock_keys(path: &Path) -> Vec<String> {
     let bytes = std::fs::read(path).unwrap();
     let value = ostrya::from_bytes(&Type::parse(DELTA_SUPERBLOCK_SIG).unwrap(), &bytes).unwrap();
@@ -34660,7 +35208,8 @@ fn superblock_keys(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The `ostree.endianness` byte of a superblock file, and its parsed form.
+/// Returns the `ostree.endianness` byte of a superblock file, and the parsed
+/// superblock.
 fn superblock_endianness(path: &Path) -> (u8, ostrya::DeltaSuperblock) {
     let bytes = std::fs::read(path).unwrap();
     let value = ostrya::from_bytes(&Type::parse(DELTA_SUPERBLOCK_SIG).unwrap(), &bytes).unwrap();
@@ -34672,7 +35221,7 @@ fn superblock_endianness(path: &Path) -> (u8, ostrya::DeltaSuperblock) {
     (byte, ostrya::DeltaSuperblock::parse(bytes).unwrap())
 }
 
-/// The `PartPayload` lines the port's `show` prints for a delta.
+/// Returns the `PartPayload` lines that `show` of ostrya prints for a delta.
 fn port_part_payloads(repo: &Path, arg: &str) -> Vec<String> {
     let repo_arg = format!("--repo={}", repo.display());
     let run = ostrya(&["static-delta", &repo_arg, "show", arg], None, &[]);
@@ -34684,17 +35233,23 @@ fn port_part_payloads(repo: &Path, arg: &str) -> Vec<String> {
         .collect()
 }
 
-/// `ls -R` of a commit in `repo`, through the tool.
+/// Returns the `ls -R -C` output of a commit in `repo` from the `ostree`
+/// command.
 fn tool_listing(repo: &Path, commit: &str) -> String {
     ostree_ok(repo, &["ls", "-R", "-C", commit])
 }
 
-/// `--inline` agrees: both print the block, neither writes a part file, the
-/// metadata keys are the same in the same order, and the port's `show` reads
-/// the parts of both superblocks. Each implementation
-/// applies the other's inline delta and the trees agree. Under `--filename`
-/// the key stays repository-relative and no part file is written beside PATH.
-/// Carries `static-delta/generate-inline`.
+/// `--inline` agrees in ostrya and in the `ostree` command:
+///
+/// - Both commands print the block.
+/// - Neither command writes a part file.
+/// - The metadata keys are the same, in the same order.
+/// - `show` of ostrya reads the parts of both superblocks.
+///
+/// Each command applies the inline delta of the other command, and the trees
+/// agree. With `--filename`, the key stays relative to the repository and no
+/// command writes a part file next to PATH. The test carries
+/// `static-delta/generate-inline`.
 #[test]
 fn static_delta_generate_inline_matches_the_tool() {
     if !ostree_available() {
@@ -34730,9 +35285,10 @@ fn static_delta_generate_inline_matches_the_tool() {
             superblock_keys(&tool_repo.join(&relative).join("superblock"))
         );
         assert_eq!(keys[1], format!("{}/0", relative));
-        // The port reads the inline parts of both. The operand offsets of the
-        // two generators differ, so the part count is compared, and the
-        // operation counts where both splice alone.
+        // ostrya reads the inline parts of both. The operand offsets of the
+        // two generators differ, so the test compares the part count. For the
+        // delta from scratch, where both only splice, it also compares the
+        // operation counts.
         let (port_lines, tool_lines) = (
             port_part_payloads(&port_repo, &name),
             port_part_payloads(&tool_repo, &name),
@@ -34750,7 +35306,8 @@ fn static_delta_generate_inline_matches_the_tool() {
         }
     }
 
-    // Cross-apply the from-scratch deltas into fresh archive repositories.
+    // Each command applies the delta from scratch of the other command into a
+    // new archive repository.
     let scratch = ostrya::static_delta_relative_dir(None, &to2);
     let into_port = base.join("into-port");
     let into_tool = base.join("into-tool");
@@ -34799,7 +35356,7 @@ fn static_delta_generate_inline_matches_the_tool() {
     assert_eq!(keys[1], format!("{scratch}/0"));
 }
 
-/// Both runs succeed with the same standard output.
+/// Asserts that both runs succeed with the same standard output.
 fn assert_runs_agree_on_stdout(port: &Run, tool: &Run, args: &[&str]) {
     for (who, run) in [("port", port), ("tool", tool)] {
         assert!(
@@ -34811,10 +35368,15 @@ fn assert_runs_agree_on_stdout(port: &Run, tool: &Run, args: &[&str]) {
     assert_eq!(port.stdout, tool.stdout, "{args:?}");
 }
 
-/// The endianness options agree over eight forms: the byte both write, the
-/// sizes read back through it, and the part file, which the byte leaves
-/// unchanged. The last `--set-endianness` wins, the flag order does not
-/// matter, and a repeated `--swap-endianness` swaps once. Carries
+/// The endianness options agree in ostrya and in the `ostree` command over
+/// eight forms:
+///
+/// - the byte that both commands write
+/// - the sizes, read back through this byte
+/// - the part file, which the byte does not change
+///
+/// The last `--set-endianness` wins. The order of the flags has no effect. A
+/// repeated `--swap-endianness` swaps one time. The test carries
 /// `static-delta/generate-set-endianness-big` and
 /// `static-delta/generate-swap-endianness`.
 #[test]
@@ -34872,15 +35434,15 @@ fn static_delta_generate_endianness_matches_the_tool() {
                 assert_eq!(&parts.1, tool_part, "{extra:?}");
             }
         }
-        // The fallback sizes agree. The part sizes are each generator's own.
+        // The fallback sizes agree. The part sizes depend on the generator.
         assert_eq!(sizes[0][2..], sizes[1][2..], "{extra:?}");
     }
 }
 
-/// A value other than `l` or `B` is refused in both at exit 1 with the same
-/// line, nothing on standard output, and nothing written. The value is
-/// checked after `-n` and after the default parent, and before the
-/// `--filename` directory. Carries
+/// For a value other than `l` or `B`, ostrya and the `ostree` command exit 1
+/// with the same line. They write nothing on standard output and nothing to
+/// the repository. Both commands check the value after `-n` and after the
+/// default parent, and before the `--filename` directory. The test carries
 /// `static-delta/generate-invalid-endianness-refused`.
 #[test]
 fn static_delta_generate_invalid_endianness_is_refused() {
@@ -34918,7 +35480,7 @@ fn static_delta_generate_invalid_endianness_is_refused() {
     assert_eq!(listed_deltas(&port_repo), vec!["(No static deltas)"]);
     assert_eq!(listed_deltas(&tool_repo), vec!["(No static deltas)"]);
 
-    // `-n` over a delta the repository holds exits 0 before the value.
+    // If the repository has the delta, `-n` exits 0 before the value check.
     let (p, t) = generate_both(port, tool, &["--to=m"]);
     assert_runs_agree_on_stdout(&p, &t, &["--to=m"]);
     let args = ["-n", "--to=m", "--set-endianness=q"];
@@ -34929,7 +35491,7 @@ fn static_delta_generate_invalid_endianness_is_refused() {
         format!("Delta {c1}-{c2} already exists.\n")
     );
 
-    // A root commit with no source refuses before the value.
+    // A root commit with no source is refused before the value check.
     let to_c1 = format!("--to={c1}");
     let args = [to_c1.as_str(), "--set-endianness=q"];
     let (p, t) = generate_both(port, tool, &args);
@@ -34939,7 +35501,8 @@ fn static_delta_generate_invalid_endianness_is_refused() {
         format!("error: Commit {c1} has no parent\n")
     );
 
-    // The value refuses before the `--filename` directory is opened.
+    // The value is refused before the command opens the `--filename`
+    // directory.
     let args = [
         "--empty",
         "--to=m",
@@ -34954,9 +35517,10 @@ fn static_delta_generate_invalid_endianness_is_refused() {
     );
 }
 
-/// The port's `apply-offline` reads the tool's inline delta, from the delta
-/// directory and from a superblock file written through `--filename`, and the
-/// objects agree with the tool's own apply. Both print nothing.
+/// `apply-offline` of ostrya reads an inline delta of the `ostree` command.
+/// The delta is in the delta directory, or in a superblock file that
+/// `--filename` writes. The objects agree with the apply of `ostree`. Both
+/// commands print nothing.
 #[test]
 fn static_delta_apply_offline_reads_an_inline_delta() {
     if !ostree_available() {
@@ -35015,7 +35579,8 @@ fn static_delta_apply_offline_reads_an_inline_delta() {
     }
 }
 
-/// Create a fresh archive repository at `base/<name>` with the port.
+/// Creates a new archive repository at `base/<name>` with the `ostrya`
+/// library.
 fn fresh_archive(base: &Path, name: &str) -> PathBuf {
     let repo = base.join(name);
     block_on(async {
@@ -35026,7 +35591,7 @@ fn fresh_archive(base: &Path, name: &str) -> PathBuf {
     repo
 }
 
-/// Run `static-delta apply-offline ARGS` from `cwd` into `dst`.
+/// Runs `static-delta apply-offline ARGS` of ostrya from `cwd` into `dst`.
 fn run_apply_offline(cwd: &Path, dst: &Path, args: &[&str]) -> Run {
     let repo_arg = format!("--repo={}", dst.display());
     let all = [
@@ -35037,17 +35602,18 @@ fn run_apply_offline(cwd: &Path, dst: &Path, args: &[&str]) -> Run {
     ostrya_in(Some(cwd), &all, None, &[])
 }
 
-/// What an `apply-offline` run is expected to do.
+/// The expected result of an `apply-offline` run.
 enum ApplyOutcome {
     /// Exit 0 with both streams empty, the commit object present, no ref.
     Applied,
     /// Exit 1 with nothing on standard output, this standard error, and no
-    /// object written.
+    /// object in the repository.
     Refused(String),
 }
 
-/// Run each case from `cwd` into its own fresh archive repository under `cwd`
-/// and assert its outcome. `commit` is the commit an applied case delivers.
+/// Runs each case from `cwd` into its own new archive repository in `cwd`,
+/// and asserts its outcome. `commit` is the commit that an applied case
+/// delivers.
 fn assert_apply_cases(cwd: &Path, commit: &str, cases: &[(&[&str], ApplyOutcome)]) {
     for (i, (args, outcome)) in cases.iter().enumerate() {
         let label = args.join(" ");
@@ -35063,10 +35629,12 @@ fn assert_apply_cases(cwd: &Path, commit: &str, cases: &[(&[&str], ApplyOutcome)
     }
 }
 
-/// `apply-offline` prints nothing and writes no ref, for each form of PATH: a
-/// delta directory, a superblock under another name beside its parts, a bare
-/// `superblock` from inside the delta directory, and an inline superblock
-/// written through `--filename`.
+/// `apply-offline` prints nothing and writes no ref, for each form of PATH:
+///
+/// - a delta directory
+/// - a superblock with another name, next to its parts
+/// - a bare `superblock`, from inside the delta directory
+/// - an inline superblock that `--filename` writes
 #[test]
 fn static_delta_apply_offline_prints_nothing_and_writes_no_ref() {
     let tmp = TmpDir::new("delta-apply-forms");
@@ -35107,9 +35675,10 @@ fn static_delta_apply_offline_prints_nothing_and_writes_no_ref() {
     assert_applied_without_ref(&run, &dst, COMMIT, "superblock from inside");
 }
 
-/// The key sources: a positional KEY-ID, `--keys-file`, and `--keys-dir` each
-/// turn on the check of a signed delta, which runs before any object is
-/// written. An unsigned delta applies under any key source whose keys load.
+/// The key sources: a positional KEY-ID, `--keys-file`, and `--keys-dir`. Each
+/// of them turns on the verification of a signed delta. The verification runs
+/// before the command writes an object. An unsigned delta applies with each
+/// key source whose keys load.
 #[test]
 fn static_delta_apply_offline_key_sources() {
     let tmp = TmpDir::new("delta-apply-keys");
@@ -35173,9 +35742,12 @@ fn static_delta_apply_offline_key_sources() {
     );
 }
 
-/// The sign type is read with or without a key source. A name the port does
-/// not carry refuses with nothing on standard output, `dummy` refuses in its
-/// own words, and the last `--sign-type` wins.
+/// The command reads the sign type with or without a key source:
+///
+/// - A name that ostrya does not have is refused with nothing on standard
+///   output.
+/// - `dummy` is refused with its own message.
+/// - The last `--sign-type` wins.
 #[test]
 fn static_delta_apply_offline_sign_types() {
     let tmp = TmpDir::new("delta-apply-sign-types");
@@ -35219,9 +35791,15 @@ fn static_delta_apply_offline_sign_types() {
     assert_apply_cases(base, COMMIT, &cases);
 }
 
-/// The refusals of PATH: none given, a path that is absent, a delta name,
-/// which is read as a path, a directory with no `superblock`, and a
-/// superblock copied away from its parts. None writes an object.
+/// The refusals of PATH:
+///
+/// - no PATH
+/// - a path that is absent
+/// - a delta name, which the command reads as a path
+/// - a directory with no `superblock`
+/// - a superblock copied away from its parts
+///
+/// No refusal writes an object.
 #[test]
 fn static_delta_apply_offline_path_forms() {
     let tmp = TmpDir::new("delta-apply-paths");
@@ -35252,16 +35830,19 @@ fn static_delta_apply_offline_path_forms() {
     assert_eq!(loose_objects(&dst), []);
 }
 
-/// The arguments of a command line as `&str`.
+/// Returns the arguments of a command line as `&str`.
 fn str_args(args: &[String]) -> Vec<&str> {
     args.iter().map(String::as_str).collect()
 }
 
-/// Run `static-delta apply-offline ARGS` from `cwd` under both
-/// implementations, each into its own fresh repository the tool creates in
-/// `mode`, after `prep` is applied into both where given. Assert that the
-/// exit status and both streams agree, that both repositories hold the same
-/// objects, and that neither holds a ref.
+/// Runs `static-delta apply-offline ARGS` from `cwd` with ostrya and with the
+/// `ostree` command. Each command applies into its own new repository, which
+/// `ostree` creates in `mode`. If `prep` is given, both commands first apply
+/// `prep`. Asserts these facts:
+///
+/// - The exit status and both streams agree.
+/// - Both repositories have the same objects.
+/// - Neither repository has a ref.
 fn assert_apply_agrees(cwd: &Path, name: &str, mode: &str, prep: Option<&str>, args: &[&str]) {
     let port_dst = cwd.join(format!("{name}-port"));
     let tool_dst = cwd.join(format!("{name}-tool"));
@@ -35304,9 +35885,12 @@ fn assert_apply_agrees(cwd: &Path, name: &str, mode: &str, prep: Option<&str>, a
     }
 }
 
-/// The cases both cross-tool tests run from `base` over `base/repo`, which
-/// holds an unsigned delta to `c1`, a delta to `c2`, and a delta from `c1` to
-/// `c2`, both signed with the shared key.
+/// Runs the cases of the two tests that compare ostrya with the `ostree`
+/// command, from `base` over `base/repo`. `base/repo` has these deltas:
+///
+/// - an unsigned delta to `c1`
+/// - a delta to `c2`, signed with the shared key
+/// - a delta from `c1` to `c2`, signed with the shared key
 fn assert_apply_cases_agree(base: &Path, c1: &str, c2: &str) {
     std::fs::write(base.join("k1"), format!("{ED25519_PUBLIC_B64}\n")).unwrap();
     std::fs::write(base.join("k2"), format!("{ED25519_PUBLIC2_B64}\n")).unwrap();
@@ -35344,8 +35928,9 @@ fn assert_apply_cases_agree(base: &Path, c1: &str, c2: &str) {
     .unwrap();
     let signed_sb = format!("{signed}/superblock");
     let signed_other = format!("{signed}/sb-other");
-    // `lnk/../<rest>` folds to `<rest>` beside the link, which holds a copy of
-    // the unsigned delta, where the kernel resolves it to the signed delta.
+    // A lexical resolution of `lnk/../<rest>` gives `<rest>` next to the link.
+    // This directory has a copy of the unsigned delta. The kernel resolves the
+    // path to the signed delta.
     let rest = Path::new(&signed).file_name().unwrap().to_str().unwrap();
     std::fs::create_dir_all(base.join(rest)).unwrap();
     for entry in std::fs::read_dir(base.join(&unsigned)).unwrap() {
@@ -35397,8 +35982,8 @@ fn assert_apply_cases_agree(base: &Path, c1: &str, c2: &str) {
     for (i, case) in cases.iter().enumerate() {
         assert_apply_agrees(base, &format!("dst-{i}"), "archive", None, case);
     }
-    // The tool applies a delta that opens a source object into a bare
-    // repository alone.
+    // `ostree` applies a delta that opens a source object only into a bare
+    // repository.
     assert_apply_agrees(
         base,
         "dst-from",
@@ -35415,10 +36000,11 @@ fn assert_apply_cases_agree(base: &Path, c1: &str, c2: &str) {
     );
 }
 
-/// `apply-offline` agrees with the tool over the tool's deltas: the exit
-/// status, both streams, and the objects written. Carries
+/// `apply-offline` of ostrya agrees with the `ostree` command over the deltas
+/// of `ostree`: the exit status, both streams, and the objects written. The
+/// test carries
 /// `static-delta/apply-offline-{superblock-file,verify-wrong-key-no-objects,unsigned-with-keys,positional-key}`
-/// for the tool as the producer.
+/// with `ostree` as the producer.
 #[test]
 fn static_delta_apply_offline_matches_the_tool_over_the_tools_deltas() {
     if !ostree_supports_ed25519() {
@@ -35440,8 +36026,10 @@ fn static_delta_apply_offline_matches_the_tool_over_the_tools_deltas() {
     assert_apply_cases_agree(tmp.path(), &c1, &c2);
 }
 
-/// The same over the port's deltas. Carries the same cells as the test
-/// above, for the port as the producer.
+/// Does the same as
+/// `static_delta_apply_offline_matches_the_tool_over_the_tools_deltas` over
+/// the deltas of ostrya. The test carries the same cells, with ostrya as the
+/// producer.
 #[test]
 fn static_delta_apply_offline_matches_the_tool_over_the_ports_deltas() {
     if !ostree_supports_ed25519() {
@@ -35467,11 +36055,18 @@ fn static_delta_apply_offline_matches_the_tool_over_the_ports_deltas() {
     assert_apply_cases_agree(tmp.path(), &c1, &c2);
 }
 
-/// The refusals agree: no PATH, an absent path, a delta name, a directory
-/// with no `superblock`, a superblock file that does not open, and keys that
-/// do not load. An unknown sign type
-/// agrees on the exit status, standard output, and the last line of standard
-/// error, where the tool writes a GLib warning before it.
+/// The refusals of ostrya and of the `ostree` command agree:
+///
+/// - no PATH
+/// - an absent path
+/// - a delta name
+/// - a directory with no `superblock`
+/// - a superblock file that does not open
+/// - keys that do not load
+///
+/// For an unknown sign type, the exit status, standard output, and the last
+/// line of standard error agree. `ostree` writes a GLib warning before this
+/// line.
 #[test]
 fn static_delta_apply_offline_refusals_match_the_tool() {
     if !ostree_supports_ed25519() {
@@ -35499,8 +36094,9 @@ fn static_delta_apply_offline_refusals_match_the_tool() {
     for (i, case) in cases.iter().enumerate() {
         assert_apply_agrees(base, &format!("dst-{i}"), "archive", None, case);
     }
-    // A superblock file that does not open is named by its last component. A
-    // file of mode 000 opens under root, where the case proves nothing.
+    // The message names a superblock file that does not open by its last
+    // component. Under root, a file of mode 000 opens, so the case checks
+    // nothing and the test skips it.
     std::fs::create_dir_all(base.join("perm")).unwrap();
     let locked = base.join("perm/superblock");
     std::fs::copy(base.join(&delta).join("superblock"), &locked).unwrap();
@@ -35553,12 +36149,18 @@ fn static_delta_apply_offline_refusals_match_the_tool() {
     }
 }
 
-/// The recorded divergences stand: the tool applies under `--sign-type=dummy`,
-/// and under a key that decodes to no curve point, over an unsigned delta and,
-/// beside a key that verifies it, in either order, over a signed delta; the
-/// port refuses each. The tool refuses `--sign-type=spki`, and the port applies
-/// under it in a build that carries the engine. A part that does not open and a
-/// superblock that does not parse refuse in both, in different words.
+/// The recorded divergences do not change:
+///
+/// - The `ostree` command applies an unsigned delta with `--sign-type=dummy`.
+///   ostrya refuses.
+/// - `ostree` applies with a key that decodes to no curve point. ostrya
+///   refuses. This is true over an unsigned delta. It is also true over a
+///   signed delta, next to a key that verifies the delta, in each order.
+/// - `ostree` refuses `--sign-type=spki`. ostrya applies with it in a build
+///   that has the engine.
+///
+/// Both commands refuse a part that does not open and a superblock that does
+/// not parse, with different messages.
 #[test]
 fn static_delta_apply_offline_divergences_stand_as_recorded() {
     if !ostree_supports_ed25519() {
@@ -35656,9 +36258,9 @@ fn static_delta_apply_offline_divergences_stand_as_recorded() {
     }
 }
 
-/// The tool archive repository of [`delta_show_repo`] with `count` commits on
-/// `m` in all, each commit past the second editing the small file. Returns the
-/// path and the commits, oldest first.
+/// Creates the archive repository of `delta_show_repo` with the `ostree`
+/// command, with `count` commits on `m` in total. Each commit after the second
+/// changes the small file. Returns the path and the commits, oldest first.
 fn delta_chain_repo(base: &Path, name: &str, count: usize) -> (PathBuf, Vec<String>) {
     let (repo, c1, c2) = delta_show_repo(base, name);
     let tree_arg = format!("--tree=dir={}", base.join(format!("{name}-tree")).display());
@@ -35674,9 +36276,9 @@ fn delta_chain_repo(base: &Path, name: &str, count: usize) -> (PathBuf, Vec<Stri
     (repo, commits)
 }
 
-/// The entries of the `ostree.static-deltas` map in `dict`, the `a{sv}` of an
-/// index file or the summary's metadata dict, in stored order: each delta name
-/// with its digest bytes.
+/// Returns the entries of the `ostree.static-deltas` map in `dict`, in stored
+/// order: each delta name with its digest bytes. `dict` is the `a{sv}` of an
+/// index file or the metadata dict of the summary.
 fn delta_map_entries(dict: &Value) -> Vec<(String, Vec<u8>)> {
     let entries = dict.as_array().unwrap();
     let map = entries
@@ -35701,7 +36303,7 @@ fn delta_map_entries(dict: &Value) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// The delta map entries of the index file at `path`, in stored order.
+/// Returns the delta map entries of the index file at `path`, in stored order.
 fn index_entries(path: &Path) -> Vec<(String, Vec<u8>)> {
     let bytes = std::fs::read(path).unwrap();
     let dict = ostrya::from_bytes(&Type::parse("a{sv}").unwrap(), &bytes).unwrap();
@@ -35715,14 +36317,15 @@ fn index_entries(path: &Path) -> Vec<(String, Vec<u8>)> {
     entries
 }
 
-/// The delta map entries of the summary of `repo`, in stored order.
+/// Returns the delta map entries of the summary of `repo`, in stored order.
 fn summary_static_delta_entries(repo: &Path) -> Vec<(String, Vec<u8>)> {
     let bytes = std::fs::read(repo.join("summary")).unwrap();
     delta_map_entries(&ostrya::Summary::parse(&bytes).unwrap().metadata)
 }
 
-/// Every file under `delta-indexes/` of `repo` with its bytes, keyed by its
-/// path relative to `delta-indexes/`. Empty where the directory is absent.
+/// Returns each file in `delta-indexes/` of `repo` with its bytes, keyed by
+/// its path relative to `delta-indexes/`. The map is empty if the directory
+/// is absent.
 fn index_file_bytes(repo: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     let mut out = std::collections::BTreeMap::new();
     let Ok(fanouts) = std::fs::read_dir(repo.join("delta-indexes")) else {
@@ -35749,9 +36352,12 @@ fn index_file_bytes(repo: &Path) -> std::collections::BTreeMap<String, Vec<u8>> 
     out
 }
 
-/// The `delta-indexes/` trees of `port` and `tool` agree: the same paths,
-/// modes, and sizes, the same entries in each index file, the port's in name
-/// order, and a one-entry file byte for byte.
+/// Asserts that the `delta-indexes/` trees of `port` and `tool` agree:
+///
+/// - the same paths, modes, and sizes
+/// - the same entries in each index file, with the entries of `port` in name
+///   order
+/// - the same bytes in each file of one entry
 fn assert_delta_indexes_agree(port: &Path, tool: &Path, label: &str) {
     let describe = |repo: &Path| {
         let dir = repo.join("delta-indexes");
@@ -35775,7 +36381,7 @@ fn assert_delta_indexes_agree(port: &Path, tool: &Path, label: &str) {
     }
 }
 
-/// Remove the delta from `from` to `to` in `repo` by hand.
+/// Removes the delta from `from` to `to` in `repo` by hand.
 fn remove_delta_dir(repo: &Path, from: Option<&str>, to: &str) {
     let from = from.map(|from| Checksum::from_hex(from).unwrap());
     let relative =
@@ -35783,9 +36389,13 @@ fn remove_delta_dir(repo: &Path, from: Option<&str>, to: &str) {
     std::fs::remove_dir_all(repo.join(relative)).unwrap();
 }
 
-/// A tool repository of three commits holding every delta into each of them,
-/// indexed by the tool's full pass: from scratch into each commit, from the
-/// first into the second and third, and from the second into the third.
+/// Creates a repository of three commits with the `ostree` command. The
+/// repository has each delta into each commit, and the full pass of `ostree`
+/// indexes them:
+///
+/// - from scratch into each commit
+/// - from the first commit into the second and the third
+/// - from the second commit into the third
 fn delta_reindex_repo(base: &Path, name: &str) -> (PathBuf, Vec<String>) {
     let (repo, commits) = delta_chain_repo(base, name, 3);
     let [c1, c2, c3] = [&commits[0], &commits[1], &commits[2]];
@@ -35808,15 +36418,17 @@ fn delta_reindex_repo(base: &Path, name: &str) -> (PathBuf, Vec<String>) {
     (repo, commits)
 }
 
-/// The index of target `to` under `delta-indexes/`, relative to it.
+/// Returns the path of the index of target `to`, relative to
+/// `delta-indexes/`.
 fn index_rel(to: &str) -> String {
     let b64 = Checksum::from_hex(to).unwrap().to_base64_modified();
     let (fanout, rest) = b64.split_at(2);
     format!("{fanout}/{rest}.index")
 }
 
-/// Run `static-delta ARGS` against `port` with the port and against `tool`
-/// with the tool, the repository named by a leading `--repo=`.
+/// Runs `static-delta ARGS` against `port` with ostrya and against `tool` with
+/// the `ostree` command. A leading `--repo=` names the repository. Returns
+/// both runs.
 fn run_reindex_both(port: &Path, tool: &Path, args: &[&str]) -> (Run, Run) {
     let all = |repo: &Path| {
         let repo_arg = format!("--repo={}", repo.display());
@@ -35835,15 +36447,20 @@ fn run_reindex_both(port: &Path, tool: &Path, args: &[&str]) -> (Run, Run) {
     (port, tool)
 }
 
-/// `static-delta reindex --to=REV` does what the tool does over one repository
-/// in six steps. A pass over one target rewrites its index file and leaves the
-/// others byte for byte, stale ones included. A pass over a target with no
-/// delta left removes its file and keeps the fanout directory. Given twice,
-/// the last value wins. An index file removed by hand is written again. A
-/// target with no delta and no index file changes nothing, and a repository
-/// with no `deltas/` gets no `delta-indexes/`. Each run exits 0 and writes
-/// nothing to either stream. After each step, an index file of one entry is
-/// byte-identical between the two.
+/// `static-delta reindex --to=REV` of ostrya does the same as the `ostree`
+/// command over one repository, in six steps:
+///
+/// 1. A pass over one target writes its index file again. The other files do
+///    not change, byte for byte, and this includes stale files.
+/// 2. A pass over a target with no remaining delta removes its file and keeps
+///    the fanout directory.
+/// 3. If `--to` is given two times, the last value wins.
+/// 4. The command writes again an index file that was removed by hand.
+/// 5. A target with no delta and no index file changes nothing.
+/// 6. A repository with no `deltas/` gets no `delta-indexes/`.
+///
+/// Each run exits 0 and writes nothing to either stream. After each step, an
+/// index file of one entry is byte-identical in the two repositories.
 #[test]
 fn static_delta_reindex_to_matches_the_tool() {
     if !ostree_available() {
@@ -35865,7 +36482,8 @@ fn static_delta_reindex_to_matches_the_tool() {
         assert_delta_indexes_agree(&port, &tool, label);
     };
 
-    // One target: c3 lists the two deltas left, and the other files stay.
+    // One target: the index of c3 lists the two remaining deltas, and the
+    // other files do not change.
     let before = index_file_bytes(&port);
     for side in [&port, &tool] {
         remove_delta_dir(side, Some(c1), c3);
@@ -35884,7 +36502,8 @@ fn static_delta_reindex_to_matches_the_tool() {
         );
     }
 
-    // No delta left: the index file goes, the fanout directory stays.
+    // No remaining delta: the command removes the index file and keeps the
+    // fanout directory.
     for side in [&port, &tool] {
         remove_delta_dir(side, None, c1);
     }
@@ -35936,12 +36555,22 @@ fn static_delta_reindex_to_matches_the_tool() {
     }
 }
 
-/// The refusals of `--to` agree on the exit status and both streams, and leave
-/// `delta-indexes/` as it was: a ref, a caret revision, an abbreviated
-/// checksum, uppercase hex, 63 and 65 characters, a delta name, an empty value,
-/// and a character past `f`. A `--to` with no value and a directory at the
-/// index path, of a target with a delta and of one with none, exit 1 in both,
-/// in different words.
+/// The refusals of `--to` agree in ostrya and in the `ostree` command on the
+/// exit status and both streams. They do not change `delta-indexes/`. The
+/// refused values:
+///
+/// - a ref
+/// - a caret revision
+/// - an abbreviated checksum
+/// - uppercase hex
+/// - 63 and 65 characters
+/// - a delta name
+/// - an empty value
+/// - a character after `f`
+///
+/// Both commands exit 1 with different messages for a `--to` with no value.
+/// This is also true for a directory at the index path, of a target with a
+/// delta and of a target with none.
 #[test]
 fn static_delta_reindex_to_refusals_match_the_tool() {
     if !ostree_available() {
@@ -35993,7 +36622,8 @@ fn static_delta_reindex_to_refusals_match_the_tool() {
         assert_eq!(index_file_bytes(&tool), before, "{to_arg}: the tool wrote");
     }
 
-    // `--to` with no value: the tool and clap word the refusal apart.
+    // `--to` with no value: `ostree` and `clap` refuse with different
+    // messages.
     let (port_run, tool_run) = run_reindex_both(&port, &tool, &["reindex", "--to"]);
     assert_eq!(
         (port_run.status.code(), tool_run.status.code()),
@@ -36005,8 +36635,8 @@ fn static_delta_reindex_to_refusals_match_the_tool() {
     );
     assert_eq!(index_file_bytes(&port), before);
 
-    // A directory at the index path, of a target with no delta left and of a
-    // target with deltas.
+    // A directory at the index path, of a target with no remaining delta and
+    // of a target with deltas.
     for side in [&port, &tool] {
         remove_delta_dir(side, None, c1);
         for to in [c1, c3] {
@@ -36049,11 +36679,13 @@ fn static_delta_reindex_to_refusals_match_the_tool() {
         }
     }
 
-    // A path of the index of c1, which has no delta left, that goes through a
-    // component which is no directory: a regular file at the fanout, a symlink
-    // there to a regular file, and a regular file at `delta-indexes`. Both
-    // refuse at exit 1 in different words. A dangling symlink at the fanout is
-    // an absent file, and both exit 0.
+    // The index path of c1, which has no remaining delta, goes through a
+    // component that is not a directory:
+    // - a regular file at the fanout
+    // - a symlink to a regular file at the fanout
+    // - a regular file at `delta-indexes`
+    // Both commands refuse at exit 1 with different messages. A dangling
+    // symlink at the fanout counts as an absent file, and both exit 0.
     let to_arg = format!("--to={c1}");
     let fanout_rel = format!("delta-indexes/{}", &index_rel(c1)[..2]);
     type Setup = fn(&Path, &str);
@@ -36117,8 +36749,9 @@ fn static_delta_reindex_to_refusals_match_the_tool() {
     }
 }
 
-/// A positional after `reindex` parts from the tool: the tool ignores it and
-/// runs the full pass, and the port refuses it at exit 1 and writes nothing.
+/// A positional after `reindex` is a divergence from the `ostree` command.
+/// `ostree` ignores it and runs the full pass. ostrya refuses it at exit 1 and
+/// writes nothing.
 #[test]
 fn static_delta_reindex_argument_handling_parts_from_the_tool() {
     if !ostree_available() {
@@ -36160,14 +36793,18 @@ fn static_delta_reindex_argument_handling_parts_from_the_tool() {
     assert_eq!(index_file_bytes(&port), before, "the port wrote");
 }
 
-/// The entry order of an index file and of the summary's
-/// `ostree.static-deltas` map parts from the tool. The tool writes both maps in
-/// hash-table order, which follows the set of names and, for some names, the
-/// order it read them. The port writes both in name order. Over six deltas
-/// into one target the two agree on the entries and on each digest, the
-/// SHA-256 of the superblock, and the tool's order of each map is not name
-/// order. The tool pulls with `--require-static-deltas` from the repository
-/// the port indexed.
+/// The entry order of an index file and of the `ostree.static-deltas` map of
+/// the summary is a divergence from the `ostree` command:
+///
+/// - `ostree` writes both maps in hash-table order. This order depends on the
+///   set of names and, for some names, on the order in which `ostree` read
+///   them.
+/// - ostrya writes both maps in name order.
+///
+/// Over six deltas into one target, both commands agree on the entries and on
+/// each digest, the SHA-256 of the superblock. The order of each map of
+/// `ostree` is not name order. `ostree` pulls with `--require-static-deltas`
+/// from the repository that ostrya indexed.
 #[test]
 fn static_delta_index_entry_order_parts_from_the_tool() {
     if !ostree_available() {
@@ -36175,11 +36812,11 @@ fn static_delta_index_entry_order_parts_from_the_tool() {
     }
     let tmp = TmpDir::new("delta-index-order");
     let base = tmp.path();
-    // The set is chosen so that the tool's order parts from name order in both
-    // maps. The fixed timestamps fix the commit checksums, and so the delta
-    // names, and the tool's order is stable over one set of names. Where the
-    // checksums differ, a set of six can come out in name order by chance, at
-    // about one in 720 for each map.
+    // The test uses a set for which the order of `ostree` differs from name
+    // order in both maps. The fixed timestamps fix the commit checksums and
+    // the delta names. The order of `ostree` is stable for one set of names.
+    // If the checksums differ, a set of six can come out in name order by
+    // chance, at about one in 720 for each map.
     let (repo, commits) = delta_chain_repo(base, "repo", 6);
     let to = &commits[5];
     ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", to]);
@@ -36251,11 +36888,16 @@ fn static_delta_index_entry_order_parts_from_the_tool() {
     assert_eq!(ostree_ok(&client, &["rev-parse", "origin:m"]), *to);
 }
 
-/// The files `static-delta generate` and `static-delta reindex` write take
-/// mode 0644 under umask 077 in both implementations: the superblock and the
-/// part files at the repository location and under `--filename`, and the index
-/// files of the full pass and of `--to`. The directories both create follow
-/// the umask, and their modes agree.
+/// In ostrya and in the `ostree` command, the files that
+/// `static-delta generate` and `static-delta reindex` write get mode 0644
+/// under umask 077:
+///
+/// - the superblock and the part files at the repository location
+/// - the superblock and the part files at the `--filename` path
+/// - the index files of the full pass and of `--to`
+///
+/// The directories that both commands create follow the umask, and their
+/// modes agree.
 #[test]
 fn static_delta_file_modes_do_not_follow_the_umask() {
     if !ostree_available() {
@@ -36331,9 +36973,9 @@ fn static_delta_file_modes_do_not_follow_the_umask() {
     }
 }
 
-/// Regenerating a delta at the repository location with `--inline`: the tool
-/// leaves the part files of the earlier delta, and the port removes them.
-/// Carries `static-delta/generate-inline-stale-parts`.
+/// If a delta at the repository location is generated again with `--inline`,
+/// the `ostree` command leaves the part files of the old delta. ostrya removes
+/// them. The test carries `static-delta/generate-inline-stale-parts`.
 #[test]
 fn static_delta_generate_inline_removes_stale_parts() {
     if !ostree_available() {
@@ -36363,19 +37005,22 @@ fn static_delta_generate_inline_removes_stale_parts() {
 
 // --- sign --verify and summary --verify key sources ---------------------------
 
-/// What one key-source row of `sign --verify` or `summary --verify` gives.
+/// The outcome of one key-source row of `sign --verify` or `summary --verify`.
 enum KeySourceOutcome {
-    /// The keys load and the signatures are checked: the exit status of the
-    /// verdict, 0 for verified and 1 for not.
+    /// The keys load and the command verifies the signatures. The value is the
+    /// exit status of the verdict: 0 if verified, 1 if not.
     Verdict(i32),
     /// The keys do not load: exit 1 with nothing on standard output and this
     /// standard error.
     Refused(String),
 }
 
-/// One key-source row: the options before the commit, the KEY-ID positionals
-/// after it, the outcome, and whether the tool's `sign --verify` gives the
-/// same outcome.
+/// One key-source row:
+///
+/// - the options before the commit
+/// - the KEY-ID positionals after it
+/// - the outcome
+/// - `true` if `sign --verify` of the `ostree` command gives the same outcome
 struct KeySourceRow {
     options: Vec<&'static str>,
     keys: Vec<&'static str>,
@@ -36383,8 +37028,8 @@ struct KeySourceRow {
     tool_agrees: bool,
 }
 
-/// Write the key files and key stores the key-source rows name into `base`,
-/// the working directory of every run.
+/// Writes the key files and the key stores that the key-source rows name into
+/// `base`, the working directory of each run.
 fn key_source_fixtures(base: &Path) {
     std::fs::write(base.join("k1"), format!("{ED25519_PUBLIC_B64}\n")).unwrap();
     std::fs::write(base.join("k2"), format!("{ED25519_PUBLIC2_B64}\n")).unwrap();
@@ -36419,9 +37064,10 @@ fn key_source_fixtures(base: &Path) {
     std::fs::write(base.join("onebyte-A"), format!("A\n{ED25519_PUBLIC_B64}\n")).unwrap();
 }
 
-/// The key-source rows over a commit or a summary signed with the shared key
-/// alone. A refusal row sits after every verdict row, and the FIFO row last,
-/// so a build that waits on a FIFO fails an earlier row first.
+/// Returns the key-source rows over a commit or a summary that only the shared
+/// key signs. Each refusal row comes after all verdict rows, and the FIFO row
+/// is the last row. As a result, a build that waits on a FIFO fails an
+/// earlier row first.
 fn key_source_rows() -> Vec<KeySourceRow> {
     use KeySourceOutcome::{Refused, Verdict};
     let row =
@@ -36517,14 +37163,14 @@ fn key_source_rows() -> Vec<KeySourceRow> {
     ]
 }
 
-/// The label of a key-source row.
+/// Returns the label of a key-source row.
 fn key_source_label(row: &KeySourceRow) -> String {
     [&row.options[..], &row.keys[..]].concat().join(" ")
 }
 
-/// Assert the outcome of each key-source row, with `run` building and running
-/// the command for the row's options and KEY-IDs. `verified` and `failed` are
-/// the standard output of a verified and a failed verdict.
+/// Asserts the outcome of each key-source row. `run` builds and runs the
+/// command for the options and the KEY-IDs of the row. `verified` and `failed`
+/// are the standard output of a verified and of a failed verdict.
 fn assert_key_source_rows(run: &dyn Fn(&[&str], &[&str]) -> Run, verified: &str, failed: &str) {
     for row in key_source_rows() {
         let label = key_source_label(&row);
@@ -36538,8 +37184,8 @@ fn assert_key_source_rows(run: &dyn Fn(&[&str], &[&str]) -> Run, verified: &str,
     }
 }
 
-/// A commit fixture under `base/<name>`, signed with the shared key by the
-/// port, or by the tool when `tool` is set.
+/// Creates a commit fixture in `base/<name>`, signed with the shared key. If
+/// `tool` is `true`, the `ostree` command signs it. Otherwise ostrya signs it.
 fn signed_commit_fixture(base: &Path, name: &str, tool: bool) -> PathBuf {
     let dir = base.join(name);
     std::fs::create_dir_all(&dir).unwrap();
@@ -36556,8 +37202,9 @@ fn signed_commit_fixture(base: &Path, name: &str, tool: bool) -> PathBuf {
     repo
 }
 
-/// A commit fixture under `base/<name>` whose summary is signed with the
-/// shared key by the port, or by the tool when `tool` is set.
+/// Creates a commit fixture in `base/<name>` with a summary signed with the
+/// shared key. If `tool` is `true`, the `ostree` command signs the summary.
+/// Otherwise ostrya signs it.
 fn signed_summary_fixture(base: &Path, name: &str, tool: bool) -> PathBuf {
     let dir = base.join(name);
     std::fs::create_dir_all(&dir).unwrap();
@@ -36583,8 +37230,9 @@ fn signed_summary_fixture(base: &Path, name: &str, tool: bool) -> PathBuf {
     repo
 }
 
-/// Run `sign --verify` over `COMMIT` in `repo` from `cwd`, with `options`
-/// before the commit and `keys` after it, in the port or in the tool.
+/// Runs `sign --verify` over `COMMIT` in `repo` from `cwd`, with `options`
+/// before the commit and `keys` after it. If `tool` is `true`, the command is
+/// `ostree`. Otherwise it is ostrya.
 fn run_sign_verify(cwd: &Path, repo: &Path, options: &[&str], keys: &[&str], tool: bool) -> Run {
     let repo_arg = format!("--repo={}", repo.display());
     let head = ["sign", repo_arg.as_str(), "--verify"];
@@ -36596,18 +37244,23 @@ fn run_sign_verify(cwd: &Path, repo: &Path, options: &[&str], keys: &[&str], too
     }
 }
 
-/// Run the port's `summary --verify` over `repo` from `cwd`.
+/// Runs `summary --verify` of ostrya over `repo` from `cwd`.
 fn run_summary_verify(cwd: &Path, repo: &Path, options: &[&str], keys: &[&str]) -> Run {
     let repo_arg = format!("--repo={}", repo.display());
     let head = ["summary", repo_arg.as_str(), "--verify"];
     ostrya_in(Some(cwd), &[&head[..], options, keys].concat(), None, &[])
 }
 
-/// `sign --verify` reads the key sources `static-delta verify` reads: the
-/// positionals and the last `--keys-file`, either one leaving `--keys-dir`
-/// unread, the last `--keys-dir`, an empty one naming the working directory,
-/// and `no keys loaded` judged before revocation. A key source that does not
-/// load refuses the run with nothing on standard output.
+/// `sign --verify` reads the same key sources as `static-delta verify`:
+///
+/// - the positionals and the last `--keys-file`
+/// - the last `--keys-dir`, which the command does not read if a positional
+///   or a `--keys-file` is given
+/// - an empty `--keys-dir`, which names the working directory
+///
+/// The command checks for `no keys loaded` before it applies revocation. If a
+/// key source does not load, the command refuses the run with nothing on
+/// standard output.
 #[test]
 fn sign_verify_key_sources() {
     let tmp = TmpDir::new("sign-verify-keys");
@@ -36621,7 +37274,7 @@ fn sign_verify_key_sources() {
     );
 }
 
-/// `summary --verify` reads the key sources `sign --verify` reads.
+/// `summary --verify` reads the same key sources as `sign --verify`.
 #[test]
 fn summary_verify_key_sources() {
     let tmp = TmpDir::new("summary-verify-keys");
@@ -36635,9 +37288,9 @@ fn summary_verify_key_sources() {
     );
 }
 
-/// The gpg engine reads keyrings from `--keys-file` alone. `sign --verify` and
-/// `summary --verify` both refuse `--keys-dir` under it, with the same message
-/// and exit status, and write nothing on standard output.
+/// The gpg engine reads keyrings only from `--keys-file`. `sign --verify` and
+/// `summary --verify` both refuse `--keys-dir` with this engine, with the same
+/// message and exit status. They write nothing on standard output.
 #[test]
 fn gpg_verify_refuses_keys_dir() {
     let tmp = TmpDir::new("gpg-verify-keys-dir");
@@ -36660,10 +37313,11 @@ fn gpg_verify_refuses_keys_dir() {
     );
 }
 
-/// Over a commit the tool signed and a commit the port signed, the port's
-/// `sign --verify` gives the tool's verdict on every key-source row the tool
-/// carries, and each refusal before verification agrees byte for byte. The
-/// verdict report is worded differently. Carries
+/// The test uses a commit that the `ostree` command signed and a commit that
+/// ostrya signed. Over each commit, `sign --verify` of ostrya gives the verdict
+/// of `ostree` on each key-source row with `tool_agrees` set. Each refusal
+/// before verification agrees byte for byte. The verdict reports of the two
+/// commands differ. The test carries
 /// `sign/verify-{keys-file-last-wins,keys-file-overrides-keys-dir,keys-dir-last-wins,no-keys,keys-file-not-regular,report}`.
 #[test]
 fn sign_verify_key_sources_match_the_tool() {
@@ -36687,8 +37341,8 @@ fn sign_verify_key_sources_match_the_tool() {
                 KeySourceOutcome::Refused(_) => assert_runs_agree(&port, &tool, &label),
             }
         }
-        // The report: the tool prints one line naming the key that verified,
-        // the port one line per signature and the verdict.
+        // The report: `ostree` prints one line with the key that verified.
+        // ostrya prints one line for each signature, and the verdict.
         let port = run_sign_verify(base, &repo, &[], &[ED25519_PUBLIC_B64], false);
         let tool = run_sign_verify(base, &repo, &[], &[ED25519_PUBLIC_B64], true);
         assert_eq!(
@@ -36707,8 +37361,8 @@ fn sign_verify_key_sources_match_the_tool() {
     }
 }
 
-/// Whether the tool verifies the summary of `server` under the ed25519 public
-/// key file `key`, through a client repository of its own.
+/// Returns `true` if the `ostree` command verifies the summary of `server` with
+/// the ed25519 public key file `key`, through its own client repository.
 fn tool_verifies_ed25519_summary(base: &Path, name: &str, server: &Path, key: &Path) -> bool {
     let client = base.join(name);
     let client_arg = format!("--repo={}", client.display());
@@ -36730,10 +37384,14 @@ fn tool_verifies_ed25519_summary(base: &Path, name: &str, server: &Path, key: &P
         .success()
 }
 
-/// The tool carries no `summary --verify`. Over a summary the tool signed and
-/// a summary the port signed, the port's `summary --verify` applies the
-/// `sign --verify` key sources, and the tool's `remote summary` verifies each
-/// summary under the signing key and refuses it under another. Carries
+/// The `ostree` command has no `summary --verify`. The test uses a summary
+/// that `ostree` signed and a summary that ostrya signed. Over each summary:
+///
+/// - `summary --verify` of ostrya applies the key sources of `sign --verify`.
+/// - `remote summary` of `ostree` verifies the summary with the signing key,
+///   and refuses it with another key.
+///
+/// The test carries
 /// `summary/verify-{keys-file-last-wins,keys-file-overrides-keys-dir}`.
 #[test]
 fn summary_verify_key_sources_over_both_signers() {
@@ -36778,10 +37436,16 @@ fn summary_verify_key_sources_over_both_signers() {
     }
 }
 
-/// Fill `tmp` with top-level entries on both sides of the default expiry
-/// window: an old file, fifo, dotfile, and non-directory `staging-` name, an old
-/// directory holding a fresh child, an old symlink to `outside`, a fresh file, a
-/// fresh directory holding an old child, and an old `cache/` entry.
+/// Fills `tmp` with top-level entries on both sides of the default expiry
+/// window:
+///
+/// - an old file, an old fifo, an old dotfile, and an old `staging-` name that
+///   is not a directory
+/// - an old directory with a new child
+/// - an old symlink to `outside`
+/// - a new file
+/// - a new directory with an old child
+/// - an old `cache/` entry
 fn aged_tmp_layout(tmp: &Path, outside: &Path) {
     let stamp = |path: &Path| {
         let status = Command::new("touch")
@@ -36815,7 +37479,7 @@ fn aged_tmp_layout(tmp: &Path, outside: &Path) {
     stamp(&tmp.join("cache"));
 }
 
-/// The sorted relative paths under `dir`, every depth.
+/// Returns the sorted relative paths in `dir`, at each depth.
 fn tmp_tree(dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -36833,10 +37497,13 @@ fn tmp_tree(dir: &Path) -> Vec<String> {
     out
 }
 
-/// A `commit` removes the same aged `tmp/` entries in the port and in the tool:
-/// each entry past `tmp-expiry-secs` by its own mtime goes, a directory as a
-/// whole tree and a symlink as the link, and `tmp/cache` and the fresh entries
-/// stay.
+/// A `commit` of ostrya and of the `ostree` command removes the same old
+/// `tmp/` entries:
+///
+/// - The command removes each entry whose own mtime is older than
+///   `tmp-expiry-secs`.
+/// - It removes a directory as a full tree, and a symlink as the link.
+/// - `tmp/cache` and the new entries stay.
 #[test]
 fn commit_reaps_aged_tmp_entries_as_the_tool_does() {
     if !ostree_available() {
@@ -36891,15 +37558,19 @@ fn commit_reaps_aged_tmp_entries_as_the_tool_does() {
 
 // --- pull-local: verification and static deltas -------------------------
 //
-// These tests are the `evidence:` the M10 records under "pull-local --
-// verification and static deltas" cite where a setup of the harness cannot
-// hold the source a case needs.
+// The M10 records under "pull-local -- verification and static deltas" cite
+// these tests as `evidence:`. They do this where a setup of the harness cannot
+// hold the source that a case needs.
 
-/// A tool archive repository at `base/<name>` holding two commits on `main`,
-/// the second over the first, with the deltas `deltas` names -- `scratch` for
-/// the from-scratch delta to the second commit and `from-to` for the delta
-/// between the two -- and, where `summary` is set, the summary. Returns the
-/// path and both commits.
+/// Creates an archive repository at `base/<name>` with the `ostree` command.
+/// The repository has two commits on `main`, the second on top of the first,
+/// and the deltas that `deltas` names:
+///
+/// - `scratch`: the delta from scratch to the second commit
+/// - `from-to`: the delta between the two commits
+///
+/// If `summary` is `true`, the repository also has a summary. Returns the path
+/// and both commits.
 fn pull_local_delta_source(
     base: &Path,
     name: &str,
@@ -36950,13 +37621,14 @@ fn pull_local_delta_source(
 /// arguments after `--repo`.
 type PullLocalRow<'a> = (&'a str, &'a dyn Fn(&Path), Vec<String>);
 
-/// A [`PullLocalRow`] and the statistics line the port prints, `<..>` where
-/// the line is compared with the tool's alone.
+/// A `PullLocalRow` and the statistics line that ostrya prints. The line is
+/// `<..>` if the test only compares it with the line of `ostree`.
 type PullLocalLineRow<'a> = (&'a str, &'a dyn Fn(&Path), Vec<String>, &'a str);
 
-/// Run `pull-local` with `args` into a new repository of `mode` under
-/// `base/<name>-<who>`, after `setup` has run with the repository path. Returns
-/// the run, the refs, and the loose objects.
+/// Runs `pull-local` with `args` into a new repository of `mode` in
+/// `base/<name>-<who>`, after `setup` runs with the repository path. If `who`
+/// is `"port"`, the command is ostrya. Otherwise it is the `ostree` command.
+/// Returns the run, the refs, and the loose objects.
 fn pull_local_case(
     base: &Path,
     name: &str,
@@ -36992,13 +37664,19 @@ fn pull_local_case(
     (run, refs, loose_objects(&dest))
 }
 
-/// The two delta switches of `pull-local` give the port the tool's outcome,
-/// refs, objects, and statistics line: the from-scratch delta, a from-to delta
-/// from a commit held under no ref, a from-scratch delta the ref's commit
-/// declines, a source with no delta for the commit, a source with no summary,
-/// a source outside archive mode, a commit-only pull, and deltas disabled over
-/// a source whose superblock is corrupt. Standard error is worded per
-/// implementation.
+/// With the two delta switches of `pull-local`, ostrya gives the outcome, the
+/// refs, the objects, and the statistics line of the `ostree` command:
+///
+/// - the delta from scratch
+/// - a from-to delta from a commit that the destination has under no ref
+/// - a delta from scratch that the commit of the ref declines
+/// - a source with no delta for the commit
+/// - a source with no summary
+/// - a source that is not in archive mode
+/// - a commit-only pull
+/// - deltas disabled over a source with a corrupt superblock
+///
+/// Each command writes its own message on standard error.
 #[test]
 fn pull_local_static_delta_switches_match_the_tool() {
     if !ostree_available() {
@@ -37125,12 +37803,15 @@ fn pull_local_static_delta_switches_match_the_tool() {
     }
 }
 
-/// Where the delta switches of `pull-local` part from the tool: into an
-/// `archive` destination the tool refuses a required delta and the port
-/// applies it, and the tool's `fsck` accepts what the port wrote; both switches
-/// together end the tool on an assertion at exit 134, and `clap` refuses them
-/// at exit 1, on `pull-local` and on `pull`. Neither refusal writes an object
-/// or a ref.
+/// The divergences of the delta switches of `pull-local` from the `ostree`
+/// command:
+///
+/// - Into an `archive` destination, `ostree` refuses a required delta and
+///   ostrya applies it. `fsck` of `ostree` accepts what ostrya wrote.
+/// - With both switches, `ostree` ends on an assertion at exit 134. `clap` in
+///   ostrya refuses them at exit 1, on `pull-local` and on `pull`.
+///
+/// Neither refusal writes an object or a ref.
 #[test]
 fn pull_local_static_delta_divergences() {
     if !ostree_available() {
@@ -37206,11 +37887,17 @@ fn pull_local_static_delta_divergences() {
     assert!(loose_objects(&dest).is_empty());
 }
 
-/// The GPG switches of `pull-local` refuse where the tool refuses and write no
-/// object and no ref: with no `--remote`, over an unsigned commit whether the
-/// remote is configured or not, over a source with no `summary.sig` and one
-/// with no summary, and `--gpg-verify=false`, which `clap` refuses and the
-/// tool reads as `--gpg-verify` with no remote. The words differ.
+/// The GPG switches of `pull-local` of ostrya refuse where the `ostree`
+/// command refuses, and write no object and no ref:
+///
+/// - with no `--remote`
+/// - over an unsigned commit, with a configured remote and with a remote that
+///   is not configured
+/// - over a source with no `summary.sig`, and over a source with no summary
+/// - with `--gpg-verify=false`, which `clap` refuses and `ostree` reads as
+///   `--gpg-verify` with no remote
+///
+/// The messages differ.
 #[test]
 fn pull_local_gpg_switches_refuse_where_the_tool_refuses() {
     if !ostree_available() {
@@ -37299,11 +37986,11 @@ fn pull_local_gpg_switches_refuse_where_the_tool_refuses() {
 }
 
 /// `pull-local --gpg-verify` opens each source commit object as many times as
-/// the same pull with no check: the check reads the bytes the walk of the
-/// chain read to find the parent. The pull opens each source commit object
-/// once: the walk of the chain reads it, and the walk of its tree takes the
-/// root from that read. The opens are counted under `strace`, over a chain of
-/// two signed commits pulled whole.
+/// the same pull with no verification. The verification reads the bytes that
+/// the walk of the chain read to find the parent. The pull opens each source
+/// commit object one time. The walk of the chain reads it, and the walk of its
+/// tree takes the root from that read. The test counts the opens under
+/// `strace`, over a full pull of a chain of two signed commits.
 #[cfg(feature = "gpg")]
 #[test]
 fn pull_local_gpg_verify_adds_no_commit_read() {
@@ -37338,8 +38025,8 @@ fn pull_local_gpg_verify_adds_no_commit_read() {
         commits.push(run.ok().stdout_trimmed());
     }
 
-    // The opens of each source commit object, in the order `commits` holds.
-    // `strace -y` prints the path behind the directory descriptor an open is
+    // The opens of each source commit object, in the order of `commits`.
+    // `strace -y` prints the path of the directory descriptor that an open is
     // relative to, so a line names the source repository and the object.
     let opens = |name: &str, extra: &[&str]| -> Vec<usize> {
         let dest = base.join(name);
@@ -37398,10 +38085,13 @@ fn pull_local_gpg_verify_adds_no_commit_read() {
     );
 }
 
-/// `pull-local` against a source holding a ref named by 64 lowercase hex
-/// digits: the tool reads the name as a checksum and fails, with the ref named
-/// and with no ref named, where the port reads the name as a checksum when it
-/// is named and copies the ref when every ref is pulled.
+/// `pull-local` from a source with a ref whose name is 64 lowercase hex
+/// digits:
+///
+/// - The `ostree` command reads the name as a checksum and fails, with the ref
+///   named and with no ref named.
+/// - If the ref is named, ostrya reads the name as a checksum and fails. If
+///   the pull takes each ref, ostrya copies the ref.
 #[test]
 fn pull_local_checksum_shaped_ref() {
     if !ostree_available() {

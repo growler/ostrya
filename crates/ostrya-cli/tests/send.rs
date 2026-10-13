@@ -16,7 +16,7 @@ use ostrya::remote::ErrorCode;
 use ostrya::remote::proto::{FrameReader, FrameWriter, GetReply, Message, ObjectRead, PullHello};
 use ostrya_rt::block_on;
 
-/// A scratch directory, made writable again and removed when dropped.
+/// A scratch directory. A drop makes it writable again and removes it.
 struct TmpDir(PathBuf);
 
 impl TmpDir {
@@ -105,7 +105,7 @@ fn pull_hello(version: u32) -> Message {
 /// fails.
 const SEND_LIMIT: Duration = Duration::from_secs(60);
 
-/// Read all of `pipe` on a thread of its own.
+/// Reads all of `pipe` on a thread of its own.
 fn drain<P: Read + Send + 'static>(mut pipe: P) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut out = Vec::new();
@@ -114,8 +114,9 @@ fn drain<P: Read + Send + 'static>(mut pipe: P) -> std::thread::JoinHandle<Vec<u
     })
 }
 
-/// Run `ostrya [global] send --repo=REPO` with `input` on standard input. A
-/// run longer than [`SEND_LIMIT`] is killed, and the test fails.
+/// Runs `ostrya [global] send --repo=REPO` with `input` on standard input.
+/// If a run takes longer than [`SEND_LIMIT`], this function kills it and the
+/// test fails.
 fn send(repo: &Path, global: &[&str], input: Vec<u8>) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ostrya"))
         .args(global)
@@ -127,8 +128,8 @@ fn send(repo: &Path, global: &[&str], input: Vec<u8>) -> Output {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    // The input is written while the output is read, so neither pipe can
-    // fill while the other waits.
+    // One thread writes the input while two other threads read the output,
+    // so no pipe can fill while another waits.
     let writer = std::thread::spawn(move || {
         let _ = stdin.write_all(&input);
     });
@@ -275,9 +276,10 @@ fn send_exits_0_after_a_clean_end_and_non_zero_after_an_error() {
 
 /// `ostrya send` serves an `archive` and a `bare-user` repository that its
 /// user can read and cannot write. It answers each path of the fixture
-/// commit as `Repo::send` in the process answers it, and it creates,
-/// changes, and removes no entry of the repository: no `.lock` either. As
-/// root the mode bits do not stop a write, so the snapshot is the check.
+/// commit as `Repo::send` in the process answers it. It creates, changes,
+/// and removes no entry of the repository, and no `.lock` either. If the
+/// test runs as root, the mode bits do not stop a write, so the snapshot is
+/// the check.
 #[test]
 fn send_serves_a_repository_its_user_cannot_write() {
     let tmp = TmpDir::new("read-only");
@@ -319,7 +321,7 @@ fn send_serves_a_repository_its_user_cannot_write() {
 }
 
 /// The anonymous resident memory of process `pid`, `RssAnon` of
-/// `/proc/PID/status`, in bytes. It leaves out the mapped pages of the
+/// `/proc/PID/status`, in bytes. It does not count the mapped pages of the
 /// binary, which `RssFile` counts.
 fn anon_resident(pid: u32) -> u64 {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
@@ -338,7 +340,8 @@ fn anon_resident(pid: u32) -> u64 {
 }
 
 /// One read of `body` into `buf`. The bound names the reader trait through
-/// the object reader of the push, so the test needs no I/O crate of its own.
+/// `ObjectReader`, the object reader of the push, so the test needs no I/O
+/// crate of its own.
 fn poll_body<R: ostrya::remote::ObjectReader>(
     body: &mut R,
     cx: &mut std::task::Context<'_>,
@@ -348,11 +351,12 @@ fn poll_body<R: ostrya::remote::ObjectReader>(
 }
 
 /// `ostrya send` streams an object of 256 MiB to a stream session over its
-/// pipes, and its anonymous resident memory stays below 16 MiB. The memory
-/// is read after each 16 MiB of the body and at its end, before the standard
-/// input of the server closes, and the test keeps the largest value. Ignored
-/// by default: it writes and deflates 256 MiB; run with
-/// `cargo test -p ostrya-cli --test send -- --ignored`.
+/// pipes, and its anonymous resident memory stays less than 16 MiB. The test
+/// reads the memory after each 16 MiB of the body and at its end, before the
+/// standard input of the server closes. It keeps the largest value.
+///
+/// The test is ignored by default because it writes and deflates 256 MiB.
+/// The command `cargo test -p ostrya-cli --test send -- --ignored` runs it.
 #[test]
 #[ignore = "streams a 256 MiB object; run with --ignored"]
 fn send_streams_a_large_object_in_bounded_memory() {

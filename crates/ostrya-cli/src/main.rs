@@ -1,65 +1,44 @@
 #![forbid(unsafe_code)]
 
-//! The `ostrya` command-line front-end.
+//! The `ostrya` command, a command-line front-end for the `ostrya` library.
 //!
-//! A thin binary over the `ostrya` library, with a command-line surface that
-//! is functionally compatible with the `ostree` tool for the subcommands it
-//! carries. `--repo`, `-v`/`--verbose`, and `--version` are
-//! global: each is accepted both before and after the subcommand name, the
-//! subcommand-position value winning when both are given, matching the tool
-//! (`docs/conformance/cli-surface.md`, "Global conventions"). With no `--repo`
-//! given, the current directory is used when it opens as a repository,
-//! otherwise `OSTREE_REPO`; with neither, the subcommand's usage text and
-//! `error: Command requires a --repo argument` go to standard error and the
-//! process exits 1. `init` shares this precedence: a cwd/`OSTREE_REPO` target
-//! that already opens as a repository is reused (an idempotent re-init); a
-//! target that does not never gets created by the fallback, only by an
-//! explicit `--repo`. The subcommands are:
+//! The `ostrya` binary creates, reads, and changes ostree repositories. A
+//! subcommand that the `ostree` command also has takes the same option names
+//! and values, and writes the same bytes into the repository. The binary is
+//! synchronous and drives the async library with [`ostrya_rt::block_on`].
 //!
-//! - `init` -- create a repository in the given mode.
-//! - `commit` -- ingest a tree from a path, or a tar stream on stdin, into a
-//!   commit and print its checksum.
-//! - `checkout` -- materialize a commit's tree, or write its composefs image.
-//! - `export` -- write a commit's tree as a tar stream, to standard output or
-//!   to a named file.
-//! - `refs` -- list, create, or delete refs, aliases, and collection refs.
-//! - `rev-parse` -- print the commit a revision names.
-//! - `cat` -- write a commit's files to stdout.
-//! - `show` -- report a metadata object, a file object, or one metadata key.
-//! - `log` -- walk a commit's parent chain.
-//! - `ls` -- list a commit's file paths.
-//! - `config` -- read a repository configuration value, or write one.
-//! - `remote` -- add, delete, and list the configured remotes, read a live
-//!   remote's refs and summary, and manage a remote's trusted GPG keys.
-//! - `prune` -- delete unreachable objects.
-//! - `fsck` -- verify object integrity and completeness.
-//! - `diff` -- report the paths that changed between two revisions, or
-//!   between a revision and a directory.
-//! - `sign` -- add, verify, or delete commit signatures under one of the
-//!   ed25519, spki, or gpg engines.
-//! - `summary` -- regenerate, sign, or verify the repository summary.
-//! - `static-delta` -- list the repository's static deltas, apply one offline,
-//!   generate one, rebuild the delta index cache, show a delta's superblock and
-//!   parts, or list the index cache.
-//! - `pull` -- fetch refs and their objects from an HTTP remote, or over ssh
-//!   from a remote whose `pull-url` is an ssh address.
-//! - `pull-local` -- import refs and their objects from another local
-//!   repository.
-//! - `receive` -- the server side of a push over ssh: one session over
-//!   standard input and standard output. The `receive` feature builds it.
-//! - `push` -- push commits of the repository to a remote over ssh or HTTP,
-//!   and update its refs. The `push` feature builds it.
-//! - `push-tree` -- push a directory to a remote over ssh or HTTP as one
-//!   commit, and set its refs to that commit. The `push` feature builds it.
-//! - `serve` -- serve the repository over HTTP or HTTPS as an archive
-//!   repository, for pull, and without `--read-only` the receive endpoint of
-//!   a push over HTTP. The `serve` feature builds it.
+//! # Subcommands
 //!
-//! The binary is synchronous and drives the async library with
-//! [`ostrya_rt::block_on`]. Tar streams from stdin flow through
-//! [`ostrya_rt::FileReader`], and streams to stdout through
-//! [`ostrya_rt::File`], each over a duplicated descriptor, so no unbounded
-//! stream is buffered in memory.
+//! [`Command`] has one variant for each subcommand, and [`Cli`] holds the
+//! global options.
+//!
+//! - Repository: `init`, `config`, `remote`, `summary`, `prune`, `fsck`.
+//! - Write: `commit`, `refs`, `sign`, `static-delta`.
+//! - Read: `checkout`, `export`, `rev-parse`, `cat`, `show`, `log`, `ls`,
+//!   `diff`.
+//! - Pull: `pull`, `pull-local`.
+//! - ostrya extensions: `push`, `push-tree`, `receive`, `send`, `serve`.
+//!
+//! # Features
+//!
+//! - `smol` (default): the `smol` runtime backend.
+//! - `tokio`: the `tokio` runtime backend.
+//! - `spki` (default): the spki signature engine.
+//! - `gpg` (default): the gpg signature engine.
+//! - `receive` (default): `receive`, the server side of a push over ssh.
+//! - `push` (default): `push` and `push-tree`.
+//! - `serve` (default): `serve`, the HTTP server of a repository.
+//! - `send` (default): `send`, the server side of a pull over ssh.
+//! - `lzma-static` (default): a static liblzma, so the binary needs no
+//!   liblzma at run time.
+//!
+//! # Usage
+//!
+//! ```text
+//! ostrya --repo=repo init --mode=archive
+//! ostrya --repo=repo commit -b main -s 'First commit' tree/
+//! ostrya --repo=repo log main
+//! ```
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, OwnedFd};
@@ -91,16 +70,22 @@ use ostrya::{SpkiSigner, SpkiVerifier};
 
 use pcre2::bytes::{CaptureLocations, RegexBuilder};
 
-/// A pure-Rust front-end over the ostrya repository library.
+/// The command line of the `ostrya` binary: the global options and the
+/// subcommand.
+///
+/// # Global options
+///
+/// `--repo`, `-v`, and `--version` are global. Each one is accepted before
+/// and after the subcommand name. If `--repo` is given in both positions, the
+/// value after the subcommand name wins, as in the `ostree` command.
 #[derive(Parser)]
 #[command(name = "ostrya", about, long_about = None)]
 struct Cli {
-    /// The repository to operate on; accepted before or after the subcommand
-    /// name, with the subcommand-position value winning when both are given.
-    /// With neither, the current directory is used when it opens as a
-    /// repository, else the `OSTREE_REPO` environment variable (`init`
-    /// reuses an existing repository resolved this way, but never creates a
-    /// new one without this option).
+    /// The repository to operate on. The option is accepted before and after
+    /// the subcommand name, and the value after the name wins. Without it,
+    /// the command opens the current directory if it is a repository, and
+    /// else the path in `OSTREE_REPO`. `init` reuses a repository that it
+    /// finds this way, and creates a new one only at an explicit --repo.
     #[arg(long, global = true)]
     repo: Option<PathBuf>,
     /// Print debug information during command processing.
@@ -114,43 +99,42 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
-// `commit` carries the largest option set of any subcommand, so its variant is
-// the largest here. `clap`'s `Subcommand` derive reads the field type as the
-// argument group itself, which a `Box` is not, so the indirection the lint asks
-// for cannot be applied. One `Cli` value is parsed per process.
+// `commit` has the largest option set of all subcommands, so its variant is
+// the largest. The `Subcommand` derive of `clap` reads the field type as the
+// argument group. A `Box` is not an argument group, so the indirection that
+// the lint asks for is not possible. The process parses one `Cli` value.
 #[allow(clippy::large_enum_variant)]
 enum Command {
     /// Initialize a new empty repository.
     Init(InitArgs),
     /// Commit a tree into the repository and print the new commit checksum.
     Commit(CommitArgs),
-    /// Check a commit out onto the filesystem, or write its composefs image.
+    /// Check a commit out onto the file system, or write its composefs image.
     Checkout(CheckoutArgs),
-    /// Write a commit's tree as a tar stream, to stdout or to --output.
+    /// Write the tree of a commit as a tar stream, to stdout or to --output.
     Export(ExportArgs),
     /// List, create, or delete refs.
     Refs(RefsArgs),
-    /// Print the commit checksum a revision names.
+    /// Print the commit checksum that a revision names.
     #[command(name = "rev-parse")]
     RevParse(RevParseArgs),
-    /// Write the contents of a commit's files to stdout.
+    /// Write the content of files of a commit to stdout.
     Cat(CatArgs),
     /// Output a metadata object.
     Show(ShowArgs),
-    /// Show the log starting at a commit or ref.
+    /// Show the log that starts at a commit or ref.
     Log(LogArgs),
-    /// List a commit's file paths.
+    /// List the file paths of a commit.
     Ls(LsArgs),
     /// Read or write a repository configuration value.
     Config(ConfigArgs),
     /// Manage the configured remotes and their trusted GPG keys.
     Remote(RemoteArgs),
-    /// Delete objects unreachable from the repository's refs and commits.
+    /// Delete the objects that no ref or commit of the repository reaches.
     Prune(PruneArgs),
     /// Verify object integrity and completeness across every commit.
     Fsck(FsckArgs),
-    /// Report the paths that changed between two revisions, or between a
-    /// revision and a directory.
+    /// Report the paths that changed between two revisions or directories.
     Diff(DiffArgs),
     /// Add, verify, or delete signatures on a commit.
     Sign(SignArgs),
@@ -159,8 +143,8 @@ enum Command {
     /// List, generate, apply, or index static deltas.
     #[command(name = "static-delta")]
     StaticDelta(StaticDeltaArgs),
-    /// Fetch refs and their objects from an HTTP remote, or over ssh from a
-    /// remote whose pull-url is an ssh address.
+    /// Fetch refs and their objects from a remote over HTTP or ssh. The pull
+    /// uses ssh if the pull-url of the remote is an ssh address.
     Pull(PullArgs),
     /// Import refs and their objects from another local repository.
     #[command(name = "pull-local")]
@@ -171,13 +155,14 @@ enum Command {
     /// Push commits to a remote over ssh or HTTP and update its refs.
     #[cfg(feature = "push")]
     Push(PushArgs),
-    /// Push a directory to a remote over ssh or HTTP as one commit and set its
-    /// refs.
+    /// Push a directory to a remote as one commit and set its refs. The
+    /// transport is ssh or HTTP.
     #[cfg(feature = "push")]
     #[command(name = "push-tree")]
     PushTree(PushTreeArgs),
-    /// Serve the repository over HTTP as an archive repository, for pull,
-    /// and, without --read-only, the receive endpoint of a push.
+    /// Serve the repository over HTTP as an archive repository for pull.
+    /// Without --read-only, the server also has the receive endpoint of a
+    /// push.
     #[cfg(feature = "serve")]
     Serve(ServeArgs),
     /// Serve one pull session over standard input and standard output.
@@ -186,9 +171,11 @@ enum Command {
 }
 
 impl Command {
-    /// Every name [`Command::name`] returns. The test at the end of this file
-    /// holds this list and `clap`'s own subcommand set to each other, so a
-    /// renamed or an added subcommand fails a test rather than the
+    /// Every name that [`Command::name`] returns.
+    ///
+    /// The test `tests::every_subcommand_name_renders_its_usage_text`
+    /// compares this list with the subcommand set of `clap`. If a subcommand
+    /// is renamed or added, that test fails before the change can break the
     /// usage-text lookup on an error path.
     #[cfg(test)]
     const NAMES: &'static [&'static str] = &[
@@ -224,8 +211,8 @@ impl Command {
         "send",
     ];
 
-    /// The name `clap` registered this subcommand under, which the error paths
-    /// use to render its usage text.
+    /// Returns the name of this subcommand in `clap`. The error paths use it
+    /// to print the usage text of the subcommand.
     fn name(&self) -> &'static str {
         match self {
             Command::Init(_) => "init",
@@ -265,8 +252,8 @@ impl Command {
 #[derive(Args)]
 struct InitArgs {
     /// The repository mode: archive (an alias for archive-z2), archive-z2,
-    /// bare, bare-user, bare-user-only, or the port extension
-    /// bare-user-shared.
+    /// bare, bare-user, bare-user-only, or bare-user-shared, an ostrya
+    /// extension.
     #[arg(long, default_value = "bare")]
     mode: String,
     /// A globally unique id for this repository as a collection of refs.
@@ -277,7 +264,7 @@ struct InitArgs {
 #[derive(Args)]
 struct CommitArgs {
     /// The parent commit (a checksum or a ref), or `none` for a root commit.
-    /// Absent, the branch's current tip is the parent.
+    /// Without this option, the current tip of the branch is the parent.
     #[arg(long)]
     parent: Option<String>,
     /// Point this branch at the new commit and bind it into the commit.
@@ -289,13 +276,15 @@ struct CommitArgs {
     /// The commit subject.
     #[arg(short, long)]
     subject: Option<String>,
-    /// The commit body. Given more than once, the last value wins.
+    /// The commit body. If the option occurs more than once, the last value
+    /// wins.
     #[arg(short = 'm', long, value_name = "BODY", overrides_with = "body")]
     body: Option<String>,
-    /// Read the commit body from this file, which wins over --body.
+    /// Read the commit body from this file. This option wins over --body.
     #[arg(short = 'F', long, value_name = "FILE", overrides_with = "body_file")]
     body_file: Option<PathBuf>,
-    /// Write the subject and the body in an editor, which replaces both.
+    /// Write the subject and the body in an editor. The editor text replaces
+    /// both.
     #[arg(short = 'e', long)]
     editor: bool,
     /// Do not write any ref bindings.
@@ -307,7 +296,8 @@ struct CommitArgs {
     /// Add a string-valued key to the commit metadata.
     #[arg(long, value_name = "KEY=VALUE")]
     add_metadata_string: Vec<String>,
-    /// Add a key to the commit metadata, its value in the GVariant text form.
+    /// Add a key to the commit metadata, with the value in the GVariant text
+    /// form.
     #[arg(long, value_name = "KEY=VALUE")]
     add_metadata: Vec<String>,
     /// Carry this metadata key over from the parent commit.
@@ -316,135 +306,139 @@ struct CommitArgs {
     /// Add a string-valued key to the detached commit metadata.
     #[arg(long, value_name = "KEY=VALUE")]
     add_detached_metadata_string: Vec<String>,
-    /// Force owner 0:0, canonicalize modes to `perm & 0755`, and drop xattrs,
-    /// for an owner- and host-independent commit.
+    /// Force owner 0:0, canonicalize modes to `perm & 0755`, and drop xattrs.
+    /// The commit then does not depend on the owner or on the host.
     #[arg(long)]
     canonical_permissions: bool,
-    /// Set file ownership user id.
+    /// Set the user id of the owner of the committed files.
     #[arg(long, value_name = "UID", allow_hyphen_values = true)]
     owner_uid: Option<String>,
-    /// Set file ownership group id.
+    /// Set the group id of the owner of the committed files.
     #[arg(long, value_name = "GID", allow_hyphen_values = true)]
     owner_gid: Option<String>,
     /// Do not import extended attributes.
     #[arg(long)]
     no_xattrs: bool,
-    /// File holding the mode changes to make, one
+    /// A file with the mode changes to make, one
     /// `[=]<decimal mode> <absolute in-tree path>` per line.
     #[arg(long, value_name = "PATH", overrides_with = "statoverride")]
     statoverride: Option<PathBuf>,
-    /// File holding the paths to leave out, one absolute in-tree path per
-    /// line. A listed directory prunes its whole subtree.
+    /// A file with the paths to leave out, one absolute in-tree path per line.
+    /// A listed directory prunes its whole subtree.
     #[arg(long, value_name = "PATH", overrides_with = "skip_list")]
     skip_list: Option<PathBuf>,
-    /// Clear the write bits of every regular file that carries an execute bit.
+    /// Clear the write bits of every regular file that has an execute bit.
     #[arg(long)]
     mode_ro_executables: bool,
-    /// Print the parent's checksum and write nothing where the tree matches
-    /// the parent commit.
+    /// If the tree matches the parent commit, print the checksum of the parent
+    /// and write nothing.
     #[arg(long)]
     skip_if_unchanged: bool,
-    /// Resolve a source file that is a hardlink to one of the repository's own
-    /// content objects by its inode, instead of reading it.
+    /// Find a source file by its inode if it is a hardlink to a content object
+    /// of this repository. The commit then does not read the file.
     #[arg(long)]
     link_checkout_speedup: bool,
-    /// Take an inode match as the file's whole identity, which skips the
-    /// commit modifiers for it. Implies --link-checkout-speedup.
+    /// Use an inode match as the whole identity of a file. The commit
+    /// modifiers then do not apply to that file. This switch implies
+    /// --link-checkout-speedup.
     #[arg(short = 'I', long)]
     devino_canonical: bool,
     /// Override the timestamp of the commit: `@SECONDS` since the Unix epoch,
-    /// or a date and time carrying a UTC offset (`2020-01-02T03:04:05Z`).
+    /// or a date and time with a UTC offset (`2020-01-02T03:04:05Z`).
     #[arg(long, value_name = "TIMESTAMP")]
     timestamp: Option<String>,
-    /// Specify how to invoke fsync(): a boolean word from `true`, `yes`, `1`,
-    /// `false`, `no`, or `0`, read without regard to case.
+    /// Specify how to invoke fsync() with a boolean word: `true`, `yes`, `1`,
+    /// `false`, `no`, or `0`. The letter case does not matter.
     #[arg(long, value_name = "POLICY", allow_hyphen_values = true)]
     fsync: Option<String>,
-    /// Report the commit and the object counts in a `KEY: VALUE` block instead
-    /// of the checksum alone.
+    /// Report the commit and the object counts in a `KEY: VALUE` block.
+    /// Without this switch, the command prints the checksum alone.
     #[arg(long)]
     table_output: bool,
-    /// Store the size of every object the commit reaches in `ostree.sizes`. An
-    /// archive repository alone writes the key.
+    /// Store the size of each object that the commit reaches in
+    /// `ostree.sizes`. Only an archive repository writes this key.
     #[arg(long)]
     generate_sizes: bool,
-    /// Store `ostree.linux` and `ostree.bootable`, read from the one kernel
-    /// directory under `/usr/lib/modules` in the committed tree.
+    /// Store `ostree.linux` and `ostree.bootable`. The command reads them from
+    /// the one kernel directory under `/usr/lib/modules` in the committed
+    /// tree.
     #[arg(long)]
     bootable: bool,
-    /// Store the fs-verity digest of the tree's composefs image in
+    /// Store the fs-verity digest of the composefs image of the tree in
     /// `ostree.composefs.digest.v0`.
     #[arg(long)]
     generate_composefs_metadata: bool,
-    /// Overlay the given argument as a tree, in command-line order. Repeatable.
+    /// Overlay the given argument as a tree, in command-line order. The option
+    /// can occur more than once.
     #[arg(long, value_name = "dir=PATH or tar=TARFILE or ref=COMMIT")]
     tree: Vec<String>,
-    /// Start from the given commit as a base (no modifiers apply). Given more
-    /// than once, the last value wins.
+    /// Start from the given commit as a base. No modifiers apply to the base.
+    /// If the option occurs more than once, the last value wins.
     #[arg(long, value_name = "REV", overrides_with = "base")]
     base: Option<String>,
-    /// Consume (delete) content after commit (for local directories).
+    /// Consume (delete) the content after the commit, for local directories.
     #[arg(long)]
     consume: bool,
-    /// When loading tar archives, automatically create parent directories as
-    /// needed.
+    /// Create the missing parent directories of the members of a tar archive.
     #[arg(long)]
     tar_autocreate_parents: bool,
-    /// When loading tar archives, use REGEX,REPLACEMENT against path names.
-    /// Given more than once, the last value wins.
+    /// Apply REGEX,REPLACEMENT to the path names of a tar archive. If the
+    /// option occurs more than once, the last value wins.
     #[arg(
         long,
         value_name = "REGEX,REPLACEMENT",
         overrides_with = "tar_pathname_filter"
     )]
     tar_pathname_filter: Option<String>,
-    /// GPG Key ID to sign the commit with. Repeatable, and each occurrence adds
-    /// one signature under `ostree.gpgsigs`, in command-line order.
+    /// The GPG key ID to sign the commit with. Each occurrence adds one
+    /// signature under `ostree.gpgsigs`, in command-line order.
     #[arg(long, value_name = "KEY-ID")]
     gpg_sign: Vec<String>,
-    /// GPG Homedir to use when looking for keyrings. Read by --gpg-sign and,
-    /// under --sign-type=gpg, by --sign and --sign-from-file. It wins over
-    /// GNUPGHOME.
+    /// The GPG home directory that holds the keyrings. --gpg-sign reads it,
+    /// and so do --sign and --sign-from-file under --sign-type=gpg. It wins
+    /// over GNUPGHOME.
     #[arg(long, value_name = "HOMEDIR")]
     gpg_homedir: Option<PathBuf>,
-    /// Sign the commit with this key: for ed25519 and spki, the base64 of the
-    /// secret key. Repeatable, and each occurrence adds one signature.
+    /// Sign the commit with this key. For ed25519 and spki, the key is the
+    /// base64 of the secret key. Each occurrence adds one signature.
     #[arg(long, value_name = "KEY_ID")]
     sign: Vec<String>,
-    /// Sign the commit with the key on the first line of this file.
-    /// Repeatable, and each occurrence adds one signature. An empty path
-    /// carries its own refusal.
+    /// Sign the commit with the key on the first line of this file. Each
+    /// occurrence adds one signature. The command refuses an empty path with
+    /// a message of its own.
     #[arg(long, value_name = "PATH")]
     sign_from_file: Vec<std::ffi::OsString>,
-    /// Signature type to use (defaults to 'ed25519'). Given more than once,
-    /// the last value wins.
+    /// The signature type to use. The default is 'ed25519'. If the option
+    /// occurs more than once, the last value wins.
     #[arg(long, value_name = "NAME", overrides_with = "sign_type")]
     sign_type: Option<String>,
-    /// The tree to commit. Ignored where any --tree is given, as is every
-    /// argument after the first; with neither, read a tar stream from stdin.
+    /// The tree to commit. If a --tree option is present, the command ignores
+    /// this argument. It also ignores each argument after the first. With no
+    /// --tree option and no PATH, the command reads a tar stream from stdin.
     path: Vec<PathBuf>,
 }
 
 #[derive(Args)]
 struct CheckoutArgs {
-    /// Refuse an entry the checkout would materialize by a copy, instead of
-    /// falling back to one.
+    /// Refuse an entry that needs a copy. Without this switch, the checkout
+    /// falls back to a copy.
     #[arg(short = 'H', long)]
     require_hardlinks: bool,
-    /// Copy every object instead of hardlinking (the copy path still reflinks).
+    /// Copy every object, and make no hardlink. The copy path still uses
+    /// reflinks.
     #[arg(short = 'C', long, conflicts_with = "require_hardlinks")]
     force_copy: bool,
-    /// Reduce every directory the checkout creates to `mode & 0775`.
+    /// Reduce every directory that the checkout creates to `mode & 0775`.
     #[arg(short = 'M', long)]
     bareuseronly_dirs: bool,
-    /// Do not update or use the repository's uncompressed object cache. The
-    /// port keeps no such cache, so the switch decides nothing.
+    /// Do not update or use the uncompressed object cache of the repository.
+    /// ostrya keeps no such cache, so this switch has no effect.
     #[arg(long)]
     disable_cache: bool,
     /// Do not change file ownership or initialize extended attributes.
     #[arg(short = 'U', long)]
     user_mode: bool,
-    /// Check out this path within the commit instead of the whole tree.
+    /// Check out only this path of the commit.
     #[arg(long, value_name = "PATH")]
     subpath: Option<PathBuf>,
     /// Keep existing directories, overwrite existing files, and add new
@@ -454,55 +448,58 @@ struct CheckoutArgs {
     /// Keep every existing entry and add only the entries that do not exist.
     #[arg(long)]
     union_add: bool,
-    /// Add new entries and keep an existing entry identical to the object it
-    /// would receive; a differing entry is an error. Requires
+    /// Add new entries, and keep an existing entry that is identical to its
+    /// object. A different existing entry is an error. This switch requires
     /// `-H/--require-hardlinks`.
     #[arg(long)]
     union_identical: bool,
-    /// Process Docker-style whiteout entries: `.wh.<name>` removes `<name>` from
-    /// the destination and `.wh..wh..opq` clears the destination directory,
-    /// and neither marker is materialized.
+    /// Process Docker-style whiteout entries. `.wh.<name>` removes `<name>`
+    /// from the destination, and `.wh..wh..opq` clears the destination
+    /// directory. The checkout writes neither marker.
     #[arg(long)]
     whiteouts: bool,
     /// Turn a `.ostree-wh.<name>` entry into an overlayfs whiteout: a
     /// character device 0:0 at `<name>`.
     #[arg(long)]
     process_passthrough_whiteouts: bool,
-    /// Exit 0 without writing anything when `--subpath` names nothing.
+    /// If `--subpath` names nothing, write nothing and exit 0.
     #[arg(long)]
     allow_noent: bool,
-    /// Write the commit's composefs EROFS image to the destination instead of a
-    /// tree.
+    /// Write the composefs EROFS image of the commit to the destination, and
+    /// no tree.
     #[arg(long)]
     composefs: bool,
     /// Write the composefs EROFS image with no fs-verity digest in it. The two
-    /// composefs switches are independent, and this one decides in any order.
+    /// composefs switches are independent, and this switch applies in any
+    /// position.
     #[arg(long)]
     composefs_noverity: bool,
-    /// Read NUL-separated (REFSPEC, SUBPATH) records from standard input and
-    /// check each pair out into the destination the first positional names.
+    /// Read NUL-separated (REFSPEC, SUBPATH) records from standard input.
+    /// Check out each pair into the destination that the first positional
+    /// names.
     #[arg(long)]
     from_stdin: bool,
-    /// Read the same records from FILE. Given more than once, the last value
-    /// wins; --from-stdin wins over this option whatever the command-line
-    /// order.
+    /// Read the same records from FILE. If the option occurs more than once,
+    /// the last value wins. --from-stdin wins over this option in any
+    /// command-line order.
     #[arg(long, value_name = "FILE", overrides_with = "from_file")]
     from_file: Option<PathBuf>,
-    /// Specify how to invoke fsync(): a boolean word from `true`, `yes`, `1`,
-    /// `false`, `no`, or `0`, read without regard to case.
+    /// Specify how to invoke fsync() with a boolean word: `true`, `yes`, `1`,
+    /// `false`, `no`, or `0`. The letter case does not matter.
     #[arg(long, value_name = "POLICY", allow_hyphen_values = true)]
     fsync: Option<String>,
-    /// Prune every tree path FILE names, one per line, a directory spelled
-    /// with a trailing slash. Given more than once, the last value wins.
+    /// Prune each tree path that FILE names, one path per line. Write a
+    /// directory with a trailing slash. If the option occurs more than once,
+    /// the last value wins.
     #[arg(long, value_name = "FILE", overrides_with = "skip_list")]
     skip_list: Option<PathBuf>,
-    /// The commit to check out (a checksum or a ref). Under --from-stdin or
-    /// --from-file this positional is the destination and every revision comes
-    /// from the record stream.
+    /// The commit to check out (a checksum or a ref). With --from-stdin or
+    /// --from-file, this positional is the destination, and each revision
+    /// comes from the record stream.
     commit: String,
-    /// The destination path. Under --from-stdin or --from-file the first
-    /// positional is the destination and this one is ignored, which is the
-    /// tool's own arity.
+    // The `ostree` command has this arity.
+    /// The destination path. With --from-stdin or --from-file, the first
+    /// positional is the destination, and the command ignores this one.
     #[arg(required_unless_present_any = ["from_stdin", "from_file"])]
     destination: Option<PathBuf>,
 }
@@ -512,75 +509,76 @@ struct ExportArgs {
     /// Emit no extended attributes.
     #[arg(long)]
     no_xattrs: bool,
-    /// Export this directory within the commit as the archive root instead of
-    /// the whole tree. Given more than once, the last value wins.
+    /// Export only this directory of the commit, as the archive root. If the
+    /// option occurs more than once, the last value wins.
     #[arg(long, value_name = "PATH", overrides_with = "subpath")]
     subpath: Option<PathBuf>,
-    /// Put PATH in front of every member pathname. Given more than once, the
-    /// last value wins.
+    /// Put PATH in front of every member pathname. If the option occurs more
+    /// than once, the last value wins.
     #[arg(long, value_name = "PATH", overrides_with = "prefix")]
     prefix: Option<String>,
-    /// Write the archive to PATH instead of standard output. Given more than
-    /// once, the last value wins.
+    /// Write the archive to PATH. Without this option, the archive goes to
+    /// standard output. If the option occurs more than once, the last value
+    /// wins.
     #[arg(short = 'o', long, value_name = "PATH", overrides_with = "output")]
     output: Option<PathBuf>,
-    /// The commit to export (a checksum or a ref). Required; checked after
-    /// the repository resolves, matching the tool's error-ordering
-    /// (`docs/conformance/cli-surface.md`, "Global conventions").
+    // ostrya checks this operand after the repository resolves, in the order
+    // of the `ostree` command.
+    /// The commit to export (a checksum or a ref). Required.
     commit: Option<String>,
 }
 
 #[derive(Args)]
 struct RefsArgs {
-    /// Delete the refs each PREFIX matches instead of listing them.
+    /// Delete the refs that each PREFIX matches. The command then lists no
+    /// ref.
     #[arg(long)]
     delete: bool,
-    /// Print each ref under its whole name, leaving the matched PREFIX in
-    /// place.
+    /// Print the whole name of each ref, with the matched PREFIX in it.
     #[arg(long)]
     list: bool,
-    /// Print each ref's commit checksum after a tab.
+    /// Print the commit checksum of each ref after a tab.
     #[arg(short = 'r', long)]
     revision: bool,
-    /// List the aliases alone; with --create, create an alias instead of a ref.
+    /// List the aliases alone. With --create, the new ref is an alias.
     #[arg(short = 'A', long)]
     alias: bool,
-    /// Create this ref, pointing it at the commit the single PREFIX argument
-    /// names.
+    /// Create this ref, and point it at the commit that the single PREFIX
+    /// argument names.
     #[arg(long, value_name = "NEWREF")]
     create: Option<String>,
-    /// List collection refs as `(collection-id, ref)` pairs, and read each
-    /// PREFIX as a collection id rather than a ref-name prefix.
+    /// List collection refs as `(collection-id, ref)` pairs. Each PREFIX is
+    /// then a collection id.
     #[arg(short = 'c', long)]
     collections: bool,
-    /// Replace an existing ref when creating.
+    /// With --create, replace an existing ref.
     #[arg(long)]
     force: bool,
-    /// The ref-name prefixes to match, or the collection ids under
-    /// --collections. With none, every ref is listed.
+    /// The ref-name prefixes to match, or the collection ids with
+    /// --collections. With none, the command lists every ref.
     prefix: Vec<String>,
 }
 
 #[derive(Args)]
 struct RevParseArgs {
-    /// Print the repository's one commit. An empty repository, and one holding
-    /// more than one commit, are both errors.
+    /// Print the one commit of the repository. An empty repository is an
+    /// error, and so is a repository with more than one commit.
     #[arg(short = 'S', long)]
     single: bool,
+    // ostrya checks this operand after the repository resolves, in the order
+    // of the `ostree` command.
     /// The revisions to resolve: a checksum, a refspec, or either with a
-    /// trailing `^` per generation of ancestry. Required unless --single;
-    /// checked after the repository resolves, matching the tool's
-    /// error-ordering (`docs/conformance/cli-surface.md`, "Global
-    /// conventions").
+    /// trailing `^` for each generation of ancestry. Required, unless
+    /// --single is given.
     rev: Vec<String>,
 }
 
 #[derive(Args)]
 struct CatArgs {
+    // ostrya checks this operand and PATH after the repository resolves, in
+    // the order of the `ostree` command.
     /// The commit to read (a checksum or a ref). Required, with at least one
-    /// PATH; both are checked after the repository resolves, matching the
-    /// tool's error-ordering (`docs/conformance/cli-surface.md`, "Global
-    /// conventions").
+    /// PATH.
     commit: Option<String>,
     /// The paths to write, in order. A leading `/` is optional.
     path: Vec<String>,
@@ -591,7 +589,7 @@ struct ShowArgs {
     /// Show the "related" commits.
     #[arg(long)]
     print_related: bool,
-    /// Read OBJECT as a file holding a value of this GVariant type.
+    /// Read OBJECT as a file that holds a value of this GVariant type.
     #[arg(long, value_name = "TYPE")]
     print_variant_type: Option<String>,
     /// List the available metadata keys.
@@ -600,7 +598,8 @@ struct ShowArgs {
     /// Print the value of one metadata key.
     #[arg(long, value_name = "KEY")]
     print_metadata_key: Option<String>,
-    /// For a byte-array valued key, print an unquoted hexadecimal string.
+    /// If the key has a byte-array value, print an unquoted hexadecimal
+    /// string.
     #[arg(long)]
     print_hex: bool,
     /// List the available detached metadata keys.
@@ -615,20 +614,21 @@ struct ShowArgs {
     /// Show the raw variant data.
     #[arg(long)]
     raw: bool,
-    /// Do not convert the variant data from big endian. The raw variant is
-    /// reported as stored, and a commit's own report follows it.
+    /// Do not convert the variant data from big endian. The command prints
+    /// the raw variant as stored. For a commit, the report of the commit
+    /// follows it.
     #[arg(short = 'B', long)]
     no_byteswap: bool,
-    /// GPG homedir to use when looking for keyrings.
+    /// The GPG home directory that holds the keyrings.
     #[arg(long, value_name = "HOMEDIR")]
     gpg_homedir: Option<PathBuf>,
-    /// Use this remote's GPG configuration when verifying signatures.
+    /// Use the GPG configuration of this remote to verify signatures.
     #[arg(long, value_name = "REMOTE")]
     gpg_verify_remote: Option<String>,
+    // ostrya checks this operand after the repository resolves, in the order
+    // of the `ostree` command.
     /// The object to report: a revision, a metadata or file object checksum,
-    /// or, under --print-variant-type, a filename. Required; checked after the
-    /// repository resolves, matching the tool's error-ordering
-    /// (`docs/conformance/cli-surface.md`, "Global conventions").
+    /// or a filename with --print-variant-type. Required.
     object: Option<String>,
 }
 
@@ -637,9 +637,9 @@ struct LogArgs {
     /// Show the raw variant data.
     #[arg(long)]
     raw: bool,
-    /// The revision to start at. Required; checked after the repository
-    /// resolves, matching the tool's error-ordering
-    /// (`docs/conformance/cli-surface.md`, "Global conventions").
+    // ostrya checks this operand after the repository resolves, in the order
+    // of the `ostree` command.
+    /// The revision to start at. Required.
     rev: Option<String>,
 }
 
@@ -651,35 +651,34 @@ struct LsArgs {
     /// Print directories recursively.
     #[arg(short = 'R', long)]
     recursive: bool,
-    /// Print each entry's checksum: the content checksum of a file, the dirtree
-    /// and dirmeta checksums of a directory.
+    /// Print the checksum of each entry: the content checksum of a file, or
+    /// the dirtree and dirmeta checksums of a directory.
     #[arg(short = 'C', long)]
     checksum: bool,
-    /// Print each entry's extended attributes.
+    /// Print the extended attributes of each entry.
     #[arg(short = 'X', long)]
     xattrs: bool,
     /// Print only the paths, NUL separated.
     #[arg(long)]
     nul_filenames_only: bool,
-    /// The commit to list (a checksum or a ref). Required; checked after the
-    /// repository resolves, matching the tool's error-ordering
-    /// (`docs/conformance/cli-surface.md`, "Global conventions").
+    // ostrya checks this operand after the repository resolves, in the order
+    // of the `ostree` command.
+    /// The commit to list (a checksum or a ref). Required.
     commit: Option<String>,
-    /// The paths within the commit to list, in order. With none, the tree root
-    /// is listed.
+    /// The paths in the commit to list, in order. With none, the command lists
+    /// the tree root.
     path: Vec<String>,
 }
 
 #[derive(Args)]
 struct ConfigArgs {
-    /// The group the KEY belongs to. With this, KEY is read as a bare key name
-    /// rather than `section.key`.
+    /// The group of KEY. With this option, KEY is a bare key name.
     #[arg(long, value_name = "GROUP")]
     group: Option<String>,
     /// The operation: `get`, `set`, or `unset`.
     operation: Option<String>,
-    /// The key to read or write -- `section.key`, or a bare key name under
-    /// --group -- and, for `set`, the value.
+    /// The key to read or write, and for `set` the value. The key is
+    /// `section.key`, or a bare key name with --group.
     args: Vec<String>,
 }
 
@@ -693,28 +692,28 @@ struct RemoteArgs {
 enum RemoteCommand {
     /// Add a remote repository.
     Add(RemoteAddArgs),
-    /// Delete a remote repository, and its trusted GPG keyring with it.
+    /// Delete a remote repository and its trusted GPG keyring.
     Delete(RemoteDeleteArgs),
     /// List the configured remote names, sorted.
     List(RemoteListArgs),
-    /// Print a remote's URL.
+    /// Print the URL of a remote.
     #[command(name = "show-url")]
     ShowUrl(RemoteNameArgs),
-    /// List the refs a remote publishes in its summary.
+    /// List the refs that a remote publishes in its summary.
     Refs(RemoteRefsArgs),
-    /// Report a remote's summary.
+    /// Report the summary of a remote.
     Summary(RemoteSummaryArgs),
-    /// Import GPG keys into a remote's trusted keyring.
+    /// Import GPG keys into the trusted keyring of a remote.
     #[command(name = "gpg-import")]
     GpgImport(RemoteGpgImportArgs),
-    /// List the GPG keys a remote's trusted keyring holds.
+    /// List the GPG keys in the trusted keyring of a remote.
     #[command(name = "gpg-list-keys")]
     GpgListKeys(RemoteNameArgs),
 }
 
 impl RemoteCommand {
-    /// The name `clap` registered this nested subcommand under, which the error
-    /// paths use to render its usage text.
+    /// Returns the name of this nested subcommand in `clap`. The error paths
+    /// use it to print the usage text of the subcommand.
     fn name(&self) -> &'static str {
         match self {
             RemoteCommand::Add(_) => "add",
@@ -731,79 +730,86 @@ impl RemoteCommand {
 
 #[derive(Args)]
 struct RemoteAddArgs {
-    /// Set this configuration key in the remote's section; repeatable, and
-    /// applied before the options that write a fixed key.
+    /// Set this configuration key in the section of the remote. The option can
+    /// occur more than once, and the command applies it before the options
+    /// that write a fixed key.
     #[arg(long = "set", value_name = "KEY=VALUE")]
     set: Vec<String>,
     /// Do not require a GPG signature on the commits pulled from this remote.
     #[arg(long)]
     no_gpg_verify: bool,
-    /// Do not require a sign-api signature, and do not require a GPG one
-    /// either, which is what the tool writes for this switch.
+    // The `ostree` command writes both keys for this switch.
+    /// Do not require an ed25519 or spki signature, and do not require a GPG
+    /// signature.
     #[arg(long)]
     no_sign_verify: bool,
-    /// Trust this key for one sign-api engine:
+    /// Trust this key for one ed25519 or spki engine:
     /// KEYTYPE=inline:PUBKEY or KEYTYPE=file:PATH.
     #[arg(long, value_name = "KEYTYPE=[inline|file]:PUBKEY")]
     sign_verify: Vec<String>,
-    /// Do nothing when the remote already exists.
+    /// If the remote exists, do nothing.
     #[arg(long)]
     if_not_exists: bool,
-    /// Replace the remote's section when it already exists.
+    /// If the remote exists, replace its section.
     #[arg(long)]
     force: bool,
-    /// Import the keys this keyring file holds into the remote's trusted
-    /// keyring, as `remote gpg-import` does.
+    /// Import the keys of this keyring file into the trusted keyring of the
+    /// remote, as `remote gpg-import` does.
     #[arg(long, value_name = "FILE")]
     gpg_import: Option<PathBuf>,
-    /// Record that this remote's content is fetched by something other than
-    /// this implementation.
+    /// Record that a program other than ostrya fetches the content of this
+    /// remote.
     #[arg(long, value_name = "NAME")]
     custom_backend: Option<String>,
-    /// Fetch content objects from this URL instead of the remote's own.
+    /// Fetch content objects from this URL. Without this option, they come
+    /// from the URL of the remote.
     #[arg(long, value_name = "URL")]
     contenturl: Option<String>,
     /// A globally unique id for the remote as a collection of refs.
     #[arg(long, value_name = "COLLECTION-ID")]
     collection_id: Option<String>,
-    /// The remote name. Required, with the URL; both are checked after the
-    /// repository resolves, matching the tool's error-ordering
-    /// (`docs/conformance/cli-surface.md`, "Global conventions").
+    // ostrya checks this operand and URL after the repository resolves, in
+    // the order of the `ostree` command.
+    /// The remote name. Required, with the URL.
     name: Option<String>,
-    /// The remote's base URL, or `metalink=URL` for a metalink-described one.
+    /// The base URL of the remote, or `metalink=URL` for a remote that a
+    /// metalink describes.
     url: Option<String>,
-    /// The refs a pull of this remote takes when it is asked for none.
+    /// The refs that a pull of this remote takes if the pull names no ref.
     branches: Vec<String>,
 }
 
 #[derive(Args)]
 struct RemoteDeleteArgs {
-    /// Do nothing when the remote does not exist.
+    /// If the remote does not exist, do nothing.
     #[arg(long)]
     if_exists: bool,
-    /// The remote to delete. Required; checked after the repository resolves.
+    // ostrya checks this operand after the repository resolves.
+    /// The remote to delete. Required.
     name: Option<String>,
 }
 
 #[derive(Args)]
 struct RemoteListArgs {
-    /// Print each remote's URL after its name.
+    /// Print the URL of each remote after its name.
     #[arg(short = 'u', long)]
     show_urls: bool,
 }
 
 #[derive(Args)]
 struct RemoteNameArgs {
-    /// The remote to report. Required; checked after the repository resolves.
+    // ostrya checks this operand after the repository resolves.
+    /// The remote to report. Required.
     name: Option<String>,
 }
 
 #[derive(Args)]
 struct RemoteRefsArgs {
-    /// Print each ref's commit checksum after a tab.
+    /// Print the commit checksum of each ref after a tab.
     #[arg(short = 'r', long)]
     revision: bool,
-    /// The remote to list. Required; checked after the repository resolves.
+    // ostrya checks this operand after the repository resolves.
+    /// The remote to list. Required.
     name: Option<String>,
 }
 
@@ -818,52 +824,57 @@ struct RemoteSummaryArgs {
     /// Show the raw variant data.
     #[arg(long)]
     raw: bool,
-    /// The remote to report. Required; checked after the repository resolves.
+    // ostrya checks this operand after the repository resolves.
+    /// The remote to report. Required.
     name: Option<String>,
 }
 
 #[derive(Args)]
 struct RemoteGpgImportArgs {
-    /// Import the keys this keyring file holds; repeatable.
+    /// Import the keys of this keyring file. The option can occur more than
+    /// once.
     #[arg(short = 'k', long = "keyring", value_name = "FILE")]
     keyring: Vec<PathBuf>,
-    /// Import the keys standard input holds.
+    /// Import the keys from standard input.
     #[arg(long)]
     stdin: bool,
-    /// The remote to import into. Required; checked after the repository
-    /// resolves.
+    // ostrya checks this operand after the repository resolves.
+    /// The remote to import into. Required.
     name: Option<String>,
-    /// The keys to import, named the way `gpg` names one; with none, every key
-    /// the source holds.
+    /// The keys to import, in a key name form that `gpg` accepts. With none,
+    /// the command imports every key of the source.
     key_ids: Vec<String>,
 }
 
 #[derive(Args)]
 struct PruneArgs {
-    /// Keep only objects reachable from refs; also prune unreferenced commits.
+    /// Keep only the objects that the refs reach. Also prune unreferenced
+    /// commits.
     #[arg(long)]
     refs_only: bool,
-    /// Parents of each ref to keep: -1 for all history, 0 for only the head.
+    /// The number of parents of each ref to keep: -1 for all history, 0 for
+    /// only the head.
     #[arg(long, default_value_t = -1, allow_negative_numbers = true, overrides_with = "depth")]
     depth: i32,
-    /// Compute and print the statistics without deleting anything.
+    /// Compute and print the statistics, and delete nothing.
     #[arg(long)]
     no_prune: bool,
-    /// Delete this specific, unreferenced commit before sweeping.
+    /// Delete this specific, unreferenced commit before the sweep.
     #[arg(long)]
     delete_commit: Option<String>,
     /// Keep no commit older than DATE: `@SECONDS` since the Unix epoch, or a
-    /// date and time carrying a UTC offset.
+    /// date and time with a UTC offset.
     #[arg(long, value_name = "DATE", overrides_with = "keep_younger_than")]
     keep_younger_than: Option<String>,
-    /// Delete the static deltas the named commit targets and nothing else.
-    /// Requires --delete-commit.
+    /// Delete the static deltas that the named commit targets, and nothing
+    /// else. This switch requires --delete-commit.
     #[arg(long)]
     static_deltas_only: bool,
-    /// Retain DEPTH parents of BRANCH, in place of --depth for that branch.
+    /// Retain DEPTH parents of BRANCH. For that branch, this value replaces
+    /// --depth.
     #[arg(long, value_name = "BRANCH=DEPTH")]
     retain_branch_depth: Vec<String>,
-    /// Prune BRANCH alone; every other branch keeps its whole ancestry.
+    /// Prune BRANCH alone. Every other branch keeps its whole ancestry.
     #[arg(long, value_name = "BRANCH")]
     only_branch: Vec<String>,
     /// Delete commit objects alone.
@@ -873,20 +884,19 @@ struct PruneArgs {
 
 #[derive(Args)]
 struct FsckArgs {
-    /// Do not mark commits partial when a referenced object is missing.
+    /// If a referenced object is missing, do not mark the commit partial.
     #[arg(long)]
     no_mark_partial: bool,
     /// Add tombstones for missing commits.
     #[arg(long)]
     add_tombstones: bool,
-    /// Only print error messages.
+    /// Print only error messages.
     #[arg(short, long)]
     quiet: bool,
-    // The port's walk runs to its end whatever the switches carry, so the
-    // option selects one thing: whether `--add-tombstones` may act on a walk
-    // that found a corrupt object
-    // (`docs/conformance/cli-surface.md`, "fsck").
-    /// Don't stop on first error.
+    // The fsck walk of ostrya always runs to its end, with all switches. This
+    // option selects one thing only: if `--add-tombstones` can act on a walk
+    // that found a corrupt object.
+    /// Do not stop on the first error.
     #[arg(short, long)]
     all: bool,
     /// Remove corrupted objects.
@@ -902,16 +912,16 @@ struct FsckArgs {
 
 #[derive(Args)]
 struct DiffArgs {
-    /// Print various statistics.
+    /// Print the object counts and the size of the common objects.
     #[arg(long)]
     stats: bool,
-    /// Print filesystem diff.
+    /// Print the file system diff.
     #[arg(long)]
     fs_diff: bool,
     /// Skip output of extended attributes.
     #[arg(long)]
     no_xattrs: bool,
-    /// Use file ownership user id for local files.
+    /// Use this user id as the owner of local files.
     #[arg(
         long,
         value_name = "UID",
@@ -919,7 +929,7 @@ struct DiffArgs {
         overrides_with = "owner_uid"
     )]
     owner_uid: Option<String>,
-    /// Use file ownership group id for local files.
+    /// Use this group id as the owner group of local files.
     #[arg(
         long,
         value_name = "GID",
@@ -927,22 +937,22 @@ struct DiffArgs {
         overrides_with = "owner_gid"
     )]
     owner_gid: Option<String>,
-    /// The first revision or directory. With no second argument, this argument
-    /// with `^` appended is compared against it. Required; checked after the
-    /// repository resolves, matching the tool's error-ordering
-    /// (`docs/conformance/cli-surface.md`, "Global conventions").
+    // ostrya checks this operand after the repository resolves, in the order
+    // of the `ostree` command.
+    /// The first revision or directory. If there is no second argument, the
+    /// command compares FROM with `^` appended against FROM. Required.
     from: Option<String>,
     /// The second revision or directory.
     to: Option<String>,
 }
 
-/// The signature engine selected by `--sign-type`.
+/// The signature engine that `--sign-type` selects.
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum SignType {
     /// ed25519 detached signatures (the sign-api default).
     #[value(name = "ed25519")]
     Ed25519,
-    /// spki: ECDSA over NIST P-256 with SHA-256.
+    /// ECDSA over NIST P-256 with SHA-256.
     #[value(name = "spki")]
     Spki,
     /// GPG (OpenPGP) detached signatures.
@@ -952,61 +962,62 @@ enum SignType {
 
 #[derive(Args)]
 struct SignArgs {
-    /// Delete stored signatures matching the given KEY-IDs.
+    /// Delete the stored signatures that match the given KEY-IDs.
     #[arg(short, long, conflicts_with = "verify")]
     delete: bool,
-    /// Verify the commit's signatures instead of adding one.
+    /// Verify the signatures of the commit, and add no signature.
     #[arg(long)]
     verify: bool,
     /// The signature engine to use.
     #[arg(short = 's', long = "sign-type", default_value = "ed25519")]
     sign_type: SignType,
-    /// Read key(s) from a file. For ed25519/spki: base64 secret keys
-    /// (signing) or public keys (verify and delete), one per line. Signing and
-    /// delete read every file. For ed25519/spki verify, the last value wins,
-    /// and with it or a KEY-ID --keys-dir and the system key directories are
-    /// not read. For gpg: a keyring, binary or armored (verify and delete),
-    /// every file read.
+    /// Read keys from a file. For ed25519 and spki, the file has base64 keys,
+    /// one per line: secret keys to sign, public keys to verify and delete.
+    /// Signing and delete read every file. For an ed25519 or spki verify, the
+    /// last value wins. With this option or a KEY-ID, that verify does not
+    /// read --keys-dir or the system key directories. For gpg, the file is a
+    /// binary or armored keyring (verify and delete), and every file is read.
     #[arg(long, value_name = "PATH")]
     keys_file: Vec<std::ffi::OsString>,
-    /// Read `trusted.<type>` and `revoked.<type>` from this directory in place
-    /// of the system key directories, for ed25519/spki verify. Given more than
-    /// once, the last value wins. An empty value names the working directory.
-    /// Not used by the gpg engine.
+    /// For an ed25519 or spki verify, read `trusted.<type>` and
+    /// `revoked.<type>` from this directory. The verify then does not read the
+    /// system key directories. If the option occurs more than once, the last
+    /// value wins. An empty value names the working directory. The gpg engine
+    /// does not use this option.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
     keys_dir: Option<std::ffi::OsString>,
-    /// The GnuPG home directory gpg resolves signing keys in (default: gpg's
-    /// own resolution). Only for the gpg engine.
+    /// The GnuPG home directory where gpg resolves signing keys. Without this
+    /// option, gpg uses its own resolution. Only the gpg engine reads it.
     #[arg(long)]
     gpg_homedir: Option<PathBuf>,
-    /// The remote whose trusted keyring to add for gpg verify and delete:
-    /// `<remote>.trustedkeys.gpg` in the repo and under
-    /// `/etc/ostree/remotes.d/`, on top of the global trusted set. Only for
-    /// the gpg engine.
+    /// The remote with the trusted keyring to add for a gpg verify and delete.
+    /// The keyring is `<remote>.trustedkeys.gpg` in the repo and under
+    /// `/etc/ostree/remotes.d/`, in addition to the global trusted set. Only
+    /// the gpg engine reads it.
     #[arg(long)]
     remote: Option<String>,
-    /// The commit to operate on (a checksum or a ref). Required; checked
-    /// after the repository resolves, matching the tool's error-ordering
-    /// (`docs/conformance/cli-surface.md`, "Global conventions").
+    // ostrya checks this operand after the repository resolves, in the order
+    // of the `ostree` command.
+    /// The commit to operate on (a checksum or a ref). Required.
     commit: Option<String>,
-    /// Key identifiers: base64 keys for ed25519/spki. For gpg: the signing
-    /// key gpg resolves (a fingerprint, key id, or user id), or, with
-    /// --delete, the fingerprints to remove.
+    /// Key identifiers. For ed25519 and spki, these are base64 keys. For gpg,
+    /// this is the signing key that gpg resolves (a fingerprint, key id, or
+    /// user id), or with --delete the fingerprints to remove.
     key_id: Vec<String>,
 }
 
 #[derive(Args)]
 struct SummaryArgs {
-    /// Regenerate the summary from the repository's refs.
+    /// Regenerate the summary from the refs of the repository.
     #[arg(short = 'u', long)]
     update: bool,
     /// View the local summary file.
     #[arg(short = 'v', long)]
     view: bool,
     /// Print debug information during command processing.
-    // The subcommand declares the switch itself so that `-v` stays bound to
-    // `--view` here. `clap` carries the value up to the global flag, which is
-    // the one every handler reads, so this field itself is never read.
+    // This subcommand declares the switch, so that `-v` stays bound to
+    // `--view`. `clap` carries the value up to the global flag, and every
+    // handler reads that flag. No code reads this field.
     #[arg(long)]
     #[allow(dead_code)]
     verbose: bool,
@@ -1019,24 +1030,26 @@ struct SummaryArgs {
     /// Print the value of one metadata key.
     #[arg(long, value_name = "KEY")]
     print_metadata_key: Option<String>,
-    /// Additional metadata field to add, as KEY=VALUE with the value in the
-    /// GVariant text form. Repeatable. Read with -u alone.
+    /// Add a metadata field, as KEY=VALUE with the value in the GVariant text
+    /// form. The option can occur more than once. Only -u reads it.
     #[arg(short = 'm', long = "add-metadata", value_name = "KEY=VALUE")]
     add_metadata: Vec<String>,
-    /// Sign the summary with this key: for ed25519 and spki, the base64 of the
-    /// secret key. Repeatable, and each occurrence adds one signature. Read
-    /// with -u alone.
+    /// Sign the summary with this key. For ed25519 and spki, the key is the
+    /// base64 of the secret key. Each occurrence adds one signature. Only -u
+    /// reads it.
     #[arg(long, value_name = "KEY-ID")]
     sign: Vec<String>,
-    /// Sign the summary with the GPG key this selector names. Repeatable, and
-    /// each occurrence adds one signature. Read with -u alone.
+    /// Sign the summary with the GPG key that this selector names. Each
+    /// occurrence adds one signature. Only -u reads it.
     #[arg(long, value_name = "KEY-ID")]
     gpg_sign: Vec<String>,
-    /// Verify the summary's signatures instead of regenerating or signing.
+    /// Verify the signatures of the summary. The command then does not
+    /// regenerate or sign the summary.
     #[arg(long)]
     verify: bool,
-    /// The signature engine to use for --verify, --sign, and the positional
-    /// keys (defaults to 'ed25519'). Given more than once, the last value wins.
+    /// The signature engine for --verify, --sign, and the positional keys. The
+    /// default is 'ed25519'. If the option occurs more than once, the last
+    /// value wins.
     #[arg(
         short = 's',
         long = "sign-type",
@@ -1045,213 +1058,226 @@ struct SummaryArgs {
     )]
     sign_type: Option<String>,
     /// Override `ostree.summary.last-modified` (seconds since the Unix epoch)
-    /// for reproducible output; defaults to the current time.
+    /// for reproducible output. The default is the current time.
     #[arg(long)]
     last_modified: Option<u64>,
     /// The timestamp of the collection anchor commit (seconds since the Unix
-    /// epoch); defaults to SOURCE_DATE_EPOCH or the current time. Only used for
-    /// a collection repository.
+    /// epoch). The default is SOURCE_DATE_EPOCH or the current time. Only a
+    /// collection repository uses it.
     #[arg(long)]
     metadata_commit_timestamp: Option<u64>,
-    /// Read key(s) from a file, same format as `ostrya sign`. For ed25519/spki
-    /// verify, the last value wins, and with it or a KEY-ID --keys-dir and the
-    /// system key directories are not read. For signing and for gpg, every
-    /// file is read.
+    /// Read keys from a file, in the format of `ostrya sign`. For an ed25519
+    /// or spki verify, the last value wins. With this option or a KEY-ID,
+    /// that verify does not read --keys-dir or the system key directories.
+    /// Signing and gpg read every file.
     #[arg(long, value_name = "PATH")]
     keys_file: Vec<std::ffi::OsString>,
-    /// Read `trusted.<type>` and `revoked.<type>` from this directory in place
-    /// of the system key directories, for ed25519/spki verify. Given more than
-    /// once, the last value wins. An empty value names the working directory.
-    /// Refused by gpg verify.
+    /// For an ed25519 or spki verify, read `trusted.<type>` and
+    /// `revoked.<type>` from this directory. The verify then does not read the
+    /// system key directories. If the option occurs more than once, the last
+    /// value wins. An empty value names the working directory. A gpg verify
+    /// refuses this option.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
     keys_dir: Option<std::ffi::OsString>,
-    /// The GnuPG home directory gpg resolves signing keys in. Only for gpg.
+    /// The GnuPG home directory where gpg resolves signing keys. Only the gpg
+    /// engine reads it.
     #[arg(long)]
     gpg_homedir: Option<PathBuf>,
-    /// The remote whose trusted gpg keyring to add for verification. Only for
-    /// the gpg engine.
+    /// The remote with the trusted gpg keyring to add for verification. Only
+    /// the gpg engine reads it.
     #[arg(long)]
     remote: Option<String>,
-    /// Signing or verification key identifiers, same format as `ostrya sign`.
-    /// A port extension: with -u the keys sign after every --sign key, and
-    /// without it they sign the summary that stands.
+    /// Signing or verification key identifiers, in the format of
+    /// `ostrya sign`. This is an ostrya extension. With -u, the keys sign
+    /// after every --sign key. Without -u, they sign the existing summary.
     key_id: Vec<String>,
 }
 
 #[derive(Args)]
 struct StaticDeltaArgs {
-    /// Optional at the argument-parsing layer so a missing one is reported
-    /// with the tool's own text, before the repository resolves, matching the
-    /// tool's error-ordering (`docs/conformance/cli-surface.md`, "Global
-    /// conventions").
+    // The subcommand is optional for `clap`, so that ostrya reports a missing
+    // subcommand with the text of the `ostree` command. The report comes
+    // before the repository resolves, in the order of the `ostree` command.
+    /// The `static-delta` subcommand to run.
     #[command(subcommand)]
     command: Option<StaticDeltaCommand>,
 }
 
 #[derive(Args)]
 struct DeltaReindexArgs {
-    /// Only rewrite, or remove, the index of target REV, a full lowercase
-    /// commit checksum. The other index files stay as they are. Given more
-    /// than once, the last value wins.
+    /// Rewrite or remove only the index of the target REV, a full lowercase
+    /// commit checksum. The other index files do not change. If the option
+    /// occurs more than once, the last value wins.
     #[arg(long, value_name = "REV", overrides_with = "to")]
     to: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum StaticDeltaCommand {
-    /// List the repository's static deltas.
+    /// List the static deltas of the repository.
     List,
-    /// Apply a static delta offline from a superblock file or a directory that
-    /// holds `superblock`, producing the target commit's objects. Prints
-    /// nothing and writes no ref. With a key source, the signatures of a
-    /// signed delta are checked before any object is written; an unsigned
-    /// delta is applied with no check.
+    /// Apply a static delta offline and write the objects of its target commit.
+    /// The source is a superblock file or a directory that holds `superblock`.
+    /// The command prints nothing and writes no ref. With a key source, the
+    /// command verifies a signed delta before it writes an object, and applies
+    /// an unsigned delta with no check.
     ApplyOffline(DeltaApplyArgs),
     /// Generate a static delta and print what it is generated from and to.
     Generate(DeltaGenerateArgs),
-    /// Rebuild the `delta-indexes/` cache from the deltas present, or with
-    /// `--to` the index of one target alone.
+    /// Rebuild the `delta-indexes/` cache from the existing deltas. With
+    /// `--to`, rebuild the index of one target alone.
     Reindex(DeltaReindexArgs),
-    /// Print a delta's superblock fields and what each of its parts holds.
+    /// Print the superblock fields of a delta and what each part holds.
     Show {
-        /// A delta name, `TO` or `FROM-TO` in full lowercase hex, or the path
-        /// of a superblock file: any argument holding a `/`. The parts of a
-        /// superblock named by path are read from the directory that holds it.
+        /// A delta name (`TO` or `FROM-TO` in full lowercase hex), or the path
+        /// of a superblock file. An argument with a `/` is a path. For a path,
+        /// the command reads the parts from the directory of the superblock.
         delta: Option<String>,
     },
     /// Remove a static delta: the entry at its path under `deltas/` and
-    /// everything in it. The `delta-indexes/` cache and `summary` stay as they
-    /// are.
+    /// everything in it. The `delta-indexes/` cache and `summary` do not
+    /// change.
     Delete {
-        /// A delta name, `TO` or `FROM-TO` in full lowercase hex. A path is
-        /// read as a name and refused.
+        /// A delta name, `TO` or `FROM-TO` in full lowercase hex. The command
+        /// reads a path as a name and refuses it.
         delta: Option<String>,
     },
-    /// List the target commits the `delta-indexes/` cache holds an index for.
+    /// List the target commits that the `delta-indexes/` cache has an index
+    /// for.
     Indexes,
-    /// Verify the signatures of a static delta's superblock and print
+    /// Verify the superblock signatures of a static delta. Print
     /// `Verification OK` or `Verification fails`.
     Verify(DeltaVerifyArgs),
 }
 
 #[derive(Args)]
 struct DeltaVerifyArgs {
-    /// The signature engine (defaults to 'ed25519'). Given more than once, the
-    /// last value wins.
+    /// The signature engine. The default is 'ed25519'. If the option occurs
+    /// more than once, the last value wins.
     #[arg(long = "sign-type", value_name = "NAME", overrides_with = "sign_type")]
     sign_type: Option<String>,
-    /// Read public keys from a file, one base64 key per line. Given more than
-    /// once, the last value wins. With this option or a KEY-ID, --keys-dir and
-    /// the system key directories are not read. An empty value is taken as
-    /// given and refused as no regular file.
+    /// Read public keys from a file, one base64 key per line. If the option
+    /// occurs more than once, the last value wins. With this option or a
+    /// KEY-ID, the command does not read --keys-dir or the system key
+    /// directories. The command takes an empty value as given, and refuses it
+    /// because it is not a regular file.
     #[arg(long, value_name = "PATH", overrides_with = "keys_file")]
     keys_file: Option<std::ffi::OsString>,
-    /// Read `trusted.<type>` and `revoked.<type>` from this directory in place
-    /// of the system key directories. Given more than once, the last value
-    /// wins. An empty value names the working directory.
+    /// Read `trusted.<type>` and `revoked.<type>` from this directory. The
+    /// command then does not read the system key directories. If the option
+    /// occurs more than once, the last value wins. An empty value names the
+    /// working directory.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
     keys_dir: Option<std::ffi::OsString>,
-    /// A delta name, `TO` or `FROM-TO` in full lowercase hex, or the path of a
-    /// superblock file: any argument holding a `/`. Only the superblock is
-    /// read. Required; checked after the repository resolves.
+    // ostrya checks this operand after the repository resolves.
+    /// A delta name (`TO` or `FROM-TO` in full lowercase hex), or the path of
+    /// a superblock file. An argument with a `/` is a path. The command reads
+    /// only the superblock. Required.
     delta: Option<String>,
-    /// base64 public keys.
+    /// Public keys in base64.
     key_id: Vec<String>,
 }
 
 #[derive(Args)]
 struct DeltaApplyArgs {
-    /// The signature engine (defaults to 'ed25519'), read also with no key
-    /// source. Given more than once, the last value wins.
+    /// The signature engine. The default is 'ed25519'. The command reads this
+    /// option also with no key source. If the option occurs more than once,
+    /// the last value wins.
     #[arg(long = "sign-type", value_name = "NAME", overrides_with = "sign_type")]
     sign_type: Option<String>,
-    /// Read public keys from a file, one base64 key per line. Given more than
-    /// once, the last value wins. With this option or a KEY-ID, --keys-dir is
-    /// not read.
+    /// Read public keys from a file, one base64 key per line. If the option
+    /// occurs more than once, the last value wins. With this option or a
+    /// KEY-ID, the command does not read --keys-dir.
     #[arg(long, value_name = "PATH", overrides_with = "keys_file")]
     keys_file: Option<std::ffi::OsString>,
-    /// Read `trusted.<type>` and `revoked.<type>` from this directory. Given
-    /// more than once, the last value wins. An empty value names the working
-    /// directory.
+    /// Read `trusted.<type>` and `revoked.<type>` from this directory. If the
+    /// option occurs more than once, the last value wins. An empty value names
+    /// the working directory.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
     keys_dir: Option<std::ffi::OsString>,
-    /// A superblock file under any name, whose parts are read from the
-    /// directory that holds it, or a directory that holds `superblock` and the
-    /// parts. Required; checked after the repository resolves.
+    // ostrya checks this operand after the repository resolves.
+    /// A superblock file with any name, or a directory that holds `superblock`
+    /// and the parts. For a file, the command reads the parts from the
+    /// directory of the file. Required.
     path: Option<PathBuf>,
-    /// base64 public keys.
+    /// Public keys in base64.
     key_id: Vec<String>,
 }
 
 #[derive(Args)]
 struct DeltaGenerateArgs {
     /// Create the delta from revision REV. With neither --from nor --empty,
-    /// the parent of TO.
+    /// the source is the parent of TO.
     #[arg(long, value_name = "REV")]
     from: Option<String>,
     /// Create the delta from scratch.
     #[arg(long)]
     empty: bool,
-    /// Create the delta to revision REV. Wins over the positional TO.
+    /// Create the delta to revision REV. This option wins over the positional
+    /// TO.
     #[arg(long, value_name = "REV")]
     to: Option<String>,
-    /// The target revision, where --to is not given.
+    /// The target revision, if --to is absent.
     #[arg(value_name = "TO")]
     to_positional: Option<String>,
-    /// Only generate where the repository holds no superblock for the delta.
+    /// Generate only if the repository has no superblock for the delta.
     #[arg(short = 'n', long)]
     if_not_exists: bool,
     /// Write the superblock to PATH and the part files to the directory that
-    /// holds it. The directory is not created.
+    /// holds it. The command does not create the directory.
     #[arg(long, value_name = "PATH", conflicts_with = "output_dir")]
     filename: Option<PathBuf>,
-    /// Deliver an object whose stream reaches this many decimal megabytes as a
-    /// loose fallback instead of packing it into a part.
+    /// If the stream of an object reaches this many decimal megabytes,
+    /// deliver the object as a loose fallback outside the parts.
     #[arg(long, value_name = "MB", default_value = "4", value_parser = parse_megabytes)]
     min_fallback_size: u64,
-    /// The largest content size, in decimal megabytes, a bspatch stream is
-    /// attempted for.
+    /// The largest content size, in decimal megabytes, for which the command
+    /// tries a bspatch stream.
     #[arg(long, value_name = "MB", default_value = "64", value_parser = parse_megabytes)]
     max_bsdiff_size: u64,
-    /// Close a part once its payload would pass this many decimal megabytes.
+    /// Close a part before its payload passes this many decimal megabytes.
     #[arg(long, value_name = "MB", default_value = "32", value_parser = parse_megabytes)]
     max_chunk_size: u64,
-    /// Never emit bspatch streams; splice what chunking cannot express.
+    /// Emit no bspatch stream. Splice the content that chunking cannot
+    /// express.
     #[arg(long)]
     disable_bsdiff: bool,
     /// Pin the superblock timestamp (seconds since the Unix epoch) for
-    /// reproducible output; defaults to the current time.
+    /// reproducible output. The default is the current time.
     #[arg(long)]
     timestamp: Option<u64>,
-    /// Write the delta's files here instead of into the repository's `deltas/`.
-    /// The directory's other contents are left alone, so part files of a longer
-    /// delta written here before stay behind.
+    /// Write the files of the delta to this directory. Without this option,
+    /// they go to `deltas/` of the repository. The other content of the
+    /// directory does not change, so part files of an earlier, longer delta
+    /// stay.
     #[arg(long)]
     output_dir: Option<PathBuf>,
-    /// Sign the generated delta with this key; repeatable. A base64 secret key
-    /// for ed25519 and spki, a KEY-ID for gpg, as `ostrya sign` takes them.
+    /// Sign the generated delta with this key. The option can occur more than
+    /// once. The key is a base64 secret key for ed25519 and spki, and a KEY-ID
+    /// for gpg, as for `ostrya sign`.
     #[arg(long = "sign")]
     sign: Vec<String>,
-    /// The signature engine used for --sign.
+    /// The signature engine for --sign.
     #[arg(short = 's', long = "sign-type", default_value = "ed25519")]
     sign_type: SignType,
-    /// Read signing key(s) from a file; repeatable, same format as
-    /// `ostrya sign`.
+    /// Read signing keys from a file, in the format of `ostrya sign`. The
+    /// option can occur more than once.
     #[arg(long)]
     keys_file: Vec<PathBuf>,
-    /// The GnuPG home directory gpg resolves signing keys in. Only for gpg.
+    /// The GnuPG home directory where gpg resolves signing keys. Only the gpg
+    /// engine reads it.
     #[arg(long)]
     gpg_homedir: Option<PathBuf>,
-    /// Rebuild the index cache after generating. Covers the deltas under the
-    /// repository's `deltas/` tree, so it cannot be combined with --output-dir
-    /// or --filename.
+    /// Rebuild the index cache after the delta is generated. The rebuild
+    /// covers the deltas under the `deltas/` tree of the repository, so this
+    /// switch cannot be used with --output-dir or --filename.
     #[arg(long)]
     reindex: bool,
     /// Carry the parts in the superblock and write no part file.
     #[arg(long)]
     inline: bool,
-    /// The byte order of the superblock size fields, 'l' or 'B'. Given more
-    /// than once, the last value wins.
+    /// The byte order of the superblock size fields, 'l' or 'B'. If the
+    /// option occurs more than once, the last value wins.
     #[arg(
         long = "set-endianness",
         value_name = "ENDIAN",
@@ -1265,143 +1291,155 @@ struct DeltaGenerateArgs {
 
 #[derive(Args)]
 struct PullArgs {
-    /// Fetch from this address instead of the remote's configured `pull-url`
-    /// or `url`: an HTTP URL, or an ssh address. A remote the config does not
-    /// describe can be pulled from this way; it supplies no keys, so such a
-    /// pull states its own signature policy or is refused.
+    /// Fetch from this address, an HTTP URL or an ssh address. It replaces
+    /// the configured `pull-url` or `url` of the remote. With it, a pull can
+    /// use a remote that the config does not describe. Such a remote supplies
+    /// no keys, so the pull must state its own signature policy, or the
+    /// command refuses it.
     #[arg(long)]
     url: Option<String>,
-    /// Write the pulled refs as local refs, take every ref the remote's summary
-    /// lists when none are named, and copy the remote's summary here.
+    /// Write the pulled refs as local refs, and copy the summary of the remote
+    /// to this repository. If no ref is named, pull every ref that the summary
+    /// of the remote lists.
     #[arg(long)]
     mirror: bool,
-    /// Parents of each pulled commit to follow: 0 for the commit alone, -1 for
-    /// the whole ancestry the remote holds. A value below -1 is refused.
+    /// The number of parents of each pulled commit to follow: 0 for the commit
+    /// alone, -1 for the whole ancestry on the remote. The command refuses a
+    /// value less than -1.
     #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
     depth: i32,
-    /// Fetch only the commit objects, leaving each commit marked partial.
+    /// Fetch only the commit objects, and mark each commit partial.
     #[arg(long)]
     commit_metadata_only: bool,
-    /// Fetch only the part of each commit's tree under this absolute path,
-    /// leaving each commit marked partial; repeatable, taking the union.
+    /// Fetch only the part of the tree of each commit under this absolute
+    /// path, and mark each commit partial. The option can occur more than
+    /// once, and the pull takes the union.
     #[arg(long = "subpath", value_name = "PATH")]
     subpath: Vec<String>,
-    /// Verify the checksum of every object. An HTTP pull does that either way,
-    /// so the switch changes nothing.
+    /// Verify the checksum of every object. An HTTP pull always does this, so
+    /// this switch changes nothing.
     #[arg(long)]
     untrusted: bool,
-    /// Accepted for the tool's command line. Every fetched object's checksum
-    /// is verified all the same, so a corrupt object fails the pull.
+    /// Accepted for the command line of the `ostree` command. The pull still
+    /// verifies the checksum of every fetched object, so a corrupt object
+    /// fails the pull.
     #[arg(long)]
     http_trusted: bool,
-    /// Reject regular files whose mode has bits outside 0775.
+    /// Reject regular files with mode bits outside 0775.
     #[arg(long)]
     bareuseronly_files: bool,
-    /// Do not check that a pulled commit's ostree.ref-binding names the ref it
-    /// is pulled under.
+    /// Do not check that the ostree.ref-binding of a pulled commit names the
+    /// ref that it is pulled under.
     #[arg(long)]
     disable_verify_bindings: bool,
-    /// Copy each object a localcache repository supplies instead of
-    /// hardlinking it.
+    /// Copy each object that a localcache repository supplies, and make no
+    /// hardlink.
     #[arg(long)]
     force_copy: bool,
-    /// Consult this repository for an object before the network; repeatable.
+    /// Look in this repository for an object before the network. The option
+    /// can occur more than once.
     #[arg(short = 'L', long = "localcache-repo")]
     localcache_repo: Vec<PathBuf>,
-    /// Do not sync anything this pull writes. Changes no byte the pull writes.
+    /// Do not sync anything that this pull writes. This switch changes no byte
+    /// that the pull writes.
     #[arg(long)]
     disable_fsync: bool,
-    /// Sync the file of each content object as it is staged. Metadata objects
-    /// are not synced on their own. --disable-fsync and `[core] fsync=false`
-    /// win over it.
+    /// Sync the file of each content object when it is staged. The pull does
+    /// not sync metadata objects one by one. --disable-fsync and
+    /// `[core] fsync=false` win over this switch.
     #[arg(long)]
     per_object_fsync: bool,
-    /// Send NAME=VALUE as an HTTP header with every request; repeatable.
+    /// Send NAME=VALUE as an HTTP header with every request. The option can
+    /// occur more than once.
     #[arg(long = "http-header", value_name = "NAME=VALUE", value_parser = parse_http_header)]
     http_header: Vec<(String, String)>,
-    /// How many fetches to keep in flight (default: 8).
+    /// The number of fetches to keep in flight (default: 8).
     #[arg(long, value_name = "N")]
     max_outstanding_fetcher_requests: Option<usize>,
-    /// How many times to repeat a round of mirrors after a retryable failure
-    /// (default: 5). A body that fails in transit is fetched again from the
-    /// start, and each refetch spends one repeat.
+    /// The number of times to repeat a round of mirrors after a retryable
+    /// failure (default: 5). If a body fails in transit, the pull fetches it
+    /// again from the start. Each refetch uses one repeat.
     #[arg(long, value_name = "N")]
     network_retries: Option<u32>,
-    /// Retry nothing, whatever --network-retries says.
+    /// Retry nothing, whatever the value of --network-retries.
     #[arg(long)]
     disable_retry_on_network_errors: bool,
-    /// Abandon a transfer whose rate stays below N bytes per second for
-    /// --low-speed-time-seconds (default: 1000). The rate is sampled once a
-    /// second over the last five seconds. 0 turns the check off, and a
+    /// Abandon a transfer if its rate stays less than N bytes per second for
+    /// --low-speed-time-seconds (default: 1000). The pull samples the rate
+    /// once a second over the last five seconds. 0 turns the check off, and a
     /// negative value keeps the default.
     #[arg(long, value_name = "N", allow_hyphen_values = true)]
     low_speed_limit_bytes: Option<String>,
-    /// How many seconds the rate may stay below --low-speed-limit-bytes
-    /// (default: 30). 0 turns the check off, and a negative value keeps the
-    /// default.
+    /// The number of seconds that the rate can stay less than
+    /// --low-speed-limit-bytes (default: 30). 0 turns the check off, and a
+    /// negative value keeps the default.
     #[arg(long, value_name = "N", allow_hyphen_values = true)]
     low_speed_time_seconds: Option<String>,
-    /// How often the progress line on a terminal is redrawn, in milliseconds
-    /// (default: 1000). 0 and a negative value keep the default. Output to
-    /// anything other than a terminal carries no progress line.
+    /// The interval between two redraws of the progress line on a terminal,
+    /// in milliseconds (default: 1000). 0 and a negative value keep the
+    /// default. If the output is not a terminal, the pull prints no progress
+    /// line.
     #[arg(long, value_name = "FREQUENCY", allow_hyphen_values = true)]
     update_frequency: Option<String>,
-    /// Require each fetched tip to be no older than the commit its ref names in
-    /// this repository.
+    /// Require each fetched tip to be no older than the commit that its ref
+    /// names in this repository.
     #[arg(short = 'T', long)]
     timestamp_check: bool,
-    /// Require each fetched tip to be no older than this commit, which this
-    /// repository must hold.
+    /// Require each fetched tip to be no older than this commit. This
+    /// repository must have the commit.
     #[arg(long, value_name = "REV", conflicts_with = "timestamp_check")]
     timestamp_check_from_rev: Option<String>,
-    /// Fetch every object loose, ignoring any static delta the remote
+    /// Fetch every object loose, and ignore all static deltas that the remote
     /// advertises.
     #[arg(long)]
     disable_static_deltas: bool,
-    /// Refuse the pull when the remote serves no summary, or advertises no
-    /// static delta that produces a commit this repository does not hold.
+    /// Refuse the pull if the remote serves no summary, or advertises no
+    /// static delta that produces a commit that this repository does not have.
     #[arg(long, conflicts_with = "disable_static_deltas")]
     require_static_deltas: bool,
-    /// Require a GPG signature on every commit the pull carries. Absent, the
-    /// remote's `gpg-verify` applies (default true); `--gpg-verify` requires
-    /// one; `--gpg-verify=false` requires none.
+    /// Require a GPG signature on every commit that the pull carries. Without
+    /// this option, the `gpg-verify` key of the remote applies (default true).
+    /// `--gpg-verify` requires a signature, and `--gpg-verify=false` requires
+    /// none.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     gpg_verify: Option<bool>,
-    /// Require a GPG signature on the remote's summary. Absent, the remote's
-    /// `gpg-verify-summary` applies (default false); `--gpg-verify-summary`
-    /// requires one; `--gpg-verify-summary=false` requires none.
+    /// Require a GPG signature on the summary of the remote. Without this
+    /// option, the `gpg-verify-summary` key of the remote applies (default
+    /// false). `--gpg-verify-summary` requires a signature, and
+    /// `--gpg-verify-summary=false` requires none.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     gpg_verify_summary: Option<bool>,
-    /// Require a sign-api signature on every commit the pull carries. Absent,
-    /// the remote's `sign-verify` applies (default off); `--sign-verify`
-    /// requires one, selecting every engine this build has;
-    /// `--sign-verify=false` requires none.
+    /// Require an ed25519 or spki signature on every commit that the pull
+    /// carries. Without this option, the `sign-verify` key of the remote
+    /// applies (default off). `--sign-verify` requires a signature and selects
+    /// every engine of this build. `--sign-verify=false` requires none.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     sign_verify: Option<bool>,
-    /// Require a sign-api signature on the remote's summary. Absent, the
-    /// remote's `sign-verify-summary` applies (default off);
-    /// `--sign-verify-summary` requires one; `--sign-verify-summary=false`
-    /// requires none.
+    /// Require an ed25519 or spki signature on the summary of the remote.
+    /// Without this option, the `sign-verify-summary` key of the remote
+    /// applies (default off). `--sign-verify-summary` requires a signature,
+    /// and `--sign-verify-summary=false` requires none.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     sign_verify_summary: Option<bool>,
-    /// The remote to pull from: a `[remote "<name>"]` section of this
-    /// repository's config, which also names the prefix the refs are written
-    /// under. Required; checked after the repository resolves, matching the
-    /// tool's error-ordering (`docs/conformance/cli-surface.md`, "Global
-    /// conventions").
+    // ostrya checks this operand after the repository resolves, in the order
+    // of the `ostree` command.
+    /// The remote to pull from: a `[remote "<name>"]` section of the config of
+    /// this repository. The remote name is also the prefix of the written
+    /// refs. Required.
     remote: Option<String>,
-    /// The refs to pull; with none, the remote's configured `branches`, or
-    /// every ref its summary lists under --mirror.
+    /// The refs to pull. With none, the pull takes the configured `branches`
+    /// of the remote, or with --mirror every ref that its summary lists.
     refs: Vec<String>,
 }
 
 #[cfg(feature = "receive")]
 #[derive(Args)]
 struct ReceiveArgs {
-    /// Read the receive, trust, and key groups, and the remotes they name,
-    /// from FILE alone, in place of those of the repository config. `[core]
-    /// auto-update-summary` and `[ex-ostrya] detached-metadata-exclude` still
-    /// come from the repository config.
+    /// Read the receive, trust, and key groups, and the remotes that they
+    /// name, from FILE alone. The command then ignores these groups in the
+    /// repository config. `[core] auto-update-summary` and
+    /// `[ex-ostrya] detached-metadata-exclude` still come from the repository
+    /// config.
     #[arg(long, value_name = "FILE")]
     policy: Option<PathBuf>,
 }
@@ -1410,8 +1448,8 @@ struct ReceiveArgs {
 #[derive(Args)]
 struct ServeArgs {
     /// Listen on ADDR:PORT, an IP address and a port. Give the option once
-    /// for each address. Port 0 lets the kernel choose a port. The default is
-    /// 127.0.0.1:8080. The command writes the URL of each listener to
+    /// for each address. Port 0 lets the kernel choose a port, and the default
+    /// is 127.0.0.1:8080. The command writes the URL of each listener to
     /// standard output, one line each.
     #[arg(long, value_name = "ADDR:PORT")]
     listen: Vec<std::net::SocketAddr>,
@@ -1426,15 +1464,15 @@ struct ServeArgs {
     /// certificate is a method of push authentication.
     #[arg(long, value_name = "FILE", requires = "tls_cert")]
     client_ca: Option<PathBuf>,
-    /// Serve the files of a pull alone, with no receive endpoint. Without it
+    /// Serve the files of a pull alone, with no receive endpoint. Without it,
     /// the command needs an authentication method of push: --push-credentials,
     /// --client-ca, or --allow-anonymous-push.
     #[arg(long)]
     read_only: bool,
-    /// Take the push credentials in FILE, one NAME:HEX line each, where HEX
-    /// is the SHA-256 digest of the token in 64 lowercase hex digits. A line
-    /// that starts with `#` and an empty line are skipped. A malformed line
-    /// stops the command at start. Without --tls-cert the option needs
+    /// Take the push credentials in FILE, one NAME:HEX line each. HEX is the
+    /// SHA-256 digest of the token in 64 lowercase hex digits. The command
+    /// skips an empty line and a line that starts with `#`, and a malformed
+    /// line stops the command at start. Without --tls-cert, the option needs
     /// --allow-cleartext-credentials or --allow-anonymous-push.
     #[arg(long, value_name = "FILE", conflicts_with = "read_only")]
     push_credentials: Option<PathBuf>,
@@ -1442,10 +1480,11 @@ struct ServeArgs {
     /// a server on a loopback address or behind a proxy that terminates TLS.
     #[arg(long, conflicts_with = "read_only")]
     allow_cleartext_credentials: bool,
-    /// Read the receive, trust, and key groups, and the remotes they name,
-    /// from FILE alone, in place of those of the repository config. `[core]
-    /// auto-update-summary` and `[ex-ostrya] detached-metadata-exclude` still
-    /// come from the repository config.
+    /// Read the receive, trust, and key groups, and the remotes that they
+    /// name, from FILE alone. The command then ignores these groups in the
+    /// repository config. `[core] auto-update-summary` and
+    /// `[ex-ostrya] detached-metadata-exclude` still come from the repository
+    /// config.
     #[arg(long, value_name = "FILE", conflicts_with = "read_only")]
     policy: Option<PathBuf>,
     /// Let a request with no credential push.
@@ -1482,9 +1521,9 @@ struct ServeArgs {
         conflicts_with = "read_only"
     )]
     parallel_uploads: u32,
-    /// End a connection whose response waits longer than SECONDS for the
-    /// client to take its next bytes. An HTTP/2 client that does not answer
-    /// a ping within SECONDS also loses its connection. The value is a
+    /// End a connection if its response waits longer than SECONDS for the
+    /// client to take its next bytes. If an HTTP/2 client does not answer a
+    /// ping within SECONDS, it also loses its connection. The value is a
     /// positive integer, and the default is 60.
     #[arg(
         long,
@@ -1498,12 +1537,12 @@ struct ServeArgs {
 #[cfg(feature = "push")]
 #[derive(Args)]
 struct PushArgs {
-    /// Parents of each source commit to send: 0 for the commit alone, -1 for
-    /// the whole chain the repository holds. Absent, the chain back to the
-    /// commit of the ref on the server. When the server does not hold the
-    /// ref, or the local chain does not hold the commit of the ref on the
-    /// server, the push then sends the source commit alone; --depth=-1 sends
-    /// the whole local chain. A value below -1 is refused.
+    /// The number of parents of each source commit to send: 0 for the commit
+    /// alone, -1 for the whole chain in the repository. Without this option,
+    /// the push sends the chain back to the commit of the ref on the server.
+    /// If the server does not have the ref, or the local chain does not have
+    /// that commit, the push sends the source commit alone. --depth=-1 sends
+    /// the whole local chain, and the command refuses a value less than -1.
     #[arg(long, value_name = "N", allow_negative_numbers = true)]
     depth: Option<i32>,
     /// Update each ref whatever its state on the server, and ask the server to
@@ -1511,10 +1550,10 @@ struct PushArgs {
     /// server still refuses a non-fast-forward update unless it allows one.
     #[arg(long)]
     force: bool,
-    /// Send the content objects deflated at LEVEL, 1 to 9 (default 6).
-    /// Absent, the push sends them raw. With it, an archive repository sends
-    /// each stored content object as it is, at the zlib level the repository
-    /// wrote it with, whatever LEVEL is.
+    /// Send the content objects deflated at LEVEL, 1 to 9 (default 6). Without
+    /// this option, the push sends them raw. With it, an archive repository
+    /// sends each stored content object as it is, whatever LEVEL is. The object
+    /// keeps the zlib level that the repository wrote it with.
     #[arg(
         long,
         value_name = "LEVEL",
@@ -1526,20 +1565,23 @@ struct PushArgs {
     compress: Option<u8>,
     #[command(flatten)]
     connect: PushConnectArgs,
-    /// The remote: a `[remote "<name>"]` section of this repository's config
-    /// with a push address, or an ssh, `http://`, or `https://` address.
-    /// Required; checked after the repository resolves.
+    // ostrya checks this operand after the repository resolves.
+    /// The remote: a `[remote "<name>"]` section with a push address in the
+    /// config of this repository, or an ssh, `http://`, or `https://` address.
+    /// Required.
     remote: Option<String>,
-    /// The refspecs, each `SRC[:DST]`. SRC is a revision of this repository and
-    /// DST the ref of the server that takes its commit; DST defaults to SRC
-    /// when SRC is a ref. `:DST` deletes the ref DST of the server. At least
-    /// one is required.
+    /// The refspecs, each `SRC[:DST]`. SRC is a revision of this repository,
+    /// and DST is the ref of the server that takes its commit. If SRC is a
+    /// ref, DST defaults to SRC. `:DST` deletes the ref DST of the server, and
+    /// at least one refspec is required.
     refspecs: Vec<String>,
 }
 
 /// The options of `push` and `push-tree` that say how the push reaches the
-/// remote. The ssh options apply to an ssh address, and the other options to
-/// an `http://` or `https://` address. An option of the other transport is
+/// remote.
+///
+/// The ssh options apply to an ssh address, and the other options to an
+/// `http://` or `https://` address. An option of the other transport is
 /// refused. Each option wins over the key of the remote that has its name.
 #[cfg(feature = "push")]
 #[derive(Args)]
@@ -1549,7 +1591,7 @@ struct PushConnectArgs {
     /// of the remote.
     #[arg(long, value_name = "CMD")]
     ssh_command: Option<String>,
-    /// The command the remote side runs, which the remote shell parses. It
+    /// The command that the remote side runs, which the remote shell parses. It
     /// wins over the `receive-command` key of the remote. The default is
     /// `ostrya receive`.
     #[arg(long, value_name = "CMD")]
@@ -1558,9 +1600,9 @@ struct PushConnectArgs {
     /// the `push-token-file` key of the remote.
     #[arg(long, value_name = "FILE")]
     push_token_file: Option<PathBuf>,
-    /// Send the token as the password of a Basic credential with this name,
-    /// in place of a bearer token. It needs a token file, and it wins over
-    /// the `push-user` key of the remote.
+    /// Send the token as the password of a Basic credential with this name.
+    /// Without this option, the token is a bearer token. It needs a token
+    /// file, and it wins over the `push-user` key of the remote.
     #[arg(long, value_name = "NAME")]
     push_user: Option<String>,
     /// The PEM file of the client certificate of an HTTPS push. It needs a
@@ -1574,9 +1616,9 @@ struct PushConnectArgs {
     /// `tls-client-key-path` key of the remote.
     #[arg(long, value_name = "FILE")]
     tls_client_key_path: Option<PathBuf>,
-    /// The PEM file of the CA certificates that verify the server, in place
-    /// of the trust store of the host. It wins over the `tls-ca-path` key of
-    /// the remote.
+    /// The PEM file of the CA certificates that verify the server. The push
+    /// then does not use the trust store of the host. It wins over the
+    /// `tls-ca-path` key of the remote.
     #[arg(long, value_name = "FILE")]
     tls_ca_path: Option<PathBuf>,
     /// Send the token to an `http://` address. Without it, a token to such an
@@ -1588,69 +1630,71 @@ struct PushConnectArgs {
 #[cfg(feature = "push")]
 #[derive(Args)]
 struct PushTreeArgs {
-    /// A target ref of the server. Repeatable, and each occurrence names one
-    /// more ref that the commit sets. At least one is required.
+    /// A target ref of the server. Each occurrence names one more ref that the
+    /// commit sets. At least one is required.
     #[arg(short = 'b', long, value_name = "REF")]
     branch: Vec<String>,
     /// The commit subject.
     #[arg(short, long)]
     subject: Option<String>,
-    /// The commit body. Given more than once, the last value wins.
+    /// The commit body. If the option occurs more than once, the last value
+    /// wins.
     #[arg(short = 'm', long, value_name = "BODY", overrides_with = "body")]
     body: Option<String>,
-    /// Read the commit body from this file, which wins over --body.
+    /// Read the commit body from this file. This option wins over --body.
     #[arg(short = 'F', long, value_name = "FILE", overrides_with = "body_file")]
     body_file: Option<PathBuf>,
     /// Add a string-valued key to the commit metadata.
     #[arg(long, value_name = "KEY=VALUE")]
     add_metadata_string: Vec<String>,
-    /// Add a key to the commit metadata, its value in the GVariant text form.
+    /// Add a key to the commit metadata, with the value in the GVariant text
+    /// form.
     #[arg(long, value_name = "KEY=VALUE")]
     add_metadata: Vec<String>,
     /// Add a string-valued key to the detached commit metadata.
     #[arg(long, value_name = "KEY=VALUE")]
     add_detached_metadata_string: Vec<String>,
     /// Override the timestamp of the commit: `@SECONDS` since the Unix epoch,
-    /// or a date and time carrying a UTC offset (`2020-01-02T03:04:05Z`).
+    /// or a date and time with a UTC offset (`2020-01-02T03:04:05Z`).
     #[arg(long, value_name = "TIMESTAMP")]
     timestamp: Option<String>,
     /// The parent commit: its full checksum, 64 lowercase hex characters, or
-    /// `none` for a root commit. Absent, the commit of the first target ref on
-    /// the server is the parent.
+    /// `none` for a root commit. Without this option, the commit of the first
+    /// target ref on the server is the parent.
     #[arg(long, value_name = "CHECKSUM")]
     parent: Option<String>,
     /// Do not write any ref bindings.
     #[arg(long)]
     no_bindings: bool,
-    /// Set file ownership user id.
+    /// Set the user id of the owner of the committed files.
     #[arg(long, value_name = "UID", allow_hyphen_values = true)]
     owner_uid: Option<String>,
-    /// Set file ownership group id.
+    /// Set the group id of the owner of the committed files.
     #[arg(long, value_name = "GID", allow_hyphen_values = true)]
     owner_gid: Option<String>,
-    /// Force owner 0:0, canonicalize modes to `perm & 0755`, and drop xattrs,
-    /// for an owner- and host-independent commit.
+    /// Force owner 0:0, canonicalize modes to `perm & 0755`, and drop xattrs.
+    /// The commit then does not depend on the owner or on the host.
     #[arg(long)]
     canonical_permissions: bool,
-    /// Sign the commit with this key: for ed25519 and spki, the base64 of the
-    /// secret key. Repeatable, and each occurrence adds one signature.
+    /// Sign the commit with this key. For ed25519 and spki, the key is the
+    /// base64 of the secret key. Each occurrence adds one signature.
     #[arg(long, value_name = "KEY_ID")]
     sign: Vec<String>,
-    /// Sign the commit with the key on the first line of this file.
-    /// Repeatable, and each occurrence adds one signature.
+    /// Sign the commit with the key on the first line of this file. Each
+    /// occurrence adds one signature.
     #[arg(long, value_name = "PATH")]
     sign_from_file: Vec<std::ffi::OsString>,
-    /// Signature type to use (defaults to 'ed25519'). Given more than once,
-    /// the last value wins.
+    /// The signature type to use. The default is 'ed25519'. If the option
+    /// occurs more than once, the last value wins.
     #[arg(long, value_name = "NAME", overrides_with = "sign_type")]
     sign_type: Option<String>,
-    /// GPG Key ID to sign the commit with. Repeatable, and each occurrence adds
-    /// one signature under `ostree.gpgsigs`.
+    /// The GPG key ID to sign the commit with. Each occurrence adds one
+    /// signature under `ostree.gpgsigs`.
     #[arg(long, value_name = "KEY-ID")]
     gpg_sign: Vec<String>,
-    /// GPG Homedir to use when looking for keyrings. Read by --gpg-sign and,
-    /// under --sign-type=gpg, by --sign and --sign-from-file. It wins over
-    /// GNUPGHOME.
+    /// The GPG home directory that holds the keyrings. --gpg-sign reads it,
+    /// and so do --sign and --sign-from-file under --sign-type=gpg. It wins
+    /// over GNUPGHOME.
     #[arg(long, value_name = "HOMEDIR")]
     gpg_homedir: Option<PathBuf>,
     /// Set each target ref whatever its state on the server, and ask the
@@ -1660,7 +1704,7 @@ struct PushTreeArgs {
     #[arg(long)]
     force: bool,
     /// Send the content objects deflated at LEVEL, 1 to 9 (default 6).
-    /// Absent, the push sends them raw.
+    /// Without this option, the push sends them raw.
     #[arg(
         long,
         value_name = "LEVEL",
@@ -1673,9 +1717,9 @@ struct PushTreeArgs {
     #[command(flatten)]
     connect: PushConnectArgs,
     /// The remote: an ssh, `http://`, or `https://` address, or a
-    /// `[remote "<name>"]` section with a push address in the config of the
-    /// repository that --repo, the current directory, or OSTREE_REPO names.
-    /// An address opens no repository. Required.
+    /// `[remote "<name>"]` section with a push address. The section is in the
+    /// config of the repository that --repo, the current directory, or
+    /// OSTREE_REPO names. An address opens no repository. Required.
     remote: Option<String>,
     /// The directory to commit. Required.
     dir: Option<PathBuf>,
@@ -1683,66 +1727,74 @@ struct PushTreeArgs {
 
 #[derive(Args)]
 struct PullLocalArgs {
-    /// Write the pulled refs under this remote (`refs/remotes/<remote>/<ref>`)
-    /// instead of as local refs.
+    /// Write the pulled refs under this remote (`refs/remotes/<remote>/<ref>`).
+    /// Without this option, they are local refs.
     #[arg(long)]
     remote: Option<String>,
-    /// Parents of each pulled commit to follow: 0 for the commit alone, -1 for
-    /// the whole ancestry the source holds. A value below -1 is refused.
+    /// The number of parents of each pulled commit to follow: 0 for the commit
+    /// alone, -1 for the whole ancestry in the source. The command refuses a
+    /// value less than -1.
     #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
     depth: i32,
-    /// Import only the commit objects, leaving each commit marked partial.
+    /// Import only the commit objects, and mark each commit partial.
     #[arg(long)]
     commit_metadata_only: bool,
-    /// Verify every imported object's checksum against its name.
+    /// Verify the checksum of every imported object against its name.
     #[arg(long)]
     untrusted: bool,
-    /// Reject regular files whose mode has bits outside 0775.
+    /// Reject regular files with mode bits outside 0775.
     #[arg(long)]
     bareuseronly_files: bool,
-    /// Do not check that a pulled commit's ostree.ref-binding names the ref it
-    /// is pulled under.
+    /// Do not check that the ostree.ref-binding of a pulled commit names the
+    /// ref that it is pulled under.
     #[arg(long)]
     disable_verify_bindings: bool,
-    /// Copy every object instead of hardlinking it.
+    /// Copy every object, and make no hardlink.
     #[arg(long)]
     force_copy: bool,
-    /// Consult this repository for objects the source does not hold;
-    /// repeatable.
+    /// Look in this repository for the objects that the source does not have.
+    /// The option can occur more than once.
     #[arg(short = 'L', long = "localcache-repo")]
     localcache_repo: Vec<PathBuf>,
-    /// Do not sync anything this pull writes. Changes no byte the pull writes.
+    /// Do not sync anything that this pull writes. This switch changes no byte
+    /// that the pull writes.
     #[arg(long)]
     disable_fsync: bool,
-    /// Sync the file of each content object as it is staged. Metadata objects
-    /// are not synced on their own. --disable-fsync and `[core] fsync=false`
-    /// win over it.
+    /// Sync the file of each content object when it is staged. The pull does
+    /// not sync metadata objects one by one. --disable-fsync and
+    /// `[core] fsync=false` win over this switch.
     #[arg(long)]
     per_object_fsync: bool,
-    /// Require a GPG signature on every commit the pull carries, with the keys
-    /// of the remote --remote names.
+    /// Require a GPG signature on every commit that the pull carries, with the
+    /// keys of the remote that --remote names.
     #[arg(long)]
     gpg_verify: bool,
     /// Require a GPG signature on the summary of the source, with the keys of
-    /// the remote --remote names.
+    /// the remote that --remote names.
     #[arg(long)]
     gpg_verify_summary: bool,
-    /// Apply the static delta the summary of the source advertises for each
-    /// commit, and refuse the pull when there is none. The source must be an
+    /// Apply the static delta that the summary of the source advertises for
+    /// each commit. If there is none, refuse the pull. The source must be an
     /// archive repository with a summary.
     #[arg(long, conflicts_with = "disable_static_deltas")]
     require_static_deltas: bool,
     /// Read no static delta. The pull reads none by default.
     #[arg(long)]
     disable_static_deltas: bool,
-    /// The repository to pull from. Required; checked after the repository
-    /// resolves, matching the tool's error-ordering
-    /// (`docs/conformance/cli-surface.md`, "Global conventions").
+    // ostrya checks this operand after the repository resolves, in the order
+    // of the `ostree` command.
+    /// The repository to pull from. Required.
     src_repo: Option<PathBuf>,
-    /// The refs to pull; with none, every ref the source holds.
+    /// The refs to pull. With none, the pull takes every ref of the source.
     refs: Vec<String>,
 }
 
+/// Parses the command line, runs the subcommand, and returns the exit status.
+///
+/// A parse error prints the message of `clap` and exits 1, and `--help` exits
+/// 0. `--version` prints `ostrya` and the version. With no subcommand,
+/// [`exit_no_command`] ends the process. A library error prints the line of
+/// [`error_line`] and exits 1.
 fn main() -> std::process::ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -1771,14 +1823,16 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// The text a library error reaches standard error as. A refspec the ref rule
-/// refuses is reported in the tool's own words, wherever a revision, a NEWREF,
-/// or a branch name reaches the library, so one condition has one message
-/// (`docs/format-reference.md`, "Ref name validation"). An abbreviated checksum
-/// more than one commit carries is reported here for the same reason: it arises
-/// wherever a revision is taken, including the sites that read one through the
-/// library rather than through [`resolve`] (`docs/format-reference.md`,
-/// "Revision syntax"). Every other error carries the library's own `Display`.
+/// Returns the text that [`main`] prints on standard error for a library error.
+///
+/// If the ref-name rule refuses a refspec, the text uses the words of the
+/// `ostree` command. This applies wherever a revision, a NEWREF, or a branch
+/// name reaches the library, so one condition has one message. An abbreviated
+/// checksum that more than one commit carries gets its text here for the same
+/// reason. This error occurs wherever a revision is taken, also at the sites
+/// that read a revision through the library without [`resolve`].
+///
+/// Every other error gets the `Display` text of the `ostrya` library.
 fn error_line(err: &Error) -> String {
     match err {
         Error::InvalidRefspec(refspec) => format!("Invalid refspec {refspec}"),
@@ -1787,28 +1841,27 @@ fn error_line(err: &Error) -> String {
     }
 }
 
+/// Runs one subcommand with the global options.
 async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()> {
     let name = command.name();
     match command {
         Command::Init(args) => init(repo, verbose, name, args).await,
         Command::Commit(args) => {
-            // The tool reads `--owner-uid` and `--owner-gid` while it parses its
-            // options, so a value it cannot read is reported ahead of the
-            // repository (`docs/format-reference.md`, "CLI output formats").
+            // The `ostree` command reads `--owner-uid` and `--owner-gid` while
+            // it parses its options, so an unreadable value is reported before
+            // the repository resolves.
             let owner = commit_owner(&args);
             let fsync = fsync_policy(args.fsync.as_deref());
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             commit(repo, args, owner, fsync).await
         }
         Command::Checkout(args) => {
-            // `--fsync` is read while the options are read on `checkout` too,
-            // so a value the reader refuses stands ahead of the repository,
-            // ahead of the revision, and ahead of the `DESTINATION must be
-            // specified` refusal a batch option makes below. `clap` has already
-            // counted the positionals by this point, so a plain-path line that
-            // omits DESTINATION reports the missing positional instead, where
-            // the tool reports the value (`docs/format-reference.md`, "The
-            // fsync vocabulary").
+            // `checkout` also reads `--fsync` with its options. The error for a
+            // refused value comes before the repository, before the revision,
+            // and before the `DESTINATION must be specified` refusal of a batch
+            // option. `clap` counts the positionals before this step. If a
+            // plain-path command line omits DESTINATION, ostrya reports the
+            // missing positional, and `ostree` reports the value.
             let fsync = fsync_policy(args.fsync.as_deref());
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             checkout(repo, args, fsync).await
@@ -1846,8 +1899,8 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
             config(repo, name, args).await
         }
         Command::Remote(args) => {
-            // The tool reports a missing nested subcommand before it resolves
-            // the repository, the same order `static-delta` takes.
+            // The `ostree` command reports a missing nested subcommand before
+            // it resolves the repository. `static-delta` has the same order.
             let Some(sub) = args.command else {
                 exit_with_error(name, "No \"remote\" subcommand specified");
             };
@@ -1863,9 +1916,9 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
             fsck(repo, args).await
         }
         Command::Diff(args) => {
-            // `--owner-uid` and `--owner-gid` are read while the options are
-            // read here too, so a value the reader refuses stands ahead of the
-            // repository (`docs/format-reference.md`, "CLI output formats").
+            // `diff` also reads `--owner-uid` and `--owner-gid` with its
+            // options, so the error for a refused value comes before the
+            // repository resolves.
             let owner = Owner {
                 uid: owner_id(args.owner_uid.as_deref(), "--owner-uid"),
                 gid: owner_id(args.owner_gid.as_deref(), "--owner-gid"),
@@ -1882,8 +1935,8 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
             summary(repo, path, args).await
         }
         Command::StaticDelta(args) => {
-            // The tool reports a missing nested subcommand before it resolves
-            // the repository, so this check comes first.
+            // The `ostree` command reports a missing nested subcommand before
+            // it resolves the repository, so this check comes first.
             let Some(sub) = args.command else {
                 exit_with_error(name, "No command specified");
             };
@@ -1891,9 +1944,8 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
             static_delta(repo, path, sub).await
         }
         Command::Pull(args) => {
-            // The low-speed values are read while the options are read, so a
-            // value the reader refuses stands ahead of the repository
-            // (`docs/format-reference.md`, "CLI output formats").
+            // The low-speed values are read with the options, so the error for
+            // a refused value comes before the repository resolves.
             let low_speed = LowSpeedArgs {
                 limit: low_speed_value(
                     args.low_speed_limit_bytes.as_deref(),
@@ -1904,7 +1956,7 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
                     "--low-speed-time-seconds",
                 ),
             };
-            // `--update-frequency` is read the same way and at the same step.
+            // `--update-frequency` is read in the same way, at the same step.
             let redraw = update_interval(owner_id(
                 args.update_frequency.as_deref(),
                 "--update-frequency",
@@ -1919,7 +1971,7 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
         #[cfg(feature = "receive")]
         Command::Receive(args) => {
             // `receive` writes nothing on success, also under `--verbose`, so
-            // the repository line of `--verbose` is not written.
+            // `resolve_repo` does not write the repository line of `--verbose`.
             let (repo, _) = resolve_repo(repo, false, name).await;
             receive(repo, args).await
         }
@@ -1930,8 +1982,8 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
         }
         #[cfg(feature = "push")]
         Command::PushTree(args) => {
-            // The owner ids are read first, as `commit` reads them, so a value
-            // the reader refuses stands ahead of every other check.
+            // `push-tree` reads the owner ids first, as `commit` does, so the
+            // error for a refused value comes before every other check.
             let owner = Owner {
                 uid: owner_id(args.owner_uid.as_deref(), "--owner-uid"),
                 gid: owner_id(args.owner_gid.as_deref(), "--owner-gid"),
@@ -1940,8 +1992,8 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
         }
         #[cfg(feature = "serve")]
         Command::Serve(args) => {
-            // A receive endpoint that no method of push authentication
-            // guards is refused before the repository is opened.
+            // If no method of push authentication guards the receive endpoint,
+            // `serve` refuses the command before it opens the repository.
             if !args.read_only
                 && !args.allow_anonymous_push
                 && args.push_credentials.is_none()
@@ -1953,7 +2005,7 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
                 );
                 exit_process(1);
             }
-            // With no TLS the credential file is the one method, and the
+            // Without TLS, the credential file is the only method, and the
             // endpoint refuses each credential over plain HTTP.
             if !args.read_only
                 && args.tls_cert.is_none()
@@ -1973,27 +2025,30 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
         #[cfg(feature = "send")]
         Command::Send => {
             // `send` writes nothing on success, also under `--verbose`, so
-            // the repository line of `--verbose` is not written.
+            // `resolve_repo` does not write the repository line of `--verbose`.
             let (repo, _) = resolve_repo(repo, false, name).await;
             send(repo).await
         }
     }
 }
 
-/// The largest file `serve` reads: a PEM file or the push credential file.
+/// The maximum size in bytes of a file that `serve` reads.
+///
+/// The files are the PEM files and the push credential file.
 #[cfg(feature = "serve")]
 const MAX_SERVE_FILE_SIZE: u64 = 1024 * 1024;
 
-/// Serve the repository with the options of `args` until the process ends.
-/// The URL of each listener goes to standard output, one line each, once
-/// every listener is bound.
+/// Serves the repository with the options of `args` until the process ends.
 ///
-/// Without `--read-only` the receive endpoint runs with the receive policy
-/// of the repository config, or of `--policy`, and the credential file of
-/// `--push-credentials`, each read once at start. A malformed credential
-/// line ends the process with an error that names the line. Each warning of
-/// the report of a session that committed goes to standard error as one
-/// line.
+/// When all listeners are bound, the URL of each listener goes to standard
+/// output, one line for each listener.
+///
+/// Without `--read-only`, the receive endpoint uses the receive policy of the
+/// repository config, or of `--policy`, and the credential file of
+/// `--push-credentials`. `serve` reads each of them once at start. A malformed
+/// credential line ends the process with an error that names the line. For
+/// each session that commits, each warning of its report goes to standard
+/// error as one line.
 #[cfg(feature = "serve")]
 async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
     use std::io::Write;
@@ -2054,8 +2109,9 @@ async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
-/// Read a file of `serve`, up to [`MAX_SERVE_FILE_SIZE`]. A file that cannot
-/// be read, or is larger, ends the process with an error.
+/// Reads a file of `serve` that has at most [`MAX_SERVE_FILE_SIZE`] bytes.
+///
+/// If the file cannot be read, or is larger, the process ends with an error.
 #[cfg(feature = "serve")]
 fn read_serve_file(path: &Path) -> Vec<u8> {
     use std::io::Read;
@@ -2081,13 +2137,14 @@ fn read_serve_file(path: &Path) -> Vec<u8> {
     }
 }
 
-/// Run one push session over standard input and standard output with the
-/// receive policy of the repository config, or of `--policy`.
+/// Runs one push session over standard input and standard output.
 ///
-/// Standard output carries the frames of the session alone. Each warning of
-/// the report goes to standard error as one line, and a failure goes there
-/// as the error line of `main`. The command writes nothing else, also under
-/// `--verbose`.
+/// The session uses the receive policy of the repository config, or of
+/// `--policy`. Standard output carries the frames of the session alone. Each
+/// warning of the report goes to standard error as one line. A failure goes
+/// there as the error line of [`main`].
+///
+/// The command writes nothing else, also under `--verbose`.
 #[cfg(feature = "receive")]
 async fn receive(repo: Repo, args: ReceiveArgs) -> Result<()> {
     let policy = match &args.policy {
@@ -2095,9 +2152,8 @@ async fn receive(repo: Repo, args: ReceiveArgs) -> Result<()> {
         None => ostrya::ReceivePolicy::from_config(&repo).await?,
     };
     // The input is read at most 256 KiB ahead of the session. Under the smol
-    // backend the output goes through a blocking-pool pipe of 8 MiB, so the
-    // output can hold up to 8 MiB that the session has written and the pipe
-    // has not.
+    // backend, the output goes through a blocking-pool pipe of 8 MiB, so up
+    // to 8 MiB that the session wrote can wait in the pipe.
     let report = repo.receive(stdin_file()?, stdout_file()?, &policy).await?;
     for warning in &report.warnings {
         eprintln!(
@@ -2109,28 +2165,30 @@ async fn receive(repo: Repo, args: ReceiveArgs) -> Result<()> {
     Ok(())
 }
 
-/// Serve one pull session over standard input and standard output.
+/// Serves one pull session over standard input and standard output.
 ///
-/// Standard output carries the frames of the session alone, and a failure
-/// goes to standard error as the error line of `main`. The command takes no
-/// lock and writes no file in the repository.
+/// Standard output carries the frames of the session alone. A failure goes to
+/// standard error as the error line of [`main`]. The command takes no lock and
+/// writes no file in the repository.
 #[cfg(feature = "send")]
 async fn send(repo: Repo) -> Result<()> {
     // The input is read at most 256 KiB ahead of the session. Under the smol
-    // backend the output goes through a blocking-pool pipe of 8 MiB, and a
-    // flush waits until each byte reached the descriptor, so the session
-    // flushes only when no whole `Get` frame waits in its input buffer.
+    // backend, the output goes through a blocking-pool pipe of 8 MiB, and a
+    // flush waits until each byte reaches the descriptor. For this reason,
+    // the session flushes only if no whole `Get` frame waits in its input
+    // buffer.
     repo.send(stdin_file()?, stdout_file()?).await
 }
 
-/// Push the commits the refspecs name to a remote over ssh or HTTP, and
-/// update its refs in one transaction.
+/// Pushes the commits that the refspecs name to a remote over ssh or HTTP.
 ///
-/// Standard output carries one line for each ref, in the order of the
-/// refspecs, and nothing else. Under `--verbose` one statistics line goes to
-/// standard error. A failure writes nothing to standard output. On a
-/// terminal, standard error shows the progress bar of [`PushBar`] while the
-/// push runs.
+/// The push updates the refs of the remote in one transaction. Standard output
+/// carries one line for each ref, in the order of the refspecs, and nothing
+/// else. Under `--verbose`, one statistics line goes to standard error. A
+/// failure writes nothing to standard output.
+///
+/// On a terminal, standard error shows the progress bar of [`PushBar`] while
+/// the push runs.
 #[cfg(feature = "push")]
 async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<()> {
     let Some(remote) = args.remote.as_deref() else {
@@ -2155,9 +2213,9 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
     // The bar is cleared before any line of the result or of the error.
     bar.finish();
     let outcome = pushed?;
-    // The refs are written on the remote at this point. A failed write to
-    // standard output, a full device or a closed pipe, is reported as the
-    // error line of `main` and exits 1.
+    // The remote holds the new refs at this point. If the write to standard
+    // output fails, for example on a full device or a closed pipe, `main`
+    // prints the error line and exits 1.
     {
         use std::io::Write;
         let mut out = std::io::stdout().lock();
@@ -2172,8 +2230,10 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
     Ok(())
 }
 
-/// The encoding of the content objects that `--compress` selects: `deflate`
-/// at the given level, or `raw` when the option is absent.
+/// Returns the encoding of the content objects that `--compress` selects.
+///
+/// The encoding is `deflate` at the given level, or `raw` if the option is
+/// absent.
 #[cfg(feature = "push")]
 fn push_compression(level: Option<u8>) -> ostrya::remote::Compression {
     match level {
@@ -2182,9 +2242,12 @@ fn push_compression(level: Option<u8>) -> ostrya::remote::Compression {
     }
 }
 
-/// The overrides of `--ssh-command`, `--receive-command`, and the HTTP
-/// options, each in the field of its name, so the resolver refuses an option
-/// of the other transport. The ssh command is split at ASCII whitespace.
+/// Returns the endpoint overrides of the ssh and HTTP options of a push.
+///
+/// The options are `--ssh-command`, `--receive-command`, and the HTTP options.
+/// Each option goes in the field of its name, so the resolver refuses an
+/// option of the other transport. The ssh command is split at ASCII
+/// whitespace.
 #[cfg(feature = "push")]
 fn push_overrides(args: PushConnectArgs) -> ostrya::endpoint::EndpointOverrides {
     let ssh_command = args.ssh_command.map(|command| {
@@ -2206,24 +2269,36 @@ fn push_overrides(args: PushConnectArgs) -> ostrya::endpoint::EndpointOverrides 
     }
 }
 
-/// Push the directory DIR to a remote over ssh or HTTP as one commit, and set
-/// each target ref of the server to it in one transaction.
+/// Pushes the directory DIR to a remote over ssh or HTTP as one commit.
 ///
-/// The owner ids are read first, in `run`. The operands are checked next, in
-/// the order REMOTE, DIR, and `-b`, each with the usage text. The other
-/// options the command reads itself, except the signing keys and the body
-/// file, are then checked before a repository opens. The command then
-/// resolves the remote: it refuses an option of the other transport and the
-/// bad HTTP options. It reads the token file of an HTTP push, and the TLS
-/// files of an `https://` push. It then makes the transport ready. The
-/// signing keys are checked next, and the body file is read last. The push
-/// refuses the other bad refs before the scan. All of these come before the
-/// ssh client starts or the first HTTP request. A remote name is looked up in
-/// the repository that `--repo`, the current directory, or `OSTREE_REPO`
-/// gives. An address opens no repository, so none of the three is read for
-/// it.
+/// The push sets each target ref of the server to this commit in one
+/// transaction.
 ///
-/// Standard output carries the commit checksum alone. Under `--verbose` one
+/// # Check order
+///
+/// 1. [`run`] reads the owner ids.
+/// 2. The command checks the operands in the order REMOTE, DIR, and `-b`, each
+///    with the usage text.
+/// 3. The command checks the other options that it reads itself, before a
+///    repository opens. The signing keys and the body file are not in this
+///    step.
+/// 4. The command resolves the remote. It refuses an option of the other
+///    transport and the bad HTTP options. It reads the token file of an HTTP
+///    push, and the TLS files of an `https://` push.
+/// 5. The command makes the transport ready.
+/// 6. The command checks the signing keys.
+/// 7. The command reads the body file.
+///
+/// The push refuses the other bad refs before the scan. All of these steps
+/// come before the ssh client starts or the first HTTP request.
+///
+/// A remote name is looked up in the repository that `--repo`, the current
+/// directory, or `OSTREE_REPO` gives. An address opens no repository, so the
+/// command reads none of the three for it.
+///
+/// # Output
+///
+/// Standard output carries the commit checksum alone. Under `--verbose`, one
 /// statistics line goes to standard error. A failure writes nothing to
 /// standard output. On a terminal, standard error shows the progress bar of
 /// [`PushBar`] while the push runs.
@@ -2256,8 +2331,8 @@ async fn push_tree(
         exit_error(&message);
     }
     // The ref rule of the push refuses `:`, a name with `^`, a bad name, and a
-    // name given twice. A name that a revision reads as a checksum is refused
-    // here, with the wording of `commit`.
+    // name that occurs twice. This loop refuses a name that a revision reads
+    // as a checksum, with the words of `commit`.
     for branch in &args.branch {
         if let Some(message) = shadowed_branch_name(branch) {
             exit_error(&message);
@@ -2287,9 +2362,10 @@ async fn push_tree(
         },
         None => None,
     };
-    // The transport is made ready before a signer can start gpg and before
-    // the body file is read, so a refusal of the remote or of its options
-    // costs neither. A name with `^` is refused later, in the library.
+    // The transport is made ready before a signer can start gpg and before the
+    // body file is read. A refusal of the remote or of its options then starts
+    // no gpg and reads no body file. The library refuses a name with `^` at a
+    // later step.
     let overrides = push_overrides(args.connect);
     let endpoint = if ostrya::is_push_address(remote) {
         ostrya::endpoint::resolve_push(None, remote, overrides).await?
@@ -2335,9 +2411,9 @@ async fn push_tree(
     bar.finish();
     let outcome = pushed?;
     let commit = outcome.commit.expect("a tree push names its commit");
-    // The refs are written on the remote at this point. A failed write to
-    // standard output, a full device or a closed pipe, is reported as the
-    // error line of `main` and exits 1.
+    // The remote holds the new refs at this point. If the write to standard
+    // output fails, for example on a full device or a closed pipe, `main`
+    // prints the error line and exits 1.
     {
         use std::io::Write;
         let mut out = std::io::stdout().lock();
@@ -2350,14 +2426,18 @@ async fn push_tree(
     Ok(())
 }
 
-/// The entry filter of `--owner-uid`, `--owner-gid`, and
-/// `--canonical-permissions`, or `None` where none of them is set.
+/// Returns the entry filter of the owner and permission options of `push-tree`.
+///
+/// The options are `--owner-uid`, `--owner-gid`, and
+/// `--canonical-permissions`. If none of them is set, the result is `None`.
 ///
 /// The filter keeps every entry, the root included, and applies the rule of
-/// `commit`: the canonical reduction first, which sets the owner to 0:0,
-/// empties the extended attributes, and reduces the mode of each entry other
-/// than a symlink to its file type and `perm & 0755`, and then each declared
-/// id.
+/// `commit` in this order:
+///
+/// 1. The canonical reduction. It sets the owner to 0:0 and empties the
+///    extended attributes. It reduces the mode of each entry other than a
+///    symlink to its file type and `perm & 0755`.
+/// 2. Each declared id.
 #[cfg(feature = "push")]
 fn tree_push_filter(owner: Owner, canonical: bool) -> Option<ostrya::remote::tree::EntryFilter> {
     use ostrya::remote::tree::{EntryAction, EntryKind};
@@ -2383,9 +2463,10 @@ fn tree_push_filter(owner: Owner, canonical: bool) -> Option<ostrya::remote::tre
     }))
 }
 
-/// The line `push` prints for one ref: the name, the commit before the write
-/// or `(new)` or `(absent)`, and the commit after it or `(deleted)` or
-/// `(unchanged)`.
+/// Returns the line that `push` prints for one ref.
+///
+/// The line holds the name, the commit before the write or `(new)` or
+/// `(absent)`, and the commit after the write or `(deleted)` or `(unchanged)`.
 #[cfg(feature = "push")]
 fn ref_line(outcome: &ostrya::remote::RefOutcome) -> String {
     let name = &outcome.name;
@@ -2398,7 +2479,7 @@ fn ref_line(outcome: &ostrya::remote::RefOutcome) -> String {
     }
 }
 
-/// The statistics line `push --verbose` writes to standard error.
+/// Returns the statistics line that `push --verbose` writes to standard error.
 #[cfg(feature = "push")]
 fn push_statistics_line(stats: &ostrya::remote::PushStats) -> String {
     format!(
@@ -2414,27 +2495,34 @@ fn push_statistics_line(stats: &ostrya::remote::PushStats) -> String {
 /// The progress bar of `push` and `push-tree` on standard error.
 ///
 /// The hook of a [`PushProgress`](ostrya::remote::PushProgress) drives the bar.
-/// `indicatif` draws it at most 20 times a second. When standard error is not
-/// a terminal, or `TERM` is unset or `dumb`, the bar is hidden, and the push
-/// gets no progress handle: the session then asks its source for no byte
-/// total and calls no hook. The bar shows nothing before the push reaches
-/// `Negotiating`, so the prompts of the ssh client and of a signer stay
-/// readable. It then shows a spinner while the session negotiates and a bar
-/// of the content bytes while it uploads. It clears when the push reaches
-/// `Committing` and shows nothing after that, so a line that the server
-/// writes on standard error at the commit starts on a clean line.
+/// `indicatif` draws it at most 20 times a second.
+///
+/// If standard error is not a terminal, or `TERM` is unset or `dumb`, the bar
+/// is hidden and the push gets no progress handle. The session then asks its
+/// source for no byte total and calls no hook.
+///
+/// The bar shows these stages:
+///
+/// - Before the push reaches `Negotiating`, the bar shows nothing, so the
+///   prompts of the ssh client and of a signer stay readable.
+/// - While the session negotiates, the bar shows a spinner.
+/// - While the session uploads, the bar shows the content bytes.
+/// - When the push reaches `Committing`, the bar clears and shows nothing more.
+///   A line that the server writes on standard error at the commit then starts
+///   on a clean line.
 #[cfg(feature = "push")]
 struct PushBar {
     bar: indicatif::ProgressBar,
-    /// The stage the bar shows: one of the `STAGE_` constants. The stage
-    /// only goes up.
+    /// The stage that the bar shows, one of the `STAGE_` constants. The stage
+    /// only increases.
     stage: std::sync::atomic::AtomicU8,
     /// The object counts of the upload, which the bar reads when it draws.
     objects: Arc<ObjectCounts>,
 }
 
-/// The objects sent and the objects needed, as the `{objects}` key of the
-/// upload templates writes them.
+/// The counts of the objects sent and needed in an upload.
+///
+/// The `{objects}` key of the upload templates writes these counts.
 #[cfg(feature = "push")]
 #[derive(Default)]
 struct ObjectCounts {
@@ -2442,31 +2530,36 @@ struct ObjectCounts {
     needed: std::sync::atomic::AtomicU64,
 }
 
+/// The stage before the push reaches `Negotiating`, in which the bar shows
+/// nothing.
 #[cfg(feature = "push")]
 const STAGE_HIDDEN: u8 = 0;
+/// The stage of the negotiation, in which the bar shows a spinner.
 #[cfg(feature = "push")]
 const STAGE_NEGOTIATING: u8 = 1;
+/// The stage of the upload, in which the bar shows the content bytes.
 #[cfg(feature = "push")]
 const STAGE_UPLOADING: u8 = 2;
-/// The bar is cleared and shows nothing more.
+/// The stage after the bar clears, in which the bar shows nothing more.
 #[cfg(feature = "push")]
 const STAGE_DONE: u8 = 3;
 
-/// The template of the negotiation.
+/// The bar template of the negotiation.
 #[cfg(feature = "push")]
 const NEGOTIATING_TEMPLATE: &str = "{spinner} Negotiating";
-/// The template of the upload when the byte total is known.
+/// The bar template of the upload with a known byte total.
 #[cfg(feature = "push")]
 const BAR_TEMPLATE: &str =
     "{objects} [{wide_bar}] {percent:>3}% {bytes}/{total_bytes} {binary_bytes_per_sec} {eta}";
-/// The template of the upload when the byte total is not known.
+/// The bar template of the upload with no known byte total.
 #[cfg(feature = "push")]
 const BYTES_TEMPLATE: &str = "{spinner} {objects} {bytes} {binary_bytes_per_sec}";
 
 #[cfg(feature = "push")]
 impl PushBar {
-    /// A new bar, and the progress handle whose hook drives it. A hidden bar
-    /// gives no handle.
+    /// Creates a new bar and the progress handle whose hook drives the bar.
+    ///
+    /// If the bar is hidden, the handle is `None`.
     fn start() -> (Option<ostrya::remote::PushProgress>, Arc<PushBar>) {
         let bar = Arc::new(PushBar {
             bar: indicatif::ProgressBar::with_draw_target(
@@ -2486,8 +2579,10 @@ impl PushBar {
         (Some(progress), bar)
     }
 
-    /// Show `snapshot`. The style changes only when the stage changes, and
-    /// a snapshot of an earlier stage changes nothing.
+    /// Shows `snapshot` on the bar.
+    ///
+    /// The style changes only if the stage changes. A snapshot of an earlier
+    /// stage changes nothing.
     fn update(&self, snapshot: &ostrya::remote::PushProgressSnapshot) {
         use ostrya::remote::PushPhase;
         let stage = match snapshot.phase {
@@ -2516,7 +2611,7 @@ impl PushBar {
         }
     }
 
-    /// Change the bar from the stage `before` to `stage`.
+    /// Changes the bar from the stage `before` to `stage`.
     fn enter(&self, before: u8, stage: u8, bytes_total: u64) {
         let style = |template: &str| {
             let objects = Arc::clone(&self.objects);
@@ -2560,7 +2655,7 @@ impl PushBar {
         }
     }
 
-    /// Clear the bar from the terminal, when the stage `before` showed it.
+    /// Clears the bar from the terminal if the stage `before` showed it.
     fn clear(&self, before: u8) {
         if before != STAGE_HIDDEN && before != STAGE_DONE {
             self.bar.disable_steady_tick();
@@ -2568,13 +2663,13 @@ impl PushBar {
         }
     }
 
-    /// Clear the bar, when it shows, and show nothing more.
+    /// Clears the bar if it shows, and stops all later drawing.
     fn finish(&self) {
         self.clear(self.stage.swap(STAGE_DONE, Ordering::Relaxed));
     }
 }
 
-/// The name of a step of the receive report, as its warning line gives it.
+/// Returns the name of a step of the receive report for its warning line.
 #[cfg(any(feature = "receive", feature = "serve"))]
 fn receive_step(step: ostrya::ReceiveStep) -> &'static str {
     match step {
@@ -2586,32 +2681,36 @@ fn receive_step(step: ostrya::ReceiveStep) -> &'static str {
     }
 }
 
-/// End the process with `code`, the one exit the CLI takes that does not return
-/// through `main`.
+/// Ends the process with `code`.
 ///
-/// `std::process::exit` runs no destructor, so a subcommand that exits while a
-/// transaction is live would leave its staging directory under `tmp/`. The reap
-/// runs first, which holds the rule for every subcommand and every exit site:
-/// a refusal writes no object, moves no ref, and leaves `tmp/` as it found it
-/// (`docs/conformance/cli-surface.md`, "Global conventions").
+/// This is the one exit of the CLI that does not return through [`main`].
+/// `std::process::exit` runs no destructor. If a subcommand exits while a
+/// transaction is live, its staging directory under `tmp/` stays.
+///
+/// Before the exit, `ostrya::reap_process_staging` removes the staging
+/// directory of each live transaction. A refusal at any exit site of any
+/// subcommand then writes no object, moves no ref, and leaves `tmp/` as it
+/// found it.
 fn exit_process(code: i32) -> ! {
     ostrya::reap_process_staging();
     std::process::exit(code);
 }
 
-/// Print the top-level usage text and the tool's own error line for a bare
-/// invocation, and exit like the tool does.
+/// Prints the top-level usage text and an error line, then exits 1.
+///
+/// This is the result of a bare invocation. The error line and the exit are
+/// the same as those of the `ostree` command.
 fn exit_no_command() -> ! {
     eprint!("{}", <Cli as CommandFactory>::command().render_help());
     eprintln!("error: No command specified");
     exit_process(1);
 }
 
-/// Print `subcommand`'s usage text and `error: {message}`, then exit 1,
-/// matching the tool's own two-line error shape (usage block, then an
-/// `error: ` line) for a missing repository, a missing required operand, and a
-/// missing nested subcommand (`docs/conformance/cli-surface.md`, "Global
-/// conventions").
+/// Prints the usage text of `subcommand` and `error: {message}`, then exits 1.
+///
+/// This is the two-line error form of the `ostree` command: the usage block,
+/// then an `error: ` line. It applies to a missing repository, a missing
+/// required operand, and a missing nested subcommand.
 fn exit_with_error(subcommand: &str, message: &str) -> ! {
     let mut top = <Cli as CommandFactory>::command();
     let sub = top
@@ -2622,9 +2721,10 @@ fn exit_with_error(subcommand: &str, message: &str) -> ! {
     exit_process(1);
 }
 
-/// Print a nested subcommand's usage text and `error: {message}`, then exit 1,
-/// the shape the tool gives a `remote add` or `remote delete` missing an
-/// operand.
+/// Prints the usage text of a nested subcommand and an error, then exits 1.
+///
+/// The error line is `error: {message}`. The `ostree` command gives this form
+/// for a `remote add` or a `remote delete` with a missing operand.
 fn exit_with_nested_error(subcommand: &str, nested: &str, message: &str) -> ! {
     let mut top = <Cli as CommandFactory>::command();
     let sub = top
@@ -2636,31 +2736,43 @@ fn exit_with_nested_error(subcommand: &str, nested: &str, message: &str) -> ! {
     exit_process(1);
 }
 
-/// Print `error: {message}` with no usage text and exit 1, the shape the tool
-/// uses once a subcommand is running and its arguments are in hand.
+/// Prints `error: {message}` with no usage text, then exits 1.
+///
+/// The `ostree` command uses this form after a subcommand starts and has its
+/// arguments.
 fn exit_error(message: &str) -> ! {
     eprintln!("error: {message}");
     exit_process(1);
 }
 
-/// Print `subcommand`'s usage text and the tool's own "no repo" error line,
-/// then exit 1, matching the tool's behavior when no repository can be
-/// resolved (`docs/conformance/cli-surface.md`, "Global conventions").
+/// Prints the usage text and the error for no repository, then exits 1.
+///
+/// The usage text is the text of `subcommand`. The `ostree` command gives the
+/// same error line and exit if it cannot resolve a repository.
 fn exit_requires_repo(subcommand: &str) -> ! {
     exit_with_error(subcommand, "Command requires a --repo argument")
 }
 
-/// Resolve the repository a subcommand operates on and the filesystem path
-/// used to reach it, applying the port's precedence: an explicit `--repo`
-/// (either position) first; then the current directory, if it opens as a
-/// repository; then `OSTREE_REPO`. The chain ends there. The tool carries one
-/// more source after `OSTREE_REPO`, the compiled-in `/sysroot/ostree/repo`;
-/// the port leaves that step out, which keeps `ostrya` from acting on a live
-/// system repository through an omitted `--repo`. With none of the three,
-/// print `subcommand`'s usage text and the tool's error line and exit. `init`
-/// shares this precedence too, through `resolve_init_path`, below, which
-/// resolves to a path rather than an opened `Repo` since its explicit-`--repo`
-/// tier need not already exist.
+/// Resolves the repository of a subcommand and the file system path to it.
+///
+/// # Precedence
+///
+/// 1. An explicit `--repo`, in either position. If this repository does not
+///    open, the process ends with an error.
+/// 2. The current directory, if it opens as a repository.
+/// 3. `OSTREE_REPO`, if it opens as a repository.
+///
+/// The chain ends there. The `ostree` command has one more source after
+/// `OSTREE_REPO`, the compiled-in `/sysroot/ostree/repo`. ostrya does not use
+/// this source, so an omitted `--repo` never makes `ostrya` act on a live
+/// system repository.
+///
+/// If no source gives a repository, the function prints the usage text of
+/// `subcommand` and the error line of `ostree`, then exits.
+///
+/// `init` uses the same precedence through [`resolve_init_path`]. That function
+/// returns a path, because the explicit `--repo` path of `init` does not need
+/// to exist.
 async fn resolve_repo(repo: Option<&Path>, verbose: bool, subcommand: &str) -> (Repo, PathBuf) {
     if let Some(path) = repo {
         match Repo::open(path).await {
@@ -2695,12 +2807,18 @@ async fn resolve_repo(repo: Option<&Path>, verbose: bool, subcommand: &str) -> (
     exit_requires_repo(subcommand);
 }
 
-/// Resolve the path `init` creates or reuses a repository at. The precedence
-/// matches `resolve_repo`, but an explicit `--repo` is used as given, valid or
-/// not, since a freshly created repository need not already exist there; only
-/// the cwd and `OSTREE_REPO` fallbacks require the path to already open as a
-/// repository (an idempotent re-init), since `init` never creates a
-/// brand-new repository at a path it did not receive explicitly.
+/// Resolves the path at which `init` creates or reuses a repository.
+///
+/// The precedence is the precedence of [`resolve_repo`], with these changes:
+///
+/// - An explicit `--repo` path is used as given, valid or not, because the new
+///   repository does not need to exist there.
+/// - The current directory and `OSTREE_REPO` apply only if the path opens as a
+///   repository. Then the call is an idempotent re-init.
+///
+/// `init` never creates a new repository at a path that it did not get
+/// explicitly. If no source gives a path, [`exit_requires_repo`] ends the
+/// process.
 async fn resolve_init_path(repo: Option<&Path>, subcommand: &str) -> PathBuf {
     if let Some(path) = repo {
         return path.to_owned();
@@ -2718,8 +2836,9 @@ async fn resolve_init_path(repo: Option<&Path>, subcommand: &str) -> PathBuf {
     exit_requires_repo(subcommand);
 }
 
-/// Create a new empty repository, or idempotently reuse one that already
-/// exists at the resolved path, matching `Repo::create`'s own idempotence.
+/// Creates a new empty repository, or reuses one at the resolved path.
+///
+/// The reuse is idempotent, as in `Repo::create`.
 async fn init(repo: Option<&Path>, verbose: bool, name: &str, args: InitArgs) -> Result<()> {
     let path = resolve_init_path(repo, name).await;
     let mode = parse_init_mode(&args.mode);
@@ -2737,12 +2856,15 @@ async fn init(repo: Option<&Path>, verbose: bool, name: &str, args: InitArgs) ->
     Ok(())
 }
 
-/// The repository modes `ostrya init --mode` accepts, matching the tool's set
-/// for the modes both implementations support. `bare-split-xattrs` is
-/// excluded even though the tool's own `init --mode` accepts it: the port
-/// reads that mode and does not write it (`format-reference.md`, "Repository
-/// modes and on-disk storage"), so exposing it here would create a repository
-/// nothing in the port could subsequently commit into.
+/// Returns the repository mode for a value of `ostrya init --mode`.
+///
+/// The accepted set is the set of the `ostree` command for the modes that both
+/// commands support. The set also holds `bare-user-shared`, an ostrya
+/// extension. An unknown value ends the process with an error.
+///
+/// `bare-split-xattrs` is not in the set, although `init --mode` of `ostree`
+/// accepts it. ostrya reads that mode and does not write it, so a repository in
+/// that mode cannot take a commit from ostrya.
 fn parse_init_mode(mode: &str) -> RepoMode {
     match mode {
         "bare" => RepoMode::Bare,
@@ -2757,24 +2879,27 @@ fn parse_init_mode(mode: &str) -> RepoMode {
     }
 }
 
-/// The low-speed rule a `pull` invocation names, a field `None` where its
-/// option is absent or negative.
+/// The low-speed rule that a `pull` command line names.
+///
+/// A field is `None` if its option is absent or negative.
 struct LowSpeedArgs {
     limit: Option<u32>,
     seconds: Option<u32>,
 }
 
-/// One `--low-speed-*` value, or `None` where the option is absent or its value
-/// is negative, which keeps the default in the tool as well. The value is read
-/// as a C `int` and refused in the words `--owner-uid` is refused in, as the
-/// tool reads and refuses both (`docs/format-reference.md`, "CLI output
-/// formats").
+/// Reads one `--low-speed-*` value.
+///
+/// If the option is absent or its value is negative, the result is `None`. The
+/// `ostree` command also keeps the default in this case. The value is read as a
+/// C `int` and refused in the words of `--owner-uid`. `ostree` reads and
+/// refuses both values in the same way.
 fn low_speed_value(value: Option<&str>, flag: &str) -> Option<u32> {
     owner_id(value, flag)
 }
 
-/// The redraw interval of the terminal progress line for an
-/// `--update-frequency` value: `None` and 0 are the default of 1000 ms.
+/// Returns the redraw interval of the progress line for `--update-frequency`.
+///
+/// `None` and 0 give the default of 1000 ms.
 fn update_interval(frequency: Option<u32>) -> std::time::Duration {
     match frequency {
         None | Some(0) => std::time::Duration::from_millis(1000),
@@ -2782,11 +2907,11 @@ fn update_interval(frequency: Option<u32>) -> std::time::Duration {
     }
 }
 
-/// Fetch refs and their objects from an HTTP remote, or over ssh.
+/// Fetches refs and their objects from an HTTP remote, or over ssh.
 ///
-/// Standard output that is a terminal carries a progress line, redrawn every
-/// `redraw`, and the statistics line is drawn over it. Other standard output
-/// carries the statistics line alone.
+/// If standard output is a terminal, it carries a progress line that is
+/// redrawn every `redraw`. The statistics line is then drawn over the progress
+/// line. Other standard output carries the statistics line alone.
 async fn pull(
     repo: Repo,
     name: &str,
@@ -2812,8 +2937,9 @@ async fn pull(
     if args.untrusted {
         flags |= PullFlags::UNTRUSTED;
     }
-    // --http-trusted asks the pull to store a fetched object without checking
-    // its checksum. The pull checks every object all the same.
+    // `--http-trusted` asks the pull to store a fetched object with no
+    // verification of its checksum. ostrya ignores the switch and verifies the
+    // checksum of every object.
     let _ = args.http_trusted;
     if args.bareuseronly_files {
         flags |= PullFlags::BAREUSERONLY_FILES;
@@ -2833,13 +2959,14 @@ async fn pull(
 
     let terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let progress = terminal.then(PullProgress::new);
-    // The filter is read before the progress line starts, so its error leaves
-    // no thread drawing.
+    // The filter is read before the progress line starts, so if the read
+    // fails, no thread draws the line.
     let detached_metadata_filter = detached_metadata_filter(&repo)?;
     let overrides = ostrya::endpoint::EndpointOverrides {
         url: args.url,
         http_headers: args.http_header,
-        // The switch wins over --network-retries, in either order.
+        // `--disable-retry-on-network-errors` wins over `--network-retries`,
+        // in either order.
         max_retries: if args.disable_retry_on_network_errors {
             Some(0)
         } else {
@@ -2896,7 +3023,7 @@ async fn pull(
     let mut text = statistics_line(&stats, PullSource::Http);
     if terminal {
         // The statistics line is drawn over the progress line and padded as
-        // it is.
+        // the progress line is.
         pad_line(&mut text, 0);
         println!("{prefix}\x1b8{text}");
     } else {
@@ -2911,14 +3038,14 @@ async fn pull(
 /// padded to [`PROGRESS_COLUMNS`] bytes. The first redraw saves the position
 /// (`ESC 7`) in the same write.
 struct ProgressLine {
-    /// Dropped to stop the thread.
+    /// The sender whose drop stops the thread.
     stop: std::sync::mpsc::Sender<()>,
-    /// Ends with whether the thread wrote `ESC 7`.
+    /// The thread. Its result is `true` if the thread wrote `ESC 7`.
     thread: std::thread::JoinHandle<bool>,
 }
 
 impl ProgressLine {
-    /// Start redrawing the counters of `progress` every `redraw`.
+    /// Starts to redraw the counters of `progress` every `redraw`.
     fn start(progress: PullProgress, redraw: std::time::Duration) -> ProgressLine {
         use std::io::Write;
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
@@ -2947,9 +3074,12 @@ impl ProgressLine {
         ProgressLine { stop, thread }
     }
 
-    /// Stop redrawing, wait for the thread to end, and return what the last
-    /// write has to begin with: `ESC 7` when no redraw has saved the cursor
-    /// position yet, as the tool saves it when the pull starts.
+    /// Stops the redraw, waits for the thread, and returns the prefix of the
+    /// last write.
+    ///
+    /// If no redraw saved the cursor position, the prefix is `ESC 7`, because
+    /// the `ostree` command saves the position when the pull starts. Otherwise
+    /// the prefix is empty.
     fn finish(self) -> &'static str {
         drop(self.stop);
         match self.thread.join() {
@@ -2959,13 +3089,17 @@ impl ProgressLine {
     }
 }
 
-/// The width a line on a terminal is padded to with spaces, in bytes: a
-/// terminal of 80 columns. The terminal's own width is not read, so a longer
-/// line is written whole and a wider terminal keeps the 80.
+/// The width in bytes to which a line on a terminal is padded with spaces.
+///
+/// The value is the width of a terminal of 80 columns. ostrya does not read the
+/// width of the terminal. A longer line is written whole, and on a wider
+/// terminal the padding still stops at 80 bytes.
 const PROGRESS_COLUMNS: usize = 80;
 
-/// Pad the text of `line` from byte `from` on with spaces to
-/// [`PROGRESS_COLUMNS`] bytes. A longer text is not cut.
+/// Pads the text of `line` from byte `from` with spaces to
+/// [`PROGRESS_COLUMNS`] bytes.
+///
+/// A longer text is not cut.
 fn pad_line(line: &mut String, from: usize) {
     let width = line.len() - from;
     line.extend(std::iter::repeat_n(
@@ -2974,13 +3108,17 @@ fn pad_line(line: &mut String, from: usize) {
     ));
 }
 
-/// Append the progress text of a pull to `line`, from its counters, `elapsed`
-/// after it started.
+/// Appends the progress text of a pull to `line`.
 ///
-/// Three forms: the delta parts while one is still to arrive, the metadata
-/// walk while a commit or a dirtree is queued, and the objects otherwise. The
-/// rate is the bytes transferred over the whole elapsed time, and reads `-`
-/// until a whole second has passed.
+/// The text comes from the counters of the pull, `elapsed` after it started.
+/// It has three forms:
+///
+/// - the delta parts, while a delta part is still to arrive
+/// - the metadata walk, while a commit or a dirtree is queued
+/// - the objects, in all other cases
+///
+/// The rate is the bytes transferred over the whole elapsed time. It reads `-`
+/// until a whole second passes.
 fn progress_text(line: &mut String, s: &PullProgressSnapshot, elapsed: std::time::Duration) {
     use std::fmt::Write;
     let rate = (elapsed.as_secs() > 0)
@@ -3023,10 +3161,12 @@ fn progress_text(line: &mut String, s: &PullProgressSnapshot, elapsed: std::time
         format_size(s.bytes_transferred)
     );
 }
-/// Read a size option in decimal megabytes, as the tool reads it, into bytes.
-/// Only ASCII digits are taken. A value the tool reads leniently (`abc`,
-/// `1.5`, `-1`, ` 3`, `+3`, `3x`) and a value past `u64::MAX` bytes are
-/// refused.
+/// Reads a size option in decimal megabytes into bytes.
+///
+/// The `ostree` command also reads the option in decimal megabytes. ostrya
+/// accepts only ASCII digits. It refuses a value that `ostree` reads leniently
+/// (`abc`, `1.5`, `-1`, ` 3`, `+3`, `3x`), and a value of more than
+/// `u64::MAX` bytes.
 fn parse_megabytes(text: &str) -> std::result::Result<u64, String> {
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
         return Err("expected a whole number of megabytes".to_owned());
@@ -3037,7 +3177,9 @@ fn parse_megabytes(text: &str) -> std::result::Result<u64, String> {
         .ok_or_else(|| "the size is past the largest byte count".to_owned())
 }
 
-/// Split a `NAME=VALUE` header argument at its first `=`.
+/// Splits a `NAME=VALUE` header argument at its first `=`.
+///
+/// An empty NAME is refused.
 fn parse_http_header(arg: &str) -> std::result::Result<(String, String), String> {
     match arg.split_once('=') {
         Some((name, value)) if !name.is_empty() => Ok((name.to_owned(), value.to_owned())),
@@ -3045,11 +3187,12 @@ fn parse_http_header(arg: &str) -> std::result::Result<(String, String), String>
     }
 }
 
-/// The detached-metadata filter a pull into `repo` applies, from the
-/// repository config key `[ex-ostrya] detached-metadata-exclude`.
+/// Returns the detached-metadata filter that a pull into `repo` applies.
 ///
-/// An absent or empty key gives the default filter, which keeps every property
-/// and stores the source bytes verbatim.
+/// The filter comes from the repository config key
+/// `[ex-ostrya] detached-metadata-exclude`. An absent or empty key gives the
+/// default filter, which keeps every property and stores the source bytes
+/// verbatim.
 fn detached_metadata_filter(repo: &Repo) -> Result<DetachedMetadataFilter> {
     let excluded = repo.config().detached_metadata_exclude()?;
     if excluded.is_empty() {
@@ -3058,18 +3201,17 @@ fn detached_metadata_filter(repo: &Repo) -> Result<DetachedMetadataFilter> {
     Ok(DetachedMetadataFilter::excluding(excluded))
 }
 
-/// Where a pull took its objects from, which decides the statistics line.
+/// The source of the objects of a pull, which selects the statistics line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PullSource {
-    /// An HTTP or ssh remote, or another local repository read as a fetch
-    /// because the pull requires static deltas.
+    /// An HTTP or ssh remote, or another local repository that the pull reads
+    /// as a fetch because it requires static deltas.
     Http,
     /// Another local repository.
     Local,
 }
 
-/// The line a pull prints when it succeeds, in the tool's wording
-/// (`docs/format-reference.md`, "CLI output formats", `pull`).
+/// Returns the success line of a pull, in the words of the `ostree` command.
 fn statistics_line(stats: &PullStats, source: PullSource) -> String {
     let written = format_size(stats.content_bytes_unpacked);
     if source == PullSource::Local {
@@ -3090,8 +3232,8 @@ fn statistics_line(stats: &PullStats, source: PullSource) -> String {
             stats.metadata_fetched, stats.content_fetched
         )
     };
-    // A pull that read no body byte after the summary and the config states
-    // no transfer at all, as the tool does.
+    // If a pull read no body byte after the summary and the config, the line
+    // states no transfer. The line of the `ostree` command does the same.
     if stats.bytes_transferred == 0 {
         return format!("{fetched}; {written} content written");
     }
@@ -3102,8 +3244,10 @@ fn statistics_line(stats: &PullStats, source: PullSource) -> String {
     )
 }
 
-/// A transferred byte count in the tool's wording: `N B` below 1024, and the
-/// whole KiB, rounded down, from there.
+/// Returns a transferred byte count in the words of the `ostree` command.
+///
+/// A count of less than 1024 is `N B`. A count of 1024 or more is the whole
+/// KiB, rounded down.
 fn format_transferred(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -3112,11 +3256,12 @@ fn format_transferred(bytes: u64) -> String {
     }
 }
 
-/// Import refs and their objects from another local repository.
+/// Imports refs and their objects from another local repository.
 async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
     let Some(src_repo) = args.src_repo.as_deref() else {
-        // The tool's own message names DESTINATION, not SRC_REPO, for this
-        // case -- an observed quirk, not a transcription error here.
+        // For this case, the message of the `ostree` command names
+        // DESTINATION. This is an observed quirk of `ostree`, and ostrya
+        // copies it on purpose.
         exit_with_error(name, "DESTINATION must be specified");
     };
     let src = Repo::open(src_repo).await?;
@@ -3166,7 +3311,7 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
         )
         .await?;
     // A pull that requires static deltas reads the source as a fetch, and the
-    // tool reports it in the words of a fetch.
+    // `ostree` command reports it in the words of a fetch.
     let source = if args.require_static_deltas {
         PullSource::Http
     } else {
@@ -3176,9 +3321,18 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
     Ok(())
 }
 
-/// List the repository's static deltas, apply one offline, generate one,
-/// rebuild the index cache or the index of one target, show one delta, delete
-/// one, list the index cache, or verify one delta's signatures.
+/// Runs one `static-delta` subcommand.
+///
+/// The subcommands do these operations:
+///
+/// - list the static deltas of the repository
+/// - apply one delta offline
+/// - generate one delta
+/// - rebuild the index cache, or the index of one target
+/// - show one delta
+/// - delete one delta
+/// - list the index cache
+/// - verify the signatures of one delta
 async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaCommand) -> Result<()> {
     match command {
         StaticDeltaCommand::List => {
@@ -3216,10 +3370,12 @@ async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaComman
     }
 }
 
-/// Read one half of a delta name: 64 lowercase hex characters. `Err` holds the
-/// tool's refusal text, which names at most the first 64 bytes of a half of
-/// the wrong length, and the decimal value of the first byte outside
-/// `[0-9a-f]` in a half of the right length.
+/// Reads one half of a delta name: 64 lowercase hex characters.
+///
+/// `Err` holds the refusal text of the `ostree` command. For a half of the
+/// wrong length, the text names at most the first 64 bytes. For a half of the
+/// right length, it names the decimal value of the first byte outside
+/// `[0-9a-f]`.
 fn delta_name_half(half: &str) -> std::result::Result<Checksum, String> {
     let bytes = half.as_bytes();
     if bytes.len() != 64 {
@@ -3235,7 +3391,7 @@ fn delta_name_half(half: &str) -> std::result::Result<Checksum, String> {
     Checksum::from_hex_lower(half).map_err(|_| format!("Invalid rev {half}"))
 }
 
-/// Read a delta name, `TO` or `FROM-TO`, split at the first `-`.
+/// Reads a delta name, `TO` or `FROM-TO`, split at the first `-`.
 fn parse_delta_name(arg: &str) -> std::result::Result<(Option<Checksum>, Checksum), String> {
     match arg.split_once('-') {
         Some((from, to)) => Ok((Some(delta_name_half(from)?), delta_name_half(to)?)),
@@ -3243,8 +3399,7 @@ fn parse_delta_name(arg: &str) -> std::result::Result<(Option<Checksum>, Checksu
     }
 }
 
-/// Where the files of a `static-delta` argument are, with the spellings the
-/// refusals name them by.
+/// The files of a `static-delta` argument, and their names in the refusals.
 struct DeltaFiles {
     superblock: PathBuf,
     superblock_shown: String,
@@ -3252,10 +3407,12 @@ struct DeltaFiles {
     parts_shown: String,
 }
 
-/// Resolve a `static-delta` argument. An argument holding `/` is the path of a
-/// superblock file, whose parts are read from the directory that holds it. Any
-/// other argument is a delta name, read under the repository's `deltas/` tree;
-/// a name the parser refuses is `Err` with the parser's text.
+/// Resolves a `static-delta` argument to its files.
+///
+/// An argument that holds `/` is the path of a superblock file. Its parts are
+/// read from the directory that holds it. Any other argument is a delta name,
+/// read under the `deltas/` tree of the repository. If the parser refuses a
+/// name, the result is `Err` with the text of the parser.
 fn resolve_delta_arg(repo_path: &Path, arg: &str) -> std::result::Result<DeltaFiles, String> {
     if arg.contains('/') {
         let superblock = PathBuf::from(arg);
@@ -3281,9 +3438,11 @@ fn resolve_delta_arg(repo_path: &Path, arg: &str) -> std::result::Result<DeltaFi
     })
 }
 
-/// The tool's words for a delta file read that failed in the system: `Is a
-/// directory` for a directory, `openat(<path>): <reason>` for every other
-/// system error. `None` for any other error.
+/// Returns the words of the `ostree` command for a failed delta file read.
+///
+/// For a system error, the text is `Is a directory` for a directory, and
+/// `openat(<path>): <reason>` for every other system error. For any other
+/// error, the result is `None`.
 fn delta_read_text(err: &Error, shown: &str) -> Option<String> {
     match err {
         Error::Io(io) if io.kind() == std::io::ErrorKind::IsADirectory => {
@@ -3296,8 +3455,10 @@ fn delta_read_text(err: &Error, shown: &str) -> Option<String> {
     }
 }
 
-/// The refusal a delta file read reaches: exit 1 with the text
-/// [`delta_read_text`] gives, or return any other error.
+/// Returns the error of a failed delta file read, or ends the process.
+///
+/// If [`delta_read_text`] gives a text, the process exits 1 with this text.
+/// Any other error is returned.
 fn delta_read_error(err: Error, shown: &str) -> Error {
     match delta_read_text(&err, shown) {
         Some(text) => exit_error(&text),
@@ -3305,8 +3466,10 @@ fn delta_read_error(err: Error, shown: &str) -> Error {
     }
 }
 
-/// Remove one static delta by name. A path is read as a name, so the name
-/// parser refuses it, as the tool refuses it.
+/// Removes one static delta by name.
+///
+/// A path is read as a name, so the name parser refuses it. The `ostree`
+/// command also refuses it.
 async fn delta_delete(repo: &Repo, delta: Option<String>) -> Result<()> {
     let Some(arg) = delta else {
         exit_error("DELTA must be specified");
@@ -3315,9 +3478,10 @@ async fn delta_delete(repo: &Repo, delta: Option<String>) -> Result<()> {
     repo.delete_static_delta(from.as_ref(), &to).await
 }
 
-/// Print a delta's superblock fields and the statistics of each part, one line
-/// at a time, so the lines before a refusal reach standard output
-/// (`docs/format-reference.md`, "CLI output formats", `static-delta`).
+/// Prints the superblock fields of a delta and the statistics of each part.
+///
+/// The command prints one line at a time, so the lines before a refusal reach
+/// standard output.
 async fn delta_show(repo_path: &Path, delta: Option<String>) -> Result<()> {
     let Some(arg) = delta else {
         exit_error("DELTA must be specified");
@@ -3342,8 +3506,8 @@ async fn delta_show(repo_path: &Path, delta: Option<String>) -> Result<()> {
     println!("Timestamp: {}", sb.timestamp());
     println!("Number of parents: {}", sb.parent_count());
     println!("Number of fallback entries: {}", sb.fallbacks().len());
-    // The sums wrap, the unsigned arithmetic a crafted superblock's sizes
-    // reach.
+    // The sums wrap, as unsigned arithmetic does, if the sizes of a crafted
+    // superblock overflow.
     let (mut fallback_size, mut fallback_usize) = (0u64, 0u64);
     for fallback in sb.fallbacks() {
         println!("  {}", fallback.checksum().to_hex());
@@ -3395,33 +3559,44 @@ async fn delta_show(repo_path: &Path, delta: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// The largest `--keys-file` a sign-api verify run (`sign --verify`,
-/// `summary --verify`, `static-delta verify`) reads, the ceiling the library's
-/// key store applies to each of its files.
+/// The maximum size of a `--keys-file` for an ed25519 or spki verify.
+///
+/// The limit applies to `sign --verify`, `summary --verify`, and
+/// `static-delta verify`. It is the limit that the key store of the `ostrya`
+/// library applies to each of its files.
 const VERIFY_KEYS_FILE_LIMIT: u64 = 1024 * 1024;
 
-/// The keys a sign-api verify run checks with: the verifier, and the trusted
-/// and revoked keys in load order, from which the `static-delta verify`
-/// failure line names the keys.
+/// The keys of an ed25519 or spki verify.
+///
+/// The keys are the verifier, and the trusted and revoked keys in load order.
+/// The failure line of `static-delta verify` names the keys from these lists.
 struct VerifyKeys {
     verifier: Box<dyn Verifier>,
     trusted: Vec<Vec<u8>>,
     revoked: Vec<Vec<u8>>,
 }
 
-/// Print `Verification fails` on standard output, then `error: {text}`, and
-/// exit 1: the shape of every `static-delta verify` failure after the keys
-/// load.
+/// Prints `Verification fails` and `error: {text}`, then exits 1.
+///
+/// The first line goes to standard output, and the second line goes to
+/// standard error. Every failure of `static-delta verify` after the keys load
+/// has this form.
 fn verification_fails(text: &str) -> ! {
     println!("Verification fails");
     exit_error(text)
 }
 
-/// Verify a static delta's signatures, in the tool's check order: the
-/// argument is present, the sign type is carried, the keys load, the argument
-/// resolves and the superblock reads, then the signatures verify. Every
-/// failure from the argument resolution on prints `Verification fails` first
-/// (`docs/format-reference.md`, "CLI output formats", `static-delta`).
+/// Verifies the signatures of a static delta.
+///
+/// The checks come in the order of the `ostree` command:
+///
+/// 1. The argument is present.
+/// 2. ostrya supports the sign type.
+/// 3. The keys load.
+/// 4. The argument resolves, and the superblock reads.
+/// 5. The signatures verify.
+///
+/// Every failure from step 4 on prints `Verification fails` first.
 async fn delta_verify(repo_path: &Path, args: DeltaVerifyArgs) -> Result<()> {
     let Some(arg) = args.delta else {
         exit_error("DELTA must be specified");
@@ -3463,8 +3638,9 @@ async fn delta_verify(repo_path: &Path, args: DeltaVerifyArgs) -> Result<()> {
     }
 }
 
-/// The failure text of a static-delta signature check, `None` where the
-/// outcome is valid.
+/// Returns the failure text of a verify of static-delta signatures.
+///
+/// The result is `None` if the outcome is valid.
 fn delta_verify_failure(
     engine: SignType,
     keys: &VerifyKeys,
@@ -3507,12 +3683,13 @@ fn delta_verify_failure(
     ))
 }
 
-/// Read the sign type of `static-delta verify` and `static-delta
-/// apply-offline`. `ed25519`, and `spki` in a build that carries it, proceed.
-/// `dummy` refuses in its own words with nothing on standard output. Every
-/// other name, `gpg` included, refuses as not implemented, as the tool does;
-/// with `report_unsupported`, `Sign-type not supported` goes to standard
-/// output first, as `verify` prints it.
+/// Reads the sign type of `static-delta verify` and `apply-offline`.
+///
+/// - `ed25519`, and `spki` in a build that supports it, proceed.
+/// - `dummy` is refused in its own words, with nothing on standard output.
+/// - Every other name, `gpg` included, is refused as not implemented, as the
+///   `ostree` command does. With `report_unsupported`, `Sign-type not
+///   supported` goes to standard output first, as `verify` prints it.
 fn verify_sign_type(name: &str, report_unsupported: bool) -> SignType {
     match sign_type_from_name(name) {
         Ok(engine @ (SignType::Ed25519 | SignType::Spki)) => engine,
@@ -3526,12 +3703,20 @@ fn verify_sign_type(name: &str, report_unsupported: bool) -> SignType {
     }
 }
 
-/// Apply a static delta offline, in the tool's check order: the path is
-/// present, the sign type is carried, the keys load where a key source is
-/// given, the path folds lexically ([`lexical_path`]) and resolves and the
-/// superblock reads, the signatures of a signed delta verify, then the delta
-/// applies. The superblock is read once, so the bytes verified are the bytes
-/// applied. Nothing is printed on success.
+/// Applies a static delta offline.
+///
+/// The steps come in the order of the `ostree` command:
+///
+/// 1. The path is present.
+/// 2. ostrya supports the sign type.
+/// 3. The keys load, if a key source is given.
+/// 4. [`lexical_path`] applies the `..` components of the path. Then the path
+///    resolves, and the superblock reads.
+/// 5. The signatures of a signed delta verify.
+/// 6. The delta applies.
+///
+/// The superblock is read once, so the verified bytes are the applied bytes.
+/// Nothing is printed on success.
 async fn delta_apply_offline(repo: &Repo, args: DeltaApplyArgs) -> Result<()> {
     let Some(path) = args.path else {
         exit_error("PATH must be specified");
@@ -3582,11 +3767,16 @@ async fn delta_apply_offline(repo: &Repo, args: DeltaApplyArgs) -> Result<()> {
     Ok(())
 }
 
-/// `path` with its `..` components folded before the kernel resolves it, as
-/// the tool reads the `apply-offline` PATH. Empty and `.` components and a
-/// trailing `/` are dropped, and each `..` removes the component before it. A
-/// `..` at the start of a relative path stays, and a `..` at the root of an
-/// absolute path stays at the root. A path that folds to nothing is `.`.
+/// Returns `path` with its `..` components applied as text.
+///
+/// This step comes before the kernel resolves the path. The `ostree` command
+/// reads the `apply-offline` PATH in the same way. The rules:
+///
+/// - Empty and `.` components and a trailing `/` are dropped.
+/// - Each `..` removes the component before it.
+/// - A `..` at the start of a relative path stays.
+/// - A `..` at the root of an absolute path stays at the root.
+/// - A path that becomes empty is `.`.
 fn lexical_path(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut kept: Vec<Component> = Vec::new();
@@ -3610,12 +3800,15 @@ fn lexical_path(path: &Path) -> PathBuf {
     }
 }
 
-/// Load the keys of a sign-api verify run: `sign --verify`, `summary
-/// --verify`, and `static-delta verify`. The trusted keys are each
-/// `key_ids` entry, then each line of `keys_file`. With neither given, the
-/// trusted and revoked keys come from `keys_dir`, or from the system key
-/// directories where it is absent. No trusted key before revocation is
-/// `{type}: no keys loaded`. A key that is not a valid key refuses the run.
+/// Loads the keys of an ed25519 or spki verify.
+///
+/// The verify is `sign --verify`, `summary --verify`, or `static-delta
+/// verify`. The trusted keys are each `key_ids` entry, then each line of
+/// `keys_file`. If neither is given, the trusted and revoked keys come from
+/// `keys_dir`, or from the system key directories if `keys_dir` is absent.
+///
+/// If no trusted key is present before revocation, the error is
+/// `{type}: no keys loaded`. A key that is not valid refuses the run.
 fn load_verify_keys(
     engine: SignType,
     key_ids: &[String],
@@ -3649,10 +3842,12 @@ fn load_verify_keys(
     })
 }
 
-/// Decode one public key of a sign-api verify run with the tool's
-/// lenient base64 reader. Text that is not UTF-8 decodes to no byte. An
-/// ed25519 key of any length but 32 bytes refuses the run in the tool's
-/// words; the spki engine validates its own keys.
+/// Decodes one public key of an ed25519 or spki verify.
+///
+/// The decoder is [`lenient_base64`], the lenient base64 reader of the
+/// `ostree` command. Text that is not UTF-8 decodes to no byte. An ed25519 key
+/// with a length other than 32 bytes refuses the run in the words of `ostree`.
+/// The spki engine checks its own keys.
 fn verify_key_bytes(engine: SignType, text: &[u8]) -> Vec<u8> {
     let key = match std::str::from_utf8(text) {
         Ok(_) => lenient_base64(text),
@@ -3667,13 +3862,19 @@ fn verify_key_bytes(engine: SignType, text: &[u8]) -> Vec<u8> {
     key
 }
 
-/// Read the public keys of a sign-api verify `--keys-file`, one per
-/// line. The path must name a regular file, symlinks followed, which is
-/// checked before the open so a FIFO is refused and not waited on. The file is
-/// read up to [`VERIFY_KEYS_FILE_LIMIT`] and refused past it. Each line is
-/// read as bytes with a trailing `\r` removed. A line that is then empty is
-/// skipped; every other line, a line of whitespace included, is decoded as a
-/// key. A file with no key line is refused.
+/// Reads the public keys of a `--keys-file` for an ed25519 or spki verify.
+///
+/// The file holds one key on each line. The rules:
+///
+/// - The path must name a regular file, with symlinks followed. This check
+///   comes before the open, so the command refuses a FIFO and does not wait
+///   on it.
+/// - The file is read up to [`VERIFY_KEYS_FILE_LIMIT`] bytes. A larger file is
+///   refused.
+/// - Each line is read as bytes, with a trailing `\r` removed.
+/// - A line that is then empty is skipped. Every other line, also a line of
+///   whitespace, is decoded as a key.
+/// - A file with no key line is refused.
 fn read_verify_keys_file(engine: SignType, path: &Path) -> Result<Vec<Vec<u8>>> {
     use std::io::Read;
     let shown = path.display();
@@ -3704,15 +3905,18 @@ fn read_verify_keys_file(engine: SignType, path: &Path) -> Result<Vec<Vec<u8>>> 
     Ok(keys)
 }
 
-/// Print one `<label>: <n> (<size wording>)` line of `static-delta show`.
+/// Prints one `<label>: <n> (<size wording>)` line of `static-delta show`.
 fn print_delta_size(label: &str, n: u64) {
     println!("{label}: {n} ({})", format_delta_size(n));
 }
 
-/// A byte count in the tool's wording: `1 byte`, and `N bytes` for any other
-/// count below 1000. From 1000, the count over the largest power of 1000 it
-/// reaches, to one decimal place with ties to even on the exact double, then
-/// U+00A0 and the unit.
+/// Returns a byte count in the words of the `ostree` command.
+///
+/// - A count of 1 is `1 byte`.
+/// - Any other count of less than 1000 is `N bytes`.
+/// - A count of 1000 or more is divided by the largest power of 1000 that it
+///   reaches. The text is this value to one decimal place, with ties to even
+///   on the exact double, then U+00A0 and the unit.
 fn format_delta_size(n: u64) -> String {
     const UNITS: [(u64, &str); 6] = [
         (1_000_000_000_000_000_000, "EB"),
@@ -3723,19 +3927,20 @@ fn format_delta_size(n: u64) -> String {
         (1_000, "kB"),
     ];
     match UNITS.iter().find(|(factor, _)| n >= *factor) {
-        // Each factor is exact as a double, 5^18 being below 2^53.
+        // Each factor is exact as a double, because 5^18 is less than 2^53.
         Some((factor, unit)) => format!("{:.1}\u{a0}{unit}", n as f64 / *factor as f64),
         None if n == 1 => "1 byte".to_owned(),
         None => format!("{n} bytes"),
     }
 }
 
-/// Generate a static delta, optionally sign it, and print what it is
-/// generated from and to.
+/// Generates a static delta and prints the commits that it goes from and to.
+///
+/// If signing keys are given, the delta is signed.
 async fn delta_generate(repo: &Repo, repo_path: &Path, args: DeltaGenerateArgs) -> Result<()> {
-    // Indexing rebuilds the cache from the deltas present under the
-    // repository's `deltas/` tree, which a delta written elsewhere is not part
-    // of, so the pair would silently index nothing.
+    // The reindex rebuilds the cache from the deltas under the `deltas/` tree
+    // of the repository. A delta written to another location is not in this
+    // tree, so the combination indexes nothing and gives no message.
     if args.reindex && (args.output_dir.is_some() || args.filename.is_some()) {
         return Err(Error::InvalidFormat(
             "--reindex covers the deltas under the repository's deltas/ tree, so it \
@@ -3756,8 +3961,8 @@ async fn delta_generate(repo: &Repo, repo_path: &Path, args: DeltaGenerateArgs) 
         (None, false) => Some(resolve(repo, &format!("{}^", to.to_hex())).await?),
     };
 
-    // The tool reads the repository's own superblock for the delta, whatever
-    // location this run writes to.
+    // The `ostree` command reads the superblock of the delta in the
+    // repository, at any output location of the run.
     if args.if_not_exists {
         let superblock = repo_path
             .join(ostrya::static_delta_relative_dir(from.as_ref(), &to))
@@ -3772,8 +3977,9 @@ async fn delta_generate(repo: &Repo, repo_path: &Path, args: DeltaGenerateArgs) 
         }
     }
 
-    // The byte order starts from the host order, as the tool's does, and is
-    // checked after `-n` and the default parent and before the block.
+    // The byte order starts from the host order, as the byte order of the
+    // `ostree` command does. It is checked after `-n` and the default parent,
+    // and before the block.
     let endianness = match args.set_endianness.as_deref() {
         None if cfg!(target_endian = "big") => DeltaEndianness::Big,
         None => DeltaEndianness::Little,
@@ -3787,8 +3993,9 @@ async fn delta_generate(repo: &Repo, repo_path: &Path, args: DeltaGenerateArgs) 
         (true, DeltaEndianness::Big) => DeltaEndianness::Little,
     };
 
-    // The block comes before the keys are read and before anything is
-    // written, as the tool prints it, so a run that fails later prints it too.
+    // The block is printed before the keys are read and before any write, as
+    // the `ostree` command prints it. A run that fails later also prints the
+    // block.
     println!("Generating static delta:");
     println!(
         "  From: {}",
@@ -3817,8 +4024,11 @@ async fn delta_generate(repo: &Repo, repo_path: &Path, args: DeltaGenerateArgs) 
     Ok(())
 }
 
-/// The signers of a generate run: one per `--sign` value and per line of each
-/// `--keys-file`, under `--sign-type`. Empty where neither is given.
+/// Returns the signers of a `static-delta generate` run.
+///
+/// There is one signer for each `--sign` value and for each line of each
+/// `--keys-file`, under `--sign-type`. If neither option is given, the list is
+/// empty.
 fn delta_signers(args: &DeltaGenerateArgs) -> Result<Vec<Arc<dyn Signer>>> {
     if args.sign.is_empty() && args.keys_file.is_empty() {
         return Ok(Vec::new());
@@ -3848,38 +4058,43 @@ fn delta_signers(args: &DeltaGenerateArgs) -> Result<Vec<Arc<dyn Signer>>> {
         .collect()
 }
 
-/// The one `--parent` value that is a literal rather than a revision, in
-/// lowercase alone: it asks for a root commit.
+/// The literal `--parent` value that asks for a root commit.
+///
+/// It is the one `--parent` value that is not read as a revision. Only the
+/// lowercase spelling has this meaning.
 const NO_PARENT: &str = "none";
 
+/// Writes one commit from the tree sources of a `commit` command line.
+///
+/// On success, the command prints the commit checksum, or the
+/// `--table-output` block.
 async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>) -> Result<()> {
-    // The two walk-control files are read first: ahead of the missing-branch
-    // check, ahead of `--parent`, ahead of the metadata options, ahead of the
-    // tree, and ahead of the timestamp, which is where the tool reports a file
-    // it cannot open or read (`docs/format-reference.md`, "CLI output
-    // formats").
+    // The two walk-control files are read first. The `ostree` command reports a
+    // file that it cannot open or read at this step. The step comes before the
+    // missing-branch check, `--parent`, the metadata options, the tree, and the
+    // timestamp.
     let walk = match WalkOptions::read(&args) {
         Ok(walk) => walk,
         Err(message) => exit_error(&message),
     };
 
-    // A commit either names the branch it moves or states that it writes no ref.
-    // The check stands ahead of `--parent`, ahead of the tree, and ahead of any
-    // object publication, which is the order the tool reports it in
-    // (`docs/format-reference.md`, "CLI output formats").
+    // A commit names the branch that it moves, or states that it writes no
+    // ref. This check comes before `--parent`, the tree, and any object
+    // publication, in the order of the `ostree` command.
     if args.branch.is_none() && !args.orphan {
         exit_error("A branch must be specified with --branch, or use --orphan");
     }
 
-    // The tool refuses `--canonical-permissions` beside a non-zero owner id
-    // after the branch check and ahead of the tree.
+    // The `ostree` command refuses `--canonical-permissions` with a non-zero
+    // owner id after the branch check and before the tree.
     if let Some(message) = canonical_owner_conflict(args.canonical_permissions, owner) {
         exit_error(&message);
     }
 
-    // Every refusal from here to the transaction below stands ahead of the
-    // repository lock, so there is no transaction to abort and no staging
-    // directory to reap: the process exits having written no object and no ref.
+    // Each refusal from this point to the transaction comes before the
+    // repository lock. At that point, there is no transaction to abort and no
+    // staging directory to reap. The process exits with no object and no ref
+    // written.
     macro_rules! refuse_unlocked {
         ($result:expr) => {
             match $result {
@@ -3889,14 +4104,14 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         };
     }
 
-    // The `[core]` keys the transaction reads are parsed here, ahead of the
-    // edit, because the transaction opens once the editor has returned. The
-    // tool reads them when it opens the repository, so a value their reader
-    // refuses stands ahead of `--parent`, ahead of the metadata options, and
-    // ahead of the editor on both sides. The first four are the set the
-    // transaction open reads; the fsync pair is the set its write paths read,
-    // and it is parsed here too so that `--fsync` does not move where a
-    // refusal lands (`docs/format-reference.md`, "The fsync vocabulary").
+    // The `[core]` keys that the transaction reads are parsed here, before the
+    // edit, because the transaction opens after the editor returns. The
+    // `ostree` command reads them when it opens the repository. In both
+    // commands, the error for a refused value then comes before `--parent`, the
+    // metadata options, and the editor. The first four keys are the set that
+    // the transaction open reads. The fsync pair is the set that its write
+    // paths read. It is also parsed here, so `--fsync` does not change the
+    // place of a refusal.
     let config = repo.config();
     config.locking()?;
     config.lock_timeout_secs()?;
@@ -3905,23 +4120,23 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     config.fsync()?;
     config.per_object_fsync()?;
 
-    // `--parent` takes a revision, so it carries the resolution wording every
-    // subcommand taking one gives.
+    // `--parent` takes a revision, so its errors use the resolution words of
+    // each subcommand that takes a revision.
     let parent = match args.parent.as_deref() {
         Some(NO_PARENT) => None,
         Some(rev) => match repo.resolve_rev(rev, false).await {
             Ok(found) => found,
             Err(err) => return Err(report_resolution_failure(err)),
         },
-        // `--orphan` suppresses the implicit parent alone, so an explicit
-        // `--parent` alongside it still parents the commit.
+        // `--orphan` suppresses only the implicit parent, so an explicit
+        // `--parent` with it still gives the commit a parent.
         None if args.orphan => None,
-        // The branch's current tip is the implicit parent. The tip is read from
-        // the ref file and not loaded, so a branch that names no ref gives a
-        // root commit and a ref over an absent object is inherited unread. A
-        // name the guard below refuses is not read at all. A name the checksum
-        // guard refuses and a name the ref-name rule refuses are both refused
-        // after the commit is written.
+        // The current tip of the branch is the implicit parent. The tip comes
+        // from the ref file, and its commit object is not loaded. A branch that
+        // names no ref then gives a root commit, and the commit inherits a ref
+        // over an absent object with no read. If the match guard refuses a
+        // name, its tip is not read. The checksum guard and the ref-name rule
+        // refuse such a name after the commit is written.
         None => match args.branch.as_deref() {
             Some(branch)
                 if shadowed_branch_name(branch).is_none() && validate_refspec(branch).is_ok() =>
@@ -3935,11 +4150,10 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         },
     };
 
-    // The metadata options are read next, each group in the order below, and a
-    // group's refusal stands ahead of the body file, ahead of the editor, ahead
-    // of the tree, and ahead of the timestamp (`docs/format-reference.md`,
-    // "CLI output formats"). An empty key is refused where the dict is
-    // assembled instead, so it stands after all four.
+    // The metadata options are read next, each group in the order of the
+    // code. The refusal of a group comes before the body file, the editor, the
+    // tree, and the timestamp. An empty key is refused when the dict is
+    // assembled, so this refusal comes after all four.
     if !args.keep_metadata.is_empty() && parent.is_none() {
         refuse_unlocked!(Err(
             "Either --branch or --parent must be specified when using --keep-metadata".to_owned()
@@ -3953,8 +4167,8 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         None => Vec::new(),
     };
 
-    // `-e` replaces the subject and the body outright, so neither `-m` nor
-    // `-F` is read when it is given; `-F` wins over `-m` in either order.
+    // `-e` replaces the subject and the body, so if it is given, neither `-m`
+    // nor `-F` is read. `-F` wins over `-m` in either order.
     let body = match (args.editor, args.body_file.as_deref()) {
         (true, _) => None,
         (false, Some(path)) => Some(refuse_unlocked!(read_body_file(path))),
@@ -3962,8 +4176,8 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     };
 
     // The editor runs after the metadata options are read and before the tree
-    // opens, so a tree path that does not open and a timestamp the reader
-    // refuses are both reported after the edit. Its result replaces both the
+    // opens. A tree path that does not open and a refused timestamp are then
+    // both reported after the edit. The result of the editor replaces the
     // subject and the body.
     let (subject, body) = if args.editor {
         let edited = refuse_unlocked!(
@@ -3978,29 +4192,27 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         (args.subject.clone(), body)
     };
 
-    // The message is settled, so the repository lock is taken now: an editing
-    // session holds no lock, and an exclusive operation on the same repository
-    // runs while the message is being written. The tool takes its lock at this
-    // same point.
+    // The message is final, so the repository lock is taken now. An edit
+    // session holds no lock, so an exclusive operation on the same repository
+    // can run while the user writes the message. The `ostree` command takes
+    // its lock at the same point.
     let mut txn = repo.transaction().await?;
-    // The option narrows the configured policy and never widens it: a repository
-    // holding `[core] fsync=false` syncs nothing under `--fsync=true`, so only
-    // `false` reaches the transaction and `true` leaves the config in charge
-    // (`docs/format-reference.md`, "CLI output formats", "The fsync
-    // vocabulary").
+    // `--fsync` can narrow the configured policy and never widens it. A
+    // repository with `[core] fsync=false` syncs nothing under `--fsync=true`.
+    // Only `false` reaches the transaction, and with `true` the config applies.
     if fsync == Some(false) {
         txn.set_fsync(false);
     }
     // `--generate-sizes` covers both ingest paths, the tar stream included, so
-    // the request goes to the transaction rather than to the walk's commit
-    // modifier. Outside archive mode it changes nothing. A skip list naming the
-    // walk root leaves every source unread, so no object is accounted and the
-    // key is left out of the commit altogether
-    // (`docs/format-reference.md`, "Metadata object formats").
+    // the request goes to the transaction. The commit modifier of the walk
+    // does not get it. Outside archive mode, the request changes nothing. If a
+    // skip list names the walk root, no source is read. Then no object is
+    // counted, and the commit has no `ostree.sizes` key.
     txn.set_generate_sizes(args.generate_sizes && !walk.root_pruned);
 
-    // A refusal from here on has a transaction to abort first: `exit_error`
-    // runs no destructor, so the staging directory is reaped ahead of it.
+    // From this point, a refusal first aborts the transaction. `exit_error`
+    // runs no destructor, so the abort reaps the staging directory before the
+    // exit.
     macro_rules! refuse {
         ($result:expr) => {
             match $result {
@@ -4013,11 +4225,10 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         };
     }
 
-    // `--base` is the bottom layer of the source list whatever its position on
-    // the command line, and it resolves ahead of the tree specifications, so an
-    // unresolvable base is reported before a source that does not open and
-    // before `--consume` removes anything
-    // (`docs/format-reference.md`, "CLI output formats", `commit`).
+    // `--base` is the bottom layer of the source list at any position on the
+    // command line. It resolves before the tree specifications. The error for a
+    // base that does not resolve then comes before a source that does not open,
+    // and before `--consume` removes anything.
     let base = match args.base.as_deref() {
         Some(rev) => match repo.resolve_rev(rev, false).await {
             Ok(found) => found,
@@ -4029,9 +4240,9 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         None => None,
     };
 
-    // The cache is built from this repository's own loose objects, so a source
-    // tree checked out by any earlier process resolves through it. `-I` implies
-    // `--link-checkout-speedup`.
+    // The cache is built from the loose objects of this repository, so a
+    // source tree that an earlier process checked out resolves through it.
+    // `-I` implies `--link-checkout-speedup`.
     let devino = if args.link_checkout_speedup || args.devino_canonical {
         Some(repo.devino_cache().await?)
     } else {
@@ -4039,15 +4250,15 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     };
     let mut modifier = commit_modifier(&args, owner, &walk, devino);
     let mut mtree = MutableTree::new();
-    // The sources are read ahead of `--timestamp`, one at a time and in order,
-    // so a source that does not open is reported where the tool reports it and
-    // a source `--consume` already emptied stays gone when a later one fails
-    // (`docs/format-reference.md`, "CLI output formats", `commit`).
+    // The sources are read before `--timestamp`, one at a time and in order.
+    // The error for a source that does not open then comes at the step of the
+    // `ostree` command. If a later source fails, a source that `--consume`
+    // emptied stays empty.
     let specs = refuse!(tree_specs(&args));
-    // The base is the bottom layer and no modifier reaches it, so every
-    // entry a later source leaves alone keeps the mode, the ownership, and
-    // the extended attributes the base recorded. A pruned walk root
-    // contributes nothing over it, so the base alone is what the commit holds.
+    // The base is the bottom layer, and no modifier applies to it. Each entry
+    // that no later source changes keeps the mode, the owner, and the extended
+    // attributes of the base. A pruned walk root adds nothing over the base, so
+    // then the commit holds the base alone.
     if let Some(base) = base {
         let (commit, _) = repo.load_commit(&base).await?;
         txn.overlay_tree_to_mtree(&commit.root_dirtree, &commit.root_dirmeta, &mut mtree, None)
@@ -4055,36 +4266,36 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     }
     for spec in specs {
         let source = refuse!(open_tree_source(&repo, spec).await?);
-        // A skip list naming the walk root prunes the walk itself: the source
-        // is opened, so one that does not open is reported here, and no entry
-        // below the root is offered to the filter, so every other entry of
-        // either control file goes unmatched.
+        // If a skip list names the walk root, it prunes the whole walk. The
+        // source is opened, so a source that does not open is reported here.
+        // The filter gets no entry under the root, so every other entry of
+        // each control file stays unmatched.
         if walk.root_pruned {
             continue;
         }
-        // An OR-form `--statoverride` entry over a directory below the walk
-        // root reaches an archive's member alone, and one modifier is shared by
-        // every source, so the source kind is stated before the overlay reads
-        // it (`docs/format-reference.md`, "CLI output formats", `commit`).
+        // An OR-form `--statoverride` entry for a directory under the walk
+        // root applies only to a member of an archive. All sources share one
+        // modifier, so the source kind is set before the overlay reads it.
         walk.source_is_tar
             .store(matches!(source, OpenSource::Tar(_)), Ordering::Relaxed);
-        // `ostree.sizes` covers the objects the last source contributed
-        // together with the directory objects the serialization writes, so
-        // each source opens its own accounting scope.
+        // `ostree.sizes` covers the objects of the last source and the
+        // directory objects that the serialization writes. For this reason,
+        // each source opens its own scope for the count.
         txn.begin_tree_source();
         refuse!(overlay_source(&repo, &txn, &args, source, &mut mtree, modifier.as_mut()).await?);
     }
-    // Both control files are checked once the sources have been read, the
-    // statoverride file first. An entry inside a pruned directory is unmatched,
-    // the walk never having reached it.
+    // Both control files are checked after all sources are read, the
+    // statoverride file first. An entry in a pruned directory is unmatched,
+    // because the walk did not reach it.
     refuse!(report_unmatched(
         "statoverride",
         &walk.unmatched_statoverride()
     ));
     refuse!(report_unmatched("skip-list", &walk.unmatched_skip_list()));
-    // A source list that supplied no root directory -- an empty archive, one
-    // naming no root member, or a walk the skip list pruned at the root --
-    // leaves the tree with no metadata to write, `--base` having supplied none.
+    // If the source list gives no root directory, and `--base` gives none,
+    // the tree has no metadata to write. This occurs for an empty archive, an
+    // archive with no root member, or a walk that the skip list pruned at the
+    // root.
     if mtree.metadata_checksum().is_none() {
         refuse!(Err("Can't commit an empty tree".to_owned()));
     }
@@ -4110,11 +4321,11 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     ));
     let detached = detached_metadata_dict(&detached_pairs);
 
-    // `--skip-if-unchanged` compares the walked tree against the resolved
-    // parent, root contents and root metadata both. The commit's own metadata
-    // takes no part, so a new subject or a new metadata key over an unchanged
-    // tree is still skipped. With no parent there is nothing to compare and the
-    // commit is written.
+    // `--skip-if-unchanged` compares the walked tree with the resolved
+    // parent, both the root contents and the root metadata. The metadata of
+    // the commit is not compared, so a new subject or a new metadata key over
+    // an unchanged tree is still skipped. With no parent, there is nothing to
+    // compare, and the commit is written.
     if args.skip_if_unchanged
         && let Some(parent) = parent
     {
@@ -4132,16 +4343,16 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         }
     }
 
-    // The two derived keys are read from the committed tree, so they stand
-    // after the walk, after the control-file reports, after the empty-tree
-    // refusal, and after `--skip-if-unchanged` has had its say
-    // (`docs/format-reference.md`, "CLI output formats", `commit`).
+    // The two derived keys come from the committed tree, so they come after the
+    // walk, the control-file reports, the empty-tree refusal, and
+    // `--skip-if-unchanged`.
     let mut metadata = metadata;
     if args.bootable {
         let version = refuse!(kernel_version(&txn, &root).await?);
-        // The derived pair replaces a value supplied for either key: a commit
-        // carrying `--add-metadata-string=ostree.linux=...` beside `--bootable`
-        // reaches the same object as one carrying `--bootable` alone.
+        // The derived pair replaces a given value for each of the two keys. As
+        // a result, a commit with `--add-metadata-string=ostree.linux=...` and
+        // `--bootable` gives the same object as a commit with `--bootable`
+        // alone.
         drop_metadata_keys(&mut metadata, &[LINUX_KEY, BOOTABLE_KEY])?;
         let mut pair = DictBuilder::new();
         pair.insert_bootable(&version);
@@ -4150,11 +4361,11 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         };
         prepend_metadata_entries(&mut metadata, entries)?;
     }
-    // The composefs digest stands after the binding keys, and the library
-    // appends `ostree.sizes` after it. A value the command line supplied under
-    // the same key -- through `--add-metadata-string`, `--add-metadata`, or
-    // `--keep-metadata` -- takes the derived digest in the slot it already
-    // holds, and a repeated key collapses to that one entry.
+    // The composefs digest comes after the binding keys, and the library
+    // appends `ostree.sizes` after the digest. A value of the command line
+    // under the same key gets the derived digest in its slot. This applies to
+    // `--add-metadata-string`, `--add-metadata`, and `--keep-metadata`. A
+    // repeated key becomes that one entry.
     if args.generate_composefs_metadata {
         let digest = txn.composefs_digest(&root).await?;
         let entry = Value::Tuple(vec![
@@ -4175,14 +4386,16 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         metadata: Some(metadata),
     };
     let checksum = txn.write_commit(opts, &root).await?;
-    // A branch name the revision syntax shadows, and one the refspec grammar
-    // refuses, are both reported after the commit is written and ahead of the
-    // signing step, which is the order the tool reports each of them against a
-    // key it cannot use. The refspec grammar is the ref-name rule of the tool,
-    // so a name with a space or a caret is refused here with `Invalid refspec
-    // <name>`. The refusal comes at the ref write, after the tree is read, so
-    // an error of the tree can come first. `exit_error` runs no destructor, so
-    // the staging directory is reaped ahead of it.
+    // A branch name that the revision syntax shadows is reported after the
+    // commit is written and before the signing step. A name that the refspec
+    // grammar refuses is reported at the same step. The `ostree` command
+    // reports each of them in this order, before a key that it cannot use. The
+    // refspec grammar is the ref-name rule of `ostree`, so a name with a space
+    // or a caret gets `Invalid refspec <name>`.
+    //
+    // The refusal comes at the ref write, after the tree is read, so an error
+    // of the tree can come first. `exit_error` runs no destructor, so the
+    // abort reaps the staging directory before the exit.
     if let Some(branch) = args.branch.as_deref() {
         if let Some(message) = shadowed_branch_name(branch) {
             txn.abort().await?;
@@ -4193,18 +4406,17 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
             exit_error(&format!("Invalid refspec {branch}"));
         }
     }
-    // `--add-detached-metadata-string` replaces the whole stored detached
-    // metadata and the signing engines append to what stands, so the dict is
-    // queued ahead of the signatures: a run naming both writes the user keys
-    // first and the signature keys after them, and it drops any signature an
-    // earlier run left on the same checksum
-    // (`docs/format-reference.md`, "CLI output formats", `commit`).
+    // `--add-detached-metadata-string` replaces all stored detached metadata,
+    // and the signing engines append to the current metadata. For this reason,
+    // the dict is queued before the signatures. A run with both writes the user
+    // keys first and the signature keys after them. It also drops each
+    // signature that an earlier run left on the same checksum.
     if let Some(detached) = detached {
         txn.set_commit_detached_metadata(&checksum, detached);
     }
-    // The signatures are produced before the ref is written and before the
-    // transaction publishes, so a key that cannot sign leaves no object in
-    // `objects/` and the ref where it stood.
+    // The signatures are made before the ref is written and before the
+    // transaction publishes. If a key cannot sign, `objects/` then gets no
+    // object and the ref does not move.
     refuse!(sign_staged_commit(&txn, &checksum, &args).await?);
     if let Some(branch) = args.branch.as_deref() {
         txn.set_ref(branch, Some(&checksum));
@@ -4219,10 +4431,11 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     Ok(())
 }
 
-/// The refusal of `--canonical-permissions` beside a declared non-zero owner
-/// id, or `None` where the options agree. Canonical ingest owns every object
-/// 0:0, so a declared non-zero id would contradict it. The refusal names the
-/// flag whose id was read, uid first.
+/// Returns the refusal of `--canonical-permissions` with a non-zero owner id.
+///
+/// The result is `None` if the options agree. Canonical ingest gives every
+/// object the owner 0:0, so a declared non-zero id contradicts it. The refusal
+/// names the option whose id was read, uid first.
 fn canonical_owner_conflict(canonical: bool, owner: Owner) -> Option<String> {
     if !canonical {
         return None;
@@ -4233,27 +4446,29 @@ fn canonical_owner_conflict(canonical: bool, owner: Owner) -> Option<String> {
         .map(|(_, flag)| format!("Cannot specify both --canonical-permissions and non-zero {flag}"))
 }
 
-/// The `--sign-type` name in force when the option is absent, and the one name
-/// the tool's own build carries.
+/// The `--sign-type` name that applies if the option is absent.
+///
+/// It is also the one name that the build of the `ostree` command supports.
 const DEFAULT_SIGN_TYPE: &str = "ed25519";
 
-/// The length of an ed25519 secret key: the 32-byte seed followed by the
-/// 32-byte public key.
+/// The length in bytes of an ed25519 secret key.
+///
+/// The key is the 32-byte seed, then the 32-byte public key.
 const ED25519_SECRET_LEN: usize = 64;
 
-/// The largest first line `--sign-from-file` accepts. A base64 ed25519 secret
-/// is 88 characters and a GPG key id shorter still, so this bounds the read well
-/// above any key while barring an unbounded one (`CLAUDE.md`, "Working
-/// conventions"). A longer first line is refused rather than cut.
+/// The maximum length in bytes of the first line that `--sign-from-file` reads.
+///
+/// A base64 ed25519 secret is 88 characters, and a GPG key id is shorter. The
+/// limit is far more than any key, and it bars an unbounded read. A longer
+/// first line is refused. The line is never cut.
 const SIGN_KEY_FILE_LIMIT: u64 = 64 * 1024;
 
-/// Sign the staged commit with every key the signing options name, in the
-/// order of [`collect_signers`].
+/// Signs the staged commit with each key that the signing options name.
 ///
-/// The step runs after the commit object is staged and before the ref write and
-/// the publication, so a refusal here leaves no object in `objects/` and the ref
-/// where it stood, and a run naming several keys is all or nothing
-/// (`docs/format-reference.md`, "Signing details").
+/// The order is the order of [`collect_signers`]. The step runs after the
+/// commit object is staged, and before the ref write and the publication. A
+/// refusal at this step leaves no object in `objects/` and does not move the
+/// ref. A run with several keys is all or nothing.
 async fn sign_staged_commit(
     txn: &Transaction,
     checksum: &Checksum,
@@ -4277,18 +4492,33 @@ async fn sign_staged_commit(
     Ok(Ok(()))
 }
 
-/// One signer for each key the signing options name, all built before any
-/// signature is made.
+/// Returns one signer for each key that the signing options name.
 ///
-/// The order is fixed and does not follow the command line: every `--sign` key
-/// first, then every `--sign-from-file` key, then every `--gpg-sign` key.
-/// `sign_type` selects the engine of the first two groups alone and is read
-/// only when one of them names a key, so a name no engine carries passes
-/// unremarked through a run that signs nothing. A key that does not decode, a
-/// key file that does not read, and a gpg selector that does not name exactly
-/// one secret key are each refused here, so a refusal comes before the first
-/// signature. A gpg selector is a `--gpg-sign` key, or a `--sign` or
-/// `--sign-from-file` key under `--sign-type=gpg`.
+/// All signers are built before the first signature.
+///
+/// # Order
+///
+/// The order is fixed and does not follow the command line:
+///
+/// 1. every `--sign` key
+/// 2. every `--sign-from-file` key
+/// 3. every `--gpg-sign` key
+///
+/// `sign_type` selects the engine of the first two groups alone. It is read
+/// only if one of these groups names a key. A run that signs nothing then
+/// accepts an engine name that no engine has, with no message.
+///
+/// # Refusals
+///
+/// The function refuses these inputs, so each refusal comes before the first
+/// signature:
+///
+/// - a key that does not decode
+/// - a key file that does not read
+/// - a gpg selector that does not name exactly one secret key
+///
+/// A gpg selector is a `--gpg-sign` key, or a `--sign` or `--sign-from-file`
+/// key under `--sign-type=gpg`.
 async fn collect_signers(
     sign: &[String],
     sign_from_file: &[std::ffi::OsString],
@@ -4332,22 +4562,26 @@ async fn collect_signers(
     Ok(Ok(signers))
 }
 
-/// The shortest `--gpg-sign` selector the key lookup accepts, in bytes. A
-/// shorter one is refused without a lookup
-/// (`docs/format-reference.md`, "Signing details").
+/// The minimum length in bytes of a `--gpg-sign` selector for the key lookup.
+///
+/// A shorter selector is refused with no lookup.
 #[cfg(feature = "gpg")]
 const GPG_SIGN_SELECTOR_MIN: usize = 8;
 
-/// Resolve the `--gpg-sign` selectors into one signer each, in command-line
-/// order.
+/// Resolves the `--gpg-sign` selectors to signers, in command-line order.
 ///
-/// Each selector is resolved in the GnuPG home directory `homedir` names, or
-/// the one gpg resolves for itself, and it must name exactly one secret key. A
-/// selector under [`GPG_SIGN_SELECTOR_MIN`] bytes is refused without a lookup,
-/// one that names no key and one that names several each carry their own
-/// refusal, and every selector is resolved before the caller produces any
-/// signature. Each signer is bound to the fingerprint the lookup returned, so
-/// the key that signs is the key the lookup named.
+/// There is one signer for each selector. Each selector is resolved in the
+/// GnuPG home directory that `homedir` names, or in the directory that gpg
+/// resolves for itself. It must name exactly one secret key.
+///
+/// - A selector of less than [`GPG_SIGN_SELECTOR_MIN`] bytes is refused with
+///   no lookup.
+/// - A selector that names no key, and a selector that names several keys,
+///   each get a refusal of their own.
+///
+/// Every selector is resolved before the caller makes a signature. Each signer
+/// is bound to the fingerprint from the lookup, so the key that signs is the
+/// key that the lookup named.
 #[cfg(feature = "gpg")]
 async fn resolve_gpg_selectors(
     selectors: &[String],
@@ -4378,6 +4612,9 @@ async fn resolve_gpg_selectors(
     Ok(Ok(signers))
 }
 
+/// Refuses each `--gpg-sign` selector, because this build has no gpg engine.
+///
+/// An empty selector list gives no signer and no refusal.
 #[cfg(not(feature = "gpg"))]
 async fn resolve_gpg_selectors(
     selectors: &[String],
@@ -4387,11 +4624,11 @@ async fn resolve_gpg_selectors(
         return Ok(Ok(Vec::new()));
     }
     // A build without the engine refuses through the same channel as every
-    // other signing refusal, so the line reads the same wherever it comes from.
+    // other signing refusal, so the line is the same at every site.
     Ok(Err("Requested signature type is not implemented".to_owned()))
 }
 
-/// The gpg signer for one key selector, bound to `homedir` where one is given.
+/// Returns the gpg signer for one key selector, bound to `homedir` if given.
 #[cfg(feature = "gpg")]
 fn gpg_signer(key: &str, homedir: Option<&Path>) -> GpgSigner {
     let signer = GpgSigner::new(key);
@@ -4401,9 +4638,10 @@ fn gpg_signer(key: &str, homedir: Option<&Path>) -> GpgSigner {
     }
 }
 
-/// The GnuPG home directory a key-lookup refusal names: the signer's home
-/// directory, or the literal `<default>` where the signer carries none and gpg
-/// resolves the directory for itself.
+/// Returns the GnuPG home directory that a key-lookup refusal names.
+///
+/// This is the home directory of the signer, or the literal `<default>` if
+/// the signer has none and gpg resolves the directory for itself.
 #[cfg(feature = "gpg")]
 fn gpg_homedir_text(signer: &GpgSigner) -> String {
     match signer.homedir() {
@@ -4412,11 +4650,13 @@ fn gpg_homedir_text(signer: &GpgSigner) -> String {
     }
 }
 
-/// Read `--sign-type` into the engine it names, refusing a name no engine
-/// carries in the tool's own words. The match is exact and case sensitive with
-/// no trimming, so `ED25519` and a whitespace-padded name each name no engine.
-/// `dummy` is a registered engine the command line does not reach, and it
-/// carries its own refusal.
+/// Reads `--sign-type` into the engine that it names.
+///
+/// A name that no engine has is refused in the words of the `ostree` command.
+/// The match is exact and case sensitive, with no trim, so `ED25519` and a name
+/// with whitespace around it each name no engine. `dummy` is a registered
+/// engine that the command line does not reach, and it has a refusal of its
+/// own.
 fn sign_type_from_name(name: &str) -> std::result::Result<SignType, String> {
     match name {
         "ed25519" => Ok(SignType::Ed25519),
@@ -4429,13 +4669,14 @@ fn sign_type_from_name(name: &str) -> std::result::Result<SignType, String> {
     }
 }
 
-/// The signer one `--sign` or `--sign-from-file` key names under `engine`.
+/// Returns the signer of one `--sign` or `--sign-from-file` key under `engine`.
 ///
-/// The key arrives as bytes, since `--sign-from-file` reads a line of a file
-/// and the tool places no encoding requirement on it. The ed25519 engine reads
-/// the bytes directly; the engines whose key is a text selector read the same
-/// bytes with every invalid UTF-8 sequence replaced. `gpg_homedir` binds the gpg
-/// engine alone.
+/// The key arrives as bytes, because `--sign-from-file` reads a line of a
+/// file, and the `ostree` command sets no encoding requirement on it. The
+/// ed25519 engine reads the bytes directly. The engines whose key is a text
+/// selector read the same bytes, with each invalid UTF-8 sequence replaced.
+///
+/// `gpg_homedir` applies to the gpg engine alone.
 fn sign_api_signer(
     engine: SignType,
     key: &[u8],
@@ -4453,6 +4694,7 @@ fn sign_api_signer(
     }
 }
 
+/// Returns the spki signer of one base64 secret key.
 #[cfg(feature = "spki")]
 fn sign_api_signer_spki(key: &str) -> std::result::Result<Box<dyn Signer>, String> {
     SpkiSigner::from_base64(key)
@@ -4460,11 +4702,13 @@ fn sign_api_signer_spki(key: &str) -> std::result::Result<Box<dyn Signer>, Strin
         .map_err(|err| err.to_string())
 }
 
+/// Returns an error, because this build has no spki engine.
 #[cfg(not(feature = "spki"))]
 fn sign_api_signer_spki(_: &str) -> std::result::Result<Box<dyn Signer>, String> {
     Err("Requested signature type is not implemented".to_owned())
 }
 
+/// Returns the gpg signer of one key selector, bound to `homedir` if given.
 #[cfg(feature = "gpg")]
 fn sign_api_signer_gpg(
     key: &str,
@@ -4473,18 +4717,22 @@ fn sign_api_signer_gpg(
     Ok(Box::new(gpg_signer(key, homedir)))
 }
 
+/// Returns an error, because this build has no gpg engine.
 #[cfg(not(feature = "gpg"))]
 fn sign_api_signer_gpg(_: &str, _: Option<&Path>) -> std::result::Result<Box<dyn Signer>, String> {
     Err("Requested signature type is not implemented".to_owned())
 }
 
-/// Read an ed25519 secret key from its base64 text, refusing a value of any
-/// other length in the tool's own words.
+/// Reads an ed25519 secret key from its base64 text.
 ///
-/// The decode is lenient: every byte outside the base64 alphabet is skipped, so
-/// surrounding whitespace, an interior newline, and a line of prose all decode
-/// to some byte count and the length check states the refusal. This is what
-/// makes `--sign=not-base64!!!` report six bytes rather than a decoder error.
+/// A value with a length other than [`ED25519_SECRET_LEN`] is refused in the
+/// words of the `ostree` command.
+///
+/// The decode ([`lenient_base64`]) is lenient: each byte outside the base64
+/// alphabet is skipped. Whitespace around the key, a newline in it, and a line
+/// of prose then all decode to some byte count. The length check gives the
+/// refusal. For this reason, `--sign=not-base64!!!` reports six bytes and no
+/// decoder error.
 fn ed25519_secret_key(key: &[u8]) -> std::result::Result<Vec<u8>, String> {
     let secret = lenient_base64(key);
     if secret.len() != ED25519_SECRET_LEN {
@@ -4497,21 +4745,29 @@ fn ed25519_secret_key(key: &[u8]) -> std::result::Result<Vec<u8>, String> {
     Ok(secret)
 }
 
-/// Decode base64 text the way the tool's decoder does.
+/// Decodes base64 text in the same way as the decoder of the `ostree` command.
 ///
-/// Every byte outside the alphabet is skipped, so whitespace and prose
-/// characters contribute nothing. A padding character carries the value zero and
-/// counts toward its group. Three bytes come out of every complete
-/// four-character group, and each of that group's last two characters that is a
-/// padding character removes one of them again. A trailing group short of four
-/// characters contributes nothing at all.
+/// # Rules
 ///
-/// Padding therefore acts per group and per position. `AAAA=` decodes to three
-/// bytes, since the padding character opens an incomplete group; `AA=A` decodes
-/// to two, since the padding character sits third in a complete group; and
-/// `AA==AA==` decodes to two, one byte from each of its two groups. A
-/// three-character argument decodes to zero bytes and a nine-character one to
-/// six.
+/// - Each byte outside the alphabet is skipped, so whitespace and prose
+///   characters add nothing.
+/// - A padding character has the value zero and counts toward its group.
+/// - Each complete group of four characters gives three bytes. Each of the
+///   last two characters of the group that is a padding character removes one
+///   of these bytes.
+/// - A trailing group of less than four characters adds nothing.
+///
+/// # Padding
+///
+/// Padding acts for each group and each position:
+///
+/// - `AAAA=` decodes to three bytes, because the padding character starts an
+///   incomplete group.
+/// - `AA=A` decodes to two bytes, because the padding character is third in a
+///   complete group.
+/// - `AA==AA==` decodes to two bytes, one byte from each of its two groups.
+/// - An argument of three characters decodes to zero bytes, and an argument of
+///   nine characters decodes to six bytes.
 fn lenient_base64(text: &[u8]) -> Vec<u8> {
     let value = |c: u8| -> Option<u8> {
         match c {
@@ -4548,23 +4804,28 @@ fn lenient_base64(text: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Read the key one `--sign-from-file` occurrence names: the first line of the
-/// file alone, with the rest of the file ignored.
+/// Reads the key that one `--sign-from-file` occurrence names.
 ///
-/// The line is read as bytes and carries no encoding requirement, so a file
-/// holding a byte sequence that is not UTF-8 reaches the engine and its own
-/// length check states the outcome. A NUL byte ends the line ahead of the
-/// newline, so `AAAA\0BBBB` is the key `AAAA`.
+/// The key is the first line of the file. The rest of the file is ignored. An
+/// empty path gets a refusal of its own.
 ///
-/// A path that does not open is reported naming the path as the command line
-/// spelled it, where the tool names the absolute path
-/// (`docs/conformance/cli-surface.md`, "P2"). An empty path carries its own
-/// refusal. A file whose first line is empty, and an empty file, both yield an
-/// empty key, which the engine's own length check refuses; the tool dies on a
-/// signal for each of the two (`docs/conformance/cli-surface.md`, "P2"). A
-/// first line longer than [`SIGN_KEY_FILE_LIMIT`] is refused rather than cut,
-/// so the length the engine reports is always the length the file holds; the
-/// tool reads a line of any length (`docs/conformance/cli-surface.md`, "P2").
+/// The line is read as bytes with no encoding requirement. A byte sequence that
+/// is not UTF-8 then reaches the engine, and the length check of the engine
+/// gives the outcome. A NUL byte ends the line before the newline, so
+/// `AAAA\0BBBB` is the key `AAAA`.
+///
+/// # Divergences
+///
+/// Each item is a recorded divergence from the `ostree` command:
+///
+/// - If a path does not open, the message names the path as the command line
+///   gives it. `ostree` names the absolute path.
+/// - An empty file, and a file whose first line is empty, give an empty key.
+///   The length check of the engine refuses it. `ostree` dies on a signal for
+///   each of the two.
+/// - A first line longer than [`SIGN_KEY_FILE_LIMIT`] is refused, never cut.
+///   The length that the engine reports is then always the length in the file.
+///   `ostree` reads a line of any length.
 fn read_sign_key_file(path: &Path) -> std::result::Result<Vec<u8>, String> {
     if path.as_os_str().is_empty() {
         return Err("Operation not supported".to_owned());
@@ -4572,8 +4833,8 @@ fn read_sign_key_file(path: &Path) -> std::result::Result<Vec<u8>, String> {
     let fail =
         |err: &std::io::Error| format!("Error opening file {}: {}", path.display(), io_reason(err));
     let file = std::fs::File::open(path).map_err(|err| fail(&err))?;
-    // One byte over the cap distinguishes a line that fills it from one that
-    // exceeds it.
+    // One byte more than the limit tells a line that fills the limit from a
+    // longer line.
     let mut reader = std::io::BufReader::new(std::io::Read::take(file, SIGN_KEY_FILE_LIMIT + 1));
     let mut line = Vec::new();
     std::io::BufRead::read_until(&mut reader, b'\n', &mut line).map_err(|err| fail(&err))?;
@@ -4591,25 +4852,30 @@ fn read_sign_key_file(path: &Path) -> std::result::Result<Vec<u8>, String> {
     Ok(line)
 }
 
-/// Print the `--table-output` block for a `--skip-if-unchanged` run that wrote
-/// nothing: the parent's checksum, and zero for each of the six counters.
+/// Prints the `--table-output` block for a skipped `--skip-if-unchanged` run.
 ///
-/// The tool prints uninitialized counter values here, which differ between two
-/// identical runs, so the port states the counts of the work it did rather than
-/// reproducing them (`docs/conformance/cli-surface.md`, "P2").
+/// The block holds the checksum of the parent, and zero for each of the six
+/// counters.
+///
+/// The `ostree` command prints uninitialized counter values here, which differ
+/// between two identical runs. ostrya prints the counts of the work that it
+/// did. This is a recorded divergence.
 fn print_skipped_commit_table(parent: &Checksum) {
     print_commit_table(parent, &TransactionStats::default());
 }
 
-/// Print the `--table-output` block: seven `KEY: VALUE` lines in a fixed order,
-/// one space after each colon and no padding
-/// (`docs/format-reference.md`, "CLI output formats").
+/// Prints the `--table-output` block.
+///
+/// The block is seven `KEY: VALUE` lines in a fixed order, with one space after
+/// each colon and no padding.
 ///
 /// `Content Bytes Written` reports `content_bytes_unpacked`, the content byte
-/// count of the regular files written, which is the number the tool prints.
-/// `TransactionStats::content_bytes_written` in the same struct holds the size
-/// the objects take in the repository, which for an `archive` repository is the
-/// compressed size and is what `PullStats` reports; the two differ for every
+/// count of the regular files written. The `ostree` command prints this
+/// number. `TransactionStats::content_bytes_written` holds the size of the
+/// objects in the repository.
+///
+/// For an `archive` repository, `content_bytes_written` is the compressed
+/// size, which `PullStats` reports. The two values differ for every
 /// compressed object.
 fn print_commit_table(checksum: &Checksum, stats: &TransactionStats) {
     println!("Commit: {}", checksum.to_hex());
@@ -4621,10 +4887,12 @@ fn print_commit_table(checksum: &Checksum, stats: &TransactionStats) {
     println!("Content Bytes Written: {}", stats.content_bytes_unpacked);
 }
 
-/// Read a `--fsync=POLICY` value into the policy it names, refusing anything
-/// else in the tool's own words and at the tool's own step: while the options
-/// are read, ahead of the repository and ahead of every check the subcommand
-/// makes (`docs/format-reference.md`, "CLI output formats").
+/// Reads a `--fsync=POLICY` value into the policy that it names.
+///
+/// The accepted values are `true`, `yes`, `1`, `false`, `no`, and `0`, in any
+/// case. Any other value is refused in the words of the `ostree` command, at
+/// the same step as `ostree`. This step is the read of the options, before the
+/// repository and before every check of the subcommand.
 fn fsync_policy(value: Option<&str>) -> Option<bool> {
     let text = value?;
     match text.to_ascii_lowercase().as_str() {
@@ -4634,19 +4902,23 @@ fn fsync_policy(value: Option<&str>) -> Option<bool> {
     }
 }
 
-/// The ownership a `commit` invocation declares, read from `--owner-uid` and
-/// `--owner-gid`. A field is `None` where the option was absent or carried a
-/// negative id, which declares nothing: the tool's own default for both is
-/// `-1`, so every negative value leaves the source's ownership in place.
+/// The owner that a `commit` command line declares with its owner options.
+///
+/// The options are `--owner-uid` and `--owner-gid`. A field is `None` if the
+/// option is absent or has a negative id, which declares nothing. The default
+/// of the `ostree` command for both options is `-1`, so every negative value
+/// keeps the owner of the source.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Owner {
     uid: Option<u32>,
     gid: Option<u32>,
 }
 
-/// Read `--owner-uid` and `--owner-gid`, reporting a value neither can hold in
-/// the tool's own words and at the tool's own step: while the options are read,
-/// ahead of the repository and ahead of every check `commit` itself makes.
+/// Reads `--owner-uid` and `--owner-gid` of `commit`.
+///
+/// A value that neither option can hold is reported in the words of the
+/// `ostree` command, at the same step as `ostree`. This step is the read of
+/// the options, before the repository and before every check of `commit`.
 fn commit_owner(args: &CommitArgs) -> Owner {
     Owner {
         uid: owner_id(args.owner_uid.as_deref(), "--owner-uid"),
@@ -4654,10 +4926,12 @@ fn commit_owner(args: &CommitArgs) -> Owner {
     }
 }
 
-/// One `--owner-*` id, or `None` where the option is absent or its value is
-/// negative. The value is read as a C `int` the way the tool's option parser
-/// reads one, so the two accept and refuse the same text
-/// (`docs/format-reference.md`, "CLI output formats").
+/// Reads one `--owner-*` id.
+///
+/// If the option is absent or its value is negative, the result is `None`. The
+/// value is read as a C `int` ([`parse_c_int`]), as the option parser of the
+/// `ostree` command reads it. Both commands then accept and refuse the same
+/// text.
 fn owner_id(value: Option<&str>, flag: &str) -> Option<u32> {
     let text = value?;
     match parse_c_int(text) {
@@ -4672,7 +4946,7 @@ fn owner_id(value: Option<&str>, flag: &str) -> Option<u32> {
     }
 }
 
-/// Why a C `int` value was refused.
+/// The reason for the refusal of a C `int` value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IntError {
     /// The text is not an integer in any accepted base.
@@ -4681,10 +4955,12 @@ enum IntError {
     Range,
 }
 
-/// Read `text` as a C `int` the way `strtol` with base 0 does: optional leading
-/// whitespace, an optional sign, then a `0x`-prefixed hexadecimal, a
-/// `0`-prefixed octal, or a decimal run. The whole text must be consumed, so a
-/// trailing space or letter is refused, and the value must fit an `i32`.
+/// Reads `text` as a C `int`, as `strtol` with base 0 does.
+///
+/// The text is optional leading whitespace, an optional sign, then a
+/// `0x`-prefixed hexadecimal, a `0`-prefixed octal, or a decimal run. The whole
+/// text must be read, so a trailing space or letter is refused. The value must
+/// fit an `i32`.
 fn parse_c_int(text: &str) -> std::result::Result<i32, IntError> {
     let body = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
     let (negative, body) = match body.as_bytes().first() {
@@ -4720,13 +4996,13 @@ fn parse_c_int(text: &str) -> std::result::Result<i32, IntError> {
     i32::try_from(value).map_err(|_| IntError::Range)
 }
 
-/// The file-type mask of an `st_mode`, and the regular-file value in it.
+/// The file-type mask of an `st_mode`.
 const S_IFMT: u32 = 0o170000;
 /// The regular-file type value of an `st_mode`.
 const S_IFREG: u32 = 0o100000;
 /// The directory type value of an `st_mode`.
 const S_IFDIR: u32 = 0o040000;
-/// The three execute bits, which `--mode-ro-executables` tests.
+/// The three execute bits, which `--mode-ro-executables` checks.
 const EXEC_BITS: u32 = 0o111;
 /// The three write bits, which `--mode-ro-executables` clears.
 const WRITE_BITS: u32 = 0o222;
@@ -4734,58 +5010,64 @@ const WRITE_BITS: u32 = 0o222;
 /// One `--statoverride` entry.
 #[derive(Debug, Clone)]
 struct StatOverride {
-    /// Whether the value replaces the entry's permission bits (an `=` prefix)
-    /// rather than being ORed into its mode.
+    /// `true` if the value replaces the permission bits of the entry (an `=`
+    /// prefix). If `false`, the value is ORed into the mode of the entry.
     assign: bool,
     /// The mode value, read in base 10.
     value: u32,
-    /// The text after the first space, which is the in-tree path the entry
-    /// matches and the text an unmatched report names.
+    /// The text after the first space. It is the in-tree path that the entry
+    /// matches, and the text that an unmatched report names.
     path: String,
 }
 
-/// The `commit` options that reach the filesystem walk, read from the two
-/// control files before anything else the subcommand does.
+/// The `commit` options that reach the file system walk.
 ///
-/// Each control file holds at most one entry per path, and the statoverride
-/// file at most one per path per form: a path named more than once by one form
-/// takes the value of the last line naming it, at the position the file first
+/// They come from the two control files, before any other step of the
+/// subcommand. Each control file holds at most one entry for each path. The
+/// statoverride file holds at most one entry for each path and form.
+///
+/// If one form names a path more than once, the path takes the value of the
+/// last line that names it. The entry keeps the position of the first line that
 /// names it.
 #[derive(Debug, Default)]
 struct WalkOptions {
-    /// The OR-form `--statoverride` entries, one per path.
+    /// The OR-form `--statoverride` entries, one for each path.
     statoverride_or: Vec<(String, u32)>,
-    /// The `=`-form `--statoverride` entries, one per path.
+    /// The `=`-form `--statoverride` entries, one for each path.
     statoverride_assign: Vec<(String, u32)>,
-    /// The `--skip-list` paths, one per path.
+    /// The `--skip-list` paths, each path once.
     skip_list: Vec<String>,
-    /// Whether the skip list names the walk root, which prunes everything.
+    /// `true` if the skip list names the walk root, which prunes everything.
     root_pruned: bool,
-    /// Which OR-form `--statoverride` path the walk reached, one flag per path.
-    /// A path the skip list prunes is reached, the walk having offered the
-    /// entry before the prune; a path below a pruned directory is not.
+    /// The OR-form `--statoverride` paths that the walk reached, one flag for
+    /// each path. A path that the skip list prunes is reached, because the
+    /// walk offers the entry before the prune. A path under a pruned directory
+    /// is not reached.
     statoverride_matched: Arc<Mutex<Vec<bool>>>,
-    /// Which `--skip-list` path the walk reached, one flag per path.
+    /// The `--skip-list` paths that the walk reached, one flag for each path.
     skip_list_matched: Arc<Mutex<Vec<bool>>>,
-    /// Which OR-form `--statoverride` entry a source has already taken the
-    /// value of, one flag per path. An entry reaches one entry of the tree per
-    /// run, so the mode callback reads this and not
-    /// [`statoverride_matched`](WalkOptions::statoverride_matched): a path the
-    /// skip list prunes counts as reached without any source taking the value.
+    /// The OR-form `--statoverride` entries whose value a source took, one
+    /// flag for each path. An entry applies to one entry of the tree in each
+    /// run, so the mode callback reads this field. It does not read
+    /// [`statoverride_matched`](WalkOptions::statoverride_matched), because a
+    /// path that the skip list prunes counts as reached with no source that
+    /// takes the value.
     statoverride_spent: Arc<Mutex<Vec<bool>>>,
-    /// Whether the source being overlaid is an archive. One modifier is shared
-    /// by every source of a run, and an OR-form `--statoverride` entry over a
-    /// directory below the walk root reaches an archive's member where it
-    /// leaves a filesystem walk and a `ref` source alone, so the caller states
-    /// the source kind here before each source is read.
+    /// `true` if the source of the current overlay is an archive.
+    ///
+    /// All sources of a run share one modifier. An OR-form `--statoverride`
+    /// entry for a directory under the walk root applies to a member of an
+    /// archive. It does not apply to a file system walk or a `ref` source. For
+    /// this reason, the caller sets the source kind in this field before each
+    /// source is read.
     source_is_tar: Arc<AtomicBool>,
 }
 
-/// The in-tree path of the walk root, which both control files spell `/`.
+/// The in-tree path of the walk root, which both control files write as `/`.
 const WALK_ROOT: &str = "/";
 
 impl WalkOptions {
-    /// Read both control files, in the order the tool reads them.
+    /// Reads both control files, in the order of the `ostree` command.
     fn read(args: &CommitArgs) -> std::result::Result<WalkOptions, String> {
         let statoverride = match args.statoverride.as_deref() {
             Some(path) => read_statoverride(path)?,
@@ -4795,17 +5077,18 @@ impl WalkOptions {
             Some(path) => fold_paths(read_skip_list(path)?),
             None => Vec::new(),
         };
-        // The walk root is never offered to the filter, so a skip list naming
-        // it is answered here: the whole tree is pruned, every other entry of
-        // either file goes unmatched, and the commit has nothing to write.
+        // The filter never gets the walk root, so this step handles a skip
+        // list that names it. Then the whole tree is pruned, every other entry
+        // of each file stays unmatched, and the commit has nothing to write.
         let root_pruned = skip_list.iter().any(|path| path == WALK_ROOT);
-        // One flag per path, with a root entry marked here since the filter
-        // never sees it.
+        // One flag for each path. A root entry is marked here, because the
+        // filter never gets it.
         let skip_seen: Vec<bool> = skip_list.iter().map(|path| path == WALK_ROOT).collect();
         let statoverride_or = fold_overrides(&statoverride, false);
-        // The walk root counts as reached whether or not the skip list prunes
-        // it, so an OR entry naming it is marked here too: with the root pruned
-        // the walk runs over nothing and the mode callback never sees it.
+        // The walk root counts as reached, also if the skip list prunes it. If
+        // the root is pruned, the walk runs over nothing and the mode callback
+        // never gets the root. For this reason, an OR entry that names the root
+        // is also marked here.
         let override_seen: Vec<bool> = statoverride_or
             .iter()
             .map(|(path, _)| root_pruned && path == WALK_ROOT)
@@ -4823,15 +5106,18 @@ impl WalkOptions {
         })
     }
 
-    /// Whether any option here shapes a mode.
+    /// Returns `true` if an option of this set changes a mode.
     fn shapes_modes(&self) -> bool {
         !self.statoverride_or.is_empty() || !self.statoverride_assign.is_empty()
     }
 
-    /// The `--statoverride` paths the walk never reached, one entry per path.
-    /// An `=` entry is not checked, so one matching nothing is ignored, and a
-    /// path both forms name is checked once, through its OR-form entry. A path
-    /// the skip list prunes is reached; a path below a pruned directory is not.
+    /// Returns the `--statoverride` paths that the walk did not reach.
+    ///
+    /// The list has one entry for each path. An `=` entry is not checked, so
+    /// an `=` entry that matches nothing is ignored. A path that both forms
+    /// name is checked once, through its OR-form entry. A path that the skip
+    /// list prunes is reached, and a path under a pruned directory is not
+    /// reached.
     fn unmatched_statoverride(&self) -> Vec<String> {
         let matched = self.statoverride_matched.lock().unwrap();
         self.statoverride_or
@@ -4842,8 +5128,9 @@ impl WalkOptions {
             .collect()
     }
 
-    /// The `--skip-list` paths the walk never reached, one entry per path.
-    /// Every path is checked.
+    /// Returns the `--skip-list` paths that the walk did not reach.
+    ///
+    /// The list has one entry for each path. Every path is checked.
     fn unmatched_skip_list(&self) -> Vec<String> {
         let matched = self.skip_list_matched.lock().unwrap();
         self.skip_list
@@ -4855,9 +5142,11 @@ impl WalkOptions {
     }
 }
 
-/// Print one `Unmatched <kind> path:` line per path of one control file the
-/// walk never reached. The error is the summary line that follows them, which
-/// the caller reports and exits 1 on; an empty list is `Ok`.
+/// Prints the `Unmatched <kind> path:` lines of one control file.
+///
+/// The lines go to standard error, one line for each path that the walk did
+/// not reach. The error is the summary line after these lines. The caller
+/// reports it and exits 1. An empty list gives `Ok`.
 fn report_unmatched(kind: &str, unmatched: &[String]) -> std::result::Result<(), String> {
     if unmatched.is_empty() {
         return Ok(());
@@ -4868,15 +5157,18 @@ fn report_unmatched(kind: &str, unmatched: &[String]) -> std::result::Result<(),
     Err(format!("Unmatched {kind} paths"))
 }
 
-/// The largest control file `--statoverride` and `--skip-list` read, matching
-/// the cap `-F/--body-file` takes (`CLAUDE.md`, "Working conventions", which
-/// bars an unbounded read).
+/// The maximum size in bytes of a `--statoverride` or `--skip-list` file.
+///
+/// It is the same limit as the limit of `-F/--body-file`, and it bars an
+/// unbounded read.
 const CONTROL_FILE_LIMIT: u64 = 128 * 1024 * 1024;
 
-/// Read a control file as bytes. A path that does not open is reported the way
-/// the tool reports it, naming the path as the command line spelled it; a
-/// directory is reported without one. The read stops at
-/// [`CONTROL_FILE_LIMIT`].
+/// Reads a control file as bytes.
+///
+/// If a path does not open, the error has the form of the `ostree` command and
+/// names the path as the command line gives it. A directory gets an error with
+/// no path. The read stops at [`CONTROL_FILE_LIMIT`], and a larger file is
+/// refused.
 fn read_control_bytes(path: &Path) -> std::result::Result<Vec<u8>, String> {
     let file = std::fs::File::open(path)
         .map_err(|err| format!("openat({}): {}", path.display(), io_reason(&err)))?;
@@ -4894,13 +5186,15 @@ fn read_control_bytes(path: &Path) -> std::result::Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Read a control file as text.
+/// Reads a control file as text.
 ///
-/// The bytes must be UTF-8 whole, and a NUL byte counts as invalid. A single
-/// invalid byte anywhere in the file refuses the command with `Invalid UTF-8`,
-/// which is what the tool does. An accepted file therefore holds text alone,
-/// and the walk compares each entry's own bytes against the walk path's bytes,
-/// so a spelled replacement character names that character and nothing else.
+/// All bytes must be UTF-8, and a NUL byte counts as invalid. One invalid byte
+/// at any position refuses the command with `Invalid UTF-8`, as the `ostree`
+/// command does. An accepted file holds text alone.
+///
+/// The walk compares the bytes of each entry with the bytes of the walk path. A
+/// replacement character in the file then names that character and nothing
+/// else.
 fn read_control_file(path: &Path) -> std::result::Result<String, String> {
     let bytes = read_control_bytes(path)?;
     if bytes.contains(&0) {
@@ -4909,8 +5203,10 @@ fn read_control_file(path: &Path) -> std::result::Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "Invalid UTF-8".to_owned())
 }
 
-/// Read a `--statoverride` file: one `[=]<decimal mode> <path>` per line, with
-/// blank lines ignored and everything after the first space taken as the path.
+/// Reads a `--statoverride` file.
+///
+/// Each line is `[=]<decimal mode> <path>`. Blank lines are ignored, and all
+/// text after the first space is the path. A line with no space is refused.
 fn read_statoverride(path: &Path) -> std::result::Result<Vec<StatOverride>, String> {
     let text = read_control_file(path)?;
     let mut entries = Vec::new();
@@ -4931,7 +5227,7 @@ fn read_statoverride(path: &Path) -> std::result::Result<Vec<StatOverride>, Stri
     Ok(entries)
 }
 
-/// Read a `--skip-list` file: one path per line, blank lines ignored.
+/// Reads a `--skip-list` file: one path on each line, blank lines ignored.
 fn read_skip_list(path: &Path) -> std::result::Result<Vec<String>, String> {
     Ok(read_control_file(path)?
         .split('\n')
@@ -4940,10 +5236,11 @@ fn read_skip_list(path: &Path) -> std::result::Result<Vec<String>, String> {
         .collect())
 }
 
-/// Reduce the `--statoverride` entries of one form to one entry per path: the
-/// value of the last line naming a path, at the position the file first names
-/// it. The two forms are folded apart, so a path named by both keeps a value
-/// under each.
+/// Reduces the `--statoverride` entries of one form to one entry per path.
+///
+/// The entry has the value of the last line that names the path, at the
+/// position of the first line that names it. The two forms are reduced
+/// separately, so a path that both forms name keeps a value under each form.
 fn fold_overrides(entries: &[StatOverride], assign: bool) -> Vec<(String, u32)> {
     let mut at: HashMap<&str, usize> = HashMap::new();
     let mut folded: Vec<(String, u32)> = Vec::new();
@@ -4959,8 +5256,9 @@ fn fold_overrides(entries: &[StatOverride], assign: bool) -> Vec<(String, u32)> 
     folded
 }
 
-/// Reduce the `--skip-list` paths to one entry per path, at the position the
-/// file first names it.
+/// Reduces the `--skip-list` paths to one entry for each path.
+///
+/// Each entry stays at the position of the first line that names it.
 fn fold_paths(paths: Vec<String>) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     paths
@@ -4969,17 +5267,21 @@ fn fold_paths(paths: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/// Read the leading decimal run of a `--statoverride` mode field: an optional
-/// sign, then digits, with the value truncated to 32 bits. Text holding no
-/// digit is the value zero, so an entry with an unreadable mode changes nothing
-/// under the OR form.
+/// Reads the leading decimal run of a `--statoverride` mode field.
 ///
-/// The tool reads the field as a C `double` and converts it, so it also takes a
-/// hexadecimal literal, a decimal point, and an exponent, and turns a value
-/// past the 32-bit range into `0x80000000`. Those forms are outside the
-/// documented format, which is a mode in decimal, and their out-of-range
-/// conversion is platform-defined; the port reads decimal alone and the
-/// difference is recorded in `docs/conformance/cli-surface.md`, "P2".
+/// The field is an optional sign, then digits. The value is truncated to 32
+/// bits. Text with no digit is the value zero, so under the OR form, an entry
+/// with a mode that cannot be read changes nothing.
+///
+/// # Divergence
+///
+/// The `ostree` command reads the field as a C `double` and converts it. As a
+/// result, `ostree` also accepts a hexadecimal literal, a decimal point, and an
+/// exponent. It turns a value out of the 32-bit range into `0x80000000`.
+///
+/// These forms are outside the documented format, which is a mode in decimal.
+/// Their conversion out of range depends on the platform. ostrya reads decimal
+/// alone. This is a recorded divergence.
 fn leading_u32(text: &str) -> u32 {
     let (negative, body) = match text.as_bytes().first() {
         Some(b'-') => (true, &text[1..]),
@@ -4998,25 +5300,25 @@ fn leading_u32(text: &str) -> u32 {
     }) as u32
 }
 
-/// One tree source a `commit` invocation names.
+/// One tree source that a `commit` command line names.
 enum TreeSpec {
-    /// `--tree=dir=PATH`, and the positional `PATH`. The path is kept as it was
-    /// spelled, which is what `--consume` reads.
+    /// `--tree=dir=PATH`, and the positional `PATH`. The path is kept as the
+    /// command line gives it, because `--consume` reads that text.
     Dir(PathBuf),
-    /// `--tree=tar=PATH`. The tool spells standard input `-`, and reaches it
-    /// through `/dev/stdin` as well.
+    /// `--tree=tar=PATH`. The `ostree` command writes standard input as `-`,
+    /// and also reaches it through `/dev/stdin`.
     Tar(PathBuf),
     /// `--tree=ref=REV`.
     Ref(String),
-    /// The port's own default source: a tar stream on standard input, where
-    /// the tool walks the current working directory
-    /// (`docs/conformance/cli-surface.md`, "P2").
+    /// The default source of ostrya: a tar stream on standard input. The
+    /// `ostree` command walks the current working directory. This is a
+    /// recorded divergence.
     Stdin,
 }
 
 /// One tree source, opened or resolved.
 enum OpenSource {
-    /// A directory, and the path it was named by.
+    /// A directory, and the path that named it.
     Dir(std::fs::File, PathBuf),
     /// A tar stream.
     Tar(ostrya_rt::FileReader),
@@ -5024,17 +5326,20 @@ enum OpenSource {
     Ref(Checksum, Checksum),
 }
 
-/// The `ENOTDIR` a source that is not a directory is refused with. The port
-/// reads the source's metadata no-follow and refuses what that read does not
-/// state a directory, so a symlink naming a directory is refused too, as the
-/// tool's own `opendir` refuses it.
+/// The `ENOTDIR` error number for a source that is not a directory.
+///
+/// ostrya reads the metadata of the source with no symlink follow. It refuses
+/// each source that this read does not show as a directory. A symlink that
+/// names a directory is then also refused, as `opendir` of the `ostree` command
+/// refuses it.
 const ENOTDIR: i32 = 20;
 
-/// The source list a `commit` invocation states, in the order the sources are
-/// overlaid. `--tree` values come in command-line order; with none, the
-/// positional `PATH` is the one source, and with neither the port reads a tar
-/// stream from standard input. A positional `PATH` beside any `--tree` is
-/// ignored, at exit 0 and unread.
+/// Returns the source list of a `commit` command line, in overlay order.
+///
+/// The `--tree` values come in command-line order. With no `--tree`, the
+/// positional `PATH` is the one source. With neither, ostrya reads a tar stream
+/// from standard input. A positional `PATH` with any `--tree` is ignored and
+/// not read, and the exit status stays 0.
 fn tree_specs(args: &CommitArgs) -> std::result::Result<Vec<TreeSpec>, String> {
     if args.tree.is_empty() {
         return Ok(vec![match args.path.first() {
@@ -5054,21 +5359,23 @@ fn tree_specs(args: &CommitArgs) -> std::result::Result<Vec<TreeSpec>, String> {
         .collect()
 }
 
-/// Open or resolve one source. The caller opens and overlays the sources one
-/// at a time and in order, so a source that does not open is reported once
-/// every earlier source is read and `--consume` has removed what those sources
-/// named. The timestamp is read once the last source is overlaid, so a source
-/// that does not open is reported ahead of a timestamp the reader refuses.
+/// Opens or resolves one tree source.
 ///
-/// A `dir=` or a `tar=` source that does not open comes back as the message
-/// rather than as an exit, because the caller holds an open transaction whose
-/// staging directory has to be reaped first.
+/// The caller opens and overlays the sources one at a time and in order. The
+/// error for a source that does not open then comes after every earlier source
+/// is read. It also comes after `--consume` removed the paths of those sources.
+/// The timestamp is read after the last source is overlaid, so this error comes
+/// before the error for a refused timestamp.
 ///
-/// A `dir=` source is stated a directory by a no-follow metadata read and is
-/// opened after that read, so the path can change between the two calls. The
-/// walk reopens the descriptor with `OFlags::DIRECTORY | OFlags::NOFOLLOW`
-/// (`ostrya::ingest::open_walk_root`), so a raced replacement that is not a
-/// directory is refused there.
+/// If a `dir=` or a `tar=` source does not open, the function returns the
+/// message and does not exit. The caller holds an open transaction, and its
+/// staging directory must be reaped first.
+///
+/// A metadata read with no symlink follow shows that a `dir=` source is a
+/// directory, and the open comes after that read. The path can change between
+/// the two calls. For this reason, the walk opens the descriptor again with
+/// `OFlags::DIRECTORY | OFlags::NOFOLLOW` (`ostrya::ingest::open_walk_root`).
+/// The walk then refuses a replacement from a race that is not a directory.
 async fn open_tree_source(
     repo: &Repo,
     spec: TreeSpec,
@@ -5118,14 +5425,14 @@ async fn open_tree_source(
     }))
 }
 
-/// Overlay one source onto `mtree`. A later source's directory metadata
-/// replaces what an earlier one recorded, its files replace files of the same
-/// name, and a name that is a directory on one side and a file on the other is
-/// refused (`docs/format-reference.md`, "CLI output formats", `commit`).
+/// Overlays one tree source onto `mtree`.
 ///
-/// A refusal comes back as the message rather than as an exit, because the
-/// caller holds an open transaction whose staging directory has to be reaped
-/// first.
+/// The directory metadata of a later source replaces the metadata of an
+/// earlier source. Its files replace files of the same name. A name that is a
+/// directory in one source and a file in the other source is refused.
+///
+/// A refusal comes back as the message, with no exit, because the caller
+/// holds an open transaction. Its staging directory must be reaped first.
 async fn overlay_source(
     repo: &Repo,
     txn: &Transaction,
@@ -5138,14 +5445,13 @@ async fn overlay_source(
         OpenSource::Dir(dfd, path) => {
             txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("."), mtree, modifier)
                 .await?;
-            // `--consume` removes the source directory itself once its contents
-            // are ingested, unless the path is spelled `.`. The test is on the
-            // text, so an absolute path naming the working directory is removed
-            // and `./` is not spared. A removal that fails aborts the commit and
-            // names the path, which is what the tool does.
-            // The test is on the text the value carries, which `Path` equality
-            // would normalize away: `./` and `.` name one directory and only
-            // the second is spared.
+            // After the contents are ingested, `--consume` removes the source
+            // directory itself, unless the path is `.`. The test is on the
+            // text, so an absolute path that names the working directory is
+            // removed, and `./` is also removed. A comparison with `Path`
+            // equality loses this difference, because `./` and `.` name one
+            // directory. If the removal fails, the commit aborts and the
+            // message names the path, as the `ostree` command does.
             if args.consume
                 && path.as_os_str() != "."
                 && let Err(err) = std::fs::remove_dir(&path)
@@ -5175,14 +5481,16 @@ async fn overlay_source(
     }
 }
 
-/// PCRE2's start-of-pattern option for the `any` newline convention, which is
-/// the convention GLib's `GRegex` compiles under.
+/// The PCRE2 start-of-pattern option for the `any` newline convention.
+///
+/// GLib `GRegex` compiles under this convention.
 const NEWLINE_ANY: &str = "(*ANY)";
 
-/// The tar import options a `commit` invocation states. The pathname filter is
-/// read here, as a tar source is loaded, so a value the reader refuses is
-/// reported only where an archive is read: a command line naming no tar source
-/// carries a malformed filter at exit 0, which is what the tool does.
+/// Returns the tar import options of a `commit` command line.
+///
+/// The pathname filter is read when a tar source loads, so a refused value is
+/// reported only where an archive is read. A command line that names no tar
+/// source accepts a malformed filter with exit 0, as the `ostree` command does.
 fn tar_import_options(args: &CommitArgs) -> std::result::Result<TarImportOptions, String> {
     let mut opts = TarImportOptions::new();
     opts.skip_xattrs = args.no_xattrs;
@@ -5194,30 +5502,33 @@ fn tar_import_options(args: &CommitArgs) -> std::result::Result<TarImportOptions
     let Some((pattern, replacement)) = value.split_once(',') else {
         return Err("Missing ',' in --tar-pathname-filter".to_owned());
     };
-    // The tool compiles this value as a PCRE2 pattern through GLib's `GRegex`,
-    // with UTF and UCP on and every other compile option at its default, which
-    // is what the probes in `docs/conformance/cli-surface.md`, "P2" state. The
-    // JIT stays off: the interpreter and the JIT part in how they account the
-    // match limits and not in what they match.
+    // The `ostree` command compiles this value as a PCRE2 pattern through GLib
+    // `GRegex`, with UTF and UCP on and every other compile option at its
+    // default. Probes of `ostree` show these options. The JIT stays off. The
+    // interpreter and the JIT differ in how they count the match limits, and
+    // they match the same text.
     //
-    // `GRegex` also sets the newline convention to `any`, so a carriage return,
-    // a line feed, the pair, a vertical tab, a form feed, `U+0085`, `U+2028`,
-    // and `U+2029` each end a line. The convention decides where `$`, `\Z`, and
-    // `(?m)^` match and which characters `.` and `\N` exclude, so a name
-    // holding one of those characters is renamed under it. The crate states no
-    // option for the convention, so the compiled pattern carries PCRE2's own
-    // `(*ANY)` start-of-pattern option ahead of the value. A convention the
-    // value states itself follows `(*ANY)` and wins, in both implementations.
+    // `GRegex` also sets the newline convention to `any`. Under this
+    // convention, each of these ends a line: a carriage return, a line feed,
+    // and the pair. A vertical tab, a form feed, `U+0085`, `U+2028`, and
+    // `U+2029` also end a line. The convention sets where `$`, `\Z`, and
+    // `(?m)^` match, and which characters `.` and `\N` exclude. The rename of a
+    // name that holds one of these characters then follows the convention.
+    //
+    // The `pcre2` crate has no option for the convention. For this reason, the
+    // compiled pattern has the PCRE2 start-of-pattern option `(*ANY)` before
+    // the value. If the value states a convention itself, that convention
+    // follows `(*ANY)` and wins, in both commands.
     let regex = RegexBuilder::new()
         .utf(true)
         .ucp(true)
         .build(&format!("{NEWLINE_ANY}{pattern}"))
         .map_err(|err| {
-            // PCRE2 counts the offset from the compiled pattern, and the line
-            // the tool writes counts the value the caller wrote. Both counts
-            // are in code units, so the subtraction is a byte count; the tool
-            // writes a character offset here, which
-            // `docs/conformance/cli-surface.md`, "P2" records as a divergence.
+            // PCRE2 counts the offset in the compiled pattern, and the line of
+            // the `ostree` command counts it in the value that the caller
+            // wrote. Both counts are in code units, so the result of the
+            // subtraction is a byte count. `ostree` writes a character offset
+            // here. This is a recorded divergence.
             let at = match err.offset() {
                 Some(offset) => {
                     format!(" at char {}", offset.saturating_sub(NEWLINE_ANY.len()))
@@ -5236,22 +5547,23 @@ fn tar_import_options(args: &CommitArgs) -> std::result::Result<TarImportOptions
              \u{2018}{replacement}\u{2019}: {reason}"
         )
     })?;
-    // A member the filter empties names the tree root, which is what the tool
-    // makes of it: a directory member mapped onto the empty string supplies the
-    // root's metadata, so `^dir1/(.*)$,\1` strips a prefix. A file member mapped
-    // onto the empty string names the root as a file, which the tar importer
-    // refuses (`docs/conformance/cli-surface.md`, "P2").
+    // If the filter makes the name of a member empty, the member names the
+    // tree root, as in the `ostree` command. A directory member mapped to the
+    // empty string gives the metadata of the root, so `^dir1/(.*)$,\1`
+    // removes a prefix. A file member mapped to the empty string names the
+    // root as a file, which the tar importer refuses. This is a recorded
+    // divergence.
     let pattern = pattern.to_owned();
     let mut locs = regex.capture_locations();
     opts.rename = Some(Box::new(move |name: &str| {
         let subject = name.as_bytes();
         let mut out = Vec::with_capacity(subject.len());
         // The replacement is global, so the loop splices one match at a time.
-        // `held` is where the untouched tail starts and `search` is where the
-        // next attempt starts. The two part after an empty match, which
-        // advances the search past one whole character while that character
-        // stays in the tail. Advancing one byte instead would start an attempt
-        // inside a character, which PCRE2 states no meaning for.
+        // `held` is the start of the unchanged tail, and `search` is the start
+        // of the next attempt. The two differ after an empty match. The search
+        // then moves past one whole character, and that character stays in the
+        // tail. A move of one byte can start an attempt inside a character, and
+        // PCRE2 gives no meaning to such an attempt.
         let mut held = 0;
         let mut search = 0;
         while search <= subject.len() {
@@ -5281,10 +5593,10 @@ fn tar_import_options(args: &CommitArgs) -> std::result::Result<TarImportOptions
             };
         }
         out.extend_from_slice(&subject[held..]);
-        // `\C` matches one byte, so a rewrite can split a character. The port
-        // stores a pathname as text and refuses such a result; the tool ends
-        // the run on a GLib assertion in the same case
-        // (`docs/conformance/cli-surface.md`, "P2").
+        // `\C` matches one byte, so a rewrite can split a character. ostrya
+        // stores a pathname as text and refuses such a result. The `ostree`
+        // command ends the run on a GLib assertion in the same case. This is a
+        // recorded divergence.
         String::from_utf8(out).map_err(|_| {
             Error::Tar(format!(
                 "--tar-pathname-filter: the rewritten name of \u{2018}{name}\u{2019} is \
@@ -5295,13 +5607,17 @@ fn tar_import_options(args: &CommitArgs) -> std::result::Result<TarImportOptions
     Ok(opts)
 }
 
-/// The reason a PCRE2 error names, without the text the crate writes in front
-/// of it. Each refusal line names the operation and the character offset in the
-/// positions the tool's own line names them, so the crate's text is dropped.
-/// The kind of the error states the shape of that text: a compile error names
-/// the operation and an offset clause the crate states for some errors alone,
-/// and every other kind names the operation up to the first `": "`. Text of
-/// another shape is answered whole.
+/// Returns the reason of a PCRE2 error, without the prefix text of the crate.
+///
+/// Each refusal line names the operation and the character offset at the
+/// positions of the line of the `ostree` command. For this reason, the text of
+/// the crate is dropped. The kind of the error gives the form of that text:
+///
+/// - A compile error names the operation, and an offset clause that the crate
+///   writes for some errors only.
+/// - Every other kind names the operation up to the first `": "`.
+///
+/// Text of another form is returned whole.
 fn pcre2_reason(err: &pcre2::Error) -> String {
     let text = err.to_string();
     let reason = match err.kind() {
@@ -5320,9 +5636,11 @@ fn pcre2_reason(err: &pcre2::Error) -> String {
     reason.unwrap_or(text.as_str()).to_owned()
 }
 
-/// The offset of the character that follows the one at `at`. An empty match
-/// advances the search this way, so no attempt starts inside a character. An
-/// offset at the end of the name answers one past it, which ends the loop.
+/// Returns the offset of the character after the character at `at`.
+///
+/// An empty match moves the search in this way, so no attempt starts inside a
+/// character. For an offset at the end of the name, the result is one past the
+/// end, which ends the loop.
 fn next_character(name: &str, at: usize) -> usize {
     let mut next = at + 1;
     while next < name.len() && !name.is_char_boundary(next) {
@@ -5335,20 +5653,25 @@ fn next_character(name: &str, at: usize) -> usize {
 enum ReplacementPiece {
     /// Literal text.
     Text(String),
-    /// The text a group matched, by number.
+    /// The text that a group matched, by number.
     Index(usize),
-    /// The text a group matched, by name.
+    /// The text that a group matched, by name.
     Name(String),
 }
 
-/// Read the replacement half of `--tar-pathname-filter`.
+/// Reads the replacement half of `--tar-pathname-filter`.
 ///
-/// The syntax is the one `g_regex_replace` states, which the port keeps because
-/// it is the syntax an operator writes: `\0` to `\9` and `\g<name>` or
-/// `\g<number>` name a group, `\\` is a backslash, `\n`, `\t`, `\r`, `\a`,
-/// `\b`, `\f`, and `\v` are the control characters, any other escape is
-/// refused, and `$` carries no meaning. A group that is unset, or that the
-/// expression does not declare, contributes nothing.
+/// The syntax is the syntax of `g_regex_replace`. ostrya keeps it because an
+/// operator writes this syntax:
+///
+/// - `\0` to `\9`, `\g<name>`, and `\g<number>` name a group.
+/// - `\\` is a backslash.
+/// - `\n`, `\t`, `\r`, `\a`, `\b`, `\f`, and `\v` are the control characters.
+/// - Any other escape is refused.
+/// - `$` has no meaning.
+///
+/// A group that is unset, or that the expression does not declare, adds
+/// nothing.
 fn parse_replacement(replacement: &str) -> std::result::Result<Vec<ReplacementPiece>, String> {
     let text: Vec<char> = replacement.chars().collect();
     let mut pieces = Vec::new();
@@ -5436,12 +5759,15 @@ fn parse_replacement(replacement: &str) -> std::result::Result<Vec<ReplacementPi
     Ok(pieces)
 }
 
-/// Append one match's replacement text. `names` holds the expression's capture
-/// names by group number, which is how a `\g<name>` reference reaches a group.
-/// `(?J)` lets several groups carry one name, so the reference resolves to the
-/// first group, by number, that carries the name and that the match set. A
-/// reference that reaches no set group, and a name the expression does not
-/// declare, contribute nothing.
+/// Appends the replacement text of one match.
+///
+/// `names` holds the capture names of the expression by group number. A
+/// `\g<name>` reference reaches its group through this list. `(?J)` lets
+/// several groups have one name. The reference then resolves to the first
+/// group, by number, that has the name and that the match set.
+///
+/// A reference that reaches no set group, and a name that the expression does
+/// not declare, add nothing.
 fn expand_replacement(
     pieces: &[ReplacementPiece],
     subject: &[u8],
@@ -5466,16 +5792,18 @@ fn expand_replacement(
     }
 }
 
-/// Append the text one capture group matched.
+/// Appends the text that one capture group matched.
 fn push_group(subject: &[u8], locs: &CaptureLocations, group: usize, out: &mut Vec<u8>) {
     if let Some((start, end)) = locs.get(group) {
         out.extend_from_slice(&subject[start..end]);
     }
 }
 
-/// The commit modifier the tree-shaping options ask for, or `None` where they
-/// ask for nothing. `--canonical-permissions` implies the xattr skip, since
-/// canonical ingest records no extended attributes.
+/// Returns the commit modifier that the tree-shaping options ask for.
+///
+/// The result is `None` if they ask for nothing. `--canonical-permissions`
+/// implies the xattr skip, because canonical ingest records no extended
+/// attributes.
 fn commit_modifier(
     args: &CommitArgs,
     owner: Owner,
@@ -5492,18 +5820,16 @@ fn commit_modifier(
     if args.devino_canonical {
         flags |= CommitModifierFlags::DEVINO_CANONICAL;
     }
-    // `--consume` empties each filesystem source as it is walked. The flag is
-    // read by that walk alone, so a `tar` or a `ref` source ignores it.
+    // `--consume` empties each file system source during its walk. Only that
+    // walk reads the flag, so a `tar` or a `ref` source ignores it.
     if args.consume {
         flags |= CommitModifierFlags::CONSUME;
     }
     let shapes_modes = args.mode_ro_executables || walk.shapes_modes();
-    // A cache that came back empty resolves nothing, so it asks for no modifier
-    // of its own. An `archive` repository stores every content object
-    // compressed and contributes no entry, and a modifier attached over that
-    // empty cache costs a `ref` source the checksum-copy overlay path for no
-    // result (`docs/format-reference.md`, "Commit modifier: canonical
-    // permissions, consume, and devino").
+    // An empty cache resolves nothing, so it asks for no modifier of its own.
+    // An `archive` repository stores every content object compressed and adds
+    // no entry to the cache. A modifier over that empty cache makes a `ref`
+    // source lose the checksum-copy overlay path, with no gain.
     if flags == CommitModifierFlags::empty()
         && owner == Owner::default()
         && !shapes_modes
@@ -5521,9 +5847,9 @@ fn commit_modifier(
         let entries = walk.skip_list.clone();
         let matched = walk.skip_list_matched.clone();
         // A pruned entry never reaches the mode callback, so the OR-form
-        // `--statoverride` entry naming the same path is marked here: the walk
+        // `--statoverride` entry for the same path is marked here. The walk
         // reached the path and pruned it there, which counts as reached. A path
-        // below a pruned directory is never offered and stays unmatched.
+        // under a pruned directory is never offered and stays unmatched.
         let or_entries: Vec<String> = walk
             .statoverride_or
             .iter()
@@ -5554,25 +5880,26 @@ fn commit_modifier(
         let ro_executables = args.mode_ro_executables;
         modifier.mode_callback = Some(Box::new(move |path, meta| {
             let mut mode = meta.mode;
-            // `--mode-ro-executables` runs first, so a `--statoverride` entry
-            // over the same path states the mode the entry ends with.
+            // `--mode-ro-executables` applies first, so a `--statoverride`
+            // entry for the same path sets the final mode of the entry.
             if ro_executables && mode & S_IFMT == S_IFREG && mode & EXEC_BITS != 0 {
                 mode &= !WRITE_BITS;
             }
             let name = path.as_os_str().as_bytes();
-            // The OR form stands ahead of the `=` form: where a path carries an
-            // entry of each, the OR value alone reaches the mode, whichever
-            // order the file states the two lines in.
+            // The OR form comes before the `=` form. If a path has an entry of
+            // each form, only the OR value reaches the mode. The order of the
+            // two lines in the file does not change this.
             if let Some(index) = or_entries.iter().position(|(e, _)| e.as_bytes() == name) {
                 matched.lock().unwrap()[index] = true;
-                // An OR entry reaches one tree entry per run: the first any
-                // source offers under its path spends it, and a later source
-                // under that path keeps the mode it brought.
+                // An OR entry applies to one tree entry in each run. The first
+                // entry that a source offers at its path spends it. A later
+                // source at that path keeps its own mode.
                 let spent = std::mem::replace(&mut spent_entries.lock().unwrap()[index], true);
-                // A directory below the walk root spends the entry and takes no
-                // value from it, leaving the mode to the `=` form or to the walk
-                // where there is none. An archive's member is the exception: the
-                // OR value reaches a directory there.
+                // A directory under the walk root spends the entry and takes no
+                // value from it. Its mode then comes from the `=` form, or from
+                // the walk if there is no `=` entry. A member of an archive is
+                // the exception, because there the OR value applies to a
+                // directory.
                 if !spent
                     && (name == WALK_ROOT.as_bytes()
                         || mode & S_IFMT != S_IFDIR
@@ -5581,9 +5908,9 @@ fn commit_modifier(
                     return mode | or_entries[index].1;
                 }
             }
-            // An `=` entry states the permission bits alone; the entry's own
-            // file-type bits stay, so a value carrying type bits of its own
-            // renames the type the mode holds.
+            // An `=` entry sets only the permission bits. The file-type bits of
+            // the entry stay, so a value with type bits of its own changes the
+            // type in the mode.
             match assign_entries.iter().find(|(e, _)| e.as_bytes() == name) {
                 Some((_, value)) => (mode & S_IFMT) | value,
                 None => mode,
@@ -5593,15 +5920,23 @@ fn commit_modifier(
     Some(modifier)
 }
 
-/// Read a `--timestamp` value: `@SECONDS` since the Unix epoch, or a date and
-/// time carrying an explicit UTC offset. `None` for a value this reader does not
-/// hold, which `commit` reports as the tool words it.
+/// Reads a `--timestamp` value.
 ///
-/// The tool reads a superset: a wall-clock time with no offset (its own local
-/// time), a relative expression such as `now` or `yesterday`, and an empty value
-/// (today's midnight). Those need a time-zone database or a natural-language
-/// date reader, so the port refuses them and the difference is recorded in
-/// `docs/conformance/cli-surface.md`, "P2".
+/// The value is `@SECONDS` since the Unix epoch, or a date and time with an
+/// explicit UTC offset. Whitespace around the value is ignored. For a value
+/// that this reader does not accept, the result is `None`. `commit` then
+/// reports it in the words of the `ostree` command.
+///
+/// # Divergence
+///
+/// `ostree` reads a superset:
+///
+/// - a wall-clock time with no offset, in the local time of `ostree`
+/// - a relative expression, for example `now` or `yesterday`
+/// - an empty value, which is midnight of the current day
+///
+/// These forms need a time-zone database or a natural-language date reader.
+/// ostrya refuses them. This is a recorded divergence.
 fn parse_timestamp(text: &str) -> Option<u64> {
     let text = text.trim_matches(|c: char| c.is_ascii_whitespace());
     match text.strip_prefix('@') {
@@ -5610,10 +5945,13 @@ fn parse_timestamp(text: &str) -> Option<u64> {
     }
 }
 
-/// The `@SECONDS` form: an optional sign, a decimal run, and an optional
-/// fractional part, which names a sub-second the commit timestamp cannot hold
-/// and is dropped. A pre-epoch value is recorded as the unsigned field's
-/// two's-complement form, matching the tool.
+/// Reads the `@SECONDS` form of a `--timestamp` value.
+///
+/// The form is an optional sign, a decimal run, and an optional fractional
+/// part. The fractional part names a sub-second that the commit timestamp
+/// cannot hold, so it is dropped. A value before the epoch is recorded as the
+/// two's-complement form of the unsigned field, as the `ostree` command
+/// records it.
 fn parse_epoch(text: &str) -> Option<u64> {
     let text = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
     let (negative, body) = match text.as_bytes().first() {
@@ -5641,10 +5979,13 @@ fn parse_epoch(text: &str) -> Option<u64> {
     })
 }
 
-/// The absolute form: `YYYY-MM-DD`, a `T` or a space, `HH:MM[:SS]`, an optional
-/// fractional second, and a UTC offset (`Z`, or `+HH`, `+HH:MM`, `+HHMM`, and
-/// their negatives). The offset is required: without one the value names a
-/// wall-clock time in a zone this reader does not resolve.
+/// Reads the absolute form of a `--timestamp` value.
+///
+/// The form is `YYYY-MM-DD`, a `T` or a space, `HH:MM[:SS]`, an optional
+/// fractional second, and a UTC offset. The offset is `Z`, or `+HH`,
+/// `+HH:MM`, `+HHMM`, and their negatives. The offset is required. Without an
+/// offset, the value names a wall-clock time in a zone that this reader does
+/// not resolve.
 fn parse_datetime(text: &str) -> Option<u64> {
     let (year, rest) = take_digits(text, 4)?;
     let (month, rest) = take_digits(rest.strip_prefix('-')?, 2)?;
@@ -5675,8 +6016,8 @@ fn parse_datetime(text: &str) -> Option<u64> {
     if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
         return None;
     }
-    // A leap second is stated as :60 and lands on the following second, which is
-    // what an unsigned epoch count can hold.
+    // A leap second is written as :60 and becomes the next second, which an
+    // unsigned epoch count can hold.
     if hour > 23 || minute > 59 || second > 60 {
         return None;
     }
@@ -5685,7 +6026,7 @@ fn parse_datetime(text: &str) -> Option<u64> {
     Some(seconds as u64)
 }
 
-/// A UTC offset in seconds, to subtract from the stated wall clock.
+/// Reads a UTC offset in seconds, to subtract from the stated wall clock.
 fn parse_offset(text: &str) -> Option<i64> {
     if text == "Z" || text == "z" {
         return Some(0);
@@ -5714,7 +6055,9 @@ fn parse_offset(text: &str) -> Option<i64> {
     Some(if negative { -offset } else { offset })
 }
 
-/// Exactly `count` decimal digits from the front of `text`, with the rest.
+/// Reads exactly `count` decimal digits from the front of `text`.
+///
+/// The result is the value and the rest of the text.
 fn take_digits(text: &str, count: usize) -> Option<(i64, &str)> {
     let (head, rest) = text.split_at_checked(count)?;
     if !head.bytes().all(|b| b.is_ascii_digit()) {
@@ -5723,8 +6066,9 @@ fn take_digits(text: &str, count: usize) -> Option<(i64, &str)> {
     Some((head.parse().ok()?, rest))
 }
 
-/// The number of days in `month` of `year`, under the proleptic Gregorian
-/// calendar the epoch count follows.
+/// Returns the number of days in `month` of `year`.
+///
+/// The calendar is the proleptic Gregorian calendar of the epoch count.
 fn days_in_month(year: i64, month: i64) -> i64 {
     match month {
         2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
@@ -5734,9 +6078,10 @@ fn days_in_month(year: i64, month: i64) -> i64 {
     }
 }
 
-/// The days from `1970-01-01` to the given proleptic Gregorian date, negative
-/// before the epoch. The era arithmetic counts 400-year cycles, whose length in
-/// days is fixed at 146097, so no table and no iteration is needed.
+/// Returns the days from `1970-01-01` to a proleptic Gregorian date.
+///
+/// The value is negative before the epoch. The era arithmetic counts 400-year
+/// cycles of 146097 days each, so the function needs no table and no loop.
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = if year >= 0 { year } else { year - 399 } / 400;
@@ -5746,25 +6091,30 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
-/// A refspec record without its line terminator: one trailing `\n` is dropped,
-/// then one trailing `\r`. A subpath record keeps every byte it carries.
+/// Returns a refspec record without its line terminator.
+///
+/// One trailing `\n` is dropped, then one trailing `\r`. A subpath record
+/// keeps all its bytes.
 fn batch_refspec(record: &[u8]) -> &[u8] {
     let record = record.strip_suffix(b"\n").unwrap_or(record);
     record.strip_suffix(b"\r").unwrap_or(record)
 }
 
-/// The `(refspec, subpath)` pairs a batch stream carries.
+/// Returns the `(refspec, subpath)` pairs of a batch stream.
 ///
-/// The records are NUL-separated and are read two at a time. An empty record in
-/// the refspec position ends the stream, and a trailing refspec with no record
-/// after it carries no subpath, which names the whole tree. An empty record in
-/// the subpath position is a subpath value of its own.
+/// The records are separated by NUL, and they are read two at a time:
 ///
-/// A final record with no terminator counts, so an empty segment with nothing
-/// after it is the terminator of the record before it and a stream ending in
-/// NUL carries no trailing empty record. The scan stops at the record that ends
-/// the stream, so the segments past it cost nothing and the walk holds the
-/// pairs the stream carries and no more.
+/// - An empty record in the refspec position ends the stream.
+/// - A trailing refspec with no record after it has no subpath, which names
+///   the whole tree.
+/// - An empty record in the subpath position is a subpath value of its own.
+///
+/// A final record with no terminator counts. An empty segment with nothing
+/// after it is then the terminator of the record before it. A stream that ends
+/// in NUL has no trailing empty record.
+///
+/// The scan stops at the record that ends the stream, so the segments after it
+/// cost nothing. The walk holds only the pairs of the stream.
 fn batch_pairs(bytes: &[u8]) -> Vec<(&[u8], Option<&[u8]>)> {
     let mut records = bytes.split(|byte| *byte == 0).peekable();
     let mut pairs = Vec::new();
@@ -5781,9 +6131,10 @@ fn batch_pairs(bytes: &[u8]) -> Vec<(&[u8], Option<&[u8]>)> {
     pairs
 }
 
-/// One batch refspec record as text. A record that is not UTF-8 names no
-/// revision the port resolves, so it is refused rather than read under a
-/// replacement character.
+/// Returns one batch refspec record as text.
+///
+/// A record that is not UTF-8 names no revision that ostrya resolves, so the
+/// record is refused. It is not read with a replacement character.
 fn batch_refspec_str(record: &[u8]) -> &str {
     match std::str::from_utf8(record) {
         Ok(refspec) => refspec,
@@ -5794,9 +6145,10 @@ fn batch_refspec_str(record: &[u8]) -> &str {
     }
 }
 
-/// The batch stream a `checkout` invocation reads, or `None` where the command
-/// line names neither source. Standard input wins over a file whatever the
-/// command-line order.
+/// Reads the batch stream of a `checkout` command line.
+///
+/// If the command line names neither source, the result is `None`. Standard
+/// input wins over a file, in any command-line order.
 fn read_batch(args: &CheckoutArgs) -> std::result::Result<Option<Vec<u8>>, String> {
     if args.from_stdin {
         return read_batch_stdin().map(Some);
@@ -5807,9 +6159,10 @@ fn read_batch(args: &CheckoutArgs) -> std::result::Result<Option<Vec<u8>>, Strin
     }
 }
 
-/// Read the batch stream from standard input. A batch of checkouts is control
-/// input, so the read is bounded by [`CONTROL_FILE_LIMIT`] as every other
-/// control input is.
+/// Reads the batch stream from standard input.
+///
+/// A batch of checkouts is control input, so the read is bounded by
+/// [`CONTROL_FILE_LIMIT`], as every other control input is.
 fn read_batch_stdin() -> std::result::Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     let mut bounded = std::io::Read::take(std::io::stdin().lock(), CONTROL_FILE_LIMIT + 1);
@@ -5822,25 +6175,28 @@ fn read_batch_stdin() -> std::result::Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// The `--skip-list` paths, split by the shape the file spells them in.
+/// The `--skip-list` paths, split by the form of each line in the file.
 ///
-/// The library calls the filter with the entry's path rooted at the checkout
-/// root and carrying no trailing slash, and with the root as `/`. The file
-/// spells a directory below the root with a trailing slash, so a line carrying
-/// one is held under the name without it and every other line is held as the
-/// file spells it. Both sets are then looked up under the path the library
-/// hands the filter, which allocates nothing per entry.
+/// The library calls the filter with the path of the entry from the checkout
+/// root, with no trailing slash, and with the root as `/`. The file writes a
+/// directory under the root with a trailing slash.
+///
+/// A line with a trailing slash is kept under the name without the slash. Every
+/// other line is kept as the file writes it. The filter looks up both sets with
+/// the path from the library, which allocates nothing for each entry.
 struct SkipPaths {
-    /// The lines naming a directory below the root, each without its trailing
-    /// slash.
+    /// The lines that name a directory under the root, each without its
+    /// trailing slash.
     dirs: HashSet<String>,
-    /// Every other line, the root's own `/` among them.
+    /// Every other line, the `/` of the root among them.
     files: HashSet<String>,
 }
 
-/// Read the `--skip-list` paths, shared by every checkout of the invocation. A
-/// command line naming no list reads nothing. `checkout` reports no unmatched
-/// entry, so the sets carry no order and a duplicate line changes nothing.
+/// Reads the `--skip-list` paths for all checkouts of the command line.
+///
+/// If the command line names no list, nothing is read. `checkout` reports no
+/// unmatched entry, so the sets have no order, and a duplicate line changes
+/// nothing.
 fn read_skip_paths(path: Option<&Path>) -> Option<Arc<SkipPaths>> {
     let path = path?;
     let lines = match read_skip_list(path) {
@@ -5852,8 +6208,9 @@ fn read_skip_paths(path: Option<&Path>) -> Option<Arc<SkipPaths>> {
         files: HashSet::new(),
     };
     for line in lines {
-        // The root is spelled `/`, and stripping its slash leaves nothing, so
-        // it stays with the lines the path itself matches.
+        // The root is written `/`, and the strip of its slash leaves nothing.
+        // For this reason, the root stays with the lines that the path itself
+        // matches.
         match line.strip_suffix('/') {
             Some(dir) if !dir.is_empty() => paths.dirs.insert(dir.to_owned()),
             _ => paths.files.insert(line),
@@ -5862,7 +6219,7 @@ fn read_skip_paths(path: Option<&Path>) -> Option<Arc<SkipPaths>> {
     Some(Arc::new(paths))
 }
 
-/// The checkout filter a `--skip-list` installs.
+/// Returns the checkout filter of a `--skip-list`.
 fn skip_list_filter(paths: Arc<SkipPaths>) -> CheckoutFilterFn {
     Box::new(move |path: &Path, meta: &FileMeta| {
         let path = path.to_string_lossy();
@@ -5879,18 +6236,19 @@ fn skip_list_filter(paths: Arc<SkipPaths>) -> CheckoutFilterFn {
     })
 }
 
-/// The library options one checkout of a `checkout` invocation runs under.
-/// Each checkout of a batch takes its own, the filter being a callback the
-/// options own.
+/// Returns the library options of one checkout of a `checkout` command line.
 ///
-/// `-U` applies no ownership and no xattrs and reduces a regular file's mode to
-/// `perm & 0777`; a `--subpath` directory's own metadata becomes the destination
-/// root's, and a `--subpath` file or symlink is placed inside a fresh
-/// destination directory (`docs/format-reference.md`, "Checkout").
+/// Each checkout of a batch takes its own options, because the filter is a
+/// callback that the options own.
 ///
-/// `enable_fsync` is the policy the caller resolved from the repository's
-/// `[core] fsync` and `--fsync` together, and every checkout of a batch runs
-/// under the one value (`docs/format-reference.md`, "The fsync vocabulary").
+/// `-U` applies no owner and no xattrs, and reduces the mode of a regular file
+/// to `perm & 0777`. The metadata of a `--subpath` directory becomes the
+/// metadata of the destination root. A `--subpath` file or symlink goes inside
+/// a new destination directory.
+///
+/// `enable_fsync` is the policy that the caller resolved from `[core] fsync`
+/// of the repository and `--fsync`. Every checkout of a batch uses this one
+/// value.
 fn checkout_options(
     args: &CheckoutArgs,
     filter: Option<CheckoutFilterFn>,
@@ -5921,15 +6279,18 @@ fn checkout_options(
     opts
 }
 
-/// Write one commit's composefs image to `destination`.
+/// Writes the composefs image of one commit to `destination`.
 ///
-/// The image is serialized as it is built, so a refusal and a failed write both
-/// come after part of the file is on disk. The export goes to a temporary file
-/// beside the destination and is renamed over it once the image is whole: an
-/// export that does not finish leaves no destination behind and leaves a
-/// destination that already existed as it was, and one that finishes replaces
-/// it in a single step. The temporary file shares the destination's directory,
-/// so the rename stays inside one filesystem whatever destination is named.
+/// The library serializes the image while it builds it, so a refusal or a
+/// failed write comes after part of the file is on disk. The export writes to
+/// a temporary file in the directory of the destination. When the image is
+/// complete, a rename moves the temporary file over the destination.
+///
+/// If the export does not complete, it writes no destination, and a
+/// destination that already exists stays as it was. If the export completes,
+/// it replaces the destination in one step. The temporary file is in the
+/// directory of the destination, so the rename stays in one file system for
+/// each destination name.
 async fn export_composefs(
     repo: &Repo,
     opts: &ComposefsOptions,
@@ -5942,10 +6303,10 @@ async fn export_composefs(
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let temp = dir.join(format!(".ostrya-composefs-{}.tmp", std::process::id()));
     let out = std::fs::File::create(&temp).map_err(Error::Io)?;
-    // The tool's image mode is 0644 whatever the umask, and `File::create`
-    // opens with 0666 reduced by the umask, so the mode is set on the open
-    // descriptor: `fchmod` takes no umask, and the rename carries the mode
-    // to the destination.
+    // The `ostree` command writes the image with mode 0644 for each umask.
+    // `File::create` opens with 0666 reduced by the umask, so the code sets
+    // the mode on the open descriptor. `fchmod` ignores the umask, and the
+    // rename keeps the mode on the destination.
     if let Err(err) = out.set_permissions(std::fs::Permissions::from_mode(0o644)) {
         let _ = std::fs::remove_file(&temp);
         return Err(Error::Io(err));
@@ -5960,10 +6321,11 @@ async fn export_composefs(
     written
 }
 
+/// Checks out a commit, or each pair of a batch, into the destination.
 async fn checkout(repo: Repo, args: CheckoutArgs, fsync: Option<bool>) -> Result<()> {
-    // The tool opens a `--from-file` ahead of every other check the subcommand
-    // makes, so a file that does not open is reported before the union pair,
-    // the composefs incompatibility, and the revision.
+    // The `ostree` command opens a `--from-file` before each other check of
+    // the subcommand. If the file does not open, that error comes before the
+    // union pair, the composefs incompatibility, and the revision.
     let batch = match read_batch(&args) {
         Ok(batch) => batch,
         Err(message) => exit_error(&message),
@@ -5971,30 +6333,30 @@ async fn checkout(repo: Repo, args: CheckoutArgs, fsync: Option<bool>) -> Result
 
     let pairs = batch.as_deref().map(batch_pairs);
 
-    // The tool makes every command-line refusal below inside the scope of one
-    // checkout, which the prefix each of them carries under a batch option
-    // shows. A stream that carries no pair enters no such scope and reaches
-    // none of them, so it exits 0 whatever the rest of the command line holds.
-    // Each of the refusals reads the command line alone, which no pair
-    // changes, so one pass over them stands for the stream's own.
+    // The `ostree` command makes each command-line refusal of `checkout` in
+    // the scope of one checkout. The prefix of each refusal under a batch
+    // option shows this. A stream with no pair enters no such scope and
+    // reaches none of the refusals, so it exits 0 for each command line. Each
+    // refusal reads only the command line, which no pair changes, so one pass
+    // over the refusals covers all pairs of the stream.
     let in_scope = pairs.as_ref().is_none_or(|pairs| !pairs.is_empty());
 
-    // The plain path resolves its own COMMIT. Under a batch option the first
-    // positional is the destination and every revision comes from the record
-    // stream, so nothing is resolved here.
+    // The plain path resolves its own COMMIT. Under a batch option, the first
+    // positional is the destination and each revision comes from the record
+    // stream, so this code resolves no revision.
     let commit = if batch.is_some() {
         None
     } else {
         Some(resolve(&repo, &args.commit).await?)
     };
 
-    // The three union options are mutually exclusive, and the first pair the
-    // command line holds is the one reported, in this order. The check sits
-    // here rather than on the `clap` definition because the tool makes it after
-    // the repository opens and the revision resolves
-    // (`docs/conformance/cli-surface.md`, "P2"). It stands ahead of the
-    // composefs export as well, so a pair the port refuses is refused whatever
-    // else the command line carries.
+    // The three union options are mutually exclusive. If the command line holds
+    // more than one pair, ostrya reports the first pair in this order. The
+    // check is in this function because the `ostree` command makes it after the
+    // repository opens and the revision resolves. A rule of the `clap`
+    // definition runs before both steps. The check also comes before the
+    // composefs export, so ostrya refuses such a pair whatever else the command
+    // line holds.
     if in_scope {
         if args.union && args.union_add {
             exit_error("Cannot specify both --union and --union-add");
@@ -6007,10 +6369,11 @@ async fn checkout(repo: Repo, args: CheckoutArgs, fsync: Option<bool>) -> Result
         }
     }
 
-    // Under a batch option the destination is the first positional and the
-    // second is ignored, which is the tool's own arity. A destination value of
-    // no bytes names no path, so it is refused rather than read as the working
-    // directory; `clap` refuses the same value on the plain path.
+    // Under a batch option, the destination is the first positional and the
+    // second positional is ignored. This is the arity of the `ostree` command.
+    // A destination value of no bytes names no path, so ostrya refuses it. It
+    // does not stand for the working directory. `clap` refuses the same value
+    // on the plain path.
     let destination = match &batch {
         Some(_) => {
             if in_scope && args.commit.is_empty() {
@@ -6025,14 +6388,15 @@ async fn checkout(repo: Repo, args: CheckoutArgs, fsync: Option<bool>) -> Result
     };
 
     if args.composefs || args.composefs_noverity {
-        // A whiteout switch describes a transformation of the tree a checkout
-        // writes, a skip list prunes paths out of it, and the four switches
-        // below decide how a checkout materializes an entry. A composefs export
-        // writes an image of the commit tree instead, so none of them reaches
-        // it. The tool refuses each combination and writes no image, and the
-        // port refuses it under the same words. The two batch options are not
-        // refused: the tool exports one image per pair, from the pair's own
-        // revision.
+        // A whiteout switch changes the tree that a checkout writes, and a
+        // skip list removes paths from it. `--require-hardlinks`,
+        // `--force-copy`, `--bareuseronly-dirs`, and `--disable-cache` decide
+        // how a checkout writes an entry. A composefs export writes an image
+        // of the commit tree, so none of these options applies to it. The
+        // `ostree` command refuses each combination and writes no image.
+        // ostrya refuses it with the same words. The two batch options are
+        // not refused: `ostree` exports one image for each pair, from the
+        // revision of the pair.
         if in_scope
             && (args.whiteouts
                 || args.process_passthrough_whiteouts
@@ -6055,8 +6419,8 @@ async fn checkout(repo: Repo, args: CheckoutArgs, fsync: Option<bool>) -> Result
             let commit = commit.expect("the plain path resolved its own COMMIT");
             return export_composefs(&repo, &opts, &commit, &destination).await;
         };
-        // A pair's subpath decides nothing here, as `--subpath` decides nothing
-        // on the plain path: a composefs export writes the image of the whole
+        // The subpath of a pair has no effect, as `--subpath` has no effect on
+        // the plain path. A composefs export writes the image of the full
         // commit tree.
         for (refspec, _) in pairs {
             let commit = resolve(&repo, batch_refspec_str(refspec)).await?;
@@ -6065,30 +6429,28 @@ async fn checkout(repo: Repo, args: CheckoutArgs, fsync: Option<bool>) -> Result
         return Ok(());
     }
 
-    // The `-H` requirement stands after the composefs export, which takes no
-    // hardlink and so has no use for the switch.
+    // The `-H` check comes after the composefs export, which makes no
+    // hardlink and has no use for the switch.
     //
-    // The hardlink is what establishes identity, so the tool takes
-    // `--union-identical` only together with `-H`, whatever the repository
-    // mode. The library holds the same pairing as its own guard, and decides
-    // which mode pair can hardlink at the entry instead.
+    // The hardlink establishes identity, so the `ostree` command accepts
+    // `--union-identical` only with `-H`, for each repository mode. The
+    // library has the same pairing as its own guard. The library decides at
+    // the entry which mode pairs can hardlink.
     if in_scope && args.union_identical && !args.require_hardlinks {
         exit_error("--union-identical requires --require-hardlinks");
     }
 
-    // The port keeps no uncompressed object cache, so a checkout writes none
-    // and reads none. The switch asks for the behaviour the port already has,
-    // so it is accepted and decides nothing
-    // (`docs/conformance/cli-surface.md`, "checkout").
+    // ostrya keeps no uncompressed object cache, so a checkout writes none
+    // and reads none. The switch asks for the behavior that ostrya already
+    // has, so ostrya accepts it and it has no effect.
     let _ = args.disable_cache;
 
-    // The checkout path takes the policy as a plain value, so the configured
-    // `[core] fsync` is read here, where it is used. The option narrows that
-    // policy and never widens it: a repository holding `[core] fsync=false`
-    // syncs nothing under `--fsync=true` (`docs/format-reference.md`, "CLI
-    // output formats", "The fsync vocabulary"). The read stands after the
-    // composefs export, which applies no such policy, and ahead of every
-    // checkout, so one read covers the plain path and every pair of a batch.
+    // The checkout path takes the fsync policy as a plain value, so the code
+    // reads the configured `[core] fsync` here, where it is used. The option
+    // narrows the policy and never widens it. A repository with
+    // `[core] fsync=false` syncs nothing under `--fsync=true`. The read comes
+    // after the composefs export, which applies no such policy, and before
+    // each checkout. One read covers the plain path and each pair of a batch.
     let enable_fsync = repo.config().fsync()? && fsync != Some(false);
 
     let dest_dir = std::fs::File::open(".").map_err(Error::Io)?;
@@ -6104,20 +6466,19 @@ async fn checkout(repo: Repo, args: CheckoutArgs, fsync: Option<bool>) -> Result
             .checkout_at(&mut opts, dest_dir.as_fd(), &destination, &commit)
             .await
         {
-            // `--allow-noent` suppresses one refusal and one only: a `--subpath`
-            // that names nothing. An unresolvable COMMIT is refused ahead of this
-            // call, and a subpath running through an entry that is not a directory
-            // keeps its refusal, both of which is what the tool does
-            // (`docs/conformance/cli-surface.md`, "P2").
+            // `--allow-noent` suppresses exactly one refusal: a `--subpath`
+            // that names nothing. An unresolvable COMMIT is refused before
+            // this call. A subpath through an entry that is not a directory
+            // keeps its refusal. The `ostree` command does both of these.
             Err(Error::SubpathNotFound(_)) if args.allow_noent => Ok(()),
             other => other,
         };
     };
 
-    // Every pair writes into the one destination under the invocation's own
-    // overwrite mode, and `--subpath` is dropped, the pair's second record
-    // carrying the subpath instead. The tool opens the skip list inside the
-    // per-pair scope, so a stream carrying no pair never reads the file.
+    // Each pair writes into the one destination with the overwrite mode of
+    // the command line. `--subpath` is dropped, and the second record of the
+    // pair gives the subpath. The `ostree` command opens the skip list in the
+    // scope of each pair, so a stream with no pair never reads the file.
     let skip = if pairs.is_empty() {
         None
     } else {
@@ -6131,9 +6492,9 @@ async fn checkout(repo: Repo, args: CheckoutArgs, fsync: Option<bool>) -> Result
             .checkout_at(&mut opts, dest_dir.as_fd(), &destination, &commit)
             .await
         {
-            // `--allow-noent` acts per pair and the stream continues. Every
-            // other refusal ends the run, leaving the pairs already written in
-            // place.
+            // `--allow-noent` acts on each pair, and the stream continues.
+            // Each other refusal ends the run. The pairs that are already
+            // written stay in place.
             Err(Error::SubpathNotFound(_)) if args.allow_noent => {}
             Err(err) => return Err(err),
             Ok(()) => {}
@@ -6142,13 +6503,14 @@ async fn checkout(repo: Repo, args: CheckoutArgs, fsync: Option<bool>) -> Result
     Ok(())
 }
 
-/// Write a commit's tree to standard output, or to `--output`, as a tar stream.
+/// Writes the tree of a commit as a tar stream to standard output or to
+/// `--output`.
 ///
-/// The destination is opened before the revision resolves, matching the tool's
-/// own order: an existing destination is truncated in place, so it keeps its
-/// inode and its mode, and a refusal that comes after the open leaves it
-/// truncated. A destination the open creates takes `0o666` reduced by the
-/// umask (`docs/conformance/cli-surface.md`, "export").
+/// The destination opens before the revision resolves, in the order of the
+/// `ostree` command. An existing destination is truncated in place, so it
+/// keeps its inode and its mode. A refusal after the open leaves it
+/// truncated. A destination that the open creates gets mode `0o666` reduced
+/// by the umask.
 async fn export(repo: Repo, name: &str, args: ExportArgs) -> Result<()> {
     let Some(rev) = args.commit.as_deref() else {
         exit_with_error(name, "A COMMIT argument is required");
@@ -6169,9 +6531,10 @@ async fn export(repo: Repo, name: &str, args: ExportArgs) -> Result<()> {
     repo.export_tar(&commit, opts, out).await
 }
 
-/// List, create, or delete refs. `--create` wins over `--delete`, and
-/// `--collections` wins over `--alias`, matching the tool's own precedence
-/// (`docs/format-reference.md`, "CLI output formats").
+/// Lists, creates, or deletes refs.
+///
+/// `--create` wins over `--delete`, and `--collections` wins over `--alias`.
+/// This is the precedence of the `ostree` command.
 async fn refs(repo: Repo, args: RefsArgs) -> Result<()> {
     if let Some(newref) = args.create.as_deref() {
         refs_create(&repo, newref, &args).await
@@ -6186,29 +6549,31 @@ async fn refs(repo: Repo, args: RefsArgs) -> Result<()> {
     }
 }
 
-/// Point a new ref, a new collection ref, or a new alias, at what the single
-/// PREFIX argument names. `-c` wins over `-A` here the way it does in a
-/// listing.
+/// Points a new ref, collection ref, or alias at the revision of PREFIX.
+///
+/// The command line must give exactly one PREFIX. `-c` wins over `-A`, as in
+/// a listing.
 async fn refs_create(repo: &Repo, newref: &str, args: &RefsArgs) -> Result<()> {
     let existing = match args.prefix.len() {
         1 => args.prefix[0].as_str(),
         0 => exit_error("You must specify a revision when creating a new ref"),
         _ => exit_error("You must specify only 1 existing ref when creating a new ref"),
     };
-    // The existence check resolves NEWREF as a revision in every case; `--force`
-    // suppresses the refusal a resolved NEWREF draws and not the resolution
-    // itself (`format-reference.md`, "refs"). So `--create=NAME^ --force` where
-    // NAME's base is a root commit stops here with `Commit <checksum> has no
-    // parent`, the words `report_resolution_failure` gives that failure.
+    // The existence check resolves NEWREF as a revision in each case.
+    // `--force` suppresses only the refusal for a NEWREF that resolves. The
+    // resolution itself still runs. If the base of NAME is a root commit,
+    // `--create=NAME^ --force` stops at this point with `Commit <checksum> has
+    // no parent`. These are the words that `report_resolution_failure` gives
+    // for that failure.
     let resolved = resolve_optional(repo, newref).await?;
     if !args.force && resolved.is_some() {
         exit_error(&format!(
             "--create specified but ref {newref} already exists"
         ));
     }
-    // NEWREF is validated as a ref name here: after the existence check and
-    // before the positional resolves, which is the order the tool takes it in.
-    // A `^` fails the ref-name rule, so a name with an ancestry suffix is
+    // ostrya checks NEWREF as a ref name after the existence check and before
+    // the positional resolves. This is the order of the `ostree` command. A
+    // `^` fails the ref-name rule, so a name with an ancestry suffix is
     // refused at this step.
     if validate_refspec(newref).is_err() {
         exit_error(&format!("Invalid refspec {newref}"));
@@ -6217,17 +6582,17 @@ async fn refs_create(repo: &Repo, newref: &str, args: &RefsArgs) -> Result<()> {
         return refs_create_collection(repo, newref, existing).await;
     }
     if args.alias {
-        // An alias lives under `refs/heads`, so a NEWREF naming a remote is
-        // refused, and the message names the remote half alone, whether or not
-        // that remote exists. The step sits after the three NEWREF checks and
-        // before the positional resolves, so `--create=origin:al nosuch`
-        // reports the remote and not the positional, and `--force` leaves it in
-        // place (`docs/format-reference.md`, "refs").
+        // An alias is under `refs/heads`, so a NEWREF that names a remote is
+        // refused. The message names only the remote half, for a remote that
+        // exists and for one that does not. This step comes after the three
+        // NEWREF checks and before the positional resolves. As a result,
+        // `--create=origin:al nosuch` reports the remote and not the
+        // positional, and `--force` keeps the refusal.
         if let Some((remote, _)) = newref.split_once(':') {
             exit_error(&format!("Cannot create alias to remote ref: {remote}"));
         }
-        // An alias records a name, so its target has to be a ref: a checksum
-        // and an ancestry suffix each name a commit and no ref file.
+        // An alias records a name, so its target must be a ref. A checksum and
+        // an ancestry suffix each name a commit and no ref file.
         if !names_a_ref(repo, existing).await? {
             exit_error(&format!(
                 "Cannot create alias to non-existent ref: {existing}"
@@ -6239,17 +6604,21 @@ async fn refs_create(repo: &Repo, newref: &str, args: &RefsArgs) -> Result<()> {
     repo.set_ref_immediate(newref, Some(&commit)).await
 }
 
-/// Write a collection ref under `-c`, where NEWREF is a
-/// `<collection-id>:<ref>` pair naming `refs/mirrors/<collection-id>/<ref>`.
+/// Writes a collection ref for `-c` from a `<collection-id>:<ref>` NEWREF.
 ///
-/// The steps run in the tool's order (`docs/format-reference.md`, "refs"): the
-/// pair shape, then the revision, then the collection id. An empty half is
-/// refused a step earlier, by the ref-name check every NEWREF passes. A NEWREF
-/// holding no `:` names no ref, so the whole argument is read as the collection
-/// id and the missing name is reported once that id holds.
+/// The pair names `refs/mirrors/<collection-id>/<ref>`. The steps run in the
+/// order of the `ostree` command:
+///
+/// 1. the shape of the pair
+/// 2. the revision
+/// 3. the collection id
+///
+/// The ref-name check of each NEWREF refuses an empty half one step earlier.
+/// If NEWREF holds no `:`, it names no ref. The full argument is then read as
+/// the collection id, and if that id is valid, the missing name is reported.
 async fn refs_create_collection(repo: &Repo, newref: &str, existing: &str) -> Result<()> {
     let pair = match newref.split_once(':') {
-        // A second `:` is refused with the pair's own message here. A `^` never
+        // A second `:` gets the message for the pair at this step. A `^` never
         // reaches this step, because the ref-name rule refuses it earlier.
         Some((_, ref_name)) if ref_name.contains(':') => {
             exit_error(&format!("Invalid refspec {newref}"))
@@ -6271,14 +6640,17 @@ async fn refs_create_collection(repo: &Repo, newref: &str, existing: &str) -> Re
         .await
 }
 
-/// Whether `id` is a collection id: two or more `.`-separated elements, each
-/// starting with an ASCII letter or `_` and continuing with ASCII letters,
+/// Returns `true` if `id` is a collection id.
+///
+/// A collection id has two or more elements, separated by `.`. Each element
+/// starts with an ASCII letter or `_` and continues with ASCII letters,
 /// digits, or `_`.
 ///
-/// Recovered by observation: the tool writes `a.b`, `A.b`, `_a.b`, `a._b`,
-/// `a_b.c`, and `a.b.c.d`, and refuses `fresh`, `a..b`, `a.b.`, `1a.b`,
-/// `a.1b`, `a-b.c`, and `a.b-c` with `error: Invalid collection ID <id>`. The
-/// length is bounded by the filesystem alone, the id being one path component.
+/// Recovered by observation: the `ostree` command writes `a.b`, `A.b`,
+/// `_a.b`, `a._b`, `a_b.c`, and `a.b.c.d`. It refuses `fresh`, `a..b`,
+/// `a.b.`, `1a.b`, `a.1b`, `a-b.c`, and `a.b-c` with
+/// `error: Invalid collection ID <id>`. Only the file system limits the
+/// length, because the id is one path component.
 fn is_collection_id(id: &str) -> bool {
     id.split('.').count() >= 2
         && id.split('.').all(|element| {
@@ -6290,25 +6662,31 @@ fn is_collection_id(id: &str) -> bool {
         })
 }
 
-/// The commit a ref name resolves to, or `None` when the name names no ref: a
-/// bare checksum and an ancestry suffix each name a commit and no ref file, and
-/// a name no ref file can carry names no ref either, which is the answer the
-/// alias refusal reports, the way the tool reports it for `..` and for an empty
-/// target. An abbreviated checksum -- a run of one to 63 lowercase hex
-/// characters -- is revision syntax as well, so `refs -A --create` and the
-/// `refs -A` prefix selection take the name as written and match it against no
-/// commit: a prefix the ref store carries no ref for names no ref, and an
-/// ambiguous prefix is no different from a unique one here, neither naming a
-/// ref (`docs/format-reference.md`, "Revision syntax"). An i/o error reaching
-/// the ref file is returned, so the caller decides whether a name that is a
-/// directory, or a path through a ref file, is a refusal or a miss.
+/// Returns the commit of a ref name, or `None` if the name names no ref.
 ///
-/// The lookup is the ref store alone (`Repo::resolve_ref_tip`), which is what
-/// keeps the revision syntax out of this site.
+/// These names name no ref:
+///
+/// - A full checksum and a name with an ancestry suffix. Each names a commit
+///   and no ref file.
+/// - A name that no ref file can carry. The alias refusal reports this
+///   answer, as the `ostree` command does for `..` and for an empty target.
+///
+/// An abbreviated checksum, a run of 1 to 63 lowercase hex characters, is
+/// also revision syntax. `refs -A --create` and the prefix selection of
+/// `refs -A` take the name as written and match it against no commit. A
+/// prefix with no ref in the ref store names no ref. An ambiguous prefix and
+/// a unique prefix are the same here, because neither names a ref.
+///
+/// If an I/O error occurs on the ref file, the function returns it. The
+/// caller decides if a name that is a directory, or a path through a ref
+/// file, is a refusal or a miss.
+///
+/// The lookup reads only the ref store ([`Repo::resolve_ref_tip`]), so no
+/// revision syntax applies here.
 async fn resolve_ref_name(repo: &Repo, rev: &str) -> Result<Option<Checksum>> {
-    // A 64-character name is a checksum in lowercase hex alone, the split
-    // resolution takes, so an uppercase one is looked up as a ref name and an
-    // alias to it is written (`docs/format-reference.md`, "Revision syntax").
+    // A 64-character name is a checksum only in lowercase hex, as the split
+    // resolution reads it. An uppercase one is looked up as a ref name, and an
+    // alias to it is written.
     if rev.ends_with('^') || Checksum::from_hex_lower(rev).is_ok() {
         return Ok(None);
     }
@@ -6319,53 +6697,64 @@ async fn resolve_ref_name(repo: &Repo, rev: &str) -> Result<Option<Checksum>> {
     }
 }
 
-/// Whether `rev` names a ref file rather than a commit.
+/// Returns `true` if `rev` names a ref file, by the rules of
+/// [`resolve_ref_name`].
 async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
     Ok(resolve_ref_name(repo, rev).await?.is_some())
 }
 
-/// Delete every ref the prefixes match. A prefix matching nothing is not an
-/// error, and the parent directories a removal empties are left in place,
-/// matching the tool.
+/// Deletes each ref that the prefixes match.
 ///
-/// A whole-remote prefix that matches at least one ref ends the invocation with
-/// exit 1 and removes none of what it matched, which is the tool's outcome: the
-/// tool names each ref it deletes by joining the prefix's ref half with the name
-/// below it, and the `.` that join carries is a refspec its own rule then
-/// refuses. The prefixes ahead of it keep their effect, and a whole-remote
-/// prefix matching no ref exits 0. The two word the refusal differently
-/// (`docs/conformance/cli-surface.md`, "P1").
+/// A prefix that matches nothing is not an error. The parent directories that
+/// a removal empties stay in place, as in the `ostree` command.
 ///
-/// A ref under `refs/heads` that an alias names is refused with exit 1, and the
-/// prefix that matched it removes nothing. The guard runs per prefix, after the
-/// whole-remote refusal, so `refs --delete deep test` removes what `deep`
-/// matched and then reports the refusal for `test`. It is the ref set and the
-/// alias set as the prefixes ahead left them that each prefix reads, so
-/// `refs --delete alal test/al` removes the alias and then the ref it named. `-c`
-/// takes no part in it (`docs/format-reference.md`, "refs").
+/// # Whole-remote prefixes
 ///
-/// Each prefix is matched against the ref set as the prefixes ahead of it left
-/// it, so a prefix that removes a remote's last ref leaves a whole-remote prefix
-/// behind it matching nothing, which exits 0 in both.
+/// If a whole-remote prefix matches one or more refs, the command ends with
+/// exit 1, and the prefix removes none of its matches. This is the outcome of
+/// `ostree`. `ostree` names each ref that it deletes as the ref half of the
+/// prefix joined with the name under it. The `.` in that join gives a refspec
+/// that the rule of `ostree` refuses.
 ///
-/// With `-A` the set each prefix selects is the one a `-A` listing prints: the
-/// ref the prefix names exactly, or the aliases nested under it. `-c` wins over
-/// `-A`, and the prefix rules, the whole-remote refusal, and the alias guard all
-/// apply to whichever set the prefix selected (`docs/format-reference.md`,
-/// "refs").
+/// The prefixes before it keep their effect. A whole-remote prefix that
+/// matches no ref exits 0. The two commands use different words for the
+/// refusal. This is a recorded divergence.
 ///
-/// With `-c` the prefixes are collection ids, and the id equal to the
-/// repository's own `collection-id` removes the refs under `refs/heads` alone,
-/// keeping the mirror refs that carry that id.
+/// # Alias guard
+///
+/// If an alias names a ref under `refs/heads`, the deletion of that ref is
+/// refused with exit 1, and the prefix that matched it removes nothing. The
+/// guard runs for each prefix, after the whole-remote refusal.
+/// `refs --delete deep test` removes the matches of `deep` and then reports
+/// the refusal for `test`. `-c` has no alias guard.
+///
+/// # Prefix order
+///
+/// Each prefix reads the ref set and the alias set as the prior prefixes left
+/// them. `refs --delete alal test/al` removes the alias and then the ref that
+/// it named. If a prefix removes the last ref of a remote, a later
+/// whole-remote prefix matches nothing, and both commands exit 0.
+///
+/// # Aliases (`-A`)
+///
+/// With `-A`, each prefix selects the set that a `-A` listing prints: the ref
+/// that the prefix names exactly, or the aliases under it. `-c` wins over
+/// `-A`. The prefix rules, the whole-remote refusal, and the alias guard apply
+/// to the set that the prefix selected.
+///
+/// # Collection ids (`-c`)
+///
+/// With `-c`, the prefixes are collection ids. The id that is equal to the
+/// `collection-id` of the repository removes only the refs under
+/// `refs/heads`. The mirror refs with that id stay.
 async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
     if args.prefix.is_empty() {
         exit_error("At least one PREFIX is required when deleting refs");
     }
     if args.collections {
-        // An id equal to the repository's own `collection-id` removes the refs
-        // under `refs/heads` alone: the mirror refs carrying that same id stand,
-        // where a foreign id removes the mirror refs it names
-        // (`docs/format-reference.md`, "refs").
+        // An id that is equal to the `collection-id` of the repository removes
+        // only the refs under `refs/heads`, and the mirror refs with the same
+        // id stay. A foreign id removes the mirror refs that it names.
         let own = repo.config().collection_id().map(str::to_owned);
         for entry in select_collection_refs(repo, &args.prefix).await? {
             if entry.local {
@@ -6379,8 +6768,8 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
     }
     let listed = repo.list_ref_aliases().await?;
     let mut aliases = active_aliases(&listed);
-    // Every alias, local and remote alike, which is the set a `-A` prefix
-    // filters and a `-A --delete` removes from.
+    // All aliases, local and remote. A `-A` prefix filters this set, and a
+    // `-A --delete` removes from it.
     let mut alias_names: Vec<String> = listed.into_iter().map(|alias| alias.refspec).collect();
     let mut all = all_refs(repo).await?;
     for prefix in prefixes(&args.prefix) {
@@ -6400,12 +6789,12 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
             return Err(Error::InvalidRefspec(given.to_owned()));
         }
         for refspec in &selected {
-            // A ref under `refs/remotes` is removed with an alias naming it, so
-            // the guard reads the refs under `refs/heads` alone -- the ones a
-            // refspec holding no `:` names. Where more than one guarded ref
-            // matches, the port names the first in refspec order and the tool
-            // names the first its own enumeration reaches
-            // (`docs/conformance/cli-surface.md`, "P1").
+            // A ref under `refs/remotes` is removed also if an alias names it,
+            // so the guard reads only the refs under `refs/heads`. These are
+            // the refspecs with no `:`. If more than one guarded ref matches,
+            // ostrya names the first in refspec order. The `ostree` command
+            // names the first that its enumeration reaches. This is a recorded
+            // divergence.
             if refspec.contains(':') {
                 continue;
             }
@@ -6423,15 +6812,18 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
     Ok(())
 }
 
-/// The aliases one `-A --delete` prefix removes, which is the set a `-A` listing
-/// prints for it: the ref the prefix names exactly, whether or not that ref is an
-/// alias, or the aliases nested under it.
+/// Returns the aliases that one `-A --delete` prefix removes.
 ///
-/// A remote alias is removed by a prefix naming it exactly and by no other, since
-/// the tool deletes each nested alias by the name it prints for it, which for a
-/// remote alias drops the remote and names no ref of that remote. The port
-/// removes the alias its own listing names, so a remote prefix holding an alias
-/// diverges (`docs/conformance/cli-surface.md`, "P1").
+/// This is the set that a `-A` listing prints for the prefix. The set is the
+/// ref that the prefix names exactly, alias or not, or the aliases under it.
+///
+/// # Divergence
+///
+/// In the `ostree` command, only a prefix that names a remote alias exactly
+/// removes it. `ostree` deletes each nested alias by the name that it prints
+/// for it. For a remote alias, this name drops the remote and names no ref of
+/// that remote. ostrya removes each alias that its listing names, so the
+/// result for a remote prefix that holds an alias is a recorded divergence.
 async fn select_aliases(
     repo: &Repo,
     aliases: &[String],
@@ -6449,16 +6841,20 @@ async fn select_aliases(
         .collect())
 }
 
-/// The aliases that can name a local ref, as `(alias refspec, the ref name its
-/// link body gives)` pairs sorted by alias refspec.
+/// Returns the aliases that can name a local ref, sorted by alias refspec.
 ///
-/// An alias names a ref under `refs/heads` by that ref's own name: the link body
-/// with its leading `../` components removed, read from the `refs/heads` root and
-/// not from the alias's own directory. So an alias at `refs/heads/test/al2` whose
-/// body is `other` names the ref `other`, where the link itself resolves to
-/// `refs/heads/test/other`. An alias under `refs/remotes` names nothing here, and
-/// a body reaching outside `refs/heads` matches no local refspec, a local ref
-/// name holding no `:` (`docs/format-reference.md`, "refs").
+/// Each pair is `(alias refspec, the ref name of its link body)`.
+///
+/// An alias names a ref under `refs/heads` by the name of that ref. This name
+/// is the link body with its leading `../` components removed. The name is
+/// relative to the `refs/heads` root, also for an alias in a subdirectory.
+///
+/// For example, an alias at `refs/heads/test/al2` with the body `other` names
+/// the ref `other`. The link itself resolves to `refs/heads/test/other`.
+///
+/// An alias under `refs/remotes` names no ref here. A body that reaches
+/// outside `refs/heads` matches no local refspec, which is a local ref name
+/// with no `:`.
 fn active_aliases(listed: &[RefAlias]) -> Vec<(String, String)> {
     listed
         .iter()
@@ -6470,10 +6866,12 @@ fn active_aliases(listed: &[RefAlias]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Print the local and remote refs the prefixes match, one per line, with the
-/// commit checksum after a tab under `-r`. A ref two prefixes match is printed
-/// once per match, and the name a row carries is stripped by the prefix that
-/// selected it -- `refs test test/main` prints `main` and then `test/main`.
+/// Prints the local and remote refs that the prefixes match, one on each line.
+///
+/// Under `-r`, a tab and the commit checksum follow the name. If two prefixes
+/// match a ref, the ref is printed once for each match. The prefix that
+/// selected a row strips the name of that row: `refs test test/main` prints
+/// `main` and then `test/main`.
 async fn refs_list(repo: &Repo, args: &RefsArgs) -> Result<()> {
     let all = all_refs(repo).await?;
     for prefix in prefixes(&args.prefix) {
@@ -6494,10 +6892,11 @@ async fn refs_list(repo: &Repo, args: &RefsArgs) -> Result<()> {
     Ok(())
 }
 
-/// Print the aliases the prefixes match, as `name -> target`. A `PREFIX` that
-/// names a ref is answered by that one ref, with the commit checksum in the
-/// target position; every other prefix keeps the aliases nested under it. The
-/// name is never stripped and `-r` adds nothing, matching the tool.
+/// Prints the aliases that the prefixes match, as `name -> target`.
+///
+/// If a `PREFIX` names a ref, the output is that one ref, with the commit
+/// checksum as the target. Each other prefix keeps the aliases under it. The
+/// name is never stripped, and `-r` adds nothing, as in the `ostree` command.
 async fn refs_list_aliases(repo: &Repo, args: &RefsArgs) -> Result<()> {
     let aliases = repo.list_ref_aliases().await?;
     for prefix in prefixes(&args.prefix) {
@@ -6521,12 +6920,13 @@ async fn refs_list_aliases(repo: &Repo, args: &RefsArgs) -> Result<()> {
     Ok(())
 }
 
-/// The commit a `-A` PREFIX names as a ref, whether or not that ref is an
-/// alias. A prefix reaching no ref file -- a directory holding refs, a path
-/// through a ref file, an alias whose target ref is missing -- names no ref, so
-/// it filters the alias listing instead. `EISDIR` and `ENOTDIR` are the two
-/// errnos those paths draw; every other read failure is returned, so a
-/// permission fault reaches the caller rather than reading as an empty listing.
+/// Returns the commit of the ref that a `-A` PREFIX names, alias or not.
+///
+/// Some prefixes reach no ref file: a directory that holds refs, a path
+/// through a ref file, and an alias with a missing target ref. Such a prefix
+/// names no ref, so it filters the alias listing. These paths give `EISDIR`
+/// and `ENOTDIR`. Each other read failure is returned, so a permission fault
+/// reaches the caller and does not show as an empty listing.
 async fn alias_prefix_commit(repo: &Repo, prefix: &str) -> Result<Option<Checksum>> {
     match resolve_ref_name(repo, prefix).await {
         Err(Error::Io(err))
@@ -6541,8 +6941,9 @@ async fn alias_prefix_commit(repo: &Repo, prefix: &str) -> Result<Option<Checksu
     }
 }
 
-/// Print the collection refs, as `(collection-id, ref)`, with the commit
-/// checksum after a tab under `-r`.
+/// Prints the collection refs as `(collection-id, ref)`.
+///
+/// Under `-r`, a tab and the commit checksum follow the pair.
 async fn refs_list_collections(repo: &Repo, args: &RefsArgs) -> Result<()> {
     for entry in select_collection_refs(repo, &args.prefix).await? {
         let pair = format!("({}, {})", entry.collection, entry.name);
@@ -6555,8 +6956,9 @@ async fn refs_list_collections(repo: &Repo, args: &RefsArgs) -> Result<()> {
     Ok(())
 }
 
-/// Every local and remote ref, sorted by refspec, which is the order a listing
-/// prints and the set each prefix filters.
+/// Returns each local and remote ref, sorted by refspec.
+///
+/// This is the order of a listing and the set that each prefix filters.
 async fn all_refs(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
     let mut all = repo.list_refs(None).await?;
     all.extend(repo.list_remote_refs().await?);
@@ -6564,10 +6966,11 @@ async fn all_refs(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
     Ok(all)
 }
 
-/// The collection refs the collection ids select, grouped the same way a
-/// listing groups ref-name prefixes. The repository's own
-/// `collection-id` qualifies its local refs; the mirror refs carry theirs in
-/// the path.
+/// Returns the collection refs that the collection ids select.
+///
+/// The ids group the refs as a listing groups ref-name prefixes. The
+/// `collection-id` of the repository qualifies its local refs. The mirror
+/// refs carry their id in the path.
 async fn select_collection_refs(repo: &Repo, ids: &[String]) -> Result<Vec<CollectionRefEntry>> {
     let all = repo.list_collection_refs().await?;
     let mut out = Vec::new();
@@ -6581,8 +6984,8 @@ async fn select_collection_refs(repo: &Repo, ids: &[String]) -> Result<Vec<Colle
     Ok(out)
 }
 
-/// The prefixes to iterate: each one given, or a single `None` standing for
-/// "every ref" when none were.
+/// Returns the prefixes to iterate: each given prefix, or one `None` for all
+/// refs.
 fn prefixes(given: &[String]) -> Vec<Option<&str>> {
     if given.is_empty() {
         return vec![None];
@@ -6590,23 +6993,25 @@ fn prefixes(given: &[String]) -> Vec<Option<&str>> {
     given.iter().map(|prefix| Some(prefix.as_str())).collect()
 }
 
-/// Refuse a PREFIX that no ref name can hold, and a PREFIX whose path under
-/// `refs/` runs through a ref file, both of which the tool refuses before the
-/// prefix filters anything. The check runs where each prefix is taken, so the
-/// rows an earlier prefix printed and the refs it deleted stand, matching the
-/// tool: `refs test 'bad/'` prints the `test` rows and then reports the refusal.
+/// Refuses a PREFIX that no ref name can hold or that goes through a ref file.
 ///
-/// The refspec rule comes first, so a prefix that breaks both rules -- `plain/x/`
-/// over the ref file `plain` -- draws the refspec message in both
-/// implementations.
+/// The `ostree` command refuses both before the prefix filters anything. The
+/// check runs when each prefix is taken. The rows that an earlier prefix
+/// printed and the refs that it deleted stay, as in `ostree`.
+/// `refs test 'bad/'` prints the `test` rows and then reports the refusal.
 ///
-/// The path probe reads the prefix as the directory a listing enumerates, the
-/// path the tool itself reads: `ENOTDIR` ends the invocation, with the port's one
-/// message for that condition where the tool names the path and the syscall. A
-/// path naming nothing continues, since a prefix matching no ref exits 0 in both
-/// (`docs/format-reference.md`, "refs"). The probe runs through
-/// [`Repo::check_refs_path`], one fd-relative call inside the repository the
-/// handle holds open.
+/// The refspec rule comes first. If a prefix breaks both rules, for example
+/// `plain/x/` over the ref file `plain`, both commands give the refspec
+/// message.
+///
+/// The path probe reads the prefix under `refs/` as the directory that a
+/// listing enumerates. `ostree` reads the same path. `ENOTDIR` ends the
+/// command. ostrya gives one message for that condition, and `ostree` names the
+/// path and the syscall. This is a recorded divergence.
+///
+/// A path that names nothing continues, because a prefix that matches no ref
+/// exits 0 in both commands. The probe is [`Repo::check_refs_path`], one
+/// fd-relative call inside the repository that the handle holds open.
 async fn check_prefix(repo: &Repo, prefix: Option<&str>) -> Result<()> {
     let Some(prefix) = prefix else {
         return Ok(());
@@ -6615,14 +7020,14 @@ async fn check_prefix(repo: &Repo, prefix: Option<&str>) -> Result<()> {
     repo.check_refs_path(&prefix_path(prefix)).await
 }
 
-/// The refspec rule a PREFIX passes, reported with the prefix as given.
+/// Checks a PREFIX against the refspec rule, and reports it as given.
 ///
-/// A whole-remote prefix passes the rule: the rule reads an empty ref name as a
-/// refusal, so [`whole_remote`] hands it the remote name alone -- one component,
-/// which the rule reads as a name holding no `/`.
+/// A whole-remote prefix passes the rule. The rule refuses an empty ref name,
+/// so [`whole_remote`] gives it only the remote name. This is one component,
+/// which the rule reads as a name with no `/`.
 ///
-/// A component of a prefix, and the remote of a prefix, is under the ref-name
-/// rule: it is not empty, does not start with `-` or `.`, and holds ASCII
+/// Each component of a prefix, and the remote of a prefix, obeys the ref-name
+/// rule. It is not empty and does not start with `-` or `.`. It holds ASCII
 /// alphanumerics, `-`, `.`, `_`, and alphanumeric characters that are not
 /// ASCII.
 fn check_prefix_name(prefix: &str) -> Result<()> {
@@ -6630,9 +7035,11 @@ fn check_prefix_name(prefix: &str) -> Result<()> {
     validate_refspec(checked).map_err(|_| Error::InvalidRefspec(prefix.to_owned()))
 }
 
-/// The path a PREFIX names below `refs/`: the ref file or directory a listing
-/// enumerates. A whole-remote prefix names the remote's own directory, its ref
-/// half standing for the remote's root.
+/// Returns the path under `refs/` that a PREFIX names.
+///
+/// This is the ref file or directory that a listing enumerates. A whole-remote
+/// prefix names the directory of the remote, and its ref half stands for the
+/// root of the remote.
 fn prefix_path(prefix: &str) -> String {
     match whole_remote(prefix) {
         Some(remote) => format!("remotes/{remote}"),
@@ -6640,10 +7047,12 @@ fn prefix_path(prefix: &str) -> String {
     }
 }
 
-/// The remote a whole-remote prefix names: a `<remote>:` prefix whose ref half
-/// is empty or `.`, which names every ref of that remote. A remote name holds no
-/// `/`, so a prefix such as `or/igin:` is not one and reaches the refspec rule
-/// whole.
+/// Returns the remote that a whole-remote prefix names.
+///
+/// A whole-remote prefix is a `<remote>:` prefix with an empty ref half or the
+/// ref half `.`, and it names each ref of that remote. A remote name holds no
+/// `/`, so a prefix such as `or/igin:` is not a whole-remote prefix. The full
+/// prefix goes to the refspec rule.
 fn whole_remote(prefix: &str) -> Option<&str> {
     match prefix.split_once(':') {
         Some((remote, "" | ".")) if !remote.contains('/') => Some(remote),
@@ -6651,17 +7060,20 @@ fn whole_remote(prefix: &str) -> Option<&str> {
     }
 }
 
-/// Whether a refspec is the prefix itself or is nested under it. `None`
-/// matches every refspec.
+/// Returns `true` if a refspec is the prefix or is nested under it.
+///
+/// The prefix `None` matches each refspec.
 fn matches_prefix(refspec: &str, prefix: Option<&str>) -> bool {
     prefix == Some(refspec) || nested_under_prefix(refspec, prefix)
 }
 
-/// Whether a refspec is nested under the prefix, with an exact match excluded.
-/// `None` matches every refspec. This is the `-A` filter: a prefix equal to an
-/// alias's own name is answered by resolving that name, so the filter reads a
-/// prefix as a directory alone. A whole-remote prefix keeps every ref of the
-/// remote it names, since its ref half stands for the remote's root.
+/// Returns `true` if a refspec is nested under the prefix and is not equal to
+/// it.
+///
+/// The prefix `None` matches each refspec. This is the `-A` filter. A prefix
+/// that is equal to the name of an alias resolves that name, so the filter
+/// reads a prefix only as a directory. A whole-remote prefix keeps each ref of
+/// its remote, because its ref half stands for the root of the remote.
 fn nested_under_prefix(refspec: &str, prefix: Option<&str>) -> bool {
     let Some(prefix) = prefix else {
         return true;
@@ -6676,12 +7088,13 @@ fn nested_under_prefix(refspec: &str, prefix: Option<&str>) -> bool {
     }
 }
 
-/// The name a listing prints for a refspec the given prefix selected: the part
-/// below the prefix, or the whole refspec when the match is exact, when the
-/// prefix names a remote in whole, or when no prefix applied. A remote's refspec
-/// keeps its `remote:` part, since the tool strips within the ref name and
-/// renders the refspec again -- `refs origin:rr` prints `origin:x` for
-/// `origin:rr/x`.
+/// Returns the name that a listing prints for a refspec that a prefix selected.
+///
+/// The name is the part under the prefix. The name is the full refspec if the
+/// match is exact, if the prefix names a full remote, or if no prefix applies.
+/// The refspec of a remote keeps its `remote:` part, because the `ostree`
+/// command strips in the ref name and then writes the refspec again.
+/// `refs origin:rr` prints `origin:x` for `origin:rr/x`.
 fn strip_prefix_from(refspec: &str, prefix: Option<&str>) -> String {
     let nested = prefix
         .and_then(|prefix| refspec.strip_prefix(prefix))
@@ -6695,13 +7108,19 @@ fn strip_prefix_from(refspec: &str, prefix: Option<&str>) -> String {
     }
 }
 
-/// The target an alias listing prints: the symlink body with its leading `../`
-/// components removed, which is the form the tool prints, or the target ref's
-/// refspec where the link leaves the alias's own ref root -- `refs/heads` for a
-/// local alias, `refs/remotes/<remote>` for a remote one.
-/// `refs -A --create=xal origin:rr/x` writes `../remotes/origin/rr/x`, so the
-/// listing prints `origin:rr/x`, a name the port resolves, in place of the path
-/// below `refs/` (`docs/conformance/cli-surface.md`, "P1").
+/// Returns the target that an alias listing prints.
+///
+/// The target is the symlink body with its leading `../` components removed,
+/// which is the form that the `ostree` command prints. If the link leaves the
+/// ref root of the alias, the target is the refspec of the target ref. The
+/// ref root is `refs/heads` for a local alias and `refs/remotes/<remote>` for
+/// a remote alias.
+///
+/// # Divergence
+///
+/// `refs -A --create=xal origin:rr/x` writes `../remotes/origin/rr/x`. The
+/// listing prints `origin:rr/x`, a name that ostrya resolves, in place of the
+/// path under `refs/`. This is a recorded divergence.
 fn alias_target(refspec: &str, target: &str) -> String {
     let path = ref_path(refspec);
     let root = path_refspec(&path).map(|(root, _)| root);
@@ -6712,9 +7131,10 @@ fn alias_target(refspec: &str, target: &str) -> String {
     crossed.unwrap_or_else(|| alias_body_name(target).to_owned())
 }
 
-/// The ref name an alias's link body gives: the body with its leading `../`
-/// components removed, which is the form an `-A` listing prints and the name the
-/// `--delete` guard reads.
+/// Returns the ref name that the link body of an alias gives.
+///
+/// This is the body with its leading `../` components removed. An `-A`
+/// listing prints this form, and the `--delete` guard reads this name.
 fn alias_body_name(target: &str) -> &str {
     let mut rest = target;
     while let Some(stripped) = rest.strip_prefix("../") {
@@ -6723,9 +7143,10 @@ fn alias_body_name(target: &str) -> &str {
     rest
 }
 
-/// The components below `refs/` of the file one refspec names: `heads` and the
-/// ref name for a local refspec, `remotes`, the remote, and the ref name for a
-/// remote one.
+/// Returns the components under `refs/` of the file that one refspec names.
+///
+/// For a local refspec, these are `heads` and the ref name. For a remote
+/// refspec, these are `remotes`, the remote, and the ref name.
 fn ref_path(refspec: &str) -> Vec<&str> {
     let (mut path, name) = match refspec.split_once(':') {
         Some((remote, name)) => (vec!["remotes", remote], name),
@@ -6735,9 +7156,11 @@ fn ref_path(refspec: &str) -> Vec<&str> {
     path
 }
 
-/// The ref root one path below `refs/` lives in, and the refspec it names.
-/// `None` where the path names no ref file: a root with no name below it, or a
-/// path under neither `refs/heads` nor `refs/remotes`.
+/// Returns the ref root of a path under `refs/` and the refspec of the path.
+///
+/// If the path names no ref file, the result is `None`. This is the case for a
+/// root with no name under it and for a path under neither `refs/heads` nor
+/// `refs/remotes`.
 fn path_refspec(path: &[&str]) -> Option<(String, String)> {
     match path {
         ["heads", name @ ..] if !name.is_empty() => Some(("heads".to_owned(), name.join("/"))),
@@ -6749,9 +7172,10 @@ fn path_refspec(path: &[&str]) -> Option<(String, String)> {
     }
 }
 
-/// The path below `refs/` a symlink body names, read from `dir`, the directory
-/// holding the link: each `..` drops one component. `None` where the body
-/// reaches above `refs/`.
+/// Returns the path under `refs/` that a symlink body names, read from `dir`.
+///
+/// `dir` is the directory that holds the link, and each `..` drops one
+/// component. If the body reaches out of `refs/`, the result is `None`.
 fn link_path<'a>(dir: &[&'a str], body: &'a str) -> Option<Vec<&'a str>> {
     let mut path = dir.to_vec();
     for part in body.split('/') {
@@ -6766,8 +7190,9 @@ fn link_path<'a>(dir: &[&'a str], body: &'a str) -> Option<Vec<&'a str>> {
     Some(path)
 }
 
-/// Print the commit each revision names, or the repository's single commit
-/// under `-S`.
+/// Prints the commit of each revision, or under `-S`, the single commit.
+///
+/// Under `-S`, the repository must hold exactly one commit object.
 async fn rev_parse(repo: Repo, name: &str, args: RevParseArgs) -> Result<()> {
     if args.single {
         if !args.rev.is_empty() {
@@ -6798,17 +7223,20 @@ async fn rev_parse(repo: Repo, name: &str, args: RevParseArgs) -> Result<()> {
     Ok(())
 }
 
-/// How many symlinks one `cat` path may follow before the port gives up: a
-/// chain this deep resolves and one link deeper is refused. The tool bounds the
-/// depth nowhere -- 20000 links resolve, and a self-referencing link recurses
-/// until the process dies (`docs/conformance/cli-surface.md`, "P1 -- reading
-/// and resolution").
+/// The maximum number of symlinks that one `cat` path follows.
+///
+/// A chain of this length resolves, and a chain with one more link is
+/// refused. The `ostree` command has no such limit. 20000 links resolve, and
+/// a link that names itself recurses until the process dies. This is a
+/// recorded divergence.
 const CAT_SYMLINK_LIMIT: usize = 256;
 
-/// Why a `cat` path wrote nothing: a refusal the port reports in the tool's own
-/// words and exits 1 on, or a library error the top-level renderer prints. Both
-/// travel back to [`cat`] as values, so the stdout writer settles before the
-/// process leaves the command.
+/// The reason that a `cat` path wrote nothing.
+///
+/// The reason is a refusal or a library error. ostrya reports a refusal in
+/// the words of the `ostree` command and exits 1. The top-level renderer
+/// prints a library error. Both go back to [`cat`] as values, so the stdout
+/// writer settles before the process leaves the command.
 enum CatFailure {
     Refused(String),
     Failed(Error),
@@ -6820,7 +7248,7 @@ impl From<Error> for CatFailure {
     }
 }
 
-/// Write each named file's content to stdout, in order, streaming it.
+/// Writes the content of each named file to stdout, in order, as a stream.
 async fn cat(repo: Repo, name: &str, args: CatArgs) -> Result<()> {
     let Some(rev) = args.commit.as_deref().filter(|_| !args.path.is_empty()) else {
         exit_with_error(name, "A COMMIT and at least one PATH argument are required");
@@ -6830,14 +7258,14 @@ async fn cat(repo: Repo, name: &str, args: CatArgs) -> Result<()> {
     let mut stdout = stdout_file()?;
     let written = cat_paths(&repo, &root, &args.path, &mut stdout).await;
     // The async writer over the duplicated stdout descriptor holds the bytes
-    // its blocking worker has not taken, so the tail of a large payload is lost
-    // unless the writes settle before the process exits. A refusal and an I/O
-    // error leave the command through here as well, so each one settles the
-    // bytes already written before it is reported.
+    // that its blocking worker has not taken. If the writes do not settle
+    // before the process exits, the tail of a large payload is lost. A refusal
+    // and an I/O error also leave the command through this point, so each one
+    // settles the bytes already written before it is reported.
     let settled = stdout.flush().await.map_err(Error::Io);
-    // Where a path failed and the flush failed with it, the path failure is the
-    // one reported: it names the condition the invocation is measured on. The
-    // two failure branches therefore drop `settled`.
+    // If a path failed and the flush also failed, the path failure is the one
+    // reported. It names the condition that the command is measured on. For
+    // this reason, the two failure branches drop `settled`.
     match written {
         Ok(()) => settled,
         Err(CatFailure::Refused(message)) => exit_error(&message),
@@ -6845,7 +7273,7 @@ async fn cat(repo: Repo, name: &str, args: CatArgs) -> Result<()> {
     }
 }
 
-/// Write each path's content to `out`, in order, stopping at the first failure.
+/// Writes the content of each path to `out` in order, up to the first failure.
 async fn cat_paths(
     repo: &Repo,
     root: &RepoTree,
@@ -6859,17 +7287,19 @@ async fn cat_paths(
     Ok(())
 }
 
-/// Resolve one `cat` path to the regular file it names.
+/// Resolves one `cat` path to the regular file that it names.
 ///
-/// The path is split on `/` and each component looked up on its own, so `.`,
-/// `..`, and an empty component each name nothing, which is what the tool does
-/// with them. A symlink in the final position is followed, its target read
-/// relative to the link's own directory; a symlink in any other position is
-/// not followed, and reports `Not a directory` the way the tool does.
+/// The path is split on `/`, and each component is looked up separately. As a
+/// result, `.`, `..`, and an empty component each name nothing, as in the
+/// `ostree` command.
 ///
-/// An empty argument reaches no component at all and reports the commit root as
-/// absent, which is what the tool does with it; `/` reaches the root and is
-/// refused as a directory.
+/// A symlink in the final position is followed, and its target is read
+/// relative to the directory of the link. A symlink in each other position is
+/// not followed. It reports `Not a directory`, as `ostree` does.
+///
+/// An empty argument reaches no component and reports the commit root as
+/// absent, as `ostree` does. `/` reaches the root and is refused as a
+/// directory.
 async fn cat_lookup(
     repo: &Repo,
     root: &RepoTree,
@@ -6879,8 +7309,8 @@ async fn cat_lookup(
         return Err(cat_refusal("No such file or directory: /"));
     }
     let mut components = split_cat_path(path);
-    // One iteration per link followed, plus the one that reads the file the
-    // last link names.
+    // One iteration for each link that is followed, plus the iteration that
+    // reads the file that the last link names.
     for _ in 0..=CAT_SYMLINK_LIMIT {
         let file = match lookup_components(root, &components).await? {
             TreeEntry::File { checksum, .. } => repo.load_file(&checksum).await?,
@@ -6894,14 +7324,15 @@ async fn cat_lookup(
     Err(cat_refusal("Too many levels of symbolic links"))
 }
 
-/// One `cat` refusal, held as a value until the stdout writer settles.
+/// Returns one `cat` refusal as a value, held until the stdout writer settles.
 fn cat_refusal(message: &str) -> CatFailure {
     CatFailure::Refused(message.to_owned())
 }
 
-/// Walk `components` from `root`, one component at a time, to the entry they
-/// name. An empty component list names the commit root, which is a directory
-/// and so the same refusal a directory path gets.
+/// Walks `components` from `root` one at a time to the entry that they name.
+///
+/// An empty component list names the commit root. The root is a directory, so
+/// it gets the refusal of a directory path.
 async fn lookup_components(
     root: &RepoTree,
     components: &[String],
@@ -6933,9 +7364,11 @@ async fn lookup_components(
     Err(cat_refusal("Can't open directory"))
 }
 
-/// Split a `cat` path into the components to look up: one optional leading `/`
-/// is dropped and the rest split on `/`, keeping every other component
-/// verbatim so `.`, `..`, and an empty one are looked up and not found.
+/// Splits a `cat` path into the components to look up.
+///
+/// One optional leading `/` is dropped, and the rest is split on `/`. Each
+/// other component stays as written, so `.`, `..`, and an empty component are
+/// looked up and not found.
 fn split_cat_path(path: &str) -> Vec<String> {
     let rest = path.strip_prefix('/').unwrap_or(path);
     if rest.is_empty() {
@@ -6944,8 +7377,10 @@ fn split_cat_path(path: &str) -> Vec<String> {
     rest.split('/').map(str::to_owned).collect()
 }
 
-/// The components a symlink's target names: relative to the link's own
-/// directory, or to the commit root for an absolute target.
+/// Returns the components that the target of a symlink names.
+///
+/// A relative target is relative to the directory of the link. An absolute
+/// target is relative to the commit root.
 fn follow_link(components: &[String], target: &str) -> Vec<String> {
     let mut out = if target.starts_with('/') {
         Vec::new()
@@ -6958,28 +7393,34 @@ fn follow_link(components: &[String], target: &str) -> Vec<String> {
 
 // --- show, log, ls, config ---------------------------------------------------
 
-/// The commit object's GVariant signature, which the raw report parses against.
+/// The GVariant signature of a commit object, for the parse of the raw report.
 const COMMIT_SIGNATURE: &str = "(a{sv}aya(say)sstayay)";
 
-/// Parse a GVariant type signature, carrying the codec's refusal as a format
-/// error, so a signature the user typed is reported rather than panicking.
+/// Parses a GVariant type signature, with a codec refusal as a format error.
+///
+/// If the user types a bad signature, ostrya reports it and does not panic.
 fn parse_type(signature: &str) -> Result<Type> {
     Type::parse(signature).map_err(|err| Error::InvalidFormat(err.to_string()))
 }
 
-/// Render a value in the GVariant text form, carrying a type mismatch as a
-/// format error.
+/// Formats a value as GVariant text, with a type mismatch as a format error.
 fn variant_text(ty: &Type, value: &Value) -> Result<String> {
     to_text(ty, value).map_err(|err| Error::InvalidFormat(err.to_string()))
 }
 
-/// Report one object.
+/// Reports one object.
 ///
-/// The reporting modes are mutually exclusive and take a fixed precedence,
-/// recovered by giving the tool each pair (`docs/format-reference.md`, "CLI
-/// output formats", under `show`): the detached metadata key, the metadata key,
-/// the detached key listing, the key listing, the related commits, the variant
-/// file, the sizes, and last the object's own report.
+/// The report modes are mutually exclusive. Each pair given to the `ostree`
+/// command showed this fixed precedence:
+///
+/// 1. the detached metadata key
+/// 2. the metadata key
+/// 3. the detached key listing
+/// 4. the key listing
+/// 5. the related commits
+/// 6. the variant file
+/// 7. the sizes
+/// 8. the report of the object itself
 async fn show(repo: Repo, repo_path: PathBuf, name: &str, args: ShowArgs) -> Result<()> {
     let Some(object) = args.object.as_deref() else {
         exit_with_error(name, "An object argument is required");
@@ -7008,8 +7449,10 @@ async fn show(repo: Repo, repo_path: PathBuf, name: &str, args: ShowArgs) -> Res
     show_object(&repo, &repo_path, object, &args).await
 }
 
-/// The commit metadata dict of the revision `object` names, byte-order
-/// converted unless `-B` was given. The dict is the commit's first member.
+/// Returns the commit metadata dict of the revision that `object` names.
+///
+/// The dict is the first member of the commit. If `-B` is not given, its byte
+/// order is converted.
 async fn commit_metadata(repo: &Repo, object: &str, args: &ShowArgs) -> Result<Value> {
     let checksum = resolve(repo, object).await?;
     let commit = repo.load_variant(ObjectType::Commit, &checksum).await?;
@@ -7021,8 +7464,9 @@ async fn commit_metadata(repo: &Repo, object: &str, args: &ShowArgs) -> Result<V
         .ok_or_else(|| Error::InvalidFormat("commit object is not a tuple".into()))
 }
 
-/// A loaded variant with the on-disk big-endian fields converted, which `-B`
-/// suppresses so the numbers report as they are stored.
+/// Returns a loaded variant with the big-endian fields on disk converted.
+///
+/// `-B` suppresses the conversion, so the numbers show as they are stored.
 fn maybe_byteswap(value: Value, args: &ShowArgs) -> Value {
     if args.no_byteswap {
         value
@@ -7031,7 +7475,7 @@ fn maybe_byteswap(value: Value, args: &ShowArgs) -> Value {
     }
 }
 
-/// Print one commit metadata key's value.
+/// Prints the value of one commit metadata key.
 async fn show_metadata_key(repo: &Repo, object: &str, key: &str, args: &ShowArgs) -> Result<()> {
     let metadata = commit_metadata(repo, object, args).await?;
     let Some(value) = metadata.dict_get(key) else {
@@ -7040,7 +7484,7 @@ async fn show_metadata_key(repo: &Repo, object: &str, key: &str, args: &ShowArgs
     print_metadata_value(value, args.print_hex)
 }
 
-/// Print one detached metadata key's value.
+/// Prints the value of one detached metadata key.
 async fn show_detached_key(repo: &Repo, object: &str, key: &str, args: &ShowArgs) -> Result<()> {
     let dict = detached_metadata(repo, object, args).await?;
     let Some(value) = dict.dict_get(key) else {
@@ -7049,8 +7493,10 @@ async fn show_detached_key(repo: &Repo, object: &str, key: &str, args: &ShowArgs
     print_metadata_value(value, args.print_hex)
 }
 
-/// The commit's detached metadata dict, byte-order converted unless `-B` was
-/// given. A commit with no `.commitmeta` is reported in the tool's own words.
+/// Returns the detached metadata dict of the commit.
+///
+/// If `-B` is not given, its byte order is converted. A commit with no
+/// `.commitmeta` is reported in the words of the `ostree` command.
 async fn detached_metadata(repo: &Repo, object: &str, args: &ShowArgs) -> Result<Value> {
     let checksum = resolve(repo, object).await?;
     let Some(dict) = repo.read_commit_detached_metadata(&checksum).await? else {
@@ -7062,9 +7508,10 @@ async fn detached_metadata(repo: &Repo, object: &str, args: &ShowArgs) -> Result
     Ok(maybe_byteswap(dict, args))
 }
 
-/// Print a metadata value, which is a `v` holding the value proper. With
-/// `--print-hex` a byte-array value prints as unquoted lowercase hex, and every
-/// other type ignores the switch.
+/// Prints a metadata value, which is a `v` that holds the value itself.
+///
+/// With `--print-hex`, a byte-array value prints as unquoted lowercase hex.
+/// Each other type ignores the switch.
 fn print_metadata_value(value: &Value, hex: bool) -> Result<()> {
     let (ty, inner) = match value.as_variant() {
         Some((ty, inner)) => (ty.clone(), inner),
@@ -7083,7 +7530,7 @@ fn print_metadata_value(value: &Value, hex: bool) -> Result<()> {
     Ok(())
 }
 
-/// Print the commit metadata keys, sorted.
+/// Prints the commit metadata keys in sort order.
 async fn show_metadata_keys(repo: &Repo, object: &str) -> Result<()> {
     let checksum = resolve(repo, object).await?;
     let (commit, _) = repo.load_commit(&checksum).await?;
@@ -7091,7 +7538,7 @@ async fn show_metadata_keys(repo: &Repo, object: &str) -> Result<()> {
     Ok(())
 }
 
-/// Print the detached metadata keys, sorted.
+/// Prints the detached metadata keys in sort order.
 async fn show_detached_keys(repo: &Repo, object: &str) -> Result<()> {
     let checksum = resolve(repo, object).await?;
     let Some(dict) = repo.read_commit_detached_metadata(&checksum).await? else {
@@ -7104,8 +7551,10 @@ async fn show_detached_keys(repo: &Repo, object: &str) -> Result<()> {
     Ok(())
 }
 
-/// Print an `a{sv}` dict's keys, one per line, in sort order rather than the
-/// order the dict stores them in.
+/// Prints the keys of an `a{sv}` dict in sort order, one on each line.
+///
+/// The output order does not depend on the order in which the dict stores
+/// the keys.
 fn print_sorted_keys(dict: &Value) {
     let mut keys: Vec<&str> = dict
         .as_array()
@@ -7119,9 +7568,10 @@ fn print_sorted_keys(dict: &Value) {
     }
 }
 
-/// Print the commit's related-objects array, one `ref checksum` pair per line.
-/// The array is empty on every commit the tool writes, so a commit that carries
-/// none prints nothing at exit 0.
+/// Prints the related-objects array of the commit as `ref checksum` lines.
+///
+/// The array is empty on each commit that the `ostree` command writes. A
+/// commit with no related objects prints nothing and exits 0.
 async fn show_related(repo: &Repo, object: &str) -> Result<()> {
     let checksum = resolve(repo, object).await?;
     let (commit, _) = repo.load_commit(&checksum).await?;
@@ -7132,14 +7582,16 @@ async fn show_related(repo: &Repo, object: &str) -> Result<()> {
     Ok(())
 }
 
-/// The ceiling on a file read as a GVariant value by `--print-variant-type`.
-/// A metadata object the format defines stays far below it, and the whole file
-/// is parsed in memory, so a larger one is refused by name rather than read.
+/// The maximum size of a GVariant file that `--print-variant-type` reads.
+///
+/// A metadata object of the format is much smaller. The full file is parsed
+/// in memory, so a larger file is refused by name and is not read.
 const MAX_VARIANT_FILE: u64 = 16 * 1024 * 1024;
 
-/// Read `path` as a serialized value of the named type and print it. The
-/// numeric fields are byte-order converted, which is what the tool does on this
-/// path whether or not `-B` is given.
+/// Reads `path` as a serialized value of the named type and prints it.
+///
+/// The numeric fields are byte-order converted. The `ostree` command does this
+/// on this path, with `-B` and without it.
 async fn show_variant_file(signature: &str, path: &Path) -> Result<()> {
     let ty = parse_type(signature)?;
     let owned = path.to_owned();
@@ -7152,9 +7604,11 @@ async fn show_variant_file(signature: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read a whole file, refusing one longer than `limit`. A refusal comes back as
-/// the line it is reported on, in the tool's own `openat(<path>): <reason>`
-/// shape for a path that does not open.
+/// Reads a full file, and refuses a file longer than `limit`.
+///
+/// A refusal comes back as the line that reports it. For a path that does not
+/// open, the line has the `openat(<path>): <reason>` shape of the `ostree`
+/// command.
 fn read_bounded(path: &Path, limit: u64) -> std::result::Result<Vec<u8>, String> {
     let opened = |err: &std::io::Error| format!("openat({}): {}", path.display(), io_reason(err));
     let meta = std::fs::metadata(path).map_err(|err| opened(&err))?;
@@ -7168,8 +7622,10 @@ fn read_bounded(path: &Path, limit: u64) -> std::result::Result<Vec<u8>, String>
     std::fs::read(path).map_err(|err| opened(&err))
 }
 
-/// The system's own reason text for an I/O error, without the `(os error N)`
-/// tail Rust appends, which is the form the tool's messages carry.
+/// Returns the reason text of the system for an I/O error.
+///
+/// The `(os error N)` tail that Rust adds is removed, because the messages of
+/// the `ostree` command carry this form.
 fn io_reason(err: &std::io::Error) -> String {
     let text = err.to_string();
     match text.find(" (os error ") {
@@ -7178,7 +7634,7 @@ fn io_reason(err: &std::io::Error) -> String {
     }
 }
 
-/// Print the commit's recorded sizes and how much of them is absent locally.
+/// Prints the recorded sizes of the commit and the part that is absent locally.
 async fn show_sizes(repo: &Repo, object: &str) -> Result<()> {
     let checksum = resolve(repo, object).await?;
     let Some(sizes) = repo.commit_sizes(&checksum).await? else {
@@ -7199,12 +7655,15 @@ async fn show_sizes(repo: &Repo, object: &str) -> Result<()> {
     Ok(())
 }
 
-/// Report the object `object` names: a metadata object by type and checksum, a
-/// commit additionally by its own report, and a file object by its header.
+/// Reports the object that `object` names.
 ///
-/// The object type is recovered by probing the store, since a bare checksum
-/// names no type: commit, then dirtree, then dirmeta, then a file object, whose
-/// absence is the failure reported when nothing of that checksum is present.
+/// A metadata object reports its type and checksum. A commit also gets its own
+/// report, and a file object reports its header.
+///
+/// A bare checksum names no type. The code probes the store for the object type
+/// in this order: commit, dirtree, dirmeta, and a file object. If no object of
+/// that checksum is present, the failure for the absent file object is
+/// reported.
 async fn show_object(repo: &Repo, repo_path: &Path, object: &str, args: &ShowArgs) -> Result<()> {
     let checksum = resolve(repo, object).await?;
     for ty in [ObjectType::Commit, ObjectType::DirTree, ObjectType::DirMeta] {
@@ -7218,8 +7677,8 @@ async fn show_object(repo: &Repo, repo_path: &Path, object: &str, args: &ShowArg
             let signature = parse_type(metadata_signature(ty))?;
             println!("{}", variant_text(&signature, &value)?);
         }
-        // `--raw` alone reports the variant and stops; `-B` reports it and goes
-        // on to the commit's own report.
+        // `--raw` alone reports the variant and stops. `-B` reports the variant
+        // and then gives the report of the commit itself.
         if ty == ObjectType::Commit && (!args.raw || args.no_byteswap) {
             report_commit(repo, repo_path, &checksum, args).await?;
         }
@@ -7228,10 +7687,10 @@ async fn show_object(repo: &Repo, repo_path: &Path, object: &str, args: &ShowArg
     match repo.load_file(&checksum).await {
         Ok(file) => report_file(&checksum, &file),
         Err(Error::ObjectNotFound { .. }) => {
-            // The absent-object line carries a prefix naming the open in every
-            // mode that stores the payload in the object file itself, and not in
-            // `archive`, whose header is read on its own
-            // (`docs/format-reference.md`, "CLI output formats", under `show`).
+            // In each mode that stores the payload in the object file itself,
+            // the line for an absent object has a prefix that names the open.
+            // In `archive` mode, the header is read separately, so the line has
+            // no prefix.
             let hex = checksum.to_hex();
             let refusal = format!("Couldn't find file object '{hex}'");
             if repo.mode() == RepoMode::Archive {
@@ -7243,7 +7702,7 @@ async fn show_object(repo: &Repo, repo_path: &Path, object: &str, args: &ShowArg
     }
 }
 
-/// The name the tool prints for an object type.
+/// Returns the name that the `ostree` command prints for an object type.
 fn object_type_name(ty: ObjectType) -> &'static str {
     match ty {
         ObjectType::Commit => "commit",
@@ -7258,7 +7717,8 @@ fn object_type_name(ty: ObjectType) -> &'static str {
     }
 }
 
-/// The GVariant signature of a metadata object type, for the raw report.
+/// Returns the GVariant signature of a metadata object type, for the raw
+/// report.
 fn metadata_signature(ty: ObjectType) -> &'static str {
     match ty {
         ObjectType::DirTree => "(a(say)a(sayay))",
@@ -7267,9 +7727,11 @@ fn metadata_signature(ty: ObjectType) -> &'static str {
     }
 }
 
-/// Print a commit's own report: its parent, content checksum, date, the
-/// `version` metadata key when it carries one, the subject and body, and the
-/// signature report when it carries GPG signatures.
+/// Prints the report of a commit.
+///
+/// The report holds the parent, the content checksum, and the date. Then come
+/// the `version` metadata key if the commit has one, the subject, and the
+/// body. If the commit has GPG signatures, the signature report follows.
 async fn report_commit(
     repo: &Repo,
     repo_path: &Path,
@@ -7307,16 +7769,18 @@ async fn report_commit(
     report_commit_signatures(repo, repo_path, checksum, args).await
 }
 
-/// Print each line of `text` indented four spaces, the shape the commit report
-/// gives a subject and a body.
+/// Prints each line of `text` indented by four spaces.
+///
+/// This is the shape that the commit report gives a subject and a body.
 fn print_indented(text: &str) {
     for line in text.split('\n') {
         println!("    {line}");
     }
 }
 
-/// Print the GPG signature report a commit's `ostree.gpgsigs` draws, or nothing
-/// when it carries none.
+/// Prints the GPG signature report for the `ostree.gpgsigs` of a commit.
+///
+/// If the commit has no GPG signatures, the function prints nothing.
 #[cfg(feature = "gpg")]
 async fn report_commit_signatures(
     repo: &Repo,
@@ -7362,16 +7826,19 @@ async fn report_commit_signatures(
     Ok(())
 }
 
-/// Without the gpg engine compiled in there are no signatures to report, and
-/// the two GPG options are accepted and unused.
+/// Prints nothing, because a build without the gpg engine has no signatures.
+///
+/// The two GPG options are accepted and have no effect.
 #[cfg(not(feature = "gpg"))]
 async fn report_commit_signatures(_: &Repo, _: &Path, _: &Checksum, _: &ShowArgs) -> Result<()> {
     Ok(())
 }
 
-/// The keyrings `show` verifies a commit's GPG signatures against: the
-/// repository's own `gpgkeys.gpg`, every `*.gpg` file in a `--gpg-homedir`, or,
-/// under `--gpg-verify-remote`, that remote's whole trusted set.
+/// Returns the GPG verifier with the keyrings that `show` uses.
+///
+/// Under `--gpg-verify-remote`, the keyrings are the full trusted set of that
+/// remote. Otherwise, the keyrings are the `gpgkeys.gpg` of the repository and
+/// each `*.gpg` file in a `--gpg-homedir`.
 #[cfg(feature = "gpg")]
 fn show_gpg_verifier(repo_path: &Path, args: &ShowArgs) -> Result<GpgVerifier> {
     if let Some(remote) = args.gpg_verify_remote.as_deref() {
@@ -7392,16 +7859,18 @@ fn show_gpg_verifier(repo_path: &Path, args: &ShowArgs) -> Result<GpgVerifier> {
     GpgVerifier::from_keyring_files(paths)
 }
 
-/// The trailing sixteen hex digits of a fingerprint, the form the signature
-/// report names a key by.
+/// Returns the last 16 hex digits of a fingerprint.
+///
+/// The signature report names a key in this form.
 #[cfg(feature = "gpg")]
 fn short_key_id(fingerprint: &str) -> &str {
     let start = fingerprint.len().saturating_sub(16);
     &fingerprint[start..]
 }
 
-/// The signer's user id as one string, `Name <email>`, from the parts the
-/// engine reported.
+/// Returns the user id of the signer as one string, `Name <email>`.
+///
+/// The parts come from the report of the engine.
 #[cfg(feature = "gpg")]
 fn signer_uid(sig: &SignatureInfo) -> String {
     match (&sig.user_name, &sig.user_email) {
@@ -7412,7 +7881,7 @@ fn signer_uid(sig: &SignatureInfo) -> String {
     }
 }
 
-/// Print a file object's header report.
+/// Prints the header report of a file object.
 fn report_file(checksum: &Checksum, file: &FileObject) -> Result<()> {
     println!("Object: {}", checksum.to_hex());
     println!("Type: file");
@@ -7433,8 +7902,9 @@ fn report_file(checksum: &Checksum, file: &FileObject) -> Result<()> {
     Ok(())
 }
 
-/// The xattr set in the `{ <a(ayay) text> }` form the file report and `ls -X`
-/// both print.
+/// Returns the xattr set in the `{ <a(ayay) text> }` form.
+///
+/// The file report and `ls -X` both print this form.
 fn xattrs_text(xattrs: &Xattrs) -> Result<String> {
     let ty = parse_type("a(ayay)")?;
     let entries: Vec<Value> = xattrs
@@ -7452,12 +7922,14 @@ fn xattrs_text(xattrs: &Xattrs) -> Result<String> {
     ))
 }
 
-/// Walk a commit's parent chain, newest first, reporting each commit.
+/// Walks the parent chain of a commit, newest first, and reports each commit.
 ///
-/// A parent whose commit object is absent ends the walk with the tool's own
-/// note, at exit 0, so a partial history reports what it holds. The starting
-/// revision itself is held to the stricter rule every other reading command
-/// uses: a checksum naming no commit is refused rather than read as an empty
+/// If the commit object of a parent is absent, the walk ends with the note of
+/// the `ostree` command and exits 0. As a result, a partial history reports
+/// what it holds.
+///
+/// The start revision obeys the stricter rule of each other read command. A
+/// checksum that names no commit is refused, and does not count as an empty
 /// history.
 async fn log(repo: Repo, repo_path: PathBuf, name: &str, args: LogArgs) -> Result<()> {
     let Some(rev) = args.rev.as_deref() else {
@@ -7494,8 +7966,9 @@ async fn log(repo: Repo, repo_path: PathBuf, name: &str, args: LogArgs) -> Resul
     Ok(())
 }
 
-/// One `ls` line's worth of entry facts, gathered before the line is written so
-/// every column has a single source.
+/// The facts of one `ls` line, collected before the line is written.
+///
+/// Each column of the line has one source.
 struct LsEntry {
     kind: char,
     mode: u32,
@@ -7508,13 +7981,14 @@ struct LsEntry {
     target: Option<String>,
 }
 
-/// List the paths a commit holds.
+/// Lists the paths of a commit.
 async fn ls(repo: Repo, name: &str, args: LsArgs) -> Result<()> {
     let Some(rev) = args.commit.as_deref() else {
         exit_with_error(name, "An COMMIT argument is required");
     };
-    // The revision resolves through the shared reader, so a name no ref holds
-    // is reported in the tool's own words here as it is at every other command.
+    // The revision resolves through the shared reader. A name that no ref
+    // holds is reported in the words of the `ostree` command, as in each other
+    // command.
     let checksum = resolve(&repo, rev).await?;
     let (root, _) = repo.read_commit(&checksum.to_hex()).await?;
     if args.path.is_empty() {
@@ -7522,8 +7996,8 @@ async fn ls(repo: Repo, name: &str, args: LsArgs) -> Result<()> {
     }
     for given in &args.path {
         let path = normalize_ls_path(given);
-        // An empty argument names the root and is still refused, which is what
-        // the tool does with it.
+        // An empty argument names the root and is still refused, as in the
+        // `ostree` command.
         if path == "/" && !given.is_empty() {
             ls_directory(&repo, &root, "/", &args).await?;
             continue;
@@ -7544,7 +8018,7 @@ async fn ls(repo: Repo, name: &str, args: LsArgs) -> Result<()> {
     Ok(())
 }
 
-/// The path an `ls` argument names, with one optional leading `/` supplied.
+/// Returns the path that an `ls` argument names, with exactly one leading `/`.
 fn normalize_ls_path(given: &str) -> String {
     let trimmed = given.trim_start_matches('/');
     if trimmed.is_empty() {
@@ -7554,8 +8028,9 @@ fn normalize_ls_path(given: &str) -> String {
     }
 }
 
-/// Print a directory and, unless `-d` was given, its children; with `-R`, every
-/// child directory's own contents follow it.
+/// Prints a directory and, if `-d` is not given, its children.
+///
+/// With `-R`, the contents of each child directory follow its line.
 async fn ls_directory(repo: &Repo, tree: &RepoTree, path: &str, args: &LsArgs) -> Result<()> {
     let entry = ls_dir_entry(repo, tree, path).await?;
     print_ls_entry(&entry, args);
@@ -7565,16 +8040,16 @@ async fn ls_directory(repo: &Repo, tree: &RepoTree, path: &str, args: &LsArgs) -
     ls_children(repo, tree, path, args).await
 }
 
-/// Print a directory's children, recursing where `-R` asks for it.
+/// Prints the children of a directory, and recurses if `-R` is given.
 ///
-/// The stack holds individual entries rather than whole directories, so
-/// printing a directory's line queues its own children right away, ahead of
-/// whatever siblings are still pending: the next line popped is always that
-/// directory's first child, which is what puts its contents immediately after
-/// its own line rather than after every sibling's line at the same level.
+/// The stack holds single entries. When the line of a directory is printed,
+/// its children go on the stack at once, before the siblings that are still
+/// pending. The next line popped is always the first child of that directory.
+/// As a result, the contents of a directory come directly after its own line,
+/// before the lines of its later siblings at the same level.
 async fn ls_children(repo: &Repo, tree: &RepoTree, path: &str, args: &LsArgs) -> Result<()> {
-    // The recursion is a work list rather than recursive calls, so a deep tree
-    // cannot grow the future's size with its depth.
+    // The recursion is a work list with no recursive calls, so a deep tree
+    // cannot make the future larger with its depth.
     let mut pending: Vec<(TreeEntry, String)> = Vec::new();
     queue_children(&mut pending, tree, path).await?;
     while let Some((child, base)) = pending.pop() {
@@ -7597,9 +8072,10 @@ async fn ls_children(repo: &Repo, tree: &RepoTree, path: &str, args: &LsArgs) ->
     Ok(())
 }
 
-/// Push `tree`'s entries onto `pending`, in reverse so the stack pops them
-/// back in `read_dir`'s own order: files, then subdirectories, each in name
-/// order.
+/// Pushes the entries of `tree` onto `pending` in reverse order.
+///
+/// The stack then pops them in the order of `read_dir`: files, then
+/// subdirectories, each in name order.
 async fn queue_children(
     pending: &mut Vec<(TreeEntry, String)>,
     tree: &RepoTree,
@@ -7611,7 +8087,7 @@ async fn queue_children(
     Ok(())
 }
 
-/// The path of `name` inside the directory at `base`.
+/// Returns the path of `name` in the directory at `base`.
 fn join_ls_path(base: &str, name: &str) -> String {
     if base == "/" {
         format!("/{name}")
@@ -7620,7 +8096,7 @@ fn join_ls_path(base: &str, name: &str) -> String {
     }
 }
 
-/// Gather a directory's `ls` facts from its dirmeta.
+/// Collects the `ls` facts of a directory from its dirmeta.
 async fn ls_dir_entry(repo: &Repo, tree: &RepoTree, path: &str) -> Result<LsEntry> {
     let meta = repo.load_dirmeta(tree.dirmeta_checksum()).await?;
     Ok(LsEntry {
@@ -7636,7 +8112,7 @@ async fn ls_dir_entry(repo: &Repo, tree: &RepoTree, path: &str) -> Result<LsEntr
     })
 }
 
-/// Gather a file's `ls` facts from its object header.
+/// Collects the `ls` facts of a file from its object header.
 async fn ls_file_entry(repo: &Repo, checksum: &Checksum, path: &str) -> Result<LsEntry> {
     let file = repo.load_file(checksum).await?;
     let (kind, size, target) = match &file.kind {
@@ -7656,7 +8132,7 @@ async fn ls_file_entry(repo: &Repo, checksum: &Checksum, path: &str) -> Result<L
     })
 }
 
-/// Write one `ls` line, or the path alone under `--nul-filenames-only`.
+/// Writes one `ls` line, or under `--nul-filenames-only`, only the path.
 fn print_ls_entry(entry: &LsEntry, args: &LsArgs) {
     use std::io::Write;
     if args.nul_filenames_only {
@@ -7680,8 +8156,9 @@ fn print_ls_entry(entry: &LsEntry, args: &LsArgs) {
         }
     }
     if args.xattrs {
-        // The xattr set came out of a parsed object, so it renders; a printer
-        // failure here would be a codec bug rather than input the user gave.
+        // The xattr set comes from a parsed object, so it renders. A printer
+        // failure here is a codec bug, and not an error in the input of the
+        // user.
         let text = xattrs_text(&entry.xattrs).unwrap_or_else(|_| "{ }".to_owned());
         line.push(' ');
         line.push_str(&text);
@@ -7695,15 +8172,14 @@ fn print_ls_entry(entry: &LsEntry, args: &LsArgs) {
     println!("{line}");
 }
 
-/// Read a repository configuration value.
+/// Reads, sets, or removes a repository configuration value.
 async fn config(repo: Repo, name: &str, args: ConfigArgs) -> Result<()> {
     let Some(operation) = args.operation.as_deref() else {
         exit_with_error(name, "OPERATION must be specified");
     };
-    // The operand count is checked ahead of the operation name: `set` takes a
-    // key and a value, and every other operation, a name the tool does not know
-    // included, takes a key alone (`docs/format-reference.md`, "CLI output
-    // formats", under `config get`).
+    // The operand count is checked before the operation name. `set` takes a
+    // key and a value. Each other operation takes only a key. This includes a
+    // name that the `ostree` command does not know.
     let allowed = if operation == "set" { 2 } else { 1 };
     if args.args.len() > allowed {
         exit_with_error(name, "Too many arguments given");
@@ -7716,10 +8192,12 @@ async fn config(repo: Repo, name: &str, args: ConfigArgs) -> Result<()> {
     }
 }
 
-/// The group and key one `config` operand names: `section.key`, split on its
-/// first `.`, or a bare key name when `--group` names the section. A missing
-/// operand is reported in the tool's own words, which name the group when
-/// `--group` was given.
+/// Returns the group and the key that one `config` operand names.
+///
+/// The operand is `section.key`, split on its first `.`. If `--group` names
+/// the section, the operand is a bare key name. A missing operand is reported
+/// in the words of the `ostree` command. If `--group` is given, the message
+/// names the group.
 fn config_target(args: &ConfigArgs) -> (&str, &str) {
     let Some(key) = args.args.first() else {
         if args.group.is_some() {
@@ -7736,7 +8214,7 @@ fn config_target(args: &ConfigArgs) -> (&str, &str) {
     }
 }
 
-/// Print one configuration value.
+/// Prints one configuration value.
 fn config_get(repo: &Repo, args: &ConfigArgs) -> Result<()> {
     let (group, key) = config_target(args);
     let keyfile = repo.config().keyfile();
@@ -7754,15 +8232,17 @@ fn config_get(repo: &Repo, args: &ConfigArgs) -> Result<()> {
     Ok(())
 }
 
-/// Set one configuration value, creating the group when it is new, and write the
-/// document back. The value is escaped the way the tool escapes one on write, so
-/// a value carrying a newline or leading whitespace is stored in a form that
-/// reads back whole.
+/// Sets one configuration value and writes the document back.
+///
+/// If the group is new, the command creates it. The value is escaped as the
+/// `ostree` command escapes a value on write. As a result, a value with a
+/// newline or leading whitespace is stored in a form that reads back
+/// complete.
 ///
 /// The edit is made first on the configuration read at open, so a refusal
 /// takes no lock. The command then takes one update guard, reads the document
-/// from disk, makes the edit again, and writes the document, so an edit another
-/// writer made before the guard was taken is kept.
+/// from disk, makes the edit again, and writes the document. As a result, an
+/// edit that another writer made before the guard is kept.
 async fn config_set(repo: &Repo, args: &ConfigArgs) -> Result<()> {
     if args.args.len() < 2 {
         if args.group.is_some() {
@@ -7788,14 +8268,15 @@ async fn config_set(repo: &Repo, args: &ConfigArgs) -> Result<()> {
     edited.and(finished)
 }
 
-/// Remove one configuration value and write the document back. A key the
-/// document does not hold, and a group it does not hold, are both success and
-/// leave the file untouched, matching the tool.
+/// Removes one configuration value and writes the document back.
+///
+/// If the document does not hold the key or the group, the result is success
+/// and the file does not change. The `ostree` command does the same.
 ///
 /// The key is looked up first in the configuration read at open, so an absent
-/// key takes no lock. Otherwise the document is read from disk, edited, and
-/// written under one update guard, as `config set` does, and a key that is
-/// gone from the document on disk is success with no write.
+/// key takes no lock. Otherwise, the document is read from disk, edited, and
+/// written under one update guard, as in [`config_set`]. If the key is not in
+/// the document on disk, the result is success with no write.
 async fn config_unset(repo: &Repo, args: &ConfigArgs) -> Result<()> {
     let (group, key) = config_target(args);
     let edit = |config: &RepoConfig| {
@@ -7819,11 +8300,10 @@ async fn config_unset(repo: &Repo, args: &ConfigArgs) -> Result<()> {
 
 // --- remote ------------------------------------------------------------------
 
-/// The summary's GVariant signature, which the raw report parses against.
+/// The GVariant signature of the summary, for the parse of the raw report.
 const SUMMARY_SIGNATURE: &str = "(a(s(taya{sv}))a{sv})";
 
-/// The summary metadata keys the report gives a label of their own
-/// (`docs/format-reference.md`, "CLI output formats", under `remote summary`).
+/// The summary metadata keys that get their own label in the report.
 const SUMMARY_LABELS: &[(&str, &str)] = &[
     ("ostree.summary.mode", "Repository Mode"),
     ("ostree.summary.last-modified", "Last-Modified"),
@@ -7834,13 +8314,13 @@ const SUMMARY_LABELS: &[(&str, &str)] = &[
     ("ostree.summary.expires", "Expires"),
 ];
 
-/// The per-ref metadata keys the report labels, with the same treatment.
+/// The metadata keys of each ref that the report labels in the same way.
 const REF_LABELS: &[(&str, &str)] = &[
     ("ostree.commit.version", "Version"),
     ("ostree.commit.timestamp", "Timestamp"),
 ];
 
-/// Run one `remote` subcommand.
+/// Runs one `remote` subcommand.
 async fn remote(repo: Repo, sub: RemoteCommand) -> Result<()> {
     let nested = sub.name();
     match sub {
@@ -7855,12 +8335,15 @@ async fn remote(repo: Repo, sub: RemoteCommand) -> Result<()> {
     }
 }
 
-/// The key-file group one remote's configuration lives in.
+/// Returns the key-file group that holds the configuration of one remote.
 fn remote_group(name: &str) -> String {
     format!("remote \"{name}\"")
 }
 
-/// The operand naming the remote, or the tool's own refusal for a missing one.
+/// Returns the operand that names the remote.
+///
+/// If the operand is missing, the process exits with the refusal of the
+/// `ostree` command.
 fn remote_operand<'a>(nested: &str, name: Option<&'a str>) -> &'a str {
     match name {
         Some(name) => name,
@@ -7868,9 +8351,12 @@ fn remote_operand<'a>(nested: &str, name: Option<&'a str>) -> &'a str {
     }
 }
 
-/// The configuration section of a remote a reading subcommand names, or the
-/// tool's own refusal. A read reaches no name rule: a name `add` would refuse
-/// simply names no section.
+/// Returns the configuration section of the remote that a read subcommand
+/// names.
+///
+/// If the section does not exist, the process exits with the refusal of the
+/// `ostree` command. A read applies no name rule: a name that `add` refuses
+/// names no section.
 fn remote_section<'a>(repo: &'a Repo, name: &str) -> ostrya::Remote<'a> {
     match repo.config().remote(name) {
         Some(section) => section,
@@ -7878,15 +8364,18 @@ fn remote_section<'a>(repo: &'a Repo, name: &str) -> ostrya::Remote<'a> {
     }
 }
 
-/// Refuse a remote the configuration does not describe, for a subcommand that
-/// reads nothing out of the section itself.
+/// Refuses a remote that the configuration does not describe.
+///
+/// This is for a subcommand that reads nothing from the section itself.
 fn require_remote(repo: &Repo, name: &str) {
     remote_section(repo, name);
 }
 
-/// The URL a remote publishes, or the tool's own refusal for a section that
-/// states none. A metalink-described remote states no `url`, so `show-url` and
-/// `list -u` refuse it.
+/// Returns the URL that a remote publishes.
+///
+/// If the section states no `url`, the process exits with the refusal of the
+/// `ostree` command. A remote that a metalink describes states no `url`, so
+/// `show-url` and `list -u` refuse it.
 fn remote_url(section: &ostrya::Remote<'_>, name: &str) -> Result<String> {
     match section.url()? {
         Some(url) => Ok(url),
@@ -7894,21 +8383,32 @@ fn remote_url(section: &ostrya::Remote<'_>, name: &str) -> Result<String> {
     }
 }
 
-/// Add a remote's configuration section, and import a keyring into its trusted
-/// keys when `--gpg-import` names one.
+/// Adds the configuration section of a remote.
 ///
-/// The keys are written in the order the tool writes them: the URL (or the
-/// metalink), the branch list, the content URL, the custom backend, the
-/// `--set` pairs in the order they were given, the GPG switch, the sign-api
-/// verification keys, and the collection id.
+/// If `--gpg-import` names a keyring, the command imports it into the trusted
+/// keys of the remote. The keys are written in the order of the `ostree`
+/// command:
 ///
-/// The edit is made first on the configuration read at open, so a remote that
-/// `--if-not-exists` leaves as it is and each refusal take no lock. The command
-/// then takes one update guard, reads the document from disk, makes the edit
-/// again, and writes the document, so an edit another writer made before the
-/// guard was taken is kept. The keyring of `--gpg-import` is imported only when
-/// the command wrote the remote, after the guard is finished, because the
-/// import takes the locks itself.
+/// 1. the URL or the metalink
+/// 2. the branch list
+/// 3. the content URL
+/// 4. the custom backend
+/// 5. the `--set` pairs, in the order of the command line
+/// 6. the GPG switch
+/// 7. the verification keys of the ed25519 and spki engines
+/// 8. the collection id
+///
+/// # Locks
+///
+/// The edit is made first on the configuration read at open. As a result, no
+/// refusal takes a lock, and a remote that `--if-not-exists` leaves as it is
+/// takes no lock. The command then takes one update guard, reads the document
+/// from disk, makes the edit again, and writes the document. As a result, an
+/// edit that another writer made before the guard is kept.
+///
+/// The command imports the keyring of `--gpg-import` only if it wrote the
+/// remote. The import comes after the guard is finished, because the import
+/// takes the locks itself.
 async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()> {
     let (Some(name), Some(url)) = (args.name.as_deref(), args.url.as_deref()) else {
         exit_with_nested_error("remote", nested, "NAME and URL must be specified");
@@ -7949,8 +8449,8 @@ async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()
             None => keyfile.set_string(&group, "url", url)?,
         }
         if !args.branches.is_empty() {
-            // Each branch is followed by the separator, the trailing one included,
-            // which is the list form the tool writes.
+            // The separator follows each branch, also the last one. This is
+            // the list form that the `ostree` command writes.
             let mut list = String::new();
             for branch in &args.branches {
                 list.push_str(branch);
@@ -7970,8 +8470,8 @@ async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()
             };
             keyfile.set_string(&group, key, value)?;
         }
-        // `--no-sign-verify` turns the GPG check off as well, which is what the tool
-        // writes for it.
+        // `--no-sign-verify` also turns the GPG check off. The `ostree`
+        // command writes the same for it.
         if args.no_gpg_verify || args.no_sign_verify {
             keyfile.set_string(&group, "gpg-verify", "false")?;
         }
@@ -8018,10 +8518,12 @@ async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()
     Ok(())
 }
 
-/// Read one `--sign-verify` or `--gpg-import` engine spec:
-/// `KEYTYPE=inline:PUBKEY` or `KEYTYPE=file:PATH`, refused in the tool's own
-/// words. The engine name is held to the ones this build carries, which is where
-/// the tool reports a type it does not implement.
+/// Reads one `--sign-verify` engine spec.
+///
+/// The spec is `KEYTYPE=inline:PUBKEY` or `KEYTYPE=file:PATH`. A malformed
+/// spec is refused in the words of the `ostree` command. The engine name must
+/// be one that this build supports. At this step, `ostree` reports a type
+/// that it does not implement.
 fn parse_sign_verify_spec(spec: &str) -> (&str, &str, bool) {
     let malformed = || {
         exit_error(&format!(
@@ -8052,11 +8554,13 @@ fn parse_sign_verify_spec(spec: &str) -> (&str, &str, bool) {
     }
 }
 
-/// Delete a remote's trusted keyring and then its configuration section, under
-/// one update guard. The section is looked up first in the configuration read
-/// at open, so an absent section takes no lock, and then again in `config` as
-/// it is on disk when the guard is taken. A failure between the two steps
-/// leaves the section with no keyring, never a keyring with no section.
+/// Deletes the trusted keyring and then the configuration section of a remote.
+///
+/// Both steps run under one update guard. The section is looked up first in
+/// the configuration read at open, so an absent section takes no lock. When
+/// the guard is taken, the section is looked up again in `config` as it is on
+/// disk. A failure between the two steps leaves the section with no keyring,
+/// and never a keyring with no section.
 async fn remote_delete(repo: &Repo, nested: &str, args: RemoteDeleteArgs) -> Result<()> {
     let name = remote_operand(nested, args.name.as_deref());
     if !ostrya::valid_remote_name(name) {
@@ -8083,12 +8587,12 @@ async fn remote_delete(repo: &Repo, nested: &str, args: RemoteDeleteArgs) -> Res
     }
 }
 
-/// List the configured remote names, sorted by name, with each URL after its
-/// name under `-u`.
+/// Lists the configured remote names, sorted by name.
 ///
-/// Under `-u` the names are padded to the longest name of the whole list plus
-/// two, counted in bytes, so the URLs line up; a remote that states no `url`
-/// stops the listing where its turn comes, the names before it already printed.
+/// Under `-u`, the URL follows each name. The names are padded to the length
+/// of the longest name in the list plus two, counted in bytes, so the URLs
+/// line up. A remote that states no `url` stops the listing at its turn. The
+/// names before it stay printed.
 fn remote_list(repo: &Repo, args: &RemoteListArgs) -> Result<()> {
     let mut names: Vec<&str> = repo.config().remotes().collect();
     names.sort_unstable();
@@ -8105,7 +8609,7 @@ fn remote_list(repo: &Repo, args: &RemoteListArgs) -> Result<()> {
     Ok(())
 }
 
-/// Print one remote's URL.
+/// Prints the URL of one remote.
 fn remote_show_url(repo: &Repo, nested: &str, args: &RemoteNameArgs) -> Result<()> {
     let name = remote_operand(nested, args.name.as_deref());
     let section = remote_section(repo, name);
@@ -8113,8 +8617,11 @@ fn remote_show_url(repo: &Repo, nested: &str, args: &RemoteNameArgs) -> Result<(
     Ok(())
 }
 
-/// The summary a remote publishes, or the tool's own refusal when it publishes
-/// none. `absent` is the wording for the subcommand asking.
+/// Returns the summary that a remote publishes.
+///
+/// If the remote publishes no summary, the process exits with the refusal of
+/// the `ostree` command. `absent` is the message for the subcommand that
+/// asks.
 async fn fetch_remote_summary(repo: &Repo, name: &str, absent: &str) -> Result<Summary> {
     require_remote(repo, name);
     let (bytes, _signature) = repo.remote_fetch_summary(name).await?;
@@ -8124,7 +8631,8 @@ async fn fetch_remote_summary(repo: &Repo, name: &str, absent: &str) -> Result<S
     Summary::parse(&bytes)
 }
 
-/// List the refs a remote's summary publishes, each under the remote's prefix.
+/// Lists the refs in the summary of a remote, each with the prefix of the
+/// remote.
 async fn remote_refs(repo: &Repo, nested: &str, args: &RemoteRefsArgs) -> Result<()> {
     let name = remote_operand(nested, args.name.as_deref());
     let summary = fetch_remote_summary(
@@ -8143,8 +8651,10 @@ async fn remote_refs(repo: &Repo, nested: &str, args: &RemoteRefsArgs) -> Result
     Ok(())
 }
 
-/// Report a remote's summary: the raw variant, the metadata keys, one metadata
-/// value, or the summary report itself.
+/// Reports the summary of a remote.
+///
+/// The output is the raw variant, the metadata keys, one metadata value, or
+/// the summary report.
 async fn remote_summary(repo: &Repo, nested: &str, args: &RemoteSummaryArgs) -> Result<()> {
     let name = remote_operand(nested, args.name.as_deref());
     require_remote(repo, name);
@@ -8155,17 +8665,18 @@ async fn remote_summary(repo: &Repo, nested: &str, args: &RemoteSummaryArgs) -> 
     print_summary_document(
         &bytes,
         args.raw,
-        // `remote summary` carries no view switch; the report is its fallback.
+        // `remote summary` has no view switch, and the report is its fallback.
         false,
         args.list_metadata_keys,
         args.print_metadata_key.as_deref(),
     )
 }
 
-/// Report one summary document under the reading options, in the precedence the
-/// tool takes them in (`docs/format-reference.md`, "CLI output formats", under
-/// `summary`): the raw variant, the report, the metadata keys, then one
-/// metadata value. With none of them the report is written.
+/// Reports one summary document under the read options.
+///
+/// The options take the precedence of the `ostree` command: the raw variant,
+/// the report, the metadata keys, and then one metadata value. With none of
+/// them, the command writes the report.
 fn print_summary_document(
     bytes: &[u8],
     raw: bool,
@@ -8176,16 +8687,16 @@ fn print_summary_document(
     if raw {
         let ty = parse_type(SUMMARY_SIGNATURE)?;
         let value = from_bytes(&ty, bytes).map_err(|err| Error::InvalidFormat(err.to_string()))?;
-        // The text form renders the converted tree, so the tree it was
-        // converted out of is dropped before the text is built.
+        // The text form renders the converted tree, so the code drops the
+        // source tree before it builds the text.
         let converted = value.byteswapped();
         drop(value);
         println!("{}", variant_text(&ty, &converted)?);
         return Ok(());
     }
     if !view {
-        // The key listing and one value by name report the metadata dict alone,
-        // so the ref list is left undecoded.
+        // The key listing and one value by name report only the metadata
+        // dict, so the ref list stays undecoded.
         if list_metadata_keys {
             print_sorted_keys(&Summary::parse_metadata(bytes)?);
             return Ok(());
@@ -8195,19 +8706,23 @@ fn print_summary_document(
             let Some(value) = metadata.dict_get(key) else {
                 exit_error(&format!("No such metadata key '{key}'"));
             };
-            // The raw reports convert the stored big-endian fields, so a value
-            // read by name reads as the number the field states. The lookup
-            // precedes the conversion, so one value is converted and not the
-            // whole dict.
+            // The raw reports convert the big-endian fields as stored, so a
+            // value read by name shows the number that the field states. The
+            // lookup comes before the conversion, so only one value is
+            // converted, and not the full dict.
             return print_metadata_value(&value.byteswapped(), false);
         }
     }
     print_summary_report(&Summary::parse(bytes)?)
 }
 
-/// Report a summary the way the tool reports one: each ref of field 0, then the
-/// refs of every collection the collection map lists, then the global metadata
-/// in the order the summary stores it.
+/// Reports a summary as the `ostree` command does.
+///
+/// The report holds:
+///
+/// 1. each ref of field 0
+/// 2. the refs of each collection in the collection map
+/// 3. the global metadata, in the order of the summary
 fn print_summary_report(summary: &Summary) -> Result<()> {
     let collection_id = summary
         .metadata_value("ostree.summary.collection-id")
@@ -8232,15 +8747,16 @@ fn print_summary_report(summary: &Summary) -> Result<()> {
     Ok(())
 }
 
-/// The type `ostree.summary.collection-map` holds.
+/// The type of the `ostree.summary.collection-map` value.
 const COLLECTION_MAP_TYPE: &str = "a{sa(s(taya{sv}))}";
 
-/// Report the refs `ostree.summary.collection-map` lists, the way the tool
-/// reads the map for its report. A value of any other type lists no refs, and a
-/// commit checksum that is not 32 bytes is named in place of the hex. The map
-/// reaches a summary through `summary -m` in both implementations, so the
-/// report does not refuse a map of another shape
-/// (`docs/format-reference.md`, "CLI output formats", `summary`).
+/// Reports the refs that `ostree.summary.collection-map` lists.
+///
+/// The report reads the map as the `ostree` command reads it for its report.
+/// A value of a different type lists no refs. If a commit checksum is not 32
+/// bytes, the report names its length in place of the hex. The map reaches a
+/// summary through `summary -m` in both commands, so the report does not
+/// refuse a map of a different shape.
 fn print_collection_map_refs(summary: &Summary) -> Result<()> {
     let Some((ty, map)) = summary
         .metadata
@@ -8273,9 +8789,11 @@ fn print_collection_map_refs(summary: &Summary) -> Result<()> {
     Ok(())
 }
 
-/// Report one ref of a summary: its name, the size and checksum of the commit it
-/// names, and the metadata the summary records for it. A repository that states
-/// a collection id names each of its refs as a `(collection, ref)` pair.
+/// Reports one ref of a summary.
+///
+/// The report gives the name, the commit size, the commit checksum, and the
+/// metadata of the ref in the summary. If a repository states a collection id,
+/// each of its refs shows as a `(collection, ref)` pair.
 fn print_summary_ref(
     collection_id: Option<&str>,
     name: &str,
@@ -8310,9 +8828,11 @@ fn print_summary_ref(
     Ok(())
 }
 
-/// Report one global metadata entry. The keys the format defines carry a label
-/// and their own rendering; every other key prints its name and its value in the
-/// text form, with no type annotation.
+/// Reports one global metadata entry.
+///
+/// Each key that the format defines has a label and its own form. Each other
+/// key prints its name and its value in the text form, with no type
+/// annotation.
 fn print_summary_metadata(key: &str, value: &Value) -> Result<()> {
     let labeled = SUMMARY_LABELS.iter().any(|(name, _)| *name == key);
     let label = label_for(SUMMARY_LABELS, key);
@@ -8328,12 +8848,12 @@ fn print_summary_metadata(key: &str, value: &Value) -> Result<()> {
             let yes = inner.as_bool().unwrap_or(false);
             println!("{label}: {}", if yes { "Yes" } else { "No" });
         }
-        // The map's refs are reported with the other refs, above.
+        // The refs of the map come earlier in the report, with the other refs.
         "ostree.summary.collection-map" => println!("{label}: (printed above)"),
         _ => match inner {
-            // A labeled string prints bare; an unlabeled one keeps the quotes
-            // the text form gives it. The delta map is read as a whole value,
-            // so a string stored under its key keeps the quotes too.
+            // A labeled string prints bare. An unlabeled string keeps the
+            // quotes of the text form. The delta map is read as a full value,
+            // so a string stored under its key also keeps the quotes.
             Value::Str(text) if labeled && key != "ostree.static-deltas" => {
                 println!("{label}: {text}")
             }
@@ -8343,8 +8863,10 @@ fn print_summary_metadata(key: &str, value: &Value) -> Result<()> {
     Ok(())
 }
 
-/// The label a report gives `key`, which is the key itself when the format does
-/// not define one. A labeled key carries its name in parentheses.
+/// Returns the label that a report gives `key`.
+///
+/// If the format defines no label, the label is the key itself. A labeled key
+/// has its name in parentheses after the label.
 fn label_for(labels: &[(&str, &str)], key: &str) -> String {
     match labels.iter().find(|(name, _)| *name == key) {
         Some((_, label)) => format!("{label} ({key})"),
@@ -8352,27 +8874,35 @@ fn label_for(labels: &[(&str, &str)], key: &str) -> String {
     }
 }
 
-/// One `a{sv}` entry read as a key and the variant it holds.
+/// Returns one `a{sv}` entry as a key and the variant that it holds.
 fn dict_entry(entry: &Value) -> Option<(&str, &Value)> {
     let fields = entry.as_tuple()?;
     Some((fields.first()?.as_str()?, fields.get(1)?))
 }
 
-/// Render a value in the GVariant text form with no type annotation, the form a
-/// report that names the value itself uses.
+/// Formats a value in the GVariant text form with no type annotation.
+///
+/// A report that names the value itself uses this form.
 fn unannotated_text(ty: &Type, value: &Value) -> Result<String> {
     to_text_unannotated(ty, value).map_err(|err| Error::InvalidFormat(err.to_string()))
 }
 
-/// The first and the last second a summary report renders as a date: the
-/// start of year 1 and the end of year 9999, in seconds from the Unix epoch.
+/// The first and the last second that a summary report shows as a date.
+///
+/// These are the start of year 1 and the end of year 9999, in seconds from
+/// the Unix epoch.
 const REPORT_INSTANT_RANGE: std::ops::RangeInclusive<i64> = -62_135_596_800..=253_402_300_799;
 
-/// Render a timestamp the way a summary report does: UTC, in
-/// `YYYY-MM-DDTHH:MM:SS+00`, with the year unpadded. The field is read as a
-/// signed count of seconds, and an instant outside years 1 through 9999
-/// renders as `invalid`. The tool renders the same instant in the host's time
-/// zone (`docs/conformance/cli-surface.md`, "P3").
+/// Formats a timestamp as a summary report shows it.
+///
+/// The form is UTC, `YYYY-MM-DDTHH:MM:SS+00`, with no padding on the year.
+/// The field is read as a signed count of seconds. An instant outside the
+/// years 1 to 9999 shows as `invalid`.
+///
+/// # Divergence
+///
+/// The `ostree` command shows the same instant in the time zone of the host.
+/// This is a recorded divergence.
 fn format_iso_utc(timestamp: u64) -> String {
     let seconds = timestamp as i64;
     if !REPORT_INSTANT_RANGE.contains(&seconds) {
@@ -8385,7 +8915,9 @@ fn format_iso_utc(timestamp: u64) -> String {
     format!("{year}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}+00")
 }
 
-/// Read a keyring file whole, refusing what the tool refuses in its own words.
+/// Reads a full keyring file.
+///
+/// A file that does not open is refused in the words of the `ostree` command.
 fn read_keyring_file(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).map_err(|err| {
         exit_error(&format!(
@@ -8396,7 +8928,7 @@ fn read_keyring_file(path: &Path) -> Result<Vec<u8>> {
     })
 }
 
-/// Import keys into a remote's trusted keyring.
+/// Imports keys into the trusted keyring of a remote.
 async fn remote_gpg_import(repo: &Repo, nested: &str, args: RemoteGpgImportArgs) -> Result<()> {
     let name = remote_operand(nested, args.name.as_deref());
     if !args.keyring.is_empty() && args.stdin {
@@ -8406,9 +8938,9 @@ async fn remote_gpg_import(repo: &Repo, nested: &str, args: RemoteGpgImportArgs)
             "--keyring and --stdin are mutually exclusive",
         );
     }
-    // The key sources are read before the remote is looked up, the order the
-    // tool takes: a `--keyring` naming no file is reported even for a remote the
-    // configuration does not describe.
+    // The key sources are read before the remote is looked up, in the order
+    // of the `ostree` command. A `--keyring` that names no file is reported
+    // also for a remote that the configuration does not describe.
     let mut keys = Vec::new();
     if args.stdin {
         use std::io::Read;
@@ -8418,8 +8950,8 @@ async fn remote_gpg_import(repo: &Repo, nested: &str, args: RemoteGpgImportArgs)
             keys.extend_from_slice(&read_keyring_file(path)?);
         }
     }
-    // This one subcommand prefixes its refusal of an unknown remote, which the
-    // tool's own message does too.
+    // Only this subcommand prefixes its refusal of an unknown remote. The
+    // message of the `ostree` command has the same prefix.
     if repo.config().remote(name).is_none() {
         exit_error(&format!("GPG: Remote \"{name}\" not found"));
     }
@@ -8431,14 +8963,15 @@ async fn remote_gpg_import(repo: &Repo, nested: &str, args: RemoteGpgImportArgs)
     Ok(())
 }
 
-/// Print what an import added, in the tool's own words, which count the keys the
-/// keyring did not already hold.
+/// Prints what an import added, in the words of the `ostree` command.
+///
+/// The count is the number of keys that the keyring did not already hold.
 fn report_gpg_import(imported: usize, remote: &str) {
     let keys = if imported == 1 { "key" } else { "keys" };
     println!("Imported {imported} GPG {keys} to remote \"{remote}\"");
 }
 
-/// List the keys a remote's trusted keyring holds.
+/// Lists the keys in the trusted keyring of a remote.
 async fn remote_gpg_list_keys(repo: &Repo, nested: &str, args: &RemoteNameArgs) -> Result<()> {
     let name = remote_operand(nested, args.name.as_deref());
     require_remote(repo, name);
@@ -8454,28 +8987,35 @@ async fn remote_gpg_list_keys(repo: &Repo, nested: &str, args: &RemoteNameArgs) 
     Ok(())
 }
 
+/// Imports `keys` into the trusted keyring of `remote`.
+///
+/// The result is the number of new keys.
 #[cfg(feature = "gpg")]
 async fn gpg_import(repo: &Repo, remote: &str, keys: &[u8], key_ids: &[String]) -> Result<usize> {
     repo.gpg_import_keys(remote, keys, key_ids).await
 }
 
+/// Returns an error, because this build has no gpg engine.
 #[cfg(not(feature = "gpg"))]
 async fn gpg_import(_: &Repo, _: &str, _: &[u8], _: &[String]) -> Result<usize> {
     Err(unsupported_type("gpg"))
 }
 
+/// Returns the keys in the trusted keyring of `remote`.
 #[cfg(feature = "gpg")]
 async fn gpg_list_keys(repo: &Repo, remote: &str) -> Result<Vec<ostrya::GpgKey>> {
     repo.gpg_list_keys(remote).await
 }
 
+/// Returns an error, because this build has no gpg engine.
 #[cfg(not(feature = "gpg"))]
 async fn gpg_list_keys(_: &Repo, _: &str) -> Result<Vec<GpgKeyStub>> {
     Err(unsupported_type("gpg"))
 }
 
-/// Stands in for the GPG key record where the engine is not built, so the
-/// listing's own code compiles under either feature set.
+/// A stand-in for the GPG key record in a build without the gpg engine.
+///
+/// With it, the code of the listing compiles under each feature set.
 #[cfg(not(feature = "gpg"))]
 struct GpgKeyStub {
     fingerprint: String,
@@ -8483,10 +9023,12 @@ struct GpgKeyStub {
     user_ids: Vec<String>,
 }
 
-/// Render a timestamp as the commit report's `Date:` line does: UTC, in
-/// `YYYY-MM-DD HH:MM:SS +0000`. The stored field is unsigned and a pre-epoch
-/// instant is its two's-complement form, so it is read as a signed count of
-/// seconds, matching the tool.
+/// Formats a timestamp as the `Date:` line of the commit report shows it.
+///
+/// The form is UTC, `YYYY-MM-DD HH:MM:SS +0000`. The stored field is
+/// unsigned, and a pre-epoch instant is in its two's-complement form. As a
+/// result, the field is read as a signed count of seconds, as in the `ostree`
+/// command.
 fn format_utc(timestamp: u64) -> String {
     let seconds = timestamp as i64;
     let days = seconds.div_euclid(86_400);
@@ -8496,8 +9038,9 @@ fn format_utc(timestamp: u64) -> String {
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} +0000")
 }
 
-/// The civil date `days` days after 1970-01-01, the inverse of
-/// [`days_from_civil`].
+/// Returns the civil date `days` days after 1970-01-01.
+///
+/// This is the inverse of [`days_from_civil`].
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let shifted = days + 719_468;
     let era = shifted.div_euclid(146_097);
@@ -8516,13 +9059,17 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
-/// Read one `--retain-branch-depth` value: a branch name, `=`, and a depth.
+/// Reads one `--retain-branch-depth` value: a branch name, `=`, and a depth.
 ///
-/// The value splits at its first `=`, so a branch name holding one is not
-/// spellable, which is what the tool does. The depth is a decimal integer with
-/// an optional leading `-`; the tool reads a leading run of digits and drops
-/// the rest of the string, and the port refuses what its own reader does not
-/// hold (`docs/conformance/cli-surface.md`, "P2").
+/// The value splits at its first `=`, so a branch name with a `=` cannot be
+/// given. The `ostree` command does the same. The depth is a decimal integer
+/// with an optional leading `-`.
+///
+/// # Divergence
+///
+/// `ostree` reads a leading run of digits and drops the rest of the string.
+/// ostrya refuses a value that its reader does not accept. This is a recorded
+/// divergence.
 fn parse_retain_branch_depth(value: &str) -> std::result::Result<(String, i32), String> {
     let Some((branch, depth)) = value.split_once('=') else {
         return Err(format!("Invalid value {value}, must specify BRANCH=DEPTH"));
@@ -8535,18 +9082,23 @@ fn parse_retain_branch_depth(value: &str) -> std::result::Result<(String, i32), 
     }
 }
 
-/// The units a prune totals line renders a byte count in above 1000 bytes.
+/// The units for a byte count of 1000 or more in a prune totals line.
 const SIZE_UNITS: [&str; 6] = ["kB", "MB", "GB", "TB", "PB", "EB"];
 
-/// The character the totals line puts between a rendered quantity and its
-/// unit, U+00A0 NO-BREAK SPACE.
+/// The character between a quantity and its unit in the totals line.
+///
+/// This is U+00A0 NO-BREAK SPACE.
 const NO_BREAK_SPACE: char = '\u{a0}';
 
-/// Render a byte count the way the totals line does: the count, a space, and
-/// the word `byte` or `bytes` below 1000, and a decimal (SI) quantity with one
-/// fractional digit, a no-break space, and the unit at or above it. The unit
-/// follows the byte count and not the rounded value, so 999999 renders as
-/// `1000.0 kB` (`docs/format-reference.md`, "CLI output formats", `prune`).
+/// Formats a byte count as the totals line shows it.
+///
+/// - Less than 1000 bytes: the count, a space, and the word `byte` or
+///   `bytes`.
+/// - 1000 bytes or more: a decimal (SI) quantity with one fractional digit, a
+///   no-break space, and the unit.
+///
+/// The byte count selects the unit, and the rounded value does not. As a
+/// result, 999999 shows as `1000.0 kB`.
 fn format_size(bytes: u64) -> String {
     if bytes < 1000 {
         let word = if bytes == 1 { "byte" } else { "bytes" };
@@ -8566,12 +9118,13 @@ fn format_size(bytes: u64) -> String {
     format!("{value:.1}{NO_BREAK_SPACE}{unit}")
 }
 
+/// Prunes the objects that no ref reaches, and prints the totals.
 async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
-    // The order of the refusals below is the tool's own: the option pair, the
-    // `--static-deltas-only` requirement, the date, each
-    // `--retain-branch-depth` value, and then the revisions, which
-    // `Repo::prune` resolves last. None of them writes, so a refusal leaves the
-    // repository untouched.
+    // The refusals that follow come in the order of the `ostree` command. The
+    // order is the option pair, the `--static-deltas-only` requirement, the
+    // date, each `--retain-branch-depth` value, and then the revisions.
+    // `Repo::prune` resolves the revisions last. No refusal writes, so a
+    // refusal leaves the repository as it was.
     if args.no_prune && args.delete_commit.is_some() {
         exit_error("Cannot specify both --delete-commit and --no-prune");
     }
@@ -8609,22 +9162,21 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
         gc_root_metadata_keys: repo.config().gc_root_metadata_keys()?,
         ..PruneOptions::default()
     };
-    // A repository whose config sets `[core] locking` false takes no lock, so
-    // the run below shares the repository with any other writer. The tool
-    // writes nothing here, which makes the line a divergence
-    // (`docs/conformance/cli-surface.md`, "prune").
+    // If the config of a repository sets `[core] locking` to false, the prune
+    // takes no lock. The run then shares the repository with each other
+    // writer. The `ostree` command writes nothing at this point, so this line
+    // is a recorded divergence.
     //
-    // The read stands here, after the options are assembled, so it does not
-    // move where an `[ex-ostrya] gc-root-metadata-keys` refusal lands. A read
-    // hoisted to the top of this function, the way `commit` hoists the four
-    // `[core]` keys its transaction needs, would put a `locking=bogus` refusal
-    // ahead of the `--keep-younger-than`, `--retain-branch-depth`, and
-    // `--delete-commit` refusals. That order contradicts the conformance
-    // record, which states that every config read `prune` makes comes after
-    // every option refusal (`docs/conformance/cli-surface.md`, "Global
-    // conventions"). `Repo::prune` reads the same key again as it takes the
-    // lock; this is a lookup over the config the handle already parsed and
-    // reads no file.
+    // The read is here, after the options are assembled, so it does not move
+    // the point of an `[ex-ostrya] gc-root-metadata-keys` refusal. `commit`
+    // reads the four `[core]` keys of its transaction at the top of its
+    // function. If this read moves to the top of this function, a
+    // `locking=bogus` refusal comes before the `--keep-younger-than`,
+    // `--retain-branch-depth`, and `--delete-commit` refusals. That order
+    // contradicts the conformance record: each config read of `prune` comes
+    // after each option refusal. `Repo::prune` reads the same key again when
+    // it takes the lock. This is a lookup in the config that the handle
+    // already parsed, and it reads no file.
     if !repo.config().locking()? {
         eprintln!(
             "ostrya: [core] locking is false, so this prune holds no repository \
@@ -8655,14 +9207,20 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
     Ok(())
 }
 
-/// The opening quote the tool wraps a ref name or a collection id in.
+/// The opening quote of a ref name or a collection id, U+2018.
+///
+/// The `ostree` command writes this quote.
 const OPEN_QUOTE: char = '\u{2018}';
-/// The closing quote the tool wraps a ref name or a collection id in.
+/// The closing quote of a ref name or a collection id, U+2019.
+///
+/// The `ostree` command writes this quote.
 const CLOSE_QUOTE: char = '\u{2019}';
-/// The word the tool writes for a collection ref in a back-reference finding.
-/// The dash is U+2013 EN DASH.
+/// The word for a collection ref in a back-reference finding.
+///
+/// The `ostree` command writes this word. The dash is U+2013 EN DASH.
 const COLLECTION_REF: &str = "Collection\u{2013}ref";
 
+/// Checks the objects of the repository and reports the findings.
 async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
     use std::io::Write;
     let opts = FsckOptions {
@@ -8671,10 +9229,9 @@ async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
         all: args.all,
         add_tombstones: args.add_tombstones,
         verify_bindings: args.verify_bindings,
-        // The tool's help text says `--verify-back-refs` implies
-        // `--verify-bindings`; the tool runs the two checks independently, so
-        // only naming both runs both (`docs/format-reference.md`, "CLI output
-        // formats", `fsck`).
+        // The help text of the `ostree` command says that `--verify-back-refs`
+        // implies `--verify-bindings`. `ostree` runs the two checks
+        // separately, so only a command line with both runs both.
         verify_back_refs: args.verify_back_refs,
     };
     let report = match repo.fsck(&opts).await {
@@ -8697,17 +9254,16 @@ async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
             );
         }
     }
-    // The walk runs to its end, so every finding is written plain and the run
-    // closes with one `error: ` line of its own
-    // (`docs/conformance/cli-surface.md`, "fsck").
+    // The walk runs to its end, so each finding is written plain, and the run
+    // ends with one `error: ` line of its own.
     for error in &report.errors {
         eprintln!("{}", fsck_finding_line(error));
     }
     for commit in &report.marked_partial {
         eprintln!("Marking commit as partial: {commit}");
     }
-    // A run the ref, collection, or enumerate phase ended writes that
-    // condition and nothing the object walk would have written.
+    // If the ref, collection, or enumerate phase ended the run, the run writes
+    // that condition and nothing of the object walk.
     if let Some(failure) = &report.failure {
         std::io::stdout().flush().ok();
         fsck_report_failure(failure);
@@ -8741,9 +9297,11 @@ async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
     Ok(())
 }
 
-/// One finding, in the tool's words. A content object is named by its
-/// checksum alone and a metadata object by its `<checksum>.<type>` form, and
-/// each carries the commits that reach it.
+/// Returns the text of one finding, in the words of the `ostree` command.
+///
+/// A content object is named by its checksum alone, and a metadata object by
+/// its `<checksum>.<type>` form. Each finding names the commits that reach the
+/// object.
 fn fsck_finding_line(error: &FsckError) -> String {
     let object = error.object;
     let subject = if object.ty == ObjectType::File {
@@ -8776,9 +9334,11 @@ fn fsck_finding_line(error: &FsckError) -> String {
     )
 }
 
-/// The commits a finding names, comma-and-space separated. The port writes
-/// them sorted where the tool writes them in the order its own hash container
-/// holds (`docs/conformance/cli-surface.md`, "fsck").
+/// Returns the commits that a finding names, separated by a comma and a space.
+///
+/// The library gives the commits sorted, and ostrya writes them in that order.
+/// The `ostree` command writes them in the order of its hash container. This
+/// is a recorded divergence.
 fn fsck_commit_list(commits: &[Checksum]) -> String {
     commits
         .iter()
@@ -8787,7 +9347,7 @@ fn fsck_commit_list(commits: &[Checksum]) -> String {
         .join(", ")
 }
 
-/// Write the condition that ended the run, then exit 1.
+/// Writes the condition that ended the run, and exits 1.
 fn fsck_report_failure(failure: &FsckFailure) -> ! {
     match failure {
         FsckFailure::RefTarget {
@@ -8809,8 +9369,11 @@ fn fsck_report_failure(failure: &FsckFailure) -> ! {
     }
 }
 
-/// One binding finding, in the tool's words. The quotes are U+2018 and
-/// U+2019 and the dash in `Collection-ref` is U+2013, as the tool writes them.
+/// Returns the text of one binding finding, in the words of the `ostree`
+/// command.
+///
+/// The quotes are U+2018 and U+2019, and the dash in `Collection-ref` is
+/// U+2013, as `ostree` writes them.
 fn fsck_binding_text(error: &FsckBindingError) -> String {
     let commit = error.commit;
     match &error.kind {
@@ -8859,9 +9422,11 @@ fn fsck_binding_text(error: &FsckBindingError) -> String {
     }
 }
 
-/// An error that ends the command, in the tool's words where the two conditions
-/// coincide. A referenced object the store cannot supply is the tool's
-/// `No such metadata object` sentence.
+/// Returns the text of an error that ends the command.
+///
+/// If the condition is the same in both commands, the text uses the words of
+/// the `ostree` command. A referenced object that the store cannot supply
+/// gets the `No such metadata object` sentence of `ostree`.
 fn fsck_error_text(error: &Error) -> String {
     match error {
         Error::ObjectNotFound { checksum, ty } => {
@@ -8871,17 +9436,16 @@ fn fsck_error_text(error: &Error) -> String {
     }
 }
 
-/// One `REV_OR_DIR` argument, read as the rule of
-/// `docs/format-reference.md`, "CLI output formats", `diff` states it.
+/// One `REV_OR_DIR` argument, read by the rule of [`diff_side_is_directory`].
 enum DiffArgSide {
-    /// A commit the argument resolved to.
+    /// A commit that the argument resolved to.
     Commit(Checksum),
-    /// A directory on the filesystem.
+    /// A directory on the file system.
     Directory(PathBuf),
 }
 
 impl DiffArgSide {
-    /// The library side this argument names.
+    /// Returns the library side that this argument names.
     fn as_side(&self) -> DiffSide<'_> {
         match self {
             DiffArgSide::Commit(checksum) => DiffSide::Commit(checksum),
@@ -8889,22 +9453,25 @@ impl DiffArgSide {
         }
     }
 
-    /// Whether the side names a path relative to a directory, which decides
-    /// how a path it owns prints.
+    /// Returns `true` if the argument names a directory.
+    ///
+    /// This decides how a path of this side prints.
     fn is_directory(&self) -> bool {
         matches!(self, DiffArgSide::Directory(_))
     }
 }
 
-/// A `REV_OR_DIR` argument names a directory where it begins with `/` or with
-/// `./`, and a revision otherwise. The rule reads the spelling alone, so an
-/// existing directory named by a relative path without `./` is read as a
-/// revision (`docs/format-reference.md`, "CLI output formats", `diff`).
+/// Returns `true` if a `REV_OR_DIR` argument names a directory.
+///
+/// An argument that starts with `/` or with `./` names a directory. Each
+/// other argument names a revision. The rule reads only the spelling, so an
+/// existing directory given as a relative path without `./` is read as a
+/// revision.
 fn diff_side_is_directory(argument: &str) -> bool {
     argument.starts_with('/') || argument.starts_with("./")
 }
 
-/// Read one `REV_OR_DIR` argument.
+/// Reads one `REV_OR_DIR` argument.
 async fn diff_arg_side(repo: &Repo, argument: &str) -> Result<DiffArgSide> {
     if diff_side_is_directory(argument) {
         Ok(DiffArgSide::Directory(PathBuf::from(argument)))
@@ -8913,7 +9480,7 @@ async fn diff_arg_side(repo: &Repo, argument: &str) -> Result<DiffArgSide> {
     }
 }
 
-/// The character each change prints.
+/// Returns the character that a change prints.
 fn diff_prefix(change: DiffChange) -> char {
     match change {
         DiffChange::Added => 'A',
@@ -8922,20 +9489,25 @@ fn diff_prefix(change: DiffChange) -> char {
     }
 }
 
+/// Prints the differences between two revisions or directories.
+///
+/// With `--stats`, the command prints the object statistics of two commits. It
+/// prints the path block before them, and only with `--fs-diff`.
 async fn diff(repo: Repo, name: &str, args: DiffArgs, owner: Owner) -> Result<()> {
     let Some(first) = args.from.as_deref() else {
         exit_with_error(name, "REV must be specified");
     };
-    // With one argument the first side is that argument with `^` appended, so
-    // the parent condition carries the resolution wording every subcommand
-    // taking a revision gives.
+    // With one argument, the first side is that argument with `^` appended.
+    // As a result, the parent condition has the resolution words that each
+    // subcommand with a revision gives.
     let (from_text, to_text) = match args.to.as_deref() {
         Some(second) => (first.to_owned(), second.to_owned()),
         None => (format!("{first}^"), first.to_owned()),
     };
 
-    // The per-path block is written in full before the stats pass runs, so a
-    // run carrying both writes the block and then the stats pass's refusal.
+    // The block for each path is written in full before the stats pass runs.
+    // A run with both writes the block and then the refusal of the stats
+    // pass.
     if args.fs_diff || !args.stats {
         let options = DiffOptions {
             skip_xattrs: args.no_xattrs,
@@ -8971,14 +9543,16 @@ async fn diff(repo: Repo, name: &str, args: DiffArgs, owner: Owner) -> Result<()
     Ok(())
 }
 
-/// The refusal of `--keys-dir` under the gpg engine, which reads keyrings from
-/// `--keys-file` alone.
+/// Returns the refusal of `--keys-dir` under the gpg engine.
+///
+/// The gpg engine reads keyrings only from `--keys-file`.
 fn gpg_keys_dir_refusal() -> Error {
     Error::Signature(
         "--keys-dir is not used by the gpg engine; supply keyrings with --keys-file".into(),
     )
 }
 
+/// Signs a commit, or verifies or deletes its signatures.
 async fn sign(repo: Repo, repo_path: PathBuf, name: &str, args: SignArgs) -> Result<()> {
     let Some(commit_rev) = args.commit.as_deref() else {
         exit_with_error(name, "Need a COMMIT to sign or verify");
@@ -9006,6 +9580,7 @@ async fn sign(repo: Repo, repo_path: PathBuf, name: &str, args: SignArgs) -> Res
     }
 }
 
+/// Updates, verifies, signs, or reads the summary of the repository.
 async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()> {
     if args.verify {
         let engine = summary_sign_type(&args);
@@ -9019,15 +9594,14 @@ async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()
     }
 
     if args.update {
-        // An update does its work and returns; the tool writes no report beside
-        // it.
+        // An update does its work and returns. The `ostree` command writes no
+        // report with it.
         return summary_update(&repo, &args).await;
     }
 
-    // Without `-u` the writing options are read by nothing. Beside a reading
-    // option they are inert; alone they draw the no-option refusal, before a
-    // positional key is read (`docs/format-reference.md`, "CLI output
-    // formats", `summary`).
+    // Without `-u`, nothing reads the write options. With a read option, they
+    // have no effect. Alone, they cause the no-option refusal, before a
+    // positional key is read.
     let reading =
         args.raw || args.view || args.list_metadata_keys || args.print_metadata_key.is_some();
     let writing =
@@ -9035,9 +9609,9 @@ async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()
     if !reading && writing {
         return Err(summary_nothing_to_do());
     }
-    // A positional key or a `--keys-file` signs the summary that stands, a port
-    // extension, and signing precedes every reading option. Every signer is
-    // built before the first signature is written.
+    // A positional key or a `--keys-file` signs the current summary. This is
+    // an ostrya extension. Signing comes before each read option. Each signer
+    // is built before the first signature is written.
     if !args.key_id.is_empty() || !args.keys_file.is_empty() {
         let signers = summary_extension_signers(&args, summary_sign_type(&args)).await?;
         return repo.sign_summary_all(&signer_refs(&signers)).await;
@@ -9048,16 +9622,20 @@ async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()
     summary_read(&repo, &args).await
 }
 
-/// The port's refusal for a `summary` run that names nothing to do. The tool
-/// words it differently (`docs/conformance/cli-surface.md`, "summary").
+/// Returns the refusal for a `summary` command line that names nothing to do.
+///
+/// The `ostree` command uses different words for this refusal. This is a
+/// recorded divergence.
 fn summary_nothing_to_do() -> Error {
     Error::InvalidFormat(
         "nothing to do: pass --update, --verify, a reading option, or a signing key".into(),
     )
 }
 
-/// The engine `--sign-type` names, refused in the tool's own words where no
-/// engine carries the name.
+/// Returns the engine that `--sign-type` names.
+///
+/// If no engine has the name, the process exits with the refusal of the
+/// `ostree` command.
 fn summary_sign_type(args: &SummaryArgs) -> SignType {
     match sign_type_from_name(args.sign_type.as_deref().unwrap_or(DEFAULT_SIGN_TYPE)) {
         Ok(engine) => engine,
@@ -9065,17 +9643,21 @@ fn summary_sign_type(args: &SummaryArgs) -> SignType {
     }
 }
 
-/// Regenerate the summary and sign it with every key the options name.
+/// Regenerates the summary and signs it with each key that the options name.
 ///
-/// Every argument is checked before the regeneration, so a refusal leaves
-/// `summary` and `summary.sig` as they stood. The checks run in the tool's
-/// order: each `-m` argument in command-line order, then each `--gpg-sign`
-/// lookup, then `--sign-type` where a key needs an engine, then each `--sign`
-/// key, then the positional and `--keys-file` keys. Under the gpg engine a
-/// `--sign` key and a positional key are looked up the way a `--gpg-sign`
-/// selector is. The GPG signatures are written first and the `--sign`
-/// signatures after them, in one write of `summary.sig`
-/// (`docs/format-reference.md`, "Summary signature").
+/// Each argument is checked before the regeneration, so a refusal leaves
+/// `summary` and `summary.sig` as they were. The checks run in the order of
+/// the `ostree` command:
+///
+/// 1. each `-m` argument, in command-line order
+/// 2. each `--gpg-sign` lookup
+/// 3. `--sign-type`, if a key needs an engine
+/// 4. each `--sign` key
+/// 5. the positional and `--keys-file` keys
+///
+/// Under the gpg engine, a `--sign` key and a positional key are looked up as
+/// a `--gpg-sign` selector is. The GPG signatures are written first, and the
+/// `--sign` signatures after them, in one write of `summary.sig`.
 async fn summary_update(repo: &Repo, args: &SummaryArgs) -> Result<()> {
     let additional_metadata = match summary_added_metadata(&args.add_metadata) {
         Ok(entries) => entries,
@@ -9116,19 +9698,22 @@ async fn summary_update(repo: &Repo, args: &SummaryArgs) -> Result<()> {
     repo.sign_summary_all(&signer_refs(&signers)).await
 }
 
-/// Borrow each boxed signer, in order, for a batch signing call.
+/// Returns a borrow of each boxed signer, in order, for a batch signing call.
 fn signer_refs(signers: &[Box<dyn Signer>]) -> Vec<&dyn Signer> {
     signers.iter().map(|signer| signer.as_ref()).collect()
 }
 
-/// The refusal a reading option draws when the repository holds no `summary`
-/// file. The tool words it as its own errno wrapper
-/// (`docs/conformance/cli-surface.md`, "summary").
+/// The refusal of a read option if the repository has no `summary` file.
+///
+/// The `ostree` command gives `openat(summary): No such file or directory`, in
+/// the form of its errno wrapper. Both commands exit 1 and write nothing to
+/// standard output. This is a recorded divergence.
 const SUMMARY_ABSENT: &str = "opening summary: No such file or directory";
 
-/// Report the local summary: the raw variant, the report, the metadata keys, or
-/// one metadata value. The precedence is the tool's own
-/// (`docs/format-reference.md`, "CLI output formats", under `summary`).
+/// Reports the local summary.
+///
+/// The output is the raw variant, the report, the metadata keys, or one
+/// metadata value. The precedence is that of the `ostree` command.
 async fn summary_read(repo: &Repo, args: &SummaryArgs) -> Result<()> {
     let Some(bytes) = repo.read_summary().await? else {
         exit_error(SUMMARY_ABSENT);
@@ -9142,9 +9727,10 @@ async fn summary_read(repo: &Repo, args: &SummaryArgs) -> Result<()> {
     )
 }
 
-/// The signers the positional keys and `--keys-file` name under `engine`, a
-/// port extension. The keys are read strictly, the way `ostrya sign` reads
-/// them, and a gpg selector is looked up before the signer is returned.
+/// Returns the signers of the positional keys and `--keys-file` under `engine`.
+///
+/// This is an ostrya extension. The keys are read strictly, as `ostrya sign`
+/// reads them. A gpg selector is looked up before the signer is returned.
 async fn summary_extension_signers(
     args: &SummaryArgs,
     engine: SignType,
@@ -9163,6 +9749,7 @@ async fn summary_extension_signers(
     }
 }
 
+/// Returns an spki signer for each summary secret key.
 #[cfg(feature = "spki")]
 fn summary_signers_spki(args: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
     summary_secret_keys(args)?
@@ -9175,11 +9762,13 @@ fn summary_signers_spki(args: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
         .collect()
 }
 
+/// Returns an error, because this build has no spki engine.
 #[cfg(not(feature = "spki"))]
 fn summary_signers_spki(_: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
     Err(unsupported_type("spki"))
 }
 
+/// Returns a gpg signer for each positional KEY-ID of `summary`.
 #[cfg(feature = "gpg")]
 async fn summary_signers_gpg(args: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
     if !args.keys_file.is_empty() {
@@ -9193,13 +9782,16 @@ async fn summary_signers_gpg(args: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>>
     }
 }
 
+/// Returns an error, because this build has no gpg engine.
 #[cfg(not(feature = "gpg"))]
 async fn summary_signers_gpg(_: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
     Err(unsupported_type("gpg"))
 }
 
-/// The base64 secret keys for a summary signing run: the KEY-IDs plus the
-/// non-blank lines of each `--keys-file`.
+/// Returns the base64 secret keys for a summary signing run.
+///
+/// These are the KEY-IDs and the non-blank lines of each `--keys-file`. At
+/// least one key is required.
 fn summary_secret_keys(args: &SummaryArgs) -> Result<Vec<String>> {
     let mut keys = args.key_id.clone();
     for path in &args.keys_file {
@@ -9213,9 +9805,11 @@ fn summary_secret_keys(args: &SummaryArgs) -> Result<Vec<String>> {
     Ok(keys)
 }
 
-/// Build the verifier for `ostrya summary --verify`. The sign-api engines read
-/// the key sources of `ostrya sign --verify`; gpg reads every `--keys-file`
-/// keyring and refuses `--keys-dir`.
+/// Returns the verifier for `ostrya summary --verify`.
+///
+/// The ed25519 and spki engines read the key sources of `ostrya sign
+/// --verify`. The gpg engine reads each `--keys-file` keyring and refuses
+/// `--keys-dir`.
 fn summary_verifier(
     repo_path: &Path,
     engine: SignType,
@@ -9234,6 +9828,10 @@ fn summary_verifier(
     }
 }
 
+/// Returns the gpg verifier for `summary --verify`.
+///
+/// The keyrings are each `--keys-file`, or else the trusted keys of
+/// `--remote`, or else the system trust.
 #[cfg(feature = "gpg")]
 fn summary_gpg_verifier(repo_path: &Path, args: &SummaryArgs) -> Result<Box<dyn Verifier>> {
     let verifier = if !args.keys_file.is_empty() {
@@ -9246,12 +9844,13 @@ fn summary_gpg_verifier(repo_path: &Path, args: &SummaryArgs) -> Result<Box<dyn 
     Ok(Box::new(verifier))
 }
 
+/// Returns an error, because this build has no gpg engine.
 #[cfg(not(feature = "gpg"))]
 fn summary_gpg_verifier(_: &Path, _: &SummaryArgs) -> Result<Box<dyn Verifier>> {
     Err(unsupported_type("gpg"))
 }
 
-/// Sign the commit once per supplied key.
+/// Signs the commit once for each given key.
 async fn add_signatures(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()> {
     match args.sign_type {
         SignType::Ed25519 => {
@@ -9266,6 +9865,7 @@ async fn add_signatures(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Resu
     }
 }
 
+/// Signs the commit with each spki secret key.
 #[cfg(feature = "spki")]
 async fn sign_spki(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()> {
     for key in secret_key_lines(args)? {
@@ -9275,15 +9875,17 @@ async fn sign_spki(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()
     Ok(())
 }
 
+/// Returns an error, because this build has no spki engine.
 #[cfg(not(feature = "spki"))]
 async fn sign_spki(_: &Repo, _: &Checksum, _: &SignArgs) -> Result<()> {
     Err(unsupported_type("spki"))
 }
 
-/// Sign with keys the `gpg` binary resolves: each KEY-ID is a fingerprint,
-/// key id, or user id, looked up in the default GnuPG home directory or the
-/// `--gpg-homedir` override. The private key stays with gpg and its agent,
-/// including a key on a hardware token.
+/// Signs the commit with keys that the `gpg` binary resolves.
+///
+/// Each KEY-ID is a fingerprint, a key id, or a user id. The lookup uses the
+/// default GnuPG home directory or the `--gpg-homedir` override. The private
+/// key stays with gpg and its agent, also a key on a hardware token.
 #[cfg(feature = "gpg")]
 async fn sign_gpg(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()> {
     if !args.keys_file.is_empty() {
@@ -9307,13 +9909,15 @@ async fn sign_gpg(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()>
     Ok(())
 }
 
+/// Returns an error, because this build has no gpg engine.
 #[cfg(not(feature = "gpg"))]
 async fn sign_gpg(_: &Repo, _: &Checksum, _: &SignArgs) -> Result<()> {
     Err(unsupported_type("gpg"))
 }
 
-/// Verify the commit under the selected engine, print each signature, and exit
-/// nonzero when no signature is valid.
+/// Verifies the commit under the selected engine and prints each signature.
+///
+/// If no signature is valid, the process exits 1.
 async fn verify_signatures(
     repo: &Repo,
     commit: &Checksum,
@@ -9332,7 +9936,7 @@ async fn verify_signatures(
     Ok(())
 }
 
-/// Delete signatures the given KEY-IDs match, and report the count removed.
+/// Deletes the signatures that the KEY-IDs match, and prints the count.
 async fn delete_signatures(
     repo: &Repo,
     commit: &Checksum,
@@ -9347,9 +9951,9 @@ async fn delete_signatures(
     let removed = match args.sign_type {
         SignType::Gpg => gpg_delete(repo, commit, repo_path, args).await?,
         engine => {
-            // A sign-api blob belongs to a KEY-ID when it verifies under that
-            // public key. Verification is async, so the blobs to remove are
-            // decided up front and the predicate matches by bytes.
+            // An ed25519 or spki blob belongs to a KEY-ID if it verifies under
+            // that public key. Verification is async, so the code selects the
+            // blobs to remove first, and the predicate matches them by bytes.
             let verifier = build_sign_api_verifier(engine, &public_key_bytes(args)?, &[])?;
             let key = sign_metadata_key(engine);
             let payload = repo.load_object_bytes(ObjectType::Commit, commit).await?;
@@ -9372,9 +9976,11 @@ async fn delete_signatures(
     Ok(())
 }
 
-/// The signature blobs stored under `key` in the commit's detached metadata,
-/// in stored order. Missing metadata, a missing key, or non-byte elements
-/// yield an empty set.
+/// Returns the signature blobs stored under `key` in the detached metadata.
+///
+/// The blobs come in stored order. If the metadata or the key is missing, or
+/// the value is not an array, the result is empty. Elements that are not
+/// bytes are skipped.
 async fn stored_signatures(repo: &Repo, commit: &Checksum, key: &str) -> Result<Vec<Vec<u8>>> {
     let Some(dict) = repo.read_commit_detached_metadata(commit).await? else {
         return Ok(Vec::new());
@@ -9397,11 +10003,13 @@ async fn stored_signatures(repo: &Repo, commit: &Checksum, key: &str) -> Result<
         .unwrap_or_default())
 }
 
-/// Delete GPG signatures whose issuer or primary-key fingerprint matches a
-/// KEY-ID. The issuer fingerprint is reported even for a key absent from the
-/// keyrings; a keyring in the trusted set (`--keys-file`, `--remote`, or the
-/// default `trusted.gpg.d`) lets a match also consider the primary-key
-/// fingerprint of a verified signature.
+/// Deletes the GPG signatures that match a KEY-ID by fingerprint.
+///
+/// A signature matches by its issuer fingerprint or by its primary-key
+/// fingerprint. The issuer fingerprint is reported also for a key that is not
+/// in the keyrings. If a keyring of the trusted set (`--keys-file`,
+/// `--remote`, or the default `trusted.gpg.d`) holds the key, a match can
+/// also use the primary-key fingerprint of a verified signature.
 #[cfg(feature = "gpg")]
 async fn gpg_delete(
     repo: &Repo,
@@ -9435,15 +10043,18 @@ async fn gpg_delete(
     .await
 }
 
+/// Returns an error, because this build has no gpg engine.
 #[cfg(not(feature = "gpg"))]
 async fn gpg_delete(_: &Repo, _: &Checksum, _: &Path, _: &SignArgs) -> Result<usize> {
     Err(unsupported_type("gpg"))
 }
 
-/// Build the sign-api (ed25519/spki) verifier of `sign --verify` through
-/// [`load_verify_keys`]: the KEY-IDs and the last `--keys-file`; with neither,
-/// the last `--keys-dir`, or the system key directories where it is absent.
-/// No trusted key before revocation is `{type}: no keys loaded`.
+/// Returns the ed25519 or spki verifier of `sign --verify`.
+///
+/// [`load_verify_keys`] reads the KEY-IDs and the last `--keys-file`. With
+/// neither, it reads the last `--keys-dir`, or the system key directories if
+/// `--keys-dir` is absent. If no trusted key is loaded before revocation, the
+/// error is `{type}: no keys loaded`.
 fn sign_api_verifier(engine: SignType, args: &SignArgs) -> Result<Box<dyn Verifier>> {
     let keys = load_verify_keys(
         engine,
@@ -9454,6 +10065,8 @@ fn sign_api_verifier(engine: SignType, args: &SignArgs) -> Result<Box<dyn Verifi
     Ok(keys.verifier)
 }
 
+/// Returns an ed25519 or spki verifier for the trusted and revoked public
+/// keys.
 fn build_sign_api_verifier(
     engine: SignType,
     trusted: &[Vec<u8>],
@@ -9469,20 +10082,25 @@ fn build_sign_api_verifier(
     }
 }
 
+/// Returns the gpg verifier of `sign --verify`, with the keyrings of
+/// [`gpg_trust`].
 #[cfg(feature = "gpg")]
 fn gpg_verifier(repo_path: &Path, args: &SignArgs) -> Result<Box<dyn Verifier>> {
     Ok(Box::new(gpg_trust(repo_path, args)?))
 }
 
+/// Returns an error, because this build has no gpg engine.
 #[cfg(not(feature = "gpg"))]
 fn gpg_verifier(_: &Path, _: &SignArgs) -> Result<Box<dyn Verifier>> {
     Err(unsupported_type("gpg"))
 }
 
-/// The gpg trusted keyring set for verify and delete: the `--keys-file`
-/// keyrings when any are given, otherwise the default ostree trust -- the
-/// global `trusted.gpg.d` directory (or `$OSTREE_GPG_HOME`) plus, when
-/// `--remote` names a remote, that remote's `trustedkeys.gpg`.
+/// Returns the trusted gpg keyring set for verify and delete.
+///
+/// If `--keys-file` gives keyrings, the set is these keyrings. Otherwise, the
+/// set is the default ostree trust: the global `trusted.gpg.d` directory (or
+/// `$OSTREE_GPG_HOME`). If `--remote` names a remote, the set also holds the
+/// `trustedkeys.gpg` of that remote.
 #[cfg(feature = "gpg")]
 fn gpg_trust(repo_path: &Path, args: &SignArgs) -> Result<GpgVerifier> {
     if !args.keys_file.is_empty() {
@@ -9494,8 +10112,10 @@ fn gpg_trust(repo_path: &Path, args: &SignArgs) -> Result<GpgVerifier> {
     }
 }
 
-/// The base64 secret keys for a sign-api signing run: the KEY-IDs plus the
-/// non-blank lines of each `--keys-file`. At least one key is required.
+/// Returns the base64 secret keys for an ed25519 or spki signing run.
+///
+/// These are the KEY-IDs and the non-blank lines of each `--keys-file`. At
+/// least one key is required.
 fn secret_key_lines(args: &SignArgs) -> Result<Vec<String>> {
     let mut keys = args.key_id.clone();
     for path in &args.keys_file {
@@ -9509,8 +10129,10 @@ fn secret_key_lines(args: &SignArgs) -> Result<Vec<String>> {
     Ok(keys)
 }
 
-/// The decoded public keys for sign-api verify/delete: the KEY-IDs and the
-/// `--keys-file` lines, each a base64-encoded key.
+/// Returns the decoded public keys for an ed25519 or spki verify or delete.
+///
+/// These are the KEY-IDs and the `--keys-file` lines, each a base64-encoded
+/// key.
 fn public_key_bytes(args: &SignArgs) -> Result<Vec<Vec<u8>>> {
     let mut keys = Vec::new();
     for key in &args.key_id {
@@ -9524,7 +10146,7 @@ fn public_key_bytes(args: &SignArgs) -> Result<Vec<Vec<u8>>> {
     Ok(keys)
 }
 
-/// The non-blank, trimmed lines of a key file.
+/// Returns the non-blank lines of a key file, trimmed.
 fn read_key_lines(path: &Path) -> Result<Vec<String>> {
     let content = std::fs::read_to_string(path).map_err(Error::Io)?;
     Ok(content
@@ -9535,8 +10157,9 @@ fn read_key_lines(path: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-/// The engine's short name, used for the `trusted.<name>` / `revoked.<name>`
-/// key-store files.
+/// Returns the short name of an engine.
+///
+/// The `trusted.<name>` and `revoked.<name>` key-store files use this name.
 fn sign_type_name(engine: SignType) -> &'static str {
     match engine {
         SignType::Ed25519 => "ed25519",
@@ -9545,7 +10168,8 @@ fn sign_type_name(engine: SignType) -> &'static str {
     }
 }
 
-/// The detached-metadata dict key each engine's signatures accumulate under.
+/// Returns the detached-metadata dict key that holds the signatures of an
+/// engine.
 fn sign_metadata_key(engine: SignType) -> &'static str {
     match engine {
         SignType::Ed25519 => "ostree.sign.ed25519",
@@ -9554,8 +10178,10 @@ fn sign_metadata_key(engine: SignType) -> &'static str {
     }
 }
 
-/// Normalize a GPG fingerprint or key id for suffix matching: drop a `0x`
-/// prefix and internal spaces, and upper-case the hex.
+/// Normalizes a GPG fingerprint or key id for a suffix match.
+///
+/// The function drops a `0x` prefix and all spaces, and changes the hex to
+/// uppercase.
 #[cfg(feature = "gpg")]
 fn normalize_fingerprint(id: &str) -> String {
     id.trim()
@@ -9565,8 +10191,9 @@ fn normalize_fingerprint(id: &str) -> String {
         .to_uppercase()
 }
 
-/// Whether a stored fingerprint ends with any of the wanted key ids (so a short
-/// key id matches the tail of a full fingerprint).
+/// Returns `true` if a stored fingerprint ends with one of the wanted key ids.
+///
+/// A short key id matches the tail of a full fingerprint.
 #[cfg(feature = "gpg")]
 fn fingerprint_matches(stored: Option<&str>, wanted: &[String]) -> bool {
     match stored {
@@ -9580,7 +10207,7 @@ fn fingerprint_matches(stored: Option<&str>, wanted: &[String]) -> bool {
     }
 }
 
-/// An error reported when a sign-type's engine was compiled out of this binary.
+/// Returns the error for a sign type whose engine this binary does not have.
 #[cfg_attr(all(feature = "spki", feature = "gpg"), allow(dead_code))]
 fn unsupported_type(name: &str) -> Error {
     Error::Unsupported(format!(
@@ -9588,7 +10215,7 @@ fn unsupported_type(name: &str) -> Error {
     ))
 }
 
-/// Print one line per examined signature and a final verdict.
+/// Prints one line for each examined signature, and a final verdict.
 fn report_verify(outcome: &VerifyOutcome) {
     if outcome.signatures.is_empty() {
         println!("no signatures found");
@@ -9624,10 +10251,12 @@ fn report_verify(outcome: &VerifyOutcome) {
     );
 }
 
-/// Resolve a revision -- a checksum, a refspec, or either with a trailing `^`
-/// per generation of ancestry -- to a commit checksum, reporting the two
-/// resolution failures in the tool's own words. `resolve_rev` with
-/// `allow_noent = false` returns `Some` or an error, never `None`.
+/// Resolves a revision to a commit checksum.
+///
+/// A revision is a checksum or a refspec, each with an optional trailing `^`
+/// for each generation of ancestry. The two resolution failures are reported
+/// in the words of the `ostree` command. `resolve_rev` with
+/// `allow_noent = false` returns `Some` or an error, and never `None`.
 async fn resolve(repo: &Repo, rev: &str) -> Result<Checksum> {
     match repo.resolve_rev(rev, false).await {
         Ok(checksum) => {
@@ -9637,9 +10266,10 @@ async fn resolve(repo: &Repo, rev: &str) -> Result<Checksum> {
     }
 }
 
-/// The same for a revision that may be absent: `None` states that nothing of
-/// that name is in the repository, and a resolution failure carries the same
-/// words [`resolve`] gives it.
+/// Resolves a revision that can be absent.
+///
+/// `None` states that nothing of that name is in the repository. A resolution
+/// failure gets the same words that [`resolve`] gives it.
 async fn resolve_optional(repo: &Repo, rev: &str) -> Result<Option<Checksum>> {
     match repo.resolve_rev(rev, true).await {
         Ok(found) => Ok(found),
@@ -9647,9 +10277,11 @@ async fn resolve_optional(repo: &Repo, rev: &str) -> Result<Option<Checksum>> {
     }
 }
 
-/// Report the two resolution failures in the tool's own words, so one condition
-/// has one message wherever a revision is resolved, and hand every other error
-/// back to the caller.
+/// Reports a resolution failure in the words of the `ostree` command.
+///
+/// This applies to two failures: a missing refspec and a commit with no
+/// parent. As a result, one condition has one message wherever a revision is
+/// resolved. Each other error goes back to the caller.
 fn report_resolution_failure(err: Error) -> Error {
     match err {
         Error::RefNotFound(refspec) => exit_error(&format!("Refspec '{refspec}' not found")),
@@ -9660,23 +10292,29 @@ fn report_resolution_failure(err: Error) -> Error {
     }
 }
 
-/// The metadata key `--bootable` fills with the kernel directory's name.
+/// The metadata key that `--bootable` fills with the name of the kernel
+/// directory.
 const LINUX_KEY: &str = "ostree.linux";
-/// The metadata key `--bootable` sets to true.
+/// The metadata key that `--bootable` sets to true.
 const BOOTABLE_KEY: &str = "ostree.bootable";
-/// The metadata key `--generate-composefs-metadata` fills with the tree's
-/// composefs image digest.
+/// The metadata key for the composefs image digest of the tree.
+///
+/// `--generate-composefs-metadata` fills this key.
 const COMPOSEFS_DIGEST_KEY: &str = "ostree.composefs.digest.v0";
-/// The directory two of the `--bootable` refusals name.
+/// The directory that two of the `--bootable` refusals name.
 const MODULES_DIR: &str = "/usr/lib/modules";
 
-/// The kernel version `--bootable` stores in `ostree.linux`, taken from the
-/// tree the transaction has staged.
+/// Returns the kernel version that `--bootable` stores in `ostree.linux`.
 ///
-/// The refusals carry the tool's own wording: the first component of the path
-/// the tree does not hold, a component that is not a directory, and the two
-/// counts that are not one. The tool's `Not a directory` names no path, so the
-/// path the refusal carries is dropped here.
+/// The version comes from the tree that the transaction staged. The refusals
+/// use the words of the `ostree` command:
+///
+/// - the first component of the path that the tree does not hold
+/// - a component that is not a directory
+/// - the two counts that are not one: no kernel, and more than one kernel
+///
+/// The `Not a directory` message of `ostree` names no path, so this function
+/// drops the path of that refusal.
 async fn kernel_version(
     txn: &Transaction,
     root: &RepoTree,
@@ -9692,9 +10330,9 @@ async fn kernel_version(
     }))
 }
 
-/// Insert entries at the head of an `a{sv}` metadata dict, the slot the keys a
-/// tree walk derives take (`docs/format-reference.md`, "CLI output formats",
-/// `commit`).
+/// Inserts entries at the head of an `a{sv}` metadata dict.
+///
+/// This is the slot of the keys that a tree walk derives.
 fn prepend_metadata_entries(metadata: &mut Value, entries: Vec<Value>) -> Result<()> {
     let Value::Array(existing) = metadata else {
         return Err(Error::InvalidFormat(
@@ -9705,9 +10343,10 @@ fn prepend_metadata_entries(metadata: &mut Value, entries: Vec<Value>) -> Result
     Ok(())
 }
 
-/// Remove every entry of an `a{sv}` metadata dict holding one of these keys,
-/// which is what a derived key does to a value the command line supplied for the
-/// same name.
+/// Removes each entry of an `a{sv}` metadata dict that holds one of `keys`.
+///
+/// A derived key does this to a value that the command line gave for the same
+/// name.
 fn drop_metadata_keys(metadata: &mut Value, keys: &[&str]) -> Result<()> {
     let Value::Array(existing) = metadata else {
         return Err(Error::InvalidFormat(
@@ -9724,10 +10363,11 @@ fn drop_metadata_keys(metadata: &mut Value, keys: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Store one entry in an `a{sv}` metadata dict under `key`. An entry the dict
-/// already holds under that name takes the new value in the slot it stands in,
-/// and every later entry under the same name is removed. A name the dict does
-/// not hold is appended.
+/// Stores one entry in an `a{sv}` metadata dict under `key`.
+///
+/// If the dict already holds an entry with that name, the new value goes in
+/// the slot of the first such entry. Each later entry with that name is
+/// removed. If the dict does not hold the name, the entry is appended.
 fn set_metadata_entry(metadata: &mut Value, key: &str, entry: Value) -> Result<()> {
     let Value::Array(existing) = metadata else {
         return Err(Error::InvalidFormat(
@@ -9757,8 +10397,10 @@ fn set_metadata_entry(metadata: &mut Value, key: &str, entry: Value) -> Result<(
     Ok(())
 }
 
-/// A string-valued metadata entry, the form `--add-metadata-string` and
-/// `--add-detached-metadata-string` write.
+/// Returns a string-valued metadata entry.
+///
+/// `--add-metadata-string` and `--add-detached-metadata-string` write this
+/// form.
 fn string_entry(key: &str, value: &str) -> Value {
     Value::Tuple(vec![
         Value::Str(key.to_owned()),
@@ -9766,9 +10408,11 @@ fn string_entry(key: &str, value: &str) -> Value {
     ])
 }
 
-/// Split every `KEY=VALUE` metadata argument at its first `=`, so a value may
-/// hold further ones. An empty key passes here and is refused where the dict is
-/// assembled; a missing `=` is refused at once, in the tool's own words.
+/// Splits each `KEY=VALUE` metadata argument at its first `=`.
+///
+/// A value can hold more `=` characters. An empty key passes here and is
+/// refused where the dict is assembled. A missing `=` is refused at once, in
+/// the words of the `ostree` command.
 fn metadata_pairs(arguments: &[String]) -> std::result::Result<Vec<(&str, &str)>, String> {
     arguments
         .iter()
@@ -9776,19 +10420,22 @@ fn metadata_pairs(arguments: &[String]) -> std::result::Result<Vec<(&str, &str)>
         .collect()
 }
 
-/// Split one `KEY=VALUE` metadata argument at its first `=`, refusing a missing
-/// `=` in the tool's own words.
+/// Splits one `KEY=VALUE` metadata argument at its first `=`.
+///
+/// A missing `=` is refused in the words of the `ostree` command.
 fn metadata_pair(argument: &str) -> std::result::Result<(&str, &str), String> {
     argument
         .split_once('=')
         .ok_or_else(|| format!("Missing '=' in KEY=VALUE metadata '{argument}'"))
 }
 
-/// Read every `--add-metadata` argument into the key it names and the variant
-/// its value states. The value goes through the GVariant text form, and a
-/// refusal names the whole argument and the reader's own offsets. Each argument
-/// is split and parsed before the next one is read, so the refusal names the
-/// first bad argument in command-line order.
+/// Reads each `--add-metadata` argument into its key and the variant of its
+/// value.
+///
+/// The value goes through the GVariant text form. A refusal names the full
+/// argument and the offsets of the reader. Each argument is split and parsed
+/// before the next one is read, so the refusal names the first bad argument
+/// in command-line order.
 fn parse_added_metadata(arguments: &[String]) -> std::result::Result<Vec<(&str, Value)>, String> {
     let mut entries = Vec::with_capacity(arguments.len());
     for argument in arguments {
@@ -9800,10 +10447,12 @@ fn parse_added_metadata(arguments: &[String]) -> std::result::Result<Vec<(&str, 
     Ok(entries)
 }
 
-/// Read every `summary -m` argument into the key it names and the variant its
-/// value states, one argument at a time in command-line order. The empty key is
-/// accepted. The refusals carry the tool's own words for this command, which
-/// name the value alone where `commit` names the whole argument.
+/// Reads each `summary -m` argument into its key and the variant of its
+/// value.
+///
+/// The arguments are read one at a time, in command-line order. The empty key
+/// is accepted. The refusals use the words of the `ostree` command for this
+/// command. They name only the value, and `commit` names the full argument.
 fn summary_added_metadata(
     arguments: &[String],
 ) -> std::result::Result<Vec<(String, Value)>, String> {
@@ -9817,9 +10466,10 @@ fn summary_added_metadata(
     Ok(entries)
 }
 
-/// Read every `--keep-metadata` key out of the resolved parent commit, keeping
-/// each value's bytes as they stand. A key the parent does not hold is refused
-/// naming the commit it was looked for in.
+/// Reads each `--keep-metadata` key from the resolved parent commit.
+///
+/// The bytes of each value stay as they are. If the parent does not hold a
+/// key, the refusal names the commit.
 async fn kept_metadata(
     repo: &Repo,
     parent: &Checksum,
@@ -9847,15 +10497,22 @@ async fn kept_metadata(
     Ok(Ok(entries))
 }
 
-/// Assemble the commit metadata dict, whose entry order is part of the commit
-/// checksum (`docs/format-reference.md`, "CLI output formats"): every
-/// `--add-metadata-string` in command-line order, then every `--add-metadata`,
-/// then every `--keep-metadata`, then the binding keys. Duplicate keys are kept
-/// as duplicates. An empty key is refused here, after the tree and the
-/// timestamp. The order and the binding keys come from the shared rule of
-/// `ostrya-core`: the binding keys name the branch `-b` gives together with
-/// every `--bind-ref` value, and a commit that names neither carries the empty
-/// `as` array, which is the value the tool writes under `--orphan` alone.
+/// Assembles the commit metadata dict.
+///
+/// The entry order is part of the commit checksum:
+///
+/// 1. each `--add-metadata-string`, in command-line order
+/// 2. each `--add-metadata`
+/// 3. each `--keep-metadata`
+/// 4. the binding keys
+///
+/// Duplicate keys stay as duplicates. An empty key is refused here, after the
+/// tree and the timestamp.
+///
+/// The order and the binding keys come from `ostrya::commit::commit_metadata`,
+/// which `ostrya-core` defines. The binding keys name the branch of `-b` and
+/// each `--bind-ref` value. A commit that names neither has the empty `as`
+/// array. The `ostree` command writes this value under `--orphan` alone.
 fn commit_metadata_dict(
     repo: &Repo,
     args: &CommitArgs,
@@ -9872,7 +10529,7 @@ fn commit_metadata_dict(
         .chain(args.bind_ref.iter().map(String::as_str))
         .collect();
     // `--no-bindings` writes neither binding key, so the dict of a commit that
-    // adds nothing of its own comes out empty.
+    // adds no entries of its own is empty.
     Ok(ostrya::commit::commit_metadata(
         entries,
         (!args.no_bindings).then_some(refs.as_slice()),
@@ -9880,10 +10537,12 @@ fn commit_metadata_dict(
     ))
 }
 
-/// The metadata entries of `--add-metadata-string` and `--add-metadata`, in
-/// two groups whatever the command-line order: every string entry in
-/// command-line order, then every variant entry. Each value is a variant, and
-/// duplicate keys are kept as duplicates. An empty key is refused.
+/// Returns the metadata entries of `--add-metadata-string` and
+/// `--add-metadata`.
+///
+/// The entries form two groups for each command-line order: each string
+/// entry in command-line order, then each variant entry. Each value is a
+/// variant, and duplicate keys stay as duplicates. An empty key is refused.
 fn user_metadata_entries(
     strings: &[(&str, &str)],
     variants: &[(&str, Value)],
@@ -9905,9 +10564,12 @@ fn user_metadata_entries(
     Ok(entries)
 }
 
-/// The detached metadata dict `--add-detached-metadata-string` writes, or `None`
-/// where the option was not given. The entries keep command-line order, an empty
-/// key is accepted here, and duplicates are kept as duplicates.
+/// Returns the detached metadata dict that `--add-detached-metadata-string`
+/// writes.
+///
+/// If the option is not given, the result is `None`. The entries keep
+/// command-line order, an empty key is accepted here, and duplicates stay as
+/// duplicates.
 fn detached_metadata_dict(pairs: &[(&str, &str)]) -> Option<Value> {
     if pairs.is_empty() {
         return None;
@@ -9920,25 +10582,28 @@ fn detached_metadata_dict(pairs: &[(&str, &str)]) -> Option<Value> {
     ))
 }
 
-/// The most `-F/--body-file` reads, and the most the `-e/--editor` file reads
-/// back. The body is a field of the commit object, and the port loads no
-/// metadata object above this size, so a body past it names a commit the port
-/// could never read back. The bound keeps the read off the file's own size
-/// (`CLAUDE.md`, "Working conventions").
+/// The maximum size in bytes of a `-F/--body-file` file or an `-e/--editor`
+/// file.
+///
+/// The body is a field of the commit object, and ostrya loads no metadata
+/// object larger than this size. A larger body names a commit that ostrya can
+/// never read back. The limit also bars an unbounded read of the file.
 const MAX_BODY_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Read `-F/--body-file`: the whole file becomes the body, byte for byte.
+/// Reads `-F/--body-file`: the full file becomes the body, byte for byte.
 fn read_body_file(path: &Path) -> std::result::Result<String, String> {
     read_message_file(path, "Commit body")
 }
 
-/// Read a file that carries commit message text. The file must be valid UTF-8,
-/// hold no NUL, and stay within [`MAX_BODY_BYTES`]; `kind` names it in the
-/// over-limit line.
+/// Reads a file that holds commit message text.
 ///
-/// The refusals carry the tool's own wording -- `openat(<path>): <reason>` for
-/// a path that does not open, the reason alone for a read that fails, and
-/// `Invalid UTF-8` for content neither implementation can hold.
+/// The file must be valid UTF-8, hold no NUL, and be no larger than
+/// [`MAX_BODY_BYTES`]. `kind` names the file in the over-limit line. The
+/// refusals use the words of the `ostree` command:
+///
+/// - `openat(<path>): <reason>` for a path that does not open
+/// - the reason alone for a read that fails
+/// - `Invalid UTF-8` for content that neither command can hold
 fn read_message_file(path: &Path, kind: &str) -> std::result::Result<String, String> {
     let file = std::fs::File::open(path)
         .map_err(|err| format!("openat({}): {}", path.display(), io_reason(&err)))?;
@@ -9954,30 +10619,31 @@ fn read_message_file(path: &Path, kind: &str) -> std::result::Result<String, Str
     String::from_utf8(bytes).map_err(|_| "Invalid UTF-8".to_owned())
 }
 
-/// The environment variables that name the editor, in the order they are
-/// consulted. The first one that is set wins, an empty value included; with
-/// none set the built-in default below is used. `GIT_EDITOR` is not among them.
+/// The environment variables that name the editor, in lookup order.
+///
+/// The first one that is set wins, also with an empty value. If none is set,
+/// [`DEFAULT_EDITOR`] applies. `GIT_EDITOR` is not one of them.
 const EDITOR_VARIABLES: [&str; 3] = ["OSTREE_EDITOR", "VISUAL", "EDITOR"];
-/// The editor used when no environment variable names one.
+/// The editor if no environment variable names one.
 const DEFAULT_EDITOR: &str = "vi";
 
-/// The commit-message template written into the editor's temporary file. The
-/// branch block is appended for a commit that names one
-/// (`docs/format-reference.md`, "CLI output formats").
+/// The commit-message template that goes into the temporary file of the
+/// editor.
+///
+/// For a commit that names a branch, the branch block is appended.
 const MESSAGE_TEMPLATE: &str = "\n\
      # Please enter the commit message for your changes. The first line will\n\
      # become the subject, and the remainder the body. Lines starting\n\
      # with '#' will be ignored, and an empty message aborts the commit.\n";
 
-/// Run the editor over the commit-message template and read the subject and the
-/// body back out of what it wrote.
+/// Runs the editor on the message template and returns the subject and body.
 ///
-/// The template carries the branch block when `branch` names one, and `subject`
-/// is appended after the block as a prefill. The editor value is a shell command
-/// line, the temporary file's path is appended to it shell-quoted, and a
-/// non-zero exit discards the whole edit.
+/// The template holds the branch block if `branch` names one. `subject` comes
+/// after the block as a prefill. The editor value is a shell command line, and
+/// the path of the temporary file is appended to it, shell-quoted. A non-zero
+/// exit discards the full edit.
 ///
-/// The wait for the editor leaves the executor free; see [`wait_for_editor`].
+/// The executor stays free while the editor runs. See [`wait_for_editor`].
 async fn run_commit_editor(
     branch: Option<&str>,
     subject: Option<&str>,
@@ -9995,16 +10661,16 @@ async fn run_commit_editor(
 
     let path = write_editor_file(template.as_bytes())?;
     let editor = editor_command();
-    // The command line carries the editor value and the path as bytes, so an
-    // editor variable that is not UTF-8, and a `TMPDIR` that is not UTF-8,
-    // still name the editor to run and the file the port wrote.
+    // The command line holds the editor value and the path as bytes. As a
+    // result, an editor variable that is not UTF-8 still names the editor to
+    // run. A `TMPDIR` that is not UTF-8 still names the file that ostrya wrote.
     let mut command = editor.as_bytes().to_vec();
     command.push(b' ');
     command.extend_from_slice(&shell_quote(&path));
     let status = wait_for_editor(command).await;
-    // The editor writes the file, so the read is bounded the way `-F` is and
-    // refuses the same content: an editor is free to leave any bytes behind
-    // (`CLAUDE.md`, "Working conventions", which bars an unbounded read).
+    // The editor writes the file, so the read has the same limit as `-F` and
+    // refuses the same content. An editor can leave any bytes in the file, and
+    // the limit bars an unbounded read.
     let edited = read_message_file(&path, "Commit message");
     let _ = std::fs::remove_file(&path);
 
@@ -10036,13 +10702,13 @@ async fn run_commit_editor(
     Ok((subject, body))
 }
 
-/// Run `command` under `/bin/sh -c` and wait for it to exit.
+/// Runs `command` under `/bin/sh -c` and waits for it to exit.
 ///
-/// The editor takes over the terminal, so it inherits this process's three
-/// standard streams, which [`std::process::Command`] gives it and
-/// [`ostrya_rt::Command`] pipes. The wait itself runs on the blocking pool
-/// through [`ostrya_rt::unblock`], so the executor thread stays free for the
-/// length of the editing session.
+/// The editor takes control of the terminal, so it inherits the three
+/// standard streams of this process. [`std::process::Command`] gives it these
+/// streams, and [`ostrya_rt::Command`] pipes them. The wait runs on the
+/// blocking pool through [`ostrya_rt::unblock`], so the executor thread stays
+/// free for the full editing session.
 async fn wait_for_editor(command: Vec<u8>) -> std::io::Result<std::process::ExitStatus> {
     ostrya_rt::unblock(move || {
         std::process::Command::new("/bin/sh")
@@ -10053,8 +10719,10 @@ async fn wait_for_editor(command: Vec<u8>) -> std::io::Result<std::process::Exit
     .await
 }
 
-/// The editor command line: the first of [`EDITOR_VARIABLES`] that is set, else
-/// [`DEFAULT_EDITOR`]. The value is read as bytes, so a variable holding a value
+/// Returns the editor command line.
+///
+/// This is the first of [`EDITOR_VARIABLES`] that is set, or else
+/// [`DEFAULT_EDITOR`]. The value is read as bytes, so a variable with a value
 /// that is not UTF-8 counts as set and names the editor to run.
 fn editor_command() -> std::ffi::OsString {
     EDITOR_VARIABLES
@@ -10063,9 +10731,11 @@ fn editor_command() -> std::ffi::OsString {
         .unwrap_or_else(|| std::ffi::OsString::from(DEFAULT_EDITOR))
 }
 
-/// Wrap a path so a shell reads it as one word: single quotes around it, with
-/// each single quote it holds closed, escaped, and reopened. The bytes pass
-/// through unchanged, so a path that is not UTF-8 survives.
+/// Quotes a path so that a shell reads it as one word.
+///
+/// The path goes in single quotes. Each single quote in the path is closed,
+/// escaped, and opened again. The bytes pass through unchanged, so a path
+/// that is not UTF-8 stays intact.
 fn shell_quote(path: &Path) -> Vec<u8> {
     let mut out = vec![b'\''];
     for &byte in path.as_os_str().as_bytes() {
@@ -10079,11 +10749,14 @@ fn shell_quote(path: &Path) -> Vec<u8> {
     out
 }
 
-/// Write the template to a fresh file under `TMPDIR`, named `.` and six
-/// characters, and return its path. The file is created readable and writable
-/// by its owner alone, which is the mode the tool creates it with, so the
-/// message cannot be read while it is being edited. It is removed once the
-/// editor has run.
+/// Writes the template to a new file in `TMPDIR` and returns its path.
+///
+/// If `TMPDIR` is not set, the directory is `/tmp`. The name is `.` and six
+/// characters.
+///
+/// Only the owner can read and write the file, which is the mode of the
+/// `ostree` command. As a result, no other user can read the message during the
+/// edit. The file is removed after the editor runs.
 fn write_editor_file(contents: &[u8]) -> std::result::Result<PathBuf, String> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -10125,20 +10798,19 @@ fn write_editor_file(contents: &[u8]) -> std::result::Result<PathBuf, String> {
     ))
 }
 
-/// The nanosecond part of the current time, which seeds the temporary name.
+/// Returns the nanoseconds of the current time, which seed the temporary name.
 fn nanos() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| u64::from(since.subsec_nanos()))
 }
 
-/// Read the subject and the body out of an edited commit message.
+/// Reads the subject and the body from an edited commit message.
 ///
-/// Every line loses its trailing whitespace, a line whose first character is
-/// `#` is dropped, and the leading blank lines go. The first line left is the
-/// subject; the lines after it, less their own leading and trailing blank
-/// lines, are the body, joined by newlines
-/// (`docs/format-reference.md`, "CLI output formats").
+/// Each line loses its trailing whitespace. A line whose first character is
+/// `#` is dropped, and the leading blank lines go. The first remaining line is
+/// the subject. The lines after it, without their leading and trailing blank
+/// lines, are the body, joined by newlines.
 fn parse_commit_message(text: &str) -> (String, String) {
     let lines: Vec<&str> = text
         .split('\n')
@@ -10162,11 +10834,13 @@ fn parse_commit_message(text: &str) -> (String, String) {
     (subject, body.join("\n"))
 }
 
-/// The message a branch name the revision syntax shadows is refused with, and
-/// `None` for any other name. Resolution reads a name of 64 lowercase hex
-/// characters as a checksum, so a ref with such a name is reachable by no
-/// revision. The message is the wording of the tool's own guard. A name that
-/// holds `^` is not covered here: the ref-name rule refuses it.
+/// Returns the refusal for a branch name that the revision syntax shadows.
+///
+/// For each other name, the result is `None`. Resolution reads a name of 64
+/// lowercase hex characters as a checksum, so no revision can reach a ref
+/// with such a name. The message uses the words of the guard of the `ostree`
+/// command. This function does not cover a name with `^`, because the
+/// ref-name rule refuses it.
 fn shadowed_branch_name(branch: &str) -> Option<String> {
     if ostrya::is_checksum_shaped(branch) {
         return Some(format!("Rev name '{branch}' looks like a checksum"));
@@ -10174,8 +10848,10 @@ fn shadowed_branch_name(branch: &str) -> Option<String> {
     None
 }
 
-/// An async streaming reader over stdin, backed by a duplicated descriptor so
-/// dropping it leaves the real stdin open.
+/// Returns an async streaming reader over stdin, on a duplicated descriptor.
+///
+/// When the reader drops, the real stdin stays open. A tar stream on standard
+/// input flows through this reader, so no unbounded stream is held in memory.
 fn stdin_file() -> Result<ostrya_rt::FileReader> {
     let fd = std::io::stdin()
         .as_fd()
@@ -10184,7 +10860,10 @@ fn stdin_file() -> Result<ostrya_rt::FileReader> {
     Ok(ostrya_rt::FileReader::from(fd))
 }
 
-/// An async streaming writer over stdout, backed by a duplicated descriptor.
+/// Returns an async streaming writer over stdout, on a duplicated descriptor.
+///
+/// A stream to standard output flows through this writer, so no unbounded
+/// stream is held in memory.
 fn stdout_file() -> Result<ostrya_rt::File> {
     let fd = std::io::stdout()
         .as_fd()
@@ -10197,9 +10876,10 @@ fn stdout_file() -> Result<ostrya_rt::File> {
 mod tests {
     use super::*;
 
-    /// The `apply-offline` PATH folds as the tool folds it: `.`, empty
-    /// components, and a trailing `/` go, each `..` removes the component
-    /// before it, a leading `..` stays, and `..` at the root stays at the root.
+    /// The `apply-offline` PATH is reduced lexically, as the `ostree` command
+    /// reduces it. `.`, empty components, and a trailing `/` go. Each `..`
+    /// removes the component before it. A leading `..` stays, and `..` at the
+    /// root stays at the root.
     #[test]
     fn an_apply_offline_path_folds_lexically() {
         for (given, folded) in [
@@ -10227,8 +10907,9 @@ mod tests {
         }
     }
 
-    /// The size wording below 1000, the U+00A0 before a unit, the unit chosen
-    /// on the raw count, and the ties-to-even rounding of the exact double.
+    /// The size words for less than 1000 bytes, and the U+00A0 before a unit.
+    /// The raw count selects the unit, and the rounding is ties to even on the
+    /// exact double.
     #[test]
     fn a_delta_size_is_worded_as_the_tool_words_it() {
         for (n, text) in [
@@ -10248,8 +10929,8 @@ mod tests {
         }
     }
 
-    /// Each half of a delta name is 64 lowercase hex characters; the two
-    /// refusals name what the tool names.
+    /// Each half of a delta name is 64 lowercase hex characters. The two
+    /// refusals name what the `ostree` command names.
     #[test]
     fn a_delta_name_is_read_as_the_tool_reads_it() {
         let hex = "ab".repeat(32);
@@ -10272,9 +10953,10 @@ mod tests {
         );
     }
 
-    /// The error paths render a subcommand's usage text by name, so a name
-    /// `clap` does not know would abort the process instead of printing. This
-    /// holds [`Command::NAMES`] and `clap`'s own set to each other in both
+    /// The error paths render the usage text of a subcommand by name. If
+    /// `clap` does not know a name, the process aborts and does not print
+    /// the usage text.
+    /// This test compares [`Command::NAMES`] and the set of `clap` in both
     /// directions, so a renamed or an added subcommand fails here.
     #[test]
     fn every_subcommand_name_renders_its_usage_text() {
@@ -10299,11 +10981,13 @@ mod tests {
         assert_eq!(registered.len(), Command::NAMES.len());
     }
 
-    /// An `--owner-uid`/`--owner-gid` value reads as a C `int` with the base
-    /// taken from the text: `0x` hexadecimal, a leading `0` octal, decimal
-    /// otherwise. Leading whitespace and a sign are accepted, a trailing byte is
-    /// not, and the range is a C `int`'s. Each value here was checked against
-    /// `ostree commit` (`docs/format-reference.md`, "CLI output formats").
+    /// An `--owner-uid`/`--owner-gid` value reads as a C `int`, with the base
+    /// from the text. `0x` is hexadecimal, a leading `0` is octal, and each
+    /// other value is decimal.
+    ///
+    /// Leading whitespace and a sign are accepted, and a trailing byte is not.
+    /// The range is the range of a C `int`. Each value here was compared with
+    /// `ostree commit`.
     #[test]
     fn an_owner_id_reads_as_a_c_int() {
         for (text, value) in [
@@ -10335,7 +11019,7 @@ mod tests {
             assert_eq!(parse_c_int(text), Err(IntError::Range), "`{text}`");
         }
 
-        // A negative id declares nothing, so the source's ownership stands.
+        // A negative id declares nothing, so the ownership of the source stays.
         let declared = |text: &str| owner_id(Some(text), "--owner-uid");
         assert_eq!(declared("0"), Some(0));
         assert_eq!(declared("42"), Some(42));
@@ -10344,10 +11028,10 @@ mod tests {
         assert_eq!(owner_id(None, "--owner-uid"), None);
     }
 
-    /// A `--timestamp` value reads as `@SECONDS` or as a date and time carrying
-    /// a UTC offset. The wall-clock forms without an offset and the relative
-    /// forms the tool also takes are refused
-    /// (`docs/conformance/cli-surface.md`, "P2").
+    /// A `--timestamp` value reads as `@SECONDS` or as a date and time with a
+    /// UTC offset. The `ostree` command also accepts the wall-clock forms with
+    /// no offset and the relative forms. ostrya refuses them. This is a
+    /// recorded divergence.
     #[test]
     fn a_timestamp_reads_the_epoch_and_offset_forms() {
         for (text, seconds) in [
@@ -10372,8 +11056,8 @@ mod tests {
         ] {
             assert_eq!(parse_timestamp(text), Some(seconds), "`{text}`");
         }
-        // A pre-epoch instant records the unsigned field's two's-complement
-        // form, which is what the tool records for the same value.
+        // A pre-epoch instant records the two's-complement form of the
+        // unsigned field. The `ostree` command records the same for this value.
         assert_eq!(parse_timestamp("@-1"), Some(u64::MAX));
         assert_eq!(
             parse_timestamp("1969-12-31T23:59:59Z"),
@@ -10390,11 +11074,11 @@ mod tests {
             "now",
             "yesterday",
             "2009-02-13",
-            // No offset: the value names a wall clock in a zone this reader does
-            // not resolve.
+            // No offset: the value names a wall clock in a zone that this
+            // reader does not resolve.
             "2009-02-13T23:31:30",
             "2009-02-13 23:31:30",
-            // Out of range for the field it names.
+            // Out of range for the field that it names.
             "2009-13-01T00:00:00Z",
             "2009-02-30T00:00:00Z",
             "2009-02-13T24:00:00Z",
@@ -10407,9 +11091,10 @@ mod tests {
         }
     }
 
-    /// The two prefix filters differ on the exact match alone: a listing keeps
-    /// the ref a prefix names, and the `-A` filter leaves it to the resolution
-    /// step, so an alias whose name a prefix gives exactly is filtered out.
+    /// The two prefix filters differ only on the exact match. A listing keeps
+    /// the ref that a prefix names, and the `-A` filter leaves it to the
+    /// resolution step. As a result, the filter drops an alias whose name a
+    /// prefix gives exactly.
     #[test]
     fn the_alias_filter_excludes_the_exact_match() {
         for prefix in [None, Some("grp"), Some("grp/deep")] {
@@ -10424,10 +11109,10 @@ mod tests {
         }
     }
 
-    /// A whole-remote prefix -- a `<remote>:` prefix whose ref half is empty or
-    /// `.` -- selects every ref of that remote and no other, in a listing and in
-    /// the `-A` filter alike, and the row keeps the whole refspec since there is
-    /// no ref name to strip.
+    /// A whole-remote prefix is a `<remote>:` prefix with an empty ref half or
+    /// the ref half `.`. It selects each ref of that remote and no other ref,
+    /// in a listing and in the `-A` filter. The row keeps the full refspec,
+    /// because there is no ref name to strip.
     #[test]
     fn a_whole_remote_prefix_selects_that_remote() {
         assert_eq!(whole_remote("origin:"), Some("origin"));
@@ -10452,9 +11137,10 @@ mod tests {
         }
     }
 
-    /// A PREFIX is refused by the refspec rule, and is reported as given. The
-    /// two whole-remote forms pass, since a `<remote>:` prefix whose ref half is
-    /// empty or `.` names every ref of that remote.
+    /// The refspec rule refuses a PREFIX, and the report gives the prefix as
+    /// written. The two whole-remote forms pass, because a `<remote>:` prefix
+    /// with an empty ref half or the ref half `.` names each ref of that
+    /// remote.
     #[test]
     fn a_prefix_no_ref_name_can_hold_is_refused() {
         for prefix in [
@@ -10489,9 +11175,9 @@ mod tests {
         }
     }
 
-    /// The path a PREFIX names below `refs/`: the ref name under `heads`, the ref
-    /// name under `remotes/<remote>`, and the remote's own directory for a
-    /// whole-remote prefix.
+    /// The path under `refs/` that a PREFIX names. It is the ref name under
+    /// `heads`, the ref name under `remotes/<remote>`, or the directory of the
+    /// remote for a whole-remote prefix.
     #[test]
     fn a_prefix_names_its_path_under_refs() {
         for (prefix, path) in [
@@ -10507,25 +11193,24 @@ mod tests {
         }
     }
 
-    /// The `-A` target column: the link body with its leading `../` components
-    /// removed while the link stays in the alias's own ref root, and the target
-    /// ref's refspec once it leaves that root, which is the form the port's own
-    /// resolver reads.
+    /// The `-A` target column. While the link stays in the ref root of the
+    /// alias, the column shows the link body with its leading `../` components
+    /// removed. When the link leaves that root, the column shows the refspec of
+    /// the target ref, which is the form that the resolver of ostrya reads.
     #[test]
     fn a_cross_root_alias_target_prints_the_refspec() {
         for (refspec, body, printed) in [
-            // Within one root, the stripped body is what both implementations
-            // print.
+            // In one root, both commands print the stripped body.
             ("al", "test/main", "test/main"),
             ("nested/q", "../plain", "plain"),
             ("origin:rr/remal", "x", "x"),
             ("origin:rr/deep/remal", "../x", "x"),
-            // Across roots, the stripped path below `refs/` names no ref.
+            // Across roots, the stripped path under `refs/` names no ref.
             ("xal", "../remotes/origin/rr/x", "origin:rr/x"),
             ("origin:rr/toheads", "../../../heads/plain", "plain"),
             ("origin:rr/oal", "../../other/z/y", "other:z/y"),
-            // A body naming no ref file keeps the stripped form: one reaching
-            // above `refs/`, and one landing on a root itself.
+            // A body that names no ref file keeps the stripped form: one that
+            // reaches out of `refs/`, and one that ends on a root itself.
             ("al", "../../objects/ab/cd", "objects/ab/cd"),
             ("al", "../remotes", "remotes"),
         ] {
@@ -10537,11 +11222,11 @@ mod tests {
         }
     }
 
-    /// The editing session runs off the executor: the first poll of
-    /// [`wait_for_editor`] over a command that is still running yields
-    /// [`Poll::Pending`] at once, so the thread that drives the commit future is
-    /// free while the editor holds the terminal. A wait performed on the
-    /// executor thread would instead return [`Poll::Ready`] after the command
+    /// The editing session runs off the executor. The first poll of
+    /// [`wait_for_editor`] on a command that still runs gives
+    /// [`Poll::Pending`] at once. As a result, the thread that drives the
+    /// commit future is free while the editor holds the terminal. A wait on
+    /// the executor thread returns [`Poll::Ready`] only after the command
     /// exits.
     #[test]
     fn the_editor_wait_leaves_the_executor() {
@@ -10549,9 +11234,9 @@ mod tests {
         use std::task::Poll;
         use std::time::{Duration, Instant};
 
-        // The command outlives the poll below and is reaped by the blocking
-        // pool. Two seconds is long enough that a wait taken on this thread
-        // cannot come back inside the window asserted below.
+        // The command runs longer than the poll, and the blocking pool reaps
+        // it. A wait on this thread cannot return in the asserted window,
+        // because the command runs for two seconds.
         let (pending, held) = ostrya_rt::block_on(async {
             let mut editor = std::pin::pin!(wait_for_editor(b"sleep 2".to_vec()));
             let started = Instant::now();
@@ -10565,15 +11250,16 @@ mod tests {
         );
     }
 
-    /// A `--skip-list` path and a `--statoverride` path are matched against the
-    /// bytes of the walk path. A control file holds UTF-8 alone
-    /// ([`read_control_file`]), so an entry spelling `U+FFFD` names that
-    /// character and reaches no entry whose name holds a byte that is not
+    /// A `--skip-list` path and a `--statoverride` path are matched against
+    /// the bytes of the walk path. A control file holds only UTF-8
+    /// ([`read_control_file`]). An entry that spells `U+FFFD` names that
+    /// character, and it reaches no entry whose name holds a byte that is not
     /// UTF-8.
     ///
-    /// Both ingest sources refuse such a name ahead of the callbacks, the
-    /// filesystem walk while it reads the directory and the tar reader while it
-    /// reads the header, so the two callbacks are driven here directly.
+    /// Both ingest sources refuse such a name before the callbacks. The file
+    /// system walk refuses it while it reads the directory, and the tar reader
+    /// while it reads the header. For this reason, the test calls the two
+    /// callbacks directly.
     #[test]
     fn a_control_file_path_matches_the_walk_path_by_bytes() {
         use ostrya::FileMeta;
@@ -10583,8 +11269,8 @@ mod tests {
         let Some(Command::Commit(args)) = cli.command else {
             panic!("`commit` parsed as another subcommand");
         };
-        // One skip-list path and one statoverride path of each form, all four
-        // spelling the replacement character.
+        // One skip-list path and one statoverride path of each form. All four
+        // spell the replacement character.
         let spelled = "/bad\u{fffd}.txt";
         let options = || WalkOptions {
             statoverride_or: vec![(spelled.to_owned(), 0o4000)],
@@ -10598,7 +11284,7 @@ mod tests {
         };
         let meta = FileMeta::regular(0, 0, 0o644);
 
-        // A walk path holding the raw byte `0xFF` is a different path.
+        // A walk path that holds the raw byte `0xFF` is a different path.
         let walk = options();
         let mut modifier = commit_modifier(&args, Owner::default(), &walk, None)
             .expect("the walk options ask for a modifier");
@@ -10613,8 +11299,8 @@ mod tests {
         assert_eq!(walk.unmatched_skip_list(), vec![spelled.to_owned()]);
         assert_eq!(walk.unmatched_statoverride(), vec![spelled.to_owned()]);
 
-        // The path the entries do spell is matched, so the comparison is exact
-        // and not merely refusing.
+        // The path that the entries spell is matched, so the comparison is
+        // exact and does not only refuse.
         let walk = options();
         let mut modifier = commit_modifier(&args, Owner::default(), &walk, None)
             .expect("the walk options ask for a modifier");
@@ -10630,11 +11316,10 @@ mod tests {
         assert!(walk.unmatched_statoverride().is_empty());
     }
 
-    /// The totals line renders a byte count as a decimal (SI) quantity above
-    /// 1000 bytes, the unit chosen from the byte count and not from the rounded
-    /// value, with a no-break space before the unit. Each pair here was checked
-    /// against `ostree prune` under `LC_ALL=C.UTF-8`
-    /// (`docs/format-reference.md`, "CLI output formats", `prune`).
+    /// For 1000 bytes or more, the totals line shows a byte count as a decimal
+    /// (SI) quantity, with a no-break space before the unit. The byte count
+    /// selects the unit, and the rounded value does not. Each pair here was
+    /// compared with `ostree prune` under `LC_ALL=C.UTF-8`.
     #[test]
     fn a_freed_byte_count_renders_the_way_the_totals_line_does() {
         for (bytes, rendered) in [
@@ -10660,10 +11345,11 @@ mod tests {
         assert!(format_size(u64::MAX).ends_with("\u{a0}EB"));
     }
 
-    /// A `--retain-branch-depth` value splits at its first `=` and its depth is
-    /// a decimal integer with an optional leading `-`. The tool reads a leading
-    /// run of digits and drops the rest of the string; the port refuses what its
-    /// own reader does not hold (`docs/conformance/cli-surface.md`, "P2").
+    /// A `--retain-branch-depth` value splits at its first `=`, and its depth
+    /// is a decimal integer with an optional leading `-`. The `ostree` command
+    /// reads a leading run of digits and drops the rest of the string. ostrya
+    /// refuses a value that its reader does not accept. This is a recorded
+    /// divergence.
     #[test]
     fn a_retain_branch_depth_value_reads_strictly() {
         assert_eq!(
@@ -10707,8 +11393,9 @@ mod tests {
         }
     }
 
-    /// The transferred figure is `N B` below 1024 and the whole KiB, rounded
-    /// down, from there, as the tool prints 3842 bytes as `3 KiB`.
+    /// The transferred figure is `N B` for less than 1024 bytes, and the full
+    /// KiB, rounded down, from 1024 bytes. The `ostree` command prints 3842
+    /// bytes as `3 KiB`.
     #[test]
     fn the_transferred_figure_rounds_down_to_whole_kib() {
         for (bytes, text) in [
@@ -10724,8 +11411,9 @@ mod tests {
     }
 
     /// The three statistics lines: a local pull, an HTTP pull with no delta
-    /// part, and one with a delta part, whose loose count adds the metadata
-    /// and the content fetched. The written figure is the tool's size wording.
+    /// part, and an HTTP pull with a delta part. Its loose count adds the
+    /// metadata and the content fetched. The written figure uses the size
+    /// words of the `ostree` command.
     #[test]
     fn the_statistics_line_takes_the_tool_forms() {
         let stats = PullStats {
@@ -10769,7 +11457,7 @@ mod tests {
             statistics_line(&one, PullSource::Local),
             "0 metadata, 0 content objects imported; 1 byte content written"
         );
-        // No byte transferred drops the transfer clause.
+        // If no byte is transferred, the transfer clause goes.
         assert_eq!(
             statistics_line(&PullStats::default(), PullSource::Http),
             "0 metadata, 0 content objects fetched; 0 bytes content written"
@@ -10783,9 +11471,10 @@ mod tests {
         line
     }
 
-    /// The three progress forms, chosen by the delta parts still to arrive,
-    /// then by the scan, then the objects. The rate reads `-` until a whole
-    /// second has passed, as the tool writes it before its first sample.
+    /// The three progress forms, selected by the delta parts that are still to
+    /// arrive, then by the scan, then by the objects. The rate shows `-` until
+    /// one full second passes. The `ostree` command writes the same before its
+    /// first sample.
     #[test]
     fn the_progress_text_takes_three_forms() {
         let second = std::time::Duration::from_secs(1);
@@ -10837,9 +11526,9 @@ mod tests {
         );
     }
 
-    /// A line on a terminal is padded to 80 bytes, as the tool pads it to the
-    /// terminal width counted in bytes, so U+00A0 takes two. The padding
-    /// starts at the given byte, and a longer text is written whole.
+    /// A line on a terminal is padded to 80 bytes. The `ostree` command pads
+    /// it to the terminal width counted in bytes, so U+00A0 counts as two. The
+    /// padding starts at the given byte, and a longer text is written in full.
     #[test]
     fn a_terminal_line_is_padded_to_80_bytes() {
         let mut line = String::from("\x1b8Receiving objects: 1.4\u{a0}MB");
@@ -10853,8 +11542,8 @@ mod tests {
         assert_eq!(padded, long);
     }
 
-    /// `--update-frequency` of 0, a negative value, and none each keep the
-    /// 1000 ms default.
+    /// An `--update-frequency` of 0, a negative value, and no value each keep
+    /// the 1000 ms default.
     #[test]
     fn the_update_frequency_defaults_to_a_second() {
         let second = std::time::Duration::from_millis(1000);
@@ -10866,8 +11555,8 @@ mod tests {
         );
     }
 
-    /// Each ref line of `push`: a new ref, a moved ref, a ref already at the
-    /// commit, a deleted ref, and a delete of an absent ref.
+    /// Each ref line of `push`. The lines are a new ref, a moved ref, a ref
+    /// already at the commit, a deleted ref, and a delete of an absent ref.
     #[cfg(feature = "push")]
     #[test]
     fn a_push_ref_line_names_the_old_and_the_new_state() {
@@ -10913,8 +11602,8 @@ mod tests {
     }
 
     /// The metadata entries of `push-tree` keep the two groups of `commit`:
-    /// every `--add-metadata-string` before every `--add-metadata`, whatever
-    /// the command-line order. An empty key is refused in either group.
+    /// each `--add-metadata-string` before each `--add-metadata`, for each
+    /// command-line order. An empty key is refused in each group.
     #[cfg(feature = "push")]
     #[test]
     fn the_tree_push_metadata_puts_the_strings_before_the_variants() {
@@ -11013,11 +11702,11 @@ mod tests {
         assert_eq!(bar.stage.load(Ordering::Relaxed), STAGE_DONE);
     }
 
-    /// The filter of `push-tree` reduces the mode of a file and of a
-    /// directory to `perm & 0755` under `--canonical-permissions`, keeps the
-    /// mode of a symlink, sets the owner to 0:0, and then applies each
-    /// declared id. The root sees the filter too. With no option set there is
-    /// no filter.
+    /// Under `--canonical-permissions`, the filter of `push-tree` reduces the
+    /// mode of a file and of a directory to `perm & 0755`. It keeps the mode
+    /// of a symlink, sets the owner to 0:0, and then applies each declared id.
+    /// The filter also applies to the root. With no option set, there is no
+    /// filter.
     #[cfg(feature = "push")]
     #[test]
     fn the_tree_push_filter_applies_the_canonical_rule_then_the_owner() {

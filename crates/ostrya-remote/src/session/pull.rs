@@ -49,7 +49,8 @@ pub struct StreamSessionOptions {
     pub max_outstanding: Option<usize>,
 }
 
-/// A client session of a pull, which reads the files of a server repository.
+/// A client session of a pull, which reads the files and ref listings of a
+/// server.
 ///
 /// [`connect`](StreamSession::connect) opens a session over ssh, and
 /// [`over_stream`](StreamSession::over_stream) opens one over a pair of byte
@@ -69,9 +70,8 @@ pub struct StreamSessionOptions {
 /// The session opens with [`PullHello`]. It asks for files by their path
 /// with [`get`](StreamSession::get), and for ref listings with
 /// [`list_refs`](StreamSession::list_refs). All requests share one stream as
-/// a pipeline. A call takes its place in the pipeline and writes its frame
-/// under one lock. Because of this lock, the frames go on the wire in the
-/// order of the places.
+/// a pipeline. A call takes its place and writes its frame under one lock, so
+/// the frames go on the wire in the order of the places.
 ///
 /// A reply carries no request id. The reply of a call is the next reply
 /// after the reply of the call before it.
@@ -80,10 +80,11 @@ pub struct StreamSessionOptions {
 /// hold a place at a time. A call holds its place from the write of its
 /// frame to the end of its reply.
 ///
-/// For a [`get`](StreamSession::get), the end of a reply is a [`GetReply`]
-/// whose `found` is `false`. For a reply whose `found` is `true`, the end is
-/// the chunk that ends the body. When the session reads that chunk, it moves
-/// to the next reply, also while the caller still holds the [`PullBody`].
+/// If a [`get`](StreamSession::get) gets a [`GetReply`] whose `found` is
+/// `false`, that `GetReply` is the end of the reply. For each other reply,
+/// the end is the chunk that ends the body. When the session reads that
+/// chunk, it moves to the next reply, also while the caller still holds the
+/// [`PullBody`].
 ///
 /// # Failures
 ///
@@ -184,12 +185,8 @@ fn body_error(e: Error) -> io::Error {
     io::Error::new(kind, e)
 }
 
-/// Returns the entries of a ref listing that a request sends.
-///
-/// The positive entries come first, then the negative entries, each with its
-/// `!`. An exact duplicate within one kind is removed, and the first
-/// appearance stays. A positive `x` and a negative `!x` both stay, and no
-/// entry is removed because another entry covers it.
+/// Returns the entries of a ref listing that a request sends, by the rules of
+/// `PullSession` `# Ref patterns`.
 ///
 /// # Errors
 ///
@@ -540,13 +537,11 @@ impl StreamSession {
     ///
     /// # Errors
     ///
-    /// The first two errors leave the session usable, and the call writes
-    /// nothing. Each other error is a failure of the session, as
-    /// [Failures](StreamSession#failures) states.
-    ///
     /// - [`Error::LimitExceeded`] if the `Get` frame of `path` is longer than
-    ///   [`MIN_FRAME_LIMIT`].
-    /// - [`Error::Protocol`] if `path` holds a NUL byte.
+    ///   [`MIN_FRAME_LIMIT`]. The session stays usable, and the call writes
+    ///   nothing.
+    /// - [`Error::Protocol`] if `path` holds a NUL byte. The session stays
+    ///   usable, and the call writes nothing.
     /// - The repeat of the first failure, if the session failed before the
     ///   call or while it waits.
     /// - [`Error::LimitExceeded`] if the stated length of the body is more
@@ -563,6 +558,9 @@ impl StreamSession {
     /// If the write of the `Get` frame fails and the server sent an `Error`
     /// message before it closed, the call returns the variant of that
     /// message. Otherwise it returns the [`Error::Io`] of the write.
+    ///
+    /// A failure ends the session, as [Failures](StreamSession#failures)
+    /// states.
     pub async fn get(&self, path: &str, max_len: u64) -> Result<Option<PullBody>> {
         self.inner.shared.check()?;
         let get = Message::Get(path.to_owned());
@@ -576,16 +574,9 @@ impl StreamSession {
     /// Asks for the ref listing of `selector` and waits for the head of its
     /// reply.
     ///
-    /// The selector selects refs under `refs/heads`. A selector with no
-    /// entry selects all refs under `refs/heads`. The [`PullBody`] holds the
-    /// listing to `max_len` bytes and to its stated length.
-    ///
-    /// The request lists the positive entries first, then the negative
-    /// entries, each with its `!`. Before it sends the request, the call
-    /// removes exact duplicate entries of one kind and keeps the first
-    /// appearance. So `["a", "!b", "a"]` sends `["a", "!b"]`. A positive `a`
-    /// and a negative `!a` both stay, and `a` and `a/b` both stay. At most
-    /// [`MAX_REF_PATTERNS`] entries can stay, positive and negative together.
+    /// The call sends the entries of `selector` by the rules of
+    /// [Ref patterns](super::PullSession#ref-patterns). The [`PullBody`] holds
+    /// the listing to `max_len` bytes and to its stated length.
     ///
     /// The call takes its place in the [pipeline](StreamSession#pipeline) as
     /// [`get`](StreamSession::get) does, and it has the same rules for the
@@ -593,21 +584,21 @@ impl StreamSession {
     ///
     /// # Errors
     ///
-    /// The first two errors leave the session usable, and the call writes
-    /// nothing. Each other error is a failure of the session, as
-    /// [Failures](StreamSession#failures) states.
-    ///
-    /// - [`Error::InvalidInput`] if an entry has more than
-    ///   [`MAX_REF_ENTRY_LEN`] bytes, with its `!` counted as one byte, or
-    ///   more than [`MAX_REF_ENTRY_PARTS`] parts, or if more than
-    ///   [`MAX_REF_PATTERNS`] entries stay after the removal.
+    /// - [`Error::InvalidInput`] if the entries break a limit of
+    ///   [Ref patterns](super::PullSession#ref-patterns). The session stays
+    ///   usable, and the call writes nothing.
     /// - [`Error::LimitExceeded`] if the `ListRefs` frame is longer than
-    ///   [`MIN_FRAME_LIMIT`].
+    ///   [`MIN_FRAME_LIMIT`]. The session stays usable, and the call writes
+    ///   nothing.
     /// - [`Error::Protocol`] if the reply is a `GetReply` whose `found` is
-    ///   `false`, or that states no length.
+    ///   `false`, or that states no length. The session fails.
     /// - Each failure of the session that [`get`](StreamSession::get) lists.
-    ///   The server sends `protocol` for an entry that it refuses, and
-    ///   `limit-exceeded` for a listing over its cap.
+    ///   If the server refuses an entry, the error is [`Error::Protocol`]. If
+    ///   the listing is over the cap of the server, the error is
+    ///   [`Error::LimitExceeded`].
+    ///
+    /// A failure ends the session, as [Failures](StreamSession#failures)
+    /// states.
     pub async fn list_refs(&self, selector: &RefSelector, max_len: u64) -> Result<PullBody> {
         self.inner.shared.check()?;
         let entries = wire_entries(selector)?;
@@ -802,11 +793,12 @@ impl Drop for StreamSession {
     }
 }
 
-/// The body of a file that [`StreamSession::get`] returns, as an `AsyncRead`.
+/// The body of a reply to [`get`](StreamSession::get) or
+/// [`list_refs`](StreamSession::list_refs).
 ///
-/// A read gives the bytes of the body until the chunk that ends it, and then
-/// end of file. When a read meets that chunk, the session moves to the next
-/// reply. The body is `Send + Sync`.
+/// A `PullBody` is an `AsyncRead`. A read gives the bytes of the body until
+/// the chunk that ends it, and then end of file. When a read meets that
+/// chunk, the session moves to the next reply. The body is `Send + Sync`.
 ///
 /// # Failures
 ///
@@ -823,9 +815,9 @@ impl Drop for StreamSession {
 /// `Other`.
 ///
 /// The session can also fail for another reason, for example a dropped
-/// `get` future or [`StreamSession::finish`]. A later read of the body then
-/// fails with the first failure and reads no more of the body. A drop of the
-/// body before its end also ends the session.
+/// `get` or `list_refs` future, or [`StreamSession::finish`]. A later read
+/// of the body then fails with the first failure and reads no more of the
+/// body. A drop of the body before its end also ends the session.
 pub struct PullBody {
     len: Option<u64>,
     inner: Mutex<BodyInner>,
@@ -1014,8 +1006,8 @@ mod tests {
         wire_entries(&selector(entries)).unwrap()
     }
 
-    /// An exact duplicate of one kind is removed, the first appearance stays,
-    /// and an entry that another entry covers stays.
+    /// `wire_entries` removes an exact duplicate of one kind and keeps the
+    /// first appearance. An entry that another entry covers stays.
     #[test]
     fn exact_duplicates_are_removed_in_order() {
         assert_eq!(wire(&["x", "a", "x", "b", "a"]), ["x", "a", "b"]);
@@ -1052,8 +1044,9 @@ mod tests {
         assert_eq!(wire(&entries[1..]).len(), MAX_REF_PATTERNS);
     }
 
-    /// An entry over the limit of bytes or parts is refused, and an entry at
-    /// the limit passes. The `!` counts as one byte and adds no part.
+    /// `wire_entries` refuses an entry over the limit of bytes or parts, and
+    /// accepts an entry at the limit. The `!` counts as one byte and adds no
+    /// part.
     #[test]
     fn an_entry_over_a_limit_is_refused() {
         let parts = |n: usize| vec!["a"; n].join("/");

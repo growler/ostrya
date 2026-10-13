@@ -8,15 +8,16 @@ use crate::session::StreamSessionOptions;
 use crate::session::http::{Endpoint, MAX_PARALLEL};
 
 /// The maximum number of requests of one session in flight: one object
-/// stream for each permit, and one `Have` or `Commit` request.
+/// stream for each upload permit of [`MAX_PARALLEL`], and one `Have` or
+/// `Commit` request.
 const MAX_OUTSTANDING: usize = MAX_PARALLEL as usize + 1;
 
-/// Checks `http` and builds the fetcher of the session. The call sends no
-/// request.
+/// Checks `http` and builds the fetcher of a push session.
 ///
 /// `http` must name exactly one mirror, the push address, and the address must
-/// pass [`ostrya_fetch::check_base_url`]. The call sets `max_outstanding` to
-/// [`MAX_OUTSTANDING`] and `max_redirects` to 0.
+/// pass [`check_base_url`](ostrya_fetch::check_base_url). The call sets
+/// `max_outstanding` to [`MAX_OUTSTANDING`] and `max_redirects` to 0. It sends
+/// no request.
 pub(super) async fn prepare(mut http: FetcherOptions) -> Result<Endpoint> {
     let url = match http.mirrors.as_slice() {
         [url] => url.clone(),
@@ -38,11 +39,11 @@ pub(super) async fn prepare(mut http: FetcherOptions) -> Result<Endpoint> {
     Ok(Endpoint { fetcher, url })
 }
 
-/// Checks `http` and `opts` for a pull, and builds the fetcher of the pull. The
-/// call sends no request.
+/// Checks `http` and `opts` for a pull, and builds the fetcher of the pull.
 ///
 /// The call refuses `opts` with a field set, and then `http` with no mirror,
-/// with [`Error::InvalidInput`]. The fetcher takes `http` as it is.
+/// with [`Error::InvalidInput`]. The fetcher takes `http` as it is. The call
+/// sends no request. `PullSession::connect` states the rules for the caller.
 pub(super) async fn prepare_pull(
     http: FetcherOptions,
     opts: StreamSessionOptions,

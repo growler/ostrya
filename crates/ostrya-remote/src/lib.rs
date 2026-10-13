@@ -2,27 +2,20 @@
 
 //! The wire codec and the client sessions of the ostrya push and pull.
 //!
-//! A caller pushes a local directory as one commit with [`push_tree`](fn@push_tree), or the
-//! objects of its own source with a [`PushSession`]. A [`StreamSession`] reads the files of a
-//! server repository over ssh or over a pair of byte streams. A [`PullSession`] is the session of
-//! a pull over HTTP or over a stream session. The crate has no repository knowledge, and it
-//! compiles on Linux, macOS, and Windows.
+//! A caller pushes a local directory with [`push_tree`](fn@push_tree), or its own objects with a
+//! [`PushSession`]. A [`PullSession`] reads the summary and the ref listings of a remote. The
+//! crate has no repository knowledge, and it compiles on Linux, macOS, and Windows.
 //!
 //! # Entry points
 //!
-//! - [`push_tree`](fn@push_tree) pushes a local directory to an [`Endpoint`] as one commit.
-//! - [`push_tree_prepared`] and [`push_tree_over_stream`] run that push over other transports.
-//! - [`PushSession::connect`] opens a push session to an [`Endpoint`].
-//! - [`Endpoint::parse`] reads an address into an endpoint with the default options.
-//! - [`PushSession::prepare`] checks an endpoint, and [`PreparedSession::open`] opens its session.
+//! - [`Endpoint::parse`] reads an address into an [`Endpoint`].
+//! - [`push_tree`](fn@push_tree) pushes a local directory to an endpoint as one commit.
+//! - [`PushSession::connect`] opens a push session to an endpoint.
+//! - [`PushSession::prepare`] checks an endpoint before the session opens.
 //! - [`PushSession::over_stream`] opens a push session over a pair of byte streams.
-//! - [`StreamSession::connect`] opens a stream session over ssh, [`StreamSession::get`] reads
-//!   a file, and [`StreamSession::list_refs`] reads a ref listing.
-//! - [`PullSession::connect`] opens the session of a pull to an [`Endpoint`], over HTTP or ssh,
-//!   [`PullSession::fetch_summary`] reads the summary of the remote, and
-//!   [`PullSession::fetch_refs`] reads the ref listing of a `RefSelector`, over HTTP from
-//!   `_ostrya/refs/v1` or over a stream session.
-//! - [`Error`] is the error of each fallible operation, and [`ErrorCode`] names its wire codes.
+//! - [`PullSession::connect`] opens the session of a pull to an endpoint.
+//! - [`StreamSession::connect`] opens a stream session over ssh.
+//! - [`Error`] is the error of each fallible operation.
 //!
 //! # Modules
 //!

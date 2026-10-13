@@ -34,10 +34,12 @@ const REFS_PATH: &str = "_ostrya/refs/v1";
 ///
 /// The target is [`REFS_PATH`], `?`, and the encoded query. The base path of
 /// the mirror comes before it on the wire, so the target that the server
-/// gets is longer. An HTTP/2 server of ostrya takes a header list of at most
-/// 32 KiB. The list counts the base path, the other header fields, and
-/// 32 bytes for each field. So a target that the client accepts fits, with
-/// 16 KiB left for the base path and the other fields.
+/// gets is longer.
+///
+/// An HTTP/2 server of ostrya takes a header list of at most 32 KiB. The list
+/// counts the base path, the other header fields, and 32 bytes for each
+/// field. A target that the client accepts fits in this list, with 16 KiB
+/// left for the base path and the other fields.
 const MAX_REFS_TARGET: usize = 16 * 1024;
 
 /// The key of each pair of the query of a ref listing.
@@ -53,10 +55,47 @@ const PATTERN_KEY: &str = "pattern=";
 /// [`fetch_refs`](PullSession::fetch_refs) take `&self`, so the session stays
 /// usable after the read.
 ///
-/// The enum has no common `get`. A caller that reads the raw files of the
-/// remote matches on the variant: [`Fetcher::fetch`] for
+/// To read a raw file of the remote, a caller matches on the variant and
+/// uses the call of that variant: [`Fetcher::fetch`] for
 /// [`Http`](PullSession::Http), and [`StreamSession::get`] for
 /// [`Stream`](PullSession::Stream).
+///
+/// # Ref patterns
+///
+/// [`fetch_refs`](PullSession::fetch_refs) and [`StreamSession::list_refs`]
+/// send the entries of a [`RefSelector`]. [`RefSelector`] and
+/// [`RefPattern`] give the pattern language. The listing holds the refs
+/// under `refs/heads` that the selector selects, so a selector with no entry
+/// lists all refs under `refs/heads`.
+///
+/// Each of the two methods sends the entries by these rules, over both
+/// transports:
+///
+/// - The positive entries come first, then the negative entries, each with
+///   its `!`.
+/// - The method removes each exact duplicate of one kind and keeps the first
+///   appearance, so `["a", "!b", "a"]` sends `["a", "!b"]`.
+/// - The method removes no entry because another entry covers it. A positive
+///   `a` and a negative `!a` both stay, and `a` and `a/b` both stay.
+/// - At most [`MAX_REF_PATTERNS`] entries can stay, positive and negative
+///   together.
+/// - An entry has at most [`MAX_REF_ENTRY_LEN`] bytes, with its `!` counted
+///   as one byte. It has at most [`MAX_REF_ENTRY_PARTS`] parts, and the `!`
+///   adds no part.
+///
+/// # Reads
+///
+/// [`fetch_summary`](PullSession::fetch_summary) and
+/// [`fetch_refs`](PullSession::fetch_refs) read each body whole into one
+/// buffer. The buffer gets the size that the remote states for the body,
+/// within the cap of the method. Each read goes into a chunk of at most
+/// 128 KiB. Over HTTP, if a body fails in transit, the method fetches it
+/// again by the rules of [`Fetcher::refetching`].
+///
+/// [`RefPattern`]: ostrya_core::RefPattern
+/// [`MAX_REF_PATTERNS`]: crate::proto::MAX_REF_PATTERNS
+/// [`MAX_REF_ENTRY_LEN`]: crate::proto::MAX_REF_ENTRY_LEN
+/// [`MAX_REF_ENTRY_PARTS`]: crate::proto::MAX_REF_ENTRY_PARTS
 pub enum PullSession {
     /// The fetcher of an HTTP remote.
     Http(Fetcher),
@@ -64,6 +103,8 @@ pub enum PullSession {
     Stream(StreamSession),
 }
 
+/// The open of a session over a pair of byte streams, and the calls of the
+/// session.
 impl PullSession {
     /// Opens a stream session over a pair of byte streams.
     ///
@@ -72,7 +113,20 @@ impl PullSession {
     ///
     /// # Errors
     ///
-    /// The errors of [`StreamSession::over_stream`].
+    /// - The [`Error`] variant of the code of an `Error` message from the
+    ///   server.
+    /// - [`Error::VersionUnsupported`] if the server states a version out of
+    ///   `1..=PULL_PROTOCOL_VERSION`.
+    /// - [`Error::Protocol`] if the reply is a message of another kind, or if
+    ///   the codec refuses a frame of the reply.
+    /// - [`Error::Protocol`] if `agent` holds a NUL byte.
+    /// - [`Error::LimitExceeded`] if the `PullHello` frame or a frame of the
+    ///   reply is longer than [`MIN_FRAME_LIMIT`].
+    /// - [`Error::Io`] if a read or a write of a stream fails.
+    ///
+    /// [`StreamSession::over_stream`] gives the conditions in full.
+    ///
+    /// [`MIN_FRAME_LIMIT`]: crate::proto::MIN_FRAME_LIMIT
     pub async fn over_stream<R, W>(
         input: R,
         output: W,
@@ -90,34 +144,41 @@ impl PullSession {
     /// Reads the `summary` and the `summary.sig` of the remote.
     ///
     /// The call returns the bytes of `summary` and of `summary.sig`, in this
-    /// order. A file that the remote does not serve is `None`. Each file has a
-    /// cap of 64 MiB.
+    /// order. If the remote does not serve a file, the call gives `None` for
+    /// that file. Each file has a cap of 64 MiB. The call reads each file by
+    /// the rules of [Reads](PullSession#reads).
     ///
-    /// Over HTTP, the call asks for `summary.sig` and then for `summary`, at
-    /// [`Priority::High`]. The signature covers the summary that follows it.
-    /// In the other order, a summary can pair with the signature of a summary
-    /// that the remote replaced before. A 404 is a file that the remote does
-    /// not serve. If a body fails in transit, the call fetches it again, by
-    /// the rules of [`Fetcher::refetching`].
+    /// # Order
+    ///
+    /// Over HTTP, the call asks for `summary.sig` first and for `summary`
+    /// second, at [`Priority::High`]. This is the order of the `ostree`
+    /// command. A 404 reply means that the remote does not serve the file.
     ///
     /// Over a stream session, the two `Get` calls are in flight together, in
     /// the same order.
     ///
-    /// The buffer of each file gets the size that the remote states for it,
-    /// within the cap. Each read goes into a chunk of at most 128 KiB.
-    ///
     /// # Errors
     ///
-    /// - [`Error::Fetch`] if an HTTP request fails after its retries, or if
-    ///   the remote answers with a status other than 200 and 404. A stated
-    ///   length over the cap is
-    ///   [`FetchTooLarge`](ostrya_fetch::Error::FetchTooLarge), and a 304 is
-    ///   [`Fetch`](ostrya_fetch::Error::Fetch).
-    /// - [`Error::Io`] if the read of an HTTP body fails.
-    /// - The errors of [`StreamSession::get`] over a stream session. A stated
+    /// - [`Error::Fetch`] over HTTP if a request fails after its retries, or
+    ///   if the remote answers with a status other than 200 and 404. For a
+    ///   stated length over the cap, the inner error of the fetcher is
+    ///   [`FetchTooLarge`](ostrya_fetch::Error::FetchTooLarge). For a 304
+    ///   reply, the inner error is [`Fetch`](ostrya_fetch::Error::Fetch).
+    /// - [`Error::Io`] over HTTP if the read of a body fails and no refetch
+    ///   applies. If a body grows past the cap, the kind is
+    ///   [`FileTooLarge`](std::io::ErrorKind::FileTooLarge), and the call does
+    ///   not fetch the body again.
+    /// - Each error of [`StreamSession::get`] over a stream session. A stated
     ///   length over the cap is [`Error::LimitExceeded`].
-    /// - The error of the session that a failed read of a stream body
-    ///   carries.
+    /// - Over a stream session, the error of the session if the read of a
+    ///   body fails, as [`PullBody`] states:
+    ///   - [`Error::LimitExceeded`] for a body over the cap
+    ///   - [`Error::Protocol`] for a body whose length is different from its
+    ///     stated length
+    ///   - the variant of an `Error` message from the server after the abandon
+    ///     marker
+    ///   - [`Error::Io`] for a failed read
+    ///   - the repeat of an earlier failure of the session
     pub async fn fetch_summary(&self) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
         match self {
             PullSession::Http(fetcher) => {
@@ -146,79 +207,83 @@ impl PullSession {
     /// Reads the ref listing of `selector` from the remote.
     ///
     /// The listing is a summary of the refs under `refs/heads` that the
-    /// selector selects, built by the server for this request. A selector
-    /// with no entry selects all refs.
-    /// The listing has a cap of [`MAX_REF_LISTING`] bytes.
+    /// selector selects. The server builds it for this request. The listing
+    /// has a cap of [`MAX_REF_LISTING`] bytes. No signature covers the
+    /// listing, and the call verifies none.
     ///
-    /// The request lists the positive entries first, then the negative
-    /// entries, each with its `!`. Before it sends a request, the call
-    /// removes exact duplicate entries of one kind and keeps the first
-    /// appearance. A positive `a` and a negative `!a` both stay, and `a` and
-    /// `a/b` both stay. At most
-    /// [`MAX_REF_PATTERNS`](crate::proto::MAX_REF_PATTERNS) entries can stay,
-    /// positive and negative together. An entry has at most
-    /// [`MAX_REF_ENTRY_LEN`](crate::proto::MAX_REF_ENTRY_LEN) bytes, with its
-    /// `!` counted as one byte, and at most
-    /// [`MAX_REF_ENTRY_PARTS`](crate::proto::MAX_REF_ENTRY_PARTS) parts. The
-    /// `!` adds no part. These rules apply to both transports.
+    /// The call sends the entries of `selector` by the rules of
+    /// [Ref patterns](PullSession#ref-patterns). It reads the listing by the
+    /// rules of [Reads](PullSession#reads).
     ///
-    /// Over HTTP, the call sends a `GET` of `_ostrya/refs/v1` under the base
-    /// URL of each mirror, at [`Priority::High`]. Each entry that stays goes
-    /// into the query as one `pattern=VALUE` pair, and `&` separates the
-    /// pairs. The value is the entry with each byte outside `A-Z`, `a-z`,
-    /// `0-9`, `-`, `.`, `_`, and `~` written as `%XX`, so `/` is `%2F`, `!` is
-    /// `%21`, and `*` is `%2A`. A selector with no entry sends no query. The
-    /// request target that the call builds, from `_ostrya/refs/v1` to the end
-    /// of the query, is at most 16 KiB. The base path of the mirror comes
-    /// before it on the wire.
+    /// # HTTP
     ///
-    /// A 404 is a remote that serves no ref listing, for example a static
-    /// file server, and the call returns `None`. If a body fails in transit,
-    /// the call fetches it again, by the rules of [`Fetcher::refetching`].
-    /// The buffer gets the size that the remote states, within the cap.
+    /// The call sends a `GET` of `_ostrya/refs/v1` under the base URL of each
+    /// mirror, at [`Priority::High`]. Each entry that stays goes into the
+    /// query as one `pattern=VALUE` pair, and `&` separates the pairs. A
+    /// selector with no entry sends no query.
+    ///
+    /// The value is the entry with each byte outside `A-Z`, `a-z`, `0-9`,
+    /// `-`, `.`, `_`, and `~` written as `%XX`. For example, `/` is `%2F`,
+    /// `!` is `%21`, and `*` is `%2A`.
+    ///
+    /// The request target that the call builds, from `_ostrya/refs/v1` to the
+    /// end of the query, is at most 16 KiB. The base path of the mirror comes
+    /// before it on the wire. An ostrya server over HTTP/2 takes a header list
+    /// of at most 32 KiB. The other 16 KiB are for the base path and the other
+    /// header fields.
+    ///
+    /// A 404 reply comes from a remote that serves no ref listing, for example
+    /// a static file server. The call then returns `None`.
+    ///
+    /// # Busy server
     ///
     /// An ostrya server answers 503 while it builds too many listings. The
-    /// fetcher retries a 503 with its backoff, and does not read
-    /// `Retry-After`. A 503 after the retries is [`Error::Fetch`]. Of a static
-    /// mirror beside a busy ostrya server, the fetcher keeps the 404 of the
-    /// static mirror from the first round and asks only the busy server
-    /// again. If the busy server answers 200 in a later round, the call
-    /// returns `Some`. The call gives `None` only if the busy server answers
-    /// 503 to each retry, and only after the full backoff, because a 404 has
-    /// priority over a 503.
+    /// fetcher retries a 503 with its backoff and does not read
+    /// `Retry-After`. If a 503 stays after the retries, the call returns
+    /// [`Error::Fetch`].
     ///
-    /// Over a stream session, the call is [`StreamSession::list_refs`], in
-    /// the pipeline with the `get` calls. It returns `Some` with the bytes of
-    /// the listing. The buffer gets the size that the server states, within
-    /// the cap.
+    /// If the mirrors are a static mirror and a busy ostrya server:
     ///
-    /// Each read goes into a chunk of at most 128 KiB. No signature covers
-    /// the listing, and the call checks none.
+    /// - The fetcher keeps the 404 of the static mirror from the first round,
+    ///   and asks only the busy server again.
+    /// - If the busy server answers 200 in a later round, the call returns
+    ///   `Some`.
+    /// - The call returns `None` only if the busy server answers 503 to each
+    ///   retry. It then returns `None` after the full backoff, because a 404
+    ///   has priority over a 503.
+    ///
+    /// # Stream session
+    ///
+    /// The call is [`StreamSession::list_refs`], in the pipeline with the
+    /// `get` calls. It returns `Some` with the bytes of the listing.
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidInput`] if an entry is over the limits of bytes or
-    ///   parts, or if more than
-    ///   [`MAX_REF_PATTERNS`](crate::proto::MAX_REF_PATTERNS) entries stay.
-    ///   The call sends no request.
+    /// - [`Error::InvalidInput`] if the entries break a limit of
+    ///   [Ref patterns](PullSession#ref-patterns). The call sends no request.
     /// - [`Error::InvalidInput`] over HTTP if the request target is longer
     ///   than 16 KiB. The call sends no request.
     /// - [`Error::Fetch`] over HTTP if a request fails after its retries, or
-    ///   if the remote answers with a status other than 200 and 404. A stated
-    ///   length over the cap is
-    ///   [`FetchTooLarge`](ostrya_fetch::Error::FetchTooLarge). A server that
-    ///   refuses the request gives
-    ///   [`HttpStatus`](ostrya_fetch::Error::HttpStatus), for example 400 for
-    ///   a pattern that it refuses, 414 or 431 for a target that is too long
-    ///   for it, and 503 for a server that stays busy.
-    /// - [`Error::Io`] over HTTP if the read of the body fails. A body that
-    ///   grows past the cap has the kind
-    ///   [`FileTooLarge`](std::io::ErrorKind::FileTooLarge).
-    /// - The errors of [`StreamSession::list_refs`] over a stream session. A
-    ///   stated length over the cap is [`Error::LimitExceeded`], and a listing
-    ///   that the server refuses for its cap is also [`Error::LimitExceeded`].
-    /// - The error of the session that a failed read of a stream body
-    ///   carries.
+    ///   if the remote answers with a status other than 200 and 404. For a
+    ///   stated length over the cap, the inner error of the fetcher is
+    ///   [`FetchTooLarge`](ostrya_fetch::Error::FetchTooLarge). For a 304
+    ///   reply, the inner error is [`Fetch`](ostrya_fetch::Error::Fetch).
+    /// - [`Error::Fetch`] over HTTP if the server refuses the request. The
+    ///   inner error is [`HttpStatus`](ostrya_fetch::Error::HttpStatus). For
+    ///   example, the status is 400 for a pattern that the server refuses, and
+    ///   414 or 431 for a target that is too long for it. A server that stays
+    ///   busy gives 503. An ostrya server gives 500 for a listing over
+    ///   [`MAX_REF_LISTING`] bytes.
+    /// - [`Error::Io`] over HTTP if the read of the body fails and no refetch
+    ///   applies. If the body grows past the cap, the kind is
+    ///   [`FileTooLarge`](std::io::ErrorKind::FileTooLarge), and the call does
+    ///   not fetch the body again.
+    /// - Each error of [`StreamSession::list_refs`] over a stream session. A
+    ///   stated length over the cap is [`Error::LimitExceeded`]. If the server
+    ///   refuses the listing for its cap, the error is also
+    ///   [`Error::LimitExceeded`].
+    /// - Over a stream session, the error of the session if the read of the
+    ///   body fails, as [`fetch_summary`](PullSession::fetch_summary) lists.
     pub async fn fetch_refs(&self, selector: &RefSelector) -> Result<Option<Vec<u8>>> {
         match self {
             PullSession::Http(fetcher) => {
@@ -237,12 +302,12 @@ impl PullSession {
         }
     }
 
-    /// Returns the number of requests that the session keeps in flight at one
-    /// time, at least 1.
+    /// Returns the most requests that the session keeps in flight at one time.
     ///
-    /// For HTTP, it is [`Fetcher::max_outstanding`]. For a stream session, it
-    /// is [`StreamSessionOptions::max_outstanding`] of its open, 8 if the
-    /// options give no number.
+    /// The value is at least 1. For HTTP, it is [`Fetcher::max_outstanding`].
+    /// For a stream session, it is the
+    /// [`StreamSessionOptions::max_outstanding`] of the open, or 8 if that
+    /// field is `None`.
     pub fn max_outstanding(&self) -> usize {
         match self {
             PullSession::Http(fetcher) => fetcher.max_outstanding(),
@@ -257,7 +322,13 @@ impl PullSession {
     ///
     /// # Errors
     ///
-    /// The errors of [`StreamSession::finish`].
+    /// Over a stream session, the errors of [`StreamSession::finish`]:
+    ///
+    /// - The repeat of the first failure, if the session failed.
+    /// - [`Error::InvalidInput`] if the body of a reply is not read to its
+    ///   end.
+    /// - [`Error::Transport`] if the ssh client exited with a failure status
+    ///   and the error of the session is [`Error::Io`].
     pub async fn finish(self) -> Result<()> {
         match self {
             PullSession::Http(_) => Ok(()),
@@ -351,7 +422,7 @@ async fn fetch_optional(
 
 /// Fetches `request` whole under `cap` bytes, at [`Priority::High`].
 ///
-/// The fetcher refuses a stated `Content-Length` above the cap before it reads
+/// The fetcher refuses a stated `Content-Length` over the cap before it reads
 /// the body, and it stops a body that passes the cap. If a body fails in
 /// transit, the function fetches it again from the start, into a new buffer,
 /// while the retry count of the fetcher has a repeat left.
@@ -399,7 +470,7 @@ async fn read_body(body: PullBody, cap: u64) -> Result<Vec<u8>> {
 ///
 /// The size of the buffer comes from `declared`, the stated length, within
 /// `cap`. Each read goes into a chunk of at most [`READ_CHUNK`] bytes, also
-/// the read that finds the end of the body. So a buffer filled to its stated
+/// the read that finds the end of the body, so a buffer filled to its stated
 /// length does not grow. With a stated length, the chunk is that length
 /// plus 1, held between 4096 and [`READ_CHUNK`] bytes. With no stated length,
 /// the chunk is [`READ_CHUNK`] bytes.
@@ -497,8 +568,9 @@ mod tests {
         assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
     }
 
-    /// A `!` counts in the length of the target. A negative entry one byte
-    /// over the limit is refused, and a negative entry at the limit passes.
+    /// A `!` counts in the length of the target. `refs_query` refuses a
+    /// negative entry one byte over the limit, and accepts a negative entry at
+    /// the limit.
     #[test]
     fn the_target_limit_counts_the_bang() {
         let fixed = REFS_PATH.len() + 1 + PATTERN_KEY.len();

@@ -143,11 +143,11 @@
 //! In version 1, `PullHelloReply` holds an empty dict. A decoder ignores a
 //! key of `PullHello` or of `PullHelloReply` that it does not know.
 //!
-//! The client then sends `Get` and `ListRefs` frames. The server answers each
-//! of them with one `GetReply`, in the order of the frames. A [`GetReply`]
-//! holds `found` and, if the server knows it, the length of the body. The
-//! frame limit of the pull is [`MIN_FRAME_LIMIT`] in both directions, and no
-//! message announces another limit.
+//! The client then sends `Get` and [`ListRefs`](self#ref-listing) frames. The
+//! server answers each of them with one `GetReply`, in the order of the
+//! frames. A [`GetReply`] holds `found` and, if the server knows it, the
+//! length of the body. The frame limit of the pull is [`MIN_FRAME_LIMIT`] in
+//! both directions, and no message announces another limit.
 //!
 //! A body follows a `GetReply` whose `found` is `true`. The body is a
 //! sequence of chunks, as in the object stream. A chunk of length 0 ends the
@@ -158,18 +158,24 @@
 //! the marker, an object of the push takes `Abort`, and a body of the pull
 //! takes an `Error` message.
 //!
-//! A `ListRefs` names a set of ref patterns. Each entry is a ref pattern with
-//! an optional leading `!`, which selects the refs under `refs/heads` that
-//! the list of entries selects. An empty list selects all refs under
-//! `refs/heads`. A `ListRefs` holds at most [`MAX_REF_PATTERNS`] entries, and
-//! each entry has at most [`MAX_REF_ENTRY_PARTS`] parts and
-//! [`MAX_REF_ENTRY_LEN`] bytes. The server
-//! answers with a `GetReply` whose `found` is `true` and that holds the length
-//! of the listing. The listing is a summary GVariant of at most
-//! [`MAX_REF_LISTING`] bytes, and the body carries it. A reply to a `ListRefs`
-//! whose `found` is `false`, or that holds no length, is a protocol error. The
-//! server sends an `Error` message in place of the `GetReply` for these
-//! conditions:
+//! # Ref listing
+//!
+//! A `ListRefs` holds the entries of a
+//! [`RefSelector`](ostrya_core::RefSelector), which gives the pattern
+//! language. An entry is a ref pattern with an optional leading `!`. The
+//! listing holds the refs under `refs/heads` that the entries select. An
+//! empty list selects all of them.
+//!
+//! A `ListRefs` holds at most [`MAX_REF_PATTERNS`] entries. Each entry has at
+//! most [`MAX_REF_ENTRY_PARTS`] parts and [`MAX_REF_ENTRY_LEN`] bytes.
+//!
+//! The server answers with a `GetReply` whose `found` is `true` and that
+//! holds the length of the listing. The body carries the listing, a summary
+//! GVariant of at most [`MAX_REF_LISTING`] bytes. A reply to a `ListRefs`
+//! whose `found` is `false`, or that holds no length, is [`Error::Protocol`].
+//!
+//! For these conditions, the server sends an `Error` message in place of the
+//! `GetReply`, and then ends the session:
 //!
 //! - `protocol` for an entry that is not a ref pattern, for an entry over
 //!   the limits of one entry, and for more than [`MAX_REF_PATTERNS`] entries
@@ -251,30 +257,43 @@ pub const MAX_FRAME: u32 = 1 << 20;
 
 /// The largest ref listing: 128 MiB.
 ///
-/// A ref listing is a summary of the refs that a list of ref patterns
-/// selects, which a server builds for each request. The builder refuses a
-/// larger listing with [`Error::LimitExceeded`].
+/// A ref listing is the summary of the refs that the ref patterns of one
+/// request select. An ostrya server builds a listing for each request. The
+/// build refuses a larger listing with [`Error::LimitExceeded`]. Over a
+/// stream, the server sends this error as the code `limit-exceeded`. Over
+/// HTTP, the server answers with the status 500.
+///
+/// [`PullSession::fetch_refs`](crate::session::PullSession::fetch_refs) reads
+/// a listing of at most this many bytes.
 pub const MAX_REF_LISTING: u64 = 128 * 1024 * 1024;
 
 /// The most entries in one request of a ref listing: 256.
 ///
-/// An entry is a ref pattern with an optional `!`. Positive and negative
-/// entries count together. A server refuses a request with more entries than
-/// this limit, and it counts each pair of the query. A client removes exact
-/// duplicate entries before it counts.
+/// Positive and negative entries count together. A server refuses a request
+/// with more entries. It counts an entry that the request holds two times as
+/// two entries. Over HTTP, each `pattern=VALUE` pair of the query is one
+/// entry.
+///
+/// Before it counts, a client removes each exact duplicate of an entry of the
+/// same kind. The [ref patterns](crate::session::PullSession#ref-patterns) of
+/// a pull give the client rules.
 pub const MAX_REF_PATTERNS: usize = 256;
 
 /// The most parts in one entry of a ref listing request: 256.
 ///
-/// An entry is a ref pattern, with an optional `!`. A part is the text
-/// between two `/`. A server refuses a longer entry before it parses the
-/// entry. The cost of a match is the product of the part counts of the
-/// pattern and the name, so the limit bounds the work of one entry.
+/// A part is one element of the entry split at each `/`, the first and the
+/// last included. For example, `a` has 1 part, and `a/b` has 2 parts. The
+/// leading `!` of a negative entry adds no part.
+///
+/// A server refuses an entry with more parts before it parses the entry. The
+/// cost of a match is the product of the part counts of the pattern and the
+/// name, so the limit bounds the work of one entry.
 pub const MAX_REF_ENTRY_PARTS: usize = 256;
 
 /// The most bytes in one entry of a ref listing request: 4,096.
 ///
-/// A server refuses a longer entry before it parses the entry.
+/// The leading `!` of a negative entry counts as one byte. A server refuses a
+/// longer entry before it parses the entry.
 pub const MAX_REF_ENTRY_LEN: usize = 4096;
 
 /// The `max-have` value that an ostrya server announces: 16,384 entries.

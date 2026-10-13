@@ -83,10 +83,6 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Direct<W> {
 /// does not close it. The caller closes `output`, and this close gives the end
 /// of file that ends the stream. A caller that keeps its writer gives `&mut W`.
 ///
-/// Under the `tokio` backend, the call needs a tokio runtime context: it
-/// serializes a [`DetachedMetadata::Dict`](super::DetachedMetadata::Dict) on
-/// the blocking pool of the runtime.
-///
 /// # Progress
 ///
 /// - `opts.agent` is the `agent` of `Hello`.
@@ -149,6 +145,13 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Direct<W> {
 ///   - detached metadata that does not serialize as `a{sv}`, or that is more
 ///     than [`MAX_METADATA_SIZE`](ostrya_core::MAX_METADATA_SIZE) bytes
 /// - [`Error::Io`] if a write to `output` or a flush of `output` fails.
+///
+/// # Panics
+///
+/// Under the `tokio` backend, the call panics outside a tokio runtime context
+/// if `source` gives a
+/// [`DetachedMetadata::Dict`](super::DetachedMetadata::Dict) for a commit of
+/// `commits`.
 pub async fn export_stream<W>(
     output: W,
     source: &dyn ObjectSource,

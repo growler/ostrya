@@ -997,9 +997,9 @@ fn detached_metadata_goes_once_per_commit() {
     );
 }
 
-/// A source that gives its detached metadata as bytes gets them sent as they
-/// are, and the session does not ask for the dict. A source with a dict gets
-/// it sent in normal form.
+/// If a source gives its detached metadata as bytes, the session sends the
+/// bytes as they are. The session does not ask the source for the dict. If a
+/// source gives a dict, the session sends the dict in normal form.
 #[test]
 fn encoded_detached_metadata_goes_as_it_is() {
     let mut dict = DictBuilder::new();

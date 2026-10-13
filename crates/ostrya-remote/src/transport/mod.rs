@@ -1,17 +1,14 @@
-//! The push addresses, and the ssh and HTTP transports of the sessions.
+//! The endpoints, and the ssh and HTTP transports of the sessions.
 //!
-//! [`Endpoint`] holds an address and the options of its transport: an
-//! [`SshAddress`] with [`SshOptions`], or the options of the HTTP client.
-//! [`PushSession::connect`] opens a push session to an endpoint.
-//! [`PushSession::prepare`] checks the endpoint and makes the transport ready,
-//! and [`PreparedSession::open`] opens the session later.
+//! An [`Endpoint`] holds a remote address and the options of its transport.
+//! These calls open a session:
 //!
-//! [`StreamSession::connect`] opens a stream session over ssh to an
-//! [`SshAddress`] with [`SshOptions`]. [`PullSession::connect`] opens the
-//! session of a pull to an endpoint: a stream session over ssh, or the fetcher
-//! of an HTTP remote.
+//! - [`PushSession::connect`], or [`PushSession::prepare`] and then
+//!   [`PreparedSession::open`], for a push to an endpoint
+//! - [`PullSession::connect`] for a pull from an endpoint
+//! - [`StreamSession::connect`] for a stream session to an [`SshAddress`]
 //!
-//! Over ssh, the client runs the ssh client as a child process, and the remote
+//! Over ssh, the session runs the ssh client as a child process, and the remote
 //! side runs the receive command or the send command. The frames of the
 //! session go over the standard input and the standard output of the child.
 //! Over HTTP, each step of a push session is one request to the server.
@@ -42,17 +39,16 @@ const PENDING_READ_LIMIT: Duration = Duration::from_secs(5);
 /// [`Endpoint::parse`] reads an address and gives the default options. A
 /// caller can also build an endpoint from its parts, with options of its own.
 ///
-/// The [`Debug`] output of [`Endpoint::Http`] shows no header value, and no
-/// userinfo, query, or fragment of a mirror URL. The [`Debug`] output of
-/// [`FetcherOptions`](ostrya_fetch::FetcherOptions) removes the userinfo and
-/// shows `<redacted>` in place of each of the other values.
+/// The [`Debug`] output of [`Endpoint::Http`] is the output of
+/// [`FetcherOptions`](ostrya_fetch::FetcherOptions), which shows no
+/// credential, no header value, and no userinfo.
 ///
 /// # HTTP addresses
 ///
 /// The forms are `http://HOST[:PORT][/PATH]` and `https://HOST[:PORT][/PATH]`.
 /// [`parse`](Endpoint::parse) refuses an `@` at any position, so it refuses
 /// userinfo. It also refuses a query, a fragment, an empty host, and a port
-/// that is not a number from 0 to 65535. A refusal does not show the userinfo.
+/// that is not a number from 0 to 65535.
 #[derive(Debug, Clone)]
 pub enum Endpoint {
     /// An ssh address and the options of the ssh client.
@@ -62,7 +58,10 @@ pub enum Endpoint {
         /// The options of the ssh client.
         options: SshOptions,
     },
-    /// The options of the HTTP client. The `mirrors` field holds the address.
+    /// The options of the HTTP client.
+    ///
+    /// [`mirrors`](ostrya_fetch::FetcherOptions::mirrors) holds the address:
+    /// exactly one mirror for a push, one or more for a pull.
     Http(ostrya_fetch::FetcherOptions),
 }
 
@@ -131,27 +130,8 @@ impl PushSession {
     ///
     /// # Errors
     ///
-    /// - An `Error` message from the server, as the [`Error`] variant of its
-    ///   code.
     /// - Each error of [`prepare`](PushSession::prepare).
-    /// - [`Error::Fetch`] if an HTTP request fails.
-    /// - [`Error::Transport`] if the ssh client cannot be started. The message
-    ///   names the program.
-    /// - [`Error::Transport`] if an HTTP answer has a status that the endpoint
-    ///   does not give, or a body that is not one frame. The message names the
-    ///   URL and the status.
-    /// - [`Error::Transport`] if the HTTP answer to `Hello` has no session id.
-    /// - [`Error::Transport`] if the session fails with [`Error::Io`] and the
-    ///   ssh client exits with a failure status. The message holds the status.
-    /// - [`Error::Protocol`] if the reply is not `HelloReply`, if its version
-    ///   is not [`PROTOCOL_VERSION`](crate::proto::PROTOCOL_VERSION), or if its
-    ///   refs are not the refs of `Hello` in order.
-    /// - [`Error::LimitExceeded`] if the `Hello` frame is more than
-    ///   [`MIN_FRAME_LIMIT`](crate::proto::MIN_FRAME_LIMIT) bytes.
-    /// - [`Error::Protocol`] or [`Error::LimitExceeded`] if the codec refuses
-    ///   a frame of the server over ssh, by the rules of
-    ///   [`proto`](crate::proto#frames).
-    /// - [`Error::Io`] if a read or a write of the session fails.
+    /// - Each error of [`PreparedSession::open`].
     ///
     /// # tokio runtime
     ///
@@ -210,21 +190,25 @@ impl PushSession {
     ///
     /// After the client sent the request body, it waits for the response. The
     /// wait is at most 6 minutes for `Hello` and at most 1 hour for `Commit`.
-    /// For each other request, the limit is the `progress_timeout` of the
-    /// options of [`Endpoint::Http`]. The client sends a request again only if
-    /// the attempt failed before it sent any byte of the request.
+    /// For each other request, the limit is the
+    /// [`progress_timeout`](ostrya_fetch::FetcherOptions::progress_timeout) of
+    /// the options of [`Endpoint::Http`]. The client sends a request again only
+    /// if the attempt failed before it sent any byte of the request.
     ///
     /// The options of [`Endpoint::Http`] must name exactly one mirror, the
-    /// push address. The client sets `max_outstanding` to 32 and
-    /// `max_redirects` to 0, whatever values the options hold. The 32 requests
-    /// are one for each of the at most 31 object streams of
-    /// [`PushSession::send`], and one `Have` or `Commit` request. The client
-    /// follows no redirect, and a 3xx answer is [`Error::Transport`].
+    /// push address. The client sets
+    /// [`max_outstanding`](ostrya_fetch::FetcherOptions::max_outstanding) to 32
+    /// and [`max_redirects`](ostrya_fetch::FetcherOptions::max_redirects) to 0,
+    /// whatever values the options hold. The 32 requests are one for each of
+    /// the at most 31 object streams of [`PushSession::send`], and one `Have`
+    /// or `Commit` request. The client follows no redirect, and a 3xx answer
+    /// is [`Error::Transport`].
     ///
     /// The fetcher carries the credential, the TLS settings, the proxy, and
-    /// the headers of the options to each request. The client accepts each
-    /// trust setting of the options, a setting that verifies no certificate
-    /// chain among them. The trust policy belongs to the caller.
+    /// the headers of the options to each request. The client takes each trust
+    /// setting of the options, also a bypass variant of
+    /// [`TrustRoots`](ostrya_fetch::TrustRoots) that verifies no certificate
+    /// chain. The caller owns the trust policy.
     ///
     /// # Examples
     ///
@@ -261,15 +245,14 @@ impl PushSession {
     /// Checks `endpoint` and makes the transport ready to open.
     ///
     /// For an ssh endpoint, the call reads the `OSTRYA_SSH_COMMAND`
-    /// environment variable and builds the command line of the ssh client, by
-    /// the rules of [`SshOptions`]. The remote command is `ostrya receive` if
-    /// [`SshOptions::remote_command`] is not set. For an HTTP endpoint, it
-    /// builds the HTTP client from the options, as
-    /// [`connect`](PushSession::connect) states. The call takes the
-    /// credential and the TLS material from the endpoint, and reads no file
-    /// that the endpoint names. An `https://` endpoint with
-    /// [`TrustRoots::System`](ostrya_fetch::TrustRoots::System) reads the
-    /// trust store of the host.
+    /// environment variable and builds the command line of the ssh client by
+    /// the rules of the [ssh command line](SshOptions#ssh-command-line).
+    ///
+    /// For an HTTP endpoint, the call builds the HTTP client from the options,
+    /// as [`connect`](PushSession::connect) states. With
+    /// [`TrustRoots::System`](ostrya_fetch::TrustRoots::System), an `https://`
+    /// endpoint reads the trust store of the host, by the rule of
+    /// [`Fetcher::new`](ostrya_fetch::Fetcher::new).
     ///
     /// The call starts no ssh client and sends no request. It refuses each
     /// value that [`connect`](PushSession::connect) refuses before it starts
@@ -284,16 +267,19 @@ impl PushSession {
     ///
     /// - [`Error::InvalidInput`] if the ssh command or the receive command is
     ///   empty or holds only white space, or if the value of
-    ///   `OSTRYA_SSH_COMMAND` is not UTF-8.
+    ///   `OSTRYA_SSH_COMMAND` is not UTF-8. [`SshOptions`] states the full
+    ///   rule under [Empty values](SshOptions#empty-values).
     /// - [`Error::InvalidInput`] if the options of an HTTP endpoint do not name
     ///   exactly one mirror, or if
     ///   [`check_base_url`](ostrya_fetch::check_base_url) refuses the mirror.
     ///   The message holds no userinfo.
-    /// - [`Error::Fetch`] if the HTTP client cannot be built. Examples are a
-    ///   credential to an `http://` address without
-    ///   `allow_cleartext_credentials`, a bearer token beside an
-    ///   `Authorization` header, and a client key that needs a passphrase that
-    ///   the options do not hold.
+    /// - [`Error::Fetch`] if [`Fetcher::new`](ostrya_fetch::Fetcher::new)
+    ///   refuses the options. Examples:
+    ///   - a credential to an `http://` address, with
+    ///     [`allow_cleartext_credentials`](ostrya_fetch::FetcherOptions::allow_cleartext_credentials)
+    ///     set to `false`
+    ///   - a bearer token and an `Authorization` header together
+    ///   - a client key that needs a passphrase that the options do not hold
     pub async fn prepare(endpoint: Endpoint) -> Result<PreparedSession> {
         let env = std::env::var_os("OSTRYA_SSH_COMMAND");
         let inner = prepare_with(endpoint, env.as_deref()).await?;
@@ -414,16 +400,10 @@ impl StreamSession {
     /// Opens a stream session to the ssh address `address`.
     ///
     /// The call starts the ssh client, sends `PullHello`, and reads
-    /// `PullHelloReply`. `address` takes the [forms](SshAddress#forms) of
-    /// [`SshAddress`]. The command line is:
-    ///
-    /// ```text
-    /// SSH_COMMAND... [-p PORT] [USER@]HOST 'SEND_COMMAND --repo=QUOTED_PATH'
-    /// ```
-    ///
-    /// `SSH_COMMAND` comes from `options` by the rules of the
-    /// [ssh command line](SshOptions#ssh-command-line), as for a push.
-    /// `SEND_COMMAND` is [`SshOptions::remote_command`], or `ostrya send`.
+    /// `PullHelloReply`. The command line of the ssh client comes from
+    /// `options` by the rules of the
+    /// [ssh command line](SshOptions#ssh-command-line) of a pull. `session`
+    /// gives the agent in `PullHello` and the request limit of the session.
     ///
     /// The session has the ssh time limits of [`PushSession::connect`].
     /// [`finish`](StreamSession::finish) waits for the ssh client as `commit`
@@ -449,6 +429,8 @@ impl StreamSession {
     ///   1 to [`PULL_PROTOCOL_VERSION`](crate::proto::PULL_PROTOCOL_VERSION).
     ///   The session then closes its output and sends no `Get`.
     /// - [`Error::Protocol`] if the reply is not `PullHelloReply`.
+    /// - [`Error::Protocol`] if the [`agent`](StreamSessionOptions::agent) of
+    ///   `session` holds a NUL byte.
     /// - [`Error::LimitExceeded`] if the `PullHello` frame is more than
     ///   [`MIN_FRAME_LIMIT`](crate::proto::MIN_FRAME_LIMIT) bytes.
     /// - [`Error::Protocol`] or [`Error::LimitExceeded`] if the codec refuses
@@ -495,22 +477,43 @@ impl PullSession {
     ///
     /// For an [`Endpoint::Http`], the call builds the fetcher with
     /// [`Fetcher::new`](ostrya_fetch::Fetcher::new), and the result is
-    /// [`PullSession::Http`]. The options of the endpoint give the agent and
-    /// the request limit, so `opts` must set no field. Before the call builds
-    /// the fetcher, it refuses `opts` with a field set, and then options that
-    /// name no mirror. The call sends no HTTP request. An `https://` mirror
-    /// with [`TrustRoots::System`](ostrya_fetch::TrustRoots::System) reads the
-    /// trust store of the host, as [`Fetcher::new`](ostrya_fetch::Fetcher::new)
-    /// states.
+    /// [`PullSession::Http`]. The call sends no HTTP request.
     ///
     /// Under the tokio backend, the call must run within a runtime that has
     /// the IO driver and the time driver enabled, as [`PushSession::connect`]
     /// states.
     ///
+    /// # HTTP options
+    ///
+    /// The call gives the options of the endpoint to the fetcher with no
+    /// change:
+    ///
+    /// - The options can name one or more mirrors.
+    /// - The fetcher follows redirects up to
+    ///   [`max_redirects`](ostrya_fetch::FetcherOptions::max_redirects).
+    /// - [`max_outstanding`](ostrya_fetch::FetcherOptions::max_outstanding) is
+    ///   the request limit of the pull.
+    /// - A `User-Agent` entry of
+    ///   [`headers`](ostrya_fetch::FetcherOptions::headers) sets the agent.
+    /// - The call does not apply [`check_base_url`](ostrya_fetch::check_base_url)
+    ///   to the mirrors.
+    ///
+    /// The options give the agent and the request limit, so `opts` must set no
+    /// field.
+    ///
+    /// With [`TrustRoots::System`](ostrya_fetch::TrustRoots::System), the call
+    /// reads the trust store of the host by the rule of
+    /// [`Fetcher::new`](ostrya_fetch::Fetcher::new). An `https://` mirror
+    /// causes the read. The options that [`Endpoint::parse`] gives an
+    /// `http://` address also cause it, because their `max_redirects` is 10.
+    ///
     /// # Errors
     ///
     /// - The errors of [`StreamSession::connect`] for an ssh endpoint.
-    /// - [`Error::InvalidInput`] if `opts` sets a field for an HTTP endpoint.
+    /// - [`Error::InvalidInput`] if `opts` sets
+    ///   [`agent`](StreamSessionOptions::agent) or
+    ///   [`max_outstanding`](StreamSessionOptions::max_outstanding) for an HTTP
+    ///   endpoint.
     /// - [`Error::InvalidInput`] if the options of an HTTP endpoint name no
     ///   mirror.
     /// - [`Error::Fetch`] if [`Fetcher::new`](ostrya_fetch::Fetcher::new)

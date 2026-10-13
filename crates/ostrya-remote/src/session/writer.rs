@@ -578,7 +578,7 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
             if up.is_stopped() {
                 return Ok(None);
             }
-            // If the source fails or has no dict for the commit, the claim
+            // If the source fails or gives `None` for the commit, the claim
             // drops. The commit is then free again for the calls that wait
             // for it.
             let Some(claim) = up.claims.claim(commit).await else {
@@ -596,7 +596,8 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
             let bytes = match detached {
                 None => continue,
                 Some(DetachedMetadata::Encoded(bytes)) => bytes,
-                // The dict can be as large as `MAX_METADATA_SIZE`, so the
+                // A dict can serialize to `MAX_METADATA_SIZE` bytes or more.
+                // The size check comes after the serialization, so the
                 // serialization runs on the blocking pool.
                 Some(DetachedMetadata::Dict(dict)) => ostrya_rt::unblock(move || {
                     let a_sv = Type::parse("a{sv}").expect("valid signature");

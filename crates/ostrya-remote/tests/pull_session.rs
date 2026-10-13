@@ -861,7 +861,8 @@ fn refused(opened: Result<PullSession>) -> Error {
 /// `connect` refuses a set field of the stream options for an HTTP endpoint,
 /// before it checks the mirrors and before it builds the fetcher. The
 /// fetcher refuses the `ftp` mirror, and the check of the mirrors refuses the
-/// options with no mirror, so the refusal of the stream options comes first.
+/// options with no mirror. The refusal of the stream options comes before
+/// both.
 #[test]
 fn connect_refuses_stream_options_for_an_http_endpoint() {
     for http in [FetcherOptions::new("ftp://h/"), FetcherOptions::default()] {
@@ -1182,9 +1183,9 @@ fn fetch_refs_gives_the_limit_exceeded_of_the_server() {
     );
 }
 
-/// An entry over the limit of 4,096 bytes or 256 parts is `InvalidInput`. The call writes
-/// nothing, and the session stays usable: the next frame that the server
-/// reads is the `Get` of a later call.
+/// An entry over the limit of 4,096 bytes or 256 parts is `InvalidInput`. The
+/// call writes nothing, and the session stays usable: the next frame that the
+/// server reads is the `Get` of a later call.
 #[test]
 fn fetch_refs_refuses_an_entry_over_a_limit_and_writes_nothing() {
     let ((input, output), mut server) = ends();
@@ -1323,8 +1324,8 @@ fn mixed_entries(count: usize) -> Vec<String> {
 
 /// Over HTTP, an entry over a limit, more than 256 entries after the removal
 /// of exact duplicates, and a request target over 16 KiB are `InvalidInput`.
-/// The call sends no request: no server listens on the address, and a request
-/// would fail with `Fetch`.
+/// The call sends no request. No server listens on the address, so a request
+/// fails with `Fetch`.
 #[test]
 fn fetch_refs_over_http_refuses_bad_input_before_a_request() {
     let session = dead_http_session();
@@ -1334,8 +1335,9 @@ fn fetch_refs_over_http_refuses_bad_input_before_a_request() {
     let long = (0..256)
         .map(|n| format!("{n:0>64}"))
         .collect::<Vec<String>>();
-    // Four entries of 700 `é` are 4,200 bytes each when encoded, which is
-    // more than 16 KiB, and each entry is under 4,096 bytes.
+    // Four entries of 700 `é` are 4,200 bytes each when encoded. The four
+    // entries together are more than 16 KiB, and each entry is under 4,096
+    // bytes.
     let accents: Vec<String> = (0..4).map(|n| format!("{}{n}", "é".repeat(700))).collect();
     let parts = "a/".repeat(256) + "a";
     let bytes = "a".repeat(4096 + 1);
@@ -1369,10 +1371,11 @@ fn fetch_refs_over_http_refuses_bad_input_before_a_request() {
     ostrya_rt::block_on(session.finish()).unwrap();
 }
 
-/// Over a stream session, more than 256 entries after the removal, positive
-/// and negative together, is `InvalidInput`, and the call writes nothing. The
-/// client removes exact duplicates before it sends `ListRefs`, puts the
-/// positive entries first, and keeps an entry that another entry covers.
+/// Over a stream session, more than 256 entries after the removal of exact
+/// duplicates are `InvalidInput`. The count holds the positive and the
+/// negative entries together. The call writes nothing. The client removes
+/// exact duplicates before it sends `ListRefs`, puts the positive entries
+/// first, and keeps an entry that another entry covers.
 #[test]
 fn fetch_refs_over_a_stream_counts_the_entries_that_stay() {
     let ((input, output), mut server) = ends();

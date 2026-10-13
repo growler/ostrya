@@ -23,58 +23,38 @@ fn invalid(msg: impl Into<String>) -> Error {
 ///
 /// # Forms
 ///
-/// The forms are:
-///
 /// - `ssh://[USER@]HOST[:PORT]/ABSOLUTE/PATH`.
-/// - `ssh://[USER@]HOST[:PORT]/~/RELATIVE/PATH`. The client removes the `/~/`
-///   prefix and sends `RELATIVE/PATH`. The remote side resolves it in the
-///   home directory of the ssh session.
+/// - `ssh://[USER@]HOST[:PORT]/~/RELATIVE/PATH`. The remote command gets
+///   `RELATIVE/PATH`. The remote side resolves it in the home directory of
+///   the ssh session.
 /// - `[USER@]HOST:PATH`, the scp form. A `PATH` that starts with `~/` or
-///   `/~/` is relative to the remote home directory, and the client removes
-///   that prefix. Each other `PATH` that starts with `/`, apart from `/~`
-///   and `/~USER`, is absolute, for example `/./~x/r` and `/srv/~/r`. Any
-///   other `PATH` is relative to the remote home directory.
+///   `/~/` is relative to the remote home directory, as git reads the form.
+///   A `PATH` that starts with `/` and not with `/~` is absolute, for example
+///   `/./~x/r` and `/srv/~/r`. A `PATH` that starts with neither `/` nor `~`
+///   is relative to the remote home directory.
 ///
-/// After a `/~/` or a `~/` prefix, the client also removes each leading `/` of
-/// the path. The path then stays relative to the home directory.
+/// [`parse`](SshAddress::parse) removes the `/~/` or `~/` prefix and each `/`
+/// that follows it, so the path stays relative to the home directory. It
+/// decodes no percent escape.
 ///
-/// In the scp form, the first `:` outside brackets ends the host, and a leading
-/// `/~` of the path is the home prefix, as git reads the form. For example,
-/// `u:p@host:path` gives the host `u` and the path `p@host:path`, so the scp
-/// form cannot give a user that holds `:`. An IPv6 host needs brackets:
-/// `fe80::1:repo` gives the host `fe80`, and `[fe80::1]:repo` gives the host
-/// `fe80::1`. ssh gets a bracketed host without the brackets.
+/// # The scp form
 ///
-/// A user holds ASCII letters, digits, `.`, `-`, and `_` alone. A host holds
-/// the same characters, or it is a bracketed IPv6 address. A bracketed address
-/// holds hex digits, `:`, and `.`, with an optional `%ZONE` of ASCII letters
-/// and digits. These rules refuse a control character, white space, and a
-/// shell metacharacter in a user or a host.
+/// The first `:` outside brackets ends the host, as git reads the form. For
+/// example, `u:p@host:path` gives the host `u` and the path `p@host:path`, so
+/// the scp form cannot give a user that holds `:`. An IPv6 host needs
+/// brackets: `fe80::1:repo` gives the host `fe80`, and `[fe80::1]:repo` gives
+/// the host `fe80::1`.
 ///
-/// [`parse`](SshAddress::parse) also refuses:
+/// # Characters
 ///
-/// - a user or a host that starts with `-`, so that no part of an address
-///   reaches ssh as an option
-/// - an empty user, host, or path, and an `ssh://` address with no `/` after
-///   the host
-/// - a port that is not a number from 1 to 65535
-/// - more than one `@`
-/// - a `USER:PASSWORD@` user in the `ssh://` form
-/// - a path of the form `~` or `~USER`, and in the scp form `/~` or `/~USER`
-/// - a stray or an unclosed bracket in the host
-/// - in the scp form, a `/` before the `:` that ends the host
-/// - an address with no `ssh://` prefix and no `:` outside brackets
-/// - a scheme other than `ssh`. An `http://` or an `https://` address gets a
-///   message of its own.
+/// - A user holds only ASCII letters, digits, `.`, `-`, and `_`.
+/// - A host holds the same characters, or it is an IPv6 address in brackets.
+/// - A host in brackets holds only hex digits, `:`, and `.`, and an optional
+///   `%ZONE` of ASCII letters and digits.
 ///
-/// The parse decodes no percent escape.
-///
-/// On Windows, the parse refuses a scp-form address that names a local path:
-///
-/// - an address whose host is one ASCII letter (`C:\repo`, `C:repo`)
-/// - an address with a `\` before the first `:` (`..\dir:x`, `\\?\C:\repo`)
-///
-/// The `ssh://` form carries a one-letter host on Windows too.
+/// These rules refuse a control character, white space, and a shell
+/// metacharacter in a user or a host. The ssh client gets a host in brackets
+/// without the brackets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshAddress {
     user: Option<String>,
@@ -90,16 +70,42 @@ impl SshAddress {
     /// Parses `address` as one of the [forms](SshAddress#forms) of an ssh
     /// address.
     ///
-    /// On Windows, the call also refuses a scp-form address that names a local
-    /// path.
-    ///
     /// # Errors
     ///
-    /// - [`Error::InvalidInput`] if `address` is not one of the forms, or if
-    ///   the parse refuses a part of it. The message holds the reason and the
-    ///   address without the text up to its last `@`, so it shows no user and
-    ///   no password. The refusal of an `http://` or an `https://` address does
-    ///   not show the address, because the address can hold userinfo.
+    /// [`Error::InvalidInput`] if the call refuses `address`. The call
+    /// refuses:
+    ///
+    /// - an address with no `ssh://` prefix and no `:` outside brackets
+    /// - an address that holds `://` and does not start with `ssh://`
+    /// - in the scp form, a `/` before the `:` that ends the host
+    /// - an empty user, host, or path, and an `ssh://` address with no `/`
+    ///   after the host
+    /// - a user or a host that starts with `-`, so that no part of an address
+    ///   reaches ssh as an option
+    /// - a user or a host with a character outside the
+    ///   [character rules](SshAddress#characters)
+    /// - more than one `@` before the first `/` of an `ssh://` address, or
+    ///   before the `:` that ends the host in the scp form
+    /// - a `USER:PASSWORD@` user in the `ssh://` form
+    /// - a path that starts with `/~` and not with `/~/`, for example `/~` or
+    ///   `/~USER/r`, and in the scp form also a path that starts with `~` and
+    ///   not with `~/`
+    /// - a stray or an unclosed bracket in the host
+    /// - text other than `:PORT` after a host in brackets in the `ssh://` form
+    /// - a port that is not a number from 1 to 65535
+    ///
+    /// On Windows, the call also refuses a scp-form address that names a local
+    /// path:
+    ///
+    /// - an address whose host is one ASCII letter (`C:\repo`, `C:repo`)
+    /// - an address with a `\` before the first `:` (`..\dir:x`, `\\?\C:\repo`)
+    ///
+    /// On Windows, an `ssh://` address with a one-letter host is valid.
+    ///
+    /// The message holds the reason and the address after
+    /// [`without_userinfo`], so it shows no user and no password. The message
+    /// for an `http://` or an `https://` address holds no address, because the
+    /// address can hold userinfo.
     ///
     /// # Examples
     ///
@@ -115,12 +121,9 @@ impl SshAddress {
         SshAddress::parse_with(address, cfg!(windows))
     }
 
-    /// Parses an `ssh://` address or a scp-form address.
+    /// Parses `address` as [`parse`](SshAddress::parse) does.
     ///
-    /// If `windows` is `true`, the call refuses a scp-form address that names
-    /// a local path: a one-letter host, or a `\` before the first `:`. A
-    /// refusal is [`Error::InvalidInput`] with the reason and the address
-    /// without the text up to its last `@`.
+    /// If `windows` is `true`, the call applies the Windows rules of `parse`.
     pub(super) fn parse_with(address: &str, windows: bool) -> Result<SshAddress> {
         // The userinfo can hold a password, so no message shows it.
         let bad = |why: &str| invalid(format!("address '{}': {why}", without_userinfo(address)));
@@ -249,8 +252,8 @@ impl SshAddress {
 /// Writes the address in the `ssh://` form.
 ///
 /// A path that is relative to the home directory gets the `/~/` prefix. A host
-/// that holds `:` or `%` gets brackets. The parse of the output gives an equal
-/// address.
+/// that holds `:` or `%` gets brackets. [`parse`](SshAddress::parse) of the
+/// output gives an equal address.
 ///
 /// # Examples
 ///
@@ -286,7 +289,7 @@ impl fmt::Display for SshAddress {
 
 /// The options of the ssh client of a session.
 ///
-/// The struct carries no `#[non_exhaustive]`. A caller builds it with
+/// A caller builds the struct with a struct expression and
 /// `..Default::default()`.
 ///
 /// # ssh command line
@@ -294,21 +297,23 @@ impl fmt::Display for SshAddress {
 /// The command line is:
 ///
 /// ```text
-/// SSH_COMMAND... [-p PORT] [USER@]HOST 'REMOTE_COMMAND --repo=QUOTED_PATH'
+/// SSH_COMMAND... [-p PORT] [USER@]HOST "REMOTE_COMMAND --repo=QUOTED_PATH"
 /// ```
 ///
-/// The last argument is one string, and the remote shell parses it. The client
-/// quotes the path with POSIX single quotes, so the path gets no expansion.
+/// The double quotes mark one argument. The remote shell parses this
+/// argument. `QUOTED_PATH` is the path in POSIX single quotes, so the path gets
+/// no expansion.
 ///
-/// `SSH_COMMAND` comes from the first of these that is set:
+/// `SSH_COMMAND` comes from the first of these sources that is set:
 ///
 /// 1. [`command`](SshOptions::command)
 /// 2. the `OSTRYA_SSH_COMMAND` environment variable
 /// 3. [`config_command`](SshOptions::config_command)
 ///
-/// If none is set, `SSH_COMMAND` is `ssh`. The client splits the environment
-/// variable and `config_command` at ASCII white space, with no quoting rule. A
-/// command with an argument that holds white space must come from `command`.
+/// If no source is set, `SSH_COMMAND` is `ssh`. The session splits the
+/// environment variable and `config_command` at ASCII white space, with no
+/// quoting rule. A command with an argument that holds white space must come
+/// from `command`.
 ///
 /// `REMOTE_COMMAND` is [`remote_command`](SshOptions::remote_command). If that
 /// field is not set, it is `ostrya receive` for a push and `ostrya send` for a
@@ -317,34 +322,47 @@ impl fmt::Display for SshAddress {
 /// The ssh client writes to the standard error of this process. Host key
 /// prompts, password prompts, and the diagnostics of the server reach the
 /// user through it.
+///
+/// # Empty values
+///
+/// The session refuses these values with [`Error::InvalidInput`], for a push
+/// and for a pull:
+///
+/// - a [`command`](SshOptions::command) list that is empty, or whose first
+///   argument holds only white space
+/// - an `OSTRYA_SSH_COMMAND` or a
+///   [`config_command`](SshOptions::config_command) that is empty or holds
+///   only ASCII white space
+/// - an `OSTRYA_SSH_COMMAND` that is not UTF-8
+/// - a [`remote_command`](SshOptions::remote_command) that is empty or holds
+///   only white space
+///
+/// A source with an empty value counts as set. If the session refuses a
+/// source, it does not go on to the next source. For example, an
+/// `OSTRYA_SSH_COMMAND` with an empty value blocks `config_command`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SshOptions {
     /// The ssh command line, as a list of arguments.
-    ///
-    /// It wins over the `OSTRYA_SSH_COMMAND` environment variable and over
-    /// [`config_command`](SshOptions::config_command). An empty list is
-    /// refused, and so is a list whose first argument holds only white space.
     pub command: Option<Vec<String>>,
     /// The ssh command line from the configuration of a remote.
     ///
-    /// It is the value of the remote key `ssh-command`. The client splits it at
-    /// ASCII white space. It has the lowest precedence: the
-    /// `OSTRYA_SSH_COMMAND` environment variable wins over it.
+    /// It is the value of the remote key `ssh-command`. The
+    /// [ssh command line](SshOptions#ssh-command-line) rules tell how the
+    /// session splits it.
     pub config_command: Option<String>,
     /// The command that the remote side runs.
     ///
-    /// The remote shell parses it. The default is `ostrya receive` for a push
-    /// and `ostrya send` for a pull.
+    /// The remote shell parses it. The
+    /// [ssh command line](SshOptions#ssh-command-line) rules give the default.
     pub remote_command: Option<String>,
 }
 
 impl SshOptions {
-    /// Returns the ssh command line from the first source that is set, with
-    /// `env` as the value of the `OSTRYA_SSH_COMMAND` environment variable.
+    /// Returns the ssh command line, with `env` as the value of
+    /// `OSTRYA_SSH_COMMAND`.
     ///
-    /// The order is [`command`](SshOptions::command), then `env`, then
-    /// [`config_command`](SshOptions::config_command), then `ssh`. An empty
-    /// command and an `env` that is not UTF-8 are [`Error::InvalidInput`].
+    /// `ssh_program` applies the order of the sources and the empty-value
+    /// rules.
     pub(crate) fn program(&self, env: Option<&OsStr>) -> Result<Vec<String>> {
         ssh_program(self.command.as_deref(), env, self.config_command.as_deref())
     }
@@ -361,14 +379,19 @@ fn split_user(s: &str) -> std::result::Result<(Option<&str>, &str), &'static str
 
 /// Returns `address` without its userinfo, for a message.
 ///
-/// `address` is any text that a caller has not parsed. A password can hold
-/// any character, `/` and `:` among them, so the end of the userinfo is not
-/// known before the parse. The function leaves out all text up to the last
-/// `@`. It keeps a `SCHEME://` prefix before that `@` when `SCHEME` is a valid
-/// URI scheme: an ASCII letter, then ASCII letters, digits, `+`, `-`, and `.`.
-/// Other text before `://` can be a part of the userinfo, so the function does
-/// not keep it. A path that holds `@` also loses the text before its last
-/// `@`. An `address` with no `@` is returned with no change.
+/// `address` is any text that the caller has not parsed. A password can hold
+/// any character, `/` and `:` among them, so the function takes the last `@`
+/// as the end of the userinfo:
+///
+/// - If `address` holds no `@`, the function returns it with no change.
+/// - If the text before the last `@` starts with `SCHEME://`, the function
+///   keeps that prefix. `SCHEME` is a URI scheme: an ASCII letter, then zero
+///   or more of the characters `+`, `-`, `.`, ASCII letters, and digits.
+/// - The function drops all other text up to and including the last `@`.
+///   This includes the text before a `://` if that text is not a scheme,
+///   because that text can be a part of the userinfo.
+/// - If the path holds `@`, the function also drops the host and the path up
+///   to the last `@`.
 ///
 /// # Examples
 ///

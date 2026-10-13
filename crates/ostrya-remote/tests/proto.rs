@@ -571,12 +571,12 @@ fn malformed_pull_bodies_decode_to_protocol() {
         hex("00 00 00 04 0e 61 00 62 00"),
         frame(14, &[]),
         frame(15, &[]),
-        // A ListRefs whose offset points past the end, one whose offset
+        // A `ListRefs` whose offset points past the end, one whose offset
         // table holds its own offset, and one with no terminating zero byte.
         frame(16, &hex("61")),
         frame(16, &hex("61 00 03")),
         frame(16, &hex("61 62 02")),
-        // A ListRefs with a prefix that is not UTF-8, and one with a zero
+        // A `ListRefs` with a prefix that is not UTF-8, and one with a zero
         // inside a prefix.
         frame(16, &hex("ff 00 02")),
         frame(16, &hex("61 00 62 00 04")),

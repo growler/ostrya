@@ -294,7 +294,7 @@ fn the_scp_form_reads_a_leading_slash_tilde_as_the_home_prefix() {
         ] {
             assert_eq!(ssh(address).to_string(), shown, "windows={windows}");
         }
-        // A scp path that starts with `//` puts `://` in the address, so the
+        // An scp path that starts with `//` puts `://` in the address, so the
         // parse reads a scheme.
         assert_eq!(reason("host://~/r"), "the scheme is not supported");
     }
@@ -795,7 +795,7 @@ fn an_ssh_endpoint_gives_the_command_line_of_its_options() {
 }
 
 /// The options of an HTTP endpoint must name exactly one mirror, which
-/// [`ostrya_fetch::check_base_url`] accepts. A refusal holds no userinfo.
+/// `ostrya_fetch::check_base_url` accepts. A refusal holds no userinfo.
 #[test]
 fn an_http_endpoint_needs_exactly_one_mirror() {
     for mirrors in [&[][..], &["https://a/", "https://b/"]] {
@@ -825,8 +825,8 @@ fn an_http_endpoint_needs_exactly_one_mirror() {
 }
 
 /// The options of an HTTP endpoint carry the credential, the cleartext
-/// permission, and each trust setting, a setting that verifies no
-/// certificate chain among them.
+/// permission, and each trust setting. The trust settings include the two
+/// settings that verify no certificate chain.
 #[test]
 fn an_http_endpoint_takes_its_credential_and_its_trust_setting() {
     use ostrya_fetch::{BasicAuth, BearerToken, TrustRoots};

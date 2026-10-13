@@ -242,7 +242,9 @@ pub struct GetReply {
     pub found: bool,
     /// The length of the body, if the server knows it.
     ///
-    /// If `found` is `false` and the length is present, encode and decode
+    /// A reply to a `ListRefs` must hold it, as the
+    /// [ref listing](super#ref-listing) rules state. If `found` is `false`
+    /// and the length is present, encode and decode
     /// return [`Error::Protocol`].
     pub len: Option<u64>,
 }
@@ -287,10 +289,12 @@ pub enum Message {
     Get(String),
     /// The `GetReply` message.
     GetReply(GetReply),
-    /// The `ListRefs` message, with the entries of a ref listing.
+    /// The `ListRefs` message, with the entries of a ref listing request.
     ///
-    /// Each entry is a ref pattern with an optional leading `!`. The codec
-    /// does not check the entries.
+    /// Each entry is a ref pattern of a
+    /// [`RefSelector`](ostrya_core::RefSelector), with an optional leading
+    /// `!`. The codec does not check the entries. The
+    /// [ref listing](super#ref-listing) rules give the limits and the reply.
     ListRefs(Vec<String>),
 }
 

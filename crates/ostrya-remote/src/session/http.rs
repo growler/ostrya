@@ -53,7 +53,10 @@ pub(crate) const MAX_PARALLEL: u32 = 31;
 /// after it aborted the session for another cause.
 const SESSION_ABORTED: &str = "the session was aborted";
 
-/// The receive endpoint of a server, as a session reaches it.
+/// The receive endpoint of a server, as an HTTP session reaches it.
+///
+/// `transport::http::prepare` builds it from the options of an HTTP
+/// `transport::Endpoint`.
 pub(crate) struct Endpoint {
     /// The fetcher, with the push address as its one mirror. It carries the
     /// credential of each request.

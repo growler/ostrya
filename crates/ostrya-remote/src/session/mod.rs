@@ -12,10 +12,9 @@
 //! [`PushProgress`] counts the progress of a session, and [`PushOutcome`]
 //! gives the result of a session that committed.
 //!
-//! A [`StreamSession`] reads files of a server repository by their path, and
-//! gives the body of each file as a [`PullBody`]. A [`PullSession`] is the
-//! session of a pull over either transport: the HTTP fetcher or a stream
-//! session.
+//! A [`StreamSession`] reads files and ref listings of a server repository,
+//! and gives each body as a [`PullBody`]. A [`PullSession`] reads the summary
+//! and the ref listings of a remote over HTTP or over a stream session.
 //!
 //! [`export_stream`] writes a one-way stream: the messages of a push session in
 //! one direction, for a receiver that sends no reply.
@@ -134,15 +133,24 @@ impl fmt::Debug for ObjectData {
 }
 
 /// The detached metadata of a commit, as an [`ObjectSource`] gives it.
+///
+/// [`ObjectSource::detached_metadata_encoded`] returns it. The session
+/// serializes a [`Dict`](DetachedMetadata::Dict) on the blocking pool of
+/// `ostrya-rt`. Under the `tokio` backend, this pool is the blocking pool of
+/// the tokio runtime, so the serialization panics outside a tokio runtime
+/// context.
+///
+/// If a dict does not serialize as `a{sv}`, the object stream stops with
+/// [`Error::InvalidInput`]. If the bytes of either form are more than 128 MiB
+/// ([`MAX_METADATA_SIZE`](ostrya_core::MAX_METADATA_SIZE)), the object stream
+/// also stops with [`Error::InvalidInput`]. An ostrya server refuses bytes
+/// that are not a normal-form `a{sv}` dict with the code `protocol`.
 pub enum DetachedMetadata {
-    /// An `a{sv}` dict. The session serializes it on the blocking pool.
+    /// An `a{sv}` dict, which the session serializes.
     Dict(Value),
-    /// The bytes of an `a{sv}` dict in normal form. The session sends the
-    /// bytes as they are.
+    /// The bytes of an `a{sv}` dict in normal form.
     ///
-    /// A source that holds the serialized dict gives it in this form, so the
-    /// session does not serialize it again. The session does not check the
-    /// bytes. The server checks them.
+    /// The session sends the bytes as they are, and checks only their length.
     Encoded(Vec<u8>),
 }
 
@@ -186,13 +194,13 @@ pub trait ObjectSource: Send + Sync {
     /// Returns the detached metadata for `commit`, an `a{sv}` dict.
     ///
     /// The source applies its own filter first. For `None`, the session sends
-    /// no detached metadata for `commit`. If the dict is not a valid `a{sv}`
-    /// value, or if its bytes are more than 128 MiB, the object stream stops
-    /// with [`Error::InvalidInput`].
+    /// no detached metadata for `commit`. [`DetachedMetadata`] gives the
+    /// checks of the dict.
     ///
-    /// The session calls
-    /// [`detached_metadata_encoded`](ObjectSource::detached_metadata_encoded),
-    /// whose default implementation calls this method.
+    /// The session calls this method only through the default implementation
+    /// of
+    /// [`detached_metadata_encoded`](ObjectSource::detached_metadata_encoded).
+    /// A source that overrides that method must still implement this one.
     ///
     /// # Errors
     ///
@@ -212,11 +220,8 @@ pub trait ObjectSource: Send + Sync {
     /// dict as [`DetachedMetadata::Dict`]. A source that holds the bytes of
     /// the dict can give them as [`DetachedMetadata::Encoded`].
     ///
-    /// For `None`, the session sends no detached metadata for `commit`. The
-    /// session serializes a [`DetachedMetadata::Dict`] on the blocking pool.
-    /// If the dict is not a valid `a{sv}` value, or if the bytes of either
-    /// form are more than 128 MiB, the object stream stops with
-    /// [`Error::InvalidInput`].
+    /// For `None`, the session sends no detached metadata for `commit`.
+    /// [`DetachedMetadata`] gives the checks of each form.
     ///
     /// # Errors
     ///
@@ -546,11 +551,9 @@ impl PushSession {
     /// time limit on a read. A peer that stays silent keeps a call waiting
     /// until the caller drops its future or closes the streams.
     ///
-    /// A session over a stream uses the `futures-io` traits for its I/O. Under
-    /// the `smol` backend, it needs no async runtime. Under the `tokio`
-    /// backend, [`send`](PushSession::send) needs a tokio runtime context: it
-    /// serializes a [`DetachedMetadata::Dict`] on the blocking pool of the
-    /// runtime. The other calls need no async runtime.
+    /// A session over a stream uses the `futures-io` traits for its I/O, and
+    /// needs no async runtime, except for [`send`](PushSession::send) under
+    /// the `tokio` backend.
     ///
     /// # Errors
     ///
@@ -769,8 +772,9 @@ impl PushSession {
     /// - [`Error::Source`] if the source fails. The session ends with
     ///   `Abort`.
     /// - [`Error::InvalidInput`] if the source gives data that the session
-    ///   cannot send, for example a symlink with a payload. The session ends
-    ///   with `Abort`.
+    ///   cannot send, for example a symlink with a payload, or detached
+    ///   metadata that [`DetachedMetadata`] refuses. The session ends with
+    ///   `Abort`.
     /// - An `Error` message from the server, as the [`Error`] variant of its
     ///   code.
     /// - [`Error::Protocol`] for a malformed reply, or for a reply that is
@@ -792,6 +796,13 @@ impl PushSession {
     /// 3. any other error, also the [`Error::Protocol`] of a stream that ends
     ///    because the server aborted the session for the failure of another
     ///    stream
+    ///
+    /// # Panics
+    ///
+    /// Under the `tokio` backend, the call panics outside a tokio runtime
+    /// context if the source gives a [`DetachedMetadata::Dict`] for a commit
+    /// of `commits`. A session over ssh or HTTP also needs this context, as
+    /// [`connect`](PushSession::connect) states.
     pub async fn send(
         &self,
         source: &dyn ObjectSource,

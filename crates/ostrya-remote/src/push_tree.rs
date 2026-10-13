@@ -104,8 +104,7 @@ pub struct TreePushOptions {
 /// 1. It checks `opts` and refuses each value that [`push_tree_over_stream`]
 ///    refuses. Then it makes the transport ready with
 ///    [`PushSession::prepare`]. For ssh, it builds the command line. For
-///    HTTP, it builds the HTTP client. It refuses each value that
-///    [`PushSession::connect`] refuses before it starts the transport.
+///    HTTP, it builds the HTTP client.
 /// 2. It walks and hashes the tree with [`TreeModel::scan`], with
 ///    `entry_filter` and `hash_jobs`.
 /// 3. It starts the ssh client, or sends the first HTTP request. It opens the
@@ -129,7 +128,19 @@ pub struct TreePushOptions {
 /// # Errors
 ///
 /// - Each error of [`push_tree_prepared`](push_tree_prepared#errors).
-/// - Each error of [`PushSession::prepare`].
+/// - [`Error::InvalidInput`] if the ssh command or the receive command is
+///   empty or holds only white space, or if the value of `OSTRYA_SSH_COMMAND`
+///   is not UTF-8. The [empty values](crate::SshOptions#empty-values) give
+///   the full rule.
+/// - [`Error::InvalidInput`] if the options of an HTTP endpoint do not name
+///   exactly one mirror, or if
+///   [`check_base_url`](ostrya_fetch::check_base_url) refuses the mirror.
+/// - [`Error::Fetch`] if [`Fetcher::new`](ostrya_fetch::Fetcher::new) refuses
+///   the options of an HTTP endpoint, for example a credential to an
+///   `http://` address without `allow_cleartext_credentials`.
+///
+/// [`Error::InvalidInput`]: crate::Error::InvalidInput
+/// [`Error::Fetch`]: crate::Error::Fetch
 pub async fn push_tree(
     endpoint: Endpoint,
     root: &Path,
@@ -187,8 +198,11 @@ pub async fn push_tree_prepared(
 /// Before the scan, the push refuses these values of `opts`:
 ///
 /// - empty `refs`, and a ref named twice
-/// - a ref that holds `:`, a ref of 64 lowercase hex characters, and a
-///   ref that fails the ref-name rule of [`ostrya_core::is_ref_name`]
+/// - a ref that holds `:`, and a ref that fails the ref-name rule of
+///   [`is_ref_name`](ostrya_core::is_ref_name), for example a ref that holds
+///   `^`, which a revision reads as the parent of a commit
+/// - a ref of 64 lowercase hex characters, which a revision reads as a
+///   commit checksum
 /// - a DEFLATE level outside 1 through 9
 /// - a malformed `SOURCE_DATE_EPOCH` if `timestamp` is not set, and a system
 ///   clock before the Unix epoch if neither is set
@@ -198,10 +212,6 @@ pub async fn push_tree_prepared(
 /// - a `subject`, a `body`, and `metadata` whose commit object is more than
 ///   `MAX_METADATA_SIZE` without the bindings and without a parent of
 ///   [`ParentPolicy::CurrentTip`]
-///
-/// The ref-name rule refuses a ref that holds `^`, because a revision reads
-/// `^` as the parent of a commit. A revision also cannot name a ref of 64
-/// lowercase hex characters, because it reads that name as a commit checksum.
 ///
 /// The bindings and a parent from the server only add bytes to the commit
 /// object. As a result, the size check before the scan never refuses a commit

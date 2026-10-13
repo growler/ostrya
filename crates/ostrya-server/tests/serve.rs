@@ -6,6 +6,8 @@
 //! - client certificates
 //! - the stop on drop
 //! - the ref listing and its query, and `PullSession::fetch_refs` over HTTP
+//! - over an archive repository, a pull of the chain of static deltas that
+//!   the ref listing advertises
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -20,9 +22,11 @@ use ostrya::fetch::{
     TrustRoots,
 };
 use ostrya::remote::PullSession;
+use ostrya::verify::PullTrust;
 use ostrya::{
-    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree,
-    ObjectType, Repo, RepoMode, Summary, loose_path,
+    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
+    MutableTree, ObjectType, PullOptions, PullProgress, Repo, RepoMode, Summary, Type, Value,
+    loose_path,
 };
 use ostrya_rt::block_on;
 use ostrya_server::{ServeOptions, ServerTls};
@@ -847,6 +851,150 @@ fn fetch_refs_of_a_too_long_part_gets_an_empty_listing() {
             let got = session.fetch_refs(&[long.as_str()]).await;
             let want = repo.build_ref_listing(&["absent"]).await.unwrap();
             assert_eq!(got.unwrap(), Some(want), "{scheme}");
+        });
+    }
+}
+
+/// Commits a tree of two files on `test/main` of `repo`, with `parent` as the
+/// parent. The file `marker` holds `name`, and the file `shared` is the same
+/// in each commit.
+async fn commit_marker(repo: &Repo, base: &Path, name: &str, parent: Option<Checksum>) -> Checksum {
+    let src = base.join(name);
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("marker"), name).unwrap();
+    std::fs::write(src.join("shared"), b"shared\n").unwrap();
+    let txn = repo.transaction().await.unwrap();
+    let mut mtree = MutableTree::new();
+    let mut modifier = CommitModifier::new(CommitModifierFlags::SKIP_XATTRS);
+    let dfd = std::fs::File::open(&src).unwrap();
+    txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("."), &mut mtree, Some(&mut modifier))
+        .await
+        .unwrap();
+    let root = txn.write_mtree(&mut mtree).await.unwrap();
+    let commit = txn
+        .write_commit(
+            CommitOptions {
+                parent,
+                timestamp: Some(1_700_000_000),
+                ..CommitOptions::default()
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+    txn.set_ref("test/main", Some(&commit));
+    txn.commit().await.unwrap();
+    commit
+}
+
+/// Returns a small `a{sv}` dict for the detached metadata of a commit.
+fn detached_dict() -> Value {
+    Value::Array(vec![Value::Tuple(vec![
+        Value::Str("test.detached".to_owned()),
+        Value::Variant(Box::new((
+            Type::parse("s").unwrap(),
+            Value::Str("present".to_owned()),
+        ))),
+    ])])
+}
+
+/// An archive repository with the commits A, B, C, and D on `test/main`, the
+/// deltas from A to B, from B to C, and from C to D, and the delta indexes.
+/// C has detached metadata. The part size limit of the deltas is one byte, so
+/// the three deltas have more part files than superblocks. A `bare-user`
+/// client under `base` for each name in `clients` holds A.
+///
+/// Returns the server, the clients, the commits A to D, and the number of
+/// part files of the three deltas.
+async fn indexed_chain(base: &Path, clients: &[&str]) -> (Repo, Vec<Repo>, Vec<Checksum>, usize) {
+    let server = Repo::create(&base.join("server"), CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap();
+    let mut commits = vec![commit_marker(&server, base, "A", None).await];
+    let mut repos = Vec::new();
+    for name in clients {
+        let client = Repo::create(&base.join(name), CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let main = PullOptions {
+            refs: vec!["test/main".to_owned()],
+            ..PullOptions::default()
+        };
+        client.pull_local(&server, main).await.unwrap();
+        repos.push(client);
+    }
+    for name in ["B", "C", "D"] {
+        let parent = commits.last().copied();
+        commits.push(commit_marker(&server, base, name, parent).await);
+    }
+    server
+        .write_commit_detached_metadata(&commits[2], Some(&detached_dict()))
+        .await
+        .unwrap();
+    let opts = DeltaOptions {
+        max_chunk_size: 1,
+        timestamp: Some(1_700_000_000),
+        ..DeltaOptions::default()
+    };
+    let mut parts = 0;
+    for step in commits.windows(2) {
+        let dir = server
+            .generate_static_delta(Some(&step[0]), &step[1], &opts)
+            .await
+            .unwrap();
+        let count = std::fs::read_dir(server.path().join(dir))
+            .unwrap()
+            .filter(|entry| {
+                let name = entry.as_ref().unwrap().file_name();
+                name.to_string_lossy().parse::<u32>().is_ok()
+            })
+            .count();
+        assert!(count >= 1, "{}-{}", step[0], step[1]);
+        parts += count;
+    }
+    assert!(parts > 3, "{parts}");
+    server.reindex_static_deltas().await.unwrap();
+    (server, repos, commits, parts)
+}
+
+/// A client that holds A pulls D with the three deltas of the ref listing,
+/// over HTTP/1.1 and over HTTP/2. The pull fetches the three superblocks and
+/// the detached metadata of C, and no content object. It applies each part
+/// file of the deltas, and the client keeps the detached metadata of C.
+#[test]
+fn a_chain_from_the_ref_listing_is_pulled_over_http() {
+    let tmp = TmpDir::new("delta-chain");
+    let (server, clients, commits, parts) =
+        block_on(indexed_chain(tmp.path(), &["client-http", "client-https"]));
+    let passes = [(local(), "http", false), (tls(false), "https", true)];
+    for ((opts, scheme, http2), client) in passes.into_iter().zip(clients) {
+        let commits = &commits;
+        with_server(server.clone(), opts, |addrs| async move {
+            let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
+            let session = PullSession::Http(fetcher(url, http2, None).await);
+            let listing = session.fetch_refs(&["test"]).await.unwrap().unwrap();
+            let deltas = Summary::parse(&listing).unwrap().static_deltas().unwrap();
+            assert_eq!(deltas.len(), 3, "{scheme}");
+            let progress = PullProgress::new();
+            let opts = PullOptions {
+                refs: vec!["test/main".to_owned()],
+                static_deltas: Some(deltas),
+                progress: Some(progress.clone()),
+                ..PullOptions::default()
+            };
+            let stats = client
+                .pull_with_session(session, PullTrust::unverified(), opts)
+                .await
+                .unwrap();
+            assert_eq!(stats.metadata_fetched, 4, "{scheme}");
+            assert_eq!(stats.content_fetched, 0, "{scheme}");
+            assert_eq!(stats.delta_parts as usize, parts, "{scheme}");
+            let snapshot = progress.snapshot();
+            assert_eq!(snapshot.delta_parts_total, stats.delta_parts, "{scheme}");
+            let head = client.resolve_rev("test/main", false).await.unwrap();
+            assert_eq!(head, Some(commits[3]), "{scheme}");
+            let meta = client.read_commit_detached_metadata(&commits[2]).await;
+            assert_eq!(meta.unwrap(), Some(detached_dict()), "{scheme}");
         });
     }
 }

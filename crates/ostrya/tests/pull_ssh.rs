@@ -4,8 +4,9 @@
 //!
 //! The oracle of each pull is the HTTP pull of the same remote into a second
 //! destination of the same mode. The refs, the objects, the markers, and the
-//! fetch statistics of the two destinations agree. The pipes are smaller than
-//! a large body, so the server waits for the client to read.
+//! fetch statistics of the two destinations agree. The pull of a chain of
+//! static deltas from the ref listing checks fixed counters instead. The pipes
+//! are smaller than a large body, so the server waits for the client to read.
 
 mod common;
 #[path = "common/pull.rs"]
@@ -35,7 +36,8 @@ use ostrya::{
 use ostrya_rt::block_on;
 use pull::{
     FIXED_TS, RepoServer, assert_list_refusal, build_remote, build_tree, commit_tree,
-    commit_tree_with, content_checksums, filez_path, incompressible, static_delta_list_cases,
+    commit_tree_with, content_checksums, detached_dict, filez_path, incompressible,
+    static_delta_list_cases,
 };
 
 /// The capacity of each pipe.
@@ -782,6 +784,112 @@ fn a_pull_session_fetches_the_ref_listing_over_a_stream() {
         assert_eq!(fetched, expected.map(Some));
         assert_eq!(listing.refs.len(), 1);
         assert_eq!(listing.refs[0].name, "test/main");
+    });
+}
+
+/// A remote archive repository under `dir/remote` with the commits A, B, C,
+/// and D on `test/main`, the deltas from A to B, from B to C, and from C to D,
+/// and the delta indexes. C has detached metadata. The part size limit of the
+/// deltas is one byte, so the three deltas have more part files than
+/// superblocks. A `bare-user` destination under `dir/dest` holds A.
+///
+/// Returns the remote, the destination, the commits A to D, and the number of
+/// part files of the three deltas.
+async fn indexed_chain(dir: &Path) -> (Repo, Repo, Vec<Checksum>, usize) {
+    let remote = Repo::create(&dir.join("remote"), CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap();
+    let dest = dest_at(&dir.join("dest"), RepoMode::BareUser, None).await;
+    build_tree(&dir.join("A"), b"A");
+    let mut commits = vec![commit_tree(&remote, dir, "A", "test/main", None, FIXED_TS).await];
+    dest.pull_local(&remote, main_ref(0)).await.unwrap();
+    for name in ["B", "C", "D"] {
+        build_tree(&dir.join(name), name.as_bytes());
+        let parent = commits.last().copied();
+        commits.push(commit_tree(&remote, dir, name, "test/main", parent, FIXED_TS).await);
+    }
+    remote
+        .write_commit_detached_metadata(&commits[2], Some(&detached_dict()))
+        .await
+        .unwrap();
+    let opts = DeltaOptions {
+        max_chunk_size: 1,
+        timestamp: Some(FIXED_TS),
+        ..DeltaOptions::default()
+    };
+    let mut parts = 0;
+    for step in commits.windows(2) {
+        let delta_dir = remote
+            .generate_static_delta(Some(&step[0]), &step[1], &opts)
+            .await
+            .unwrap();
+        let count = std::fs::read_dir(remote.path().join(delta_dir))
+            .unwrap()
+            .filter(|entry| {
+                let name = entry.as_ref().unwrap().file_name();
+                name.to_string_lossy().parse::<u32>().is_ok()
+            })
+            .count();
+        assert!(count >= 1, "{}-{}", step[0], step[1]);
+        parts += count;
+    }
+    assert!(parts > 3, "{parts}");
+    remote.reindex_static_deltas().await.unwrap();
+    (remote, dest, commits, parts)
+}
+
+/// A destination that holds A pulls D through a stream session with the
+/// three deltas of the ref listing. The pull fetches the three superblocks
+/// and the detached metadata of C, and no content object. It applies each
+/// part file of the deltas, the destination keeps the detached metadata of C,
+/// and the session ends with `Ok`.
+#[test]
+fn a_chain_from_the_ref_listing_is_pulled_over_a_stream() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-delta-chain");
+        let (remote, dest, commits, parts) = indexed_chain(dir.path()).await;
+        let progress = PullProgress::new();
+        let (to_server, server_in) = pipe(PIPE_CAP);
+        let (server_out, from_server) = pipe(PIPE_CAP);
+        let (pulled, served) = within(
+            "the pull of a chain through a stream session",
+            future::zip(
+                async {
+                    let session = PullSession::over_stream(
+                        from_server,
+                        to_server,
+                        StreamSessionOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                    let listing = session.fetch_refs(&["test"]).await.unwrap().unwrap();
+                    let deltas = ostrya::Summary::parse(&listing)
+                        .unwrap()
+                        .static_deltas()
+                        .unwrap();
+                    assert_eq!(deltas.len(), 3);
+                    let opts = PullOptions {
+                        static_deltas: Some(deltas),
+                        progress: Some(progress.clone()),
+                        ..main_ref(0)
+                    };
+                    dest.pull_with_session(session, PullTrust::unverified(), opts)
+                        .await
+                },
+                async move { remote.send(server_in, server_out).await },
+            ),
+        )
+        .await;
+        let stats = pulled.unwrap();
+        served.unwrap();
+        assert_eq!(stats.metadata_fetched, 4);
+        assert_eq!(stats.content_fetched, 0);
+        assert_eq!(stats.delta_parts as usize, parts);
+        assert_eq!(progress.snapshot().delta_parts_total, stats.delta_parts);
+        let head = dest.resolve_rev("test/main", false).await.unwrap();
+        assert_eq!(head, Some(commits[3]));
+        let meta = dest.read_commit_detached_metadata(&commits[2]).await;
+        assert_eq!(meta.unwrap(), Some(detached_dict()));
     });
 }
 

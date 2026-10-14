@@ -166,6 +166,25 @@ code in the same change that alters behavior.
   the locked decisions.
 - `docs/api-sketch.md` -- the target rust-native async API.
 
+## Requirement: package README files follow the crate docs
+
+Each published crate has a `README.md` in its crate directory, and its
+manifest sets `readme = "README.md"`. crates.io shows this file on the page of
+the crate. `ostrya-cli` takes the workspace `README.md`.
+
+The package `README.md` is a Markdown copy of the crate-level doc in
+`src/lib.rs`. A change to one of the two changes the other in the same commit.
+The copy differs from the crate-level doc in these points:
+
+- The file starts with a `# <crate name>` heading, then the Ostrya sentence.
+- A line before the first section links to the API documentation of the
+  crate on docs.rs.
+- Each heading is one level lower.
+- Each intra-doc link is a code span with no link.
+- An example has no hidden `# ` lines, and its code block is marked `rust`.
+
+A new published crate gets its `README.md` in the same form.
+
 ## Requirement: confirm every dependency before adding
 
 Before adding any crate to any `Cargo.toml` -- a regular dependency, a

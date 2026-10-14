@@ -465,3 +465,44 @@ by hand before it is accepted.
   content readers and writers -- must be `Send + Sync`, so they can be shared
   across tasks and threads. Pin this with compile-time assertions in tests as
   each type lands.
+
+## Release sequence
+
+A push of a `v*` tag publishes the workspace to crates.io through
+`.github/workflows/release.yml`. That workflow depends on no CI job, and
+`cargo publish --workspace` cannot roll back. All steps below are local. Do
+not push the tag and do not run `cargo publish` without the dry-run flag
+until the maintainer asks for that step in words.
+
+1. Set the new version in `[workspace.package] version` and in the path
+   versions of `[workspace.dependencies]` in the root `Cargo.toml`. If
+   `docs/port-plan.md` names the version in the paragraph of the phase that
+   ships, change that sentence too.
+2. Run `cargo update --workspace`, so that `Cargo.lock` has the new version
+   of each member.
+3. Write the man pages of the `ostrya` command again from the `clap`
+   definition:
+
+   ```sh
+   OSTRYA_BLESS_MAN=1 cargo test -p ostrya-cli --bin ostrya man_pages
+   ```
+
+   Read the diff of `crates/ostrya-cli/man/`. Each change must come from a
+   change to the help text or to a file in `crates/ostrya-cli/man/extra/`.
+4. Add an entry for the new version at the top of
+   `crates/ostrya-cli/debian/changelog`. The Debian package takes its
+   version from this entry, so each release needs one, and its version is
+   the workspace version. Use the form of the entries in the file: the line
+   `ostrya (<version>) unstable; urgency=medium`, one `*` item for each
+   change to the `ostrya` command or its package, and the line of the
+   maintainer with the date in the `date -R` format. If the command and the
+   package do not change, the one item is `New upstream release.`
+5. Run the gates of `.github/workflows/ci.yml`. Run the tests with
+   `OSTRYA_REQUIRE_MULTIGROUP=1 OSTRYA_REQUIRE_GNUPG=1`, as CI does.
+6. Commit as `chore(release): bump the workspace version to <version>`. The
+   commit includes the man pages of step 3 and the changelog entry of
+   step 4.
+7. Run `cargo publish --workspace --dry-run --locked`. This uploads nothing.
+   It refuses an uncommitted tracked file, so it comes after the commit. Fix
+   a failure with `git commit --amend`.
+8. Make a signed tag: `git tag -s -m 'ostrya <version>' v<version>`.

@@ -1,0 +1,217 @@
+.TH "OSTRYA\-COMMIT" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-commit \- Commit a tree into the repository and print the new commit checksum
+.SH SYNOPSIS
+.nf
+ostrya commit [OPTIONS] [PATH]...
+.fi
+.SH DESCRIPTION
+Commit a tree into the repository and print the new commit checksum.
+.PP
+The command reads one or more tree sources: a directory, a tar archive, or a committed tree. With no \%\-\-tree option and no PATH, it reads a tar stream from standard input. It writes the objects of the tree and the commit object. If signing options name keys, it signs the commit. Then it points the \%\-\-branch ref at the new commit.
+.PP
+The command needs \%\-\-branch or \%\-\-orphan. Without \%\-\-parent, the current tip of the branch is the parent. On success, standard output carries the commit checksum, or the \%\-\-table\-output block. If the command refuses its input, it exits \%1 and moves no ref.
+.SH ARGUMENTS
+.TP
+\fIPATH...\fR
+The directory to commit.
+.IP
+If a \%\-\-tree option is present, the command ignores this argument. It also ignores each argument after the first. With no \%\-\-tree option and no PATH, the command reads a tar stream from standard input. The command refuses a symlink to a directory.
+.SH OPTIONS
+.TP
+\fB\-\-parent\fR \fIPARENT\fR
+The parent commit (a checksum or a ref), or \fB\%none\fR for a root commit.
+.IP
+Without this option, the current tip of the branch is the parent, unless \%\-\-orphan is given. A branch that names no ref gives a root commit. Only the lowercase \fB\%none\fR asks for a root commit, and each other value is a revision.
+.TP
+\fB\-b\fR, \fB\-\-branch\fR \fIBRANCH\fR
+Point this branch at the new commit and bind it into the commit.
+.IP
+The command needs \%\-\-branch or \%\-\-orphan. The branch name goes into the \fB\%ostree.ref\-binding\fR metadata key, unless \%\-\-no\-bindings is given. The command refuses a name that the \%ref\-name rule refuses, and a name of \%64 lowercase hexadecimal characters. It checks the name after it reads the tree. A refused name gives no new object and no ref.
+.TP
+\fB\-\-orphan\fR
+Take no implicit parent, and permit a commit that names no branch.
+.IP
+The commit has no parent unless \%\-\-parent names one. Without \%\-\-branch, the command moves no ref. Without \%\-\-branch and \%\-\-bind\-ref, the \fB\%ostree.ref\-binding\fR key holds an empty list.
+.TP
+\fB\-s\fR, \fB\-\-subject\fR \fISUBJECT\fR
+The commit subject.
+.IP
+Without this option and without \%\-\-editor, the subject is empty. With \%\-\-editor, the value goes into the editor file, and the edit replaces it.
+.TP
+\fB\-m\fR, \fB\-\-body\fR \fIBODY\fR
+The commit body.
+.IP
+If the option occurs more than once, the last value wins. \%\-\-body\-file wins over this option, and \%\-\-editor replaces both. Without \%\-\-body, \%\-\-body\-file, and \%\-\-editor, the body is empty.
+.TP
+\fB\-F\fR, \fB\-\-body\-file\fR \fIFILE\fR
+Read the commit body from this file.
+.IP
+This option wins over \%\-\-body in either order. The full file becomes the body, byte for byte. The file must be valid \%UTF\-8 with no NUL byte, and \%128 MiB or less. If the option occurs more than once, the last value wins. \%\-\-editor replaces the body.
+.TP
+\fB\-e\fR, \fB\-\-editor\fR
+Write the subject and the body in an editor.
+.IP
+The editor text replaces both. The command runs the first of \fB\%OSTREE_EDITOR\fR, \fB\%VISUAL\fR, and \fB\%EDITOR\fR that is set, else \fB\%vi\fR, through \fB\%/bin/sh \-c\fR\&. The command ignores each line that starts with \fB\%#\fR\&. The first line that is not blank is the subject, and the lines after it are the body. An empty subject, or a \%non\-zero exit of the editor, stops the commit. The command runs the editor before it reads the tree, and holds no repository lock during the edit.
+.TP
+\fB\-\-no\-bindings\fR
+Do not write any ref bindings.
+.IP
+The commit then has no \fB\%ostree.ref\-binding\fR key and no \fB\%ostree.collection\-binding\fR key.
+.TP
+\fB\-\-bind\-ref\fR \fIBRANCH\fR
+Bind this ref name into the commit beside the branch.
+.IP
+The option can occur more than once. The \fB\%ostree.ref\-binding\fR key holds the \%\-\-branch name and each \%\-\-bind\-ref name, sorted byte by byte. The command moves no ref for a \%\-\-bind\-ref name.
+.TP
+\fB\-\-add\-metadata\-string\fR \fIKEY=VALUE\fR
+Add a \%string\-valued key to the commit metadata.
+.IP
+The argument splits at its first \fB\%=\fR, so the value can hold \fB\%=\fR\&. The option can occur more than once, and a repeated key stays as a separate entry. The command refuses an argument with no \fB\%=\fR and an empty key. The metadata holds these entries first, then the \%\-\-add\-metadata entries, then the \%\-\-keep\-metadata entries.
+.TP
+\fB\-\-add\-metadata\fR \fIKEY=VALUE\fR
+Add a key to the commit metadata, with a value in GVariant text form.
+.IP
+The argument splits at its first \fB\%=\fR\&. The type of the value comes from the text. The command refuses an argument with no \fB\%=\fR, a value that does not parse, and an empty key. A repeated key stays as a separate entry.
+.TP
+\fB\-\-keep\-metadata\fR \fIKEY\fR
+Carry this metadata key over from the parent commit.
+.IP
+The value keeps its bytes. The option needs a parent, from \%\-\-parent or from the tip of \%\-\-branch. The command refuses a key that the parent does not hold.
+.TP
+\fB\-\-add\-detached\-metadata\-string\fR \fIKEY=VALUE\fR
+Add a \%string\-valued key to the detached commit metadata.
+.IP
+The argument splits at its first \fB\%=\fR\&. These entries replace all detached metadata of the commit, so a signature that an earlier run left on the same commit checksum goes. The signatures of this run come after these entries.
+.TP
+\fB\-\-canonical\-permissions\fR
+Record owner \%0:0, modes of \fB\%perm & 0755\fR, and no extended attributes.
+.IP
+The commit then does not depend on the owner or on the host. A symlink keeps its mode. The mode reduction applies after \%\-\-mode\-ro\-executables and \%\-\-statoverride. The command refuses a \%non\-zero \%\-\-owner\-uid or \%\-\-owner\-gid with this switch.
+.TP
+\fB\-\-owner\-uid\fR \fIUID\fR
+Set the user id of the owner of the committed files.
+.IP
+The value is a C \fB\%int\fR in decimal, in hexadecimal with \fB\%0x\fR, or in octal with a leading \fB\%0\fR\&. A negative value keeps the owner of the source. The command refuses a value that does not parse before it opens the repository.
+.TP
+\fB\-\-owner\-gid\fR \fIGID\fR
+Set the group id of the owner of the committed files.
+.IP
+The value is a C \fB\%int\fR in decimal, in hexadecimal with \fB\%0x\fR, or in octal with a leading \fB\%0\fR\&. A negative value keeps the group of the source. The command refuses a value that does not parse before it opens the repository.
+.TP
+\fB\-\-no\-xattrs\fR
+Do not import extended attributes.
+.TP
+\fB\-\-statoverride\fR \fIPATH\fR
+Change the modes of the paths that this file lists.
+.IP
+Each line is \fB\%[=]<decimal mode> <absolute in\-tree path>\fR\&. All text after the first space is the path, and the command ignores blank lines. Without the \fB\%=\fR prefix, the command ORs the value into the mode. With the \fB\%=\fR prefix, the value replaces the permission bits. If both forms name a path, only the OR value applies. An OR entry for a directory below the root applies to a member of a tar archive alone.
+.IP
+The file must be valid \%UTF\-8, and the command refuses a line with no space. After the command reads the tree, it refuses an OR entry whose path the walk did not reach. It names each such path on standard error. If the option occurs more than once, the last value wins.
+.TP
+\fB\-\-skip\-list\fR \fIPATH\fR
+A file with the paths to leave out, one absolute \%in\-tree path per line.
+.IP
+A listed directory prunes its whole subtree. The command ignores blank lines, and the file must be valid \%UTF\-8. After the command reads the tree, it refuses a listed path that the walk did not reach. It names each such path on standard error. A line \fB\%/\fR prunes every source, so the commit holds the \%\-\-base tree alone, and without \%\-\-base the command refuses the empty tree. If the option occurs more than once, the last value wins.
+.TP
+\fB\-\-mode\-ro\-executables\fR
+Clear the write bits of every regular file that has an execute bit.
+.IP
+The switch applies before \%\-\-statoverride, so a \%\-\-statoverride entry sets the final mode of its path.
+.TP
+\fB\-\-skip\-if\-unchanged\fR
+Skip the commit and print the parent checksum if the tree is unchanged.
+.IP
+The command compares the root contents and the root metadata of the tree with the parent commit. It does not compare the commit metadata, so a new subject alone does not give a new commit. If the tree matches, the command writes no commit and moves no ref. With no parent, the command writes the commit. With \%\-\-table\-output, the block shows the parent checksum and a zero for each count.
+.TP
+\fB\-\-link\-checkout\-speedup\fR
+Find a source file by its inode among the stored content objects.
+.IP
+If a source file is a hardlink to a loose content object of this repository, the command does not read the file. It applies the commit modifiers to the metadata of the stored object. If the result differs, it writes a new object from the stored content. An \fB\%archive\fR repository stores each content object compressed, so the switch has no effect there.
+.TP
+\fB\-I\fR, \fB\-\-devino\-canonical\fR
+Use an inode match as the whole identity of a file.
+.IP
+The commit modifiers then do not apply to that file, and the stored object goes into the commit as it is. This switch implies \%\-\-link\-checkout\-speedup.
+.TP
+\fB\-\-timestamp\fR \fITIMESTAMP\fR
+Set the timestamp of the commit.
+.IP
+The value is \fB\%@SECONDS\fR since the Unix epoch, or a date and time with a UTC offset, for example \fB\%2020\-01\-02T03:04:05Z\fR\&. The offset is \fB\%Z\fR, \fB\%+HH\fR, \fB\%+HH:MM\fR, or \fB\%+HHMM\fR, or one of these forms with \fB\%\-\fR\&. The command drops a fractional second, and refuses a value that it cannot read. Without this option, the commit uses \fB\%SOURCE_DATE_EPOCH\fR if it is set, else the current time.
+.TP
+\fB\-\-fsync\fR \fIPOLICY\fR
+Set the fsync policy of this commit with a boolean word.
+.IP
+The words are \fB\%true\fR, \fB\%yes\fR, \fB\%1\fR, \fB\%false\fR, \fB\%no\fR, and \fB\%0\fR, in any letter case. A false word turns off fsync for this commit. A true word keeps the \fB\%[core] fsync\fR value of the repository config, so the option never turns on fsync that the config turns off. The command refuses any other word before it opens the repository.
+.TP
+\fB\-\-table\-output\fR
+Report the commit and the object counts in a \fB\%KEY: VALUE\fR block.
+.IP
+Without this switch, the command prints the checksum alone. The block has seven lines in this order: \fB\%Commit\fR, \fB\%Metadata Total\fR, \fB\%Metadata Written\fR, \fB\%Content Total\fR, \fB\%Content Written\fR, \fB\%Content Cache Hits\fR, and \fB\%Content Bytes Written\fR\&. The last count is the content size of the regular files that the commit wrote, before compression.
+.TP
+\fB\-\-generate\-sizes\fR
+Store the sizes of the objects of the commit in \fB\%ostree.sizes\fR\&.
+.IP
+Only an \fB\%archive\fR repository writes this key. The key holds the objects that the last tree source adds, and the directory objects of the tree. A content object from an earlier source or from \%\-\-base is not in the key.
+.TP
+\fB\-\-bootable\fR
+Store \fB\%ostree.linux\fR and \fB\%ostree.bootable\fR in the commit metadata.
+.IP
+The command reads the kernel version from the committed tree. The version is the name of the one directory under \fB\%/usr/lib/modules\fR that holds a \fB\%vmlinuz\fR entry. The command refuses a tree with no such directory, or with more than one. \fB\%ostree.bootable\fR is \fB\%true\fR\&. The two keys come first in the metadata, and replace a value that another option gives for the same key.
+.TP
+\fB\-\-generate\-composefs\-metadata\fR
+Store the composefs image digest of the tree in the commit metadata.
+.IP
+The key is \fB\%ostree.composefs.digest.v0\fR, and the value is the \%fs\-verity digest of the image as a byte array. The value depends on the tree alone, so each repository mode gives the same digest. It replaces a value that \%\-\-add\-metadata\-string, \%\-\-add\-metadata, or \%\-\-keep\-metadata gives for the same key.
+.TP
+\fB\-\-tree\fR \fIdir=PATH or tar=TARFILE or ref=COMMIT\fR
+Add a tree source: a directory, a tar archive, or a committed tree.
+.IP
+The option can occur more than once. \fB\%tar=\-\fR and \fB\%tar=/dev/stdin\fR read standard input. The command overlays the sources in \%command\-line order. A later source replaces the files of the same name and the directory metadata of an earlier source. The command refuses a name that is a directory in one source and a file in another. With this option, the command ignores PATH.
+.TP
+\fB\-\-base\fR \fIREV\fR
+Start from the given commit as a base.
+.IP
+No modifiers apply to the base. The base is the bottom layer at any position on the command line, and the tree sources go on top of it. An entry that no source changes keeps the mode, the owner, and the extended attributes of the base. If the option occurs more than once, the last value wins.
+.TP
+\fB\-\-consume\fR
+Delete the files of each directory source while the command reads it.
+.IP
+The command removes each source entry after it records the entry. It also removes the entries that \%\-\-skip\-list prunes. Then it removes the source directory, unless the path is exactly \fB\%\&.\fR\&. A \fB\%tar\fR or \fB\%ref\fR source ignores this switch. If a later step fails, the removed files stay removed.
+.TP
+\fB\-\-tar\-autocreate\-parents\fR
+Create the missing parent directories of the members of a tar archive.
+.TP
+\fB\-\-tar\-pathname\-filter\fR \fIREGEX,REPLACEMENT\fR
+Rename the members of a tar archive with \%REGEX,REPLACEMENT.
+.IP
+The value splits at its first comma. REGEX is a \%PCRE2 expression with UTF and Unicode properties on. The command replaces each match in the path name of each member. In REPLACEMENT, \fB\%\e0\fR to \fB\%\e9\fR, \fB\%\eg<name>\fR, and \fB\%\eg<number>\fR insert the text of a group, and \fB\%\e\e\fR inserts a backslash. The command reads the value only when it reads a tar source. If the option occurs more than once, the last value wins.
+.TP
+\fB\-\-gpg\-sign\fR \fIKEY\-ID\fR
+The GPG key ID to sign the commit with.
+.IP
+Each occurrence adds one signature under \fB\%ostree.gpgsigs\fR in the detached metadata, in \%command\-line order. The key ID must name exactly one secret key, and the command refuses a key ID of less than \%8 bytes. These signatures come after the \%\-\-sign and \%\-\-sign\-from\-file signatures. If a key cannot sign, the command writes no object and moves no ref.
+.TP
+\fB\-\-gpg\-homedir\fR \fIHOMEDIR\fR
+The GPG home directory that holds the keyrings.
+.IP
+\%\-\-gpg\-sign reads it, and so do \%\-\-sign and \%\-\-sign\-from\-file under \%\-\-sign\-type=gpg. It wins over \fB\%GNUPGHOME\fR\&. Without this option, gpg uses its own home directory.
+.TP
+\fB\-\-sign\fR \fIKEY_ID\fR
+Sign the commit with this key.
+.IP
+For \fB\%ed25519\fR and \fB\%spki\fR, the key is the \%base64 of the secret key. An \fB\%ed25519\fR secret key is \%64 bytes: the \%32\-byte seed, then the \%32\-byte public key. For \fB\%gpg\fR, the key is a key ID. Each occurrence adds one signature. \%\-\-sign\-type selects the engine. The command reads every key before it makes the first signature, so a bad key gives no signature. The order is the \%\-\-sign keys, then the \%\-\-sign\-from\-file keys, then the \%\-\-gpg\-sign keys.
+.TP
+\fB\-\-sign\-from\-file\fR \fIPATH\fR
+Sign the commit with the key on the first line of this file.
+.IP
+The command ignores the rest of the file. A NUL byte ends the line, and the command refuses a first line of more than \%65536 bytes. Each occurrence adds one signature. The command refuses an empty path with a message of its own.
+.TP
+\fB\-\-sign\-type\fR \fINAME\fR
+The signature engine of \%\-\-sign and \%\-\-sign\-from\-file.
+.IP
+The names are \fB\%ed25519\fR, \fB\%spki\fR, and \fB\%gpg\fR, and the default is \fB\%ed25519\fR\&. The match is case sensitive, and the command refuses any other name. The command reads this option only if \%\-\-sign or \%\-\-sign\-from\-file names a key. If the option occurs more than once, the last value wins.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

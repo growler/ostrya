@@ -1,0 +1,167 @@
+.TH "OSTRYA\-PUSH\-TREE" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-push\-tree \- Push a directory as one commit over ssh or HTTP and set the remote refs
+.SH SYNOPSIS
+.nf
+ostrya push\-tree [OPTIONS] [REMOTE] [DIR]
+.fi
+.SH DESCRIPTION
+Push a directory as one commit over ssh or HTTP and set the remote refs.
+.PP
+The command walks DIR, builds one commit over it, and sends the objects that the server does not have. The server sets each \%\-b ref to the commit in one transaction. The commit holds no extended attributes. The option names and the value forms are those of \fB\%commit\fR\&.
+.PP
+The command makes its checks before the ssh client starts or the first HTTP request goes. It resolves REMOTE before it reads the signing keys and \%\-\-body\-file. A refusal of the remote thus starts no gpg and reads no body file.
+.PP
+On success, standard output carries the commit checksum alone. Under \%\-\-verbose, one statistics line goes to standard error. On a terminal, standard error shows the progress bar of \fB\%push\fR while the push runs. On failure, the command writes \fB\%error: MESSAGE\fR to standard error and nothing to standard output, and exits \%1.
+.SH ARGUMENTS
+.TP
+\fIREMOTE\fR
+The remote: a remote name or an ssh or HTTP address. Required.
+.IP
+A value with a \fB\%:\fR or a \fB\%/\fR is an address: an ssh, \fB\%http://\fR, or \fB\%https://\fR address. An address opens no repository, and the command ignores \%\-\-repo for it. Each other value names a \fB\%[remote "<name>"]\fR section with a push address. The section is in the config of the repository that \%\-\-repo, the current directory, or \fB\%OSTREE_REPO\fR names.
+.TP
+\fIDIR\fR
+The directory to commit. Required.
+.SH OPTIONS
+.TP
+\fB\-b\fR, \fB\-\-branch\fR \fIREF\fR
+A target ref of the server. At least one is required.
+.IP
+Each occurrence names one more ref that the commit sets. The command refuses a name that holds \fB\%:\fR, a name that the \%ref\-name rule refuses, which includes a name with \fB\%^\fR, and a name that occurs twice. It also refuses a name of \%64 lowercase hex characters, because a revision reads such a name as a commit checksum.
+.TP
+\fB\-s\fR, \fB\-\-subject\fR \fISUBJECT\fR
+The commit subject.
+.TP
+\fB\-m\fR, \fB\-\-body\fR \fIBODY\fR
+The commit body.
+.IP
+If the option occurs more than once, the last value wins.
+.TP
+\fB\-F\fR, \fB\-\-body\-file\fR \fIFILE\fR
+Read the commit body from this file. This option wins over \%\-\-body.
+.IP
+The whole file becomes the body, byte for byte. The command refuses a file that is larger than \%128 MiB, is not \%UTF\-8, or holds a NUL byte.
+.TP
+\fB\-\-add\-metadata\-string\fR \fIKEY=VALUE\fR
+Add a \%string\-valued key to the commit metadata.
+.IP
+The command splits \%KEY=VALUE at the first \fB\%=\fR, and refuses an empty key. Each occurrence adds one key.
+.TP
+\fB\-\-add\-metadata\fR \fIKEY=VALUE\fR
+Add a key to the commit metadata, with a value in GVariant text form.
+.IP
+Each occurrence adds one key. The metadata holds each \%\-\-add\-metadata\-string entry first, then each \%\-\-add\-metadata entry, and then the ref bindings.
+.TP
+\fB\-\-add\-detached\-metadata\-string\fR \fIKEY=VALUE\fR
+Add a \%string\-valued key to the detached commit metadata.
+.IP
+Each occurrence adds one key. The command refuses an empty key. The command does not apply \fB\%[ex\-ostrya] detached\-metadata\-exclude\fR to these keys.
+.TP
+\fB\-\-timestamp\fR \fITIMESTAMP\fR
+Override the timestamp of the commit.
+.IP
+The value is \fB\%@SECONDS\fR since the Unix epoch, or a date and time with a UTC offset (\fB\%2020\-01\-02T03:04:05Z\fR). Without this option, the commit takes the \fB\%SOURCE_DATE_EPOCH\fR environment variable. If that variable is not set, the commit takes the current time.
+.TP
+\fB\-\-parent\fR \fICHECKSUM\fR
+The parent commit: a full checksum, or \fB\%none\fR for a root commit.
+.IP
+A full checksum has \%64 lowercase hex characters. Without this option, the parent is the commit of the first target ref on the server. If the server does not have that ref, the commit has no parent.
+.TP
+\fB\-\-no\-bindings\fR
+Do not write any ref bindings.
+.IP
+Without this switch, \fB\%ostree.ref\-binding\fR holds the target refs in sorted order. \fB\%ostree.collection\-binding\fR holds the collection ID of the server, if the server has one.
+.TP
+\fB\-\-owner\-uid\fR \fIUID\fR
+Set the user id of the owner of the committed files.
+.IP
+The value applies to the root directory too. A negative value keeps the user id of each file.
+.TP
+\fB\-\-owner\-gid\fR \fIGID\fR
+Set the group id of the owner of the committed files.
+.IP
+The value applies to the root directory too. A negative value keeps the group id of each file.
+.TP
+\fB\-\-canonical\-permissions\fR
+Force owner \%0:0, canonicalize modes to \fB\%perm & 0755\fR, and drop xattrs.
+.IP
+The commit then does not depend on the owner or on the host. A symlink keeps its mode. The command refuses this switch with a \%non\-zero \%\-\-owner\-uid or \%\-\-owner\-gid.
+.TP
+\fB\-\-sign\fR \fIKEY_ID\fR
+Sign the commit with this key. Each occurrence adds one signature.
+.IP
+For \%ed25519 and spki, the key is the \%base64 of the secret key. Under \%\-\-sign\-type=gpg, the key is a GPG key ID. The signatures come in this order: every \%\-\-sign key, then every \%\-\-sign\-from\-file key, and then every \%\-\-gpg\-sign key.
+.TP
+\fB\-\-sign\-from\-file\fR \fIPATH\fR
+Sign the commit with the key on the first line of this file.
+.IP
+Each occurrence adds one signature. \%\-\-sign\-type selects the engine, as for \%\-\-sign. The command refuses a first line that is longer than \%64 KiB.
+.TP
+\fB\-\-sign\-type\fR \fINAME\fR
+The signature type of \%\-\-sign and \%\-\-sign\-from\-file.
+.IP
+The types are \fB\%ed25519\fR, \fB\%spki\fR, and \fB\%gpg\fR, and the default is \fB\%ed25519\fR\&. If the option occurs more than once, the last value wins. The command reads this option only if \%\-\-sign or \%\-\-sign\-from\-file names a key.
+.TP
+\fB\-\-gpg\-sign\fR \fIKEY\-ID\fR
+The GPG key ID to sign the commit with.
+.IP
+Each occurrence adds one signature under \fB\%ostree.gpgsigs\fR\&. The ID must name exactly one secret key in the GnuPG home directory. The command refuses an ID of less than \%8 bytes.
+.TP
+\fB\-\-gpg\-homedir\fR \fIHOMEDIR\fR
+The GPG home directory that holds the keyrings.
+.IP
+\%\-\-gpg\-sign reads it, and so do \%\-\-sign and \%\-\-sign\-from\-file under \%\-\-sign\-type=gpg. It wins over \fB\%GNUPGHOME\fR\&.
+.TP
+\fB\-\-force\fR
+Set each target ref whatever its state on the server.
+.IP
+The push also asks the server to allow an update that is not a \%fast\-forward. The receive policy of the server still refuses such an update unless the policy sets \fB\%allow\-non\-fast\-forward\fR\&.
+.TP
+\fB\-\-compress\fR[=\fILEVEL\fR]
+Send the content objects deflated at LEVEL, \%1 to \%9.
+.IP
+The value needs the \fB\%=\fR form, and \%\-\-compress alone gives level \%6. Without this option, the push sends the content objects raw.
+.TP
+\fB\-\-ssh\-command\fR \fICMD\fR
+The ssh command, split at ASCII whitespace.
+.IP
+It wins over the \fB\%OSTRYA_SSH_COMMAND\fR environment variable and over the \fB\%ssh\-command\fR key of the remote. Without each of the three, the push runs \fB\%ssh\fR\&. The split has no quoting rule. The command refuses an empty value, and refuses this option for an HTTP address.
+.TP
+\fB\-\-receive\-command\fR \fICMD\fR
+The command that the remote side runs over ssh.
+.IP
+The remote shell parses the command. The push adds \fB\%\-\-repo=\fR and the path of the address in single quotes. This option wins over the \fB\%receive\-command\fR key of the remote. The default is \fB\%ostrya receive\fR\&. The command refuses an empty value, and refuses this option for an HTTP address.
+.TP
+\fB\-\-push\-token\-file\fR \fIFILE\fR
+The file whose first line is the token of an HTTP push.
+.IP
+It wins over the \fB\%push\-token\-file\fR key of the remote. Without \%\-\-push\-user, the push sends the token as a bearer token. The command refuses a first line that is empty or longer than \%1 MiB. It refuses a token file for an \fB\%http://\fR address without \%\-\-allow\-cleartext\-credentials, and for an ssh address.
+.TP
+\fB\-\-push\-user\fR \fINAME\fR
+Send the token as the password of a Basic credential with this name.
+.IP
+Without this option, the token is a bearer token. The option needs a token file, from \%\-\-push\-token\-file or from the \fB\%push\-token\-file\fR key of the remote. It wins over the \fB\%push\-user\fR key of the remote. The command refuses an empty name and a name that holds \fB\%:\fR\&.
+.TP
+\fB\-\-tls\-client\-cert\-path\fR \fIFILE\fR
+The PEM file of the client certificate of an HTTPS push.
+.IP
+It needs a key file: \%\-\-tls\-client\-key\-path or the \fB\%tls\-client\-key\-path\fR key of the remote. It wins over the \fB\%tls\-client\-cert\-path\fR key of the remote. A push to an \fB\%http://\fR address reads no TLS file, and the command refuses this option for an ssh address.
+.TP
+\fB\-\-tls\-client\-key\-path\fR \fIFILE\fR
+The PEM file of the private key of the client certificate.
+.IP
+The key must need no passphrase. It needs a certificate file: \%\-\-tls\-client\-cert\-path or the \fB\%tls\-client\-cert\-path\fR key of the remote. It wins over the \fB\%tls\-client\-key\-path\fR key of the remote. The command refuses this option for an ssh address.
+.TP
+\fB\-\-tls\-ca\-path\fR \fIFILE\fR
+The PEM file of the CA certificates that verify the server.
+.IP
+With it, the push does not use the trust store of the host. It wins over the \fB\%tls\-ca\-path\fR key of the remote. A push to an \fB\%http://\fR address reads no TLS file, and the command refuses this option for an ssh address.
+.TP
+\fB\-\-allow\-cleartext\-credentials\fR
+Send the token to an \fB\%http://\fR address.
+.IP
+Without this switch, the command refuses a token to such an address before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an ssh address.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

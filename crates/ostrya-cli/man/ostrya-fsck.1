@@ -1,0 +1,53 @@
+.TH "OSTRYA\-FSCK" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-fsck \- Verify object integrity and completeness across every commit
+.SH SYNOPSIS
+.nf
+ostrya fsck [OPTIONS]
+.fi
+.SH DESCRIPTION
+Verify object integrity and completeness across every commit.
+.PP
+The command loads the commit of each ref, lists each commit in the store, and reads each object that these commits reach. Each object must be present, and its checksum must equal its name. The command skips each commit that has a \fB\%state/<commit>.commitpartial\fR marker, and prints the number of these commits.
+.PP
+The walk runs to its end and writes each finding on standard error. A ref to a missing commit, a missing dirtree, or a failed binding check ends the run early. If the command finds an error or skips a partial commit, it exits \%1.
+.SH OPTIONS
+.TP
+\fB\-\-no\-mark\-partial\fR
+If a referenced object is missing, do not mark the commit partial.
+.IP
+Without this option, the command writes the marker \fB\%state/<commit>.commitpartial\fR for each commit that reaches a missing object, or an object that \%\-\-delete removed.
+.TP
+\fB\-\-add\-tombstones\fR
+Delete each commit whose parent commit is missing, and add a tombstone.
+.IP
+This step comes after the object walk. It writes a \fB\%\&.tombstone\-commit\fR for each deleted commit, and a ref to a deleted commit stays. One run deletes one generation of commits. After a walk that found a corrupt object, the step runs only with \%\-a or \%\-\-delete. This option also stops the count of partial commits on standard output.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Do not print the lines that name each phase of the check.
+.IP
+The command still prints the findings, the tombstone lines, the count of partial commits, and the final result line.
+.TP
+\fB\-a\fR, \fB\-\-all\fR
+Let \%\-\-add\-tombstones run after a walk that found a corrupt object.
+.IP
+The object walk always runs to its end and reports each error, with or without this option. \%\-\-delete also gives this permission.
+.TP
+\fB\-\-delete\fR
+Delete each object whose checksum differs from its name.
+.IP
+The command also marks each commit that reaches a deleted object as partial. A metadata object that does not parse stays, and the command reports it.
+.TP
+\fB\-\-verify\-bindings\fR
+Verify that the commit of each ref is bound to that ref.
+.IP
+The \fB\%ostree.ref\-binding\fR metadata of the commit of each ref must hold the name of the ref. For a collection ref, the \fB\%ostree.collection\-binding\fR of the commit must be the collection id of the ref. A commit with no binding key passes. A failure ends the run.
+.TP
+\fB\-\-verify\-back\-refs\fR
+Verify that the ref bindings of each commit resolve to that commit.
+.IP
+For each commit in the store, each name in its \fB\%ostree.ref\-binding\fR must name a ref that resolves to the commit. If the commit has an \fB\%ostree.collection\-binding\fR, the collection ref with that id and that name must also resolve to the commit. This option does not include \%\-\-verify\-bindings. A failure ends the run.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

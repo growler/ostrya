@@ -1,0 +1,25 @@
+.TH "OSTRYA\-LOG" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-log \- Show the log that starts at a commit or ref
+.SH SYNOPSIS
+.nf
+ostrya log [OPTIONS] [REV]
+.fi
+.SH DESCRIPTION
+Show the log that starts at a commit or ref.
+.PP
+The command walks the parent chain, newest first. For each commit, it prints \fB\%commit <checksum>\fR and the commit report of \fB\%show\fR\&. If the object of a parent commit is not in the repository, the command prints \fB\%<< History beyond this commit not fetched >>\fR and exits \%0.
+.SH ARGUMENTS
+.TP
+\fIREV\fR
+The revision to start at. Required.
+.SH OPTIONS
+.TP
+\fB\-\-raw\fR
+Show the raw variant data.
+.IP
+For each commit, the command prints the commit value in the GVariant text form, in place of the commit report.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

@@ -1,0 +1,25 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	cargo fetch --locked
+
+override_dh_auto_build:
+	cargo build --release --locked -p ostrya-cli --bin ostrya
+
+# The suite drives the ostree binary as its oracle and reaches the network,
+# so a package build passes nocheck.
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	cargo test --locked -p ostrya-cli --all-targets -- --nocapture
+endif
+
+override_dh_auto_install:
+	install -Dm755 $(CURDIR)/../../target/release/ostrya \
+		$(CURDIR)/debian/ostrya/usr/bin/ostrya
+
+override_dh_auto_clean:

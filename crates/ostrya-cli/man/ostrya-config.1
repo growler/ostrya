@@ -1,0 +1,32 @@
+.TH "OSTRYA\-CONFIG" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-config \- Read or write a repository configuration value
+.SH SYNOPSIS
+.nf
+ostrya config [OPTIONS] [OPERATION] [ARGS]...
+.fi
+.SH DESCRIPTION
+Read or write a repository configuration value.
+.PP
+The command reads and writes the \fB\%config\fR file of the repository. \fB\%get\fR prints the value and a newline. \fB\%set\fR and \fB\%unset\fR print nothing. A missing group or key is an error for \fB\%get\fR\&.
+.SH ARGUMENTS
+.TP
+\fIOPERATION\fR
+The operation: \fB\%get\fR, \fB\%set\fR, or \fB\%unset\fR\&.
+.IP
+\fB\%get\fR prints the value. \fB\%set\fR writes the value, and creates the group if it does not exist. \fB\%unset\fR removes the key. If the key or its group does not exist, \fB\%unset\fR changes nothing and exits \%0. \fB\%set\fR and \fB\%unset\fR write the whole \fB\%config\fR file of the repository again. This write drops the comment lines and the blank lines of the file.
+.TP
+\fIARGS...\fR
+The key to read or write, and for \fB\%set\fR the value.
+.IP
+The key is \fB\%section.key\fR, split on the first \fB\%\&.\fR, or a bare key name with \%\-\-group. The command refuses more operands than the operation takes.
+.SH OPTIONS
+.TP
+\fB\-\-group\fR \fIGROUP\fR
+The group of KEY. With this option, KEY is a bare key name.
+.IP
+The key name can then hold \fB\%\&.\fR characters.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

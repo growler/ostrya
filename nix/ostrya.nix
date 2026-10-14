@@ -1,6 +1,7 @@
 {
   lib,
   rustPlatform,
+  installShellFiles,
 }:
 let
   cliToml = lib.importTOML ../crates/ostrya-cli/Cargo.toml;
@@ -37,6 +38,17 @@ rustPlatform.buildRustPackage {
   # `.cargo/config.toml` sets `PCRE2_SYS_STATIC`, so `pcre2-sys` compiles the
   # vendored PCRE2 sources. Both are linked statically. The rest of the graph
   # is pure Rust.
+
+  nativeBuildInputs = [ installShellFiles ];
+
+  # The man pages are generated from the `clap` definition and checked in, so
+  # the build installs them and runs no generator. `failglob` fails the build
+  # if no page is in the source.
+  postInstall = ''
+    shopt -s failglob
+    installManPage crates/ostrya-cli/man/*.1
+    shopt -u failglob
+  '';
 
   # The suite drives the `ostree` binary as its oracle, reaches the network,
   # and wants uid 0 in a user namespace. Run it from the dev shell.

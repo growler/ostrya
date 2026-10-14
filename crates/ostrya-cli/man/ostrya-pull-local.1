@@ -1,0 +1,95 @@
+.TH "OSTRYA\-PULL\-LOCAL" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-pull\-local \- Import refs and their objects from another local repository
+.SH SYNOPSIS
+.nf
+ostrya pull\-local [OPTIONS] [SRC_REPO] [REFS]...
+.fi
+.SH DESCRIPTION
+Import refs and their objects from another local repository.
+.PP
+The command opens \%SRC_REPO and imports each ref, the commits that \%\-\-depth reaches, and the objects that these commits reach. When the link is possible, the pull hardlinks an object of the source into this repository. The pull writes local refs, or remote refs under \%\-\-remote. It drops the detached metadata keys that \fB\%[ex\-ostrya] detached\-metadata\-exclude\fR names.
+.PP
+On success, the command prints one statistics line to standard output: \fB\%M metadata, C content objects imported; SIZE content written\fR\&. Under \%\-\-require\-static\-deltas, the line has the form of a pull from a remote. The command writes no progress line.
+.SH ARGUMENTS
+.TP
+\fISRC_REPO\fR
+The repository to pull from. Required.
+.TP
+\fIREFS...\fR
+The refs to pull.
+.IP
+With none, the pull takes every local ref of the source, under \fB\%refs/heads\fR\&.
+.SH OPTIONS
+.TP
+\fB\-\-remote\fR \fIREMOTE\fR
+Write the pulled refs under this remote name.
+.IP
+The refs go to \fB\%refs/remotes/<remote>/<ref>\fR\&. Without this option, they are local refs. \%\-\-gpg\-verify and \%\-\-gpg\-verify\-summary read the keys of this remote.
+.TP
+\fB\-\-depth\fR \fIDEPTH\fR
+The number of parents of each pulled commit to follow.
+.IP
+\%0 takes the commit alone, and \%\-1 takes the whole ancestry in the source. The command refuses a value less than \%\-1 before it reads a ref or an object of the source. Default: \%0.
+.TP
+\fB\-\-commit\-metadata\-only\fR
+Import only the commit objects, and mark each commit partial.
+.TP
+\fB\-\-untrusted\fR
+Verify the checksum of every imported object against its name.
+.IP
+Without this switch, the pull links or copies an object with no hash. An object that the pull writes again in another form always gets a hash. A mismatch fails the pull.
+.TP
+\fB\-\-bareuseronly\-files\fR
+Reject regular files with mode bits outside \%0775.
+.IP
+The switch refuses a \%world\-writable, setuid, setgid, or sticky file. A symlink is exempt.
+.TP
+\fB\-\-disable\-verify\-bindings\fR
+Do not check the ref binding of a pulled commit.
+.IP
+Without this switch, the pull checks that the \fB\%ostree.ref\-binding\fR list of each pulled commit names the ref that it is pulled under. A commit with no binding key passes.
+.TP
+\fB\-\-force\-copy\fR
+Copy every object, and make no hardlink.
+.IP
+Without this switch, the pull hardlinks an object of the source into this repository when the link is possible.
+.TP
+\fB\-L\fR, \fB\-\-localcache\-repo\fR \fILOCALCACHE_REPO\fR
+Look in this repository for the objects that the source does not have.
+.IP
+The option can occur more than once. The pull reads the source first, and then each such repository in \%command\-line order. It takes an object from the first repository that holds it.
+.TP
+\fB\-\-disable\-fsync\fR
+Do not sync anything that this pull writes.
+.IP
+This switch changes no byte that the pull writes.
+.TP
+\fB\-\-per\-object\-fsync\fR
+Sync the file of each content object when the pull stages it.
+.IP
+The pull does not sync metadata objects or hardlinked objects one by one. Without this switch, \fB\%[core] per\-object\-fsync\fR applies. \%\-\-disable\-fsync and \fB\%[core] fsync=false\fR win over this switch.
+.TP
+\fB\-\-gpg\-verify\fR
+Require a GPG signature on every commit that the pull carries.
+.IP
+The pull uses the keys of the remote that \%\-\-remote names. Without \%\-\-remote, the command refuses this switch. The switch takes no value.
+.TP
+\fB\-\-gpg\-verify\-summary\fR
+Require a GPG signature on the summary of the source.
+.IP
+The pull uses the keys of the remote that \%\-\-remote names. Without \%\-\-remote, the command refuses this switch. The switch takes no value.
+.TP
+\fB\-\-require\-static\-deltas\fR
+Apply the static delta that the summary of the source advertises.
+.IP
+If the source advertises no delta for a commit, the command refuses the pull. The source must be an archive repository with a summary. The statistics line then has the form of a pull from a remote. This switch conflicts with \%\-\-disable\-static\-deltas.
+.TP
+\fB\-\-disable\-static\-deltas\fR
+Read no static delta.
+.IP
+Without \%\-\-require\-static\-deltas, the pull reads no static delta, so this switch changes nothing.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

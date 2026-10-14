@@ -1,0 +1,14 @@
+.SH ENVIRONMENT
+.TP
+\fBOSTREE_REPO\fR
+The repository to operate on when \fB\-\-repo\fR is not given and the
+current directory is not a repository.
+.SH EXAMPLES
+Create an archive repository, commit a directory to the ref \fBmain\fR, and
+show the log of the ref:
+.PP
+.nf
+ostrya \-\-repo=repo init \-\-mode=archive
+ostrya \-\-repo=repo commit \-b main \-s 'First commit' tree/
+ostrya \-\-repo=repo log main
+.fi

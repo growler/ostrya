@@ -1,0 +1,121 @@
+.TH "OSTRYA" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya \- \%Command\-line \%front\-end for the ostrya library
+.SH SYNOPSIS
+.nf
+ostrya [OPTIONS] [COMMAND]
+.fi
+.SH DESCRIPTION
+\%Command\-line \%front\-end for the ostrya library.
+.PP
+ostrya reads and writes ostree repositories. A repository keeps file trees as commits. Each file, directory, and commit is stored as objects, and the \%SHA\-256 checksum of an object is its name. A ref is a name that points to a commit. The \%on\-disk format is the format of the \fB\%ostree\fR command.
+.PP
+Each subcommand operates on one repository. The command finds the repository in this order: the \%\-\-repo option, the current directory, and the \fB\%OSTREE_REPO\fR environment variable. Run \fB\%ostrya <COMMAND> \-\-help\fR to see the options of a subcommand.
+.SH OPTIONS
+The options below are global. Each one is accepted before and after
+the subcommand name.
+.TP
+\fB\-\-repo\fR \fIREPO\fR
+The path of the repository to operate on.
+.IP
+The option is accepted before and after the subcommand name. If both positions give a value, the value after the name wins. Without this option, the command opens the current directory if it is a repository. Else it opens the path in \fB\%OSTREE_REPO\fR if that path is a repository. If no source gives a repository, the command prints its usage text and \fB\%error: Command requires a \-\-repo argument\fR, then exits \%1.
+.IP
+\fB\%init\fR creates a new repository only at an explicit \%\-\-repo. Without the option, \fB\%init\fR reuses a repository that it finds in the current directory or at \fB\%OSTREE_REPO\fR\&. Each other subcommand exits \%1 if an explicit \%\-\-repo does not open as a repository.
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Write extra information to standard error.
+.IP
+Most subcommands write the line \fB\%ostrya: using repository PATH\fR when they open the repository. \fB\%push\fR and \fB\%push\-tree\fR also write a statistics line after the push. \fB\%receive\fR and \fB\%send\fR write nothing more.
+.TP
+\fB\-\-version\fR
+Print version information and exit.
+.SH COMMANDS
+.TP
+\fBostrya\-init\fR(1)
+Initialize a new empty repository
+.TP
+\fBostrya\-commit\fR(1)
+Commit a tree into the repository and print the new commit checksum
+.TP
+\fBostrya\-checkout\fR(1)
+Check a commit out onto the file system, or write its composefs image
+.TP
+\fBostrya\-export\fR(1)
+Write the tree of a commit as a tar stream, to stdout or to \%\-\-output
+.TP
+\fBostrya\-refs\fR(1)
+List, create, or delete refs
+.TP
+\fBostrya\-rev\-parse\fR(1)
+Print the commit checksum that a revision names
+.TP
+\fBostrya\-cat\fR(1)
+Write the content of files of a commit to stdout
+.TP
+\fBostrya\-show\fR(1)
+Print the report of an object, or one part of its commit metadata
+.TP
+\fBostrya\-log\fR(1)
+Show the log that starts at a commit or ref
+.TP
+\fBostrya\-ls\fR(1)
+List the file paths of a commit
+.TP
+\fBostrya\-config\fR(1)
+Read or write a repository configuration value
+.TP
+\fBostrya\-remote\fR(1)
+Manage the configured remotes and their trusted GPG keys
+.TP
+\fBostrya\-prune\fR(1)
+Delete the objects that no ref or commit of the repository reaches
+.TP
+\fBostrya\-fsck\fR(1)
+Verify object integrity and completeness across every commit
+.TP
+\fBostrya\-diff\fR(1)
+Report the paths that changed between two revisions or directories
+.TP
+\fBostrya\-sign\fR(1)
+Add, verify, or delete signatures on a commit
+.TP
+\fBostrya\-summary\fR(1)
+Regenerate, sign, or verify the repository summary
+.TP
+\fBostrya\-static\-delta\fR(1)
+List, generate, apply, or index static deltas
+.TP
+\fBostrya\-pull\fR(1)
+Fetch refs and their objects from a remote over HTTP or ssh
+.TP
+\fBostrya\-pull\-local\fR(1)
+Import refs and their objects from another local repository
+.TP
+\fBostrya\-receive\fR(1)
+Receive one push session over standard input and standard output
+.TP
+\fBostrya\-push\fR(1)
+Push commits to a remote over ssh or HTTP and update its refs
+.TP
+\fBostrya\-push\-tree\fR(1)
+Push a directory as one commit over ssh or HTTP and set the remote refs
+.TP
+\fBostrya\-serve\fR(1)
+Serve the repository over HTTP as an archive repository for pull
+.TP
+\fBostrya\-send\fR(1)
+Serve one pull session over standard input and standard output
+.SH ENVIRONMENT
+.TP
+\fBOSTREE_REPO\fR
+The repository to operate on when \fB\-\-repo\fR is not given and the
+current directory is not a repository.
+.SH EXAMPLES
+Create an archive repository, commit a directory to the ref \fBmain\fR, and
+show the log of the ref:
+.PP
+.nf
+ostrya \-\-repo=repo init \-\-mode=archive
+ostrya \-\-repo=repo commit \-b main \-s 'First commit' tree/
+ostrya \-\-repo=repo log main
+.fi

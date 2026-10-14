@@ -1,0 +1,119 @@
+.TH "OSTRYA\-CHECKOUT" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-checkout \- Check a commit out onto the file system, or write its composefs image
+.SH SYNOPSIS
+.nf
+ostrya checkout [OPTIONS] <COMMIT> [DESTINATION]
+.fi
+.SH DESCRIPTION
+Check a commit out onto the file system, or write its composefs image.
+.PP
+The command writes the tree of COMMIT into DESTINATION. It applies the owner, the mode, and the extended attributes that the commit records. \%\-U applies no owner and no extended attributes. A regular file is a hardlink to its loose object if the repository mode and the checkout mode permit it. Otherwise it is a copy. Without a union option, an existing entry at the path of a tree entry is an error.
+.PP
+\%\-\-composefs and \%\-\-composefs\-noverity write one EROFS image file at DESTINATION, and no tree. \%\-\-from\-stdin and \%\-\-from\-file read a stream of (REFSPEC, SUBPATH) pairs, and check out each pair into one destination. The command prints nothing.
+.SH ARGUMENTS
+.TP
+\fICOMMIT\fR
+The commit to check out (a checksum or a ref).
+.IP
+With \%\-\-from\-stdin or \%\-\-from\-file, this positional is the destination, and each revision comes from the record stream.
+.TP
+\fIDESTINATION\fR
+The destination directory, or the image file with \%\-\-composefs.
+.IP
+The parent directory of the destination must exist. With \%\-\-from\-stdin or \%\-\-from\-file, the first positional is the destination, and the command ignores this one.
+.SH OPTIONS
+.TP
+\fB\-H\fR, \fB\-\-require\-hardlinks\fR
+Refuse each entry that the checkout must copy.
+.IP
+Without this switch, the checkout falls back to a copy. A regular file of \%non\-zero length needs a copy in an \fB\%archive\fR repository, in a \fB\%bare\fR repository under \%\-U, and in a \fB\%bare\-user\fR repository without \%\-U. A symlink is refused in an \fB\%archive\fR repository, and in a \fB\%bare\fR repository under \%\-U. A directory and a \%zero\-length file never need a copy. The checkout also refuses a destination directory on a different file system than the repository. The refusal comes at the entry, so the entries that the checkout wrote before it stay in the destination.
+.TP
+\fB\-C\fR, \fB\-\-force\-copy\fR
+Copy every object, and make no hardlink.
+.IP
+Outside an \fB\%archive\fR repository, a copy first tries a reflink of the loose object. If the reflink fails, the copy writes the bytes. This switch conflicts with \%\-H/\-\-require\-hardlinks.
+.TP
+\fB\-M\fR, \fB\-\-bareuseronly\-dirs\fR
+Reduce every directory that the checkout creates to \fB\%mode & 0775\fR\&.
+.IP
+A directory that the checkout reuses under a union option keeps its own mode. The switch has no effect on regular files and symlinks.
+.TP
+\fB\-\-disable\-cache\fR
+Do not update or use the uncompressed object cache (no effect).
+.IP
+ostrya keeps no such cache, so this switch has no effect on the destination.
+.TP
+\fB\-U\fR, \fB\-\-user\-mode\fR
+Do not change file ownership or initialize extended attributes.
+.IP
+A regular file that the checkout copies loses its setuid and setgid bits, and keeps its sticky bit. A hardlinked file keeps the mode of the object inode. A directory keeps all its mode bits. In a \fB\%bare\-user\fR repository, this switch lets the checkout hardlink regular files. A \fB\%bare\-user\-only\fR repository always gets this checkout mode.
+.TP
+\fB\-\-subpath\fR \fIPATH\fR
+Check out only this path of the commit.
+.IP
+If PATH names a directory, the destination root gets the metadata of that directory. If PATH names a file or a symlink, the checkout creates the destination directory and puts the entry in it under its own name. If PATH names nothing and \%\-\-allow\-noent is not given, the command fails. With \%\-\-from\-stdin or \%\-\-from\-file, the command ignores this option, and each record gives the subpath. A composefs image always holds the full commit tree.
+.TP
+\fB\-\-union\fR
+Keep existing directories, overwrite existing files, add new entries.
+.IP
+An existing entry that the tree does not hold stays in place. An existing directory where the tree holds a file or a symlink is an error, and so is an existing regular file where the tree holds a directory. With \%\-\-whiteouts, the checkout removes such an entry and writes the tree entry in its place. Without a union option, an existing entry at the path of a tree entry is an error. If the command line holds two union options, the command fails.
+.TP
+\fB\-\-union\-add\fR
+Keep every existing entry, and add only the entries that do not exist.
+.TP
+\fB\-\-union\-identical\fR
+Add new entries, and keep an existing entry that matches the tree.
+.IP
+An existing entry that does not match is an error. A regular file matches if it is the inode of the loose object. It also matches if it has the file object checksum and the permission bits of the object. A symlink matches if its target is the same. An existing directory stays with no comparison. This switch requires \fB\%\-H/\-\-require\-hardlinks\fR\&.
+.TP
+\fB\-\-whiteouts\fR
+Process \%Docker\-style whiteout entries.
+.IP
+A \fB\%\&.wh.<name>\fR entry removes \fB\%<name>\fR from the destination, and a \fB\%\&.wh..wh..opq\fR entry clears the destination directory. The checkout writes neither marker. Only a \%regular\-file entry acts as a marker. A marker named \fB\%\&.wh.\fR alone is an error. With \%\-\-union, this switch also lets the checkout replace an existing entry of a different type.
+.TP
+\fB\-\-process\-passthrough\-whiteouts\fR
+Turn a \fB\%\&.ostree\-wh.<name>\fR entry into an overlayfs whiteout.
+.IP
+The whiteout is a character device \%0:0 at \fB\%<name>\fR, with the permission bits of the marker. The checkout does not write the marker under its own name. A marker named \fB\%\&.ostree\-wh.\fR alone is an error.
+.TP
+\fB\-\-allow\-noent\fR
+If \fB\%\-\-subpath\fR names nothing, write nothing and exit \%0.
+.IP
+With \%\-\-from\-stdin or \%\-\-from\-file, the switch applies to the subpath of each record, and the stream continues. A subpath through an entry that is not a directory is still an error.
+.TP
+\fB\-\-composefs\fR
+Write the composefs EROFS image of the commit to the destination.
+.IP
+The destination is the image file, and the checkout writes no tree. The image holds the \%fs\-verity digest of each backed file, unless \%\-\-composefs\-noverity is given. The command writes a temporary file in the directory of the destination. Then it renames the file over the destination, at mode \%0644. If the export fails, an existing destination stays as it was.
+.IP
+\fB\%\-\-subpath\fR has no effect on the image. With \%\-\-from\-stdin or \%\-\-from\-file, each record writes the image of its revision to the destination. The command refuses this switch together with \%\-\-whiteouts, \%\-\-process\-passthrough\-whiteouts, \%\-\-skip\-list, \%\-H, \%\-C, \%\-M, or \%\-\-disable\-cache.
+.TP
+\fB\-\-composefs\-noverity\fR
+Write the composefs EROFS image with no \%fs\-verity digest in it.
+.IP
+The two composefs switches are independent, and this switch applies in any position. This switch also writes the image without \%\-\-composefs. The other rules of \%\-\-composefs apply.
+.TP
+\fB\-\-from\-stdin\fR
+Read \%NUL\-separated (REFSPEC, SUBPATH) records from standard input.
+.IP
+The command checks out each pair into the destination that the first positional names, and ignores the second positional and \%\-\-subpath. An empty REFSPEC record ends the stream. A REFSPEC with no record after it names the whole tree. Each pair writes with the overwrite mode of the command line, so the pairs layer under \%\-\-union. If a pair fails, the run stops, and the pairs before it stay written. The command refuses a stream larger than \%128 MiB.
+.TP
+\fB\-\-from\-file\fR \fIFILE\fR
+Read \%NUL\-separated (REFSPEC, SUBPATH) records from FILE.
+.IP
+The records have the format of \%\-\-from\-stdin. If the option occurs more than once, the last value wins. \%\-\-from\-stdin wins over this option in any \%command\-line order. The command refuses a file larger than \%128 MiB.
+.TP
+\fB\-\-fsync\fR \fIPOLICY\fR
+Specify how to invoke \%fsync() with a boolean word.
+.IP
+POLICY is \fB\%true\fR, \fB\%yes\fR, \fB\%1\fR, \fB\%false\fR, \fB\%no\fR, or \fB\%0\fR\&. The letter case does not matter. The policy starts from \fB\%[core] fsync\fR of the repository configuration, which is on if the key is absent. \fB\%false\fR turns fsync off. \fB\%true\fR keeps the configured policy, so a repository with \fB\%[core] fsync=false\fR syncs nothing. With fsync on, the checkout syncs each directory and each new regular file. The command reads POLICY before it opens the repository, and refuses any other word.
+.TP
+\fB\-\-skip\-list\fR \fIFILE\fR
+Prune each tree path that FILE names, one path per line.
+.IP
+Each path starts with \fB\%/\fR at the checkout root, which is the \fB\%\-\-subpath\fR root if one is given. Write a directory with a trailing slash. A directory matches only in that form. The path \fB\%/\fR prunes the whole tree. Blank lines are ignored, and the command reports no path that matches nothing. If the option occurs more than once, the last value wins. The command refuses a file larger than \%128 MiB, and a file that is not \%UTF\-8 or holds a NUL byte.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

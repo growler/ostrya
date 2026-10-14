@@ -1,0 +1,21 @@
+.TH "OSTRYA\-RECEIVE" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-receive \- Receive one push session over standard input and standard output
+.SH SYNOPSIS
+.nf
+ostrya receive [OPTIONS]
+.fi
+.SH DESCRIPTION
+Receive one push session over standard input and standard output.
+.PP
+By default, \fB\%ostrya push\fR runs this command on the server over ssh. The receive policy comes from the repository config, or from the file of \%\-\-policy. Standard output carries the frames of the session alone. For each warning of the session, the command writes one \fB\%warning: STEP: MESSAGE\fR line to standard error. It writes nothing else, also under \%\-\-verbose. The exit status is \%0 after a committed session, also with warnings, and \%1 otherwise.
+.SH OPTIONS
+.TP
+\fB\-\-policy\fR \fIFILE\fR
+Read the receive policy from FILE in place of the repository config.
+.IP
+FILE holds the receive, trust, and key groups and the remote sections, in the \%key\-file format of the config. The command then ignores these groups and sections in the repository config. \fB\%[core] auto\-update\-summary\fR and \fB\%[ex\-ostrya] detached\-metadata\-exclude\fR still come from the repository config. FILE must be a regular \%UTF\-8 file of \%1 MiB or less.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

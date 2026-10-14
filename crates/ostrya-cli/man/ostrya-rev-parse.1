@@ -1,0 +1,27 @@
+.TH "OSTRYA\-REV\-PARSE" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-rev\-parse \- Print the commit checksum that a revision names
+.SH SYNOPSIS
+.nf
+ostrya rev\-parse [OPTIONS] [REV]...
+.fi
+.SH DESCRIPTION
+Print the commit checksum that a revision names.
+.PP
+The command prints one \%64\-character checksum on each line, one for each REV, in order. A revision that does not resolve is an error. \%\-\-single prints the one commit object of the repository and takes no REV.
+.SH ARGUMENTS
+.TP
+\fIREV...\fR
+The revisions to resolve. Required, unless \%\-\-single is given.
+.IP
+A revision is a full checksum, an abbreviated checksum of \%1 to \%63 lowercase hex characters, or a refspec. An abbreviated checksum must match exactly one commit. Each trailing \fB\%^\fR steps back one generation of ancestry. The command prints one commit checksum for each revision, in order.
+.SH OPTIONS
+.TP
+\fB\-S\fR, \fB\-\-single\fR
+Print the one commit of the repository.
+.IP
+An empty repository is an error, and so is a repository with more than one commit. The command refuses a REV argument with this switch.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

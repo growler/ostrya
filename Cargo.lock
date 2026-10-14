@@ -478,6 +478,7 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+ "terminal_size",
 ]
 
 [[package]]
@@ -1676,7 +1677,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "ostrya"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-compression",
  "bsdiff",
@@ -1705,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "ostrya-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "clap",
  "indicatif",
@@ -1718,21 +1719,21 @@ dependencies = [
 
 [[package]]
 name = "ostrya-composefs"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "ostrya-conformance"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rustix",
 ]
 
 [[package]]
 name = "ostrya-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "futures-io",
  "futures-lite",
@@ -1743,7 +1744,7 @@ dependencies = [
 
 [[package]]
 name = "ostrya-fetch"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "futures-io",
  "futures-lite",
@@ -1762,11 +1763,11 @@ dependencies = [
 
 [[package]]
 name = "ostrya-gvariant"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "ostrya-remote"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "futures-io",
  "futures-lite",
@@ -1781,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "ostrya-rt"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "futures-io",
  "futures-lite",
@@ -1791,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "ostrya-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "futures-io",
  "futures-lite",
@@ -1806,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "ostrya-sign"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ed25519-dalek",
  "futures-lite",
@@ -1819,7 +1820,7 @@ dependencies = [
 
 [[package]]
 name = "ostrya-sys"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rustix",
 ]
@@ -2689,6 +2690,16 @@ name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
+
+[[package]]
+name = "terminal_size"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "thiserror"

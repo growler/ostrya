@@ -1,0 +1,52 @@
+.TH "OSTRYA\-DIFF" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-diff \- Report the paths that changed between two revisions or directories
+.SH SYNOPSIS
+.nf
+ostrya diff [OPTIONS] [FROM] [TO]
+.fi
+.SH DESCRIPTION
+Report the paths that changed between two revisions or directories.
+.PP
+The command prints one line for each changed path: \fB\%M\fR, \fB\%D\fR, or \fB\%A\fR, four spaces, and the path. The modified paths come first, then the deleted paths, then the added paths. An added directory also gives a line for each entry below it. A deleted directory gives one line. A path of a commit side starts with \fB\%/\fR, and a path of a directory side does not.
+.PP
+With \%\-\-stats, the command prints the object statistics of two commits in place of the path lines. With \%\-\-stats and \%\-\-fs\-diff, it prints the path lines and then the statistics.
+.SH ARGUMENTS
+.TP
+\fIFROM\fR
+The first revision or directory. Required.
+.IP
+An argument that starts with \fB\%/\fR or \fB\%\&./\fR names a directory. Each other argument names a revision. If there is no second argument, the command compares FROM with \fB\%^\fR appended against FROM.
+.TP
+\fITO\fR
+The second revision or directory.
+.SH OPTIONS
+.TP
+\fB\-\-stats\fR
+Print the object counts and the size of the common objects.
+.IP
+The command reads both arguments as revisions. It prints the object count of each commit, the number of objects that both commits hold, and the size of these common objects on disk. Without \%\-\-fs\-diff, the command prints no path lines.
+.TP
+\fB\-\-fs\-diff\fR
+Print the file system diff.
+.IP
+The path lines are the default output. This option is necessary only with \%\-\-stats, to print the path lines before the statistics.
+.TP
+\fB\-\-no\-xattrs\fR
+Do not read the extended attributes of a directory side.
+.IP
+A commit side keeps the extended attributes of its objects.
+.TP
+\fB\-\-owner\-uid\fR \fIUID\fR
+Use this user id as the owner of each file of a directory side.
+.IP
+The option applies only to the second side, and only if that side is a directory. A negative value keeps the user id from the file system. The value is a C integer: decimal, hexadecimal with \fB\%0x\fR, or octal with \fB\%0\fR\&.
+.TP
+\fB\-\-owner\-gid\fR \fIGID\fR
+Use this group id as the owner group of each file of a directory side.
+.IP
+The option applies only to the second side, and only if that side is a directory. A negative value keeps the group id from the file system. The value is a C integer: decimal, hexadecimal with \fB\%0x\fR, or octal with \fB\%0\fR\&.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

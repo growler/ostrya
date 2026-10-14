@@ -70,6 +70,9 @@ use ostrya::{SpkiSigner, SpkiVerifier};
 
 use pcre2::bytes::{CaptureLocations, RegexBuilder};
 
+#[cfg(test)]
+mod man;
+
 /// The command line of the `ostrya` binary: the global options and the
 /// subcommand.
 ///
@@ -79,16 +82,45 @@ use pcre2::bytes::{CaptureLocations, RegexBuilder};
 /// and after the subcommand name. If `--repo` is given in both positions, the
 /// value after the subcommand name wins, as in the `ostree` command.
 #[derive(Parser)]
-#[command(name = "ostrya", about, long_about = None)]
+#[command(
+    name = "ostrya",
+    about,
+    long_about = concat!(
+        env!("CARGO_PKG_DESCRIPTION"),
+        ".\n\n",
+        "ostrya reads and writes ostree repositories. A repository keeps file \
+         trees as commits. Each file, directory, and commit is stored as \
+         objects, and the SHA-256 checksum of an object is its name. A ref is \
+         a name that points to a commit. The on-disk format is the format of \
+         the `ostree` command.\n\n",
+        "Each subcommand operates on one repository. The command finds the \
+         repository in this order: the --repo option, the current directory, \
+         and the `OSTREE_REPO` environment variable. Run `ostrya <COMMAND> \
+         --help` to see the options of a subcommand."
+    )
+)]
 struct Cli {
-    /// The repository to operate on. The option is accepted before and after
-    /// the subcommand name, and the value after the name wins. Without it,
-    /// the command opens the current directory if it is a repository, and
-    /// else the path in `OSTREE_REPO`. `init` reuses a repository that it
-    /// finds this way, and creates a new one only at an explicit --repo.
+    /// The path of the repository to operate on.
+    ///
+    /// The option is accepted before and after the subcommand name. If both
+    /// positions give a value, the value after the name wins. Without this
+    /// option, the command opens the current directory if it is a repository.
+    /// Else it opens the path in `OSTREE_REPO` if that path is a repository.
+    /// If no source gives a repository, the command prints its usage text and
+    /// `error: Command requires a --repo argument`, then exits 1.
+    ///
+    /// `init` creates a new repository only at an explicit --repo. Without the
+    /// option, `init` reuses a repository that it finds in the current
+    /// directory or at `OSTREE_REPO`. Each other subcommand exits 1 if an
+    /// explicit --repo does not open as a repository.
     #[arg(long, global = true)]
     repo: Option<PathBuf>,
-    /// Print debug information during command processing.
+    /// Write extra information to standard error.
+    ///
+    /// Most subcommands write the line `ostrya: using repository PATH` when
+    /// they open the repository. `push` and `push-tree` also write a
+    /// statistics line after the push. `receive` and `send` write nothing
+    /// more.
     #[arg(short, long, global = true)]
     verbose: bool,
     /// Print version information and exit.
@@ -106,66 +138,315 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 enum Command {
     /// Initialize a new empty repository.
+    ///
+    /// The command creates the directory at the --repo path if it does not
+    /// exist. The parent directory must exist. Then the command writes the
+    /// directories of the repository layout and the `config` file. The
+    /// `[core]` group of `config` holds `repo_version=1`, `mode`, and
+    /// `collection-id` if --collection-id is given.
+    ///
+    /// The command is idempotent. It keeps each part of the layout that
+    /// exists. If the `config` file exists, the command keeps it unchanged,
+    /// and the repository keeps its mode and its collection id. Without
+    /// --repo, the command reuses a repository in the current directory or at
+    /// `OSTREE_REPO`. It prints nothing on success.
     Init(InitArgs),
     /// Commit a tree into the repository and print the new commit checksum.
+    ///
+    /// The command reads one or more tree sources: a directory, a tar
+    /// archive, or a committed tree. With no --tree option and no PATH, it
+    /// reads a tar stream from standard input. It writes the objects of the
+    /// tree and the commit object. If signing options name keys, it signs the
+    /// commit. Then it points the --branch ref at the new commit.
+    ///
+    /// The command needs --branch or --orphan. Without --parent, the current
+    /// tip of the branch is the parent. On success, standard output carries
+    /// the commit checksum, or the --table-output block. If the command
+    /// refuses its input, it exits 1 and moves no ref.
     Commit(CommitArgs),
     /// Check a commit out onto the file system, or write its composefs image.
+    ///
+    /// The command writes the tree of COMMIT into DESTINATION. It applies the
+    /// owner, the mode, and the extended attributes that the commit records.
+    /// -U applies no owner and no extended attributes. A regular file is a
+    /// hardlink to its loose object if the repository mode and the checkout
+    /// mode permit it. Otherwise it is a copy. Without a union option, an
+    /// existing entry at the path of a tree entry is an error.
+    ///
+    /// --composefs and --composefs-noverity write one EROFS image file at
+    /// DESTINATION, and no tree. --from-stdin and --from-file read a stream of
+    /// (REFSPEC, SUBPATH) pairs, and check out each pair into one destination.
+    /// The command prints nothing.
     Checkout(CheckoutArgs),
     /// Write the tree of a commit as a tar stream, to stdout or to --output.
+    ///
+    /// The stream holds the files of the tree and no ostree objects. The root
+    /// directory is the member `./`, and the other member names are relative
+    /// paths. Ownership is numeric, and each timestamp is the commit
+    /// timestamp. The extended attributes are `SCHILY.xattr.*` records, which
+    /// --no-xattrs removes. The first regular file of a content object goes
+    /// into the stream in full, and each later file of that object is a tar
+    /// hardlink to it.
     Export(ExportArgs),
     /// List, create, or delete refs.
+    ///
+    /// Without an option, the command prints the local refs and the remote
+    /// refs, one on each line, sorted by refspec. A remote ref prints as
+    /// `remote:name`. Each PREFIX keeps the refs equal to it or below it, and
+    /// the output groups the rows by PREFIX in the order given. -A lists the
+    /// aliases, and -c lists the collection refs. --create and --delete write
+    /// the refs and print nothing. --create wins over --delete.
     Refs(RefsArgs),
     /// Print the commit checksum that a revision names.
+    ///
+    /// The command prints one 64-character checksum on each line, one for each
+    /// REV, in order. A revision that does not resolve is an error. --single
+    /// prints the one commit object of the repository and takes no REV.
     #[command(name = "rev-parse")]
     RevParse(RevParseArgs),
     /// Write the content of files of a commit to stdout.
+    ///
+    /// The command writes the bytes of each PATH in order, with no separator.
+    /// It follows a symlink in the last component of a PATH. A directory, or a
+    /// PATH that names nothing, is an error.
     Cat(CatArgs),
-    /// Output a metadata object.
+    /// Print the report of an object, or one part of its commit metadata.
+    ///
+    /// For a commit, a dirtree, or a dirmeta, the command prints the object
+    /// type and the checksum. A commit then gets its report: the parent, the
+    /// content checksum, the date in UTC, the `version` metadata key if
+    /// present, the subject, and the body. The GPG signatures of the commit
+    /// follow, if it has any. For a file object, the command prints its
+    /// header: the file type, the size or the symlink target, the mode, the
+    /// owner, and the extended attributes.
+    ///
+    /// The report options exclude each other. If the command line holds more
+    /// than one, the first in this order wins:
+    /// --print-detached-metadata-key, --print-metadata-key,
+    /// --list-detached-metadata-keys, --list-metadata-keys, --print-related,
+    /// --print-variant-type, and --print-sizes.
     Show(ShowArgs),
     /// Show the log that starts at a commit or ref.
+    ///
+    /// The command walks the parent chain, newest first. For each commit, it
+    /// prints `commit <checksum>` and the commit report of `show`. If the
+    /// object of a parent commit is not in the repository, the command prints
+    /// `<< History beyond this commit not fetched >>` and exits 0.
     Log(LogArgs),
     /// List the file paths of a commit.
+    ///
+    /// The command prints one line for each entry: the type and the permission
+    /// bits, the uid, the gid, the size, and the path. A symlink adds
+    /// ` -> <target>`. The type is `d` for a directory, `-` for a regular
+    /// file, and `l` for a symlink. A directory prints its own line, then its
+    /// files, then its subdirectories, each in name order.
     Ls(LsArgs),
     /// Read or write a repository configuration value.
+    ///
+    /// The command reads and writes the `config` file of the repository. `get`
+    /// prints the value and a newline. `set` and `unset` print nothing. A
+    /// missing group or key is an error for `get`.
     Config(ConfigArgs),
     /// Manage the configured remotes and their trusted GPG keys.
+    ///
+    /// Each remote is a `[remote "NAME"]` section in the `config` file of the
+    /// repository. The trusted GPG keyring of a remote is the file
+    /// `NAME.trustedkeys.gpg` at the root of the repository. A nested
+    /// subcommand is necessary. Without one, the command fails before it
+    /// opens the repository.
     Remote(RemoteArgs),
     /// Delete the objects that no ref or commit of the repository reaches.
+    ///
+    /// The walk starts from each ref and from each commit in the store. The
+    /// command deletes each loose object that the walk does not reach.
+    /// --refs-only, --only-branch, --retain-branch-depth, and
+    /// --keep-younger-than start the walk from the refs alone. The depth and
+    /// date options then limit the history of each ref. The commits that the
+    /// metadata keys of the config key `[ex-ostrya] gc-root-metadata-keys`
+    /// name are also roots.
+    ///
+    /// The command also deletes each static delta whose target commit it
+    /// deleted. A run with neither --no-prune nor --static-deltas-only also
+    /// deletes each static delta and each `state/<commit>.commitpartial`
+    /// marker whose commit is not in the store. If `[core] tombstone-commits`
+    /// is true, the command writes a `.tombstone-commit` for each deleted
+    /// commit.
+    ///
+    /// The command prints the total number of objects. It then prints the
+    /// number of deleted objects and the freed size, or
+    /// `No unreachable objects`. If `[core] locking` is false, the command
+    /// takes no repository lock and prints a warning on standard error.
     Prune(PruneArgs),
     /// Verify object integrity and completeness across every commit.
+    ///
+    /// The command loads the commit of each ref, lists each commit in the
+    /// store, and reads each object that these commits reach. Each object must
+    /// be present, and its checksum must equal its name. The command skips
+    /// each commit that has a `state/<commit>.commitpartial` marker, and
+    /// prints the number of these commits.
+    ///
+    /// The walk runs to its end and writes each finding on standard error. A
+    /// ref to a missing commit, a missing dirtree, or a failed binding check
+    /// ends the run early. If the command finds an error or skips a partial
+    /// commit, it exits 1.
     Fsck(FsckArgs),
     /// Report the paths that changed between two revisions or directories.
+    ///
+    /// The command prints one line for each changed path: `M`, `D`, or `A`,
+    /// four spaces, and the path. The modified paths come first, then the
+    /// deleted paths, then the added paths. An added directory also gives a
+    /// line for each entry below it. A deleted directory gives one line. A
+    /// path of a commit side starts with `/`, and a path of a directory side
+    /// does not.
+    ///
+    /// With --stats, the command prints the object statistics of two commits
+    /// in place of the path lines. With --stats and --fs-diff, it prints the
+    /// path lines and then the statistics.
     Diff(DiffArgs),
     /// Add, verify, or delete signatures on a commit.
+    ///
+    /// The signatures are in the detached metadata of the commit. Without
+    /// --verify or --delete, the command signs the commit once for each key and
+    /// prints nothing. With --verify, it prints one line for each signature and
+    /// a final verdict, and exits 1 if no signature is valid. With --delete, it
+    /// removes the signatures that match the KEY-IDs and prints their count.
+    /// An ed25519 or spki verify with no key source reads the system key
+    /// directories `/etc/ostree` and `/usr/share/ostree`.
     Sign(SignArgs),
     /// Regenerate, sign, or verify the repository summary.
+    ///
+    /// With -u, the command writes `summary` from the refs of the repository
+    /// and signs it with the given keys. With --verify, it verifies the
+    /// signatures in `summary.sig`, and --verify takes precedence over -u.
+    /// Without these two options, a KEY-ID or a --keys-file signs the existing
+    /// summary. The read options --raw, -v, --list-metadata-keys, and
+    /// --print-metadata-key print the local summary. If no option gives an
+    /// action, the command exits 1.
     Summary(SummaryArgs),
     /// List, generate, apply, or index static deltas.
+    ///
+    /// A static delta carries the objects that a target commit reaches and its
+    /// source commit does not reach. A delta from scratch has no source commit.
+    /// The `deltas/` tree of the repository holds the deltas. The
+    /// `delta-indexes/` cache lists them for a pull. The nested subcommands
+    /// also show, delete, and verify one delta. Without a nested subcommand,
+    /// the command reports `No command specified` and exits 1.
     #[command(name = "static-delta")]
     StaticDelta(StaticDeltaArgs),
-    /// Fetch refs and their objects from a remote over HTTP or ssh. The pull
-    /// uses ssh if the pull-url of the remote is an ssh address.
+    /// Fetch refs and their objects from a remote over HTTP or ssh.
+    ///
+    /// The address is --url, else the `pull-url` key of the remote, else its
+    /// `url` key. An address that starts with `ssh://`, or that holds no
+    /// `://`, is an ssh address, and the pull runs the ssh client. The remote
+    /// command is `ostrya send`, or the `send-command` key of the remote. Each
+    /// other address goes to the HTTP fetcher, which takes `http` and `https`
+    /// alone. The `url` key cannot hold an ssh address.
+    ///
+    /// The pull stores the objects in one transaction, and then writes each
+    /// ref under `refs/remotes/<remote>/`, or under `refs/heads/` with
+    /// --mirror. It verifies the signatures that the config of the remote or
+    /// the verify options ask for. The pull does not store the detached
+    /// metadata keys that `[ex-ostrya] detached-metadata-exclude` names.
+    ///
+    /// On success, the command prints one statistics line to standard output.
+    /// If standard output is a terminal, a progress line shows while the pull
+    /// runs, and the statistics line is drawn over it.
     Pull(PullArgs),
     /// Import refs and their objects from another local repository.
+    ///
+    /// The command opens SRC_REPO and imports each ref, the commits that
+    /// --depth reaches, and the objects that these commits reach. When the
+    /// link is possible, the pull hardlinks an object of the source into this
+    /// repository. The pull writes local refs, or remote refs under --remote.
+    /// It drops the detached metadata keys that
+    /// `[ex-ostrya] detached-metadata-exclude` names.
+    ///
+    /// On success, the command prints one statistics line to standard output:
+    /// `M metadata, C content objects imported; SIZE content written`. Under
+    /// --require-static-deltas, the line has the form of a pull from a
+    /// remote. The command writes no progress line.
     #[command(name = "pull-local")]
     PullLocal(PullLocalArgs),
     /// Receive one push session over standard input and standard output.
+    ///
+    /// By default, `ostrya push` runs this command on the server over ssh. The
+    /// receive policy comes from the repository config, or from the file of
+    /// --policy. Standard output carries the frames of the session alone. For
+    /// each warning of the session, the command writes one
+    /// `warning: STEP: MESSAGE` line to standard error. It writes nothing
+    /// else, also under --verbose. The exit status is 0 after a committed
+    /// session, also with warnings, and 1 otherwise.
     #[cfg(feature = "receive")]
     Receive(ReceiveArgs),
     /// Push commits to a remote over ssh or HTTP and update its refs.
+    ///
+    /// The command resolves REMOTE and sends the objects that the server does
+    /// not have. The server then updates all the refs of the refspecs in one
+    /// transaction. Over ssh, the push runs the ssh client with the receive
+    /// command on the remote side. Over HTTP, the push sends its requests to
+    /// the receive endpoint of `ostrya serve`. The push drops the detached
+    /// metadata keys that `[ex-ostrya] detached-metadata-exclude` names.
+    ///
+    /// On success, standard output carries one line for each ref, in the order
+    /// of the refspecs. A line holds the DST name, the old state, and the new
+    /// state. The old state is a full commit checksum, `(new)`, or `(absent)`.
+    /// The new state is a full commit checksum, `(unchanged)`, or `(deleted)`.
+    ///
+    /// Under --verbose, one statistics line goes to standard error. If
+    /// standard error is a terminal and `TERM` is set and is not `dumb`,
+    /// standard error shows a progress bar while the push runs. On failure,
+    /// the command writes `error: MESSAGE` to standard error and nothing to
+    /// standard output, and exits 1.
     #[cfg(feature = "push")]
     Push(PushArgs),
-    /// Push a directory to a remote as one commit and set its refs. The
-    /// transport is ssh or HTTP.
+    /// Push a directory as one commit over ssh or HTTP and set the remote refs.
+    ///
+    /// The command walks DIR, builds one commit over it, and sends the objects
+    /// that the server does not have. The server sets each -b ref to the
+    /// commit in one transaction. The commit holds no extended attributes. The
+    /// option names and the value forms are those of `commit`.
+    ///
+    /// The command makes its checks before the ssh client starts or the first
+    /// HTTP request goes. It resolves REMOTE before it reads the signing keys
+    /// and --body-file. A refusal of the remote thus starts no gpg and reads
+    /// no body file.
+    ///
+    /// On success, standard output carries the commit checksum alone. Under
+    /// --verbose, one statistics line goes to standard error. On a terminal,
+    /// standard error shows the progress bar of `push` while the push runs. On
+    /// failure, the command writes `error: MESSAGE` to standard error and
+    /// nothing to standard output, and exits 1.
     #[cfg(feature = "push")]
     #[command(name = "push-tree")]
     PushTree(PushTreeArgs),
     /// Serve the repository over HTTP as an archive repository for pull.
-    /// Without --read-only, the server also has the receive endpoint of a
-    /// push.
+    ///
+    /// The repository can be in any mode that ostrya reads. In a mode other
+    /// than `archive`, the server builds each `.filez` object on request. The
+    /// server also answers the ref listing at `/_ostrya/refs/v1`. Without
+    /// --read-only, the server also has the receive endpoint of a push, and
+    /// the command needs a method of push authentication.
+    ///
+    /// When all listeners are bound, the command writes the URL of each
+    /// listener to standard output, one line each. Then it serves until the
+    /// process ends. For each push session that commits, the command writes
+    /// one `warning: STEP: MESSAGE` line to standard error for each warning
+    /// of the session.
     #[cfg(feature = "serve")]
     Serve(ServeArgs),
     /// Serve one pull session over standard input and standard output.
+    ///
+    /// An ssh pull runs this command on the remote side. The command answers
+    /// each `Get` path as the archive view of `ostrya serve` answers a `GET` of
+    /// that path. It takes no lock and writes no file in the repository.
+    ///
+    /// Standard output carries the frames of the session alone. On failure,
+    /// the command writes `error: MESSAGE` to standard error. It writes
+    /// nothing else, also under --verbose. It exits 0 when standard input ends
+    /// at a frame boundary, and 1 after an `Error` frame or a failed write.
+    ///
+    /// An `authorized_keys` entry with `command="ostrya send --repo=PATH"`
+    /// limits an ssh key to a pull from one repository.
     #[cfg(feature = "send")]
     Send,
 }
@@ -251,12 +532,21 @@ impl Command {
 
 #[derive(Args)]
 struct InitArgs {
-    /// The repository mode: archive (an alias for archive-z2), archive-z2,
-    /// bare, bare-user, bare-user-only, or bare-user-shared, an ostrya
-    /// extension.
+    /// The storage mode of the new repository.
+    ///
+    /// The values are `archive`, `archive-z2`, `bare`, `bare-user`,
+    /// `bare-user-only`, and `bare-user-shared`. `archive` is an alias for
+    /// `archive-z2`, and the `config` file records `archive-z2`.
+    /// `bare-user-shared` is an ostrya extension. The command refuses any
+    /// other value and exits 1. A repository that exists keeps its mode.
     #[arg(long, default_value = "bare")]
     mode: String,
     /// A globally unique id for this repository as a collection of refs.
+    ///
+    /// The command writes the value to `[core] collection-id` in the `config`
+    /// file. A repository that exists keeps its `config` file unchanged.
+    /// `commit` records this id in the `ostree.collection-binding` metadata
+    /// key of each commit, unless --no-bindings is given.
     #[arg(long = "collection-id")]
     collection_id: Option<String>,
 }
@@ -264,242 +554,521 @@ struct InitArgs {
 #[derive(Args)]
 struct CommitArgs {
     /// The parent commit (a checksum or a ref), or `none` for a root commit.
-    /// Without this option, the current tip of the branch is the parent.
+    ///
+    /// Without this option, the current tip of the branch is the parent,
+    /// unless --orphan is given. A branch that names no ref gives a root
+    /// commit. Only the lowercase `none` asks for a root commit, and each
+    /// other value is a revision.
     #[arg(long)]
     parent: Option<String>,
     /// Point this branch at the new commit and bind it into the commit.
+    ///
+    /// The command needs --branch or --orphan. The branch name goes into the
+    /// `ostree.ref-binding` metadata key, unless --no-bindings is given. The
+    /// command refuses a name that the ref-name rule refuses, and a name of
+    /// 64 lowercase hexadecimal characters. It checks the name after it reads
+    /// the tree. A refused name gives no new object and no ref.
     #[arg(short, long)]
     branch: Option<String>,
-    /// Commit with no parent, and permit a commit that names no branch.
+    /// Take no implicit parent, and permit a commit that names no branch.
+    ///
+    /// The commit has no parent unless --parent names one. Without --branch,
+    /// the command moves no ref. Without --branch and --bind-ref, the
+    /// `ostree.ref-binding` key holds an empty list.
     #[arg(long)]
     orphan: bool,
     /// The commit subject.
+    ///
+    /// Without this option and without --editor, the subject is empty. With
+    /// --editor, the value goes into the editor file, and the edit replaces
+    /// it.
     #[arg(short, long)]
     subject: Option<String>,
-    /// The commit body. If the option occurs more than once, the last value
-    /// wins.
+    /// The commit body.
+    ///
+    /// If the option occurs more than once, the last value wins. --body-file
+    /// wins over this option, and --editor replaces both. Without --body,
+    /// --body-file, and --editor, the body is empty.
     #[arg(short = 'm', long, value_name = "BODY", overrides_with = "body")]
     body: Option<String>,
-    /// Read the commit body from this file. This option wins over --body.
+    /// Read the commit body from this file.
+    ///
+    /// This option wins over --body in either order. The full file becomes
+    /// the body, byte for byte. The file must be valid UTF-8 with no NUL
+    /// byte, and 128 MiB or less. If the option occurs more than once, the
+    /// last value wins. --editor replaces the body.
     #[arg(short = 'F', long, value_name = "FILE", overrides_with = "body_file")]
     body_file: Option<PathBuf>,
-    /// Write the subject and the body in an editor. The editor text replaces
-    /// both.
+    /// Write the subject and the body in an editor.
+    ///
+    /// The editor text replaces both. The command runs the first of
+    /// `OSTREE_EDITOR`, `VISUAL`, and `EDITOR` that is set, else `vi`, through
+    /// `/bin/sh -c`. The command ignores each line that starts with `#`. The
+    /// first line that is not blank is the subject, and the lines after it
+    /// are the body. An empty subject, or a non-zero exit of the editor,
+    /// stops the commit. The command runs the editor before it reads the
+    /// tree, and holds no repository lock during the edit.
     #[arg(short = 'e', long)]
     editor: bool,
     /// Do not write any ref bindings.
+    ///
+    /// The commit then has no `ostree.ref-binding` key and no
+    /// `ostree.collection-binding` key.
     #[arg(long)]
     no_bindings: bool,
     /// Bind this ref name into the commit beside the branch.
+    ///
+    /// The option can occur more than once. The `ostree.ref-binding` key holds
+    /// the --branch name and each --bind-ref name, sorted byte by byte. The
+    /// command moves no ref for a --bind-ref name.
     #[arg(long = "bind-ref", value_name = "BRANCH")]
     bind_ref: Vec<String>,
     /// Add a string-valued key to the commit metadata.
+    ///
+    /// The argument splits at its first `=`, so the value can hold `=`. The
+    /// option can occur more than once, and a repeated key stays as a
+    /// separate entry. The command refuses an argument with no `=` and an
+    /// empty key. The metadata holds these entries first, then the
+    /// --add-metadata entries, then the --keep-metadata entries.
     #[arg(long, value_name = "KEY=VALUE")]
     add_metadata_string: Vec<String>,
-    /// Add a key to the commit metadata, with the value in the GVariant text
-    /// form.
+    /// Add a key to the commit metadata, with a value in GVariant text form.
+    ///
+    /// The argument splits at its first `=`. The type of the value comes from
+    /// the text. The command refuses an argument with no `=`, a value that
+    /// does not parse, and an empty key. A repeated key stays as a separate
+    /// entry.
     #[arg(long, value_name = "KEY=VALUE")]
     add_metadata: Vec<String>,
     /// Carry this metadata key over from the parent commit.
+    ///
+    /// The value keeps its bytes. The option needs a parent, from --parent or
+    /// from the tip of --branch. The command refuses a key that the parent
+    /// does not hold.
     #[arg(long, value_name = "KEY")]
     keep_metadata: Vec<String>,
     /// Add a string-valued key to the detached commit metadata.
+    ///
+    /// The argument splits at its first `=`. These entries replace all
+    /// detached metadata of the commit, so a signature that an earlier run
+    /// left on the same commit checksum goes. The signatures of this run come
+    /// after these entries.
     #[arg(long, value_name = "KEY=VALUE")]
     add_detached_metadata_string: Vec<String>,
-    /// Force owner 0:0, canonicalize modes to `perm & 0755`, and drop xattrs.
-    /// The commit then does not depend on the owner or on the host.
+    /// Record owner 0:0, modes of `perm & 0755`, and no extended attributes.
+    ///
+    /// The commit then does not depend on the owner or on the host. A symlink
+    /// keeps its mode. The mode reduction applies after --mode-ro-executables
+    /// and --statoverride. The command refuses a non-zero --owner-uid or
+    /// --owner-gid with this switch.
     #[arg(long)]
     canonical_permissions: bool,
     /// Set the user id of the owner of the committed files.
+    ///
+    /// The value is a C `int` in decimal, in hexadecimal with `0x`, or in
+    /// octal with a leading `0`. A negative value keeps the owner of the
+    /// source. The command refuses a value that does not parse before it
+    /// opens the repository.
     #[arg(long, value_name = "UID", allow_hyphen_values = true)]
     owner_uid: Option<String>,
     /// Set the group id of the owner of the committed files.
+    ///
+    /// The value is a C `int` in decimal, in hexadecimal with `0x`, or in
+    /// octal with a leading `0`. A negative value keeps the group of the
+    /// source. The command refuses a value that does not parse before it
+    /// opens the repository.
     #[arg(long, value_name = "GID", allow_hyphen_values = true)]
     owner_gid: Option<String>,
     /// Do not import extended attributes.
     #[arg(long)]
     no_xattrs: bool,
-    /// A file with the mode changes to make, one
-    /// `[=]<decimal mode> <absolute in-tree path>` per line.
+    /// Change the modes of the paths that this file lists.
+    ///
+    /// Each line is `[=]<decimal mode> <absolute in-tree path>`. All text
+    /// after the first space is the path, and the command ignores blank
+    /// lines. Without the `=` prefix, the command ORs the value into the mode.
+    /// With the `=` prefix, the value replaces the permission bits. If both
+    /// forms name a path, only the OR value applies. An OR entry for a
+    /// directory below the root applies to a member of a tar archive alone.
+    ///
+    /// The file must be valid UTF-8, and the command refuses a line with no
+    /// space. After the command reads the tree, it refuses an OR entry whose
+    /// path the walk did not reach. It names each such path on standard
+    /// error. If the option occurs more than once, the last value wins.
     #[arg(long, value_name = "PATH", overrides_with = "statoverride")]
     statoverride: Option<PathBuf>,
     /// A file with the paths to leave out, one absolute in-tree path per line.
-    /// A listed directory prunes its whole subtree.
+    ///
+    /// A listed directory prunes its whole subtree. The command ignores blank
+    /// lines, and the file must be valid UTF-8. After the command reads the
+    /// tree, it refuses a listed path that the walk did not reach. It names
+    /// each such path on standard error. A line `/` prunes every source, so
+    /// the commit holds the --base tree alone, and without --base the command
+    /// refuses the empty tree. If the option occurs more than once, the last
+    /// value wins.
     #[arg(long, value_name = "PATH", overrides_with = "skip_list")]
     skip_list: Option<PathBuf>,
     /// Clear the write bits of every regular file that has an execute bit.
+    ///
+    /// The switch applies before --statoverride, so a --statoverride entry
+    /// sets the final mode of its path.
     #[arg(long)]
     mode_ro_executables: bool,
-    /// If the tree matches the parent commit, print the checksum of the parent
-    /// and write nothing.
+    /// Skip the commit and print the parent checksum if the tree is unchanged.
+    ///
+    /// The command compares the root contents and the root metadata of the
+    /// tree with the parent commit. It does not compare the commit metadata,
+    /// so a new subject alone does not give a new commit. If the tree
+    /// matches, the command writes no commit and moves no ref. With no
+    /// parent, the command writes the commit. With --table-output, the block
+    /// shows the parent checksum and a zero for each count.
     #[arg(long)]
     skip_if_unchanged: bool,
-    /// Find a source file by its inode if it is a hardlink to a content object
-    /// of this repository. The commit then does not read the file.
+    /// Find a source file by its inode among the stored content objects.
+    ///
+    /// If a source file is a hardlink to a loose content object of this
+    /// repository, the command does not read the file. It applies the commit
+    /// modifiers to the metadata of the stored object. If the result differs,
+    /// it writes a new object from the stored content. An `archive`
+    /// repository stores each content object compressed, so the switch has
+    /// no effect there.
     #[arg(long)]
     link_checkout_speedup: bool,
-    /// Use an inode match as the whole identity of a file. The commit
-    /// modifiers then do not apply to that file. This switch implies
+    /// Use an inode match as the whole identity of a file.
+    ///
+    /// The commit modifiers then do not apply to that file, and the stored
+    /// object goes into the commit as it is. This switch implies
     /// --link-checkout-speedup.
     #[arg(short = 'I', long)]
     devino_canonical: bool,
-    /// Override the timestamp of the commit: `@SECONDS` since the Unix epoch,
-    /// or a date and time with a UTC offset (`2020-01-02T03:04:05Z`).
+    /// Set the timestamp of the commit.
+    ///
+    /// The value is `@SECONDS` since the Unix epoch, or a date and time with a
+    /// UTC offset, for example `2020-01-02T03:04:05Z`. The offset is `Z`,
+    /// `+HH`, `+HH:MM`, or `+HHMM`, or one of these forms with `-`. The
+    /// command drops a fractional second, and refuses a value that it cannot
+    /// read. Without this option, the commit uses `SOURCE_DATE_EPOCH` if it is
+    /// set, else the current time.
     #[arg(long, value_name = "TIMESTAMP")]
     timestamp: Option<String>,
-    /// Specify how to invoke fsync() with a boolean word: `true`, `yes`, `1`,
-    /// `false`, `no`, or `0`. The letter case does not matter.
+    /// Set the fsync policy of this commit with a boolean word.
+    ///
+    /// The words are `true`, `yes`, `1`, `false`, `no`, and `0`, in any letter
+    /// case. A false word turns off fsync for this commit. A true word keeps
+    /// the `[core] fsync` value of the repository config, so the option never
+    /// turns on fsync that the config turns off. The command refuses any
+    /// other word before it opens the repository.
     #[arg(long, value_name = "POLICY", allow_hyphen_values = true)]
     fsync: Option<String>,
     /// Report the commit and the object counts in a `KEY: VALUE` block.
-    /// Without this switch, the command prints the checksum alone.
+    ///
+    /// Without this switch, the command prints the checksum alone. The block
+    /// has seven lines in this order: `Commit`, `Metadata Total`,
+    /// `Metadata Written`, `Content Total`, `Content Written`,
+    /// `Content Cache Hits`, and `Content Bytes Written`. The last count is
+    /// the content size of the regular files that the commit wrote, before
+    /// compression.
     #[arg(long)]
     table_output: bool,
-    /// Store the size of each object that the commit reaches in
-    /// `ostree.sizes`. Only an archive repository writes this key.
+    /// Store the sizes of the objects of the commit in `ostree.sizes`.
+    ///
+    /// Only an `archive` repository writes this key. The key holds the
+    /// objects that the last tree source adds, and the directory objects of
+    /// the tree. A content object from an earlier source or from --base is
+    /// not in the key.
     #[arg(long)]
     generate_sizes: bool,
-    /// Store `ostree.linux` and `ostree.bootable`. The command reads them from
-    /// the one kernel directory under `/usr/lib/modules` in the committed
-    /// tree.
+    /// Store `ostree.linux` and `ostree.bootable` in the commit metadata.
+    ///
+    /// The command reads the kernel version from the committed tree. The
+    /// version is the name of the one directory under `/usr/lib/modules` that
+    /// holds a `vmlinuz` entry. The command refuses a tree with no such
+    /// directory, or with more than one. `ostree.bootable` is `true`. The two
+    /// keys come first in the metadata, and replace a value that another
+    /// option gives for the same key.
     #[arg(long)]
     bootable: bool,
-    /// Store the fs-verity digest of the composefs image of the tree in
-    /// `ostree.composefs.digest.v0`.
+    /// Store the composefs image digest of the tree in the commit metadata.
+    ///
+    /// The key is `ostree.composefs.digest.v0`, and the value is the fs-verity
+    /// digest of the image as a byte array. The value depends on the tree
+    /// alone, so each repository mode gives the same digest. It replaces a
+    /// value that --add-metadata-string, --add-metadata, or --keep-metadata
+    /// gives for the same key.
     #[arg(long)]
     generate_composefs_metadata: bool,
-    /// Overlay the given argument as a tree, in command-line order. The option
-    /// can occur more than once.
+    /// Add a tree source: a directory, a tar archive, or a committed tree.
+    ///
+    /// The option can occur more than once. `tar=-` and `tar=/dev/stdin` read
+    /// standard input. The command overlays the sources in command-line
+    /// order. A later source replaces the files of the same name and the
+    /// directory metadata of an earlier source. The command refuses a name
+    /// that is a directory in one source and a file in another. With this
+    /// option, the command ignores PATH.
     #[arg(long, value_name = "dir=PATH or tar=TARFILE or ref=COMMIT")]
     tree: Vec<String>,
-    /// Start from the given commit as a base. No modifiers apply to the base.
-    /// If the option occurs more than once, the last value wins.
+    /// Start from the given commit as a base.
+    ///
+    /// No modifiers apply to the base. The base is the bottom layer at any
+    /// position on the command line, and the tree sources go on top of it. An
+    /// entry that no source changes keeps the mode, the owner, and the
+    /// extended attributes of the base. If the option occurs more than once,
+    /// the last value wins.
     #[arg(long, value_name = "REV", overrides_with = "base")]
     base: Option<String>,
-    /// Consume (delete) the content after the commit, for local directories.
+    /// Delete the files of each directory source while the command reads it.
+    ///
+    /// The command removes each source entry after it records the entry. It
+    /// also removes the entries that --skip-list prunes. Then it removes the
+    /// source directory, unless the path is exactly `.`. A `tar` or `ref`
+    /// source ignores this switch. If a later step fails, the removed files
+    /// stay removed.
     #[arg(long)]
     consume: bool,
     /// Create the missing parent directories of the members of a tar archive.
     #[arg(long)]
     tar_autocreate_parents: bool,
-    /// Apply REGEX,REPLACEMENT to the path names of a tar archive. If the
-    /// option occurs more than once, the last value wins.
+    /// Rename the members of a tar archive with REGEX,REPLACEMENT.
+    ///
+    /// The value splits at its first comma. REGEX is a PCRE2 expression with
+    /// UTF and Unicode properties on. The command replaces each match in the
+    /// path name of each member. In REPLACEMENT, `\0` to `\9`, `\g<name>`,
+    /// and `\g<number>` insert the text of a group, and `\\` inserts a
+    /// backslash. The command reads the value only when it reads a tar
+    /// source. If the option occurs more than once, the last value wins.
     #[arg(
         long,
         value_name = "REGEX,REPLACEMENT",
         overrides_with = "tar_pathname_filter"
     )]
     tar_pathname_filter: Option<String>,
-    /// The GPG key ID to sign the commit with. Each occurrence adds one
-    /// signature under `ostree.gpgsigs`, in command-line order.
+    /// The GPG key ID to sign the commit with.
+    ///
+    /// Each occurrence adds one signature under `ostree.gpgsigs` in the
+    /// detached metadata, in command-line order. The key ID must name exactly
+    /// one secret key, and the command refuses a key ID of less than 8 bytes.
+    /// These signatures come after the --sign and --sign-from-file
+    /// signatures. If a key cannot sign, the command writes no object and
+    /// moves no ref.
     #[arg(long, value_name = "KEY-ID")]
     gpg_sign: Vec<String>,
-    /// The GPG home directory that holds the keyrings. --gpg-sign reads it,
-    /// and so do --sign and --sign-from-file under --sign-type=gpg. It wins
-    /// over GNUPGHOME.
+    /// The GPG home directory that holds the keyrings.
+    ///
+    /// --gpg-sign reads it, and so do --sign and --sign-from-file under
+    /// --sign-type=gpg. It wins over `GNUPGHOME`. Without this option, gpg
+    /// uses its own home directory.
     #[arg(long, value_name = "HOMEDIR")]
     gpg_homedir: Option<PathBuf>,
-    /// Sign the commit with this key. For ed25519 and spki, the key is the
-    /// base64 of the secret key. Each occurrence adds one signature.
+    /// Sign the commit with this key.
+    ///
+    /// For `ed25519` and `spki`, the key is the base64 of the secret key. An
+    /// `ed25519` secret key is 64 bytes: the 32-byte seed, then the 32-byte
+    /// public key. For `gpg`, the key is a key ID. Each occurrence adds one
+    /// signature. --sign-type selects the engine. The command reads every key
+    /// before it makes the first signature, so a bad key gives no signature.
+    /// The order is the --sign keys, then the --sign-from-file keys, then the
+    /// --gpg-sign keys.
     #[arg(long, value_name = "KEY_ID")]
     sign: Vec<String>,
-    /// Sign the commit with the key on the first line of this file. Each
+    /// Sign the commit with the key on the first line of this file.
+    ///
+    /// The command ignores the rest of the file. A NUL byte ends the line, and
+    /// the command refuses a first line of more than 65536 bytes. Each
     /// occurrence adds one signature. The command refuses an empty path with
     /// a message of its own.
     #[arg(long, value_name = "PATH")]
     sign_from_file: Vec<std::ffi::OsString>,
-    /// The signature type to use. The default is 'ed25519'. If the option
-    /// occurs more than once, the last value wins.
+    /// The signature engine of --sign and --sign-from-file.
+    ///
+    /// The names are `ed25519`, `spki`, and `gpg`, and the default is
+    /// `ed25519`. The match is case sensitive, and the command refuses any
+    /// other name. The command reads this option only if --sign or
+    /// --sign-from-file names a key. If the option occurs more than once, the
+    /// last value wins.
     #[arg(long, value_name = "NAME", overrides_with = "sign_type")]
     sign_type: Option<String>,
-    /// The tree to commit. If a --tree option is present, the command ignores
-    /// this argument. It also ignores each argument after the first. With no
-    /// --tree option and no PATH, the command reads a tar stream from stdin.
+    /// The directory to commit.
+    ///
+    /// If a --tree option is present, the command ignores this argument. It
+    /// also ignores each argument after the first. With no --tree option and
+    /// no PATH, the command reads a tar stream from standard input. The
+    /// command refuses a symlink to a directory.
     path: Vec<PathBuf>,
 }
 
 #[derive(Args)]
 struct CheckoutArgs {
-    /// Refuse an entry that needs a copy. Without this switch, the checkout
-    /// falls back to a copy.
+    /// Refuse each entry that the checkout must copy.
+    ///
+    /// Without this switch, the checkout falls back to a copy. A regular file
+    /// of non-zero length needs a copy in an `archive` repository, in a `bare`
+    /// repository under -U, and in a `bare-user` repository without -U. A
+    /// symlink is refused in an `archive` repository, and in a `bare`
+    /// repository under -U. A directory and a zero-length file never need a
+    /// copy. The checkout also refuses a destination directory on a different
+    /// file system than the repository. The refusal comes at the entry, so the
+    /// entries that the checkout wrote before it stay in the destination.
     #[arg(short = 'H', long)]
     require_hardlinks: bool,
-    /// Copy every object, and make no hardlink. The copy path still uses
-    /// reflinks.
+    /// Copy every object, and make no hardlink.
+    ///
+    /// Outside an `archive` repository, a copy first tries a reflink of the
+    /// loose object. If the reflink fails, the copy writes the bytes. This
+    /// switch conflicts with -H/--require-hardlinks.
     #[arg(short = 'C', long, conflicts_with = "require_hardlinks")]
     force_copy: bool,
     /// Reduce every directory that the checkout creates to `mode & 0775`.
+    ///
+    /// A directory that the checkout reuses under a union option keeps its own
+    /// mode. The switch has no effect on regular files and symlinks.
     #[arg(short = 'M', long)]
     bareuseronly_dirs: bool,
-    /// Do not update or use the uncompressed object cache of the repository.
-    /// ostrya keeps no such cache, so this switch has no effect.
+    /// Do not update or use the uncompressed object cache (no effect).
+    ///
+    /// ostrya keeps no such cache, so this switch has no effect on the
+    /// destination.
     #[arg(long)]
     disable_cache: bool,
     /// Do not change file ownership or initialize extended attributes.
+    ///
+    /// A regular file that the checkout copies loses its setuid and setgid
+    /// bits, and keeps its sticky bit. A hardlinked file keeps the mode of the
+    /// object inode. A directory keeps all its mode bits. In a `bare-user`
+    /// repository, this switch lets the checkout hardlink regular files. A
+    /// `bare-user-only` repository always gets this checkout mode.
     #[arg(short = 'U', long)]
     user_mode: bool,
     /// Check out only this path of the commit.
+    ///
+    /// If PATH names a directory, the destination root gets the metadata of
+    /// that directory. If PATH names a file or a symlink, the checkout creates
+    /// the destination directory and puts the entry in it under its own name.
+    /// If PATH names nothing and --allow-noent is not given, the command
+    /// fails. With --from-stdin or --from-file, the command ignores this
+    /// option, and each record gives the subpath. A composefs image always
+    /// holds the full commit tree.
     #[arg(long, value_name = "PATH")]
     subpath: Option<PathBuf>,
-    /// Keep existing directories, overwrite existing files, and add new
-    /// entries.
+    /// Keep existing directories, overwrite existing files, add new entries.
+    ///
+    /// An existing entry that the tree does not hold stays in place. An
+    /// existing directory where the tree holds a file or a symlink is an
+    /// error, and so is an existing regular file where the tree holds a
+    /// directory. With --whiteouts, the checkout removes such an entry
+    /// and writes the tree entry in its place. Without a union option, an
+    /// existing entry at the path of a tree entry is an error. If the command
+    /// line holds two union options, the command fails.
     #[arg(long)]
     union: bool,
-    /// Keep every existing entry and add only the entries that do not exist.
+    /// Keep every existing entry, and add only the entries that do not exist.
     #[arg(long)]
     union_add: bool,
-    /// Add new entries, and keep an existing entry that is identical to its
-    /// object. A different existing entry is an error. This switch requires
-    /// `-H/--require-hardlinks`.
+    /// Add new entries, and keep an existing entry that matches the tree.
+    ///
+    /// An existing entry that does not match is an error. A regular file
+    /// matches if it is the inode of the loose object. It also matches if it
+    /// has the file object checksum and the permission bits of the object. A
+    /// symlink matches if its target is the same. An existing directory stays
+    /// with no comparison. This switch requires `-H/--require-hardlinks`.
     #[arg(long)]
     union_identical: bool,
-    /// Process Docker-style whiteout entries. `.wh.<name>` removes `<name>`
-    /// from the destination, and `.wh..wh..opq` clears the destination
-    /// directory. The checkout writes neither marker.
+    /// Process Docker-style whiteout entries.
+    ///
+    /// A `.wh.<name>` entry removes `<name>` from the destination, and a
+    /// `.wh..wh..opq` entry clears the destination directory. The checkout
+    /// writes neither marker. Only a regular-file entry acts as a marker. A
+    /// marker named `.wh.` alone is an error. With --union, this switch also
+    /// lets the checkout replace an existing entry of a different type.
     #[arg(long)]
     whiteouts: bool,
-    /// Turn a `.ostree-wh.<name>` entry into an overlayfs whiteout: a
-    /// character device 0:0 at `<name>`.
+    /// Turn a `.ostree-wh.<name>` entry into an overlayfs whiteout.
+    ///
+    /// The whiteout is a character device 0:0 at `<name>`, with the permission
+    /// bits of the marker. The checkout does not write the marker under its
+    /// own name. A marker named `.ostree-wh.` alone is an error.
     #[arg(long)]
     process_passthrough_whiteouts: bool,
     /// If `--subpath` names nothing, write nothing and exit 0.
+    ///
+    /// With --from-stdin or --from-file, the switch applies to the subpath of
+    /// each record, and the stream continues. A subpath through an entry that
+    /// is not a directory is still an error.
     #[arg(long)]
     allow_noent: bool,
-    /// Write the composefs EROFS image of the commit to the destination, and
-    /// no tree.
+    /// Write the composefs EROFS image of the commit to the destination.
+    ///
+    /// The destination is the image file, and the checkout writes no tree.
+    /// The image holds the fs-verity digest of each backed file, unless
+    /// --composefs-noverity is given. The command writes a temporary file in
+    /// the directory of the destination. Then it renames the file over the
+    /// destination, at mode 0644. If the export fails, an existing destination
+    /// stays as it was.
+    ///
+    /// `--subpath` has no effect on the image. With --from-stdin or
+    /// --from-file, each record writes the image of its revision to the
+    /// destination. The command refuses this switch together with --whiteouts,
+    /// --process-passthrough-whiteouts, --skip-list, -H, -C, -M, or
+    /// --disable-cache.
     #[arg(long)]
     composefs: bool,
-    /// Write the composefs EROFS image with no fs-verity digest in it. The two
-    /// composefs switches are independent, and this switch applies in any
-    /// position.
+    /// Write the composefs EROFS image with no fs-verity digest in it.
+    ///
+    /// The two composefs switches are independent, and this switch applies in
+    /// any position. This switch also writes the image without --composefs.
+    /// The other rules of --composefs apply.
     #[arg(long)]
     composefs_noverity: bool,
     /// Read NUL-separated (REFSPEC, SUBPATH) records from standard input.
-    /// Check out each pair into the destination that the first positional
-    /// names.
+    ///
+    /// The command checks out each pair into the destination that the first
+    /// positional names, and ignores the second positional and --subpath. An
+    /// empty REFSPEC record ends the stream. A REFSPEC with no record after it
+    /// names the whole tree. Each pair writes with the overwrite mode of the
+    /// command line, so the pairs layer under --union. If a pair fails, the
+    /// run stops, and the pairs before it stay written. The command refuses a
+    /// stream larger than 128 MiB.
     #[arg(long)]
     from_stdin: bool,
-    /// Read the same records from FILE. If the option occurs more than once,
-    /// the last value wins. --from-stdin wins over this option in any
-    /// command-line order.
+    /// Read NUL-separated (REFSPEC, SUBPATH) records from FILE.
+    ///
+    /// The records have the format of --from-stdin. If the option occurs more
+    /// than once, the last value wins. --from-stdin wins over this option in
+    /// any command-line order. The command refuses a file larger than 128 MiB.
     #[arg(long, value_name = "FILE", overrides_with = "from_file")]
     from_file: Option<PathBuf>,
-    /// Specify how to invoke fsync() with a boolean word: `true`, `yes`, `1`,
-    /// `false`, `no`, or `0`. The letter case does not matter.
+    /// Specify how to invoke fsync() with a boolean word.
+    ///
+    /// POLICY is `true`, `yes`, `1`, `false`, `no`, or `0`. The letter case
+    /// does not matter. The policy starts from `[core] fsync` of the
+    /// repository configuration, which is on if the key is absent. `false`
+    /// turns fsync off. `true` keeps the configured policy, so a repository
+    /// with `[core] fsync=false` syncs nothing. With fsync on, the checkout
+    /// syncs each directory and each new regular file. The command reads
+    /// POLICY before it opens the repository, and refuses any other word.
     #[arg(long, value_name = "POLICY", allow_hyphen_values = true)]
     fsync: Option<String>,
-    /// Prune each tree path that FILE names, one path per line. Write a
-    /// directory with a trailing slash. If the option occurs more than once,
-    /// the last value wins.
+    /// Prune each tree path that FILE names, one path per line.
+    ///
+    /// Each path starts with `/` at the checkout root, which is the `--subpath`
+    /// root if one is given. Write a directory with a trailing slash. A
+    /// directory matches only in that form. The path `/` prunes the whole
+    /// tree. Blank lines are ignored, and the command reports no path that
+    /// matches nothing. If the option occurs more than once, the last value
+    /// wins. The command refuses a file larger than 128 MiB, and a file that
+    /// is not UTF-8 or holds a NUL byte.
     #[arg(long, value_name = "FILE", overrides_with = "skip_list")]
     skip_list: Option<PathBuf>,
-    /// The commit to check out (a checksum or a ref). With --from-stdin or
-    /// --from-file, this positional is the destination, and each revision
-    /// comes from the record stream.
+    /// The commit to check out (a checksum or a ref).
+    ///
+    /// With --from-stdin or --from-file, this positional is the destination,
+    /// and each revision comes from the record stream.
     commit: String,
     // The `ostree` command has this arity.
-    /// The destination path. With --from-stdin or --from-file, the first
-    /// positional is the destination, and the command ignores this one.
+    /// The destination directory, or the image file with --composefs.
+    ///
+    /// The parent directory of the destination must exist. With --from-stdin
+    /// or --from-file, the first positional is the destination, and the
+    /// command ignores this one.
     #[arg(required_unless_present_any = ["from_stdin", "from_file"])]
     destination: Option<PathBuf>,
 }
@@ -509,17 +1078,28 @@ struct ExportArgs {
     /// Emit no extended attributes.
     #[arg(long)]
     no_xattrs: bool,
-    /// Export only this directory of the commit, as the archive root. If the
-    /// option occurs more than once, the last value wins.
+    /// Export only this directory of the commit, as the archive root.
+    ///
+    /// PATH must name a directory. A file, a symlink, or a path that names
+    /// nothing is an error. If the option occurs more than once, the last
+    /// value wins.
     #[arg(long, value_name = "PATH", overrides_with = "subpath")]
     subpath: Option<PathBuf>,
-    /// Put PATH in front of every member pathname. If the option occurs more
-    /// than once, the last value wins.
+    /// Put PATH in front of every member pathname.
+    ///
+    /// The command adds no separator after PATH, so a PATH that acts as a
+    /// directory must end in `/`. The name of the root member is PATH with a
+    /// `/` added if PATH does not end in one. The target of a symlink gets no
+    /// prefix. If the option occurs more than once, the last value wins.
     #[arg(long, value_name = "PATH", overrides_with = "prefix")]
     prefix: Option<String>,
-    /// Write the archive to PATH. Without this option, the archive goes to
-    /// standard output. If the option occurs more than once, the last value
-    /// wins.
+    /// Write the archive to PATH, and not to standard output.
+    ///
+    /// The command opens PATH before it resolves the commit. An existing file
+    /// is truncated in place, and keeps its inode and its mode. A new file
+    /// gets mode 0666, reduced by the umask. If the export fails after the
+    /// open, PATH stays truncated. If the option occurs more than once, the
+    /// last value wins.
     #[arg(short = 'o', long, value_name = "PATH", overrides_with = "output")]
     output: Option<PathBuf>,
     // ostrya checks this operand after the repository resolves, in the order
@@ -530,46 +1110,80 @@ struct ExportArgs {
 
 #[derive(Args)]
 struct RefsArgs {
-    /// Delete the refs that each PREFIX matches. The command then lists no
-    /// ref.
+    /// Delete the refs that each PREFIX matches.
+    ///
+    /// The command then lists no ref. At least one PREFIX is required. A
+    /// PREFIX that matches nothing is not an error. With -A, each PREFIX
+    /// selects the aliases that a -A listing prints for it. With -c, each
+    /// PREFIX is a collection id. If an alias names a local ref that a PREFIX
+    /// matches, the command fails, and that PREFIX deletes nothing.
     #[arg(long)]
     delete: bool,
     /// Print the whole name of each ref, with the matched PREFIX in it.
+    ///
+    /// Without this switch, the command prints the part of the name below the
+    /// PREFIX. A ref whose name is equal to the PREFIX prints its whole name.
     #[arg(long)]
     list: bool,
     /// Print the commit checksum of each ref after a tab.
+    ///
+    /// With -A, this switch adds nothing.
     #[arg(short = 'r', long)]
     revision: bool,
-    /// List the aliases alone. With --create, the new ref is an alias.
+    /// List the aliases alone, each as `name -> target`.
+    ///
+    /// If a PREFIX names a ref, the command prints that ref with its commit
+    /// checksum as the target. Each other PREFIX selects the aliases below it.
+    /// With --create, the new ref is an alias. Its target must be a ref, and
+    /// NEWREF must not name a remote ref. -c wins over this switch.
     #[arg(short = 'A', long)]
     alias: bool,
-    /// Create this ref, and point it at the commit that the single PREFIX
-    /// argument names.
+    /// Create the ref NEWREF, and point it at the commit that PREFIX names.
+    ///
+    /// The command line must give exactly one PREFIX argument, which is a
+    /// revision here. If NEWREF exists and --force is not given, the command
+    /// fails. With -A, NEWREF is an alias of the ref that PREFIX names. With
+    /// -c, NEWREF is `<collection-id>:<ref>`, and the command writes a
+    /// collection ref. This option wins over --delete.
     #[arg(long, value_name = "NEWREF")]
     create: Option<String>,
-    /// List collection refs as `(collection-id, ref)` pairs. Each PREFIX is
-    /// then a collection id.
+    /// List collection refs as `(collection-id, ref)` pairs.
+    ///
+    /// Each PREFIX is then a collection id. The local refs carry the
+    /// collection id of the repository. With --delete and the collection id
+    /// of the repository, the command deletes only the local refs. The mirror
+    /// refs with that id stay. This switch wins over -A.
     #[arg(short = 'c', long)]
     collections: bool,
     /// With --create, replace an existing ref.
     #[arg(long)]
     force: bool,
-    /// The ref-name prefixes to match, or the collection ids with
-    /// --collections. With none, the command lists every ref.
+    /// The ref-name prefixes to match, or the collection ids with -c.
+    ///
+    /// A PREFIX matches the ref with that name and each ref below it.
+    /// `<remote>:` matches each ref of the remote. With no PREFIX, the command
+    /// lists every ref. With --create, the one PREFIX is the revision that the
+    /// new ref points at.
     prefix: Vec<String>,
 }
 
 #[derive(Args)]
 struct RevParseArgs {
-    /// Print the one commit of the repository. An empty repository is an
-    /// error, and so is a repository with more than one commit.
+    /// Print the one commit of the repository.
+    ///
+    /// An empty repository is an error, and so is a repository with more than
+    /// one commit. The command refuses a REV argument with this switch.
     #[arg(short = 'S', long)]
     single: bool,
     // ostrya checks this operand after the repository resolves, in the order
     // of the `ostree` command.
-    /// The revisions to resolve: a checksum, a refspec, or either with a
-    /// trailing `^` for each generation of ancestry. Required, unless
-    /// --single is given.
+    /// The revisions to resolve. Required, unless --single is given.
+    ///
+    /// A revision is a full checksum, an abbreviated checksum of 1 to 63
+    /// lowercase hex characters, or a refspec. An abbreviated checksum must
+    /// match exactly one commit. Each trailing `^` steps back one generation
+    /// of ancestry. The command prints one commit checksum for each revision,
+    /// in order.
     rev: Vec<String>,
 }
 
@@ -577,64 +1191,116 @@ struct RevParseArgs {
 struct CatArgs {
     // ostrya checks this operand and PATH after the repository resolves, in
     // the order of the `ostree` command.
-    /// The commit to read (a checksum or a ref). Required, with at least one
-    /// PATH.
+    /// The commit to read (a checksum or a ref).
+    ///
+    /// COMMIT and at least one PATH are required.
     commit: Option<String>,
     /// The paths to write, in order. A leading `/` is optional.
+    ///
+    /// Each PATH must name a regular file, or a symlink that leads to one. The
+    /// command follows a symlink in the last component, up to 256 links. A
+    /// symlink in another component is an error. A `.` or `..` component
+    /// names nothing. The command stops at the first PATH that fails, and the
+    /// content of the paths before it stays written.
     path: Vec<String>,
 }
 
 #[derive(Args, Default)]
 struct ShowArgs {
     /// Show the "related" commits.
+    ///
+    /// The command prints one `<ref> <checksum>` line for each entry of the
+    /// related-objects array of the commit. An empty array prints nothing.
     #[arg(long)]
     print_related: bool,
     /// Read OBJECT as a file that holds a value of this GVariant type.
+    ///
+    /// The command prints the value in the GVariant text form, with the byte
+    /// order of its numbers converted. -B has no effect here. The command
+    /// refuses a file larger than 16 MiB.
     #[arg(long, value_name = "TYPE")]
     print_variant_type: Option<String>,
-    /// List the available metadata keys.
+    /// List the metadata keys of the commit, one on each line, sorted.
     #[arg(long)]
     list_metadata_keys: bool,
     /// Print the value of one metadata key.
+    ///
+    /// The value prints in the GVariant text form. A key that the commit
+    /// metadata does not hold is an error.
     #[arg(long, value_name = "KEY")]
     print_metadata_key: Option<String>,
-    /// If the key has a byte-array value, print an unquoted hexadecimal
-    /// string.
+    /// Print a byte-array key value as an unquoted hexadecimal string.
+    ///
+    /// This switch applies to --print-metadata-key and
+    /// --print-detached-metadata-key. The hex digits are lowercase. A value of
+    /// another type ignores the switch.
     #[arg(long)]
     print_hex: bool,
-    /// List the available detached metadata keys.
+    /// List the detached metadata keys of the commit, one on each line, sorted.
+    ///
+    /// A commit with no detached metadata is an error.
     #[arg(long)]
     list_detached_metadata_keys: bool,
     /// Print the value of one detached metadata key.
+    ///
+    /// The value prints in the GVariant text form. A commit with no detached
+    /// metadata is an error, and so is a key that it does not hold.
     #[arg(long, value_name = "KEY")]
     print_detached_metadata_key: Option<String>,
-    /// Show the commit size metadata.
+    /// Print the sizes that the `ostree.sizes` metadata of the commit records.
+    ///
+    /// The command prints the compressed size, the unpacked size, and the
+    /// object count. Each is a needed/total pair. The needed values cover the
+    /// objects that the local store does not hold. A commit with no
+    /// `ostree.sizes` key is an error.
     #[arg(long)]
     print_sizes: bool,
     /// Show the raw variant data.
+    ///
+    /// The command prints the value of the object in the GVariant text form,
+    /// after the type line. For a commit, the commit report does not follow.
+    /// For a file object, this switch has no effect.
     #[arg(long)]
     raw: bool,
-    /// Do not convert the variant data from big endian. The command prints
-    /// the raw variant as stored. For a commit, the report of the commit
-    /// follows it.
+    /// Do not convert the variant data from big endian.
+    ///
+    /// The command prints the raw variant as stored. For a commit, the report
+    /// of the commit follows it, also with --raw. The switch also applies to
+    /// the values of --print-metadata-key and --print-detached-metadata-key.
     #[arg(short = 'B', long)]
     no_byteswap: bool,
     /// The GPG home directory that holds the keyrings.
+    ///
+    /// The command reads each `*.gpg` file in HOMEDIR as a keyring, together
+    /// with the `gpgkeys.gpg` file of the repository. It uses these keyrings
+    /// to verify the GPG signatures in the commit report. --gpg-verify-remote
+    /// wins over this option.
     #[arg(long, value_name = "HOMEDIR")]
     gpg_homedir: Option<PathBuf>,
     /// Use the GPG configuration of this remote to verify signatures.
+    ///
+    /// The keyrings are `<remote>.trustedkeys.gpg` in the repository and in
+    /// `/etc/ostree/remotes.d/`, and the global trusted keyrings. The global
+    /// keyrings are the `*.gpg` files in the directory that `OSTREE_GPG_HOME`
+    /// names, or in `/usr/share/ostree/trusted.gpg.d/`.
     #[arg(long, value_name = "REMOTE")]
     gpg_verify_remote: Option<String>,
     // ostrya checks this operand after the repository resolves, in the order
     // of the `ostree` command.
-    /// The object to report: a revision, a metadata or file object checksum,
-    /// or a filename with --print-variant-type. Required.
+    /// The object to report: a revision or an object checksum. Required.
+    ///
+    /// A full checksum can name a metadata object or a file object. The
+    /// command looks for a commit, a dirtree, a dirmeta, and a file object, in
+    /// that order. With --print-variant-type, OBJECT is a file name.
     object: Option<String>,
 }
 
 #[derive(Args)]
 struct LogArgs {
     /// Show the raw variant data.
+    ///
+    /// For each commit, the command prints the commit value in the GVariant
+    /// text form, in place of the commit report.
     #[arg(long)]
     raw: bool,
     // ostrya checks this operand after the repository resolves, in the order
@@ -645,40 +1311,67 @@ struct LogArgs {
 
 #[derive(Args)]
 struct LsArgs {
-    /// Do not recurse into directory arguments.
+    /// Print the line of each directory argument alone, without its entries.
+    ///
+    /// This switch wins over -R.
     #[arg(short = 'd', long)]
     dironly: bool,
     /// Print directories recursively.
+    ///
+    /// The entries of each subdirectory follow its own line. Without this
+    /// switch, the command prints one level of entries.
     #[arg(short = 'R', long)]
     recursive: bool,
-    /// Print the checksum of each entry: the content checksum of a file, or
-    /// the dirtree and dirmeta checksums of a directory.
+    /// Print the checksum of each entry.
+    ///
+    /// A file shows its content checksum. A directory shows its dirtree
+    /// checksum and then its dirmeta checksum.
     #[arg(short = 'C', long)]
     checksum: bool,
     /// Print the extended attributes of each entry.
+    ///
+    /// The set prints after the checksums, in the GVariant text form between
+    /// `{ ` and ` }`.
     #[arg(short = 'X', long)]
     xattrs: bool,
     /// Print only the paths, NUL separated.
+    ///
+    /// Each path ends with a NUL byte, and the output has no newline. This
+    /// switch wins over -C and -X.
     #[arg(long)]
     nul_filenames_only: bool,
     // ostrya checks this operand after the repository resolves, in the order
     // of the `ostree` command.
     /// The commit to list (a checksum or a ref). Required.
     commit: Option<String>,
-    /// The paths in the commit to list, in order. With none, the command lists
-    /// the tree root.
+    /// The paths in the commit to list, in order.
+    ///
+    /// With no PATH, the command lists the tree root. A leading `/` is
+    /// optional. A PATH that names a file prints one line. A PATH that names
+    /// nothing is an error.
     path: Vec<String>,
 }
 
 #[derive(Args)]
 struct ConfigArgs {
     /// The group of KEY. With this option, KEY is a bare key name.
+    ///
+    /// The key name can then hold `.` characters.
     #[arg(long, value_name = "GROUP")]
     group: Option<String>,
     /// The operation: `get`, `set`, or `unset`.
+    ///
+    /// `get` prints the value. `set` writes the value, and creates the group
+    /// if it does not exist. `unset` removes the key. If the key or its group
+    /// does not exist, `unset` changes nothing and exits 0. `set` and `unset`
+    /// write the whole `config` file of the repository again. This write
+    /// drops the comment lines and the blank lines of the file.
     operation: Option<String>,
-    /// The key to read or write, and for `set` the value. The key is
-    /// `section.key`, or a bare key name with --group.
+    /// The key to read or write, and for `set` the value.
+    ///
+    /// The key is `section.key`, split on the first `.`, or a bare key name
+    /// with --group. The command refuses more operands than the operation
+    /// takes.
     args: Vec<String>,
 }
 
@@ -691,22 +1384,66 @@ struct RemoteArgs {
 #[derive(Subcommand)]
 enum RemoteCommand {
     /// Add a remote repository.
+    ///
+    /// The command writes the `[remote "NAME"]` section of the `config` file
+    /// of the repository, and prints nothing. It refuses a name that is not a
+    /// valid remote name. If the remote exists, the command fails, unless
+    /// --if-not-exists or --force is given.
     Add(RemoteAddArgs),
     /// Delete a remote repository and its trusted GPG keyring.
+    ///
+    /// The command removes the keyring `NAME.trustedkeys.gpg` at the root of
+    /// the repository, and then the `[remote "NAME"]` section of `config`. It
+    /// prints nothing. If the remote does not exist, the command fails, unless
+    /// --if-exists is given.
     Delete(RemoteDeleteArgs),
     /// List the configured remote names, sorted.
+    ///
+    /// The command prints one name on each line. With -u, the URL of each
+    /// remote follows its name.
     List(RemoteListArgs),
     /// Print the URL of a remote.
+    ///
+    /// The command prints the value of the `url` key of the remote. It fails
+    /// if the remote does not exist, or if the remote has no `url` key. A
+    /// remote that a metalink describes has no `url` key.
     #[command(name = "show-url")]
     ShowUrl(RemoteNameArgs),
     /// List the refs that a remote publishes in its summary.
+    ///
+    /// The command fetches the summary of the remote over HTTP or ssh, as a
+    /// pull does. It prints one `NAME:REF` line for each ref, in the order of
+    /// the summary. It does not verify the signature of the summary. If the
+    /// remote has no summary file, the command fails.
     Refs(RemoteRefsArgs),
     /// Report the summary of a remote.
+    ///
+    /// The command fetches the summary of the remote over HTTP or ssh, as a
+    /// pull does. It does not verify the signature of the summary. If the
+    /// remote has no summary file, the command fails.
+    ///
+    /// The default report gives each ref with its commit size, its commit
+    /// checksum, and its metadata. The global metadata of the summary follows
+    /// the refs. The report shows each timestamp in UTC.
     Summary(RemoteSummaryArgs),
     /// Import GPG keys into the trusted keyring of a remote.
+    ///
+    /// The keyring is the file `NAME.trustedkeys.gpg` at the root of the
+    /// repository. The keys come from the --keyring files or from standard
+    /// input. A key source is a binary or an ASCII-armored public keyring. The
+    /// command prints the number of keys that the keyring did not hold before.
+    ///
+    /// A key that the keyring holds stays as it is. The command replaces it
+    /// only for a key revocation that it can verify, or for a later expiry
+    /// time of the key.
     #[command(name = "gpg-import")]
     GpgImport(RemoteGpgImportArgs),
     /// List the GPG keys in the trusted keyring of a remote.
+    ///
+    /// The command reads the file `NAME.trustedkeys.gpg` at the root of the
+    /// repository. For each key, it prints a `Key:` line with the fingerprint,
+    /// a `Created:` line with the creation time in UTC, and one `UID:` line for
+    /// each user id. If the keyring does not exist, the command prints nothing.
     #[command(name = "gpg-list-keys")]
     GpgListKeys(RemoteNameArgs),
 }
@@ -730,52 +1467,92 @@ impl RemoteCommand {
 
 #[derive(Args)]
 struct RemoteAddArgs {
-    /// Set this configuration key in the section of the remote. The option can
-    /// occur more than once, and the command applies it before the options
-    /// that write a fixed key.
+    /// Set this configuration key in the section of the remote.
+    ///
+    /// The option can occur more than once. The command writes the pairs in
+    /// the order of the command line. They come after the URL, the branches,
+    /// --contenturl, and --custom-backend, and before the keys of
+    /// --no-gpg-verify, --no-sign-verify, --sign-verify, and --collection-id.
+    /// A later write of a key replaces the earlier value. The command refuses
+    /// a value with no `=`.
     #[arg(long = "set", value_name = "KEY=VALUE")]
     set: Vec<String>,
     /// Do not require a GPG signature on the commits pulled from this remote.
+    ///
+    /// The command writes `gpg-verify=false`. Without this option, a pull from
+    /// the remote verifies the GPG signature of each commit.
     #[arg(long)]
     no_gpg_verify: bool,
     // The `ostree` command writes both keys for this switch.
-    /// Do not require an ed25519 or spki signature, and do not require a GPG
-    /// signature.
+    /// Do not require an ed25519, spki, or GPG signature on pulled commits.
+    ///
+    /// The command writes `gpg-verify=false` and `sign-verify=false`. This
+    /// option conflicts with --sign-verify.
     #[arg(long)]
     no_sign_verify: bool,
-    /// Trust this key for one ed25519 or spki engine:
-    /// KEYTYPE=inline:PUBKEY or KEYTYPE=file:PATH.
+    /// Trust this public key for the ed25519 or the spki engine.
+    ///
+    /// The value is KEYTYPE=inline:PUBKEY or KEYTYPE=file:PATH. KEYTYPE is
+    /// `ed25519`, or `spki` in a build with the `spki` feature. The command
+    /// writes the key `verification-KEYTYPE-key` for an inline key, or
+    /// `verification-KEYTYPE-file` for a file. It then writes `sign-verify`
+    /// with the engine of each --sign-verify, separated by commas. The option
+    /// can occur more than once, and it conflicts with --no-sign-verify.
     #[arg(long, value_name = "KEYTYPE=[inline|file]:PUBKEY")]
     sign_verify: Vec<String>,
     /// If the remote exists, do nothing.
+    ///
+    /// The command then also imports no keys for --gpg-import, and it exits
+    /// 0. This option conflicts with --force.
     #[arg(long)]
     if_not_exists: bool,
     /// If the remote exists, replace its section.
+    ///
+    /// The command removes the full section and writes a new one. This option
+    /// conflicts with --if-not-exists.
     #[arg(long)]
     force: bool,
-    /// Import the keys of this keyring file into the trusted keyring of the
-    /// remote, as `remote gpg-import` does.
+    /// Import the keys of this keyring file into the trusted keyring.
+    ///
+    /// The import is the same as `remote gpg-import` with --keyring. The
+    /// command imports the keys only after it writes the section of the
+    /// remote, and then prints the number of imported keys.
     #[arg(long, value_name = "FILE")]
     gpg_import: Option<PathBuf>,
-    /// Record that a program other than ostrya fetches the content of this
-    /// remote.
+    /// Name a program other than ostrya that fetches this remote.
+    ///
+    /// The command writes NAME to the `custom-backend` key. ostrya does not
+    /// read this key.
     #[arg(long, value_name = "NAME")]
     custom_backend: Option<String>,
-    /// Fetch content objects from this URL. Without this option, they come
-    /// from the URL of the remote.
+    /// Write this URL to the `contenturl` key of the remote.
+    ///
+    /// The key names a different URL for the content objects. The pull of
+    /// ostrya does not read this key. It fetches all objects from the
+    /// `pull-url` or the `url` of the remote.
     #[arg(long, value_name = "URL")]
     contenturl: Option<String>,
     /// A globally unique id for the remote as a collection of refs.
+    ///
+    /// The command writes the value to the `collection-id` key of the remote.
     #[arg(long, value_name = "COLLECTION-ID")]
     collection_id: Option<String>,
     // ostrya checks this operand and URL after the repository resolves, in
     // the order of the `ostree` command.
     /// The remote name. Required, with the URL.
+    ///
+    /// A name has one or more characters. Each character is a letter, a digit,
+    /// `-`, `_`, or `.`. The first character is a letter, a digit, or `_`.
     name: Option<String>,
-    /// The base URL of the remote, or `metalink=URL` for a remote that a
-    /// metalink describes.
+    /// The base URL of the remote, or `metalink=URL` for a metalink remote.
+    ///
+    /// The command writes a base URL to the `url` key. For `metalink=URL`, it
+    /// writes URL to the `metalink` key and writes no `url` key. The pull of
+    /// ostrya does not read the `metalink` key.
     url: Option<String>,
     /// The refs that a pull of this remote takes if the pull names no ref.
+    ///
+    /// The command writes them to the `branches` key.
     branches: Vec<String>,
 }
 
@@ -786,12 +1563,18 @@ struct RemoteDeleteArgs {
     if_exists: bool,
     // ostrya checks this operand after the repository resolves.
     /// The remote to delete. Required.
+    ///
+    /// The command refuses a name that `remote add` refuses.
     name: Option<String>,
 }
 
 #[derive(Args)]
 struct RemoteListArgs {
     /// Print the URL of each remote after its name.
+    ///
+    /// The command pads each name with spaces to the length of the longest
+    /// name plus two, so the URLs align. A remote with no `url` key stops the
+    /// listing with an error. The names before it stay printed.
     #[arg(short = 'u', long)]
     show_urls: bool,
 }
@@ -816,12 +1599,22 @@ struct RemoteRefsArgs {
 #[derive(Args)]
 struct RemoteSummaryArgs {
     /// List the available metadata keys.
+    ///
+    /// The command prints the keys of the global metadata of the summary,
+    /// sorted, one key on each line. --raw takes precedence over this option.
     #[arg(long)]
     list_metadata_keys: bool,
     /// Print the value of one metadata key.
+    ///
+    /// The command prints the value in the GVariant text form, with its type.
+    /// If the global metadata has no such key, the command fails. --raw and
+    /// --list-metadata-keys take precedence over this option.
     #[arg(long, value_name = "KEY")]
     print_metadata_key: Option<String>,
     /// Show the raw variant data.
+    ///
+    /// The command prints the full summary in the GVariant text form, with the
+    /// big-endian fields converted.
     #[arg(long)]
     raw: bool,
     // ostrya checks this operand after the repository resolves.
@@ -831,53 +1624,98 @@ struct RemoteSummaryArgs {
 
 #[derive(Args)]
 struct RemoteGpgImportArgs {
-    /// Import the keys of this keyring file. The option can occur more than
-    /// once.
+    /// Import the keys of this keyring file.
+    ///
+    /// The file is a binary or an ASCII-armored public keyring. The option can
+    /// occur more than once, and it conflicts with --stdin.
     #[arg(short = 'k', long = "keyring", value_name = "FILE")]
     keyring: Vec<PathBuf>,
     /// Import the keys from standard input.
+    ///
+    /// This option conflicts with --keyring.
     #[arg(long)]
     stdin: bool,
     // ostrya checks this operand after the repository resolves.
     /// The remote to import into. Required.
     name: Option<String>,
-    /// The keys to import, in a key name form that `gpg` accepts. With none,
-    /// the command imports every key of the source.
+    /// The keys to import, by fingerprint, key id, or user id.
+    ///
+    /// With no KEY_IDS, the command imports each key of the source. The
+    /// command reads a key name as `gpg --export` reads it. A run of 8 or 16
+    /// hex digits is a key id, and a run of 32, 40, or 64 hex digits is a
+    /// fingerprint. Each other value matches a part of a user id, and the
+    /// match ignores the case of ASCII letters. If a value names no key of the
+    /// source, the command fails.
     key_ids: Vec<String>,
 }
 
 #[derive(Args)]
 struct PruneArgs {
-    /// Keep only the objects that the refs reach. Also prune unreferenced
-    /// commits.
+    /// Delete each commit and object that no ref reaches.
+    ///
+    /// Without this option, each commit in the store is a root of the walk. A
+    /// commit that no ref names then stays, with the objects that it reaches.
     #[arg(long)]
     refs_only: bool,
-    /// The number of parents of each ref to keep: -1 for all history, 0 for
-    /// only the head.
+    /// The number of parents of each ref to keep.
+    ///
+    /// The value -1 keeps all history. The value 0 keeps only the commit that
+    /// the ref names, and so does each negative value other than -1. The bound
+    /// deletes commits only if the walk starts from the refs alone: with
+    /// --refs-only, --only-branch, --retain-branch-depth, or
+    /// --keep-younger-than.
     #[arg(long, default_value_t = -1, allow_negative_numbers = true, overrides_with = "depth")]
     depth: i32,
     /// Compute and print the statistics, and delete nothing.
+    ///
+    /// The command prints the number of objects that a prune deletes and the
+    /// size that it frees. This option conflicts with --delete-commit.
     #[arg(long)]
     no_prune: bool,
     /// Delete this specific, unreferenced commit before the sweep.
+    ///
+    /// The value is a revision. The command refuses a commit that a ref names.
+    /// The sweep then deletes each object that only this commit reached. The
+    /// command writes a `.tombstone-commit` for each commit that it deletes.
+    /// This option conflicts with --no-prune.
     #[arg(long)]
     delete_commit: Option<String>,
-    /// Keep no commit older than DATE: `@SECONDS` since the Unix epoch, or a
-    /// date and time with a UTC offset.
+    /// Delete the history of each ref that is older than DATE.
+    ///
+    /// DATE is `@SECONDS` since the Unix epoch, or a date and time with a UTC
+    /// offset, for example `2024-05-01T12:00:00Z` or `2024-05-01 12:00+02:00`.
+    /// The command refuses each other form. The commit that a ref names stays
+    /// at all ages. The walk starts from the refs alone, as with --refs-only.
+    /// For each branch that --retain-branch-depth does not set, this bound
+    /// replaces --depth.
     #[arg(long, value_name = "DATE", overrides_with = "keep_younger_than")]
     keep_younger_than: Option<String>,
-    /// Delete the static deltas that the named commit targets, and nothing
-    /// else. This switch requires --delete-commit.
+    /// Delete only the static deltas whose target commit is --delete-commit.
+    ///
+    /// The command deletes no loose object, so the commit stays. This option
+    /// requires --delete-commit.
     #[arg(long)]
     static_deltas_only: bool,
-    /// Retain DEPTH parents of BRANCH. For that branch, this value replaces
-    /// --depth.
+    /// Keep DEPTH parents of BRANCH, in place of --depth for that branch.
+    ///
+    /// DEPTH is a decimal integer with an optional leading `-`. The option can
+    /// occur more than once, and the last value for a branch applies. The
+    /// value 0 keeps the branch at --depth. The walk starts from the refs
+    /// alone, as with --refs-only.
     #[arg(long, value_name = "BRANCH=DEPTH")]
     retain_branch_depth: Vec<String>,
     /// Prune BRANCH alone. Every other branch keeps its whole ancestry.
+    ///
+    /// The option can occur more than once. A branch that
+    /// --retain-branch-depth names is also pruned, to its own depth. The walk
+    /// starts from the refs alone, as with --refs-only. The command reads each
+    /// BRANCH as a revision, and it fails if a BRANCH names nothing.
     #[arg(long, value_name = "BRANCH")]
     only_branch: Vec<String>,
     /// Delete commit objects alone.
+    ///
+    /// The objects that a deleted commit reached stay. The totals count commit
+    /// objects alone.
     #[arg(long)]
     commit_only: bool,
 }
@@ -885,27 +1723,58 @@ struct PruneArgs {
 #[derive(Args)]
 struct FsckArgs {
     /// If a referenced object is missing, do not mark the commit partial.
+    ///
+    /// Without this option, the command writes the marker
+    /// `state/<commit>.commitpartial` for each commit that reaches a missing
+    /// object, or an object that --delete removed.
     #[arg(long)]
     no_mark_partial: bool,
-    /// Add tombstones for missing commits.
+    /// Delete each commit whose parent commit is missing, and add a tombstone.
+    ///
+    /// This step comes after the object walk. It writes a `.tombstone-commit`
+    /// for each deleted commit, and a ref to a deleted commit stays. One run
+    /// deletes one generation of commits. After a walk that found a corrupt
+    /// object, the step runs only with -a or --delete. This option also stops
+    /// the count of partial commits on standard output.
     #[arg(long)]
     add_tombstones: bool,
-    /// Print only error messages.
+    /// Do not print the lines that name each phase of the check.
+    ///
+    /// The command still prints the findings, the tombstone lines, the count
+    /// of partial commits, and the final result line.
     #[arg(short, long)]
     quiet: bool,
     // The fsck walk of ostrya always runs to its end, with all switches. This
     // option selects one thing only: if `--add-tombstones` can act on a walk
     // that found a corrupt object.
-    /// Do not stop on the first error.
+    /// Let --add-tombstones run after a walk that found a corrupt object.
+    ///
+    /// The object walk always runs to its end and reports each error, with or
+    /// without this option. --delete also gives this permission.
     #[arg(short, long)]
     all: bool,
-    /// Remove corrupted objects.
+    /// Delete each object whose checksum differs from its name.
+    ///
+    /// The command also marks each commit that reaches a deleted object as
+    /// partial. A metadata object that does not parse stays, and the command
+    /// reports it.
     #[arg(long)]
     delete: bool,
-    /// Verify ref bindings.
+    /// Verify that the commit of each ref is bound to that ref.
+    ///
+    /// The `ostree.ref-binding` metadata of the commit of each ref must hold
+    /// the name of the ref. For a collection ref, the
+    /// `ostree.collection-binding` of the commit must be the collection id of
+    /// the ref. A commit with no binding key passes. A failure ends the run.
     #[arg(long)]
     verify_bindings: bool,
-    /// Verify back-references.
+    /// Verify that the ref bindings of each commit resolve to that commit.
+    ///
+    /// For each commit in the store, each name in its `ostree.ref-binding`
+    /// must name a ref that resolves to the commit. If the commit has an
+    /// `ostree.collection-binding`, the collection ref with that id and that
+    /// name must also resolve to the commit. This option does not include
+    /// --verify-bindings. A failure ends the run.
     #[arg(long)]
     verify_back_refs: bool,
 }
@@ -913,15 +1782,29 @@ struct FsckArgs {
 #[derive(Args)]
 struct DiffArgs {
     /// Print the object counts and the size of the common objects.
+    ///
+    /// The command reads both arguments as revisions. It prints the object
+    /// count of each commit, the number of objects that both commits hold, and
+    /// the size of these common objects on disk. Without --fs-diff, the
+    /// command prints no path lines.
     #[arg(long)]
     stats: bool,
     /// Print the file system diff.
+    ///
+    /// The path lines are the default output. This option is necessary only
+    /// with --stats, to print the path lines before the statistics.
     #[arg(long)]
     fs_diff: bool,
-    /// Skip output of extended attributes.
+    /// Do not read the extended attributes of a directory side.
+    ///
+    /// A commit side keeps the extended attributes of its objects.
     #[arg(long)]
     no_xattrs: bool,
-    /// Use this user id as the owner of local files.
+    /// Use this user id as the owner of each file of a directory side.
+    ///
+    /// The option applies only to the second side, and only if that side is a
+    /// directory. A negative value keeps the user id from the file system. The
+    /// value is a C integer: decimal, hexadecimal with `0x`, or octal with `0`.
     #[arg(
         long,
         value_name = "UID",
@@ -929,7 +1812,12 @@ struct DiffArgs {
         overrides_with = "owner_uid"
     )]
     owner_uid: Option<String>,
-    /// Use this group id as the owner group of local files.
+    /// Use this group id as the owner group of each file of a directory side.
+    ///
+    /// The option applies only to the second side, and only if that side is a
+    /// directory. A negative value keeps the group id from the file system.
+    /// The value is a C integer: decimal, hexadecimal with `0x`, or octal with
+    /// `0`.
     #[arg(
         long,
         value_name = "GID",
@@ -939,8 +1827,11 @@ struct DiffArgs {
     owner_gid: Option<String>,
     // ostrya checks this operand after the repository resolves, in the order
     // of the `ostree` command.
-    /// The first revision or directory. If there is no second argument, the
-    /// command compares FROM with `^` appended against FROM. Required.
+    /// The first revision or directory. Required.
+    ///
+    /// An argument that starts with `/` or `./` names a directory. Each other
+    /// argument names a revision. If there is no second argument, the command
+    /// compares FROM with `^` appended against FROM.
     from: Option<String>,
     /// The second revision or directory.
     to: Option<String>,
@@ -963,55 +1854,99 @@ enum SignType {
 #[derive(Args)]
 struct SignArgs {
     /// Delete the stored signatures that match the given KEY-IDs.
+    ///
+    /// The command needs at least one KEY-ID, and prints `Deleted <n>
+    /// signature(s)`. For ed25519 and spki, a signature matches if it verifies
+    /// under a public key from a KEY-ID or from a --keys-file. For gpg, a
+    /// KEY-ID matches the end of the issuer fingerprint or of the primary-key
+    /// fingerprint of a signature. This option conflicts with --verify.
     #[arg(short, long, conflicts_with = "verify")]
     delete: bool,
     /// Verify the signatures of the commit, and add no signature.
+    ///
+    /// The command prints one line for each signature, with `good`, `BAD`, or
+    /// `no public key`. Then it prints `verification OK` or `verification
+    /// FAILED`. If the commit has no signature for the engine, the command
+    /// prints `no signatures found`. If no signature is valid, the command
+    /// exits 1.
     #[arg(long)]
     verify: bool,
     /// The signature engine to use.
+    ///
+    /// The engine selects the key format and the detached-metadata key that
+    /// holds the signatures: `ostree.sign.ed25519`, `ostree.sign.spki`, or
+    /// `ostree.gpgsigs`.
     #[arg(short = 's', long = "sign-type", default_value = "ed25519")]
     sign_type: SignType,
-    /// Read keys from a file. For ed25519 and spki, the file has base64 keys,
-    /// one per line: secret keys to sign, public keys to verify and delete.
-    /// Signing and delete read every file. For an ed25519 or spki verify, the
-    /// last value wins. With this option or a KEY-ID, that verify does not
-    /// read --keys-dir or the system key directories. For gpg, the file is a
-    /// binary or armored keyring (verify and delete), and every file is read.
+    /// Read keys from a file.
+    ///
+    /// For ed25519 and spki, the file has base64 keys, one per line: secret
+    /// keys to sign, public keys to verify and delete. Signing and delete read
+    /// every file. For an ed25519 or spki verify, the last value wins. With
+    /// this option or a KEY-ID, that verify does not read --keys-dir or the
+    /// system key directories.
+    ///
+    /// For gpg, the file is a binary or armored keyring for verify and delete,
+    /// and every file is read. These keyrings then replace the global trusted
+    /// set and the keyrings of --remote. A gpg signing run refuses this option.
     #[arg(long, value_name = "PATH")]
     keys_file: Vec<std::ffi::OsString>,
-    /// For an ed25519 or spki verify, read `trusted.<type>` and
-    /// `revoked.<type>` from this directory. The verify then does not read the
-    /// system key directories. If the option occurs more than once, the last
-    /// value wins. An empty value names the working directory. The gpg engine
-    /// does not use this option.
+    /// Read the keys of an ed25519 or spki verify from this directory.
+    ///
+    /// The verify reads `trusted.<type>`, `revoked.<type>`, and the files in
+    /// `trusted.<type>.d/` and `revoked.<type>.d/`. It then does not read the
+    /// system key directories `/etc/ostree` and `/usr/share/ostree`. If the
+    /// option occurs more than once, the last value wins. An empty value names
+    /// the working directory. The gpg engine refuses this option.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
     keys_dir: Option<std::ffi::OsString>,
-    /// The GnuPG home directory where gpg resolves signing keys. Without this
-    /// option, gpg uses its own resolution. Only the gpg engine reads it.
+    /// The GnuPG home directory where gpg resolves signing keys.
+    ///
+    /// Without this option, gpg uses its own resolution. Only the gpg engine
+    /// reads it, and the ed25519 and spki engines refuse it.
     #[arg(long)]
     gpg_homedir: Option<PathBuf>,
-    /// The remote with the trusted keyring to add for a gpg verify and delete.
-    /// The keyring is `<remote>.trustedkeys.gpg` in the repo and under
-    /// `/etc/ostree/remotes.d/`, in addition to the global trusted set. Only
-    /// the gpg engine reads it.
+    /// Add the trusted keyrings of this remote to a gpg verify and delete.
+    ///
+    /// The keyrings are `<remote>.trustedkeys.gpg` in the repository and in
+    /// `/etc/ostree/remotes.d/`. The command adds them to the global trusted
+    /// set: the `*.gpg` keyrings in `OSTREE_GPG_HOME`, or in
+    /// `/usr/share/ostree/trusted.gpg.d/` if that variable is unset or empty.
+    /// With --keys-file, the command does not read these keyrings. Only the gpg
+    /// engine reads this option, and the ed25519 and spki engines refuse it.
     #[arg(long)]
     remote: Option<String>,
     // ostrya checks this operand after the repository resolves, in the order
     // of the `ostree` command.
     /// The commit to operate on (a checksum or a ref). Required.
     commit: Option<String>,
-    /// Key identifiers. For ed25519 and spki, these are base64 keys. For gpg,
-    /// this is the signing key that gpg resolves (a fingerprint, key id, or
-    /// user id), or with --delete the fingerprints to remove.
+    /// Key identifiers: base64 keys, or gpg key selectors.
+    ///
+    /// For ed25519 and spki, each KEY-ID is a base64 key: a secret key to
+    /// sign, or a public key to verify and delete. For gpg, each KEY-ID is a
+    /// signing key that gpg resolves (a fingerprint, key id, or user id). A
+    /// gpg signing run needs at least one KEY-ID. With --delete, the gpg
+    /// KEY-IDs are the fingerprints to remove.
     key_id: Vec<String>,
 }
 
 #[derive(Args)]
 struct SummaryArgs {
     /// Regenerate the summary from the refs of the repository.
+    ///
+    /// The command writes `summary` and removes `summary.sig`. Then it signs
+    /// the new summary with each --gpg-sign key, each --sign key, and each
+    /// KEY-ID and --keys-file key, in this order. The command checks every -m
+    /// value and every key before the regeneration, so a refusal leaves
+    /// `summary` and `summary.sig` as they were. The command prints nothing.
     #[arg(short = 'u', long)]
     update: bool,
-    /// View the local summary file.
+    /// View a report of the local summary file.
+    ///
+    /// The report holds each ref, the refs of each collection, and the global
+    /// metadata. This option takes precedence over --list-metadata-keys and
+    /// --print-metadata-key. If the repository has no `summary` file, the
+    /// command exits 1.
     #[arg(short = 'v', long)]
     view: bool,
     /// Print debug information during command processing.
@@ -1021,35 +1956,57 @@ struct SummaryArgs {
     #[arg(long)]
     #[allow(dead_code)]
     verbose: bool,
-    /// View the raw bytes of the summary file.
+    /// View the local summary file in the GVariant text form.
+    ///
+    /// This option takes precedence over every other read option.
     #[arg(long)]
     raw: bool,
     /// List the available metadata keys.
+    ///
+    /// The command prints the keys of the global metadata, in sorted order.
     #[arg(long)]
     list_metadata_keys: bool,
     /// Print the value of one metadata key.
+    ///
+    /// If the global metadata has no such key, the command exits 1.
     #[arg(long, value_name = "KEY")]
     print_metadata_key: Option<String>,
-    /// Add a metadata field, as KEY=VALUE with the value in the GVariant text
-    /// form. The option can occur more than once. Only -u reads it.
+    /// Add a metadata field to the summary, as KEY=VALUE.
+    ///
+    /// VALUE is in the GVariant text form. The option can occur more than once.
+    /// Only -u reads it. If the summary writes KEY as one of its own entries,
+    /// the summary keeps its own value. A repository with a collection id
+    /// refuses this option.
     #[arg(short = 'm', long = "add-metadata", value_name = "KEY=VALUE")]
     add_metadata: Vec<String>,
-    /// Sign the summary with this key. For ed25519 and spki, the key is the
-    /// base64 of the secret key. Each occurrence adds one signature. Only -u
-    /// reads it.
+    /// Sign the summary with this key.
+    ///
+    /// The --sign-type option selects the engine. For ed25519 and spki, the key
+    /// is the base64 of the secret key. For gpg, the key is a selector, as for
+    /// --gpg-sign. Each occurrence adds one signature. Only -u reads it.
     #[arg(long, value_name = "KEY-ID")]
     sign: Vec<String>,
-    /// Sign the summary with the GPG key that this selector names. Each
-    /// occurrence adds one signature. Only -u reads it.
+    /// Sign the summary with the GPG key that this selector names.
+    ///
+    /// The option uses the gpg engine for each --sign-type. Each occurrence
+    /// adds one signature. Only -u reads it.
     #[arg(long, value_name = "KEY-ID")]
     gpg_sign: Vec<String>,
-    /// Verify the signatures of the summary. The command then does not
-    /// regenerate or sign the summary.
+    /// Verify the signatures of the summary.
+    ///
+    /// The command then does not regenerate or sign the summary, also with -u.
+    /// It prints one line for each signature and then `verification OK` or
+    /// `verification FAILED`. If no signature is valid, the command exits 1.
+    /// The ed25519 and spki engines read the key sources of `ostrya sign
+    /// --verify`. The gpg engine reads each --keys-file keyring, or else the
+    /// keyrings of --remote, or else the global trusted set.
     #[arg(long)]
     verify: bool,
-    /// The signature engine for --verify, --sign, and the positional keys. The
-    /// default is 'ed25519'. If the option occurs more than once, the last
-    /// value wins.
+    /// The signature engine for --verify, --sign, and the positional keys.
+    ///
+    /// The engine also applies to --keys-file. The names are `ed25519`,
+    /// `spki`, and `gpg`, and the command refuses any other name. The default
+    /// is `ed25519`. If the option occurs more than once, the last value wins.
     #[arg(
         short = 's',
         long = "sign-type",
@@ -1057,39 +2014,58 @@ struct SummaryArgs {
         overrides_with = "sign_type"
     )]
     sign_type: Option<String>,
-    /// Override `ostree.summary.last-modified` (seconds since the Unix epoch)
-    /// for reproducible output. The default is the current time.
+    /// Set `ostree.summary.last-modified`, in seconds since the Unix epoch.
+    ///
+    /// A fixed value makes the output reproducible. Without this option, the
+    /// command uses the current time. `SOURCE_DATE_EPOCH` does not change this
+    /// value. Only -u reads it.
     #[arg(long)]
     last_modified: Option<u64>,
-    /// The timestamp of the collection anchor commit (seconds since the Unix
-    /// epoch). The default is SOURCE_DATE_EPOCH or the current time. Only a
-    /// collection repository uses it.
+    /// The timestamp of the collection anchor commit, in Unix epoch seconds.
+    ///
+    /// The anchor commit is the `ostree-metadata` commit. Without this option,
+    /// the timestamp is `SOURCE_DATE_EPOCH` if it is set, or else the current
+    /// time. Only -u reads it, and only a repository with a collection id uses
+    /// it.
     #[arg(long)]
     metadata_commit_timestamp: Option<u64>,
-    /// Read keys from a file, in the format of `ostrya sign`. For an ed25519
-    /// or spki verify, the last value wins. With this option or a KEY-ID,
-    /// that verify does not read --keys-dir or the system key directories.
-    /// Signing and gpg read every file.
+    /// Read keys from a file, in the format of `ostrya sign`.
+    ///
+    /// For an ed25519 or spki verify, the last value wins. With this option or
+    /// a KEY-ID, that verify does not read --keys-dir or the system key
+    /// directories. A signing run reads every file. A gpg verify reads every
+    /// file as a keyring, and a gpg signing run refuses this option. Without -u
+    /// and --verify, the keys sign the existing summary.
     #[arg(long, value_name = "PATH")]
     keys_file: Vec<std::ffi::OsString>,
-    /// For an ed25519 or spki verify, read `trusted.<type>` and
-    /// `revoked.<type>` from this directory. The verify then does not read the
-    /// system key directories. If the option occurs more than once, the last
-    /// value wins. An empty value names the working directory. A gpg verify
-    /// refuses this option.
+    /// Read the keys of an ed25519 or spki verify from this directory.
+    ///
+    /// The verify reads `trusted.<type>`, `revoked.<type>`, and the files in
+    /// `trusted.<type>.d/` and `revoked.<type>.d/`. It then does not read the
+    /// system key directories `/etc/ostree` and `/usr/share/ostree`. If the
+    /// option occurs more than once, the last value wins. An empty value names
+    /// the working directory. A gpg verify refuses this option.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
     keys_dir: Option<std::ffi::OsString>,
-    /// The GnuPG home directory where gpg resolves signing keys. Only the gpg
-    /// engine reads it.
+    /// The GnuPG home directory where gpg resolves signing keys.
+    ///
+    /// Only the gpg engine reads it: for --gpg-sign, and for --sign and the
+    /// positional keys under the gpg engine.
     #[arg(long)]
     gpg_homedir: Option<PathBuf>,
-    /// The remote with the trusted gpg keyring to add for verification. Only
-    /// the gpg engine reads it.
+    /// Add the trusted gpg keyrings of this remote to a gpg verify.
+    ///
+    /// The keyrings are `<remote>.trustedkeys.gpg` in the repository and in
+    /// `/etc/ostree/remotes.d/`, in addition to the global trusted set. With
+    /// --keys-file, the command does not read them. Only the gpg engine reads
+    /// this option.
     #[arg(long)]
     remote: Option<String>,
-    /// Signing or verification key identifiers, in the format of
-    /// `ostrya sign`. This is an ostrya extension. With -u, the keys sign
-    /// after every --sign key. Without -u, they sign the existing summary.
+    /// Signing or verification keys, in the format of `ostrya sign`.
+    ///
+    /// This is an ostrya extension. With -u, the keys sign after every --sign
+    /// key. Without -u, they sign the existing summary, and the command then
+    /// ignores every read option. With --verify, they are the trusted keys.
     key_id: Vec<String>,
 }
 
@@ -1105,9 +2081,11 @@ struct StaticDeltaArgs {
 
 #[derive(Args)]
 struct DeltaReindexArgs {
-    /// Rewrite or remove only the index of the target REV, a full lowercase
-    /// commit checksum. The other index files do not change. If the option
-    /// occurs more than once, the last value wins.
+    /// Rewrite or remove only the index of the target REV.
+    ///
+    /// REV is a full lowercase commit checksum. If no delta to REV exists, the
+    /// command removes the index file of REV. The other index files do not
+    /// change. If the option occurs more than once, the last value wins.
     #[arg(long, value_name = "REV", overrides_with = "to")]
     to: Option<String>,
 }
@@ -1115,169 +2093,259 @@ struct DeltaReindexArgs {
 #[derive(Subcommand)]
 enum StaticDeltaCommand {
     /// List the static deltas of the repository.
+    ///
+    /// The command prints one delta name on each line, in sorted order: `TO`
+    /// for a delta from scratch, or `FROM-TO`. If the repository has no delta,
+    /// the command prints `(No static deltas)`.
     List,
     /// Apply a static delta offline and write the objects of its target commit.
+    ///
     /// The source is a superblock file or a directory that holds `superblock`.
-    /// The command prints nothing and writes no ref. With a key source, the
-    /// command verifies a signed delta before it writes an object, and applies
-    /// an unsigned delta with no check.
+    /// The command prints nothing and writes no ref. A key source is a KEY-ID,
+    /// --keys-file, or --keys-dir. With a key source, the command verifies a
+    /// signed delta before it writes an object, and applies an unsigned delta
+    /// with no check. Without a key source, the command verifies no signature.
     ApplyOffline(DeltaApplyArgs),
     /// Generate a static delta and print what it is generated from and to.
+    ///
+    /// The command prints `Generating static delta:` and the `From:` and `To:`
+    /// commits before it writes a file. Without --output-dir or --filename,
+    /// the delta goes into the `deltas/` tree of the repository. With --sign
+    /// or --keys-file, the command signs the superblock.
     Generate(DeltaGenerateArgs),
-    /// Rebuild the `delta-indexes/` cache from the existing deltas. With
-    /// `--to`, rebuild the index of one target alone.
+    /// Rebuild the `delta-indexes/` cache from the existing deltas.
+    ///
+    /// Each target commit gets one index file. The file lists each delta to
+    /// that target with the SHA-256 of its superblock. The command removes the
+    /// index file of a target that has no delta. With `--to`, the command
+    /// rebuilds the index of one target alone.
     Reindex(DeltaReindexArgs),
     /// Print the superblock fields of a delta and what each part holds.
+    ///
+    /// The command prints the signed state, the source and target commits, the
+    /// byte order, the timestamp, and the fallback objects. Then it prints the
+    /// statistics of each part and the total sizes.
     Show {
-        /// A delta name (`TO` or `FROM-TO` in full lowercase hex), or the path
-        /// of a superblock file. An argument with a `/` is a path. For a path,
-        /// the command reads the parts from the directory of the superblock.
+        /// A delta name, or the path of a superblock file.
+        ///
+        /// A delta name is `TO` or `FROM-TO` in full lowercase hex. An
+        /// argument with a `/` is a path. For a path, the command reads the
+        /// parts from the directory of the superblock.
         delta: Option<String>,
     },
-    /// Remove a static delta: the entry at its path under `deltas/` and
-    /// everything in it. The `delta-indexes/` cache and `summary` do not
-    /// change.
+    /// Remove a static delta: its entry under `deltas/` and everything in it.
+    ///
+    /// The `delta-indexes/` cache and `summary` do not change, so they can
+    /// still name the delta. `ostrya static-delta reindex` and `ostrya summary
+    /// -u` update them.
     Delete {
-        /// A delta name, `TO` or `FROM-TO` in full lowercase hex. The command
-        /// reads a path as a name and refuses it.
+        /// A delta name, `TO` or `FROM-TO` in full lowercase hex.
+        ///
+        /// The command reads a path as a name and refuses it.
         delta: Option<String>,
     },
-    /// List the target commits that the `delta-indexes/` cache has an index
-    /// for.
+    /// List the targets that the `delta-indexes/` cache has an index for.
+    ///
+    /// The command prints one checksum on each line, in sorted order. If the
+    /// cache has no index, the command prints `(No static deltas indexes)`.
+    /// The command reads no delta, so it lists a target also if no delta to it
+    /// exists.
     Indexes,
-    /// Verify the superblock signatures of a static delta. Print
-    /// `Verification OK` or `Verification fails`.
+    /// Verify the superblock signatures of a static delta.
+    ///
+    /// On success, the command prints `Verification OK`. After the keys load,
+    /// each failure prints `Verification fails` on standard output and an
+    /// error on standard error, and the command exits 1. An unsigned delta is
+    /// a failure. Without --keys-file, --keys-dir, or a KEY-ID, the command
+    /// reads the system key directories `/etc/ostree` and `/usr/share/ostree`.
     Verify(DeltaVerifyArgs),
 }
 
 #[derive(Args)]
 struct DeltaVerifyArgs {
-    /// The signature engine. The default is 'ed25519'. If the option occurs
-    /// more than once, the last value wins.
+    /// The signature engine: `ed25519` or `spki`.
+    ///
+    /// The default is `ed25519`. The command refuses any other name, `gpg`
+    /// included. If the option occurs more than once, the last value wins.
     #[arg(long = "sign-type", value_name = "NAME", overrides_with = "sign_type")]
     sign_type: Option<String>,
-    /// Read public keys from a file, one base64 key per line. If the option
-    /// occurs more than once, the last value wins. With this option or a
-    /// KEY-ID, the command does not read --keys-dir or the system key
-    /// directories. The command takes an empty value as given, and refuses it
-    /// because it is not a regular file.
+    /// Read public keys from a file, one base64 key per line.
+    ///
+    /// If the option occurs more than once, the last value wins. With this
+    /// option or a KEY-ID, the command does not read --keys-dir or the system
+    /// key directories. The path must name a regular file of 1 MiB or less.
+    /// The command takes an empty value as given, and refuses it because it is
+    /// not a regular file.
     #[arg(long, value_name = "PATH", overrides_with = "keys_file")]
     keys_file: Option<std::ffi::OsString>,
-    /// Read `trusted.<type>` and `revoked.<type>` from this directory. The
-    /// command then does not read the system key directories. If the option
-    /// occurs more than once, the last value wins. An empty value names the
-    /// working directory.
+    /// Read `trusted.<type>` and `revoked.<type>` from this directory.
+    ///
+    /// The command also reads the files in `trusted.<type>.d/` and
+    /// `revoked.<type>.d/`. It then does not read the system key directories.
+    /// If the option occurs more than once, the last value wins. An empty value
+    /// names the working directory.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
     keys_dir: Option<std::ffi::OsString>,
     // ostrya checks this operand after the repository resolves.
-    /// A delta name (`TO` or `FROM-TO` in full lowercase hex), or the path of
-    /// a superblock file. An argument with a `/` is a path. The command reads
-    /// only the superblock. Required.
+    /// A delta name, or the path of a superblock file. Required.
+    ///
+    /// A delta name is `TO` or `FROM-TO` in full lowercase hex. An argument
+    /// with a `/` is a path. The command reads only the superblock.
     delta: Option<String>,
-    /// Public keys in base64.
+    /// Trusted public keys in base64.
+    ///
+    /// An ed25519 key must decode to 32 bytes.
     key_id: Vec<String>,
 }
 
 #[derive(Args)]
 struct DeltaApplyArgs {
-    /// The signature engine. The default is 'ed25519'. The command reads this
-    /// option also with no key source. If the option occurs more than once,
-    /// the last value wins.
+    /// The signature engine: `ed25519` or `spki`.
+    ///
+    /// The default is `ed25519`. The command reads this option also with no
+    /// key source, and refuses any other name, `gpg` included. If the option
+    /// occurs more than once, the last value wins.
     #[arg(long = "sign-type", value_name = "NAME", overrides_with = "sign_type")]
     sign_type: Option<String>,
-    /// Read public keys from a file, one base64 key per line. If the option
-    /// occurs more than once, the last value wins. With this option or a
-    /// KEY-ID, the command does not read --keys-dir.
+    /// Read public keys from a file, one base64 key per line.
+    ///
+    /// If the option occurs more than once, the last value wins. With this
+    /// option or a KEY-ID, the command does not read --keys-dir. The path must
+    /// name a regular file of 1 MiB or less.
     #[arg(long, value_name = "PATH", overrides_with = "keys_file")]
     keys_file: Option<std::ffi::OsString>,
-    /// Read `trusted.<type>` and `revoked.<type>` from this directory. If the
-    /// option occurs more than once, the last value wins. An empty value names
-    /// the working directory.
+    /// Read `trusted.<type>` and `revoked.<type>` from this directory.
+    ///
+    /// The command also reads the files in `trusted.<type>.d/` and
+    /// `revoked.<type>.d/`. If the option occurs more than once, the last value
+    /// wins. An empty value names the working directory.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
     keys_dir: Option<std::ffi::OsString>,
     // ostrya checks this operand after the repository resolves.
-    /// A superblock file with any name, or a directory that holds `superblock`
-    /// and the parts. For a file, the command reads the parts from the
-    /// directory of the file. Required.
+    /// A superblock file, or a directory with `superblock` and the parts.
+    ///
+    /// The superblock file can have any name. For a file, the command reads
+    /// the parts from the directory of the file. The command applies each `..`
+    /// component of PATH as text before it resolves the path. Required.
     path: Option<PathBuf>,
-    /// Public keys in base64.
+    /// Trusted public keys in base64.
+    ///
+    /// An ed25519 key must decode to 32 bytes.
     key_id: Vec<String>,
 }
 
 #[derive(Args)]
 struct DeltaGenerateArgs {
-    /// Create the delta from revision REV. With neither --from nor --empty,
-    /// the source is the parent of TO.
+    /// Create the delta from revision REV.
+    ///
+    /// With neither --from nor --empty, the source is the parent of TO. The
+    /// command refuses --from together with --empty.
     #[arg(long, value_name = "REV")]
     from: Option<String>,
-    /// Create the delta from scratch.
+    /// Create the delta from scratch, with no source commit.
     #[arg(long)]
     empty: bool,
-    /// Create the delta to revision REV. This option wins over the positional
-    /// TO.
+    /// Create the delta to revision REV.
+    ///
+    /// This option wins over the positional TO. With neither, the command
+    /// refuses the run.
     #[arg(long, value_name = "REV")]
     to: Option<String>,
     /// The target revision, if --to is absent.
     #[arg(value_name = "TO")]
     to_positional: Option<String>,
     /// Generate only if the repository has no superblock for the delta.
+    ///
+    /// If the superblock exists, the command prints `Delta <name> already
+    /// exists.` and exits 0. The check reads the `deltas/` tree of the
+    /// repository, also with --output-dir or --filename.
     #[arg(short = 'n', long)]
     if_not_exists: bool,
-    /// Write the superblock to PATH and the part files to the directory that
-    /// holds it. The command does not create the directory.
+    /// Write the superblock to PATH and the parts to the directory of PATH.
+    ///
+    /// The command does not create the directory. It refuses a PATH that names
+    /// a directory, or whose last component is empty, `.`, `..`, or a part
+    /// file name such as `0`. This option conflicts with --output-dir.
     #[arg(long, value_name = "PATH", conflicts_with = "output_dir")]
     filename: Option<PathBuf>,
-    /// If the stream of an object reaches this many decimal megabytes,
-    /// deliver the object as a loose fallback outside the parts.
+    /// Send an object of this many decimal megabytes or more as a fallback.
+    ///
+    /// The size is the size of the uncompressed stream of the object: the file
+    /// header and the content. A loose fallback goes outside the parts, and
+    /// the receiver fetches it whole. The value is a whole number. A value of
+    /// `0` turns fallbacks off.
     #[arg(long, value_name = "MB", default_value = "4", value_parser = parse_megabytes)]
     min_fallback_size: u64,
-    /// The largest content size, in decimal megabytes, for which the command
-    /// tries a bspatch stream.
+    /// The largest content size, in decimal megabytes, for a bspatch stream.
+    ///
+    /// A fixed limit of 64 KiB also applies, and the smaller limit decides.
+    /// Both limits apply to the source object and to the target object.
     #[arg(long, value_name = "MB", default_value = "64", value_parser = parse_megabytes)]
     max_bsdiff_size: u64,
     /// Close a part before its payload passes this many decimal megabytes.
+    ///
+    /// A part that holds one large object can pass this size. The command
+    /// refuses a value of `0`.
     #[arg(long, value_name = "MB", default_value = "32", value_parser = parse_megabytes)]
     max_chunk_size: u64,
-    /// Emit no bspatch stream. Splice the content that chunking cannot
-    /// express.
+    /// Emit no bspatch stream.
+    ///
+    /// The command splices the content that chunking cannot express.
     #[arg(long)]
     disable_bsdiff: bool,
-    /// Pin the superblock timestamp (seconds since the Unix epoch) for
-    /// reproducible output. The default is the current time.
+    /// Set the superblock timestamp, in seconds since the Unix epoch.
+    ///
+    /// A fixed value makes the output reproducible. Without this option, the
+    /// command uses the current time.
     #[arg(long)]
     timestamp: Option<u64>,
-    /// Write the files of the delta to this directory. Without this option,
-    /// they go to `deltas/` of the repository. The other content of the
+    /// Write the files of the delta to this directory.
+    ///
+    /// Without this option, the files go to `deltas/` of the repository. The
+    /// command creates the directory if it is absent. The other content of the
     /// directory does not change, so part files of an earlier, longer delta
     /// stay.
     #[arg(long)]
     output_dir: Option<PathBuf>,
-    /// Sign the generated delta with this key. The option can occur more than
-    /// once. The key is a base64 secret key for ed25519 and spki, and a KEY-ID
-    /// for gpg, as for `ostrya sign`.
+    /// Sign the generated delta with this key.
+    ///
+    /// The option can occur more than once. The key is a base64 secret key for
+    /// ed25519 and spki, and a KEY-ID for gpg, as for `ostrya sign`.
     #[arg(long = "sign")]
     sign: Vec<String>,
-    /// The signature engine for --sign.
+    /// The signature engine for --sign and --keys-file.
     #[arg(short = 's', long = "sign-type", default_value = "ed25519")]
     sign_type: SignType,
-    /// Read signing keys from a file, in the format of `ostrya sign`. The
-    /// option can occur more than once.
+    /// Read signing keys from a file, in the format of `ostrya sign`.
+    ///
+    /// The option can occur more than once. The gpg engine refuses this
+    /// option.
     #[arg(long)]
     keys_file: Vec<PathBuf>,
-    /// The GnuPG home directory where gpg resolves signing keys. Only the gpg
-    /// engine reads it.
+    /// The GnuPG home directory where gpg resolves signing keys.
+    ///
+    /// Only the gpg engine reads it.
     #[arg(long)]
     gpg_homedir: Option<PathBuf>,
-    /// Rebuild the index cache after the delta is generated. The rebuild
-    /// covers the deltas under the `deltas/` tree of the repository, so this
-    /// switch cannot be used with --output-dir or --filename.
+    /// Rebuild the index cache after the delta is generated.
+    ///
+    /// The rebuild covers the deltas under the `deltas/` tree of the
+    /// repository, so the command refuses this switch with --output-dir or
+    /// --filename.
     #[arg(long)]
     reindex: bool,
     /// Carry the parts in the superblock and write no part file.
+    ///
+    /// The parts count toward the superblock limit of 128 MiB. If the
+    /// superblock passes this limit, the command fails before it writes the
+    /// superblock.
     #[arg(long)]
     inline: bool,
-    /// The byte order of the superblock size fields, 'l' or 'B'. If the
-    /// option occurs more than once, the last value wins.
+    /// The byte order of the superblock size fields: `l` or `B`.
+    ///
+    /// `l` is little-endian, and `B` is big-endian. Without this option, the
+    /// byte order is the host order. The command refuses any other value. If
+    /// the option occurs more than once, the last value wins.
     #[arg(
         long = "set-endianness",
         value_name = "ENDIAN",
@@ -1291,155 +2359,242 @@ struct DeltaGenerateArgs {
 
 #[derive(Args)]
 struct PullArgs {
-    /// Fetch from this address, an HTTP URL or an ssh address. It replaces
-    /// the configured `pull-url` or `url` of the remote. With it, a pull can
-    /// use a remote that the config does not describe. Such a remote supplies
-    /// no keys, so the pull must state its own signature policy, or the
-    /// command refuses it.
+    /// Fetch from this address, an HTTP URL or an ssh address.
+    ///
+    /// The address replaces the configured `pull-url` or `url` of the remote.
+    /// An address that starts with `ssh://`, or that holds no `://`, is an
+    /// ssh address. With this option, a pull can use a remote that the config
+    /// does not describe. The config gives no keys for such a remote, and
+    /// `gpg-verify` keeps its default of true. So the pull requires a GPG
+    /// signature on each commit, unless the command line states its own
+    /// signature policy, for example --gpg-verify=false.
     #[arg(long)]
     url: Option<String>,
-    /// Write the pulled refs as local refs, and copy the summary of the remote
-    /// to this repository. If no ref is named, pull every ref that the summary
-    /// of the remote lists.
+    /// Write the pulled refs as local refs under `refs/heads/`.
+    ///
+    /// If no ref is named, the pull takes every ref that the summary of the
+    /// remote lists, and fails if the remote serves no summary. This pull also
+    /// copies the `summary` and `summary.sig` of the remote to this
+    /// repository. If the remote has no `summary.sig`, the `summary.sig` of
+    /// this repository stays as it is. A pull of named refs copies no summary.
     #[arg(long)]
     mirror: bool,
-    /// The number of parents of each pulled commit to follow: 0 for the commit
-    /// alone, -1 for the whole ancestry on the remote. The command refuses a
-    /// value less than -1.
+    /// The number of parents of each pulled commit to follow.
+    ///
+    /// 0 takes the commit alone, and -1 takes the whole ancestry on the
+    /// remote. The pull follows the chain of each ref separately. The command
+    /// refuses a value less than -1.
     #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
     depth: i32,
     /// Fetch only the commit objects, and mark each commit partial.
+    ///
+    /// The pull walks no tree and takes no static delta.
     #[arg(long)]
     commit_metadata_only: bool,
-    /// Fetch only the part of the tree of each commit under this absolute
-    /// path, and mark each commit partial. The option can occur more than
-    /// once, and the pull takes the union.
+    /// Fetch only the part of the tree of each commit under this path.
+    ///
+    /// PATH is an absolute path, and the command refuses a value that does
+    /// not start with `/`. The option can occur more than once, and the pull
+    /// takes the union. The pull marks each commit partial, and a later pull
+    /// without this option completes the commit. Into an `archive`
+    /// repository, the pull takes no static delta, unless
+    /// --require-static-deltas is given.
     #[arg(long = "subpath", value_name = "PATH")]
     subpath: Vec<String>,
-    /// Verify the checksum of every object. An HTTP pull always does this, so
-    /// this switch changes nothing.
+    /// Verify the checksum of every object. A pull always does this.
+    ///
+    /// A pull over HTTP or over ssh hashes each object that it stores, and
+    /// compares the result with the name of the object. So this switch changes
+    /// nothing.
     #[arg(long)]
     untrusted: bool,
-    /// Accepted for the command line of the `ostree` command. The pull still
-    /// verifies the checksum of every fetched object, so a corrupt object
-    /// fails the pull.
+    /// A switch of the `ostree` command that this pull accepts and ignores.
+    ///
+    /// The pull still verifies the checksum of every fetched object, so a
+    /// corrupt object fails the pull.
     #[arg(long)]
     http_trusted: bool,
-    /// Reject regular files with mode bits outside 0775.
+    /// Refuse regular files with mode bits outside 0775.
+    ///
+    /// A world-writable, setuid, setgid, or sticky file fails the pull. A
+    /// symlink passes. The check applies to the loose objects and to the
+    /// objects that a static delta gives.
     #[arg(long)]
     bareuseronly_files: bool,
-    /// Do not check that the ostree.ref-binding of a pulled commit names the
-    /// ref that it is pulled under.
+    /// Do not check the ostree.ref-binding list of each pulled commit.
+    ///
+    /// Without this switch, the list must name the ref that the commit is
+    /// pulled under, or the pull fails. A commit with no ostree.ref-binding
+    /// key passes.
     #[arg(long)]
     disable_verify_bindings: bool,
-    /// Copy each object that a localcache repository supplies, and make no
-    /// hardlink.
+    /// Copy each object from a localcache repository, and make no hardlink.
+    ///
+    /// The pull copies an object from a repository on another file system
+    /// also without this switch.
     #[arg(long)]
     force_copy: bool,
-    /// Look in this repository for an object before the network. The option
-    /// can occur more than once.
+    /// Look in this repository for an object before the network.
+    ///
+    /// The option can occur more than once, and the pull reads the
+    /// repositories in the order given. It verifies the checksum of each
+    /// object that it takes from them. Each path must be a repository, or the
+    /// command fails before the pull sends a request.
     #[arg(short = 'L', long = "localcache-repo")]
     localcache_repo: Vec<PathBuf>,
-    /// Do not sync anything that this pull writes. This switch changes no byte
-    /// that the pull writes.
+    /// Do not sync anything that this pull writes.
+    ///
+    /// This switch changes no byte that the pull writes. It wins over
+    /// --per-object-fsync.
     #[arg(long)]
     disable_fsync: bool,
-    /// Sync the file of each content object when it is staged. The pull does
-    /// not sync metadata objects one by one. --disable-fsync and
+    /// Sync the file of each content object when the pull stages it.
+    ///
+    /// The switch applies whatever `[core] per-object-fsync` says. The pull
+    /// does not sync metadata objects one by one. --disable-fsync and
     /// `[core] fsync=false` win over this switch.
     #[arg(long)]
     per_object_fsync: bool,
-    /// Send NAME=VALUE as an HTTP header with every request. The option can
-    /// occur more than once.
+    /// Send NAME=VALUE as an HTTP header with every request.
+    ///
+    /// The option can occur more than once. The value splits at its first
+    /// `=`, and the command refuses an empty NAME. A pull over ssh refuses
+    /// this option.
     #[arg(long = "http-header", value_name = "NAME=VALUE", value_parser = parse_http_header)]
     http_header: Vec<(String, String)>,
     /// The number of fetches to keep in flight (default: 8).
     #[arg(long, value_name = "N")]
     max_outstanding_fetcher_requests: Option<usize>,
-    /// The number of times to repeat a round of mirrors after a retryable
-    /// failure (default: 5). If a body fails in transit, the pull fetches it
-    /// again from the start. Each refetch uses one repeat.
+    /// The number of repeats after a retryable failure (default: 5).
+    ///
+    /// Each repeat goes through the round of mirrors again, from the first
+    /// mirror. A 404 gets no repeat. If a body fails in transit, the pull
+    /// fetches it again from the start, and each refetch uses one repeat. The
+    /// pull waits 250 milliseconds before the first repeat, and doubles the
+    /// wait up to 2 seconds. A pull over ssh refuses a value above 0.
     #[arg(long, value_name = "N")]
     network_retries: Option<u32>,
     /// Retry nothing, whatever the value of --network-retries.
+    ///
+    /// The switch wins in either order of the two options. A pull over ssh
+    /// accepts it, because a pull over ssh never sends a request again.
     #[arg(long)]
     disable_retry_on_network_errors: bool,
-    /// Abandon a transfer if its rate stays less than N bytes per second for
-    /// --low-speed-time-seconds (default: 1000). The pull samples the rate
-    /// once a second over the last five seconds. 0 turns the check off, and a
-    /// negative value keeps the default.
+    /// The lowest rate in bytes per second of a transfer (default: 1000).
+    ///
+    /// If the rate of a transfer stays at N bytes per second or less for
+    /// --low-speed-time-seconds, the transfer fails as a retryable failure.
+    /// The pull samples the rate once a second over the last five seconds. 0
+    /// turns the check off, and a negative value keeps the default. The value
+    /// is read as a C `int`, and a value that this reader refuses ends the
+    /// command before the repository opens. A pull over ssh refuses a value
+    /// of 0 or more.
     #[arg(long, value_name = "N", allow_hyphen_values = true)]
     low_speed_limit_bytes: Option<String>,
-    /// The number of seconds that the rate can stay less than
-    /// --low-speed-limit-bytes (default: 30). 0 turns the check off, and a
-    /// negative value keeps the default.
+    /// The seconds that a transfer can stay at the lowest rate (default: 30).
+    ///
+    /// --low-speed-limit-bytes sets the lowest rate. 0 turns the check off,
+    /// and a negative value keeps the default. The value is read as a C `int`,
+    /// as the value of --low-speed-limit-bytes is. A pull over ssh refuses a
+    /// value of 0 or more.
     #[arg(long, value_name = "N", allow_hyphen_values = true)]
     low_speed_time_seconds: Option<String>,
-    /// The interval between two redraws of the progress line on a terminal,
-    /// in milliseconds (default: 1000). 0 and a negative value keep the
-    /// default. If the output is not a terminal, the pull prints no progress
-    /// line.
+    /// The time between two redraws of the progress line (default: 1000 ms).
+    ///
+    /// FREQUENCY is in milliseconds. 0 and a negative value keep the default.
+    /// The value is read as a C `int`, as the value of --low-speed-limit-bytes
+    /// is. The progress line goes to standard output. If the output is not a
+    /// terminal, the pull prints no progress line.
     #[arg(long, value_name = "FREQUENCY", allow_hyphen_values = true)]
     update_frequency: Option<String>,
-    /// Require each fetched tip to be no older than the commit that its ref
-    /// names in this repository.
+    /// Refuse a fetched tip that is older than the current commit of its ref.
+    ///
+    /// The current commit is the commit that the ref names in this
+    /// repository. A tip with an equal timestamp passes. A ref that this
+    /// repository does not hold passes.
     #[arg(short = 'T', long)]
     timestamp_check: bool,
-    /// Require each fetched tip to be no older than this commit. This
-    /// repository must have the commit.
+    /// Refuse a fetched tip that is older than the commit that REV names.
+    ///
+    /// The command resolves REV in this repository, so this repository must
+    /// have the commit. A tip with an equal timestamp passes. The option
+    /// conflicts with --timestamp-check.
     #[arg(long, value_name = "REV", conflicts_with = "timestamp_check")]
     timestamp_check_from_rev: Option<String>,
-    /// Fetch every object loose, and ignore all static deltas that the remote
-    /// advertises.
+    /// Fetch every object loose, and ignore all static deltas of the remote.
     #[arg(long)]
     disable_static_deltas: bool,
-    /// Refuse the pull if the remote serves no summary, or advertises no
-    /// static delta that produces a commit that this repository does not have.
+    /// Refuse the pull if a missing commit has no static delta on the remote.
+    ///
+    /// A missing commit is a commit that this repository does not hold
+    /// complete. The pull also fails if the remote serves no summary. The
+    /// option conflicts with --disable-static-deltas.
     #[arg(long, conflicts_with = "disable_static_deltas")]
     require_static_deltas: bool,
-    /// Require a GPG signature on every commit that the pull carries. Without
-    /// this option, the `gpg-verify` key of the remote applies (default true).
-    /// `--gpg-verify` requires a signature, and `--gpg-verify=false` requires
-    /// none.
+    /// Require a GPG signature on every commit that the pull carries.
+    ///
+    /// Without this option, the `gpg-verify` key of the remote applies, and
+    /// its default is true. `--gpg-verify` requires a signature, and
+    /// `--gpg-verify=false` requires none. The trusted keys are
+    /// `<remote>.trustedkeys.gpg` of the repository, the system trusted set,
+    /// and the keyrings that the `gpgkeypath` key of the remote names.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     gpg_verify: Option<bool>,
-    /// Require a GPG signature on the summary of the remote. Without this
-    /// option, the `gpg-verify-summary` key of the remote applies (default
-    /// false). `--gpg-verify-summary` requires a signature, and
-    /// `--gpg-verify-summary=false` requires none.
+    /// Require a GPG signature on the summary of the remote.
+    ///
+    /// Without this option, the `gpg-verify-summary` key of the remote
+    /// applies, and its default is false. `--gpg-verify-summary` requires a
+    /// signature, and `--gpg-verify-summary=false` requires none. If a
+    /// signature is required and the remote has no `summary` or no
+    /// `summary.sig`, the pull fails.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     gpg_verify_summary: Option<bool>,
-    /// Require an ed25519 or spki signature on every commit that the pull
-    /// carries. Without this option, the `sign-verify` key of the remote
-    /// applies (default off). `--sign-verify` requires a signature and selects
-    /// every engine of this build. `--sign-verify=false` requires none.
+    /// Require an ed25519 or spki signature on every pulled commit.
+    ///
+    /// Without this option, the `sign-verify` key of the remote applies, and
+    /// its default is off. `--sign-verify` requires a signature and selects
+    /// every engine of this build. `--sign-verify=false` requires none. A
+    /// valid signature of one engine is sufficient. The trusted keys come from
+    /// the `verification-<engine>-key` and `verification-<engine>-file` keys
+    /// of the remote, and from the system key store.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     sign_verify: Option<bool>,
     /// Require an ed25519 or spki signature on the summary of the remote.
+    ///
     /// Without this option, the `sign-verify-summary` key of the remote
-    /// applies (default off). `--sign-verify-summary` requires a signature,
-    /// and `--sign-verify-summary=false` requires none.
+    /// applies, and its default is off. `--sign-verify-summary` requires a
+    /// signature and selects every engine of this build.
+    /// `--sign-verify-summary=false` requires none.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     sign_verify_summary: Option<bool>,
     // ostrya checks this operand after the repository resolves, in the order
     // of the `ostree` command.
-    /// The remote to pull from: a `[remote "<name>"]` section of the config of
-    /// this repository. The remote name is also the prefix of the written
-    /// refs. Required.
+    /// The remote to pull from, a `[remote "<name>"]` section of the config.
+    ///
+    /// The remote name is also the prefix of the written refs,
+    /// `refs/remotes/<name>/`. The operand is required, and the command
+    /// refuses a pull with no remote.
     remote: Option<String>,
-    /// The refs to pull. With none, the pull takes the configured `branches`
-    /// of the remote, or with --mirror every ref that its summary lists.
+    /// The refs to pull.
+    ///
+    /// With none, the pull takes the configured `branches` of the remote, or
+    /// with --mirror every ref that its summary lists. The pull looks up each
+    /// ref in the summary of the remote. If the summary does not list the ref,
+    /// the pull reads `refs/heads/<ref>` of the remote.
     refs: Vec<String>,
 }
 
 #[cfg(feature = "receive")]
 #[derive(Args)]
 struct ReceiveArgs {
-    /// Read the receive, trust, and key groups, and the remotes that they
-    /// name, from FILE alone. The command then ignores these groups in the
-    /// repository config. `[core] auto-update-summary` and
+    /// Read the receive policy from FILE in place of the repository config.
+    ///
+    /// FILE holds the receive, trust, and key groups and the remote sections,
+    /// in the key-file format of the config. The command then ignores these
+    /// groups and sections in the repository config.
+    /// `[core] auto-update-summary` and
     /// `[ex-ostrya] detached-metadata-exclude` still come from the repository
-    /// config.
+    /// config. FILE must be a regular UTF-8 file of 1 MiB or less.
     #[arg(long, value_name = "FILE")]
     policy: Option<PathBuf>,
 }
@@ -1447,52 +2602,83 @@ struct ReceiveArgs {
 #[cfg(feature = "serve")]
 #[derive(Args)]
 struct ServeArgs {
-    /// Listen on ADDR:PORT, an IP address and a port. Give the option once
-    /// for each address. Port 0 lets the kernel choose a port, and the default
-    /// is 127.0.0.1:8080. The command writes the URL of each listener to
-    /// standard output, one line each.
+    /// Listen on ADDR:PORT, an IP address and a port.
+    ///
+    /// Give the option once for each address. Without it, the server listens
+    /// on `127.0.0.1:8080`. Port 0 lets the kernel choose a port. The command
+    /// refuses a host name. When all listeners are bound, the command writes
+    /// the URL of each listener to standard output, one line each.
     #[arg(long, value_name = "ADDR:PORT")]
     listen: Vec<std::net::SocketAddr>,
     /// Serve HTTPS with the certificate chain in FILE, in PEM.
+    ///
+    /// The option needs --tls-key. ALPN selects HTTP/2 or HTTP/1.1. The
+    /// command reads FILE once, at start, and refuses a file larger than
+    /// 1 MiB.
     #[arg(long, value_name = "FILE", requires = "tls_key")]
     tls_cert: Option<PathBuf>,
-    /// The private key of --tls-cert, in PEM. An encrypted key is refused.
+    /// The private key of --tls-cert, in PEM.
+    ///
+    /// The command refuses an encrypted key, because it has no option for a
+    /// passphrase. It reads FILE once, at start, and refuses a file larger
+    /// than 1 MiB.
     #[arg(long, value_name = "FILE", requires = "tls_cert")]
     tls_key: Option<PathBuf>,
-    /// Verify a client certificate against the CA certificates in FILE, in
-    /// PEM. A client that presents no certificate is served. A client
-    /// certificate is a method of push authentication.
+    /// Verify client certificates against the CA certificates in FILE, in PEM.
+    ///
+    /// The option needs --tls-cert. A client that presents a certificate must
+    /// present one that the CA signed. A client that presents no certificate
+    /// is served. A client certificate that the CA signed is a method of push
+    /// authentication.
     #[arg(long, value_name = "FILE", requires = "tls_cert")]
     client_ca: Option<PathBuf>,
-    /// Serve the files of a pull alone, with no receive endpoint. Without it,
-    /// the command needs an authentication method of push: --push-credentials,
-    /// --client-ca, or --allow-anonymous-push.
+    /// Serve the files of a pull alone, with no receive endpoint.
+    ///
+    /// Without this switch, the command needs a method of push
+    /// authentication: --push-credentials, --client-ca, or
+    /// --allow-anonymous-push. With none of them, the command exits with
+    /// status 1 before it opens the repository. The options of the receive
+    /// endpoint conflict with this switch.
     #[arg(long)]
     read_only: bool,
-    /// Take the push credentials in FILE, one NAME:HEX line each. HEX is the
-    /// SHA-256 digest of the token in 64 lowercase hex digits. The command
-    /// skips an empty line and a line that starts with `#`, and a malformed
-    /// line stops the command at start. Without --tls-cert, the option needs
-    /// --allow-cleartext-credentials or --allow-anonymous-push.
+    /// Take the push credentials in FILE, one NAME:HEX line each.
+    ///
+    /// HEX is the SHA-256 digest of the token in 64 lowercase hex digits. The
+    /// command skips an empty line and a line that starts with `#`, and a
+    /// malformed line stops the command at start. A bearer token pushes if
+    /// its digest matches a line. A Basic credential NAME:TOKEN pushes if the
+    /// digest of TOKEN matches the line of NAME. Without --tls-cert, the
+    /// option needs --allow-cleartext-credentials or --allow-anonymous-push.
+    /// The command reads FILE once, at start, and refuses a file larger than
+    /// 1 MiB.
     #[arg(long, value_name = "FILE", conflicts_with = "read_only")]
     push_credentials: Option<PathBuf>,
-    /// Take a bearer or Basic credential of push over plain HTTP. Use it for
-    /// a server on a loopback address or behind a proxy that terminates TLS.
+    /// Take a bearer or Basic credential of push over plain HTTP.
+    ///
+    /// Without this switch, the receive endpoint answers 403 to such a
+    /// request, also with --allow-anonymous-push. Use it for a server on a
+    /// loopback address or behind a proxy that terminates TLS. A read of the
+    /// files of a pull needs no credential.
     #[arg(long, conflicts_with = "read_only")]
     allow_cleartext_credentials: bool,
-    /// Read the receive, trust, and key groups, and the remotes that they
-    /// name, from FILE alone. The command then ignores these groups in the
-    /// repository config. `[core] auto-update-summary` and
+    /// Read the receive policy from FILE in place of the repository config.
+    ///
+    /// FILE holds the receive, trust, and key groups and the remote sections,
+    /// in the key-file format of the config. The command then ignores these
+    /// groups and sections in the repository config.
+    /// `[core] auto-update-summary` and
     /// `[ex-ostrya] detached-metadata-exclude` still come from the repository
-    /// config.
+    /// config. The command reads the policy once, at start. FILE must be a
+    /// regular UTF-8 file of 1 MiB or less.
     #[arg(long, value_name = "FILE", conflicts_with = "read_only")]
     policy: Option<PathBuf>,
     /// Let a request with no credential push.
     #[arg(long, conflicts_with = "read_only")]
     allow_anonymous_push: bool,
-    /// Abort a push session with no request in progress for SECONDS, and a
-    /// push session whose request body delivers no byte for SECONDS. The
-    /// value is a positive integer, and the default is 300.
+    /// Abort a push session that stays idle for SECONDS.
+    ///
+    /// A push session is idle when it has no request in progress, or when its
+    /// request body delivers no byte. The value is a positive integer.
     #[arg(
         long,
         value_name = "SECONDS",
@@ -1501,8 +2687,10 @@ struct ServeArgs {
         conflicts_with = "read_only"
     )]
     session_timeout: u64,
-    /// Serve at most N push sessions at the same time. The value is a
-    /// positive integer, and the default is 16.
+    /// Serve at most N push sessions at the same time.
+    ///
+    /// The value is a positive integer. A request that opens a session past
+    /// this limit gets the HTTP status 503.
     #[arg(
         long,
         value_name = "N",
@@ -1511,8 +2699,11 @@ struct ServeArgs {
         conflicts_with = "read_only"
     )]
     max_sessions: u64,
-    /// Let a push session send N object streams at the same time. The value
-    /// is 1 to 31, and the default is 4.
+    /// Let a push session send N object streams at the same time.
+    ///
+    /// The value is 1 to 31. The `HelloReply` of a session announces it. Over
+    /// HTTP/2, the receive window of a stream is 2 MiB, and the window of a
+    /// connection is N times 2 MiB.
     #[arg(
         long,
         value_name = "N",
@@ -1521,10 +2712,12 @@ struct ServeArgs {
         conflicts_with = "read_only"
     )]
     parallel_uploads: u32,
-    /// End a connection if its response waits longer than SECONDS for the
-    /// client to take its next bytes. If an HTTP/2 client does not answer a
-    /// ping within SECONDS, it also loses its connection. The value is a
-    /// positive integer, and the default is 60.
+    /// End a connection whose response waits more than SECONDS for the client.
+    ///
+    /// The response waits for the client to take its next bytes. If an HTTP/2
+    /// client does not answer a ping within SECONDS, it also loses its
+    /// connection. The value is a positive integer. The option also applies
+    /// with --read-only.
     #[arg(
         long,
         value_name = "SECONDS",
@@ -1537,23 +2730,31 @@ struct ServeArgs {
 #[cfg(feature = "push")]
 #[derive(Args)]
 struct PushArgs {
-    /// The number of parents of each source commit to send: 0 for the commit
-    /// alone, -1 for the whole chain in the repository. Without this option,
-    /// the push sends the chain back to the commit of the ref on the server.
-    /// If the server does not have the ref, or the local chain does not have
-    /// that commit, the push sends the source commit alone. --depth=-1 sends
-    /// the whole local chain, and the command refuses a value less than -1.
+    /// The number of parents of each source commit to send.
+    ///
+    /// 0 sends the commit alone, and -1 sends the whole chain that this
+    /// repository holds. The command refuses a value less than -1.
+    ///
+    /// Without this option, the push sends the chain back to the commit of the
+    /// ref on the server. If the server does not have the ref, or the local
+    /// chain does not have that commit, the push sends the source commit
+    /// alone.
     #[arg(long, value_name = "N", allow_negative_numbers = true)]
     depth: Option<i32>,
-    /// Update each ref whatever its state on the server, and ask the server to
-    /// allow an update that is not a fast-forward. The receive policy of the
-    /// server still refuses a non-fast-forward update unless it allows one.
+    /// Update each ref whatever its state on the server.
+    ///
+    /// The push also asks the server to allow an update that is not a
+    /// fast-forward. The receive policy of the server still refuses such an
+    /// update unless the policy sets `allow-non-fast-forward`.
     #[arg(long)]
     force: bool,
-    /// Send the content objects deflated at LEVEL, 1 to 9 (default 6). Without
-    /// this option, the push sends them raw. With it, an archive repository
-    /// sends each stored content object as it is, whatever LEVEL is. The object
-    /// keeps the zlib level that the repository wrote it with.
+    /// Send the content objects deflated at LEVEL, 1 to 9.
+    ///
+    /// The value needs the `=` form, and --compress alone gives level 6.
+    /// Without this option, the push sends the content objects raw. With it,
+    /// if this repository is an archive repository, the push sends each stored
+    /// content object as it is, whatever LEVEL is. The object keeps the zlib
+    /// level that the repository wrote it with.
     #[arg(
         long,
         value_name = "LEVEL",
@@ -1566,14 +2767,31 @@ struct PushArgs {
     #[command(flatten)]
     connect: PushConnectArgs,
     // ostrya checks this operand after the repository resolves.
-    /// The remote: a `[remote "<name>"]` section with a push address in the
-    /// config of this repository, or an ssh, `http://`, or `https://` address.
-    /// Required.
+    /// The remote: a remote name or an ssh or HTTP address. Required.
+    ///
+    /// A value with a `:` or a `/` is an address:
+    /// `ssh://[USER@]HOST[:PORT]/PATH`, `[USER@]HOST:PATH`, `http://`, or
+    /// `https://`. Each other value names a `[remote "<name>"]` section in
+    /// the config of this repository. The push address of the section is its
+    /// `push-url` key. If `push-url` is absent, a `url` key with an `http://`
+    /// or `https://` address is the push address.
+    ///
+    /// To an ssh address, the push runs the ssh client with the receive
+    /// command on the remote side. To an HTTP address, the push sends its
+    /// requests to the receive endpoint of `ostrya serve`.
     remote: Option<String>,
-    /// The refspecs, each `SRC[:DST]`. SRC is a revision of this repository,
-    /// and DST is the ref of the server that takes its commit. If SRC is a
-    /// ref, DST defaults to SRC. `:DST` deletes the ref DST of the server, and
-    /// at least one refspec is required.
+    /// The refspecs, each `SRC[:DST]`. At least one refspec is required.
+    ///
+    /// SRC is a revision of this repository, and DST is the ref of the server
+    /// that takes its commit. The command splits each refspec at its last
+    /// `:`. If SRC is a ref, DST defaults to SRC. A SRC that is a checksum, or
+    /// that has a `^` suffix, needs a DST. `:DST` deletes the ref DST of the
+    /// server.
+    ///
+    /// The command refuses a DST that the ref-name rule refuses, which
+    /// includes a DST with `^`. It also refuses a DST of 64 lowercase hex
+    /// characters after a SRC, because a revision reads such a name as a
+    /// commit checksum. A delete of such a DST passes.
     refspecs: Vec<String>,
 }
 
@@ -1586,43 +2804,70 @@ struct PushArgs {
 #[cfg(feature = "push")]
 #[derive(Args)]
 struct PushConnectArgs {
-    /// The ssh command, split at ASCII whitespace. It wins over the
-    /// OSTRYA_SSH_COMMAND environment variable and over the `ssh-command` key
-    /// of the remote.
+    /// The ssh command, split at ASCII whitespace.
+    ///
+    /// It wins over the `OSTRYA_SSH_COMMAND` environment variable and over the
+    /// `ssh-command` key of the remote. Without each of the three, the push
+    /// runs `ssh`. The split has no quoting rule. The command refuses an empty
+    /// value, and refuses this option for an HTTP address.
     #[arg(long, value_name = "CMD")]
     ssh_command: Option<String>,
-    /// The command that the remote side runs, which the remote shell parses. It
-    /// wins over the `receive-command` key of the remote. The default is
-    /// `ostrya receive`.
+    /// The command that the remote side runs over ssh.
+    ///
+    /// The remote shell parses the command. The push adds `--repo=` and the
+    /// path of the address in single quotes. This option wins over the
+    /// `receive-command` key of the remote. The default is `ostrya receive`.
+    /// The command refuses an empty value, and refuses this option for an
+    /// HTTP address.
     #[arg(long, value_name = "CMD")]
     receive_command: Option<String>,
-    /// The file whose first line is the token of an HTTP push. It wins over
-    /// the `push-token-file` key of the remote.
+    /// The file whose first line is the token of an HTTP push.
+    ///
+    /// It wins over the `push-token-file` key of the remote. Without
+    /// --push-user, the push sends the token as a bearer token. The command
+    /// refuses a first line that is empty or longer than 1 MiB. It refuses a
+    /// token file for an `http://` address without
+    /// --allow-cleartext-credentials, and for an ssh address.
     #[arg(long, value_name = "FILE")]
     push_token_file: Option<PathBuf>,
     /// Send the token as the password of a Basic credential with this name.
-    /// Without this option, the token is a bearer token. It needs a token
-    /// file, and it wins over the `push-user` key of the remote.
+    ///
+    /// Without this option, the token is a bearer token. The option needs a
+    /// token file, from --push-token-file or from the `push-token-file` key of
+    /// the remote. It wins over the `push-user` key of the remote. The command
+    /// refuses an empty name and a name that holds `:`.
     #[arg(long, value_name = "NAME")]
     push_user: Option<String>,
-    /// The PEM file of the client certificate of an HTTPS push. It needs a
-    /// key file: --tls-client-key-path or the `tls-client-key-path` key of
-    /// the remote. It wins over the `tls-client-cert-path` key of the remote.
+    /// The PEM file of the client certificate of an HTTPS push.
+    ///
+    /// It needs a key file: --tls-client-key-path or the `tls-client-key-path`
+    /// key of the remote. It wins over the `tls-client-cert-path` key of the
+    /// remote. A push to an `http://` address reads no TLS file, and the
+    /// command refuses this option for an ssh address.
     #[arg(long, value_name = "FILE")]
     tls_client_cert_path: Option<PathBuf>,
-    /// The PEM file of the private key of the client certificate, which needs
-    /// no passphrase. It needs a certificate file: --tls-client-cert-path or
-    /// the `tls-client-cert-path` key of the remote. It wins over the
-    /// `tls-client-key-path` key of the remote.
+    /// The PEM file of the private key of the client certificate.
+    ///
+    /// The key must need no passphrase. It needs a certificate file:
+    /// --tls-client-cert-path or the `tls-client-cert-path` key of the remote.
+    /// It wins over the `tls-client-key-path` key of the remote. The command
+    /// refuses this option for an ssh address.
     #[arg(long, value_name = "FILE")]
     tls_client_key_path: Option<PathBuf>,
-    /// The PEM file of the CA certificates that verify the server. The push
-    /// then does not use the trust store of the host. It wins over the
-    /// `tls-ca-path` key of the remote.
+    /// The PEM file of the CA certificates that verify the server.
+    ///
+    /// With it, the push does not use the trust store of the host. It wins
+    /// over the `tls-ca-path` key of the remote. A push to an `http://`
+    /// address reads no TLS file, and the command refuses this option for an
+    /// ssh address.
     #[arg(long, value_name = "FILE")]
     tls_ca_path: Option<PathBuf>,
-    /// Send the token to an `http://` address. Without it, a token to such an
-    /// address is refused before any request.
+    /// Send the token to an `http://` address.
+    ///
+    /// Without this switch, the command refuses a token to such an address
+    /// before any request. Use it for a server on a loopback address or behind
+    /// a proxy that terminates TLS. No key of the remote sets this switch. The
+    /// command refuses it for an ssh address.
     #[arg(long)]
     allow_cleartext_credentials: bool,
 }
@@ -1630,81 +2875,137 @@ struct PushConnectArgs {
 #[cfg(feature = "push")]
 #[derive(Args)]
 struct PushTreeArgs {
-    /// A target ref of the server. Each occurrence names one more ref that the
-    /// commit sets. At least one is required.
+    /// A target ref of the server. At least one is required.
+    ///
+    /// Each occurrence names one more ref that the commit sets. The command
+    /// refuses a name that holds `:`, a name that the ref-name rule refuses,
+    /// which includes a name with `^`, and a name that occurs twice. It also
+    /// refuses a name of 64 lowercase hex characters, because a revision reads
+    /// such a name as a commit checksum.
     #[arg(short = 'b', long, value_name = "REF")]
     branch: Vec<String>,
     /// The commit subject.
     #[arg(short, long)]
     subject: Option<String>,
-    /// The commit body. If the option occurs more than once, the last value
-    /// wins.
+    /// The commit body.
+    ///
+    /// If the option occurs more than once, the last value wins.
     #[arg(short = 'm', long, value_name = "BODY", overrides_with = "body")]
     body: Option<String>,
     /// Read the commit body from this file. This option wins over --body.
+    ///
+    /// The whole file becomes the body, byte for byte. The command refuses a
+    /// file that is larger than 128 MiB, is not UTF-8, or holds a NUL byte.
     #[arg(short = 'F', long, value_name = "FILE", overrides_with = "body_file")]
     body_file: Option<PathBuf>,
     /// Add a string-valued key to the commit metadata.
+    ///
+    /// The command splits KEY=VALUE at the first `=`, and refuses an empty
+    /// key. Each occurrence adds one key.
     #[arg(long, value_name = "KEY=VALUE")]
     add_metadata_string: Vec<String>,
-    /// Add a key to the commit metadata, with the value in the GVariant text
-    /// form.
+    /// Add a key to the commit metadata, with a value in GVariant text form.
+    ///
+    /// Each occurrence adds one key. The metadata holds each
+    /// --add-metadata-string entry first, then each --add-metadata entry, and
+    /// then the ref bindings.
     #[arg(long, value_name = "KEY=VALUE")]
     add_metadata: Vec<String>,
     /// Add a string-valued key to the detached commit metadata.
+    ///
+    /// Each occurrence adds one key. The command refuses an empty key. The
+    /// command does not apply `[ex-ostrya] detached-metadata-exclude` to these
+    /// keys.
     #[arg(long, value_name = "KEY=VALUE")]
     add_detached_metadata_string: Vec<String>,
-    /// Override the timestamp of the commit: `@SECONDS` since the Unix epoch,
-    /// or a date and time with a UTC offset (`2020-01-02T03:04:05Z`).
+    /// Override the timestamp of the commit.
+    ///
+    /// The value is `@SECONDS` since the Unix epoch, or a date and time with a
+    /// UTC offset (`2020-01-02T03:04:05Z`). Without this option, the commit
+    /// takes the `SOURCE_DATE_EPOCH` environment variable. If that variable is
+    /// not set, the commit takes the current time.
     #[arg(long, value_name = "TIMESTAMP")]
     timestamp: Option<String>,
-    /// The parent commit: its full checksum, 64 lowercase hex characters, or
-    /// `none` for a root commit. Without this option, the commit of the first
-    /// target ref on the server is the parent.
+    /// The parent commit: a full checksum, or `none` for a root commit.
+    ///
+    /// A full checksum has 64 lowercase hex characters. Without this option,
+    /// the parent is the commit of the first target ref on the server. If the
+    /// server does not have that ref, the commit has no parent.
     #[arg(long, value_name = "CHECKSUM")]
     parent: Option<String>,
     /// Do not write any ref bindings.
+    ///
+    /// Without this switch, `ostree.ref-binding` holds the target refs in
+    /// sorted order. `ostree.collection-binding` holds the collection ID of
+    /// the server, if the server has one.
     #[arg(long)]
     no_bindings: bool,
     /// Set the user id of the owner of the committed files.
+    ///
+    /// The value applies to the root directory too. A negative value keeps
+    /// the user id of each file.
     #[arg(long, value_name = "UID", allow_hyphen_values = true)]
     owner_uid: Option<String>,
     /// Set the group id of the owner of the committed files.
+    ///
+    /// The value applies to the root directory too. A negative value keeps
+    /// the group id of each file.
     #[arg(long, value_name = "GID", allow_hyphen_values = true)]
     owner_gid: Option<String>,
     /// Force owner 0:0, canonicalize modes to `perm & 0755`, and drop xattrs.
-    /// The commit then does not depend on the owner or on the host.
+    ///
+    /// The commit then does not depend on the owner or on the host. A symlink
+    /// keeps its mode. The command refuses this switch with a non-zero
+    /// --owner-uid or --owner-gid.
     #[arg(long)]
     canonical_permissions: bool,
-    /// Sign the commit with this key. For ed25519 and spki, the key is the
-    /// base64 of the secret key. Each occurrence adds one signature.
+    /// Sign the commit with this key. Each occurrence adds one signature.
+    ///
+    /// For ed25519 and spki, the key is the base64 of the secret key. Under
+    /// --sign-type=gpg, the key is a GPG key ID. The signatures come in this
+    /// order: every --sign key, then every --sign-from-file key, and then
+    /// every --gpg-sign key.
     #[arg(long, value_name = "KEY_ID")]
     sign: Vec<String>,
-    /// Sign the commit with the key on the first line of this file. Each
-    /// occurrence adds one signature.
+    /// Sign the commit with the key on the first line of this file.
+    ///
+    /// Each occurrence adds one signature. --sign-type selects the engine, as
+    /// for --sign. The command refuses a first line that is longer than
+    /// 64 KiB.
     #[arg(long, value_name = "PATH")]
     sign_from_file: Vec<std::ffi::OsString>,
-    /// The signature type to use. The default is 'ed25519'. If the option
-    /// occurs more than once, the last value wins.
+    /// The signature type of --sign and --sign-from-file.
+    ///
+    /// The types are `ed25519`, `spki`, and `gpg`, and the default is
+    /// `ed25519`. If the option occurs more than once, the last value wins.
+    /// The command reads this option only if --sign or --sign-from-file names
+    /// a key.
     #[arg(long, value_name = "NAME", overrides_with = "sign_type")]
     sign_type: Option<String>,
-    /// The GPG key ID to sign the commit with. Each occurrence adds one
-    /// signature under `ostree.gpgsigs`.
+    /// The GPG key ID to sign the commit with.
+    ///
+    /// Each occurrence adds one signature under `ostree.gpgsigs`. The ID must
+    /// name exactly one secret key in the GnuPG home directory. The command
+    /// refuses an ID of less than 8 bytes.
     #[arg(long, value_name = "KEY-ID")]
     gpg_sign: Vec<String>,
-    /// The GPG home directory that holds the keyrings. --gpg-sign reads it,
-    /// and so do --sign and --sign-from-file under --sign-type=gpg. It wins
-    /// over GNUPGHOME.
+    /// The GPG home directory that holds the keyrings.
+    ///
+    /// --gpg-sign reads it, and so do --sign and --sign-from-file under
+    /// --sign-type=gpg. It wins over `GNUPGHOME`.
     #[arg(long, value_name = "HOMEDIR")]
     gpg_homedir: Option<PathBuf>,
-    /// Set each target ref whatever its state on the server, and ask the
-    /// server to allow an update that is not a fast-forward. The receive
-    /// policy of the server still refuses a non-fast-forward update unless it
-    /// allows one.
+    /// Set each target ref whatever its state on the server.
+    ///
+    /// The push also asks the server to allow an update that is not a
+    /// fast-forward. The receive policy of the server still refuses such an
+    /// update unless the policy sets `allow-non-fast-forward`.
     #[arg(long)]
     force: bool,
-    /// Send the content objects deflated at LEVEL, 1 to 9 (default 6).
-    /// Without this option, the push sends them raw.
+    /// Send the content objects deflated at LEVEL, 1 to 9.
+    ///
+    /// The value needs the `=` form, and --compress alone gives level 6.
+    /// Without this option, the push sends the content objects raw.
     #[arg(
         long,
         value_name = "LEVEL",
@@ -1716,10 +3017,13 @@ struct PushTreeArgs {
     compress: Option<u8>,
     #[command(flatten)]
     connect: PushConnectArgs,
-    /// The remote: an ssh, `http://`, or `https://` address, or a
-    /// `[remote "<name>"]` section with a push address. The section is in the
-    /// config of the repository that --repo, the current directory, or
-    /// OSTREE_REPO names. An address opens no repository. Required.
+    /// The remote: a remote name or an ssh or HTTP address. Required.
+    ///
+    /// A value with a `:` or a `/` is an address: an ssh, `http://`, or
+    /// `https://` address. An address opens no repository, and the command
+    /// ignores --repo for it. Each other value names a `[remote "<name>"]`
+    /// section with a push address. The section is in the config of the
+    /// repository that --repo, the current directory, or `OSTREE_REPO` names.
     remote: Option<String>,
     /// The directory to commit. Required.
     dir: Option<PathBuf>,
@@ -1727,65 +3031,102 @@ struct PushTreeArgs {
 
 #[derive(Args)]
 struct PullLocalArgs {
-    /// Write the pulled refs under this remote (`refs/remotes/<remote>/<ref>`).
-    /// Without this option, they are local refs.
+    /// Write the pulled refs under this remote name.
+    ///
+    /// The refs go to `refs/remotes/<remote>/<ref>`. Without this option, they
+    /// are local refs. --gpg-verify and --gpg-verify-summary read the keys of
+    /// this remote.
     #[arg(long)]
     remote: Option<String>,
-    /// The number of parents of each pulled commit to follow: 0 for the commit
-    /// alone, -1 for the whole ancestry in the source. The command refuses a
-    /// value less than -1.
+    /// The number of parents of each pulled commit to follow.
+    ///
+    /// 0 takes the commit alone, and -1 takes the whole ancestry in the
+    /// source. The command refuses a value less than -1 before it reads a ref
+    /// or an object of the source.
     #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
     depth: i32,
     /// Import only the commit objects, and mark each commit partial.
     #[arg(long)]
     commit_metadata_only: bool,
     /// Verify the checksum of every imported object against its name.
+    ///
+    /// Without this switch, the pull links or copies an object with no hash.
+    /// An object that the pull writes again in another form always gets a
+    /// hash. A mismatch fails the pull.
     #[arg(long)]
     untrusted: bool,
     /// Reject regular files with mode bits outside 0775.
+    ///
+    /// The switch refuses a world-writable, setuid, setgid, or sticky file. A
+    /// symlink is exempt.
     #[arg(long)]
     bareuseronly_files: bool,
-    /// Do not check that the ostree.ref-binding of a pulled commit names the
-    /// ref that it is pulled under.
+    /// Do not check the ref binding of a pulled commit.
+    ///
+    /// Without this switch, the pull checks that the `ostree.ref-binding` list
+    /// of each pulled commit names the ref that it is pulled under. A commit
+    /// with no binding key passes.
     #[arg(long)]
     disable_verify_bindings: bool,
     /// Copy every object, and make no hardlink.
+    ///
+    /// Without this switch, the pull hardlinks an object of the source into
+    /// this repository when the link is possible.
     #[arg(long)]
     force_copy: bool,
     /// Look in this repository for the objects that the source does not have.
-    /// The option can occur more than once.
+    ///
+    /// The option can occur more than once. The pull reads the source first,
+    /// and then each such repository in command-line order. It takes an object
+    /// from the first repository that holds it.
     #[arg(short = 'L', long = "localcache-repo")]
     localcache_repo: Vec<PathBuf>,
-    /// Do not sync anything that this pull writes. This switch changes no byte
-    /// that the pull writes.
+    /// Do not sync anything that this pull writes.
+    ///
+    /// This switch changes no byte that the pull writes.
     #[arg(long)]
     disable_fsync: bool,
-    /// Sync the file of each content object when it is staged. The pull does
-    /// not sync metadata objects one by one. --disable-fsync and
-    /// `[core] fsync=false` win over this switch.
+    /// Sync the file of each content object when the pull stages it.
+    ///
+    /// The pull does not sync metadata objects or hardlinked objects one by
+    /// one. Without this switch, `[core] per-object-fsync` applies.
+    /// --disable-fsync and `[core] fsync=false` win over this switch.
     #[arg(long)]
     per_object_fsync: bool,
-    /// Require a GPG signature on every commit that the pull carries, with the
-    /// keys of the remote that --remote names.
+    /// Require a GPG signature on every commit that the pull carries.
+    ///
+    /// The pull uses the keys of the remote that --remote names. Without
+    /// --remote, the command refuses this switch. The switch takes no value.
     #[arg(long)]
     gpg_verify: bool,
-    /// Require a GPG signature on the summary of the source, with the keys of
-    /// the remote that --remote names.
+    /// Require a GPG signature on the summary of the source.
+    ///
+    /// The pull uses the keys of the remote that --remote names. Without
+    /// --remote, the command refuses this switch. The switch takes no value.
     #[arg(long)]
     gpg_verify_summary: bool,
-    /// Apply the static delta that the summary of the source advertises for
-    /// each commit. If there is none, refuse the pull. The source must be an
-    /// archive repository with a summary.
+    /// Apply the static delta that the summary of the source advertises.
+    ///
+    /// If the source advertises no delta for a commit, the command refuses the
+    /// pull. The source must be an archive repository with a summary. The
+    /// statistics line then has the form of a pull from a remote. This switch
+    /// conflicts with --disable-static-deltas.
     #[arg(long, conflicts_with = "disable_static_deltas")]
     require_static_deltas: bool,
-    /// Read no static delta. The pull reads none by default.
+    /// Read no static delta.
+    ///
+    /// Without --require-static-deltas, the pull reads no static delta, so
+    /// this switch changes nothing.
     #[arg(long)]
     disable_static_deltas: bool,
     // ostrya checks this operand after the repository resolves, in the order
     // of the `ostree` command.
     /// The repository to pull from. Required.
     src_repo: Option<PathBuf>,
-    /// The refs to pull. With none, the pull takes every ref of the source.
+    /// The refs to pull.
+    ///
+    /// With none, the pull takes every local ref of the source, under
+    /// `refs/heads`.
     refs: Vec<String>,
 }
 

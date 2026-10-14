@@ -1,0 +1,102 @@
+.TH "OSTRYA\-SUMMARY" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-summary \- Regenerate, sign, or verify the repository summary
+.SH SYNOPSIS
+.nf
+ostrya summary [OPTIONS] [KEY_ID]...
+.fi
+.SH DESCRIPTION
+Regenerate, sign, or verify the repository summary.
+.PP
+With \%\-u, the command writes \fB\%summary\fR from the refs of the repository and signs it with the given keys. With \%\-\-verify, it verifies the signatures in \fB\%summary.sig\fR, and \%\-\-verify takes precedence over \%\-u. Without these two options, a \%KEY\-ID or a \%\-\-keys\-file signs the existing summary. The read options \%\-\-raw, \%\-v, \%\-\-list\-metadata\-keys, and \%\-\-print\-metadata\-key print the local summary. If no option gives an action, the command exits \%1.
+.SH ARGUMENTS
+.TP
+\fIKEY_ID...\fR
+Signing or verification keys, in the format of \fB\%ostrya sign\fR\&.
+.IP
+This is an ostrya extension. With \%\-u, the keys sign after every \%\-\-sign key. Without \%\-u, they sign the existing summary, and the command then ignores every read option. With \%\-\-verify, they are the trusted keys.
+.SH OPTIONS
+.TP
+\fB\-u\fR, \fB\-\-update\fR
+Regenerate the summary from the refs of the repository.
+.IP
+The command writes \fB\%summary\fR and removes \fB\%summary.sig\fR\&. Then it signs the new summary with each \%\-\-gpg\-sign key, each \%\-\-sign key, and each \%KEY\-ID and \%\-\-keys\-file key, in this order. The command checks every \%\-m value and every key before the regeneration, so a refusal leaves \fB\%summary\fR and \fB\%summary.sig\fR as they were. The command prints nothing.
+.TP
+\fB\-v\fR, \fB\-\-view\fR
+View a report of the local summary file.
+.IP
+The report holds each ref, the refs of each collection, and the global metadata. This option takes precedence over \%\-\-list\-metadata\-keys and \%\-\-print\-metadata\-key. If the repository has no \fB\%summary\fR file, the command exits \%1.
+.TP
+\fB\-\-raw\fR
+View the local summary file in the GVariant text form.
+.IP
+This option takes precedence over every other read option.
+.TP
+\fB\-\-list\-metadata\-keys\fR
+List the available metadata keys.
+.IP
+The command prints the keys of the global metadata, in sorted order.
+.TP
+\fB\-\-print\-metadata\-key\fR \fIKEY\fR
+Print the value of one metadata key.
+.IP
+If the global metadata has no such key, the command exits \%1.
+.TP
+\fB\-m\fR, \fB\-\-add\-metadata\fR \fIKEY=VALUE\fR
+Add a metadata field to the summary, as \%KEY=VALUE.
+.IP
+VALUE is in the GVariant text form. The option can occur more than once. Only \%\-u reads it. If the summary writes KEY as one of its own entries, the summary keeps its own value. A repository with a collection id refuses this option.
+.TP
+\fB\-\-sign\fR \fIKEY\-ID\fR
+Sign the summary with this key.
+.IP
+The \%\-\-sign\-type option selects the engine. For \%ed25519 and spki, the key is the \%base64 of the secret key. For gpg, the key is a selector, as for \%\-\-gpg\-sign. Each occurrence adds one signature. Only \%\-u reads it.
+.TP
+\fB\-\-gpg\-sign\fR \fIKEY\-ID\fR
+Sign the summary with the GPG key that this selector names.
+.IP
+The option uses the gpg engine for each \%\-\-sign\-type. Each occurrence adds one signature. Only \%\-u reads it.
+.TP
+\fB\-\-verify\fR
+Verify the signatures of the summary.
+.IP
+The command then does not regenerate or sign the summary, also with \%\-u. It prints one line for each signature and then \fB\%verification OK\fR or \fB\%verification FAILED\fR\&. If no signature is valid, the command exits \%1. The \%ed25519 and spki engines read the key sources of \fB\%ostrya sign \-\-verify\fR\&. The gpg engine reads each \%\-\-keys\-file keyring, or else the keyrings of \%\-\-remote, or else the global trusted set.
+.TP
+\fB\-s\fR, \fB\-\-sign\-type\fR \fINAME\fR
+The signature engine for \%\-\-verify, \%\-\-sign, and the positional keys.
+.IP
+The engine also applies to \%\-\-keys\-file. The names are \fB\%ed25519\fR, \fB\%spki\fR, and \fB\%gpg\fR, and the command refuses any other name. The default is \fB\%ed25519\fR\&. If the option occurs more than once, the last value wins.
+.TP
+\fB\-\-last\-modified\fR \fILAST_MODIFIED\fR
+Set \fB\%ostree.summary.last\-modified\fR, in seconds since the Unix epoch.
+.IP
+A fixed value makes the output reproducible. Without this option, the command uses the current time. \fB\%SOURCE_DATE_EPOCH\fR does not change this value. Only \%\-u reads it.
+.TP
+\fB\-\-metadata\-commit\-timestamp\fR \fIMETADATA_COMMIT_TIMESTAMP\fR
+The timestamp of the collection anchor commit, in Unix epoch seconds.
+.IP
+The anchor commit is the \fB\%ostree\-metadata\fR commit. Without this option, the timestamp is \fB\%SOURCE_DATE_EPOCH\fR if it is set, or else the current time. Only \%\-u reads it, and only a repository with a collection id uses it.
+.TP
+\fB\-\-keys\-file\fR \fIPATH\fR
+Read keys from a file, in the format of \fB\%ostrya sign\fR\&.
+.IP
+For an \%ed25519 or spki verify, the last value wins. With this option or a \%KEY\-ID, that verify does not read \%\-\-keys\-dir or the system key directories. A signing run reads every file. A gpg verify reads every file as a keyring, and a gpg signing run refuses this option. Without \%\-u and \%\-\-verify, the keys sign the existing summary.
+.TP
+\fB\-\-keys\-dir\fR \fIPATH\fR
+Read the keys of an \%ed25519 or spki verify from this directory.
+.IP
+The verify reads \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR\&. It then does not read the system key directories \fB\%/etc/ostree\fR and \fB\%/usr/share/ostree\fR\&. If the option occurs more than once, the last value wins. An empty value names the working directory. A gpg verify refuses this option.
+.TP
+\fB\-\-gpg\-homedir\fR \fIGPG_HOMEDIR\fR
+The GnuPG home directory where gpg resolves signing keys.
+.IP
+Only the gpg engine reads it: for \%\-\-gpg\-sign, and for \%\-\-sign and the positional keys under the gpg engine.
+.TP
+\fB\-\-remote\fR \fIREMOTE\fR
+Add the trusted gpg keyrings of this remote to a gpg verify.
+.IP
+The keyrings are \fB\%<remote>.trustedkeys.gpg\fR in the repository and in \fB\%/etc/ostree/remotes.d/\fR, in addition to the global trusted set. With \%\-\-keys\-file, the command does not read them. Only the gpg engine reads this option.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

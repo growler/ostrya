@@ -362,6 +362,39 @@ term below is measured on the resolved dependency graph.
 - Six packages entered `Cargo.lock` with it: `indicatif`, `console`,
   `portable-atomic`, `unicode-width`, `unit-prefix`, and `encode_unicode`.
 
+### Authorized: the `terminal_size` crate
+
+`terminal_size` 0.4.4 is authorized for `crates/ostrya-cli` alone. It enters
+the graph through the `wrap_help` feature of `clap`, which wraps the
+`--help` text to the width of the terminal. No crate of the workspace names
+it directly. Each term below is measured on the resolved dependency graph.
+
+- License `MIT OR Apache-2.0`.
+- The crate has no features. On Unix it takes `rustix` with the feature
+  `termios`.
+- The graph holds 4 packages under 4 distinct names on the host target,
+  measured with `cargo tree -p terminal_size -e normal,build`:
+  `terminal_size` 0.4.4, `rustix` 1.1.4, `bitflags` 2.13.0, and
+  `linux-raw-sys` 0.12.1. With `--target all` it holds 8, adding `errno`
+  0.3.14, `libc` 0.2.186, `windows-sys` 0.61.2, and `windows-link` 0.2.1.
+  `ostrya-cli` is not built on Windows.
+- No package in the graph declares a `links` key. `linux-raw-sys` is the one
+  package name on the host target that ends in `-sys`. It holds Rust
+  declarations of the Linux syscall interface and links no C library.
+  `windows-sys` is in the graph on Windows alone.
+- Two packages carry a build script: `rustix` and `libc`. Both were already
+  in the graph.
+- Every license in the graph is permissive by the rule in "Requirement:
+  permissive licenses only": `terminal_size`, `bitflags`, `errno`, `libc`,
+  `windows-sys`, and `windows-link` state `MIT OR Apache-2.0`, and `rustix`
+  and `linux-raw-sys` state
+  `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`.
+- The highest minimum supported Rust version in the graph is 1.71, stated
+  by `terminal_size`, `windows-sys`, and `windows-link`. On the host target
+  `terminal_size` alone states it. The workspace pins 1.92, so the
+  requirement holds.
+- One package entered `Cargo.lock` with it: `terminal_size`.
+
 ## Requirement: permissive licenses only
 
 The library and everything it links -- every crate in the dependency graph,

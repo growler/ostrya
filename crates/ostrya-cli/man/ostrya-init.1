@@ -1,0 +1,28 @@
+.TH "OSTRYA\-INIT" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-init \- Initialize a new empty repository
+.SH SYNOPSIS
+.nf
+ostrya init [OPTIONS]
+.fi
+.SH DESCRIPTION
+Initialize a new empty repository.
+.PP
+The command creates the directory at the \%\-\-repo path if it does not exist. The parent directory must exist. Then the command writes the directories of the repository layout and the \fB\%config\fR file. The \fB\%[core]\fR group of \fB\%config\fR holds \fB\%repo_version=1\fR, \fB\%mode\fR, and \fB\%collection\-id\fR if \%\-\-collection\-id is given.
+.PP
+The command is idempotent. It keeps each part of the layout that exists. If the \fB\%config\fR file exists, the command keeps it unchanged, and the repository keeps its mode and its collection id. Without \%\-\-repo, the command reuses a repository in the current directory or at \fB\%OSTREE_REPO\fR\&. It prints nothing on success.
+.SH OPTIONS
+.TP
+\fB\-\-mode\fR \fIMODE\fR
+The storage mode of the new repository.
+.IP
+The values are \fB\%archive\fR, \fB\%archive\-z2\fR, \fB\%bare\fR, \fB\%bare\-user\fR, \fB\%bare\-user\-only\fR, and \fB\%bare\-user\-shared\fR\&. \fB\%archive\fR is an alias for \fB\%archive\-z2\fR, and the \fB\%config\fR file records \fB\%archive\-z2\fR\&. \fB\%bare\-user\-shared\fR is an ostrya extension. The command refuses any other value and exits \%1. A repository that exists keeps its mode. Default: bare.
+.TP
+\fB\-\-collection\-id\fR \fICOLLECTION_ID\fR
+A globally unique id for this repository as a collection of refs.
+.IP
+The command writes the value to \fB\%[core] collection\-id\fR in the \fB\%config\fR file. A repository that exists keeps its \fB\%config\fR file unchanged. \fB\%commit\fR records this id in the \fB\%ostree.collection\-binding\fR metadata key of each commit, unless \%\-\-no\-bindings is given.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

@@ -1,0 +1,50 @@
+.TH "OSTRYA\-LS" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-ls \- List the file paths of a commit
+.SH SYNOPSIS
+.nf
+ostrya ls [OPTIONS] [COMMIT] [PATH]...
+.fi
+.SH DESCRIPTION
+List the file paths of a commit.
+.PP
+The command prints one line for each entry: the type and the permission bits, the uid, the gid, the size, and the path. A symlink adds \fB\% \-> <target>\fR\&. The type is \fB\%d\fR for a directory, \fB\%\-\fR for a regular file, and \fB\%l\fR for a symlink. A directory prints its own line, then its files, then its subdirectories, each in name order.
+.SH ARGUMENTS
+.TP
+\fICOMMIT\fR
+The commit to list (a checksum or a ref). Required.
+.TP
+\fIPATH...\fR
+The paths in the commit to list, in order.
+.IP
+With no PATH, the command lists the tree root. A leading \fB\%/\fR is optional. A PATH that names a file prints one line. A PATH that names nothing is an error.
+.SH OPTIONS
+.TP
+\fB\-d\fR, \fB\-\-dironly\fR
+Print the line of each directory argument alone, without its entries.
+.IP
+This switch wins over \%\-R.
+.TP
+\fB\-R\fR, \fB\-\-recursive\fR
+Print directories recursively.
+.IP
+The entries of each subdirectory follow its own line. Without this switch, the command prints one level of entries.
+.TP
+\fB\-C\fR, \fB\-\-checksum\fR
+Print the checksum of each entry.
+.IP
+A file shows its content checksum. A directory shows its dirtree checksum and then its dirmeta checksum.
+.TP
+\fB\-X\fR, \fB\-\-xattrs\fR
+Print the extended attributes of each entry.
+.IP
+The set prints after the checksums, in the GVariant text form between \fB\%{ \fR and \fB\% }\fR\&.
+.TP
+\fB\-\-nul\-filenames\-only\fR
+Print only the paths, NUL separated.
+.IP
+Each path ends with a NUL byte, and the output has no newline. This switch wins over \%\-C and \%\-X.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

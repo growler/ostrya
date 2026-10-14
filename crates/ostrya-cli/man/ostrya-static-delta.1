@@ -1,0 +1,256 @@
+.TH "OSTRYA\-STATIC\-DELTA" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-static\-delta \- List, generate, apply, or index static deltas
+.SH SYNOPSIS
+.nf
+ostrya static\-delta [OPTIONS] [COMMAND]
+.fi
+.SH DESCRIPTION
+List, generate, apply, or index static deltas.
+.PP
+A static delta carries the objects that a target commit reaches and its source commit does not reach. A delta from scratch has no source commit. The \fB\%deltas/\fR tree of the repository holds the deltas. The \fB\%delta\-indexes/\fR cache lists them for a pull. The nested subcommands also show, delete, and verify one delta. Without a nested subcommand, the command reports \fB\%No command specified\fR and exits \%1.
+.SH OPTIONS
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH COMMANDS
+.SS "list"
+List the static deltas of the repository.
+.PP
+The command prints one delta name on each line, in sorted order: \fB\%TO\fR for a delta from scratch, or \fB\%FROM\-TO\fR\&. If the repository has no delta, the command prints \fB\%(No static deltas)\fR\&.
+.PP
+.nf
+ostrya static\-delta list [OPTIONS]
+.fi
+.SS "apply\-offline"
+Apply a static delta offline and write the objects of its target commit.
+.PP
+The source is a superblock file or a directory that holds \fB\%superblock\fR\&. The command prints nothing and writes no ref. A key source is a \%KEY\-ID, \%\-\-keys\-file, or \%\-\-keys\-dir. With a key source, the command verifies a signed delta before it writes an object, and applies an unsigned delta with no check. Without a key source, the command verifies no signature.
+.PP
+.nf
+ostrya static\-delta apply\-offline [OPTIONS] [PATH] [KEY_ID]...
+.fi
+.PP
+Arguments:
+.TP
+\fIPATH\fR
+A superblock file, or a directory with \fB\%superblock\fR and the parts.
+.IP
+The superblock file can have any name. For a file, the command reads the parts from the directory of the file. The command applies each \fB\%\&..\fR component of PATH as text before it resolves the path. Required.
+.TP
+\fIKEY_ID...\fR
+Trusted public keys in \%base64.
+.IP
+An \%ed25519 key must decode to \%32 bytes.
+.PP
+Options:
+.TP
+\fB\-\-sign\-type\fR \fINAME\fR
+The signature engine: \fB\%ed25519\fR or \fB\%spki\fR\&.
+.IP
+The default is \fB\%ed25519\fR\&. The command reads this option also with no key source, and refuses any other name, \fB\%gpg\fR included. If the option occurs more than once, the last value wins.
+.TP
+\fB\-\-keys\-file\fR \fIPATH\fR
+Read public keys from a file, one \%base64 key per line.
+.IP
+If the option occurs more than once, the last value wins. With this option or a \%KEY\-ID, the command does not read \%\-\-keys\-dir. The path must name a regular file of \%1 MiB or less.
+.TP
+\fB\-\-keys\-dir\fR \fIPATH\fR
+Read \fB\%trusted.<type>\fR and \fB\%revoked.<type>\fR from this directory.
+.IP
+The command also reads the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR\&. If the option occurs more than once, the last value wins. An empty value names the working directory.
+.SS "generate"
+Generate a static delta and print what it is generated from and to.
+.PP
+The command prints \fB\%Generating static delta:\fR and the \fB\%From:\fR and \fB\%To:\fR commits before it writes a file. Without \%\-\-output\-dir or \%\-\-filename, the delta goes into the \fB\%deltas/\fR tree of the repository. With \%\-\-sign or \%\-\-keys\-file, the command signs the superblock.
+.PP
+.nf
+ostrya static\-delta generate [OPTIONS] [TO]
+.fi
+.PP
+Arguments:
+.TP
+\fITO\fR
+The target revision, if \%\-\-to is absent.
+.PP
+Options:
+.TP
+\fB\-\-from\fR \fIREV\fR
+Create the delta from revision REV.
+.IP
+With neither \%\-\-from nor \%\-\-empty, the source is the parent of TO. The command refuses \%\-\-from together with \%\-\-empty.
+.TP
+\fB\-\-empty\fR
+Create the delta from scratch, with no source commit.
+.TP
+\fB\-\-to\fR \fIREV\fR
+Create the delta to revision REV.
+.IP
+This option wins over the positional TO. With neither, the command refuses the run.
+.TP
+\fB\-n\fR, \fB\-\-if\-not\-exists\fR
+Generate only if the repository has no superblock for the delta.
+.IP
+If the superblock exists, the command prints \fB\%Delta <name> already exists.\fR and exits \%0. The check reads the \fB\%deltas/\fR tree of the repository, also with \%\-\-output\-dir or \%\-\-filename.
+.TP
+\fB\-\-filename\fR \fIPATH\fR
+Write the superblock to PATH and the parts to the directory of PATH.
+.IP
+The command does not create the directory. It refuses a PATH that names a directory, or whose last component is empty, \fB\%\&.\fR, \fB\%\&..\fR, or a part file name such as \fB\%0\fR\&. This option conflicts with \%\-\-output\-dir.
+.TP
+\fB\-\-min\-fallback\-size\fR \fIMB\fR
+Send an object of this many decimal megabytes or more as a fallback.
+.IP
+The size is the size of the uncompressed stream of the object: the file header and the content. A loose fallback goes outside the parts, and the receiver fetches it whole. The value is a whole number. A value of \fB\%0\fR turns fallbacks off. Default: \%4.
+.TP
+\fB\-\-max\-bsdiff\-size\fR \fIMB\fR
+The largest content size, in decimal megabytes, for a bspatch stream.
+.IP
+A fixed limit of \%64 KiB also applies, and the smaller limit decides. Both limits apply to the source object and to the target object. Default: \%64.
+.TP
+\fB\-\-max\-chunk\-size\fR \fIMB\fR
+Close a part before its payload passes this many decimal megabytes.
+.IP
+A part that holds one large object can pass this size. The command refuses a value of \fB\%0\fR\&. Default: \%32.
+.TP
+\fB\-\-disable\-bsdiff\fR
+Emit no bspatch stream.
+.IP
+The command splices the content that chunking cannot express.
+.TP
+\fB\-\-timestamp\fR \fITIMESTAMP\fR
+Set the superblock timestamp, in seconds since the Unix epoch.
+.IP
+A fixed value makes the output reproducible. Without this option, the command uses the current time.
+.TP
+\fB\-\-output\-dir\fR \fIOUTPUT_DIR\fR
+Write the files of the delta to this directory.
+.IP
+Without this option, the files go to \fB\%deltas/\fR of the repository. The command creates the directory if it is absent. The other content of the directory does not change, so part files of an earlier, longer delta stay.
+.TP
+\fB\-\-sign\fR \fISIGN\fR
+Sign the generated delta with this key.
+.IP
+The option can occur more than once. The key is a \%base64 secret key for \%ed25519 and spki, and a \%KEY\-ID for gpg, as for \fB\%ostrya sign\fR\&.
+.TP
+\fB\-s\fR, \fB\-\-sign\-type\fR \fISIGN_TYPE\fR
+The signature engine for \%\-\-sign and \%\-\-keys\-file. Default: \%ed25519. Possible values: \%ed25519, spki, gpg.
+.TP
+\fB\-\-keys\-file\fR \fIKEYS_FILE\fR
+Read signing keys from a file, in the format of \fB\%ostrya sign\fR\&.
+.IP
+The option can occur more than once. The gpg engine refuses this option.
+.TP
+\fB\-\-gpg\-homedir\fR \fIGPG_HOMEDIR\fR
+The GnuPG home directory where gpg resolves signing keys.
+.IP
+Only the gpg engine reads it.
+.TP
+\fB\-\-reindex\fR
+Rebuild the index cache after the delta is generated.
+.IP
+The rebuild covers the deltas under the \fB\%deltas/\fR tree of the repository, so the command refuses this switch with \%\-\-output\-dir or \%\-\-filename.
+.TP
+\fB\-\-inline\fR
+Carry the parts in the superblock and write no part file.
+.IP
+The parts count toward the superblock limit of \%128 MiB. If the superblock passes this limit, the command fails before it writes the superblock.
+.TP
+\fB\-\-set\-endianness\fR \fIENDIAN\fR
+The byte order of the superblock size fields: \fB\%l\fR or \fB\%B\fR\&.
+.IP
+\fB\%l\fR is \%little\-endian, and \fB\%B\fR is \%big\-endian. Without this option, the byte order is the host order. The command refuses any other value. If the option occurs more than once, the last value wins.
+.TP
+\fB\-\-swap\-endianness\fR
+Swap the byte order from the host order, or from \%\-\-set\-endianness.
+.SS "reindex"
+Rebuild the \fB\%delta\-indexes/\fR cache from the existing deltas.
+.PP
+Each target commit gets one index file. The file lists each delta to that target with the \%SHA\-256 of its superblock. The command removes the index file of a target that has no delta. With \fB\%\-\-to\fR, the command rebuilds the index of one target alone.
+.PP
+.nf
+ostrya static\-delta reindex [OPTIONS]
+.fi
+.PP
+Options:
+.TP
+\fB\-\-to\fR \fIREV\fR
+Rewrite or remove only the index of the target REV.
+.IP
+REV is a full lowercase commit checksum. If no delta to REV exists, the command removes the index file of REV. The other index files do not change. If the option occurs more than once, the last value wins.
+.SS "show"
+Print the superblock fields of a delta and what each part holds.
+.PP
+The command prints the signed state, the source and target commits, the byte order, the timestamp, and the fallback objects. Then it prints the statistics of each part and the total sizes.
+.PP
+.nf
+ostrya static\-delta show [OPTIONS] [DELTA]
+.fi
+.PP
+Arguments:
+.TP
+\fIDELTA\fR
+A delta name, or the path of a superblock file.
+.IP
+A delta name is \fB\%TO\fR or \fB\%FROM\-TO\fR in full lowercase hex. An argument with a \fB\%/\fR is a path. For a path, the command reads the parts from the directory of the superblock.
+.SS "delete"
+Remove a static delta: its entry under \fB\%deltas/\fR and everything in it.
+.PP
+The \fB\%delta\-indexes/\fR cache and \fB\%summary\fR do not change, so they can still name the delta. \fB\%ostrya static\-delta reindex\fR and \fB\%ostrya summary \-u\fR update them.
+.PP
+.nf
+ostrya static\-delta delete [OPTIONS] [DELTA]
+.fi
+.PP
+Arguments:
+.TP
+\fIDELTA\fR
+A delta name, \fB\%TO\fR or \fB\%FROM\-TO\fR in full lowercase hex.
+.IP
+The command reads a path as a name and refuses it.
+.SS "indexes"
+List the targets that the \fB\%delta\-indexes/\fR cache has an index for.
+.PP
+The command prints one checksum on each line, in sorted order. If the cache has no index, the command prints \fB\%(No static deltas indexes)\fR\&. The command reads no delta, so it lists a target also if no delta to it exists.
+.PP
+.nf
+ostrya static\-delta indexes [OPTIONS]
+.fi
+.SS "verify"
+Verify the superblock signatures of a static delta.
+.PP
+On success, the command prints \fB\%Verification OK\fR\&. After the keys load, each failure prints \fB\%Verification fails\fR on standard output and an error on standard error, and the command exits \%1. An unsigned delta is a failure. Without \%\-\-keys\-file, \%\-\-keys\-dir, or a \%KEY\-ID, the command reads the system key directories \fB\%/etc/ostree\fR and \fB\%/usr/share/ostree\fR\&.
+.PP
+.nf
+ostrya static\-delta verify [OPTIONS] [DELTA] [KEY_ID]...
+.fi
+.PP
+Arguments:
+.TP
+\fIDELTA\fR
+A delta name, or the path of a superblock file. Required.
+.IP
+A delta name is \fB\%TO\fR or \fB\%FROM\-TO\fR in full lowercase hex. An argument with a \fB\%/\fR is a path. The command reads only the superblock.
+.TP
+\fIKEY_ID...\fR
+Trusted public keys in \%base64.
+.IP
+An \%ed25519 key must decode to \%32 bytes.
+.PP
+Options:
+.TP
+\fB\-\-sign\-type\fR \fINAME\fR
+The signature engine: \fB\%ed25519\fR or \fB\%spki\fR\&.
+.IP
+The default is \fB\%ed25519\fR\&. The command refuses any other name, \fB\%gpg\fR included. If the option occurs more than once, the last value wins.
+.TP
+\fB\-\-keys\-file\fR \fIPATH\fR
+Read public keys from a file, one \%base64 key per line.
+.IP
+If the option occurs more than once, the last value wins. With this option or a \%KEY\-ID, the command does not read \%\-\-keys\-dir or the system key directories. The path must name a regular file of \%1 MiB or less. The command takes an empty value as given, and refuses it because it is not a regular file.
+.TP
+\fB\-\-keys\-dir\fR \fIPATH\fR
+Read \fB\%trusted.<type>\fR and \fB\%revoked.<type>\fR from this directory.
+.IP
+The command also reads the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR\&. It then does not read the system key directories. If the option occurs more than once, the last value wins. An empty value names the working directory.
+.SH SEE ALSO
+\fBostrya\fR(1)

@@ -1,0 +1,25 @@
+# The build dependencies do not include cargo and rustc. The build
+# environment installs a pinned Rust toolchain into /usr/opt. The default
+# features of ostrya-cli compile liblzma and PCRE2 from their vendored
+# sources and link them statically, so the build needs a C compiler from
+# build-essential and no -dev package.
+Source: ostrya
+Section: utils
+Priority: optional
+Maintainer: Alexey Naidyonov <alexey.naidyonov@gmail.com>
+Build-Depends:
+ debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/growler/ostrya
+
+Package: ostrya
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: gnupg
+Description: OSTree repository tool in pure Rust
+ ostrya is a pure-Rust, async reimplementation of the ostree repository
+ library. It writes the ostree on-disk format byte for byte.
+ .
+ This package contains the ostrya command-line tool. It initializes,
+ commits to, checks out, pulls into, and serves ostree repositories.

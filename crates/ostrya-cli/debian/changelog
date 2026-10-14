@@ -1,0 +1,13 @@
+ostrya (0.3.1) unstable; urgency=medium
+
+  * Install the man pages of the ostrya command.
+  * Give each help item a short line for -h and a long text for --help.
+  * Wrap the --help text to the width of the terminal.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Wed, 14 Oct 2026 09:04:31 +0200
+
+ostrya (0.3.0) unstable; urgency=medium
+
+  * Initial release.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Tue, 13 Oct 2026 22:14:41 +0200

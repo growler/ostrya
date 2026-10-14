@@ -1,0 +1,82 @@
+.TH "OSTRYA\-SHOW" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-show \- Print the report of an object, or one part of its commit metadata
+.SH SYNOPSIS
+.nf
+ostrya show [OPTIONS] [OBJECT]
+.fi
+.SH DESCRIPTION
+Print the report of an object, or one part of its commit metadata.
+.PP
+For a commit, a dirtree, or a dirmeta, the command prints the object type and the checksum. A commit then gets its report: the parent, the content checksum, the date in UTC, the \fB\%version\fR metadata key if present, the subject, and the body. The GPG signatures of the commit follow, if it has any. For a file object, the command prints its header: the file type, the size or the symlink target, the mode, the owner, and the extended attributes.
+.PP
+The report options exclude each other. If the command line holds more than one, the first in this order wins: \%\-\-print\-detached\-metadata\-key, \%\-\-print\-metadata\-key, \%\-\-list\-detached\-metadata\-keys, \%\-\-list\-metadata\-keys, \%\-\-print\-related, \%\-\-print\-variant\-type, and \%\-\-print\-sizes.
+.SH ARGUMENTS
+.TP
+\fIOBJECT\fR
+The object to report: a revision or an object checksum. Required.
+.IP
+A full checksum can name a metadata object or a file object. The command looks for a commit, a dirtree, a dirmeta, and a file object, in that order. With \%\-\-print\-variant\-type, OBJECT is a file name.
+.SH OPTIONS
+.TP
+\fB\-\-print\-related\fR
+Show the \%"related" commits.
+.IP
+The command prints one \fB\%<ref> <checksum>\fR line for each entry of the \%related\-objects array of the commit. An empty array prints nothing.
+.TP
+\fB\-\-print\-variant\-type\fR \fITYPE\fR
+Read OBJECT as a file that holds a value of this GVariant type.
+.IP
+The command prints the value in the GVariant text form, with the byte order of its numbers converted. \%\-B has no effect here. The command refuses a file larger than \%16 MiB.
+.TP
+\fB\-\-list\-metadata\-keys\fR
+List the metadata keys of the commit, one on each line, sorted.
+.TP
+\fB\-\-print\-metadata\-key\fR \fIKEY\fR
+Print the value of one metadata key.
+.IP
+The value prints in the GVariant text form. A key that the commit metadata does not hold is an error.
+.TP
+\fB\-\-print\-hex\fR
+Print a \%byte\-array key value as an unquoted hexadecimal string.
+.IP
+This switch applies to \%\-\-print\-metadata\-key and \%\-\-print\-detached\-metadata\-key. The hex digits are lowercase. A value of another type ignores the switch.
+.TP
+\fB\-\-list\-detached\-metadata\-keys\fR
+List the detached metadata keys of the commit, one on each line, sorted.
+.IP
+A commit with no detached metadata is an error.
+.TP
+\fB\-\-print\-detached\-metadata\-key\fR \fIKEY\fR
+Print the value of one detached metadata key.
+.IP
+The value prints in the GVariant text form. A commit with no detached metadata is an error, and so is a key that it does not hold.
+.TP
+\fB\-\-print\-sizes\fR
+Print the sizes that the \fB\%ostree.sizes\fR metadata of the commit records.
+.IP
+The command prints the compressed size, the unpacked size, and the object count. Each is a \%needed/total pair. The needed values cover the objects that the local store does not hold. A commit with no \fB\%ostree.sizes\fR key is an error.
+.TP
+\fB\-\-raw\fR
+Show the raw variant data.
+.IP
+The command prints the value of the object in the GVariant text form, after the type line. For a commit, the commit report does not follow. For a file object, this switch has no effect.
+.TP
+\fB\-B\fR, \fB\-\-no\-byteswap\fR
+Do not convert the variant data from big endian.
+.IP
+The command prints the raw variant as stored. For a commit, the report of the commit follows it, also with \%\-\-raw. The switch also applies to the values of \%\-\-print\-metadata\-key and \%\-\-print\-detached\-metadata\-key.
+.TP
+\fB\-\-gpg\-homedir\fR \fIHOMEDIR\fR
+The GPG home directory that holds the keyrings.
+.IP
+The command reads each \fB\%*.gpg\fR file in HOMEDIR as a keyring, together with the \fB\%gpgkeys.gpg\fR file of the repository. It uses these keyrings to verify the GPG signatures in the commit report. \%\-\-gpg\-verify\-remote wins over this option.
+.TP
+\fB\-\-gpg\-verify\-remote\fR \fIREMOTE\fR
+Use the GPG configuration of this remote to verify signatures.
+.IP
+The keyrings are \fB\%<remote>.trustedkeys.gpg\fR in the repository and in \fB\%/etc/ostree/remotes.d/\fR, and the global trusted keyrings. The global keyrings are the \fB\%*.gpg\fR files in the directory that \fB\%OSTREE_GPG_HOME\fR names, or in \fB\%/usr/share/ostree/trusted.gpg.d/\fR\&.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

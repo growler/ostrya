@@ -33,7 +33,9 @@ lzma-static = ["ostrya/lzma-static"]
 ostrya = { path = "../ostrya", default-features = false }
 ostrya-rt = { workspace = true }
 ostrya-server = { workspace = true, optional = true }
-clap = { version = "4", features = ["derive"] }
+# `wrap_help` wraps the `--help` text to the width of the terminal. It takes
+# `terminal_size`, which reads the width through `rustix`.
+clap = { version = "4", features = ["derive", "wrap_help"] }
 # `commit --tar-pathname-filter` compiles an expression. The tool compiles it as
 # a PCRE2 pattern through GLib's `GRegex`, so the port compiles it with PCRE2
 # too (`docs/conformance/cli-surface.md`, "P2"). This is the one crate in the

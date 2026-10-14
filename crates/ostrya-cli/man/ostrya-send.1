@@ -1,0 +1,20 @@
+.TH "OSTRYA\-SEND" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-send \- Serve one pull session over standard input and standard output
+.SH SYNOPSIS
+.nf
+ostrya send [OPTIONS]
+.fi
+.SH DESCRIPTION
+Serve one pull session over standard input and standard output.
+.PP
+An ssh pull runs this command on the remote side. The command answers each \fB\%Get\fR path as the archive view of \fB\%ostrya serve\fR answers a \fB\%GET\fR of that path. It takes no lock and writes no file in the repository.
+.PP
+Standard output carries the frames of the session alone. On failure, the command writes \fB\%error: MESSAGE\fR to standard error. It writes nothing else, also under \%\-\-verbose. It exits \%0 when standard input ends at a frame boundary, and \%1 after an \fB\%Error\fR frame or a failed write.
+.PP
+An \fB\%authorized_keys\fR entry with \fB\%command="ostrya send \-\-repo=PATH"\fR limits an ssh key to a pull from one repository.
+.SH OPTIONS
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

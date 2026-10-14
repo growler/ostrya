@@ -1,0 +1,167 @@
+.TH "OSTRYA\-PULL" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-pull \- Fetch refs and their objects from a remote over HTTP or ssh
+.SH SYNOPSIS
+.nf
+ostrya pull [OPTIONS] [REMOTE] [REFS]...
+.fi
+.SH DESCRIPTION
+Fetch refs and their objects from a remote over HTTP or ssh.
+.PP
+The address is \%\-\-url, else the \fB\%pull\-url\fR key of the remote, else its \fB\%url\fR key. An address that starts with \fB\%ssh://\fR, or that holds no \fB\%://\fR, is an ssh address, and the pull runs the ssh client. The remote command is \fB\%ostrya send\fR, or the \fB\%send\-command\fR key of the remote. Each other address goes to the HTTP fetcher, which takes \fB\%http\fR and \fB\%https\fR alone. The \fB\%url\fR key cannot hold an ssh address.
+.PP
+The pull stores the objects in one transaction, and then writes each ref under \fB\%refs/remotes/<remote>/\fR, or under \fB\%refs/heads/\fR with \%\-\-mirror. It verifies the signatures that the config of the remote or the verify options ask for. The pull does not store the detached metadata keys that \fB\%[ex\-ostrya] detached\-metadata\-exclude\fR names.
+.PP
+On success, the command prints one statistics line to standard output. If standard output is a terminal, a progress line shows while the pull runs, and the statistics line is drawn over it.
+.SH ARGUMENTS
+.TP
+\fIREMOTE\fR
+The remote to pull from, a \fB\%[remote "<name>"]\fR section of the config.
+.IP
+The remote name is also the prefix of the written refs, \fB\%refs/remotes/<name>/\fR\&. The operand is required, and the command refuses a pull with no remote.
+.TP
+\fIREFS...\fR
+The refs to pull.
+.IP
+With none, the pull takes the configured \fB\%branches\fR of the remote, or with \%\-\-mirror every ref that its summary lists. The pull looks up each ref in the summary of the remote. If the summary does not list the ref, the pull reads \fB\%refs/heads/<ref>\fR of the remote.
+.SH OPTIONS
+.TP
+\fB\-\-url\fR \fIURL\fR
+Fetch from this address, an HTTP URL or an ssh address.
+.IP
+The address replaces the configured \fB\%pull\-url\fR or \fB\%url\fR of the remote. An address that starts with \fB\%ssh://\fR, or that holds no \fB\%://\fR, is an ssh address. With this option, a pull can use a remote that the config does not describe. The config gives no keys for such a remote, and \fB\%gpg\-verify\fR keeps its default of true. So the pull requires a GPG signature on each commit, unless the command line states its own signature policy, for example \%\-\-gpg\-verify=false.
+.TP
+\fB\-\-mirror\fR
+Write the pulled refs as local refs under \fB\%refs/heads/\fR\&.
+.IP
+If no ref is named, the pull takes every ref that the summary of the remote lists, and fails if the remote serves no summary. This pull also copies the \fB\%summary\fR and \fB\%summary.sig\fR of the remote to this repository. If the remote has no \fB\%summary.sig\fR, the \fB\%summary.sig\fR of this repository stays as it is. A pull of named refs copies no summary.
+.TP
+\fB\-\-depth\fR \fIDEPTH\fR
+The number of parents of each pulled commit to follow.
+.IP
+\%0 takes the commit alone, and \%\-1 takes the whole ancestry on the remote. The pull follows the chain of each ref separately. The command refuses a value less than \%\-1. Default: \%0.
+.TP
+\fB\-\-commit\-metadata\-only\fR
+Fetch only the commit objects, and mark each commit partial.
+.IP
+The pull walks no tree and takes no static delta.
+.TP
+\fB\-\-subpath\fR \fIPATH\fR
+Fetch only the part of the tree of each commit under this path.
+.IP
+PATH is an absolute path, and the command refuses a value that does not start with \fB\%/\fR\&. The option can occur more than once, and the pull takes the union. The pull marks each commit partial, and a later pull without this option completes the commit. Into an \fB\%archive\fR repository, the pull takes no static delta, unless \%\-\-require\-static\-deltas is given.
+.TP
+\fB\-\-untrusted\fR
+Verify the checksum of every object. A pull always does this.
+.IP
+A pull over HTTP or over ssh hashes each object that it stores, and compares the result with the name of the object. So this switch changes nothing.
+.TP
+\fB\-\-http\-trusted\fR
+A switch of the \fB\%ostree\fR command that this pull accepts and ignores.
+.IP
+The pull still verifies the checksum of every fetched object, so a corrupt object fails the pull.
+.TP
+\fB\-\-bareuseronly\-files\fR
+Refuse regular files with mode bits outside \%0775.
+.IP
+A \%world\-writable, setuid, setgid, or sticky file fails the pull. A symlink passes. The check applies to the loose objects and to the objects that a static delta gives.
+.TP
+\fB\-\-disable\-verify\-bindings\fR
+Do not check the \%ostree.ref\-binding list of each pulled commit.
+.IP
+Without this switch, the list must name the ref that the commit is pulled under, or the pull fails. A commit with no \%ostree.ref\-binding key passes.
+.TP
+\fB\-\-force\-copy\fR
+Copy each object from a localcache repository, and make no hardlink.
+.IP
+The pull copies an object from a repository on another file system also without this switch.
+.TP
+\fB\-L\fR, \fB\-\-localcache\-repo\fR \fILOCALCACHE_REPO\fR
+Look in this repository for an object before the network.
+.IP
+The option can occur more than once, and the pull reads the repositories in the order given. It verifies the checksum of each object that it takes from them. Each path must be a repository, or the command fails before the pull sends a request.
+.TP
+\fB\-\-disable\-fsync\fR
+Do not sync anything that this pull writes.
+.IP
+This switch changes no byte that the pull writes. It wins over \%\-\-per\-object\-fsync.
+.TP
+\fB\-\-per\-object\-fsync\fR
+Sync the file of each content object when the pull stages it.
+.IP
+The switch applies whatever \fB\%[core] per\-object\-fsync\fR says. The pull does not sync metadata objects one by one. \%\-\-disable\-fsync and \fB\%[core] fsync=false\fR win over this switch.
+.TP
+\fB\-\-http\-header\fR \fINAME=VALUE\fR
+Send \%NAME=VALUE as an HTTP header with every request.
+.IP
+The option can occur more than once. The value splits at its first \fB\%=\fR, and the command refuses an empty NAME. A pull over ssh refuses this option.
+.TP
+\fB\-\-max\-outstanding\-fetcher\-requests\fR \fIN\fR
+The number of fetches to keep in flight (default: \%8).
+.TP
+\fB\-\-network\-retries\fR \fIN\fR
+The number of repeats after a retryable failure (default: \%5).
+.IP
+Each repeat goes through the round of mirrors again, from the first mirror. A \%404 gets no repeat. If a body fails in transit, the pull fetches it again from the start, and each refetch uses one repeat. The pull waits \%250 milliseconds before the first repeat, and doubles the wait up to \%2 seconds. A pull over ssh refuses a value above \%0.
+.TP
+\fB\-\-disable\-retry\-on\-network\-errors\fR
+Retry nothing, whatever the value of \%\-\-network\-retries.
+.IP
+The switch wins in either order of the two options. A pull over ssh accepts it, because a pull over ssh never sends a request again.
+.TP
+\fB\-\-low\-speed\-limit\-bytes\fR \fIN\fR
+The lowest rate in bytes per second of a transfer (default: \%1000).
+.IP
+If the rate of a transfer stays at N bytes per second or less for \%\-\-low\-speed\-time\-seconds, the transfer fails as a retryable failure. The pull samples the rate once a second over the last five seconds. \%0 turns the check off, and a negative value keeps the default. The value is read as a C \fB\%int\fR, and a value that this reader refuses ends the command before the repository opens. A pull over ssh refuses a value of \%0 or more.
+.TP
+\fB\-\-low\-speed\-time\-seconds\fR \fIN\fR
+The seconds that a transfer can stay at the lowest rate (default: \%30).
+.IP
+\%\-\-low\-speed\-limit\-bytes sets the lowest rate. \%0 turns the check off, and a negative value keeps the default. The value is read as a C \fB\%int\fR, as the value of \%\-\-low\-speed\-limit\-bytes is. A pull over ssh refuses a value of \%0 or more.
+.TP
+\fB\-\-update\-frequency\fR \fIFREQUENCY\fR
+The time between two redraws of the progress line (default: \%1000 ms).
+.IP
+FREQUENCY is in milliseconds. \%0 and a negative value keep the default. The value is read as a C \fB\%int\fR, as the value of \%\-\-low\-speed\-limit\-bytes is. The progress line goes to standard output. If the output is not a terminal, the pull prints no progress line.
+.TP
+\fB\-T\fR, \fB\-\-timestamp\-check\fR
+Refuse a fetched tip that is older than the current commit of its ref.
+.IP
+The current commit is the commit that the ref names in this repository. A tip with an equal timestamp passes. A ref that this repository does not hold passes.
+.TP
+\fB\-\-timestamp\-check\-from\-rev\fR \fIREV\fR
+Refuse a fetched tip that is older than the commit that REV names.
+.IP
+The command resolves REV in this repository, so this repository must have the commit. A tip with an equal timestamp passes. The option conflicts with \%\-\-timestamp\-check.
+.TP
+\fB\-\-disable\-static\-deltas\fR
+Fetch every object loose, and ignore all static deltas of the remote.
+.TP
+\fB\-\-require\-static\-deltas\fR
+Refuse the pull if a missing commit has no static delta on the remote.
+.IP
+A missing commit is a commit that this repository does not hold complete. The pull also fails if the remote serves no summary. The option conflicts with \%\-\-disable\-static\-deltas.
+.TP
+\fB\-\-gpg\-verify\fR[=\fIBOOL\fR]
+Require a GPG signature on every commit that the pull carries.
+.IP
+Without this option, the \fB\%gpg\-verify\fR key of the remote applies, and its default is true. \fB\%\-\-gpg\-verify\fR requires a signature, and \fB\%\-\-gpg\-verify=false\fR requires none. The trusted keys are \fB\%<remote>.trustedkeys.gpg\fR of the repository, the system trusted set, and the keyrings that the \fB\%gpgkeypath\fR key of the remote names. Possible values: true, false.
+.TP
+\fB\-\-gpg\-verify\-summary\fR[=\fIBOOL\fR]
+Require a GPG signature on the summary of the remote.
+.IP
+Without this option, the \fB\%gpg\-verify\-summary\fR key of the remote applies, and its default is false. \fB\%\-\-gpg\-verify\-summary\fR requires a signature, and \fB\%\-\-gpg\-verify\-summary=false\fR requires none. If a signature is required and the remote has no \fB\%summary\fR or no \fB\%summary.sig\fR, the pull fails. Possible values: true, false.
+.TP
+\fB\-\-sign\-verify\fR[=\fIBOOL\fR]
+Require an \%ed25519 or spki signature on every pulled commit.
+.IP
+Without this option, the \fB\%sign\-verify\fR key of the remote applies, and its default is off. \fB\%\-\-sign\-verify\fR requires a signature and selects every engine of this build. \fB\%\-\-sign\-verify=false\fR requires none. A valid signature of one engine is sufficient. The trusted keys come from the \fB\%verification\-<engine>\-key\fR and \fB\%verification\-<engine>\-file\fR keys of the remote, and from the system key store. Possible values: true, false.
+.TP
+\fB\-\-sign\-verify\-summary\fR[=\fIBOOL\fR]
+Require an \%ed25519 or spki signature on the summary of the remote.
+.IP
+Without this option, the \fB\%sign\-verify\-summary\fR key of the remote applies, and its default is off. \fB\%\-\-sign\-verify\-summary\fR requires a signature and selects every engine of this build. \fB\%\-\-sign\-verify\-summary=false\fR requires none. Possible values: true, false.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

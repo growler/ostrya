@@ -1,0 +1,237 @@
+.TH "OSTRYA\-REMOTE" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-remote \- Manage the configured remotes and their trusted GPG keys
+.SH SYNOPSIS
+.nf
+ostrya remote [OPTIONS] [COMMAND]
+.fi
+.SH DESCRIPTION
+Manage the configured remotes and their trusted GPG keys.
+.PP
+Each remote is a \fB\%[remote "NAME"]\fR section in the \fB\%config\fR file of the repository. The trusted GPG keyring of a remote is the file \fB\%NAME.trustedkeys.gpg\fR at the root of the repository. A nested subcommand is necessary. Without one, the command fails before it opens the repository.
+.SH OPTIONS
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH COMMANDS
+.SS "add"
+Add a remote repository.
+.PP
+The command writes the \fB\%[remote "NAME"]\fR section of the \fB\%config\fR file of the repository, and prints nothing. It refuses a name that is not a valid remote name. If the remote exists, the command fails, unless \%\-\-if\-not\-exists or \%\-\-force is given.
+.PP
+.nf
+ostrya remote add [OPTIONS] [NAME] [URL] [BRANCHES]...
+.fi
+.PP
+Arguments:
+.TP
+\fINAME\fR
+The remote name. Required, with the URL.
+.IP
+A name has one or more characters. Each character is a letter, a digit, \fB\%\-\fR, \fB\%_\fR, or \fB\%\&.\fR\&. The first character is a letter, a digit, or \fB\%_\fR\&.
+.TP
+\fIURL\fR
+The base URL of the remote, or \fB\%metalink=URL\fR for a metalink remote.
+.IP
+The command writes a base URL to the \fB\%url\fR key. For \fB\%metalink=URL\fR, it writes URL to the \fB\%metalink\fR key and writes no \fB\%url\fR key. The pull of ostrya does not read the \fB\%metalink\fR key.
+.TP
+\fIBRANCHES...\fR
+The refs that a pull of this remote takes if the pull names no ref.
+.IP
+The command writes them to the \fB\%branches\fR key.
+.PP
+Options:
+.TP
+\fB\-\-set\fR \fIKEY=VALUE\fR
+Set this configuration key in the section of the remote.
+.IP
+The option can occur more than once. The command writes the pairs in the order of the command line. They come after the URL, the branches, \%\-\-contenturl, and \%\-\-custom\-backend, and before the keys of \%\-\-no\-gpg\-verify, \%\-\-no\-sign\-verify, \%\-\-sign\-verify, and \%\-\-collection\-id. A later write of a key replaces the earlier value. The command refuses a value with no \fB\%=\fR\&.
+.TP
+\fB\-\-no\-gpg\-verify\fR
+Do not require a GPG signature on the commits pulled from this remote.
+.IP
+The command writes \fB\%gpg\-verify=false\fR\&. Without this option, a pull from the remote verifies the GPG signature of each commit.
+.TP
+\fB\-\-no\-sign\-verify\fR
+Do not require an \%ed25519, spki, or GPG signature on pulled commits.
+.IP
+The command writes \fB\%gpg\-verify=false\fR and \fB\%sign\-verify=false\fR\&. This option conflicts with \%\-\-sign\-verify.
+.TP
+\fB\-\-sign\-verify\fR \fIKEYTYPE=[inline|file]:PUBKEY\fR
+Trust this public key for the \%ed25519 or the spki engine.
+.IP
+The value is \%KEYTYPE=inline:PUBKEY or \%KEYTYPE=file:PATH. KEYTYPE is \fB\%ed25519\fR, or \fB\%spki\fR in a build with the \fB\%spki\fR feature. The command writes the key \fB\%verification\-KEYTYPE\-key\fR for an inline key, or \fB\%verification\-KEYTYPE\-file\fR for a file. It then writes \fB\%sign\-verify\fR with the engine of each \%\-\-sign\-verify, separated by commas. The option can occur more than once, and it conflicts with \%\-\-no\-sign\-verify.
+.TP
+\fB\-\-if\-not\-exists\fR
+If the remote exists, do nothing.
+.IP
+The command then also imports no keys for \%\-\-gpg\-import, and it exits \%0. This option conflicts with \%\-\-force.
+.TP
+\fB\-\-force\fR
+If the remote exists, replace its section.
+.IP
+The command removes the full section and writes a new one. This option conflicts with \%\-\-if\-not\-exists.
+.TP
+\fB\-\-gpg\-import\fR \fIFILE\fR
+Import the keys of this keyring file into the trusted keyring.
+.IP
+The import is the same as \fB\%remote gpg\-import\fR with \%\-\-keyring. The command imports the keys only after it writes the section of the remote, and then prints the number of imported keys.
+.TP
+\fB\-\-custom\-backend\fR \fINAME\fR
+Name a program other than ostrya that fetches this remote.
+.IP
+The command writes NAME to the \fB\%custom\-backend\fR key. ostrya does not read this key.
+.TP
+\fB\-\-contenturl\fR \fIURL\fR
+Write this URL to the \fB\%contenturl\fR key of the remote.
+.IP
+The key names a different URL for the content objects. The pull of ostrya does not read this key. It fetches all objects from the \fB\%pull\-url\fR or the \fB\%url\fR of the remote.
+.TP
+\fB\-\-collection\-id\fR \fICOLLECTION\-ID\fR
+A globally unique id for the remote as a collection of refs.
+.IP
+The command writes the value to the \fB\%collection\-id\fR key of the remote.
+.SS "delete"
+Delete a remote repository and its trusted GPG keyring.
+.PP
+The command removes the keyring \fB\%NAME.trustedkeys.gpg\fR at the root of the repository, and then the \fB\%[remote "NAME"]\fR section of \fB\%config\fR\&. It prints nothing. If the remote does not exist, the command fails, unless \%\-\-if\-exists is given.
+.PP
+.nf
+ostrya remote delete [OPTIONS] [NAME]
+.fi
+.PP
+Arguments:
+.TP
+\fINAME\fR
+The remote to delete. Required.
+.IP
+The command refuses a name that \fB\%remote add\fR refuses.
+.PP
+Options:
+.TP
+\fB\-\-if\-exists\fR
+If the remote does not exist, do nothing.
+.SS "list"
+List the configured remote names, sorted.
+.PP
+The command prints one name on each line. With \%\-u, the URL of each remote follows its name.
+.PP
+.nf
+ostrya remote list [OPTIONS]
+.fi
+.PP
+Options:
+.TP
+\fB\-u\fR, \fB\-\-show\-urls\fR
+Print the URL of each remote after its name.
+.IP
+The command pads each name with spaces to the length of the longest name plus two, so the URLs align. A remote with no \fB\%url\fR key stops the listing with an error. The names before it stay printed.
+.SS "show\-url"
+Print the URL of a remote.
+.PP
+The command prints the value of the \fB\%url\fR key of the remote. It fails if the remote does not exist, or if the remote has no \fB\%url\fR key. A remote that a metalink describes has no \fB\%url\fR key.
+.PP
+.nf
+ostrya remote show\-url [OPTIONS] [NAME]
+.fi
+.PP
+Arguments:
+.TP
+\fINAME\fR
+The remote to report. Required.
+.SS "refs"
+List the refs that a remote publishes in its summary.
+.PP
+The command fetches the summary of the remote over HTTP or ssh, as a pull does. It prints one \fB\%NAME:REF\fR line for each ref, in the order of the summary. It does not verify the signature of the summary. If the remote has no summary file, the command fails.
+.PP
+.nf
+ostrya remote refs [OPTIONS] [NAME]
+.fi
+.PP
+Arguments:
+.TP
+\fINAME\fR
+The remote to list. Required.
+.PP
+Options:
+.TP
+\fB\-r\fR, \fB\-\-revision\fR
+Print the commit checksum of each ref after a tab.
+.SS "summary"
+Report the summary of a remote.
+.PP
+The command fetches the summary of the remote over HTTP or ssh, as a pull does. It does not verify the signature of the summary. If the remote has no summary file, the command fails.
+.PP
+The default report gives each ref with its commit size, its commit checksum, and its metadata. The global metadata of the summary follows the refs. The report shows each timestamp in UTC.
+.PP
+.nf
+ostrya remote summary [OPTIONS] [NAME]
+.fi
+.PP
+Arguments:
+.TP
+\fINAME\fR
+The remote to report. Required.
+.PP
+Options:
+.TP
+\fB\-\-list\-metadata\-keys\fR
+List the available metadata keys.
+.IP
+The command prints the keys of the global metadata of the summary, sorted, one key on each line. \%\-\-raw takes precedence over this option.
+.TP
+\fB\-\-print\-metadata\-key\fR \fIKEY\fR
+Print the value of one metadata key.
+.IP
+The command prints the value in the GVariant text form, with its type. If the global metadata has no such key, the command fails. \%\-\-raw and \%\-\-list\-metadata\-keys take precedence over this option.
+.TP
+\fB\-\-raw\fR
+Show the raw variant data.
+.IP
+The command prints the full summary in the GVariant text form, with the \%big\-endian fields converted.
+.SS "gpg\-import"
+Import GPG keys into the trusted keyring of a remote.
+.PP
+The keyring is the file \fB\%NAME.trustedkeys.gpg\fR at the root of the repository. The keys come from the \%\-\-keyring files or from standard input. A key source is a binary or an \%ASCII\-armored public keyring. The command prints the number of keys that the keyring did not hold before.
+.PP
+A key that the keyring holds stays as it is. The command replaces it only for a key revocation that it can verify, or for a later expiry time of the key.
+.PP
+.nf
+ostrya remote gpg\-import [OPTIONS] [NAME] [KEY_IDS]...
+.fi
+.PP
+Arguments:
+.TP
+\fINAME\fR
+The remote to import into. Required.
+.TP
+\fIKEY_IDS...\fR
+The keys to import, by fingerprint, key id, or user id.
+.IP
+With no \%KEY_IDS, the command imports each key of the source. The command reads a key name as \fB\%gpg \-\-export\fR reads it. A run of \%8 or \%16 hex digits is a key id, and a run of \%32, \%40, or \%64 hex digits is a fingerprint. Each other value matches a part of a user id, and the match ignores the case of ASCII letters. If a value names no key of the source, the command fails.
+.PP
+Options:
+.TP
+\fB\-k\fR, \fB\-\-keyring\fR \fIFILE\fR
+Import the keys of this keyring file.
+.IP
+The file is a binary or an \%ASCII\-armored public keyring. The option can occur more than once, and it conflicts with \%\-\-stdin.
+.TP
+\fB\-\-stdin\fR
+Import the keys from standard input.
+.IP
+This option conflicts with \%\-\-keyring.
+.SS "gpg\-list\-keys"
+List the GPG keys in the trusted keyring of a remote.
+.PP
+The command reads the file \fB\%NAME.trustedkeys.gpg\fR at the root of the repository. For each key, it prints a \fB\%Key:\fR line with the fingerprint, a \fB\%Created:\fR line with the creation time in UTC, and one \fB\%UID:\fR line for each user id. If the keyring does not exist, the command prints nothing.
+.PP
+.nf
+ostrya remote gpg\-list\-keys [OPTIONS] [NAME]
+.fi
+.PP
+Arguments:
+.TP
+\fINAME\fR
+The remote to report. Required.
+.SH SEE ALSO
+\fBostrya\fR(1)

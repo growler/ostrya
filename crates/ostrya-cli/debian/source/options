@@ -1,0 +1,18 @@
+# keep cargo build artifacts and local tooling caches out of the source tarball
+tar-ignore = target
+tar-ignore = target/*
+tar-ignore = .direnv
+tar-ignore = .direnv/*
+tar-ignore = .git
+tar-ignore = .git/*
+tar-ignore = .vscode
+tar-ignore = .vscode/*
+tar-ignore = .idea
+tar-ignore = .idea/*
+tar-ignore = tmp
+tar-ignore = tmp/*
+tar-ignore = out
+tar-ignore = out/*
+
+# allow untracked files under these directories without upsetting dpkg-source
+extend-diff-ignore = ^(target|\.direnv|\.git|\.vscode|\.idea|tmp|out)/

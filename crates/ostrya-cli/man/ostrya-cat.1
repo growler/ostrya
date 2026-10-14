@@ -1,0 +1,27 @@
+.TH "OSTRYA\-CAT" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-cat \- Write the content of files of a commit to stdout
+.SH SYNOPSIS
+.nf
+ostrya cat [OPTIONS] [COMMIT] [PATH]...
+.fi
+.SH DESCRIPTION
+Write the content of files of a commit to stdout.
+.PP
+The command writes the bytes of each PATH in order, with no separator. It follows a symlink in the last component of a PATH. A directory, or a PATH that names nothing, is an error.
+.SH ARGUMENTS
+.TP
+\fICOMMIT\fR
+The commit to read (a checksum or a ref).
+.IP
+COMMIT and at least one PATH are required.
+.TP
+\fIPATH...\fR
+The paths to write, in order. A leading \fB\%/\fR is optional.
+.IP
+Each PATH must name a regular file, or a symlink that leads to one. The command follows a symlink in the last component, up to \%256 links. A symlink in another component is an error. A \fB\%\&.\fR or \fB\%\&..\fR component names nothing. The command stops at the first PATH that fails, and the content of the paths before it stays written.
+.SH OPTIONS
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

@@ -1,0 +1,62 @@
+.TH "OSTRYA\-SIGN" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-sign \- Add, verify, or delete signatures on a commit
+.SH SYNOPSIS
+.nf
+ostrya sign [OPTIONS] [COMMIT] [KEY_ID]...
+.fi
+.SH DESCRIPTION
+Add, verify, or delete signatures on a commit.
+.PP
+The signatures are in the detached metadata of the commit. Without \%\-\-verify or \%\-\-delete, the command signs the commit once for each key and prints nothing. With \%\-\-verify, it prints one line for each signature and a final verdict, and exits \%1 if no signature is valid. With \%\-\-delete, it removes the signatures that match the \%KEY\-IDs and prints their count. An \%ed25519 or spki verify with no key source reads the system key directories \fB\%/etc/ostree\fR and \fB\%/usr/share/ostree\fR\&.
+.SH ARGUMENTS
+.TP
+\fICOMMIT\fR
+The commit to operate on (a checksum or a ref). Required.
+.TP
+\fIKEY_ID...\fR
+Key identifiers: \%base64 keys, or gpg key selectors.
+.IP
+For \%ed25519 and spki, each \%KEY\-ID is a \%base64 key: a secret key to sign, or a public key to verify and delete. For gpg, each \%KEY\-ID is a signing key that gpg resolves (a fingerprint, key id, or user id). A gpg signing run needs at least one \%KEY\-ID. With \%\-\-delete, the gpg \%KEY\-IDs are the fingerprints to remove.
+.SH OPTIONS
+.TP
+\fB\-d\fR, \fB\-\-delete\fR
+Delete the stored signatures that match the given \%KEY\-IDs.
+.IP
+The command needs at least one \%KEY\-ID, and prints \fB\%Deleted <n> signature(s)\fR\&. For \%ed25519 and spki, a signature matches if it verifies under a public key from a \%KEY\-ID or from a \%\-\-keys\-file. For gpg, a \%KEY\-ID matches the end of the issuer fingerprint or of the \%primary\-key fingerprint of a signature. This option conflicts with \%\-\-verify.
+.TP
+\fB\-\-verify\fR
+Verify the signatures of the commit, and add no signature.
+.IP
+The command prints one line for each signature, with \fB\%good\fR, \fB\%BAD\fR, or \fB\%no public key\fR\&. Then it prints \fB\%verification OK\fR or \fB\%verification FAILED\fR\&. If the commit has no signature for the engine, the command prints \fB\%no signatures found\fR\&. If no signature is valid, the command exits \%1.
+.TP
+\fB\-s\fR, \fB\-\-sign\-type\fR \fISIGN_TYPE\fR
+The signature engine to use.
+.IP
+The engine selects the key format and the \%detached\-metadata key that holds the signatures: \fB\%ostree.sign.ed25519\fR, \fB\%ostree.sign.spki\fR, or \fB\%ostree.gpgsigs\fR\&. Default: \%ed25519. Possible values: \%ed25519, spki, gpg.
+.TP
+\fB\-\-keys\-file\fR \fIPATH\fR
+Read keys from a file.
+.IP
+For \%ed25519 and spki, the file has \%base64 keys, one per line: secret keys to sign, public keys to verify and delete. Signing and delete read every file. For an \%ed25519 or spki verify, the last value wins. With this option or a \%KEY\-ID, that verify does not read \%\-\-keys\-dir or the system key directories.
+.IP
+For gpg, the file is a binary or armored keyring for verify and delete, and every file is read. These keyrings then replace the global trusted set and the keyrings of \%\-\-remote. A gpg signing run refuses this option.
+.TP
+\fB\-\-keys\-dir\fR \fIPATH\fR
+Read the keys of an \%ed25519 or spki verify from this directory.
+.IP
+The verify reads \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR\&. It then does not read the system key directories \fB\%/etc/ostree\fR and \fB\%/usr/share/ostree\fR\&. If the option occurs more than once, the last value wins. An empty value names the working directory. The gpg engine refuses this option.
+.TP
+\fB\-\-gpg\-homedir\fR \fIGPG_HOMEDIR\fR
+The GnuPG home directory where gpg resolves signing keys.
+.IP
+Without this option, gpg uses its own resolution. Only the gpg engine reads it, and the \%ed25519 and spki engines refuse it.
+.TP
+\fB\-\-remote\fR \fIREMOTE\fR
+Add the trusted keyrings of this remote to a gpg verify and delete.
+.IP
+The keyrings are \fB\%<remote>.trustedkeys.gpg\fR in the repository and in \fB\%/etc/ostree/remotes.d/\fR\&. The command adds them to the global trusted set: the \fB\%*.gpg\fR keyrings in \fB\%OSTREE_GPG_HOME\fR, or in \fB\%/usr/share/ostree/trusted.gpg.d/\fR if that variable is unset or empty. With \%\-\-keys\-file, the command does not read these keyrings. Only the gpg engine reads this option, and the \%ed25519 and spki engines refuse it.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

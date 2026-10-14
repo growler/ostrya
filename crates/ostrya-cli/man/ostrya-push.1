@@ -1,0 +1,92 @@
+.TH "OSTRYA\-PUSH" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-push \- Push commits to a remote over ssh or HTTP and update its refs
+.SH SYNOPSIS
+.nf
+ostrya push [OPTIONS] [REMOTE] [REFSPECS]...
+.fi
+.SH DESCRIPTION
+Push commits to a remote over ssh or HTTP and update its refs.
+.PP
+The command resolves REMOTE and sends the objects that the server does not have. The server then updates all the refs of the refspecs in one transaction. Over ssh, the push runs the ssh client with the receive command on the remote side. Over HTTP, the push sends its requests to the receive endpoint of \fB\%ostrya serve\fR\&. The push drops the detached metadata keys that \fB\%[ex\-ostrya] detached\-metadata\-exclude\fR names.
+.PP
+On success, standard output carries one line for each ref, in the order of the refspecs. A line holds the DST name, the old state, and the new state. The old state is a full commit checksum, \fB\%(new)\fR, or \fB\%(absent)\fR\&. The new state is a full commit checksum, \fB\%(unchanged)\fR, or \fB\%(deleted)\fR\&.
+.PP
+Under \%\-\-verbose, one statistics line goes to standard error. If standard error is a terminal and \fB\%TERM\fR is set and is not \fB\%dumb\fR, standard error shows a progress bar while the push runs. On failure, the command writes \fB\%error: MESSAGE\fR to standard error and nothing to standard output, and exits \%1.
+.SH ARGUMENTS
+.TP
+\fIREMOTE\fR
+The remote: a remote name or an ssh or HTTP address. Required.
+.IP
+A value with a \fB\%:\fR or a \fB\%/\fR is an address: \fB\%ssh://[USER@]HOST[:PORT]/PATH\fR, \fB\%[USER@]HOST:PATH\fR, \fB\%http://\fR, or \fB\%https://\fR\&. Each other value names a \fB\%[remote "<name>"]\fR section in the config of this repository. The push address of the section is its \fB\%push\-url\fR key. If \fB\%push\-url\fR is absent, a \fB\%url\fR key with an \fB\%http://\fR or \fB\%https://\fR address is the push address.
+.IP
+To an ssh address, the push runs the ssh client with the receive command on the remote side. To an HTTP address, the push sends its requests to the receive endpoint of \fB\%ostrya serve\fR\&.
+.TP
+\fIREFSPECS...\fR
+The refspecs, each \fB\%SRC[:DST]\fR\&. At least one refspec is required.
+.IP
+SRC is a revision of this repository, and DST is the ref of the server that takes its commit. The command splits each refspec at its last \fB\%:\fR\&. If SRC is a ref, DST defaults to SRC. A SRC that is a checksum, or that has a \fB\%^\fR suffix, needs a DST. \fB\%:DST\fR deletes the ref DST of the server.
+.IP
+The command refuses a DST that the \%ref\-name rule refuses, which includes a DST with \fB\%^\fR\&. It also refuses a DST of \%64 lowercase hex characters after a SRC, because a revision reads such a name as a commit checksum. A delete of such a DST passes.
+.SH OPTIONS
+.TP
+\fB\-\-depth\fR \fIN\fR
+The number of parents of each source commit to send.
+.IP
+\%0 sends the commit alone, and \%\-1 sends the whole chain that this repository holds. The command refuses a value less than \%\-1.
+.IP
+Without this option, the push sends the chain back to the commit of the ref on the server. If the server does not have the ref, or the local chain does not have that commit, the push sends the source commit alone.
+.TP
+\fB\-\-force\fR
+Update each ref whatever its state on the server.
+.IP
+The push also asks the server to allow an update that is not a \%fast\-forward. The receive policy of the server still refuses such an update unless the policy sets \fB\%allow\-non\-fast\-forward\fR\&.
+.TP
+\fB\-\-compress\fR[=\fILEVEL\fR]
+Send the content objects deflated at LEVEL, \%1 to \%9.
+.IP
+The value needs the \fB\%=\fR form, and \%\-\-compress alone gives level \%6. Without this option, the push sends the content objects raw. With it, if this repository is an archive repository, the push sends each stored content object as it is, whatever LEVEL is. The object keeps the zlib level that the repository wrote it with.
+.TP
+\fB\-\-ssh\-command\fR \fICMD\fR
+The ssh command, split at ASCII whitespace.
+.IP
+It wins over the \fB\%OSTRYA_SSH_COMMAND\fR environment variable and over the \fB\%ssh\-command\fR key of the remote. Without each of the three, the push runs \fB\%ssh\fR\&. The split has no quoting rule. The command refuses an empty value, and refuses this option for an HTTP address.
+.TP
+\fB\-\-receive\-command\fR \fICMD\fR
+The command that the remote side runs over ssh.
+.IP
+The remote shell parses the command. The push adds \fB\%\-\-repo=\fR and the path of the address in single quotes. This option wins over the \fB\%receive\-command\fR key of the remote. The default is \fB\%ostrya receive\fR\&. The command refuses an empty value, and refuses this option for an HTTP address.
+.TP
+\fB\-\-push\-token\-file\fR \fIFILE\fR
+The file whose first line is the token of an HTTP push.
+.IP
+It wins over the \fB\%push\-token\-file\fR key of the remote. Without \%\-\-push\-user, the push sends the token as a bearer token. The command refuses a first line that is empty or longer than \%1 MiB. It refuses a token file for an \fB\%http://\fR address without \%\-\-allow\-cleartext\-credentials, and for an ssh address.
+.TP
+\fB\-\-push\-user\fR \fINAME\fR
+Send the token as the password of a Basic credential with this name.
+.IP
+Without this option, the token is a bearer token. The option needs a token file, from \%\-\-push\-token\-file or from the \fB\%push\-token\-file\fR key of the remote. It wins over the \fB\%push\-user\fR key of the remote. The command refuses an empty name and a name that holds \fB\%:\fR\&.
+.TP
+\fB\-\-tls\-client\-cert\-path\fR \fIFILE\fR
+The PEM file of the client certificate of an HTTPS push.
+.IP
+It needs a key file: \%\-\-tls\-client\-key\-path or the \fB\%tls\-client\-key\-path\fR key of the remote. It wins over the \fB\%tls\-client\-cert\-path\fR key of the remote. A push to an \fB\%http://\fR address reads no TLS file, and the command refuses this option for an ssh address.
+.TP
+\fB\-\-tls\-client\-key\-path\fR \fIFILE\fR
+The PEM file of the private key of the client certificate.
+.IP
+The key must need no passphrase. It needs a certificate file: \%\-\-tls\-client\-cert\-path or the \fB\%tls\-client\-cert\-path\fR key of the remote. It wins over the \fB\%tls\-client\-key\-path\fR key of the remote. The command refuses this option for an ssh address.
+.TP
+\fB\-\-tls\-ca\-path\fR \fIFILE\fR
+The PEM file of the CA certificates that verify the server.
+.IP
+With it, the push does not use the trust store of the host. It wins over the \fB\%tls\-ca\-path\fR key of the remote. A push to an \fB\%http://\fR address reads no TLS file, and the command refuses this option for an ssh address.
+.TP
+\fB\-\-allow\-cleartext\-credentials\fR
+Send the token to an \fB\%http://\fR address.
+.IP
+Without this switch, the command refuses a token to such an address before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an ssh address.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

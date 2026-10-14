@@ -1,0 +1,38 @@
+.TH "OSTRYA\-EXPORT" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-export \- Write the tree of a commit as a tar stream, to stdout or to \%\-\-output
+.SH SYNOPSIS
+.nf
+ostrya export [OPTIONS] [COMMIT]
+.fi
+.SH DESCRIPTION
+Write the tree of a commit as a tar stream, to stdout or to \%\-\-output.
+.PP
+The stream holds the files of the tree and no ostree objects. The root directory is the member \fB\%\&./\fR, and the other member names are relative paths. Ownership is numeric, and each timestamp is the commit timestamp. The extended attributes are \fB\%SCHILY.xattr.*\fR records, which \%\-\-no\-xattrs removes. The first regular file of a content object goes into the stream in full, and each later file of that object is a tar hardlink to it.
+.SH ARGUMENTS
+.TP
+\fICOMMIT\fR
+The commit to export (a checksum or a ref). Required.
+.SH OPTIONS
+.TP
+\fB\-\-no\-xattrs\fR
+Emit no extended attributes.
+.TP
+\fB\-\-subpath\fR \fIPATH\fR
+Export only this directory of the commit, as the archive root.
+.IP
+PATH must name a directory. A file, a symlink, or a path that names nothing is an error. If the option occurs more than once, the last value wins.
+.TP
+\fB\-\-prefix\fR \fIPATH\fR
+Put PATH in front of every member pathname.
+.IP
+The command adds no separator after PATH, so a PATH that acts as a directory must end in \fB\%/\fR\&. The name of the root member is PATH with a \fB\%/\fR added if PATH does not end in one. The target of a symlink gets no prefix. If the option occurs more than once, the last value wins.
+.TP
+\fB\-o\fR, \fB\-\-output\fR \fIPATH\fR
+Write the archive to PATH, and not to standard output.
+.IP
+The command opens PATH before it resolves the commit. An existing file is truncated in place, and keeps its inode and its mode. A new file gets mode \%0666, reduced by the umask. If the export fails after the open, PATH stays truncated. If the option occurs more than once, the last value wins.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

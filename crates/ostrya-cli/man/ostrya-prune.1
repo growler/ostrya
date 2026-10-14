@@ -1,0 +1,65 @@
+.TH "OSTRYA\-PRUNE" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-prune \- Delete the objects that no ref or commit of the repository reaches
+.SH SYNOPSIS
+.nf
+ostrya prune [OPTIONS]
+.fi
+.SH DESCRIPTION
+Delete the objects that no ref or commit of the repository reaches.
+.PP
+The walk starts from each ref and from each commit in the store. The command deletes each loose object that the walk does not reach. \%\-\-refs\-only, \%\-\-only\-branch, \%\-\-retain\-branch\-depth, and \%\-\-keep\-younger\-than start the walk from the refs alone. The depth and date options then limit the history of each ref. The commits that the metadata keys of the config key \fB\%[ex\-ostrya] gc\-root\-metadata\-keys\fR name are also roots.
+.PP
+The command also deletes each static delta whose target commit it deleted. A run with neither \%\-\-no\-prune nor \%\-\-static\-deltas\-only also deletes each static delta and each \fB\%state/<commit>.commitpartial\fR marker whose commit is not in the store. If \fB\%[core] tombstone\-commits\fR is true, the command writes a \fB\%\&.tombstone\-commit\fR for each deleted commit.
+.PP
+The command prints the total number of objects. It then prints the number of deleted objects and the freed size, or \fB\%No unreachable objects\fR\&. If \fB\%[core] locking\fR is false, the command takes no repository lock and prints a warning on standard error.
+.SH OPTIONS
+.TP
+\fB\-\-refs\-only\fR
+Delete each commit and object that no ref reaches.
+.IP
+Without this option, each commit in the store is a root of the walk. A commit that no ref names then stays, with the objects that it reaches.
+.TP
+\fB\-\-depth\fR \fIDEPTH\fR
+The number of parents of each ref to keep.
+.IP
+The value \%\-1 keeps all history. The value \%0 keeps only the commit that the ref names, and so does each negative value other than \%\-1. The bound deletes commits only if the walk starts from the refs alone: with \%\-\-refs\-only, \%\-\-only\-branch, \%\-\-retain\-branch\-depth, or \%\-\-keep\-younger\-than. Default: \%\-1.
+.TP
+\fB\-\-no\-prune\fR
+Compute and print the statistics, and delete nothing.
+.IP
+The command prints the number of objects that a prune deletes and the size that it frees. This option conflicts with \%\-\-delete\-commit.
+.TP
+\fB\-\-delete\-commit\fR \fIDELETE_COMMIT\fR
+Delete this specific, unreferenced commit before the sweep.
+.IP
+The value is a revision. The command refuses a commit that a ref names. The sweep then deletes each object that only this commit reached. The command writes a \fB\%\&.tombstone\-commit\fR for each commit that it deletes. This option conflicts with \%\-\-no\-prune.
+.TP
+\fB\-\-keep\-younger\-than\fR \fIDATE\fR
+Delete the history of each ref that is older than DATE.
+.IP
+DATE is \fB\%@SECONDS\fR since the Unix epoch, or a date and time with a UTC offset, for example \fB\%2024\-05\-01T12:00:00Z\fR or \fB\%2024\-05\-01 12:00+02:00\fR\&. The command refuses each other form. The commit that a ref names stays at all ages. The walk starts from the refs alone, as with \%\-\-refs\-only. For each branch that \%\-\-retain\-branch\-depth does not set, this bound replaces \%\-\-depth.
+.TP
+\fB\-\-static\-deltas\-only\fR
+Delete only the static deltas whose target commit is \%\-\-delete\-commit.
+.IP
+The command deletes no loose object, so the commit stays. This option requires \%\-\-delete\-commit.
+.TP
+\fB\-\-retain\-branch\-depth\fR \fIBRANCH=DEPTH\fR
+Keep DEPTH parents of BRANCH, in place of \%\-\-depth for that branch.
+.IP
+DEPTH is a decimal integer with an optional leading \fB\%\-\fR\&. The option can occur more than once, and the last value for a branch applies. The value \%0 keeps the branch at \%\-\-depth. The walk starts from the refs alone, as with \%\-\-refs\-only.
+.TP
+\fB\-\-only\-branch\fR \fIBRANCH\fR
+Prune BRANCH alone. Every other branch keeps its whole ancestry.
+.IP
+The option can occur more than once. A branch that \%\-\-retain\-branch\-depth names is also pruned, to its own depth. The walk starts from the refs alone, as with \%\-\-refs\-only. The command reads each BRANCH as a revision, and it fails if a BRANCH names nothing.
+.TP
+\fB\-\-commit\-only\fR
+Delete commit objects alone.
+.IP
+The objects that a deleted commit reached stay. The totals count commit objects alone.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

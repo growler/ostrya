@@ -160,6 +160,19 @@ nix develop               # Rust 1.92, the `ostree` tool, gnupg, and the
 The flake exposes the package as an overlay under `overlays.default`, so
 another flake can take `pkgs.ostrya`.
 
+The man pages of the `ostrya` command are in `crates/ostrya-cli/man/`. A
+unit test of `ostrya-cli` generates them from the `clap` definition and fails
+if a checked-in page differs. Write the pages again after a change to the
+help text:
+
+```sh
+OSTRYA_BLESS_MAN=1 cargo test -p ostrya-cli --bin ostrya man_pages
+```
+
+Hand-written sections, such as ENVIRONMENT and EXAMPLES, are in
+`crates/ostrya-cli/man/extra/<page>.roff`. The Nix package and the Debian
+package install the pages.
+
 The test suite runs under both runtime backends:
 
 ```sh

@@ -1,0 +1,55 @@
+.TH "OSTRYA\-REFS" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-refs \- List, create, or delete refs
+.SH SYNOPSIS
+.nf
+ostrya refs [OPTIONS] [PREFIX]...
+.fi
+.SH DESCRIPTION
+List, create, or delete refs.
+.PP
+Without an option, the command prints the local refs and the remote refs, one on each line, sorted by refspec. A remote ref prints as \fB\%remote:name\fR\&. Each PREFIX keeps the refs equal to it or below it, and the output groups the rows by PREFIX in the order given. \%\-A lists the aliases, and \%\-c lists the collection refs. \%\-\-create and \%\-\-delete write the refs and print nothing. \%\-\-create wins over \%\-\-delete.
+.SH ARGUMENTS
+.TP
+\fIPREFIX...\fR
+The \%ref\-name prefixes to match, or the collection ids with \%\-c.
+.IP
+A PREFIX matches the ref with that name and each ref below it. \fB\%<remote>:\fR matches each ref of the remote. With no PREFIX, the command lists every ref. With \%\-\-create, the one PREFIX is the revision that the new ref points at.
+.SH OPTIONS
+.TP
+\fB\-\-delete\fR
+Delete the refs that each PREFIX matches.
+.IP
+The command then lists no ref. At least one PREFIX is required. A PREFIX that matches nothing is not an error. With \%\-A, each PREFIX selects the aliases that a \%\-A listing prints for it. With \%\-c, each PREFIX is a collection id. If an alias names a local ref that a PREFIX matches, the command fails, and that PREFIX deletes nothing.
+.TP
+\fB\-\-list\fR
+Print the whole name of each ref, with the matched PREFIX in it.
+.IP
+Without this switch, the command prints the part of the name below the PREFIX. A ref whose name is equal to the PREFIX prints its whole name.
+.TP
+\fB\-r\fR, \fB\-\-revision\fR
+Print the commit checksum of each ref after a tab.
+.IP
+With \%\-A, this switch adds nothing.
+.TP
+\fB\-A\fR, \fB\-\-alias\fR
+List the aliases alone, each as \fB\%name \-> target\fR\&.
+.IP
+If a PREFIX names a ref, the command prints that ref with its commit checksum as the target. Each other PREFIX selects the aliases below it. With \%\-\-create, the new ref is an alias. Its target must be a ref, and NEWREF must not name a remote ref. \%\-c wins over this switch.
+.TP
+\fB\-\-create\fR \fINEWREF\fR
+Create the ref NEWREF, and point it at the commit that PREFIX names.
+.IP
+The command line must give exactly one PREFIX argument, which is a revision here. If NEWREF exists and \%\-\-force is not given, the command fails. With \%\-A, NEWREF is an alias of the ref that PREFIX names. With \%\-c, NEWREF is \fB\%<collection\-id>:<ref>\fR, and the command writes a collection ref. This option wins over \%\-\-delete.
+.TP
+\fB\-c\fR, \fB\-\-collections\fR
+List collection refs as \fB\%(collection\-id, ref)\fR pairs.
+.IP
+Each PREFIX is then a collection id. The local refs carry the collection id of the repository. With \%\-\-delete and the collection id of the repository, the command deletes only the local refs. The mirror refs with that id stay. This switch wins over \%\-A.
+.TP
+\fB\-\-force\fR
+With \%\-\-create, replace an existing ref.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

@@ -3890,7 +3890,8 @@ Observed by running the tool (2026.1).
   its boolean reader ignores a run of trailing space, tab, or form feed before
   it matches the four literals (`../format-reference.md`, "Config file"). So
   `ostree` opens a repository holding `lock-timeout-secs=bogus`,
-  `tmp-expiry-secs=bogus`, `min-free-space-percent=bogus`,
+  `lock-timeout-secs=+101`, `tmp-expiry-secs=bogus`,
+  `min-free-space-percent=bogus`,
   `min-free-space-percent=101x` (read as 101), or `fsync=true `, and `ostrya`
   refuses each of them at exit 1, naming the group, the key, and the value.
   Three reasons hold the refusal:

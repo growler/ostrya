@@ -294,20 +294,23 @@ impl KeyFile {
 
     /// Returns the signed integer value of a key.
     ///
-    /// The value text is a decimal `i64` with an optional `+` or `-` sign. If
-    /// the group or the key is absent, the method returns `Ok(None)`.
+    /// The value text is a decimal `i64` with an optional `-` sign. If the
+    /// group or the key is absent, the method returns `Ok(None)`.
     ///
     /// # Errors
     ///
     /// [`Error::KeyFile`] with the reason "value 'VALUE' for GROUP.KEY is not
     /// an integer" if the value text is not a decimal `i64`. White space in
-    /// the text causes this error.
+    /// the text and a leading `+` sign cause this error.
     pub fn get_integer(&self, group: &str, key: &str) -> Result<Option<i64>> {
+        let not_integer =
+            |v: &str| Error::KeyFile(format!("value '{v}' for {group}.{key} is not an integer"));
         match self.find(group, key) {
             None => Ok(None),
-            Some(v) => v.parse::<i64>().map(Some).map_err(|_| {
-                Error::KeyFile(format!("value '{v}' for {group}.{key} is not an integer"))
-            }),
+            // `str::parse` takes a leading `+`. The `ostree` command reads
+            // such a value as no value, so the port refuses it.
+            Some(v) if v.starts_with('+') => Err(not_integer(v)),
+            Some(v) => v.parse::<i64>().map(Some).map_err(|_| not_integer(v)),
         }
     }
 
@@ -772,6 +775,22 @@ mod tests {
         assert!(kf.get_bool("core", "case").is_err());
         assert!(kf.get_bool("core", "two").is_err());
         assert_eq!(kf.get_integer("core", "depth").unwrap(), Some(-1));
+    }
+
+    #[test]
+    fn integer_refuses_a_leading_plus_sign() {
+        // The port reads an integer as a whole decimal value with an optional
+        // `-` sign. The `ostree` command reads `+101` as no value and applies
+        // the default of the key, so the port refuses it.
+        let kf = KeyFile::parse("[core]\nplus=+101\nminus=-5\nplain=101\n").unwrap();
+        assert_eq!(
+            kf.get_integer("core", "plus"),
+            Err(Error::KeyFile(
+                "value '+101' for core.plus is not an integer".into()
+            ))
+        );
+        assert_eq!(kf.get_integer("core", "minus").unwrap(), Some(-5));
+        assert_eq!(kf.get_integer("core", "plain").unwrap(), Some(101));
     }
 
     #[test]

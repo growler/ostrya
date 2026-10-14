@@ -961,7 +961,9 @@ pub struct PullOptions {
     /// the signature check of the commit, before the transaction opens. So the
     /// pull can call it for a commit that a later plan of discovery drops, or
     /// for a commit of a pull that fails later in discovery. Else the pull
-    /// calls it when it fetches the commit.
+    /// calls it when it fetches the commit, and discovery parses no
+    /// `.commitmeta`. So a `.commitmeta` that does not parse fails the pull
+    /// only for a commit that the pull fetches.
     pub detached_metadata_filter: DetachedMetadataFilter,
     /// The handle to which a pull from a remote adds its live counters.
     ///

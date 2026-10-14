@@ -135,6 +135,13 @@ impl Repo {
     /// the stated length. A ref listing is whole in memory, up to
     /// [`MAX_REF_LISTING`] bytes.
     ///
+    /// The memory of a session is the two stream buffers, the chunk buffer,
+    /// one `Get` frame, and the reader of the current body. That reader is a
+    /// `FileReader` with a read-ahead of 4 KiB to 256 KiB, or a compressor and
+    /// two buffers of 64 KiB for a built `.filez`. A `Get` frame at the frame
+    /// limit adds about 2 MiB, because the frame body and the decoded path are
+    /// in memory at the same time.
+    ///
     /// If the input buffer holds no whole frame, the next read can wait. The
     /// session flushes `output` before that read. It also flushes `output`
     /// after each `Error` message.

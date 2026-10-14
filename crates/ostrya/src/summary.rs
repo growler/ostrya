@@ -783,6 +783,9 @@ impl Repo {
     ///
     /// A failure of one selected ref or of one index file fails the whole
     /// listing. The call does not read a ref that the selector does not select.
+    ///
+    /// `ostrya-server` exports no handler of the listing. A host with a router
+    /// of its own calls this method in its own handler.
     pub async fn build_ref_listing(&self, selector: &RefSelector) -> Result<Vec<u8>> {
         self.build_ref_listing_capped(selector, MAX_REF_LISTING)
             .await

@@ -188,7 +188,9 @@ struct Edit<'a> {
 /// The merges, the signatures, and the refs that change go into the queue of
 /// the transaction. If the repository has a collection id, the policy
 /// regenerates the summary, and a ref changes, the anchor commit also goes
-/// into the queue. Then the transaction commits.
+/// into the queue. Its parent is the anchor commit that this function reads
+/// under the lock. A failure of the anchor is `internal`, and nothing is
+/// published. Then the transaction commits.
 ///
 /// After the transaction commit, this function removes the partial marker of
 /// each commit of the session. If the policy regenerates the summary and a ref

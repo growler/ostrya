@@ -25,7 +25,7 @@ pub enum PushPhase {
     /// The session starts its transport and exchanges `Hello` with the server.
     ///
     /// In this phase, an ssh client can ask for a password or a passphrase on
-    /// the terminal.
+    /// the terminal. A tree push also signs its commit in this phase.
     Connecting,
     /// The session exchanges `Have` with the server.
     Negotiating,

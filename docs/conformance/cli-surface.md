@@ -363,7 +363,7 @@ GVariant type string in both implementations: Phase 17f widened
 maybe types, which `commit --add-metadata` writes into a commit's metadata dict.
 `Value` carries the matching variants -- `I16`, `U16`, `I32`, `I64`, `Double`,
 and `Maybe` -- with `o` and `g` held as `Str` and `h` as `I32`; the two enums
-are listed in `../api-sketch.md`, "GVariant types and values".
+are listed in the rustdoc of `ostrya_gvariant::Type` and `Value`.
 The indefinite characters part the two. The tool takes `r`, `*` and `?` and
 prints `**` for each, where the port refuses the type string with `error:
 invalid format: invalid type signature "<type>" at offset <n>: unsupported type
@@ -3707,8 +3707,9 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   `ostrya receive` does. `reply-not-delivered` states that the connection
   did not take the `CommitReply` response.
 - The paths, the methods, the status codes, and the order of the
-  authentication checks of the receive endpoint are in
-  `../api-sketch.md`, "Archive view and HTTP server".
+  authentication checks of the receive endpoint are in the rustdoc of
+  `ostrya_server::ReceiveEndpoint`, "Responses", and `ServeOptions`,
+  "Authentication".
 - `--listen` takes an IP address and a port. Give it once for each address.
   The default is `127.0.0.1:8080`, and port 0 lets the kernel choose a port.
   A host name is refused.
@@ -3756,8 +3757,7 @@ ostrya send [--repo=PATH]
   default set. `Repo::send` takes no feature of `ostrya`, so the command
   builds without `receive`, `push`, and `serve`.
 - The command serves one pull session over standard input and standard
-  output, through `Repo::send` (`../api-sketch.md`, "Pull over ssh: the
-  serving side"). An ssh pull runs it on the remote side. It answers each
+  output, through `Repo::send`. An ssh pull runs it on the remote side. It answers each
   `Get` path as the archive view of `serve` answers a `GET` of that path. A
   path that the view refuses gets the reply of a path that is not found.
 - The command takes no lock and writes no file in the repository. An

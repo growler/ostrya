@@ -196,7 +196,6 @@ with the code:
 
 - `docs/format-reference.md` -- the byte-exact on-disk format
 - `docs/port-plan.md` -- architecture, testing strategy, and the phased roadmap
-- `docs/api-sketch.md` -- the target Rust-native async API
 
 ## License
 

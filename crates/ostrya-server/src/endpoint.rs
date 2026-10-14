@@ -103,7 +103,9 @@ impl Default for EndpointOptions {
 ///   `Router::nest_service` of axum removes the prefix itself. The push
 ///   address of a client is then `https://HOST/api/v1/push`.
 /// - The request body does not need to be `Sync`, so the body of axum fits.
-///   The response body is [`ReceiveBody`].
+///   The response body is [`ReceiveBody`], which makes no promise of `Sync`.
+/// - The endpoint is `Send + Sync` and has no `Clone`. A host shares it in an
+///   `Arc`.
 /// - Run the future of [`sweep`](ReceiveEndpoint::sweep) once, in a task of
 ///   its own, when the host starts. If no task runs it, no session reaches
 ///   its idle timeout.

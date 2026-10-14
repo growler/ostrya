@@ -28,6 +28,12 @@ type Backend = tokio::fs::File;
 /// `futures-io` with each backend. With the `tokio` feature, it also
 /// implements the same three traits of `tokio`, which `tokio_io` re-exports.
 ///
+/// # Memory
+///
+/// With the `smol` feature, a write goes through a pipe to the blocking pool,
+/// and the pipe holds up to 8 MiB. With the `tokio` feature, one write of at
+/// most 2 MiB is in flight on the blocking pool.
+///
 /// # Examples
 ///
 /// ```
@@ -385,7 +391,9 @@ type ReaderBackend = tokio::fs::File;
 /// also bounds that read.
 ///
 /// If a read is in flight when the reader drops, the descriptor closes on the
-/// pool thread after that read returns.
+/// pool thread after that read returns. A read from a pipe or a socket blocks
+/// that pool thread until the peer writes or closes the stream, also after the
+/// reader drops.
 pub struct FileReader {
     inner: ReaderBackend,
 }

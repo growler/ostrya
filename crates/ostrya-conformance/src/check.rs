@@ -91,8 +91,8 @@ impl Report {
 ///
 /// A `spec:` value is `<document>#<anchor>`. The document name resolves first
 /// in the matrix directory, which holds `cli-surface.md` and `harness.md`.
-/// Then it resolves in the parent directory, which holds `format-reference.md`,
-/// `port-plan.md`, and `api-sketch.md`.
+/// Then it resolves in the parent directory, which holds `format-reference.md`
+/// and `port-plan.md`.
 ///
 /// The anchor is the fragment that GitHub makes from the heading text, so a
 /// resolved value links to the section in the rendered document.

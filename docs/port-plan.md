@@ -3,7 +3,7 @@
 Ostrya is a from-scratch reimplementation of libostree as a pure-Rust, async
 library. This
 plan targets the on-disk format and observable behavior specified in
-`format-reference.md`, with the target API in `api-sketch.md`. Each phase is
+`format-reference.md`. The rustdoc of each crate documents the API. Each phase is
 scoped to be independently reviewable, with explicit success criteria.
 
 Provenance: this is a clean-room reimplementation. Its design is grounded only
@@ -49,7 +49,7 @@ suite, recorded in `conformance/` (see `conformance/README.md`).
 
 Faithful means: byte-for-byte identical on-disk format, identical checksums,
 identical algorithms. It does not mean mirroring the C API shape. The API is
-redesigned to be idiomatic Rust (see `api-sketch.md`).
+redesigned to be idiomatic Rust (see `crates/ostrya/README.md`, "Design").
 
 ## Interpretation of "no dependencies except rust"
 
@@ -212,7 +212,7 @@ bounded:
   mode, over HTTP/1.1, and over TLS with ALPN for HTTP/2 and HTTP/1.1. With
   a receive policy it also runs the receive endpoint of a push: it holds the
   session table, and each request is one step of the `ReceiveService` of
-  its session (`api-sketch.md`, "Archive view and HTTP server"). The
+  its session (the rustdoc of `ostrya_server::ReceiveEndpoint`). The
   endpoint opens each session with `ReceiveService::hello_with_hooks`, with
   the policy and the hooks that `ReceiveAuth::open` gives in
   `SessionSetup`. The endpoint authenticates each request through the
@@ -970,7 +970,7 @@ Staging and metadata application use `rustix` under the already-enabled
 `fs` feature (`openat` with `O_TMPFILE`, `linkat`, `symlinkat`,
 `renameat`, `fchmod`, `fchown`, `fsetxattr`, `fstatvfs`, `syncfs`, `Dir`
 iteration), offloaded through `rt::unblock` at per-object granularity;
-hashing is the Phase 5a `HashingWriter` over `sha2`; archive compression
+hashing is a `Sha256` digester of `sha2`; archive compression
 is a streaming raw-DEFLATE encoder over `miniz_oxide`.
 
 Format facts the write path needs that `format-reference.md` does not yet
@@ -996,7 +996,7 @@ Definition:
   primary ingestion surface: streams one regular-file payload into a
   staging temp file (`O_TMPFILE` in the staging directory, `linkat` on
   finish; a named temp file where the filesystem refuses `O_TMPFILE`).
-  Bytes pass through a `HashingWriter` seeded with the framed
+  Bytes feed a `Sha256` digester seeded with the framed
   uncompressed header, so the object id is complete when the stream ends;
   in archive mode the same pass feeds the raw-DEFLATE encoder at
   `[archive] zlib-level` and counts compressed bytes. Bounded chunks end
@@ -1085,7 +1085,7 @@ checksums; walking a real filesystem is 7c.
 
 Definition:
 
-- `MutableTree` per `api-sketch.md`: name-keyed files (content checksum)
+- `MutableTree`: name-keyed files (content checksum)
   and subdirectories (nested trees); `new`, `from_commit`, `ensure_dir`,
   `replace_file`, `remove`, `set_metadata_checksum`. Names are validated
   on insertion (UTF-8, no `/`, not `.` or `..`), and one name cannot be
@@ -1264,7 +1264,7 @@ representation; it reuses the 7c walk machinery and the 7a writers.
 
 Definition:
 
-- Signature per `api-sketch.md`: `dfd` is the upperdir root; the
+- Signature: `dfd` is the upperdir root; the
   overlay is expected to be unmounted, unchecked.
 - Whiteouts: a char 0:0 device removes the corresponding mtree path.
   Other upper entries ingest through the 7c machinery and replace or
@@ -1324,7 +1324,7 @@ flows through the 7a writers and 7b trees.
 
 Definition:
 
-- `StagingTree<'txn>` per `api-sketch.md`: borrows the transaction, so
+- `StagingTree<'txn>`: borrows the transaction, so
   close, `write_mtree`, commit is the only ordering that compiles; the
   tree sits behind a sync mutex held only across map operations,
   `&StagingTree` is `Send + Sync`, and file writes may run
@@ -1341,9 +1341,9 @@ Definition:
   (`FileMeta`; the mode is fixed by the object model), `hardlink` (a
   second entry for the content object at the target path; no metadata
   taken). Intermediate path components resolve through symlinks; the
-  final component never follows: `write_file` and `write_file_content`
-  replace an existing file or symlink and fail on a directory;
-  `make_dir`, `symlink`, and `hardlink` fail on any existing entry;
+  final component never follows: `write_file`, `write_file_content`,
+  `symlink`, and `hardlink` replace an existing file or symlink and fail
+  on a directory; `make_dir` fails on any existing entry;
   `make_dir_all` applies its `DirMeta` to directories it creates, leaves
   existing ones untouched, and refuses a symlink at the last component
   with `EntryExists`, since that component is the directory it creates,
@@ -1784,7 +1784,7 @@ crypto engines drop in behind it.
 
 Definition:
 
-- `Signer` and `Verifier` traits per `api-sketch.md`: `Signer` carries the
+- `Signer` and `Verifier` traits: `Signer` carries the
   engine name and its detached-metadata key and signs an opaque byte payload;
   `Verifier` verifies a set of signature blobs against a payload and yields a
   `VerifyOutcome`. Both take opaque bytes so the commit path here and the
@@ -1803,7 +1803,7 @@ Definition:
   the guard that serializes the `.commitmeta` read-modify-write in this
   process; on the verify side collect each engine's signature array and run its
   verifier.
-- `VerifyOutcome` and `SignatureInfo` per `api-sketch.md`.
+- `VerifyOutcome` and `SignatureInfo`.
 - The dummy engine (`DummySigner` / `DummyVerifier`): the test engine whose
   secret and public keys are ASCII strings, whose signature and verification
   bytes are recovered by observation and recorded in `format-reference.md`. It
@@ -2064,7 +2064,8 @@ Definition:
   A signature past its own expiry is not valid and carries no field of its
   own. `gpgv` reports `EXPSIG` for it and no status keyword states more, so
   the record carries the fields a verified signature carries and states
-  `valid` false. `api-sketch.md` states the three field sets in full.
+  `valid` false. The rustdoc of `GpgVerifier`, "Fields of a record", states
+  the three field sets in full.
   A signature over a document is one of the Binary class and the Text class.
   The `pgp` crate verifies a signature without reading its class, and it
   hashes one byte of the payload for the Standalone class and the Timestamp
@@ -2901,8 +2902,8 @@ no socket.
   failure mid-body are each latched and replayed on every later read, so a
   consumer reading past a failure never observes a clean end of stream and cannot
   mistake a truncated object for a complete one -- which matters most for the
-  paths fetched without an expected digest, since a payload with one is also
-  caught by `VerifyingReader`. hyper reports a body error once and then reports
+  paths fetched without an expected digest, since a payload with one also
+  fails the digest check of the pull. hyper reports a body error once and then reports
   that body as ended, so the latch is what stands between a cut connection and a
   short object read as whole. The connection and the permit are released on the
   drop path, which closes the connection rather than pooling a response still in
@@ -7297,7 +7298,7 @@ over a pair of byte streams. Both take the options of `RepoPushOptions`. The
 push holds the lock of the local repository shared for the whole push. It
 reads the commits before the session opens, and it offers the commits first.
 It then offers the trees of the new values and of the history commits that the
-server lacks (`docs/api-sketch.md`, "Push from a repository"). The push keys
+server lacks (the rustdoc of `Repo::push`). The push keys
 of a remote section, `push-url`, `ssh-command`, `receive-command`,
 `push-token-file`, and `push-user`, are read through `Remote` in every build.
 `resolve_push` applies the keys of the transport of the push address alone,
@@ -7316,7 +7317,7 @@ passes `ostree fsck`, `ostree rev-parse` resolves each pushed ref, and
 `ostree pull-local` from it succeeds. The library half of the tree push is
 done: `ostrya::remote::push_tree` and `push_tree_over_stream` walk and hash a
 local directory, build and sign one commit over it, and set the target refs
-in one session (`docs/api-sketch.md`, "Tree push"). The commit checksum
+in one session (the rustdoc of `ostrya::remote::push_tree`). The commit checksum
 equals that of `Transaction::write_commit` over the same tree with the same
 inputs. `ostrya push-tree` pushes a local directory over ssh as one commit
 and prints the commit checksum (`docs/conformance/cli-surface.md`, "Port
@@ -7328,23 +7329,23 @@ mode, over HTTP and HTTPS, and `ostree pull` from it passes `ostree fsck`
 (`docs/conformance/cli-surface.md`, "Port extensions with no counterpart in
 the tool"). The fetcher has the upload request that the HTTP push transport
 sends through: a `POST` with a body given whole or streamed, retried only
-while it is unsent, with a bounded response (`docs/api-sketch.md`). The
+while it is unsent, with a bounded response (the rustdoc of `Fetcher::upload`). The
 receive endpoint of `ostrya serve` takes a push over HTTP: the sessions,
 their idle timeout and limit, `DELETE`, the status of each error, and the
 authentication of each request with a bearer token, a Basic credential, a
-client certificate, or as an anonymous push (`docs/api-sketch.md`,
-"Archive view and HTTP server", and `docs/conformance/cli-surface.md`,
+client certificate, or as an anonymous push (the rustdoc of
+`ostrya_server::ReceiveEndpoint` and `ServeOptions`, and `docs/conformance/cli-surface.md`,
 "serve"). A host mounts the same endpoint in its own router with
 `ReceiveEndpoint` of `ostrya-server` and an authentication of its own, and
 `push_tree` pushes to it over HTTPS and HTTP/2 under a path prefix that the
-host removes (`docs/api-sketch.md`, "Archive view and HTTP server"). A
+host removes (the rustdoc of `ReceiveEndpoint`, "Mounting"). A
 host of `ReceiveService` gives a session hooks of its own through
 `ReceiveService::hello_with_hooks`: `ReceiveHooks::before_update` runs just
 before the update lock of the commit, can refuse the commit, and gives
 detached-metadata entries that the commit writes with the refs, and a
 carried value that goes to `ReceiveHooks::after_update`, which runs with the
 report of the commit after the update lock is released
-(`docs/api-sketch.md`, "Receive policy (feature `receive`)"). A host of
+(the rustdoc of `ReceiveHooks`). A host of
 `ReceiveEndpoint` gives a session hooks through `SessionSetup::hooks`. A
 test pushes over HTTPS and HTTP/2 through a mounted endpoint with hooks: the
 entry of the host is written, an entry with `keep_existing` keeps the first
@@ -7354,15 +7355,15 @@ with `ref-mismatch`. The
 HTTP push transport is done: `PushSession::connect`,
 `push_tree`, and `Repo::push` take an `http://` or `https://` address, with
 a bearer token, a Basic credential, or a client certificate, and with
-`min(parallel-uploads, 31)` object streams (`docs/api-sketch.md`, "Push
-transports"). `ostrya push` and `ostrya push-tree` take the HTTP options and
+`min(parallel-uploads, 31)` object streams (the rustdoc of
+`PushSession::send`). `ostrya push` and `ostrya push-tree` take the HTTP options and
 the HTTP keys of a remote (`docs/conformance/cli-surface.md`, "push").
 
 The serving side of the pull over ssh is done. `Repo::send` serves one pull
 session over a pair of streams through one `ArchiveView`, and takes no lock.
 `ostrya send` serves the session over standard input and standard output
-(`docs/api-sketch.md`, "Pull over ssh: the serving side", and
-`docs/conformance/cli-surface.md`, "send").
+(the rustdoc of `Repo::send`, and `docs/conformance/cli-surface.md`,
+"send").
 
 The client side of the pull over ssh is done.
 `ostrya::remote::StreamSession` opens a stream session over a pair of streams
@@ -7372,7 +7373,7 @@ driver of `Repo::pull` reads the remote through a source: the HTTP source over
 the fetcher, with no change in behavior, or the stream source over a
 `StreamSession`. `PullSession::over_stream` opens a stream session over a
 pair of streams, and `Repo::pull_with_session` runs the pull through it
-(`docs/api-sketch.md`, "Pull over ssh: the client side").
+(the rustdoc of `StreamSession` and `Repo::pull_with_session`).
 `PullOptions::overrides` carries the values of the caller for the endpoint
 resolution of `Repo::pull`. `Repo::pull` runs over the ssh client for an ssh
 address in the `url` field of `PullOptions::overrides` or in the remote key
@@ -7396,7 +7397,7 @@ reads one `Hello` with the key `one-way` true, the object streams, and one
 the checks of `Repo::receive`. It adds no server signature and does not
 regenerate the summary. It accepts a repository with `[core] locking=false`.
 The two-way receiver refuses a `Hello` with `one-way` true as `protocol`
-(`docs/api-sketch.md`, "Receive policy (feature `receive`)").
+(the rustdoc of `Repo::receive`, "Hello").
 
 The sending half of the one-way stream is done.
 `ostrya_remote::session::export_stream` writes `Hello` with `one-way` true,
@@ -7409,7 +7410,7 @@ delete, a partial commit, a binding mismatch, empty updates, a ref named
 twice, an invalid ref name, a level outside 1 to 9, and a `Hello` or a
 `Commit` frame over 1 MiB before it writes a byte. A source that fails ends
 the stream inside an object with the abandon marker and `Abort`
-(`docs/api-sketch.md`, "Push from a repository").
+(the rustdoc of `Repo::export_stream`).
 
 Verify: push between two port repositories over ssh to localhost and over
 HTTP. The receiving repository passes `ostree fsck` and resolves the pushed
@@ -7556,7 +7557,7 @@ work: the execution order, the deliberate public breaks, and the public
 surface each deliverable adds.
 
 Each deliverable is reviewed before the next begins. No deliverable adds a
-crate to any manifest, and `api-sketch.md` is updated in the same change as
+crate to any manifest, and the rustdoc is updated in the same change as
 each. Three public breaks are deliberate and recorded here:
 `Content::Backed`'s `verity` field becomes an `Option`,
 `Repo::export_composefs` gains a parameter, and `MergeOptions` gains a field.

@@ -136,6 +136,33 @@ const KEYBOX_MAGIC_OFFSET: usize = 8;
 /// the past sets no key expiry, binds no subkey, and ranks no user id. These
 /// rules give the behavior of `gpgv` 2.4.9.
 ///
+/// # Fields of a record
+///
+/// A record carries one of three field sets. The set tells how far the
+/// verification went.
+///
+/// - A signature that a loaded key verifies gives the signing key in
+///   `fingerprint` and the certificate that holds it in
+///   `primary_fingerprint`. It also gives the user id of that certificate in
+///   `user_name` and `user_email`, the instants and the algorithm names of the
+///   signature packet, and the verdict of the policy in `valid`. `expires` is
+///   the creation time plus the lifetime that the packet states. It is `None`
+///   if the packet states no lifetime.
+/// - A signature whose issuer no loaded certificate holds gives the fields of
+///   its own packet, with `key_missing` set: the issuer fingerprint, or none
+///   if the packet names none, the creation time, and the two algorithm
+///   names. A signature that the policy refuses for its class, for its digest
+///   algorithm, or for a subkey that the primary key did not cross-certify
+///   gives the same fields with `key_missing` clear. Neither set has a user
+///   id.
+/// - A signature whose issuer resolved and whose cryptography failed gives the
+///   signing key, the certificate that holds it, and the user id of that
+///   certificate. It gives no instant and no algorithm name, because the
+///   verifier checked no claim of the packet.
+///
+/// A signature after its own expiry is not valid and adds no field to the set
+/// of a verified signature.
+///
 /// # Limits of a keyring
 ///
 /// A keyring is untrusted input. Each keyring, as bytes or as a file, has

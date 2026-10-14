@@ -454,8 +454,9 @@ impl Repo {
     ///   UTF-8.
     /// - [`Error::Core`] if the `config` of the remote does not parse as a key
     ///   file, or if a `refs/heads/<ref>` file holds no checksum.
-    /// - [`Error::InvalidRefspec`] if a requested ref, or a ref of the summary
-    ///   under `MIRROR`, is not a valid ref name. A `MIRROR` pull of every ref
+    /// - [`Error::InvalidRefspec`] if a requested ref, a ref of the summary
+    ///   under `MIRROR`, or a name of the `branches` key of the remote is not
+    ///   a valid ref name. A `MIRROR` pull of every ref
     ///   fails with this error if the summary lists one name that the ref-name
     ///   rule refuses. The pull does not skip the name.
     /// - [`Error::RefNotFound`] if neither the summary nor `refs/heads/<ref>`

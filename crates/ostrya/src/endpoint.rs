@@ -162,6 +162,9 @@ impl fmt::Debug for EndpointOverrides {
 /// because the `ostree` command also reads it. The function ignores the keys
 /// `contenturl` and `metalink`.
 ///
+/// A `url` of the caller replaces the address alone. The TLS keys, the key
+/// `proxy`, and the ssh keys of the section still apply.
+///
 /// # HTTP address
 ///
 /// The function gives [`Endpoint::Http`] with these values:
@@ -474,7 +477,8 @@ async fn pull_http(
 /// - A `push_user` has no token file, or is empty, or holds `:`.
 /// - The address is `http://`, the push has a token file, and the caller
 ///   does not set `allow_cleartext_credentials`. The token would go to the
-///   server in cleartext.
+///   server in cleartext. This refusal comes before the read of the key
+///   `proxy`.
 /// - The address is ssh, and the caller sets a field of an HTTP address. The
 ///   message names the first such field and shows the address without its
 ///   user.

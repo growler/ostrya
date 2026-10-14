@@ -164,7 +164,8 @@ code in the same change that alters behavior.
   gate for every phase.
 - `docs/port-plan.md` -- architecture, testing strategy, the phased roadmap, and
   the locked decisions.
-- `docs/api-sketch.md` -- the target rust-native async API.
+- The rustdoc of each crate -- the public Rust API. The design principles
+  of the API are in `crates/ostrya/README.md`, "Design".
 
 ## Requirement: package README files follow the crate docs
 
@@ -182,6 +183,9 @@ The copy differs from the crate-level doc in these points:
 - Each heading is one level lower.
 - Each intra-doc link is a code span with no link.
 - An example has no hidden `# ` lines, and its code block is marked `rust`.
+- The `README.md` of `ostrya` ends with a section "Design", which states
+  the design principles of the API and its relation to the C API. This
+  section is in the `README.md` alone.
 
 A new published crate gets its `README.md` in the same form.
 

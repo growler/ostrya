@@ -1,0 +1,285 @@
+.TH "OSTRYA\-REPO" "5" "" "ostrya" "File Formats"
+.SH NAME
+ostrya\-repo \- The layout of an ostrya repository
+.SH DESCRIPTION
+An ostrya repository is a directory.
+It holds content\-addressed objects, refs that name commits, and a configuration file.
+The format is the on\-disk format of an ostree repository.
+The \fB\%ostree\fR tool reads the objects that \fB\%ostrya\fR writes, and \fB\%ostrya\fR reads the objects that the tool writes.
+Some files and one mode are extensions of ostrya.
+The section EXTENSIONS lists them.
+.PP
+\fB\%ostrya init\fR makes a repository.
+The keys of the \fB\%config\fR file are in \fB\%ostrya\-config\fR(1).
+In this page, \fB\%<repo>\fR is the repository directory.
+.SH MODES
+The key \fB\%core.mode\fR of \fB\%config\fR sets the mode of the repository.
+\fB\%ostrya init \-\-mode\fR writes the key, and the default mode is \fB\%bare\fR.
+The mode controls how a file object is stored.
+An object has the same checksum in each mode.
+.TP
+\fB\%bare\fR
+A file object is a regular file or a symbolic link.
+Its inode has the owner, the group, the mode, and the extended attributes of the committed file.
+A write of a correct owner needs root.
+.TP
+\fB\%bare\-user\fR
+A file object is a regular file that the writing user owns.
+The extended attribute \fB\%user.ostreemeta\fR holds the committed owner, group, mode, and extended attributes.
+The inode mode of a regular file is the committed permission bits masked with 0775, with the owner read bit set.
+A symbolic link is a regular file that holds the target and one NUL byte, with the inode mode 0644.
+.TP
+\fB\%bare\-user\-only\fR
+A file object is a regular file or a symbolic link with no extended attributes.
+The owner and the group read back as 0.
+The inode mode of a regular file is the committed permission bits masked with 0755.
+A commit records the owner, the group, and the mode in this reduced form, so its checksums follow from that form.
+.TP
+\fB\%bare\-split\-xattrs\fR
+A file object is stored as in \fB\%bare\fR, with no extended attributes on the inode.
+The extended attributes are in separate \fB\%.file\-xattrs\fR objects.
+\fB\%ostrya\fR reads this mode and does not write it.
+\fB\%ostrya init\fR refuses it.
+.TP
+\fB\%archive\fR and \fB\%archive\-z2\fR
+A file object is a \fB\%.filez\fR file.
+The file holds a header with the file metadata, then the content compressed with raw DEFLATE.
+The key \fB\%archive.zlib\-level\fR sets the compression level.
+A symbolic link is the header alone.
+The inode mode of each object is 0644.
+\fB\%ostrya init\fR writes \fB\%archive\fR as \fB\%archive\-z2\fR.
+An HTTP server can serve the repository as static files.
+.TP
+\fB\%bare\-user\-shared\fR
+An ostrya extension for development hosts where a group of users share one repository.
+A file object has the bytes and the \fB\%user.ostreemeta\fR attribute of \fB\%bare\-user\fR.
+The inode mode of each object is 0644, and the committed mode is never applied to the inode.
+A checkout copies or reflinks each file, and refuses a hard link checkout.
+The \fB\%ostree\fR tool does not know this mode string and refuses to open the repository.
+The section PERMISSIONS gives the modes of the directories and the lock files.
+.PP
+In each mode, a metadata object is stored uncompressed with the inode mode 0644.
+.SH OBJECTS
+An object is a file below \fB\%objects/\fR.
+Its name is the SHA\-256 checksum of its content, in 64 lowercase hexadecimal characters.
+The first two characters name a subdirectory, and the other 62 characters and the suffix name the file:
+.PP
+.nf
+objects/<first 2 hex>/<last 62 hex>.<suffix>
+.fi
+.PP
+The suffix gives the object type:
+.TP
+\fB\%.commit\fR
+A commit: the metadata, the parent, the subject, the body, the time, and the root dirtree and dirmeta checksums.
+.TP
+\fB\%.dirtree\fR
+A directory listing: the names and checksums of the files and of the subdirectories.
+.TP
+\fB\%.dirmeta\fR
+The owner, the group, the mode, and the extended attributes of a directory.
+.TP
+\fB\%.file\fR
+A file object in each mode other than archive.
+.TP
+\fB\%.filez\fR
+A file object in an archive repository.
+.TP
+\fB\%.commitmeta\fR
+The detached metadata of a commit, for example its signatures.
+The checksum of a commit does not include it, so a signature can be added after the commit.
+.TP
+\fB\%.tombstone\-commit\fR
+A marker that records a commit that a prune deleted.
+\fB\%ostrya prune\fR writes it when the key \fB\%core.tombstone\-commits\fR is true.
+.TP
+\fB\%.file\-xattrs\fR and \fB\%.file\-xattrs\-link\fR
+The extended attributes of a file object in a \fB\%bare\-split\-xattrs\fR repository.
+\fB\%ostrya\fR reads these objects and does not write them.
+.PP
+The byte layout of each object type is in \fB\%docs/format\-reference.md\fR of the ostrya source tree.
+.SH LAYOUT
+\fB\%ostrya init\fR makes the directories \fB\%objects\fR, \fB\%tmp\fR, \fB\%tmp/cache\fR, \fB\%refs\fR, \fB\%refs/heads\fR, \fB\%refs/remotes\fR, \fB\%refs/mirrors\fR, \fB\%state\fR, and \fB\%extensions\fR, and the file \fB\%config\fR.
+It keeps an existing \fB\%config\fR unchanged.
+The other entries below appear when a command first needs them.
+.TP
+\fB\%<repo>/config\fR
+The configuration file, in the key file format.
+A new repository gets the group \fB\%[core]\fR with \fB\%repo_version=1\fR, \fB\%mode\fR, and the optional \fB\%collection\-id\fR.
+\fB\%ostrya\-config\fR(1) lists the keys.
+.TP
+\fB\%<repo>/.lock\fR
+The repository lock.
+Each transaction takes a shared lock, so many commits and pulls can run at the same time.
+A prune takes an exclusive lock.
+The keys \fB\%core.locking\fR and \fB\%core.lock\-timeout\-secs\fR control it.
+.TP
+\fB\%<repo>/.update.lock\fR
+An ostrya extension.
+An exclusive lock that serializes each write of refs, \fB\%config\fR, keyrings, \fB\%summary\fR, \fB\%summary.sig\fR, and \fB\%.commitmeta\fR files.
+\fB\%ostrya\fR takes it also when \fB\%core.locking\fR is false.
+.TP
+\fB\%<repo>/objects/\fR
+The object store.
+The section OBJECTS gives its layout.
+.TP
+\fB\%<repo>/refs/heads/<ref>\fR
+A local ref.
+The file holds the 64 hexadecimal characters of a commit checksum and a newline.
+A \fB\%/\fR in the ref name makes a subdirectory.
+An alias is a relative symbolic link to another ref.
+.TP
+\fB\%<repo>/refs/remotes/<remote>/<ref>\fR
+A ref that a pull from the remote \fB\%<remote>\fR wrote.
+The refspec \fB\%<remote>:<ref>\fR names it.
+.TP
+\fB\%<repo>/refs/mirrors/<collection\-id>/<ref>\fR
+A collection ref.
+The summary lists these refs in its collection map.
+.TP
+\fB\%<repo>/state/<checksum>.commitpartial\fR
+A marker of a commit that the repository does not hold in full.
+A pull writes it before it fetches the objects of the commit, and removes it when the pull completes.
+A pull with \fB\%\-\-subpath\fR or \fB\%\-\-commit\-metadata\-only\fR keeps it.
+.TP
+\fB\%<repo>/tmp/\fR
+The staging area.
+Each transaction makes a directory \fB\%tmp/staging\-<boot\-id>\-<6 characters>/\fR and a lock file with the same name and the suffix \fB\%\-lock\fR.
+A transaction writes its objects there and moves them into \fB\%objects/\fR when it commits.
+At the start of each transaction, ostrya removes the staging directories whose lock is free, and the other entries older than \fB\%core.tmp\-expiry\-secs\fR.
+\fB\%tmp/cache/\fR is never removed.
+.TP
+\fB\%<repo>/extensions/\fR
+Reserved.
+\fB\%ostrya init\fR makes it empty, and \fB\%ostrya serve\fR serves its content as stored.
+.TP
+\fB\%<repo>/deltas/\fR
+The static deltas.
+\fB\%ostrya static\-delta generate\fR writes them.
+The section STATIC DELTAS gives the layout.
+.TP
+\fB\%<repo>/delta\-indexes/<to 2>/<to rest>.index\fR
+The index of the static deltas that end at the commit \fB\%<to>\fR.
+\fB\%ostrya static\-delta reindex\fR writes it.
+Each entry maps a delta name to the SHA\-256 checksum of its superblock.
+.TP
+\fB\%<repo>/summary\fR
+The summary: the refs and their commits, the static deltas, and the repository metadata.
+\fB\%ostrya summary \-u\fR writes it.
+A pull reads it from the remote.
+.TP
+\fB\%<repo>/summary.sig\fR
+The signatures of the summary.
+\fB\%ostrya summary \-u \-\-sign\fR and \fB\%\-\-gpg\-sign\fR write it.
+A regeneration of the summary removes it.
+.TP
+\fB\%<repo>/<remote>.trustedkeys.gpg\fR
+The trusted GPG keyring of the remote \fB\%<remote>\fR.
+\fB\%ostrya remote gpg\-import\fR writes it, and \fB\%ostrya remote delete\fR removes it.
+.TP
+\fB\%<repo>/gpgkeys.gpg\fR
+A keyring that \fB\%ostrya show\fR reads to check a GPG signature, when \fB\%\-\-gpg\-verify\-remote\fR is not given.
+No command writes it.
+.PP
+To change \fB\%config\fR, a ref, or \fB\%summary\fR, ostrya writes a temporary file and renames it over the target.
+The temporary file is \fB\%<name>.tmp\-<pid>\-<n>\fR next to the target, or \fB\%tmp/.ostrya\-ref\-*\fR or \fB\%tmp/.ostrya\-meta\-*\fR below \fB\%tmp/\fR.
+.SH STATIC DELTAS
+A static delta holds the objects that change between two commits, or all the objects of one commit.
+Its path uses a modified base64 form of the commit checksums: standard base64 with \fB\%/\fR changed to \fB\%_\fR and no trailing \fB\%=\fR, 43 characters in all.
+.TP
+\fB\%deltas/<to 2>/<to rest>/\fR
+A delta that makes the commit \fB\%<to>\fR from no commit.
+\fB\%<to 2>\fR is the first two characters of the base64 form, and \fB\%<to rest>\fR is the other 41.
+.TP
+\fB\%deltas/<from 2>/<from rest>\-<to>/\fR
+A delta from the commit \fB\%<from>\fR to the commit \fB\%<to>\fR.
+.PP
+A delta directory holds the file \fB\%superblock\fR and the parts \fB\%0\fR, \fB\%1\fR, and up.
+The superblock holds the metadata of the delta, the target commit, and the list of the parts.
+A signed delta has the same file names, and its superblock is wrapped in a signed envelope.
+\fB\%static\-delta generate \-\-inline\fR puts each part into the superblock and writes no part file.
+A part starts with one byte that names its compression: 0 for none, or \fB\%x\fR for xz.
+.PP
+In the summary and in an index, the name of a delta is the hexadecimal \fB\%<to>\fR or \fB\%<from>\-<to>\fR.
+\fB\%ostrya prune\fR removes a delta when its target commit is not in the repository.
+.SH PERMISSIONS
+In each mode other than \fB\%bare\-user\-shared\fR, ostrya makes a directory with the mode 0775, or 0777 for an \fB\%objects/<xx>/\fR directory, less the umask.
+It writes \fB\%config\fR, each ref file, each object, \fB\%summary\fR, \fB\%summary.sig\fR, and each file in \fB\%deltas/\fR and \fB\%delta\-indexes/\fR with the mode 0644.
+.PP
+In a \fB\%bare\-user\-shared\fR repository, ostrya sets these modes with fchmod after it makes each entry, so the umask has no effect:
+.TP
+Directories: 02770
+The repository root, if ostrya made it, each directory that \fB\%ostrya init\fR makes, each \fB\%objects/<xx>/\fR directory, each directory below \fB\%refs/\fR, \fB\%tmp/\fR, and each staging directory.
+The setgid bit makes each new entry take the group of its directory.
+.TP
+Lock files: 0660
+\fB\%.lock\fR, \fB\%.update.lock\fR, and the lock file of each staging directory.
+Each member of the group can then take the locks.
+.TP
+Objects: 0644
+Each object and each \fB\%.commitmeta\fR.
+.TP
+Markers: 0644
+Each \fB\%state/<checksum>.commitpartial\fR.
+.PP
+An entry that exists keeps its mode and its group.
+ostrya sets no group owner.
+\fB\%deltas/\fR and \fB\%delta\-indexes/\fR take the modes of the other repository modes.
+.SH SERVED FILES
+\fB\%ostrya serve\fR and \fB\%ostrya send\fR read the repository through an archive view.
+The view serves these paths:
+.IP \(bu 2
+\fB\%config\fR, which the view makes and does not read from disk: \fB\%[core]\fR with \fB\%repo_version=1\fR, \fB\%mode=archive\-z2\fR, and the \fB\%collection\-id\fR and \fB\%indexed\-deltas\fR keys of the repository if they are set.
+.IP \(bu 2
+\fB\%summary\fR, \fB\%summary.sig\fR, \fB\%refs/\fR, and \fB\%extensions/\fR, as stored.
+An alias ref is served as its target.
+.IP \(bu 2
+The metadata objects, as stored.
+.IP \(bu 2
+The \fB\%.filez\fR objects.
+In an archive repository the view serves them as stored, and in another mode it makes them on request.
+.IP \(bu 2
+\fB\%deltas/\fR and \fB\%delta\-indexes/\fR, in an archive repository alone.
+.PP
+The view refuses \fB\%tmp/\fR, \fB\%state/\fR, each name that starts with \fB\%.\fR, and each other path.
+\fB\%ostrya serve\fR also serves \fB\%/_ostrya/refs/v1\fR, a list of refs that match a pattern, and \fB\%/_ostrya/receive/v1/\fR, the endpoint of a push over HTTP.
+These two are not files of the repository.
+.SH EXTENSIONS
+These parts of the layout are extensions of ostrya:
+.IP \(bu 2
+the mode \fB\%bare\-user\-shared\fR and its permissions;
+.IP \(bu 2
+the lock file \fB\%.update.lock\fR;
+.IP \(bu 2
+the temporary names \fB\%tmp/.ostrya\-ref\-*\fR, \fB\%tmp/.ostrya\-meta\-*\fR, and \fB\%<name>.tmp\-<pid>\-<n>\fR;
+.IP \(bu 2
+the config groups \fB\%[ex\-ostrya]\fR, \fB\%[ex\-ostrya receive]\fR, \fB\%[ex\-ostrya receive "PATTERN"]\fR, \fB\%[ex\-ostrya trust "NAME"]\fR, and \fB\%[ex\-ostrya key "NAME"]\fR;
+.IP \(bu 2
+the remote keys \fB\%push\-url\fR, \fB\%ssh\-command\fR, \fB\%receive\-command\fR, \fB\%push\-token\-file\fR, \fB\%push\-user\fR, \fB\%pull\-url\fR, and \fB\%send\-command\fR.
+.PP
+The \fB\%ostree\fR tool keeps the extension keys when it writes \fB\%config\fR, and ignores them.
+.PP
+ostrya does not write these entries of the ostree layout: \fB\%tmp/cache/summaries/\fR, \fB\%uncompressed\-objects\-cache/\fR, \fB\%.payload\-link\fR objects, and \fB\%remotes.d/\fR configuration files.
+.SH FILES
+ostrya also reads these files outside the repository:
+.TP
+\fB\%/etc/ostree/remotes.d/<remote>.trustedkeys.gpg\fR
+The system keyring of the remote \fB\%<remote>\fR.
+.TP
+\fB\%/usr/share/ostree/trusted.gpg.d/*.gpg\fR
+The global trusted GPG keyrings.
+If \fB\%OSTREE_GPG_HOME\fR is set and is not empty, ostrya reads the keyrings in that directory in place of this one.
+.TP
+\fB\%/etc/ostree/trusted.<engine>\fR, \fB\%/etc/ostree/trusted.<engine>.d/\fR
+.TQ
+\fB\%/usr/share/ostree/trusted.<engine>\fR, \fB\%/usr/share/ostree/trusted.<engine>.d/\fR
+The system trusted keys of the signature engine \fB\%<engine>\fR, which is \fB\%ed25519\fR or \fB\%spki\fR.
+.TP
+\fB\%/etc/ostree/revoked.<engine>\fR, \fB\%/etc/ostree/revoked.<engine>.d/\fR
+.TQ
+\fB\%/usr/share/ostree/revoked.<engine>\fR, \fB\%/usr/share/ostree/revoked.<engine>.d/\fR
+The system revoked keys of the signature engine \fB\%<engine>\fR.
+.SH SEE ALSO
+\fBostrya\fR(1),
+\fBostrya\-config\fR(1),
+\fBostrya\-init\fR(1)

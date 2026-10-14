@@ -185,6 +185,27 @@ The copy differs from the crate-level doc in these points:
 
 A new published crate gets its `README.md` in the same form.
 
+## Requirement: man pages follow the repository layout and config
+
+Two man pages of the `ostrya` command describe the repository itself:
+
+- `ostrya-repo(5)` describes the layout: the modes, the objects, each file
+  and directory of a repository, the permissions, the served files, and the
+  files outside the repository that the port reads. Its body is
+  `crates/ostrya-cli/man/extra/ostrya-repo.5.roff`.
+- `ostrya-config(1)` lists each key of the `config` file, ostree keys and
+  port extensions, and the receive policy groups. The list is in
+  `crates/ostrya-cli/man/extra/ostrya-config.1.roff`.
+
+A change to the layout or to the config keys changes these pages in the same
+commit. Examples are a new file or directory in a repository, a new mode, a
+new key or group, a new default, and a new refused value. Write the pages
+again after the change:
+
+```sh
+OSTRYA_BLESS_MAN=1 cargo test -p ostrya-cli --bin ostrya man_pages
+```
+
 ## Requirement: confirm every dependency before adding
 
 Before adding any crate to any `Cargo.toml` -- a regular dependency, a

@@ -1,0 +1,386 @@
+.SH CONFIGURATION FILE
+The file \fB\%<repo>/config\fR is a key file.
+\fB\%ostrya\-repo\fR(5) gives its place in the repository.
+.IP \(bu 2
+A line \fB\%[GROUP]\fR starts a group.
+A line \fB\%KEY=VALUE\fR sets a key in the current group.
+A line that starts with \fB\%#\fR is a comment.
+.IP \(bu 2
+The key ends at the first \fB\%=\fR.
+Space and tab around the key, and at the start of the value, are removed.
+A repeated group adds to the first group, and a repeated key takes the last value.
+.IP \(bu 2
+A boolean is \fB\%true\fR, \fB\%false\fR, \fB\%1\fR, or \fB\%0\fR, with no other bytes.
+.IP \(bu 2
+An integer is a whole decimal number, with an optional sign.
+.IP \(bu 2
+A list is a series of items, each followed by \fB\%;\fR.
+The last \fB\%;\fR is optional.
+\fB\%\e;\fR is a \fB\%;\fR in an item.
+.IP \(bu 2
+In a string, \fB\%\es\fR is a space, \fB\%\et\fR a tab, \fB\%\en\fR a newline, \fB\%\er\fR a carriage return, and \fB\%\e\e\fR a backslash.
+\fB\%ostrya config set\fR writes these escapes, and \fB\%ostrya config get\fR prints the value without them.
+.PP
+ostrya reads at most 1048576 bytes of \fB\%config\fR, and refuses a larger file.
+ostrya checks \fB\%repo_version\fR, \fB\%mode\fR, and \fB\%collection\-id\fR of \fB\%[core]\fR when it opens the repository.
+It reads each other key when a command needs it, and a malformed value makes that command fail.
+\fB\%ostrya config set\fR does not check the group, the key, or the value.
+.PP
+ostrya keeps each group and each key that it does not know when it writes \fB\%config\fR.
+A write removes the comments and the blank lines.
+.SH CORE KEYS
+The keys of the group \fB\%[core]\fR.
+\fB\%ostrya init\fR writes \fB\%repo_version\fR, \fB\%mode\fR, and \fB\%collection\-id\fR.
+.TP
+\fB\%repo_version\fR (integer)
+The version of the repository format.
+It must be 1.
+ostrya refuses to open a repository without it, or with another value.
+.TP
+\fB\%mode\fR (string)
+The mode of the repository: \fB\%bare\fR, \fB\%bare\-user\fR, \fB\%bare\-user\-only\fR, \fB\%bare\-split\-xattrs\fR, \fB\%archive\-z2\fR, \fB\%archive\fR, or \fB\%bare\-user\-shared\fR.
+\fB\%archive\fR is a second name of \fB\%archive\-z2\fR.
+\fB\%ostrya\-repo\fR(5) describes each mode.
+ostrya refuses to open a repository without this key, or with another value.
+.TP
+\fB\%collection\-id\fR (string)
+The collection ID of the repository.
+The summary records it, and the collection refs below \fB\%refs/mirrors/\fR use it.
+\fB\%ostrya init \-\-collection\-id\fR writes it.
+.TP
+\fB\%fsync\fR (boolean, default true)
+Sync each write to disk before it completes.
+\fB\%ostrya commit \-\-fsync=false\fR, and \fB\%\-\-disable\-fsync\fR of \fB\%ostrya pull\fR and \fB\%ostrya pull\-local\fR, turn the sync off for one command.
+.TP
+\fB\%per\-object\-fsync\fR (boolean, default false)
+Sync each content object when it is staged.
+\fB\%\-\-per\-object\-fsync\fR of \fB\%ostrya pull\fR and \fB\%ostrya pull\-local\fR turns it on for one command.
+.TP
+\fB\%locking\fR (boolean, default true)
+Take the repository lock \fB\%.lock\fR.
+The update lock \fB\%.update.lock\fR is always taken.
+A push session of \fB\%ostrya receive\fR or \fB\%ostrya serve\fR refuses a repository with \fB\%locking=false\fR.
+\fB\%ostrya prune\fR writes a warning when it is false.
+.TP
+\fB\%lock\-timeout\-secs\fR (integer, default 300)
+The time in seconds that a command waits for a lock.
+\fB\%\-1\fR means no limit.
+A value less than \fB\%\-1\fR is refused.
+.TP
+\fB\%tmp\-expiry\-secs\fR (integer, default 86400)
+The age in seconds after which a transaction removes a temporary entry of \fB\%tmp/\fR.
+A transaction removes a staging directory whose lock is free at any age.
+.TP
+\fB\%min\-free\-space\-size\fR (string)
+The free space that a transaction must leave on the file system.
+The value is a number followed by \fB\%MB\fR, \fB\%GB\fR, or \fB\%TB\fR.
+\fB\%MB\fR is 1048576 bytes, \fB\%GB\fR is 1024 \fB\%MB\fR, and \fB\%TB\fR is 1024 \fB\%GB\fR.
+Any other form is refused, for example \fB\%1gb\fR, \fB\%1.5GB\fR, or a value with a trailing space.
+When this key is set, \fB\%min\-free\-space\-percent\fR has no effect.
+.TP
+\fB\%min\-free\-space\-percent\fR (integer, default 3)
+The free space that a transaction must leave, as a percentage of the file system size.
+A value outside 0 to 100 is refused.
+.TP
+\fB\%tombstone\-commits\fR (boolean, default false)
+Write a \fB\%.tombstone\-commit\fR object for each commit that \fB\%ostrya prune\fR deletes.
+The summary records the value as \fB\%ostree.summary.tombstone\-commits\fR.
+.TP
+\fB\%indexed\-deltas\fR (boolean, default true)
+The summary records the value as \fB\%ostree.summary.indexed\-deltas\fR.
+\fB\%ostrya serve\fR copies the key into the \fB\%config\fR that it serves.
+.TP
+\fB\%auto\-update\-summary\fR (boolean, default false)
+Write the summary again after a push changes a ref.
+\fB\%ostrya receive\fR and \fB\%ostrya serve\fR read it.
+\fB\%ostrya commit\fR and \fB\%ostrya pull\fR do not write the summary.
+.TP
+\fB\%commit\-update\-summary\fR (boolean, default false)
+A deprecated name of \fB\%auto\-update\-summary\fR.
+If one of the two keys is true, the summary is written.
+A value that is not a boolean in one of the two keys is refused.
+.SH ARCHIVE KEYS
+The keys of the group \fB\%[archive]\fR.
+.TP
+\fB\%zlib\-level\fR (integer, default 6)
+The DEFLATE level of the \fB\%.filez\fR objects that ostrya writes into an archive repository, and that \fB\%ostrya serve\fR makes from another mode.
+A value less than 1 gives 1, and a value more than 9 gives 9.
+.SH INTEGRITY KEYS
+The keys of the group \fB\%[ex\-integrity]\fR.
+Each key takes \fB\%no\fR, \fB\%maybe\fR, or \fB\%yes\fR, and ostrya refuses any other value.
+.TP
+\fB\%fsverity\fR (default no)
+Seal each loose object that is a regular file with fs\-verity, in each mode.
+With \fB\%maybe\fR, a write continues if the file system cannot seal the object.
+With \fB\%yes\fR, the write fails.
+If the key is absent and \fB\%composefs\fR is \fB\%maybe\fR or \fB\%yes\fR, the default is \fB\%maybe\fR.
+.TP
+\fB\%composefs\fR (default no)
+Sets the default of \fB\%fsverity\fR.
+ostrya reads it for no other purpose.
+.SH REMOTE KEYS
+The keys of a group \fB\%[remote "NAME"]\fR.
+\fB\%ostrya remote add\fR writes the group.
+\fB\%NAME\fR has one or more letters, digits, \fB\%\-\fR, \fB\%_\fR, or \fB\%.\fR, and starts with a letter, a digit, or \fB\%_\fR.
+.SS "Address"
+.TP
+\fB\%url\fR (string)
+The base URL of a pull over HTTP: \fB\%http://\fR or \fB\%https://\fR.
+When \fB\%pull\-url\fR is set, a pull uses it in place of this key.
+When \fB\%push\-url\fR is absent, a push uses this key if it starts with \fB\%http://\fR or \fB\%https://\fR.
+A pull refuses an ssh address in this key.
+.TP
+\fB\%branches\fR (list)
+The refs that \fB\%ostrya pull NAME\fR fetches when the command names no ref.
+.SS "Verification"
+.TP
+\fB\%gpg\-verify\fR (boolean, default true)
+A pull checks the GPG signature of each commit that it fetches.
+The trusted keys are in \fB\%gpgkeypath\fR, \fB\%<repo>/NAME.trustedkeys.gpg\fR, \fB\%/etc/ostree/remotes.d/NAME.trustedkeys.gpg\fR, and the global trusted keyrings.
+A build without GPG support refuses \fB\%true\fR.
+.TP
+\fB\%gpg\-verify\-summary\fR (boolean, default false)
+A pull checks the GPG signature of the summary in \fB\%summary.sig\fR.
+.TP
+\fB\%gpgkeypath\fR (list)
+More keyring files, or directories of \fB\%*.gpg\fR keyrings, that \fB\%gpg\-verify\fR trusts.
+An entry that does not exist fails the pull.
+.TP
+\fB\%sign\-verify\fR (boolean or list, default false)
+A pull checks the signature of each commit with the signature engines.
+\fB\%true\fR uses each engine that has a key.
+A list names the engines, split on \fB\%,\fR or \fB\%;\fR, and each engine must have a key.
+The engines are \fB\%ed25519\fR, and \fB\%spki\fR in a build with SPKI support.
+The keys are in the two keys below and in the system key stores of \fB\%ostrya\-repo\fR(5).
+.TP
+\fB\%sign\-verify\-summary\fR (boolean or list, default false)
+A pull checks the signature of the summary with the signature engines.
+It is independent of \fB\%sign\-verify\fR.
+.TP
+\fB\%verification\-ENGINE\-key\fR (string)
+One trusted public key of the engine \fB\%ENGINE\fR, in base64.
+.TP
+\fB\%verification\-ENGINE\-file\fR (string)
+A file of trusted public keys of the engine \fB\%ENGINE\fR, one key on each line.
+.SS "TLS and proxy"
+A relative path is relative to the current directory of the command.
+ostrya does not expand \fB\%~\fR.
+.TP
+\fB\%tls\-ca\-path\fR (string)
+A PEM file of the CA certificates that verify the server, in place of the trust store of the host.
+.TP
+\fB\%tls\-client\-cert\-path\fR and \fB\%tls\-client\-key\-path\fR (string)
+The PEM files of a client certificate and its private key.
+Set both or neither.
+A key that needs a passphrase is refused.
+.TP
+\fB\%tls\-permissive\fR (boolean, default false)
+A pull accepts each certificate chain, and still checks the host name.
+A push to an \fB\%https://\fR address refuses \fB\%true\fR.
+.TP
+\fB\%proxy\fR (string)
+The \fB\%http://\fR proxy URL of each request to the remote.
+The \fB\%no_proxy\fR variables do not apply to it.
+When the key is empty or absent, the proxy variables of the environment apply.
+A value with white space at its start or end is refused.
+.SS "Push and pull extensions"
+These keys are extensions of ostrya.
+The \fB\%ostree\fR tool keeps them and ignores them.
+.TP
+\fB\%pull\-url\fR (string)
+The pull address: \fB\%ssh://[USER@]HOST[:PORT]/PATH\fR, \fB\%[USER@]HOST:PATH\fR, or an \fB\%http://\fR or \fB\%https://\fR URL.
+It has precedence over \fB\%url\fR, and \fB\%ostrya pull \-\-url\fR has precedence over it.
+A remote that the \fB\%ostree\fR tool also reads must keep an HTTP \fB\%url\fR.
+.TP
+\fB\%push\-url\fR (string)
+The push address, in the forms of \fB\%pull\-url\fR.
+.TP
+\fB\%ssh\-command\fR (string, default ssh)
+The ssh command line of a push or a pull over ssh, split at white space with no quoting rule.
+\fB\%\-\-ssh\-command\fR and \fB\%OSTRYA_SSH_COMMAND\fR have precedence over it.
+.TP
+\fB\%receive\-command\fR (string, default ostrya receive)
+The command that the remote side runs for a push over ssh.
+The remote shell parses it.
+\fB\%\-\-receive\-command\fR has precedence over it.
+.TP
+\fB\%send\-command\fR (string, default ostrya send)
+The command that the remote side runs for a pull over ssh.
+The remote shell parses it.
+.TP
+\fB\%push\-token\-file\fR (string)
+A file whose first line is the token of a push over HTTP.
+The token is token68: letters, digits, \fB\%\-\fR, \fB\%.\fR, \fB\%_\fR, \fB\%~\fR, \fB\%+\fR, and \fB\%/\fR, then zero or more \fB\%=\fR.
+A push to an \fB\%http://\fR address refuses to send it, unless the command has \fB\%\-\-allow\-cleartext\-credentials\fR.
+\fB\%\-\-push\-token\-file\fR has precedence over it.
+.TP
+\fB\%push\-user\fR (string)
+The user name of a Basic credential, with the token as the password.
+Without it, the push sends the token as a bearer token.
+A name that is empty or holds \fB\%:\fR is refused, and so is a name with no token file.
+\fB\%\-\-push\-user\fR has precedence over it.
+.PP
+For an ssh address, a push reads \fB\%ssh\-command\fR and \fB\%receive\-command\fR, and ignores the HTTP keys.
+For an HTTP address, a push reads \fB\%push\-token\-file\fR, \fB\%push\-user\fR, \fB\%proxy\fR, and the TLS keys.
+.SH EXTENSION KEYS
+The keys of the group \fB\%[ex\-ostrya]\fR.
+The group is an extension of ostrya, and the \fB\%ostree\fR tool ignores it.
+.TP
+\fB\%gc\-root\-metadata\-keys\fR (list)
+Metadata keys that hold more roots for \fB\%ostrya prune\fR.
+The value of each key, in the metadata or the detached metadata of a commit, is an array of 32\-byte commit checksums.
+A prune keeps each commit that such a value names.
+.TP
+\fB\%detached\-metadata\-exclude\fR (list)
+Detached metadata keys that are not stored.
+\fB\%ostrya pull\fR, \fB\%ostrya pull\-local\fR, and \fB\%ostrya push\fR remove these keys from the \fB\%.commitmeta\fR that they write.
+\fB\%ostrya receive\fR and \fB\%ostrya serve\fR remove them from each commit that a push gives.
+.SH RECEIVE POLICY
+The receive policy controls what \fB\%ostrya receive\fR and \fB\%ostrya serve\fR accept from a push.
+These groups are extensions of ostrya:
+.TP
+\fB\%[ex\-ostrya receive]\fR
+The default rule, and the session keys.
+.TP
+\fB\%[ex\-ostrya receive "PATTERN"]\fR
+The rule of the refs that \fB\%PATTERN\fR matches.
+.TP
+\fB\%[ex\-ostrya trust "NAME"]\fR
+A set of trusted keys.
+.TP
+\fB\%[ex\-ostrya key "NAME"]\fR
+A signing key of the server.
+.PP
+ostrya refuses an unknown key, a key that has no effect, a reference to a group that does not exist, and a group name that starts with \fB\%ex\-ostrya \fR and has no form of this list.
+The quoted part of a group name is not empty and holds no \fB\%"\fR and no control character.
+.SS "Patterns"
+\fB\%PATTERN\fR is \fB\%NAME\fR for the local refs, \fB\%REMOTE:NAME\fR for the refs of the remote \fB\%REMOTE\fR, or \fB\%*:NAME\fR for the refs of each remote.
+\fB\%NAME\fR is a series of parts split at \fB\%/\fR.
+Each part is a literal, \fB\%*\fR for exactly one part, or \fB\%**\fR for one or more parts.
+For example, \fB\%apps/*\fR matches \fB\%apps/web\fR and does not match \fB\%apps/web/db\fR.
+\fB\%apps/**\fR matches both, and neither pattern matches \fB\%apps\fR.
+.PP
+For each ref, the server selects one rule:
+.IP 1. 3
+A remote ref matches only a pattern with a remote part, and a local ref only a pattern without one.
+.IP 2. 3
+A literal remote part has precedence over \fB\%*:\fR.
+.IP 3. 3
+The parts of \fB\%NAME\fR compare from the left.
+At the first part where two patterns differ, a literal has precedence over \fB\%*\fR, and \fB\%*\fR over \fB\%**\fR.
+A longer pattern has precedence over a pattern that is its start.
+If the patterns are equal in kind, the first rule in the file applies.
+.IP 4. 3
+A local ref that no pattern matches gets the default rule.
+A remote ref that no pattern matches is refused.
+.SS "Rule keys"
+Each receive group takes these keys.
+A pattern rule takes no key from the default rule.
+.TP
+\fB\%accept\fR (boolean, default true)
+\fB\%false\fR refuses each update of a matching ref.
+A rule with \fB\%accept=false\fR refuses each other rule key.
+.TP
+\fB\%verify\fR (string, default off)
+\fB\%off\fR, \fB\%trust:NAME\fR for the keys of \fB\%[ex\-ostrya trust "NAME"]\fR, or \fB\%remote:NAME\fR for the keys that a pull from \fB\%[remote "NAME"]\fR trusts.
+.TP
+\fB\%allow\-non\-fast\-forward\fR (boolean, default false)
+Accept a ref update whose new commit does not descend from the current commit.
+.TP
+\fB\%allow\-delete\fR (boolean, default false)
+Accept the delete of a ref.
+.TP
+\fB\%sign\fR (list)
+The key groups whose keys sign each new commit of a matching ref.
+.SS "Session keys"
+Only \fB\%[ex\-ostrya receive]\fR takes these keys.
+.TP
+\fB\%allow\-privileged\fR (boolean, default false)
+In a \fB\%bare\fR repository, accept the setuid and setgid bits, and the extended attributes \fB\%security.capability\fR and \fB\%security.selinux\fR.
+.TP
+\fB\%sign\-summary\fR (list)
+The key groups whose keys sign the summary that a push writes again.
+.SS "Trust keys"
+A trust group takes the remote keys \fB\%gpg\-verify\fR (default false here), \fB\%gpgkeypath\fR, \fB\%sign\-verify\fR, \fB\%verification\-ENGINE\-key\fR, and \fB\%verification\-ENGINE\-file\fR.
+It trusts the keys that it names, and no system key store or keyring.
+A trust group that turns on no check is refused.
+\fB\%gpgkeypath\fR without \fB\%gpg\-verify=true\fR is refused, and so is \fB\%gpg\-verify=true\fR with no \fB\%gpgkeypath\fR.
+\fB\%gpg\-verify\-summary\fR and \fB\%sign\-verify\-summary\fR are refused, because a push carries no summary.
+.SS "Signing key keys"
+.TP
+\fB\%type\fR (string)
+\fB\%ed25519\fR, \fB\%spki\fR, or \fB\%gpg\fR.
+The key is necessary.
+.TP
+\fB\%secret\-key\-file\fR (string)
+For \fB\%ed25519\fR and \fB\%spki\fR: a regular file of at most 1 MiB that holds one line, a base64 secret key.
+.TP
+\fB\%gpg\-key\fR (string)
+For \fB\%gpg\fR: a selector that names exactly one secret key.
+.TP
+\fB\%gpg\-homedir\fR (string)
+For \fB\%gpg\fR: the GnuPG home directory.
+It is optional.
+.SS "Policy file"
+\fB\%ostrya receive \-\-policy=FILE\fR and \fB\%ostrya serve \-\-policy=FILE\fR read the receive groups, the trust groups, the key groups, and the remote groups from \fB\%FILE\fR.
+They then ignore these groups in \fB\%<repo>/config\fR.
+\fB\%FILE\fR holds no other group.
+\fB\%[core] auto\-update\-summary\fR and \fB\%[ex\-ostrya] detached\-metadata\-exclude\fR still come from \fB\%<repo>/config\fR.
+A \fB\%remote:NAME\fR reference then does not read \fB\%<repo>/NAME.trustedkeys.gpg\fR.
+.SH KEYS WITHOUT EFFECT
+ostrya keeps these keys and does not use them:
+.TP
+\fB\%[core] disable\-xattrs\fR, \fB\%[core] parent\fR, \fB\%[core] default\-repo\-finders\fR
+ostrya does not read these keys.
+.TP
+\fB\%contenturl\fR, \fB\%metalink\fR, \fB\%custom\-backend\fR, and \fB\%collection\-id\fR of a remote
+\fB\%ostrya remote add\fR writes them, and a pull does not read them.
+.PP
+ostrya does not read the remote groups in \fB\%remotes.d/\fR directories.
+.SH ENVIRONMENT
+.TP
+\fB\%OSTRYA_SSH_COMMAND\fR
+The ssh command line.
+It has precedence over the \fB\%ssh\-command\fR key.
+.TP
+\fB\%http_proxy\fR, \fB\%https_proxy\fR, \fB\%HTTPS_PROXY\fR, \fB\%all_proxy\fR, \fB\%ALL_PROXY\fR, \fB\%no_proxy\fR, \fB\%NO_PROXY\fR
+The proxy of a remote whose \fB\%proxy\fR key is empty or absent.
+ostrya does not read \fB\%HTTP_PROXY\fR.
+.TP
+\fB\%OSTREE_GPG_HOME\fR
+The directory of the global trusted GPG keyrings, in place of \fB\%/usr/share/ostree/trusted.gpg.d\fR.
+.SH EXAMPLES
+Show the mode of the repository:
+.PP
+.nf
+ostrya \-\-repo=repo config get core.mode
+.fi
+.PP
+Read a key of a remote:
+.PP
+.nf
+ostrya \-\-repo=repo config \-\-group='remote "origin"' get url
+.fi
+.PP
+A remote that pulls over HTTP and pushes over ssh:
+.PP
+.nf
+[remote "origin"]
+url=https://ostree.example.com/repo
+push\-url=ssh://builder@ostree.example.com/srv/repo
+gpg\-verify=false
+sign\-verify=ed25519
+verification\-ed25519\-file=/etc/ostrya/origin.ed25519
+.fi
+.PP
+A receive policy that accepts the refs below \fB\%apps/\fR with a trusted signature, and refuses each other ref:
+.PP
+.nf
+[ex\-ostrya receive]
+accept=false
+[ex\-ostrya receive "apps/**"]
+verify=trust:release
+[ex\-ostrya trust "release"]
+sign\-verify=ed25519
+verification\-ed25519\-file=/etc/ostrya/release.ed25519
+.fi

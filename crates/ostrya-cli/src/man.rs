@@ -17,11 +17,14 @@
 //! - `ostrya.1` has the global options and the list of subcommands.
 //! - `ostrya-<name>.1` has one subcommand. A nested subcommand, such as
 //!   `remote add`, is a section of the page of its parent.
+//! - Each page of [`FILE_PAGES`], such as `ostrya-repo.5`, describes a file
+//!   format and has no subcommand.
 //!
 //! A file `man/extra/<page>.roff`, for example `man/extra/ostrya.1.roff`, is
 //! added to the end of the page of the same name, before SEE ALSO. It holds
 //! the sections that `clap` does not describe, such as ENVIRONMENT and
-//! EXAMPLES.
+//! EXAMPLES. The body of a page of [`FILE_PAGES`] is its file in
+//! `man/extra` alone.
 //!
 //! # Text
 //!
@@ -43,6 +46,33 @@ const NAME: &str = "ostrya";
 
 /// The environment variable that lets the test write the pages again.
 const BLESS: &str = "OSTRYA_BLESS_MAN";
+
+/// A page that describes a file format and has no subcommand.
+struct FilePage {
+    /// The page name, such as `ostrya-repo`.
+    name: &'static str,
+    /// The manual section, such as `5`.
+    section: &'static str,
+    /// The title of the manual in the title line.
+    manual: &'static str,
+    /// The one-line summary of the NAME section.
+    summary: &'static str,
+    /// The pages of the SEE ALSO section, as a name and a section.
+    see_also: &'static [(&'static str, &'static str)],
+}
+
+/// The pages that describe a file format.
+const FILE_PAGES: &[FilePage] = &[FilePage {
+    name: "ostrya-repo",
+    section: "5",
+    manual: "File Formats",
+    summary: "The layout of an ostrya repository",
+    see_also: &[
+        ("ostrya", "1"),
+        ("ostrya-config", "1"),
+        ("ostrya-init", "1"),
+    ],
+}];
 
 /// Returns the file name and the roff text of each page.
 ///
@@ -68,6 +98,12 @@ fn render_pages(extra: &Path) -> Vec<(String, String)> {
         let text = render_subcommand_page(sub, &globals, &read_extra(extra, &file));
         pages.push((file, text));
     }
+    for page in FILE_PAGES {
+        let file = format!("{}.{}", page.name, page.section);
+        let body = read_extra(extra, &file);
+        assert!(!body.is_empty(), "man/extra has no body for {file}");
+        pages.push((file, render_file_page(page, &body)));
+    }
     pages
 }
 
@@ -76,10 +112,27 @@ fn read_extra(extra: &Path, file: &str) -> String {
     std::fs::read_to_string(extra.join(format!("{file}.roff"))).unwrap_or_default()
 }
 
+/// Renders a page of [`FILE_PAGES`] with the hand-written `body`.
+fn render_file_page(page: &FilePage, body: &str) -> String {
+    let mut out = String::new();
+    push_title(&mut out, page.name, page.section, page.manual);
+    push_name(&mut out, page.name, page.summary);
+    push_extra(&mut out, body);
+    out.push_str(".SH SEE ALSO\n");
+    let see_also: Vec<String> = page
+        .see_also
+        .iter()
+        .map(|(name, section)| format!("\\fB{}\\fR({section})", escape(name)))
+        .collect();
+    out.push_str(&see_also.join(",\n"));
+    out.push('\n');
+    out
+}
+
 /// Renders `ostrya.1`.
 fn render_top_page(top: &Command, extra: &str) -> String {
     let mut out = String::new();
-    push_title(&mut out, NAME);
+    push_title(&mut out, NAME, "1", "User Commands");
     push_name(&mut out, NAME, &about(top));
     push_synopsis(&mut out, top);
     out.push_str(".SH DESCRIPTION\n");
@@ -112,7 +165,7 @@ fn render_top_page(top: &Command, extra: &str) -> String {
 fn render_subcommand_page(cmd: &Command, globals: &HashSet<String>, extra: &str) -> String {
     let name = format!("{NAME}-{}", cmd.get_name());
     let mut out = String::new();
-    push_title(&mut out, &name);
+    push_title(&mut out, &name, "1", "User Commands");
     push_name(&mut out, &name, &about(cmd));
     push_synopsis(&mut out, cmd);
     out.push_str(".SH DESCRIPTION\n");
@@ -178,13 +231,13 @@ fn push_nested(out: &mut String, title: &str, cmd: &Command, globals: &HashSet<S
     }
 }
 
-/// Writes the title line of the page `name`.
+/// Writes the title line of the page `name` in the manual section `section`.
 ///
-/// The line has no date and no version, so a page changes only when its
-/// text changes.
-fn push_title(out: &mut String, name: &str) {
+/// `manual` is the title of the manual. The line has no date and no version,
+/// so a page changes only when its text changes.
+fn push_title(out: &mut String, name: &str, section: &str, manual: &str) {
     out.push_str(&format!(
-        ".TH \"{}\" \"1\" \"\" \"{NAME}\" \"User Commands\"\n",
+        ".TH \"{}\" \"{section}\" \"\" \"{NAME}\" \"{manual}\"\n",
         escape_quoted(&name.to_uppercase())
     ));
 }
@@ -501,7 +554,8 @@ fn escape_quoted(text: &str) -> String {
 ///
 /// The pages describe the default feature set, which the shipped binary
 /// has, so the test runs only when each subcommand feature is on. If a page
-/// differs, is missing, or has no subcommand, the test fails. Only then does
+/// differs, is missing, or has no subcommand and is not in [`FILE_PAGES`],
+/// the test fails. Only then does
 /// it read `OSTRYA_BLESS_MAN`. If the variable is set, the test writes the
 /// pages again and removes each page that has no subcommand.
 #[cfg(all(
@@ -528,7 +582,7 @@ fn man_pages_match_the_committed_files() {
             entries
                 .filter_map(|entry| entry.ok())
                 .filter_map(|entry| entry.file_name().into_string().ok())
-                .filter(|name| name.ends_with(".1") && !names.contains(name.as_str()))
+                .filter(|name| is_page_file(name) && !names.contains(name.as_str()))
                 .collect()
         })
         .unwrap_or_default();
@@ -568,4 +622,18 @@ fn man_pages_match_the_committed_files() {
     for name in orphans {
         std::fs::remove_file(dir.join(name)).expect("remove a man page");
     }
+}
+
+/// Returns true if `name` is the file name of a man page, such as
+/// `ostrya.1` or `ostrya-repo.5`.
+#[cfg(all(
+    feature = "receive",
+    feature = "push",
+    feature = "serve",
+    feature = "send"
+))]
+fn is_page_file(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(stem, section)| {
+        !stem.is_empty() && section.len() == 1 && section.as_bytes()[0].is_ascii_digit()
+    })
 }

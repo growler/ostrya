@@ -8556,6 +8556,68 @@ The removal of these leftovers is a port behavior. The tool's handling of a
 delta whose target is absent, and of a marker whose commit is absent, is not
 observed.
 
+### Phase 26 -- Client access for serve, receive, and send
+
+Client groups control the access to a served repository. A group is
+`[ex-ostrya client "NAME"]` in the repository config. The identification of
+a client gives one auth item, and the namespace of the request, the local
+refs or one collection, then selects one group. The group gives the access
+modes of each ref, `r`, `w`, `c`, `t`, and `d`, and the rules for the
+verification and the signing of a commit. `[ex-ostrya server]` holds the
+settings of `ostrya serve`. The phase also adds collection refs to the push
+path, the ref listing, and the pull, and a commit that the server builds
+from a tree that a client sends.
+
+The phase breaks the configuration of published versions. No group of the
+receive policy is kept. The wire changes go into protocol version 1, because
+no deployment runs version 1 yet.
+
+The release is 0.4.0. The configuration break is a breaking change, and so
+is each public item the phase removes, for example the fields `credentials`
+and `allow_anonymous_push` of `ServeOptions`. A breaking change takes a
+minor version before 1.0, and this release takes it.
+
+The phase has these items. Each item is one reviewable change, and the tests
+and the CI gates pass at its end.
+
+- `S1` -- the phase setup: the measurement of `x509-cert`, the check of the
+  WebPKI verifier outside the TLS handshake, and this entry. No code change.
+- `S2` -- a library type that reads the client groups and the server group,
+  runs the start checks, computes the rights of a ref, and selects a group.
+- `S3` -- the receive path on the rights of one group, in the local
+  namespace.
+- `S4` -- the identification of a client over HTTP and over ssh.
+- `S5` -- the keys of `[ex-ostrya server]` and the flags of `ostrya serve`.
+- `S6` -- PROXY protocol v1 and v2, the trusted proxies, and a client
+  certificate from a proxy.
+- `S7` -- the claims in the URI SANs of a client certificate.
+- `S8` -- read access in the archive view and the ref listing, and the
+  summary rule.
+- `S9` -- collection namespaces in the push path, and `push --tag`.
+- `S10` -- collection refs in the ref listing.
+- `S11` -- the update `ServerCommit`: the server builds the commit.
+- `S12` -- `push --onto` and `push-tree` send a `ServerCommit`.
+- `S13` -- `commit --tag`.
+- `S14` -- `pull --collection`.
+- `S15` -- the closing checks: the `spec:` values, the man pages, the
+  package `README.md` files, and the CI gates.
+
+Dependency set for the phase. `CLAUDE.md`, "Authorized: the `x509-cert`
+crate", states the measured graph.
+
+- `x509-cert` 0.2.5, `default-features = false`, in `crates/ostrya-server`
+  alone. It reads the subject CN and the URI SANs of a client certificate.
+  It is built on `der` 0.7, which is in the graph through `pgp` and
+  `pkcs8`.
+- PEM decoding -- `PemObject` of `rustls-pki-types`, through the re-export
+  of `rustls`, with no crate. A base64 DER certificate that a proxy forwards
+  gets the PEM armor and goes through the same decoder.
+- PROXY protocol v1 and v2 -- written in the tree, with no crate.
+- CIDR matching -- `std::net::IpAddr` and a prefix length, with no crate.
+- The verification of a client certificate from a proxy uses the
+  `WebPkiClientVerifier` of `rustls`, which `ostrya-fetch` already builds
+  for the TLS handshake. `rustls-webpki` stays a transitive dependency.
+
 ## Risk register
 
 - composefs/EROFS byte-exactness (Phase 9): the EROFS and composefs on-disk

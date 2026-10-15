@@ -454,6 +454,55 @@ it directly. Each term below is measured on the resolved dependency graph.
   requirement holds.
 - One package entered `Cargo.lock` with it: `terminal_size`.
 
+### Authorized: the `x509-cert` crate
+
+`x509-cert` 0.2.5 is authorized for `crates/ostrya-server` alone. It reads
+the subject CN and the URI SANs of a client certificate from the DER bytes
+of the certificate. The certificate comes from the TLS handshake or from the
+header of a trusted proxy. Each term below is measured on the resolved
+dependency graph.
+
+- License `Apache-2.0 OR MIT`.
+- `default-features = false` is mandatory, and no feature is turned on. The
+  default features `pem` and `std` stay off. The server decodes PEM with
+  `rustls-pki-types`, through the re-export of `rustls`, so the crate
+  decodes DER alone. With the default features, `Cargo.lock` gains
+  `tls_codec` 0.4.2 and `tls_codec_derive` 0.4.2 through the weak feature
+  `tls_codec?/std`, and no build compiles them.
+- The crate turns on the features `derive` and `flagset` of `der` 0.7.10
+  and the feature `db` of `const-oid` 0.9.6. Both packages were already in
+  the graph through `pgp` and `pkcs8`.
+- Version 0.3.0 is not taken. It takes `der` 0.8, `spki` 0.8, and
+  `const-oid` 0.10, so each of the three would be in the graph at two
+  versions, and six packages would enter `Cargo.lock`.
+- The graph holds 14 packages under 14 distinct names, measured with
+  `cargo tree -p x509-cert -e normal,build`: `x509-cert` 0.2.5, `der`
+  0.7.10, `der_derive` 0.7.3, `spki` 0.7.3, `const-oid` 0.9.6, `flagset`
+  0.4.7, `pem-rfc7468` 0.7.0, `base64ct` 1.8.3, `zeroize` 1.9.0,
+  `zeroize_derive` 1.5.0, `proc-macro2` 1.0.106, `quote` 1.0.46, `syn`
+  2.0.118, and `unicode-ident` 1.0.24. `pem-rfc7468` and `base64ct` are in
+  it because other crates of the workspace turn on the feature `pem` of
+  `der`. `zeroize` is in it because other crates turn on the feature
+  `zeroize` of `der`. `zeroize_derive` is in it because `pgp` and
+  `x25519-dalek` turn on the feature `zeroize_derive` of `zeroize`. With
+  `--target all` it holds the same 14.
+  `cargo metadata --format-version 1 --all-features` counts the same 14 for
+  the closure.
+- No package in the graph declares a `links` key, and no package name in it
+  ends in `-sys`.
+- Two packages carry a build script: `proc-macro2` and `quote`. Both were
+  already in the graph.
+- Every license in the graph is permissive by the rule in "Requirement:
+  permissive licenses only": 9 packages state `Apache-2.0 OR MIT`, 3 state
+  `MIT OR Apache-2.0`, `flagset` states `Apache-2.0`, and `unicode-ident`
+  states `(MIT OR Apache-2.0) AND Unicode-3.0`.
+- The highest minimum supported Rust version in the graph is 1.85, stated
+  by `base64ct`, `zeroize`, and `zeroize_derive`. `x509-cert`, `der_derive`,
+  and `flagset` state 1.65. The workspace pins 1.92, so the requirement
+  holds.
+- Three packages enter `Cargo.lock` with it: `x509-cert` 0.2.5,
+  `der_derive` 0.7.3, and `flagset` 0.4.7.
+
 ## Requirement: permissive licenses only
 
 The library and everything it links -- every crate in the dependency graph,
